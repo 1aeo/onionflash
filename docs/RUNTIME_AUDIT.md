@@ -171,3 +171,24 @@ available observations separately from source-timestamp proxies and controlled
 polling simulations. `--poll-seconds` changes the hypothetical polling model;
 it does not change the running service. Regression tests cover the distinctions and verify
 that read-only auditing leaves the input bytes unchanged.
+
+## Post-update acceptance
+
+Version 0.2.0 was published on November 9 at 09:45:22 PST. All 16 enabled
+sources fetched successfully. The previously ignored tag entries were processed
+without an inference client and merged into existing release stories.
+
+A subsequent live check observed Tor tag polls at **09:55:02 and 10:00:02 PST**,
+exactly **300 seconds** apart, with no source error. This is an acceptance sample,
+not an end-to-end latency percentile. New items use post-fetch observation times;
+the database metadata records the boundary so older cycle-start timestamps are
+not silently relabeled.
+
+The new next-fetch deadline was 10:05:01 PST. With the configured 300-second
+interval, that implies a 10:00:01 cycle start—one second before the preceding
+10:00:02 deadline. The healthy-source tolerance allowed this poll; the previous
+strict comparison would have skipped it.
+
+The database measured 1,056,768 bytes (about 1.01 MiB) after the update, and its
+integrity check passed. A new private backup restored 17 stories and verified
+32 public-file hashes. No compaction or history pruning was performed.
