@@ -5,24 +5,78 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from contextlib import closing
 from pathlib import Path
 
-from .util import digest, item_cluster, now_iso
+from .util import after, backoff_seconds, digest, item_cluster
 
 
-def after(seconds: float, start: str | None = None) -> str:
-    dt = datetime.fromisoformat((start or now_iso()).replace("Z", "+00:00"))
-    return (
-        (dt + timedelta(seconds=seconds))
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z")
+def backup_database(source: str | Path, destination: str | Path) -> None:
+    """Copy committed WAL data into a new, private, validated SQLite file."""
+    source, destination = Path(source).resolve(strict=True), Path(destination)
+    try:
+        descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        raise ValueError("Backup destination must be new") from None
+    os.close(descriptor)
+    try:
+        with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as origin:
+            with closing(sqlite3.connect(destination)) as target:
+                origin.backup(target, pages=128)
+                if target.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                    raise ValueError("Database backup validation failed")
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+
+
+def source_due(source: dict, state: dict, collection: dict, observed: str) -> bool:
+    """Forgive small scheduler skew only after a completed successful poll."""
+    due = state.get("next_fetch_at")
+    if not due or due <= observed:
+        return True
+    healthy = (
+        bool(state.get("last_success"))
+        and state.get("error") is None
+        and not state.get("failures")
+        and not state.get("scan_upper")
+        and not state.get("scan_page")
     )
+    if not healthy:
+        return False
+    tolerance = min(
+        collection["healthy_poll_tolerance_seconds"], source["interval_seconds"] / 10
+    )
+    return after(tolerance, observed) >= due
+
+
+def item_priority(item: dict, tag_priority_score: int = 5) -> int:
+    words = (
+        item["title"]
+        + " "
+        + item["content"][:1500]
+        + " "
+        + " ".join(item.get("labels", []))
+    ).lower()
+    score = sum(
+        weight
+        for word, weight in [
+            ("compromis", 30),
+            ("security", 15),
+            ("attack", 10),
+            ("denial", 10),
+            ("dirauth", 8),
+            ("released", 5),
+        ]
+        if word in words
+    )
+    return max(score, tag_priority_score if item["kind"] == "tag" else 0)
 
 
 class Store:
     def __init__(self, path: str | Path):
         path = Path(path)
+        self.path = path.absolute()
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if path.is_symlink():
             raise ValueError("Database must not be a symlink")
@@ -94,7 +148,14 @@ class Store:
             ).fetchone()
         )
 
-    def source_success(self, source: dict, result: dict, observed: str) -> None:
+    def source_success(
+        self,
+        source: dict,
+        result: dict,
+        observed: str,
+        *,
+        schedule_from: str | None = None,
+    ) -> None:
         with self.db:
             self.db.execute(
                 """UPDATE source_state SET active_url=?, watermark=COALESCE(?,watermark),
@@ -107,7 +168,7 @@ class Store:
                     result.get("etag"),
                     result.get("last_modified"),
                     observed,
-                    after(source["interval_seconds"], observed),
+                    after(source["interval_seconds"], schedule_from or observed),
                     bool(result.get("reconciled")),
                     result.get("watermark"),
                     source["id"],
@@ -128,35 +189,34 @@ class Store:
         delay = (
             source["interval_seconds"]
             if catching_up
-            else min(
+            else backoff_seconds(
+                failures,
+                collection["failure_backoff_base_seconds"],
                 collection["failure_backoff_cap_seconds"],
-                collection["failure_backoff_base_seconds"] * 2 ** min(failures - 1, 20),
             )
         )
+        fields = {
+            "failures": 0 if catching_up else failures,
+            "error": error[:160],
+            "next_fetch_at": after(delay, observed),
+        }
+        if checkpoint:
+            fields.update({
+                "scan_lower": checkpoint["lower"],
+                "scan_upper": checkpoint["upper"],
+                "scan_page": checkpoint["page"],
+                "scan_cursor": checkpoint.get("cursor"),
+                "scan_reconcile": bool(checkpoint.get("reconcile")),
+            })
+        # Column names are only the literal keys above, never source data.
+        assignments = ",".join(f"{name}=?" for name in fields)
         with self.db:
             self.db.execute(
-                "UPDATE source_state SET failures=?,error=?,next_fetch_at=? WHERE id=?",
-                (
-                    0 if catching_up else failures,
-                    error[:160],
-                    after(delay, observed),
-                    source["id"],
-                ),
+                f"UPDATE source_state SET {assignments} WHERE id=?",
+                (*fields.values(), source["id"]),
             )
-            if checkpoint:
-                self.db.execute(
-                    "UPDATE source_state SET scan_lower=?,scan_upper=?,scan_page=?,scan_cursor=?,scan_reconcile=? WHERE id=?",
-                    (
-                        checkpoint["lower"],
-                        checkpoint["upper"],
-                        checkpoint["page"],
-                        checkpoint.get("cursor"),
-                        bool(checkpoint.get("reconcile")),
-                        source["id"],
-                    ),
-                )
 
-    def ingest(self, item: dict, observed: str) -> bool:
+    def ingest(self, item: dict, observed: str, *, tag_priority_score: int = 5) -> bool:
         item_id = digest(item["url"])[:24]
         item["id"] = item_id
         content_hash = digest(
@@ -183,25 +243,7 @@ class Store:
         if row and item["updated_at"] < json.loads(row["payload"])["updated_at"]:
             # A stale cache/fallback must not roll a newer incident back in time.
             return False
-        words = (
-            item["title"]
-            + " "
-            + item["content"][:1500]
-            + " "
-            + " ".join(item.get("labels", []))
-        ).lower()
-        score = sum(
-            weight
-            for word, weight in [
-                ("compromis", 30),
-                ("security", 15),
-                ("attack", 10),
-                ("denial", 10),
-                ("dirauth", 8),
-                ("released", 5),
-            ]
-            if word in words
-        )
+        score = item_priority(item, tag_priority_score)
         with self.db:
             self.db.execute(
                 """INSERT INTO items(id,url,source_id,payload,content_hash,cluster_key,first_seen,last_seen,priority_score)
@@ -244,19 +286,18 @@ class Store:
         return json.loads(row[0]) if row else None
 
     def defer(self, item_id: str, error: str, llm: dict, observed: str) -> None:
-        attempts = (
-            self.db.execute(
-                "SELECT attempts FROM items WHERE id=?", (item_id,)
-            ).fetchone()[0]
-            + 1
-        )
-        delay = min(
-            llm["retry_cap_seconds"],
-            llm["retry_base_seconds"] * 2 ** min(attempts - 1, 20),
+        row = self.db.execute(
+            "SELECT attempts FROM items WHERE id=? AND status='pending'", (item_id,)
+        ).fetchone()
+        if row is None:
+            return
+        attempts = row[0] + 1
+        delay = backoff_seconds(
+            attempts, llm["retry_base_seconds"], llm["retry_cap_seconds"]
         )
         with self.db:
             self.db.execute(
-                "UPDATE items SET attempts=?,last_error=?,next_attempt_at=? WHERE id=?",
+                "UPDATE items SET attempts=?,last_error=?,next_attempt_at=? WHERE id=? AND status='pending'",
                 (attempts, error[:160], after(delay, observed), item_id),
             )
 
@@ -307,7 +348,7 @@ class Store:
                 }
                 if previous and (
                     item["updated_at"] < previous["updated_at"]
-                    or (item["kind"] == "tag" and previous["state"] == "released")
+                    or (item["kind"] == "tag" and previous["state"] != "tagged")
                 ):
                     # A newly discovered older mirror adds corroborating links, not an
                     # editorial rollback. The evidence still remains in the private cache.
@@ -359,6 +400,11 @@ class Store:
             )
         ]
 
+    def story_count(self, limit: int) -> int:
+        return self.db.execute(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM stories LIMIT ?)", (limit,)
+        ).fetchone()[0]
+
     def health(
         self, sources: list[dict], stale_seconds: int, observed: str
     ) -> list[dict]:
@@ -396,10 +442,4 @@ class Store:
             )
 
     def backup(self, destination: str | Path) -> None:
-        """A consistent SQLite backup, including committed WAL data."""
-        destination = Path(destination)
-        if destination.exists() or destination.is_symlink():
-            raise ValueError("Backup destination must be new")
-        with sqlite3.connect(destination) as target:
-            self.db.backup(target)
-        os.chmod(destination, 0o600)
+        backup_database(self.path, destination)

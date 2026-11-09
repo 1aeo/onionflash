@@ -19,7 +19,7 @@ from . import __version__
 from .analyze import AnalysisError, Analyzer, cache_key
 from .collect import CollectionError, collect_source
 from .config import load_config
-from .store import Store
+from .store import Store, source_due
 from .transport import HttpClient
 from .util import BudgetExceeded, digest, now_iso
 
@@ -60,7 +60,8 @@ def time_budget(seconds: int):
 
 def _renderer_identity() -> str:
     root = Path(__file__).parent
-    files = [root / "render.py", *sorted((root / "assets").glob("*"))]
+    files = [root / name for name in ("render.py", "schema.py", "util.py")]
+    files.extend(sorted((root / "assets").glob("*")))
     return digest(
         [
             (p.name, hashlib.sha256(p.read_bytes()).hexdigest())
@@ -142,6 +143,8 @@ def build(config: dict, store: Store, *, force: bool = False) -> bool:
 
 def run(config: dict, store: Store) -> dict:
     observed = now_iso()
+    if not store.get_meta("fetch_completion_clock_since"):
+        store.set_meta("fetch_completion_clock_since", observed)
     report = {
         "sources_ok": 0,
         "sources_failed": 0,
@@ -155,12 +158,21 @@ def run(config: dict, store: Store) -> dict:
     collection_deadline = started + budget * (
         1 - config["collection"]["analysis_reserve_fraction"]
     )
+
+    def record_items(items):
+        received = now_iso()
+        priority = config["collection"]["tag_priority_score"]
+        report["items_changed"] += sum(
+            store.ingest(item, received, tag_priority_score=priority) for item in items
+        )
+        return received
+
     with HttpClient(config["http"]) as client:
         for source in config["sources"]:
             if not source["enabled"]:
                 continue
             state = store.source(source)
-            if state["next_fetch_at"] and state["next_fetch_at"] > observed:
+            if not source_due(source, state, config["collection"], observed):
                 continue
             remaining = collection_deadline - time.monotonic()
             if remaining < 1:
@@ -173,18 +185,16 @@ def run(config: dict, store: Store) -> dict:
                     result = collect_source(
                         client, source, state, config["collection"], observed
                     )
-                for item in result["items"]:
-                    report["items_changed"] += int(store.ingest(item, observed))
-                store.source_success(source, result, observed)
+                received = record_items(result["items"])
+                store.source_success(source, result, received, schedule_from=observed)
                 report["sources_ok"] += 1
             except CollectionError as exc:
-                for item in exc.items:
-                    report["items_changed"] += int(store.ingest(item, observed))
+                received = record_items(exc.items)
                 store.source_failure(
                     source,
                     str(exc),
                     config["collection"],
-                    observed,
+                    received,
                     exc.checkpoint,
                     exc.catching_up,
                 )
@@ -194,29 +204,36 @@ def run(config: dict, store: Store) -> dict:
                     source,
                     "Source time budget exceeded",
                     config["collection"],
-                    observed,
+                    now_iso(),
                 )
                 report["sources_failed"] += 1
     remaining = budget - (time.monotonic() - started)
     active_row = None
+    inference_unavailable = False
     try:
         with time_budget(max(1, remaining)):
             with Analyzer(config) as analyzer:
                 for row in store.pending(config["llm"]["max_items_per_run"], now_iso()):
-                    active_row = row
                     key = cache_key(row, config["llm"])
                     try:
                         result = store.cached(key)
                         if result is None:
-                            result = analyzer.analyze(json.loads(row["payload"]))
+                            item = json.loads(row["payload"])
+                            if inference_unavailable and item["kind"] != "tag":
+                                continue
+                            active_row = row
+                            result = analyzer.analyze(item)
+                            active_row = None
                         store.finish(row, result, key, now_iso())
                         report["analyzed"] += 1
                     except AnalysisError as exc:
+                        active_row = None
                         store.defer(row["id"], str(exc), config["llm"], now_iso())
                         report["analysis_failed"] += 1
                         if exc.retryable:
-                            # A shared inference outage must not consume every item's retry budget.
-                            break
+                            # Skip further network analysis, but deterministic tags
+                            # and already-cached results remain publishable.
+                            inference_unavailable = True
     except RunBudgetReached:
         report["budget_reached"] = True
         if active_row is not None:
@@ -227,7 +244,7 @@ def run(config: dict, store: Store) -> dict:
                 now_iso(),
             )
     report["pending_analysis"] = store.pending_count()
-    report["published_stories"] = len(store.stories(config["storage"]["max_stories"]))
+    report["published_stories"] = store.story_count(config["storage"]["max_stories"])
     report["public_changed"] = build(config, store)
     return report
 
@@ -285,9 +302,7 @@ def main(argv: list[str] | None = None) -> int:
                 elif args.command == "status":
                     result = {
                         "pending_analysis": store.pending_count(),
-                        "published_stories": len(
-                            store.stories(config["storage"]["max_stories"])
-                        ),
+                        "published_stories": store.story_count(config["storage"]["max_stories"]),
                         "sources": store.health(
                             config["sources"],
                             config["collection"]["stale_after_seconds"],

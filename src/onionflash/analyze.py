@@ -8,30 +8,10 @@ import re
 
 from .transport import FetchError, HttpClient
 from .util import digest
+from .schema import CATEGORIES, PRIORITIES, CONFIDENCES, STATES, PRODUCTS
 
 PROMPT_VERSION = "onionflash-3"
-CATEGORIES = [
-    "security",
-    "release",
-    "dos",
-    "directory-authority",
-    "relay",
-    "protocol",
-    "feature",
-    "network",
-]
-PRIORITIES = ["critical", "high", "normal", "low"]
-CONFIDENCES = ["confirmed", "reported", "suspected", "observed-anomaly"]
-STATES = [
-    "developing",
-    "mitigation-available",
-    "fixed",
-    "resolved",
-    "released",
-    "merged",
-    "tagged",
-]
-PRODUCTS = ["tor", "arti", "tor-browser", "torspec", "network"]
+TAG_NOTICE_VERSION = "tag-notice-2"
 SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -115,6 +95,10 @@ class AnalysisError(Exception):
 
 
 def cache_key(row: dict, llm: dict) -> str:
+    if json.loads(row["payload"])["kind"] == "tag":
+        # Old LLM decisions must not suppress the deterministic tag path. Its
+        # result does not depend on the configured inference model.
+        return digest([row["content_hash"], TAG_NOTICE_VERSION])
     return digest([row["content_hash"], llm["model"], PROMPT_VERSION])
 
 
@@ -134,7 +118,10 @@ def _json_object(text: str) -> dict:
         result = json.loads(
             text, object_pairs_hook=pairs, parse_constant=invalid_constant
         )
-    except (ValueError, TypeError) as exc:
+        # SQLite text is UTF-8; reject unpaired JSON surrogate escapes before
+        # a malformed model response can interrupt a queue transaction.
+        json.dumps(result, ensure_ascii=False).encode("utf-8")
+    except (ValueError, TypeError, RecursionError) as exc:
         raise AnalysisError("Model returned invalid JSON") from exc
     if not isinstance(result, dict):
         raise AnalysisError("Model response is not an object")
@@ -142,43 +129,40 @@ def _json_object(text: str) -> dict:
 
 
 def validate_analysis(result: dict, item: dict) -> dict:
-    if not isinstance(result, dict) or set(result) != set(SCHEMA["properties"]):
+    fields = SCHEMA["properties"]
+    if not isinstance(result, dict) or set(result) != set(fields):
         raise AnalysisError("Model response fields do not match schema")
-    if type(result["publish"]) is not bool:
-        raise AnalysisError("Model publish field is not boolean")
-    for key, limit in [("title", 140), ("summary", 1200), ("why_it_matters", 500)]:
+    for key, rule in fields.items():
         value = result[key]
-        if (
-            not isinstance(value, str)
-            or len(value) > limit
-            or any(ord(c) < 32 and c not in "\n\t" for c in value)
-        ):
-            raise AnalysisError(f"Invalid model {key}")
-        result[key] = value.strip()
-    for key, allowed in [
-        ("category", CATEGORIES),
-        ("priority", PRIORITIES),
-        ("confidence", CONFIDENCES),
-        ("state", STATES),
-    ]:
-        if result[key] not in allowed:
-            raise AnalysisError(f"Invalid model {key}")
-    for key, allowed, maximum in [("products", PRODUCTS, 5), ("tags", CATEGORIES, 8)]:
-        value = result[key]
-        if (
-            not isinstance(value, list)
-            or len(value) > maximum
-            or any(not isinstance(v, str) or v not in allowed for v in value)
-            or len(set(value)) != len(value)
-        ):
-            raise AnalysisError(f"Invalid model {key}")
+        if rule["type"] == "boolean":
+            if type(value) is not bool:
+                raise AnalysisError("Model publish field is not boolean")
+        elif rule["type"] == "string":
+            allowed = rule.get("enum")
+            valid = isinstance(value, str) and (
+                value in allowed if allowed is not None else (
+                    len(value) <= rule["maxLength"]
+                    and not any(ord(c) < 32 and c not in "\n\t" for c in value)
+                )
+            )
+            if not valid:
+                raise AnalysisError(f"Invalid model {key}")
+            if allowed is None:
+                result[key] = value.strip()
+        elif rule["type"] == "array":
+            if not isinstance(value, list) or len(value) > rule["maxItems"]:
+                raise AnalysisError(f"Invalid model {key}")
+            member = rule["items"]
+            if "enum" in member:
+                if any(not isinstance(v, str) or v not in member["enum"] for v in value):
+                    raise AnalysisError(f"Invalid model {key}")
+                # Check caps before normalizing harmless repeated labels.
+                result[key] = list(dict.fromkeys(value))
+            else:
+                minimum = 1 if item["kind"] == "tag" else 8
+                if any(not isinstance(v, str) or not minimum <= len(v) <= member["maxLength"] for v in value):
+                    raise AnalysisError(f"Invalid model {key}")
     evidence = result["evidence"]
-    if (
-        not isinstance(evidence, list)
-        or len(evidence) > 3
-        or any(not isinstance(v, str) or not 8 <= len(v) <= 500 for v in evidence)
-    ):
-        raise AnalysisError("Invalid model evidence")
     context = re.sub(r"\s+", " ", item["title"] + "\n" + item["content"])
     if any(re.sub(r"\s+", " ", quote) not in context for quote in evidence):
         raise AnalysisError("Model evidence is not present in source")
@@ -223,6 +207,37 @@ def validate_analysis(result: dict, item: dict) -> dict:
     return result
 
 
+def tag_notice(item: dict) -> dict:
+    """Report only the observed tag entry, without inferring a release."""
+    name = item["title"].strip()
+    if not name or len(name) > 500:
+        raise AnalysisError("Invalid tag name")
+    product = {
+        "tor": "Tor",
+        "arti": "Arti",
+        "tor-browser": "Tor Browser",
+        "torspec": "Tor specification",
+        "network": "Upstream",
+    }[item["product"]]
+    display_name = name if len(name) <= 96 else name[:95] + "…"
+    return validate_analysis(
+        {
+            "publish": True,
+            "title": f"{product} tag observed: {display_name}",
+            "summary": f"The upstream feed lists the tag “{name}”. This notice records the upstream tag entry linked below.",
+            "why_it_matters": "Use the linked upstream entry for context about this tag.",
+            "category": "release",
+            "priority": "normal",
+            "confidence": "reported",
+            "state": "tagged",
+            "products": [item["product"]],
+            "tags": ["release"],
+            "evidence": [name],
+        },
+        item,
+    )
+
+
 def _validate_issue_actions(result: dict, evidence: list[str]) -> None:
     """An imperative issue title must not become a completed security action."""
     actions = r"removed|fixed|patched|resolved|deployed|disabled|revoked|rotated"
@@ -264,29 +279,34 @@ def _validate_issue_actions(result: dict, evidence: list[str]) -> None:
 class Analyzer:
     def __init__(self, config: dict):
         self.llm = config["llm"]
-        settings = {
+        self.http_settings = {
             **config["http"],
             **{k: v for k, v in self.llm.items() if k in config["http"]},
         }
-        self.client = HttpClient(
-            settings,
-            allowed_networks=self.llm["allowed_networks"],
-            allow_http=self.llm["allow_http"],
-        )
+        self.client: HttpClient | None = None
 
     def __enter__(self) -> Analyzer:
         return self
 
     def __exit__(self, *args) -> None:
-        self.client.close()
+        if self.client is not None:
+            self.client.close()
 
     def analyze(self, item: dict) -> dict:
+        if item["kind"] == "tag":
+            return tag_notice(item)
         if not self.llm["base_url"]:
             raise AnalysisError("LLM endpoint is not configured", retryable=True)
         key = os.environ.get(self.llm["api_key_env"], "")
         if not key:
             raise AnalysisError(
                 "LLM credential environment variable is missing", retryable=True
+            )
+        if self.client is None:
+            self.client = HttpClient(
+                self.http_settings,
+                allowed_networks=self.llm["allowed_networks"],
+                allow_http=self.llm["allow_http"],
             )
         bounded = {
             k: item.get(k)

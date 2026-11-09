@@ -30,6 +30,11 @@ analysis_reserve_fraction = 0.5
 reconcile_seconds = 86400
 max_xml_depth = 128
 max_xml_elements = 50000
+# Forgive small scheduler skew after successful polls, capped at 10% of interval.
+# Failed requests and incomplete scans always retain their full cooldown.
+healthy_poll_tolerance_seconds = 5
+# Queue priority floor for tag entries; serious security reports remain ahead.
+tag_priority_score = 5
 
 [http]
 timeout_seconds = 30
@@ -182,3 +187,28 @@ kind = "gitlab_mr"
 url = "https://gitlab.torproject.org/api/v4/projects/543/merge_requests"
 product = "torspec"
 authority = "development"
+
+[[sources]]
+id = "tor-browser-security"
+name = "Tor Browser security issues"
+kind = "gitlab_issue"
+url = "https://gitlab.torproject.org/api/v4/projects/472/issues?labels=Security"
+product = "tor-browser"
+authority = "development"
+
+[[sources]]
+id = "anti-censorship-team"
+name = "Anti-censorship team"
+kind = "gitlab_issue"
+url = "https://gitlab.torproject.org/api/v4/projects/549/issues"
+product = "network"
+authority = "development"
+
+# Optional development discussion; enable if this wider coverage is useful.
+[[sources]]
+id = "tor-dev"
+name = "Tor development mailing list"
+url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/feed/"
+product = "network"
+authority = "community"
+enabled = false

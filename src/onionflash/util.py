@@ -7,7 +7,7 @@ import html
 import ipaddress
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -19,22 +19,43 @@ class BudgetExceeded(Exception):
 
 
 def now_iso() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return format_utc(datetime.now(UTC))
+
+
+def parse_utc(value: str) -> datetime:
+    """Read an aware ISO timestamp and normalize its timezone to UTC."""
+    try:
+        if not isinstance(value, str):
+            raise ValueError
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if moment.tzinfo is None:
+            raise ValueError
+        return moment.astimezone(UTC)
+    except (ValueError, TypeError, OverflowError):
+        raise ValueError("Missing or invalid timezone-aware timestamp") from None
+
+
+def format_utc(moment: datetime) -> str:
+    if moment.tzinfo is None:
+        raise ValueError("Missing or invalid timezone-aware timestamp")
+    return moment.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def after(seconds: float, start: str | None = None) -> str:
+    return format_utc(parse_utc(start or now_iso()) + timedelta(seconds=seconds))
+
+
+def backoff_seconds(attempt: int, base: float, cap: float) -> float:
+    """Persisted cooldown for a one-based attempt count; no sleeping here."""
+    return min(cap, base * 2 ** min(max(attempt - 1, 0), 20))
 
 
 def timestamp(value: str | None, fallback: str | None = None) -> str:
     """Normalize a supplied aware timestamp, without inventing changing dates."""
-    if isinstance(value, str) and value:
-        try:
-            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            if dt.tzinfo is not None:
-                return (
-                    dt.astimezone(UTC)
-                    .isoformat(timespec="seconds")
-                    .replace("+00:00", "Z")
-                )
-        except (ValueError, TypeError):
-            pass
+    try:
+        return format_utc(parse_utc(value))
+    except ValueError:
+        pass
     if fallback is not None:
         return fallback
     raise ValueError("Missing or invalid timezone-aware timestamp")
@@ -76,7 +97,14 @@ def plain_text(value: object, limit: int) -> str:
         return ""
     parser = _TextParser()
     parser.feed(value[: limit * 4])
-    text = "".join(parser.parts)
+    pending, parts, hidden = parser.rawdata, len(parser.parts), parser.hidden
+    parser.close()
+    # Some Python versions silently discard a final incomplete tag such as
+    # '<word', even on close(). Keep that literal text, not comments or scripts.
+    if not hidden and len(parser.parts) == parts and re.fullmatch(r"</?[A-Za-z][^>]*", pending):
+        parser.parts.append(pending)
+    text = "".join(parser.parts).replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[\ud800-\udfff]", "\ufffd", text)
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
     return re.sub(r"[ \t]+", " ", re.sub(r"\n{3,}", "\n\n", text)).strip()[:limit]
 
@@ -93,6 +121,7 @@ def canonical_url(value: str) -> str:
         or any(ord(c) < 33 for c in value)
     ):
         raise ValueError("Invalid source URL")
+    value.encode("utf-8")  # Reject invalid Unicode URLs before persistence.
     parsed = urlsplit(html.unescape(value))
     host = (parsed.hostname or "").lower().rstrip(".")
     if (

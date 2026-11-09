@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from .util import canonical_url
+from .schema import PRODUCTS
 
 DEFAULTS = {
     "site": {
@@ -42,6 +43,8 @@ DEFAULTS = {
         "reconcile_seconds": 86400,
         "max_xml_depth": 128,
         "max_xml_elements": 50000,
+        "healthy_poll_tolerance_seconds": 5,
+        "tag_priority_score": 5,
     },
     "http": {
         "timeout_seconds": 30,
@@ -116,6 +119,8 @@ BOUNDS = {
     "reconcile_seconds": (300, 604800),
     "max_xml_depth": (8, 256),
     "max_xml_elements": (100, 100000),
+    "healthy_poll_tolerance_seconds": (0, 60),
+    "tag_priority_score": (0, 20),
 }
 
 
@@ -286,13 +291,7 @@ def load_config(path: str | Path) -> dict:
             "telemetry",
         }:
             raise ValueError("Unsupported source authority")
-        if source["product"] not in {
-            "tor",
-            "arti",
-            "tor-browser",
-            "torspec",
-            "network",
-        }:
+        if source["product"] not in PRODUCTS:
             raise ValueError("Unsupported source product")
         if (
             not isinstance(source["enabled"], bool)

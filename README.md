@@ -53,6 +53,14 @@ only creates local files.
 
 ## Configuration
 
+The deployed scheduler runs every five minutes. Its `interval_minutes` setting
+lives in the deployment repository's `deployment.toml`; apply schedule changes
+with `./deploy.sh schedule`. Each source also has `interval_seconds` (default
+300), so a slower source can be polled less often than the job runs. The source
+interval cannot make a five-minute job execute more frequently. A small
+`collection.healthy_poll_tolerance_seconds` handles scheduler start jitter only
+after a successful poll; failure and Retry-After cooldowns remain intact.
+
 All settings are shown in [`config.example.toml`](config.example.toml). Relative
 database and output paths resolve against the configuration file's directory.
 `${ENVIRONMENT_VARIABLE}` references are expanded for paths and LLM URLs.
@@ -137,6 +145,11 @@ Publishers should use the same database lock while taking their upload snapshot.
   content hash, model, and prompt version. The application makes one model request
   at a time, with explicit per-run and token limits. Source polling reserves time
   for pending analysis so an unavailable source cannot monopolize every run.
+- Explicit `kind = "tag"` streams produce attributed tag notices without an LLM
+  request. These notices remain `tagged`, have a configurable queue-priority
+  floor, and cannot replace a richer announcement already grouped with that
+  version. Repeated identical model labels are normalized rather than retried;
+  invalid labels and unsupported evidence are still rejected.
 - Summaries need schema-valid fields and exact supporting excerpts from the
   supplied source. The excerpts stay private; public citations are created from
   collected URLs, never model-proposed URLs. Source text is treated as untrusted
@@ -172,6 +185,20 @@ LLM availability and output quality depend on your model. The prompt and evidenc
 checks reduce unsupported statements, but important security conclusions should
 always be checked against the linked primary source. Personal alert delivery is
 intentionally outside this initial website/RSS release.
+
+## Measured behavior and review work
+
+- [Tracked improvement checklist](docs/IMPROVEMENT_CHECKLIST.md)
+- [Publication-delay backtest and SQLite growth audit](docs/RUNTIME_AUDIT.md)
+- [Source coverage and remaining features](docs/SOURCE_COVERAGE.md)
+- [Gemini critique results and simplification decisions](docs/REVIEW_RESULTS.md)
+
+The historical audit distinguishes source timestamps, observation markers,
+startup backfill and verified website publication. New collection runs record
+post-fetch observation times and preserve a metadata boundary identifying the
+older cycle-start markers. Source timestamps still do not prove when a feed
+first made an item available. Backups are already gzip-compressed; the small
+measured database does not currently need compression or routine compaction.
 
 ## Development
 

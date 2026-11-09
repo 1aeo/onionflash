@@ -5,14 +5,16 @@ from __future__ import annotations
 import calendar
 import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from xml.parsers import expat
 
 import feedparser
 
 from .transport import FetchError, HttpClient
-from .util import BudgetExceeded, canonical_url, plain_text, timestamp
+from .util import (
+    UTC, BudgetExceeded, after, canonical_url, format_utc, parse_utc, plain_text, timestamp,
+)
 
 
 class CollectionError(Exception):
@@ -35,11 +37,7 @@ def _entry_time(entry: dict, name: str, fallback: str) -> str:
     parsed = dict.get(entry, name + "_parsed")
     if parsed:
         try:
-            return (
-                datetime.fromtimestamp(calendar.timegm(parsed), timezone.utc)
-                .isoformat(timespec="seconds")
-                .replace("+00:00", "Z")
-            )
+            return format_utc(datetime.fromtimestamp(calendar.timegm(parsed), UTC))
         except (ValueError, OverflowError, TypeError):
             pass
     return fallback
@@ -105,18 +103,14 @@ def _feed(
     parser.StartDoctypeDeclHandler = reject_declaration
     parser.EntityDeclHandler = reject_declaration
     parser.ExternalEntityRefHandler = reject_declaration
-    depth = elements = entries = 0
+    depth = elements = 0
 
     def start_element(name, attributes):
-        nonlocal depth, elements, entries
+        nonlocal depth, elements
         depth += 1
         elements += 1
-        if name.rsplit(":", 1)[-1] in {"item", "entry"}:
-            entries += 1
         if depth > settings["max_xml_depth"] or elements > settings["max_xml_elements"]:
             raise CollectionError("Feed XML structure exceeds configured limits")
-        if entries > source["max_items"]:
-            raise CollectionError("Feed item limit reached; increase source max_items")
 
     def end_element(name):
         nonlocal depth
@@ -131,9 +125,7 @@ def _feed(
     feed = feedparser.parse(response.body)
     if not feed.get("version") or feed.get("bozo"):
         raise CollectionError("Invalid RSS/Atom document")
-    cutoff = datetime.fromisoformat(started.replace("Z", "+00:00")) - timedelta(
-        days=settings["lookback_days"]
-    )
+    cutoff = after(-settings["lookback_days"] * 86400, started)
     items = []
     for entry in feed.entries[: source["max_items"]]:
         content_parts = entry.get("content") or []
@@ -147,7 +139,7 @@ def _feed(
             entry, "published", _entry_time(entry, "updated", started)
         )
         updated = _entry_time(entry, "updated", published)
-        if datetime.fromisoformat(updated.replace("Z", "+00:00")) < cutoff:
+        if updated < cutoff:
             continue
         try:
             item = _item(
@@ -166,7 +158,7 @@ def _feed(
     # Oversized feed windows are visible as a coverage warning, never silently truncated.
     if len(feed.entries) > source["max_items"]:
         raise CollectionError(
-            "Feed item limit reached; increase source max_items", items
+            "Feed item limit reached; increase source max_items", items, catching_up=True
         )
     return {
         "items": items,
@@ -184,26 +176,24 @@ def _gitlab(
     settings: dict,
     started: str,
 ) -> dict:
-    upper = datetime.fromisoformat(
-        (state.get("scan_upper") or started).replace("Z", "+00:00")
-    )
+    upper = parse_utc(state.get("scan_upper") or started)
     watermark = state.get("watermark")
     last_reconciled = state.get("last_reconciled")
     reconcile = (
         not last_reconciled
         or (
-            upper - datetime.fromisoformat(last_reconciled.replace("Z", "+00:00"))
+            upper - parse_utc(last_reconciled)
         ).total_seconds()
         >= settings["reconcile_seconds"]
     )
     lower = (
-        datetime.fromisoformat(watermark.replace("Z", "+00:00"))
+        parse_utc(watermark)
         - timedelta(seconds=settings["overlap_seconds"])
         if watermark and not reconcile
         else upper - timedelta(days=settings["lookback_days"])
     )
     if state.get("scan_lower"):
-        lower = datetime.fromisoformat(state["scan_lower"].replace("Z", "+00:00"))
+        lower = parse_utc(state["scan_lower"])
         reconcile = bool(state.get("scan_reconcile"))
     page_size = min(settings["page_size"], source["max_items"])
     page_budget = min(source["max_pages"], max(1, source["max_items"] // page_size))
@@ -252,7 +242,7 @@ def _gitlab(
             raise CollectionError(str(exc), items, checkpoint) from exc
         try:
             records = json.loads(response.body)
-        except (ValueError, UnicodeError) as exc:
+        except (ValueError, UnicodeError, RecursionError) as exc:
             raise CollectionError(
                 "GitLab returned invalid JSON", items, checkpoint
             ) from exc
@@ -332,7 +322,7 @@ def _gitlab(
             return {
                 "items": items,
                 "url": url,
-                "watermark": timestamp(upper.isoformat()),
+                "watermark": format_utc(upper),
                 "reconciled": reconcile,
             }
         cursor = next_cursor
@@ -368,7 +358,7 @@ def collect_source(
             partial.extend(exc.items)
             if exc.checkpoint:
                 checkpoint = exc.checkpoint
-                catching_up = exc.catching_up
+            catching_up = exc.catching_up
             if exc.catching_up or exc.timed_out:
                 # Another mirror cannot make this bounded scan finish faster.
                 break

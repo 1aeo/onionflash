@@ -17,21 +17,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
+from .schema import CATEGORY_LABELS as CATEGORIES, PRIORITIES, CONFIDENCES, STATES
+from .util import parse_utc as _date, format_utc as _iso
 
 
-CATEGORIES = {
-    "security": "Security",
-    "release": "Releases",
-    "dos": "DoS",
-    "directory-authority": "Authorities",
-    "relay": "Relays",
-    "protocol": "Protocol",
-    "feature": "Features",
-    "network": "Network",
-}
-PRIORITIES = {"critical", "high", "normal", "low"}
-CONFIDENCES = {"confirmed", "reported", "suspected", "observed-anomaly"}
-STATES = {"developing", "mitigation-available", "fixed", "resolved", "tagged", "released", "merged"}
 ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 ASSET_FILES = ("style.css", "app.js", "mark.svg")
 ATOM_NS = "http://www.w3.org/2005/Atom"
@@ -86,22 +75,6 @@ def _site_base(value: object) -> str:
     if parsed.query or parsed.fragment or any(part in {".", ".."} for part in unquote(parsed.path).split("/")):
         raise ValueError("site.base_url must contain a clean path without query or fragment")
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/") + "/", "", ""))
-
-
-def _date(value: object) -> datetime:
-    if not isinstance(value, str):
-        raise ValueError("Story timestamps must be ISO 8601 strings")
-    try:
-        result = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ValueError("Story timestamps must be valid ISO 8601 strings") from exc
-    if result.tzinfo is None:
-        raise ValueError("Story timestamps must include a timezone")
-    return result.astimezone(timezone.utc)
-
-
-def _iso(date: datetime) -> str:
-    return date.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _time(value: str, *, full: bool = False) -> str:
