@@ -80,7 +80,7 @@ def _prepare_story(story: dict) -> dict:
     if not sources:
         raise ValueError("Published stories require at least one safe source URL")
     # Only schema values reach the page, so one malformed stored field cannot break a build.
-    tags = [tag for tag in dict.fromkeys([category, *story.get("tags", [])]) if tag in CATEGORIES]
+    tags = list(dict.fromkeys(tag for tag in [category, *story.get("tags", [])] if isinstance(tag, str) and tag in CATEGORIES))
     published = _date(story.get("published_at"))
     updated = _date(story.get("updated_at"))
     if updated < published:
@@ -90,7 +90,7 @@ def _prepare_story(story: dict) -> dict:
         "why_it_matters": _text(story.get("why_it_matters"), 800),
         "category": category, "priority": priority, "confidence": confidence,
         "state": state, "tags": tags, "sources": list(sources.values()),
-        "products": [product for product in story.get("products", []) if product in PRODUCTS],
+        "products": [product for product in story.get("products", []) if isinstance(product, str) and product in PRODUCTS],
         "published_at": _iso(published), "updated_at": _iso(updated),
         # When Onion Flash first published the story; older records fall back to the source date.
         "added_at": _iso(_date(story.get("added_at") or story.get("published_at"))),
@@ -131,7 +131,7 @@ def _card(story: dict, base: str) -> str:
     updated = ""
     if story["updated_at"] > story["added_at"]:
         updated = f'<span class="updated-note">Updated {_time(story["updated_at"])}</span>'
-    return f'''<article class="story" id="story-{story['id']}" data-tags="{_escape(' '.join(story['tags']))}" data-search="{_escape(search.casefold())}">
+    return f'''<article class="story" id="story-{story['id']}" data-tags="{_escape(' '.join(story['tags']))}" data-search="{_escape(search.lower())}">
       <div class="story-topline">{_badges(story)}<span class="story-date">{_time(story['added_at'])}</span></div>
       <h2><a href="{_escape(_permalink(base, story))}">{_escape(story['title'])}</a></h2>
       <p class="story-summary">{_escape(story['summary'])}</p>
