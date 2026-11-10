@@ -669,6 +669,28 @@ def test_retry_after_past_the_deadline_is_not_replaced_by_a_shorter_backoff():
     assert len(calls) == 1 and sleeps == []
 
 
+def test_the_deadline_flag_describes_only_the_latest_request():
+    import socket
+    import httpx
+    from onionflash.transport import DeadlineReached, HttpClient
+
+    settings = {**DEFAULTS["http"], "retry_attempts": 3, "backoff_base_seconds": 1, "requests_per_minute": 10000}
+    resolver = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+    def respond(request):
+        if request.url.path == "/primary":
+            return httpx.Response(429, headers={"Retry-After": "30"}, content=b"slow down")
+        return httpx.Response(404, content=b"missing")
+    with HttpClient(settings, transport=httpx.MockTransport(respond), resolver=resolver,
+                    sleep=lambda seconds: None, clock=lambda: 100.0) as client:
+        client.deadline = 110.0
+        with pytest.raises(DeadlineReached):
+            client.request("GET", "https://example.org/primary")
+        # A fallback that then fails with a 404 while time remains is a real failure.
+        with pytest.raises(FetchError, match="404"):
+            client.request("GET", "https://example.org/fallback")
+        assert not client.deadline_reached
+
+
 def test_rate_limit_wait_stops_at_the_deadline():
     import socket
     import httpx

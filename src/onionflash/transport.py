@@ -239,7 +239,7 @@ class HttpClient:
         self._next_request = 0.0
         # Absolute time.monotonic() deadline set by the caller (None: no limit).
         # Every attempt is capped by it and no retry sleeps past it; deadline_reached
-        # records that the deadline, not the server, ended a request.
+        # records that the deadline, not the server, ended the latest request.
         self.deadline: float | None = None
         self.deadline_reached = False
         self._injected_transport = transport is not None
@@ -359,6 +359,7 @@ class HttpClient:
         method = method.upper()
         if method not in {"GET", "HEAD", "POST", "DELETE"}:
             raise FetchError("unsupported request method")
+        self.deadline_reached = False  # describes this request only, e.g. the last fallback
         start_url = self._url(url)
         start_headers = {"user-agent": self.settings.get("user_agent", "OnionFlash"),
                          "accept-encoding": "gzip, deflate"}
