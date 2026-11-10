@@ -39,6 +39,13 @@ class FetchError(Exception):
         self.retryable = retryable
 
 
+class DeadlineReached(FetchError):
+    """The caller's deadline arrived, or a retry wait would pass it. Never retried here."""
+
+    def __init__(self) -> None:
+        super().__init__("request deadline reached", retryable=True)
+
+
 @dataclass(frozen=True)
 class Response:
     status: int
@@ -231,8 +238,10 @@ class HttpClient:
         self.clock = clock
         self._next_request = 0.0
         # Absolute time.monotonic() deadline set by the caller (None: no limit).
-        # Every attempt is capped by it and no retry sleeps past it.
+        # Every attempt is capped by it and no retry sleeps past it; deadline_reached
+        # records that the deadline, not the server, ended a request.
         self.deadline: float | None = None
+        self.deadline_reached = False
         self._injected_transport = transport is not None
         self._client = httpx.Client(
             transport=transport or _CheckedTransport(self.policy),
@@ -285,9 +294,13 @@ class HttpClient:
         parts = urlsplit(value)
         return parts.scheme, parts.hostname or "", parts.port or (443 if parts.scheme == "https" else 80)
 
+    def _check_deadline(self, wait: float = 0.0) -> None:
+        if self.deadline is not None and self.clock() + wait >= self.deadline:
+            self.deadline_reached = True
+            raise DeadlineReached()
+
     def _pause(self, seconds: float) -> None:
-        if self.deadline is not None and self.clock() + seconds >= self.deadline:
-            raise FetchError("request deadline reached", retryable=True)
+        self._check_deadline(seconds)
         self.sleep(seconds)
 
     def _rate_limit(self) -> None:
@@ -357,8 +370,7 @@ class HttpClient:
             current, active_headers, active_method, payload = start_url, dict(start_headers), method, json_body
             deadline = self.clock() + float(self.settings.get("total_timeout_seconds", 90.0))
             if self.deadline is not None:
-                if self.deadline <= self.clock():
-                    raise FetchError("request deadline reached", retryable=True)
+                self._check_deadline()
                 deadline = min(deadline, self.deadline)
             try:
                 for redirects in range(int(self.settings.get("max_redirects", 4)) + 1):
@@ -397,7 +409,8 @@ class HttpClient:
                 else:
                     raise FetchError("redirect limit exceeded")
             except FetchError as exc:
-                if not exc.retryable or attempt + 1 >= attempts:
+                # A deadline stop must not fall back to a shorter wait than Retry-After.
+                if isinstance(exc, DeadlineReached) or not exc.retryable or attempt + 1 >= attempts:
                     raise
                 self._pause(retry_delay(attempt, self.settings))
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError,

@@ -592,7 +592,7 @@ def test_malformed_gitlab_timestamp_cannot_abort_the_entire_cycle():
     assert result["items"][0]["published_at"] == DATE
 
 
-def test_slow_source_is_deferred_and_does_not_starve_queued_analysis(
+def test_a_failing_source_is_deferred_and_does_not_starve_queued_analysis(
     tmp_path, monkeypatch
 ):
     from onionflash import cli
@@ -647,6 +647,60 @@ def test_request_deadline_is_never_slept_past():
         with pytest.raises(FetchError, match="deadline"):
             client.request("GET", "https://example.org/")
     assert len(calls) == 1 and sleeps == []
+
+
+def test_retry_after_past_the_deadline_is_not_replaced_by_a_shorter_backoff():
+    import socket
+    import httpx
+    from onionflash.transport import DeadlineReached, HttpClient
+
+    calls, sleeps = [], []
+    settings = {**DEFAULTS["http"], "retry_attempts": 3, "backoff_base_seconds": 1, "requests_per_minute": 10000}
+    resolver = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+    def limited(request):
+        calls.append(request)
+        return httpx.Response(429, headers={"Retry-After": "30"}, content=b"slow down")
+    with HttpClient(settings, transport=httpx.MockTransport(limited), resolver=resolver,
+                    sleep=sleeps.append, clock=lambda: 100.0) as client:
+        client.deadline = 110.0  # the 30 s Retry-After does not fit; a 1 s backoff would
+        with pytest.raises(DeadlineReached):
+            client.request("GET", "https://example.org/")
+        assert client.deadline_reached
+    assert len(calls) == 1 and sleeps == []
+
+
+def test_a_source_cut_off_by_the_shared_window_is_not_penalized(tmp_path, monkeypatch):
+    from onionflash import cli
+
+    cfg = config(tmp_path)
+    cfg["collection"]["source_budget_seconds"] = 600  # longer than the window: the window binds
+    cfg["sources"] = [source(id="first"), source(id="second", url="https://example.org/second.xml")]
+    collected = []
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    def collect(client, stream, *args):
+        collected.append(stream["id"])
+        client.deadline_reached = True
+        raise CollectionError("request deadline reached")
+
+    monkeypatch.setattr(cli, "HttpClient", Client)
+    monkeypatch.setattr(cli, "collect_source", collect)
+    monkeypatch.setattr(cli, "build", lambda *args: {})
+    with Store(tmp_path / "state.db") as store:
+        result = cli.run(cfg, store)
+        first = store.source(cfg["sources"][0])
+    assert result["budget_reached"] and collected == ["first"]
+    assert first["failures"] == 0
+
 
 def test_render_failure_preserves_prior_site(tmp_path, monkeypatch):
     cfg = config(tmp_path)

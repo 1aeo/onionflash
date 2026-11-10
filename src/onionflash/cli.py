@@ -147,7 +147,9 @@ def run(config: dict, store: Store) -> dict:
                 break
             # Requests stop at this deadline; a source cut off only by the shared
             # collection deadline is not penalized and resumes next run.
+            shared = remaining <= config["collection"]["source_budget_seconds"]
             client.deadline = time.monotonic() + min(remaining, config["collection"]["source_budget_seconds"])
+            client.deadline_reached = False
             try:
                 result = collect_source(client, source, state, config["collection"], observed)
                 received = record_items(source, result["items"])
@@ -155,7 +157,7 @@ def run(config: dict, store: Store) -> dict:
                 report["sources_ok"] += 1
             except CollectionError as exc:
                 received = record_items(source, exc.items)
-                out_of_time = time.monotonic() >= collection_deadline
+                out_of_time = shared and (client.deadline_reached or time.monotonic() >= collection_deadline)
                 store.source_failure(
                     source,
                     str(exc),
