@@ -292,6 +292,9 @@ class HttpClient:
         self._next_request = self.clock() + 60.0 / rate
 
     def _body(self, response: httpx.Response) -> bytes:
+        if response.request.method == "HEAD":
+            # Content-Length describes the GET representation, not a HEAD body.
+            return b""
         limit = int(self.settings.get("max_response_bytes", 4 * 1024 * 1024))
         if self._injected_transport and response.is_stream_consumed:
             # MockTransport commonly constructs already-read responses. The

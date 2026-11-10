@@ -23,6 +23,15 @@ class TransportTests(unittest.TestCase):
         config.update(settings)
         return HttpClient(config, transport=httpx.MockTransport(handler), resolver=public_dns, sleep=sleeps.append), sleeps
 
+    def test_head_can_verify_large_objects_without_reading_a_body(self):
+        handler = lambda request: httpx.Response(200, headers={"content-length": "100000000", "etag": '"hash"'})
+        client, _ = self.client(handler)
+        with client:
+            result = client.request("HEAD", "https://example.org/large-feed.xml")
+        self.assertEqual(result.body, b"")
+        self.assertEqual(result.headers["content-length"], "100000000")
+        self.assertEqual(result.headers["etag"], '"hash"')
+
     def test_transient_retry_then_success(self):
         calls = []
         def handle(request):

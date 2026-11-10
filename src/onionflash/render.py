@@ -253,9 +253,8 @@ def _shell(site: dict, base: str, title: str, description: str, body: str, canon
 </body></html>'''
 
 
-def _rss(site: dict, base: str, stories: list[dict], path: str, category: str | None = None) -> bytes:
-    root = ET.Element("rss", version="2.0")
-    channel = ET.SubElement(root, "channel")
+def _rss_channel(site: dict, base: str, path: str, latest: str | None, category: str | None = None) -> ET.Element:
+    channel = ET.Element("channel")
     title = _text(site.get("title", "Onion Flash"), 80)
     if category:
         title += " · " + CATEGORIES[category]
@@ -266,35 +265,142 @@ def _rss(site: dict, base: str, stories: list[dict], path: str, category: str | 
     }.items():
         ET.SubElement(channel, key).text = value
     ET.SubElement(channel, f"{{{ATOM_NS}}}link", href=base + path, rel="self", type="application/rss+xml")
-    if stories:
-        ET.SubElement(channel, "lastBuildDate").text = email.utils.format_datetime(max(_date(s["updated_at"]) for s in stories), usegmt=True)
+    if latest:
+        ET.SubElement(channel, "lastBuildDate").text = email.utils.format_datetime(_date(latest), usegmt=True)
+    return channel
+
+
+def _rss_item(story: dict, base: str) -> ET.Element:
+    item = ET.Element("item")
+    ET.SubElement(item, "title").text = story["title"]
+    ET.SubElement(item, "link").text = _permalink(base, story)
+    ET.SubElement(item, "guid", isPermaLink="true").text = _permalink(base, story)
+    ET.SubElement(item, "pubDate").text = email.utils.format_datetime(_date(story["published_at"]), usegmt=True)
+    for tag in story["tags"]:
+        ET.SubElement(item, "category").text = tag
+    description = f'<p>{_escape(story["summary"])}</p>'
+    if story["why_it_matters"]:
+        description += f'<p><strong>Why it matters:</strong> {_escape(story["why_it_matters"])}</p>'
+    description += f'<p>{_label(story["confidence"])} · {_label(story["priority"])} priority · {_label(story["state"])}</p>'
+    description += _source_links(story, expanded=True)
+    ET.SubElement(item, "description").text = description
+    return item
+
+
+def rss_header(site: dict, base: str, path: str, latest: str | None, category: str | None = None) -> bytes:
+    return b'<?xml version="1.0" encoding="utf-8"?>\n<rss xmlns:atom="http://www.w3.org/2005/Atom" version="2.0"><channel>' + b"".join(ET.tostring(child, encoding="utf-8") for child in _rss_channel(site, base, path, latest, category))
+
+
+def rss_chunks(site: dict, base: str, stories, path: str, latest: str | None, category: str | None = None):
+    # One story at a time: archive length does not set memory use.
+    yield rss_header(site, base, path, latest, category)
     for story in stories:
-        item = ET.SubElement(channel, "item")
-        ET.SubElement(item, "title").text = story["title"]
-        ET.SubElement(item, "link").text = _permalink(base, story)
-        ET.SubElement(item, "guid", isPermaLink="true").text = _permalink(base, story)
-        ET.SubElement(item, "pubDate").text = email.utils.format_datetime(_date(story["published_at"]), usegmt=True)
-        for tag in story["tags"]:
-            ET.SubElement(item, "category").text = tag
-        description = f'<p>{_escape(story["summary"])}</p>'
-        if story["why_it_matters"]:
-            description += f'<p><strong>Why it matters:</strong> {_escape(story["why_it_matters"])}</p>'
-        description += f'<p>{_label(story["confidence"])} · {_label(story["priority"])} priority · {_label(story["state"])}</p>'
-        description += _source_links(story, expanded=True)
-        ET.SubElement(item, "description").text = description
-    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        yield ET.tostring(_rss_item(story, base), encoding="utf-8")
+    yield b"</channel></rss>"
+
+
+def _rss(site: dict, base: str, stories: list[dict], path: str, category: str | None = None) -> bytes:
+    latest = max((story["updated_at"] for story in stories), default=None)
+    return b"".join(rss_chunks(site, base, stories, path, latest, category))
+
+
+def _json_feed_item(story: dict, base: str) -> dict:
+    content = story["summary"]
+    if story["why_it_matters"]:
+        content += "\n\nWhy it matters: " + story["why_it_matters"]
+    content += "\n\nSources:\n" + "\n".join(source["url"] for source in story["sources"])
+    return {"id": _permalink(base, story), "url": _permalink(base, story), "title": story["title"], "content_text": content, "date_published": story["published_at"], "date_modified": story["updated_at"], "tags": story["tags"]}
+
+
+def json_feed_header(site: dict, base: str) -> bytes:
+    metadata = {"version": "https://jsonfeed.org/version/1.1", "title": _text(site.get("title", "Onion Flash"), 80), "home_page_url": base, "feed_url": base + "feed.json", "description": _text(site.get("description", "Important Tor news, distilled."), 400), "language": "en"}
+    return (json.dumps(metadata, ensure_ascii=False)[:-1] + ', "items": [').encode("utf-8")
+
+
+def json_feed_chunks(site: dict, base: str, stories):
+    yield json_feed_header(site, base)
+    separator = b""
+    for story in stories:
+        yield separator
+        yield json.dumps(_json_feed_item(story, base), ensure_ascii=False).encode("utf-8")
+        separator = b",\n"
+    yield b"]}\n"
+
+
+def _page_url(base: str, page: int) -> str:
+    return base if page == 1 else f"{base}page/{page}/"
+
+
+def _pagination(base: str, page: int, pages: int) -> str:
+    if pages <= 1:
+        return ""
+    previous = f'<a href="{_escape(_page_url(base, page - 1))}" rel="prev">← Newer stories</a>' if page > 1 else ""
+    following = f'<a href="{_escape(_page_url(base, page + 1))}" rel="next">Older stories →</a>' if page < pages else ""
+    return f'<nav class="pagination" aria-label="News pages">{previous}<span>Page {page} of {pages}</span>{following}</nav>'
+
+
+def index_html(site: dict, base: str, homepage: list[dict], source_health: list[dict], *, total: int, page: int = 1, pages: int = 1, latest: str | None = None) -> str:
+    filters = '<button type="button" class="filter active" data-filter="all" aria-pressed="true">All news</button>'
+    for key, label in CATEGORIES.items():
+        if any(key in story["tags"] for story in homepage):
+            filters += f'<button type="button" class="filter" data-filter="{key}" aria-pressed="false">{label}</button>'
+    latest_label = f'Latest story update {_time(latest, full=True)}' if latest else 'First edition coming soon'
+    cards = "".join(_card(story, base) for story in homepage)
+    if not cards:
+        cards = '<section class="empty-state"><span class="empty-mark" aria-hidden="true">↗</span><h2>The feed is getting started.</h2><p>Stories appear here after collection and source checks. Subscribe to the RSS feed for the first edition.</p></section>'
+    body = f'''<main id="main" class="page">
+<section class="intro"><div><p class="eyebrow">Security. Releases. The network.</p><h1>Tor news, distilled.</h1><p class="intro-copy">The developments that matter, with the sources to understand them.</p></div><div class="edition-note"><span class="live-dot" aria-hidden="true"></span>{latest_label}</div></section>
+<div class="news-layout"><section class="news-column" aria-label="Latest news">
+<div class="tools" data-news-tools hidden><div class="filters" role="group" aria-label="Filter this page by topic">{filters}</div>
+<label class="search"><span class="sr-only">Search news</span><span aria-hidden="true">⌕</span><input id="news-search" type="search" placeholder="Search this page" autocomplete="off" maxlength="200"></label></div>
+<div class="section-heading"><h2>Latest dispatches</h2><span id="result-count" aria-live="polite">{len(homepage)} {'story' if len(homepage) == 1 else 'stories'}</span></div>
+<div id="news-list">{cards}</div><p id="no-results" class="no-results" hidden>No stories match. Try another topic or search.</p>
+{_pagination(base, page, pages)}
+{f'<p class="archive-note">{total} stories in the complete history. Search and topic filters apply to this page.</p>' if pages > 1 else ''}
+</section><aside class="sidebar" aria-label="About this feed">
+<section class="subscribe-box"><span class="sidebar-kicker">Follow the feed</span><h2>Stay in the loop.</h2><p>Important Tor developments, delivered to your feed reader.</p><a class="subscribe-link" href="{_escape(base)}feed.xml">Subscribe via RSS <span aria-hidden="true">↗</span></a><a class="secondary-feed" href="{_escape(base)}feed.json">JSON Feed</a></section>
+<section class="about-feed"><h2>Context comes first.</h2><p>Reports, fixes, and releases are grouped into concise stories. Every summary links to its sources.</p><p>Labels distinguish confirmed findings from reports and suspected incidents.</p></section>
+{_health_details(source_health)}
+<p class="sidebar-footnote">An independent project by <a href="https://1aeo.com/">1AEO</a>.</p>
+</aside></div></main>'''
+    title = _text(site.get("title", "Onion Flash"), 80)
+    title += " — Tor news, distilled" if page == 1 else f" — News, page {page}"
+    description = _text(site.get("description", "Important Tor news, distilled."), 400)
+    return _shell(site, base, title, description, body, _page_url(base, page))
+
+
+def article_html(site: dict, base: str, story: dict) -> str:
+    body = f'''<main id="main" class="page article-page"><a class="back-link" href="{_escape(base)}">← All dispatches</a>
+<article class="full-story">{_badges(story)}<h1>{_escape(story['title'])}</h1>
+<div class="article-dates">Published {_time(story['published_at'], full=True)}{f' <span>·</span> Updated {_time(story["updated_at"], full=True)}' if story['updated_at'] != story['published_at'] else ''}</div>
+<p class="article-summary">{_escape(story['summary'])}</p>
+{f'<section class="article-context"><h2>Why it matters</h2><p>{_escape(story["why_it_matters"])}</p></section>' if story['why_it_matters'] else ''}
+<p class="event-state"><span>Event status</span> {_label(story['state'])}</p>
+<section class="article-sources"><h2>Read the sources</h2>{_source_links(story, expanded=True)}</section>
+<p class="article-note">This is an AI-assisted summary of the linked public sources. Consult the original reports for details and operator guidance.</p></article></main>'''
+    title = _text(site.get("title", "Onion Flash"), 80)
+    return _shell(site, base, f"{story['title']} — {title}", story["summary"][:300], body, _permalink(base, story))
+
+
+def headers_text(base: str) -> str:
+    prefix = urlsplit(base).path.rstrip("/")
+    return f'''{prefix}/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
+  Cache-Control: public, max-age=60, must-revalidate
+'''
 
 
 def render_site(config: dict, stories: list[dict], source_health: list[dict], output_dir: Path) -> int:
-    """Render a complete self-contained release into a new, empty directory.
+    """Compatibility renderer for a supplied batch; the CLI uses publication.build.
 
-    Returns how many stored stories were skipped because they cannot be rendered
-    safely; one bad record must not stop every later publication.
+    A single bad story is quarantined without blocking the other stories.
     """
     output_dir = Path(output_dir).absolute()
     if output_dir.is_symlink():
         raise ValueError("Output directory must not be a symlink")
-    # Resolve trusted parent directories (macOS /tmp and /var are symlinks).
     output_dir = output_dir.resolve()
     if output_dir.exists() and (not output_dir.is_dir() or any(output_dir.iterdir())):
         raise ValueError("Output directory must be empty")
@@ -311,76 +417,33 @@ def render_site(config: dict, stories: list[dict], source_health: list[dict], ou
                 story_id if isinstance(story_id, str) and ID_PATTERN.fullmatch(story_id) else "with an invalid id",
                 type(exc).__name__,
             )
-            continue
     if stories and not public:
-        # Every story failing points at a systematic problem: keep the previous site.
         raise ValueError("No stored story can be rendered")
+    if len({story["id"] for story in public}) != len(public):
+        raise ValueError("Duplicate story IDs")
     public.sort(key=lambda story: (story["updated_at"], story["published_at"], story["id"]), reverse=True)
     page_size = _limit(site.get("page_size"), 100, 1000)
-    feed_size = _limit(site.get("feed_size"), 50, 1000)
-    homepage = sorted(public, key=lambda story: (story["added_at"], story["updated_at"], story["id"]), reverse=True)[:page_size]
+    feed_size = None if site.get("feed_size", 0) == 0 else _limit(site.get("feed_size"), 50, 100000)
+    pages = max(1, (len(public) + page_size - 1) // page_size)
+    homepage = sorted(public, key=lambda story: (story["added_at"], story["updated_at"], story["id"]), reverse=True)
     output_dir.mkdir(parents=True, exist_ok=True)
-    assets = Path(__file__).with_name("assets")
     for name in ASSET_FILES:
-        shutil.copyfile(assets / name, output_dir / name)
-    filters = '<button type="button" class="filter active" data-filter="all" aria-pressed="true">All news</button>'
-    for key, label in CATEGORIES.items():
-        if any(key in story["tags"] for story in public):
-            filters += f'<button type="button" class="filter" data-filter="{key}" aria-pressed="false">{label}</button>'
+        shutil.copyfile(Path(__file__).with_name("assets") / name, output_dir / name)
     latest = public[0]["updated_at"] if public else None
-    latest_label = f'Latest story update {_time(latest, full=True)}' if latest else 'First edition coming soon'
-    cards = "".join(_card(story, base) for story in homepage)
-    if not cards:
-        cards = '<section class="empty-state"><span class="empty-mark" aria-hidden="true">↗</span><h2>The feed is getting started.</h2><p>Stories appear here after collection and source checks. Subscribe to the RSS feed for the first edition.</p></section>'
-    body = f'''<main id="main" class="page">
-<section class="intro"><div><p class="eyebrow">Security. Releases. The network.</p><h1>Tor news, distilled.</h1><p class="intro-copy">The developments that matter, with the sources to understand them.</p></div><div class="edition-note"><span class="live-dot" aria-hidden="true"></span>{latest_label}</div></section>
-<div class="news-layout"><section class="news-column" aria-label="Latest news">
-<div class="tools" data-news-tools hidden><div class="filters" role="group" aria-label="Filter news by topic">{filters}</div>
-<label class="search"><span class="sr-only">Search news</span><span aria-hidden="true">⌕</span><input id="news-search" type="search" placeholder="Search the feed" autocomplete="off" maxlength="200"></label></div>
-<div class="section-heading"><h2>Latest dispatches</h2><span id="result-count" aria-live="polite">{len(homepage)} {'story' if len(homepage) == 1 else 'stories'}</span></div>
-<div id="news-list">{cards}</div><p id="no-results" class="no-results" hidden>No stories match. Try another topic or search.</p>
-{f'<p class="archive-note">Showing the latest {page_size} stories. Individual story links remain available.</p>' if len(public) > page_size else ''}
-</section><aside class="sidebar" aria-label="About this feed">
-<section class="subscribe-box"><span class="sidebar-kicker">Follow the feed</span><h2>Stay in the loop.</h2><p>Important Tor developments, delivered to your feed reader.</p><a class="subscribe-link" href="{_escape(base)}feed.xml">Subscribe via RSS <span aria-hidden="true">↗</span></a><a class="secondary-feed" href="{_escape(base)}feed.json">JSON Feed</a></section>
-<section class="about-feed"><h2>Context comes first.</h2><p>Reports, fixes, and releases are grouped into concise stories. Every summary links to its sources.</p><p>Labels distinguish confirmed findings from reports and suspected incidents.</p></section>
-{_health_details(source_health)}
-<p class="sidebar-footnote">An independent project by <a href="https://1aeo.com/">1AEO</a>.</p>
-</aside></div></main>'''
-    title = _text(site.get("title", "Onion Flash"), 80)
-    description = _text(site.get("description", "Important Tor news, distilled."), 400)
-    (output_dir / "index.html").write_text(_shell(site, base, f"{title} — Tor news, distilled", description, body, base), encoding="utf-8")
+    for page in range(1, pages + 1):
+        path = output_dir / ("index.html" if page == 1 else f"page/{page}/index.html")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(index_html(site, base, homepage[(page - 1) * page_size:page * page_size], source_health if page == 1 else [], total=len(public), page=page, pages=pages, latest=latest), encoding="utf-8")
     for story in public:
         target = output_dir / "news" / story["id"]
         target.mkdir(parents=True)
-        story_body = f'''<main id="main" class="page article-page"><a class="back-link" href="{_escape(base)}">← All dispatches</a>
-<article class="full-story">{_badges(story)}<h1>{_escape(story['title'])}</h1>
-<div class="article-dates">Published {_time(story['published_at'], full=True)}{f' <span>·</span> Updated {_time(story["updated_at"], full=True)}' if story['updated_at'] != story['published_at'] else ''}</div>
-<p class="article-summary">{_escape(story['summary'])}</p>
-{f'<section class="article-context"><h2>Why it matters</h2><p>{_escape(story["why_it_matters"])}</p></section>' if story['why_it_matters'] else ''}
-<p class="event-state"><span>Event status</span> {_label(story['state'])}</p>
-<section class="article-sources"><h2>Read the sources</h2>{_source_links(story, expanded=True)}</section>
-<p class="article-note">This is an AI-assisted summary of the linked public sources. Consult the original reports for details and operator guidance.</p></article></main>'''
-        (target / "index.html").write_text(_shell(site, base, f"{story['title']} — {title}", story["summary"][:300], story_body, _permalink(base, story)), encoding="utf-8")
+        (target / "index.html").write_text(article_html(site, base, story), encoding="utf-8")
+        (target / "story.json").write_text(json.dumps(story, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
     (output_dir / "feed.xml").write_bytes(_rss(site, base, public[:feed_size], "feed.xml"))
     (output_dir / "tags").mkdir()
     for category in CATEGORIES:
         path = f"tags/{category}.xml"
-        (output_dir / path).write_bytes(_rss(site, base, [s for s in public if category in s["tags"]][:feed_size], path, category))
-    feed = {"version": "https://jsonfeed.org/version/1.1", "title": title, "home_page_url": base, "feed_url": base + "feed.json", "description": description, "language": "en", "items": []}
-    for story in public[:feed_size]:
-        content = story["summary"]
-        if story["why_it_matters"]:
-            content += "\n\nWhy it matters: " + story["why_it_matters"]
-        content += "\n\nSources:\n" + "\n".join(source["url"] for source in story["sources"])
-        feed["items"].append({"id": _permalink(base, story), "url": _permalink(base, story), "title": story["title"], "content_text": content, "date_published": story["published_at"], "date_modified": story["updated_at"], "tags": story["tags"]})
-    (output_dir / "feed.json").write_text(json.dumps(feed, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    prefix = urlsplit(base).path.rstrip("/")
-    headers = f'''{prefix}/*
-  X-Content-Type-Options: nosniff
-  Referrer-Policy: strict-origin-when-cross-origin
-  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
-  Permissions-Policy: camera=(), microphone=(), geolocation=()
-  Cache-Control: public, max-age=60, must-revalidate
-'''
-    (output_dir / "_headers").write_text(headers, encoding="utf-8")
+        (output_dir / path).write_bytes(_rss(site, base, [story for story in public if category in story["tags"]][:feed_size], path, category))
+    (output_dir / "feed.json").write_bytes(b"".join(json_feed_chunks(site, base, public[:feed_size])))
+    (output_dir / "_headers").write_text(headers_text(base), encoding="utf-8")
     return len(stories) - len(public)

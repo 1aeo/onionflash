@@ -7,10 +7,8 @@ import contextlib
 import fcntl
 import json
 import os
-import shutil
 import signal
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -57,72 +55,10 @@ def time_budget(seconds: int):
         signal.signal(signal.SIGALRM, previous)
 
 
-def build(config: dict, store: Store) -> dict:
-    """Render every stored story into a fresh directory and swap it in atomically.
+def build(config: dict, store: Store, *, force: bool = False) -> dict:
+    from .publication import build as publish_build
 
-    Rendering is deterministic and cheap, so it runs every time; the deployment
-    uploads only output whose hashes changed.
-    """
-    from .render import render_site
-
-    stories = store.stories()
-    health = store.health(
-        config["sources"], config["collection"]["stale_after_seconds"], now_iso()
-    )
-    public_health = [
-        {
-            "id": s["id"],
-            "name": s["name"],
-            "website_url": s["website_url"],
-            "stale": s["stale"],
-        }
-        for s in health
-    ]
-    output = Path(config["storage"]["output_dir"])
-    owner = output.parent / ("." + output.name + ".onionflash-owner")
-    identity = "OnionFlash generated output v1\n" + str(output) + "\n"
-    if output.is_symlink() or owner.is_symlink():
-        raise ValueError("Public output and ownership marker must not be symlinks")
-    if output.exists() and not output.is_dir():
-        raise ValueError("Public output must be a directory")
-    if owner.exists() and owner.read_text() != identity:
-        raise ValueError("Output ownership marker does not match configured directory")
-    if output.exists() and any(output.iterdir()) and not owner.exists():
-        raise ValueError(
-            "Refusing to replace a nonempty directory not owned by Onion Flash"
-        )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temp = Path(
-        tempfile.mkdtemp(prefix="." + output.name + ".build-", dir=output.parent)
-    )
-    previous = output.parent / (temp.name + ".previous")
-    replaced = False
-    try:
-        skipped = render_site(config, stories, public_health, temp)
-        if not owner.exists():
-            fd = os.open(
-                owner,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-            )
-            with os.fdopen(fd, "w") as stream:
-                stream.write(identity)
-        if output.exists():
-            os.replace(output, previous)
-            replaced = True
-        try:
-            os.replace(temp, output)
-        except BaseException:
-            if replaced:
-                os.replace(previous, output)
-            raise
-        store.set_meta(published_stories=str(len(stories) - skipped))
-    finally:
-        if temp.exists():
-            shutil.rmtree(temp)
-        if previous.exists() and output.exists():
-            shutil.rmtree(previous)
-    return {"published_stories": len(stories) - skipped, "stories_skipped": skipped}
+    return publish_build(config, store, force=force)
 
 
 def run(config: dict, store: Store) -> dict:
@@ -253,6 +189,8 @@ def main(argv: list[str] | None = None) -> int:
     ]:
         command = commands.add_parser(name, help=help_text)
         command.add_argument("--config", required=True, type=Path)
+        if name == "build":
+            command.add_argument("--force", action="store_true", help="Queue a bounded rebuild of all published articles")
         if name == "backup":
             command.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
@@ -281,12 +219,12 @@ def main(argv: list[str] | None = None) -> int:
                 if args.command == "run":
                     result = run(config, store)
                 elif args.command == "build":
-                    result = build(config, store)
+                    result = build(config, store, force=args.force)
                 elif args.command == "status":
                     result = {
                         "pending_analysis": store.pending_count(),
                         "rejected_analysis": store.rejected_count(),
-                        # Recorded by the last successful build; None until one has run.
+                        # Accepted catalog count from the last successful build; None until one has run.
                         "published_stories": None if store.get_meta("published_stories") is None
                         else int(store.get_meta("published_stories")),
                         "monitoring": store.monitoring_status(config["monitoring"], now_iso()),

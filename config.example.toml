@@ -6,11 +6,14 @@ description = "Important Tor news, distilled."
 base_url = "https://1aeo.com/onionflash/"
 repository_url = "https://github.com/1aeo/onionflash"
 page_size = 100
-feed_size = 50
+# Zero includes all published history; a positive value is an optional feed limit.
+feed_size = 0
 
 [storage]
 database = "state/onionflash.sqlite3"
 output_dir = "build/public"
+# Article work per run, never a published-history retention limit.
+render_batch_size = 250
 
 [collection]
 lookback_days = 14

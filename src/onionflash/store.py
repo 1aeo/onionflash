@@ -117,6 +117,10 @@ class Store:
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
         monitoring.initialize(self.db)
+        analysis_columns = {row[1] for row in self.db.execute("PRAGMA table_info(analyses)")}
+        for name in ("source_payload", "source_item_id"):
+            if name not in analysis_columns:
+                self.db.execute(f"ALTER TABLE analyses ADD COLUMN {name} TEXT")
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(source_state)")}
         for name, kind in [
             ("scan_lower", "TEXT"),
@@ -322,8 +326,9 @@ class Store:
         item = json.loads(row["payload"])
         with self.db:
             self.db.execute(
-                "INSERT OR IGNORE INTO analyses(cache_key,result,created_at) VALUES(?,?,?)",
-                (cache_key, json.dumps(result, ensure_ascii=False), observed),
+                """INSERT OR IGNORE INTO analyses
+                (cache_key,result,created_at,source_payload,source_item_id) VALUES(?,?,?,?,?)""",
+                (cache_key, json.dumps(result, ensure_ascii=False), observed, row["payload"], row["id"]),
             )
             story_id = row.get("story_id")
             if result["publish"]:

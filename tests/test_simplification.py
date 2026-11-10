@@ -88,6 +88,21 @@ def test_failed_backup_closes_source_and_removes_private_partial(tmp_path):
         opened[0].execute("SELECT 1")
 
 
+def test_shared_render_dependencies_invalidate_public_build_cache(tmp_path, monkeypatch):
+    from onionflash import publication
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "assets").mkdir()
+    for name in ("render.py", "publication.py", "schema.py", "util.py"):
+        (package / name).write_text("initial")
+    monkeypatch.setattr(publication, "__file__", str(package / "publication.py"))
+    first = publication.template_identity({})
+    (package / "schema.py").write_text("changed labels")
+    second = publication.template_identity({})
+    assert first != second
+    (package / "util.py").write_text("changed timestamp formatting")
+    assert second != publication.template_identity({})
+
 
 def test_backup_keeps_original_database_when_cwd_changes(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
