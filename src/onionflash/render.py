@@ -302,6 +302,7 @@ def render_site(config: dict, stories: list[dict], source_health: list[dict], ou
     public.sort(key=lambda story: (story["updated_at"], story["published_at"], story["id"]), reverse=True)
     page_size = _limit(site.get("page_size"), 100, 1000)
     feed_size = _limit(site.get("feed_size"), 50, 1000)
+    homepage = sorted(public, key=lambda story: (story["published_at"], story["updated_at"], story["id"]), reverse=True)[:page_size]
     output_dir.mkdir(parents=True, exist_ok=True)
     assets = Path(__file__).with_name("assets")
     for name in ASSET_FILES:
@@ -312,7 +313,7 @@ def render_site(config: dict, stories: list[dict], source_health: list[dict], ou
             filters += f'<button type="button" class="filter" data-filter="{key}" aria-pressed="false">{label}</button>'
     latest = public[0]["updated_at"] if public else None
     latest_label = f'Latest story update {_time(latest, full=True)}' if latest else 'First edition coming soon'
-    cards = "".join(_card(story, base) for story in public[:page_size])
+    cards = "".join(_card(story, base) for story in homepage)
     if not cards:
         cards = '<section class="empty-state"><span class="empty-mark" aria-hidden="true">↗</span><h2>The feed is getting started.</h2><p>Stories appear here after collection and source checks. Subscribe to the RSS feed for the first edition.</p></section>'
     body = f'''<main id="main" class="page">
@@ -320,7 +321,7 @@ def render_site(config: dict, stories: list[dict], source_health: list[dict], ou
 <div class="news-layout"><section class="news-column" aria-label="Latest news">
 <div class="tools" data-news-tools hidden><div class="filters" role="group" aria-label="Filter news by topic">{filters}</div>
 <label class="search"><span class="sr-only">Search news</span><span aria-hidden="true">⌕</span><input id="news-search" type="search" placeholder="Search the feed" autocomplete="off" maxlength="200"></label></div>
-<div class="section-heading"><h2>Latest dispatches</h2><span id="result-count" aria-live="polite">{len(public[:page_size])} {'story' if len(public[:page_size]) == 1 else 'stories'}</span></div>
+<div class="section-heading"><h2>Latest dispatches</h2><span id="result-count" aria-live="polite">{len(homepage)} {'story' if len(homepage) == 1 else 'stories'}</span></div>
 <div id="news-list">{cards}</div><p id="no-results" class="no-results" hidden>No stories match. Try another topic or search.</p>
 {f'<p class="archive-note">Showing the latest {page_size} stories. Individual story links remain available.</p>' if len(public) > page_size else ''}
 </section><aside class="sidebar" aria-label="About this feed">

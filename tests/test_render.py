@@ -80,6 +80,21 @@ class RenderTests(unittest.TestCase):
         self.assertIn('<script>', feed["items"][0]["content_text"])
         self.assertNotIn('content_html', feed["items"][0])
 
+    def test_homepage_puts_new_publications_before_recent_edits_to_old_stories(self):
+        older = {**STORY, "id": "older", "published_at": "2026-11-01T12:00:00Z", "updated_at": "2026-11-09T12:00:00Z"}
+        newer = {**STORY, "id": "newer"}
+        output = self.render([older, newer])
+        page = (output / "index.html").read_text()
+        self.assertLess(page.index('id="story-newer"'), page.index('id="story-older"'))
+        # A small homepage must select the newest publication before truncation.
+        config = {"site": {**CONFIG["site"], "page_size": 1}}
+        limited = self.render([older, newer], config=config, name="limited")
+        page = (limited / "index.html").read_text()
+        self.assertIn('id="story-newer"', page)
+        self.assertNotIn('id="story-older"', page)
+        self.assertIn('Latest story update <time datetime="2026-11-09T12:00:00Z"', page)
+        self.assertEqual(json.loads((output / "feed.json").read_text())["items"][0]["id"], "https://example.com/onionflash/news/older/")
+
     def test_unsafe_sources_cannot_be_published(self):
         for index, url in enumerate([
             "javascript:alert(1)", "data:text/html,test", "//example.com/",
