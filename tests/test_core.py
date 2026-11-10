@@ -790,3 +790,21 @@ def test_precedence_compares_with_the_writing_item_not_later_losers(tmp_path):
         # A newer confirmed item than the writer still replaces the text.
         story = publish(store, "https://c.example/1", "2026-11-08T13:00:00Z", title="C", confidence="confirmed")
         assert story["title"] == "C"
+
+
+def test_legacy_story_without_editorial_fields_survives_successive_items(tmp_path):
+    # Same tier and confidence, so the timestamps decide (and must be comparable).
+    legacy = {**analysis(title="Tor 0.4.9.18 released"),
+              "id": "legacy000000000000000000", "published_at": DATE, "updated_at": "2026-11-08T15:00:00Z",
+              "sources": [{"id": "old", "url": "https://old.example/1", "title": "Old", "published_at": DATE}]}
+    legacy.pop("evidence")
+    with Store(tmp_path / "state.db") as store:
+        key = item_cluster(item(title="Tor 0.4.9.18 released", kind="feed"))
+        store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (legacy["id"], key, json.dumps(legacy), DATE, legacy["updated_at"]))
+        for index, stamp in enumerate(["2026-11-08T13:00:00Z", "2026-11-08T14:00:00Z"]):
+            store.ingest(item(url=f"https://new.example/{index}", title="Tor 0.4.9.18 released", kind="feed",
+                              content=str(index), updated_at=stamp), stamp)
+            row = next(r for r in store.pending(10, stamp) if r["url"].endswith(str(index)))
+            store.finish(row, analysis(title=f"Item {index}"), f"k{index}", stamp)
+        story = store.stories(10)[0]
+    assert story["title"] == "Tor 0.4.9.18 released" and len(story["sources"]) == 3

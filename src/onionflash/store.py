@@ -359,11 +359,13 @@ class Store:
                     # ranks higher: tag notice < Metrics timeline < primary report, then
                     # a confirmed account, then the newer item. The loser only adds a link.
                     kind = previous.get("editorial_kind") or ("tag" if previous["state"] == "tagged" else "")
-                    stamp = previous.get("editorial_updated_at", previous["updated_at"])
+                    stamp = previous.get("editorial_updated_at") or previous["updated_at"]
                     if _rank(kind, previous["confidence"], stamp) > _rank(
                         item["kind"], data["confidence"], item["updated_at"]
                     ):
                         data = {key: previous.get(key) for key in data}
+                        # Older stories lack the editorial fields; keep usable values.
+                        data["editorial_kind"], data["editorial_updated_at"] = kind, stamp
                 data.update(
                     {
                         "id": story_id,
