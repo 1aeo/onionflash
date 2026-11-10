@@ -92,8 +92,9 @@ clustering still adds corroborating citations to existing release stories.
    latency reporting. Keep source timestamps distinct from observation and
    publication time.
 5. **A review queue for repeatedly rejected model output.** Invalid evidence and
-   unsupported factual claims must remain rejected. `onionflash status` exposes
-   queue and error counts; an explicit operator workflow would make these
+   unsupported factual claims must remain rejected. `onionflash status` shows the
+   pending queue and source errors, and each `onionflash run` result reports that
+   run's analysis failures; an explicit operator workflow would make these
    cases easier to resolve.
 
 Tag publication and scheduler jitter are addressed in this update rather than
