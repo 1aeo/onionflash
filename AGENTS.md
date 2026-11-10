@@ -21,13 +21,17 @@ operations steps go to the operator, not into PR text.
 
 ## Settings
 
-A setting exists only for a real operator choice: the site's identity and paths,
-the sources, the model endpoint, model and network allowlist, and the two limits
-that depend on the operator's model, `llm.timeout_seconds` and
-`llm.max_items_per_run` (`OPERATOR_SETTINGS` in `src/onionflash/config.py`). Other
-budgets, limits, timeouts, retries, batch and cache sizes are constants in the
-module that uses them. When a setting is removed, add its key to `RETIRED` so
-existing files keep loading.
+A setting exists only for a real operator choice: for example the site's
+identity, paths and page sizes, the sources, and the model endpoint, model,
+network allowlist, timeout and items per run (see `OPERATOR_SETTINGS` and
+`config.example.toml`). Other budgets, limits, timeouts, retries, batch and cache
+sizes belong in code as constants. Some sections, such as `[comments]` and
+`[review]`, still expose such values; add no more, and remove one only together
+with the code that reads it.
+
+When a section setting is removed, add its key to `RETIRED` so existing files
+keep loading. Source entries have no such list: keep a removed source key in the
+allowed set and ignore it, or existing files stop loading.
 
 ## Code
 
