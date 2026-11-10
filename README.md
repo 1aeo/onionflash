@@ -6,7 +6,8 @@ builds a static website, RSS feeds, and JSON Feed. It is an independent 1AEO
 project, not an official Tor Project publication.
 
 One Python application, one TOML configuration file, and SQLite. The public site
-does not call an LLM or need a database server. Deployment and scheduling live in
+uses HTML and CSS with no browser JavaScript. It does not call an LLM or need a
+database server. Deployment and scheduling live in
 [`1aeo/onionflash-deploy`](https://github.com/1aeo/onionflash-deploy).
 
 ## Quick start
@@ -39,6 +40,18 @@ The generated website is in `build/public/`. Open `http://localhost:8080/` after
 setting that address as `site.base_url`. Change it to the real deployment URL
 before publishing. `feed.xml` is the main RSS feed, `feed.json` is JSON Feed, and
 `tags/security.xml` is one of the topic-specific RSS feeds.
+
+Topic links open static pages such as `topics/security/`, covering matching
+stories throughout the complete history, including secondary topic tags. Topic
+pages paginate like the homepage. The mobile menu, source-availability panel and
+editorial-history disclosures use native HTML. Essential navigation uses text,
+so it remains understandable when images or custom fonts are unavailable.
+
+There is no search box or search service. Use the browser's **Find in Page** for
+the currently loaded page. The publisher generates the copyright year and queues
+a bounded rebuild when the year changes. Content Security Policy blocks browser
+scripts with `script-src 'none'`. Cloudflare's routing Worker is server-side
+JavaScript and does not run in visitors' browsers.
 
 The first run collects up to the configured lookback window and analyzes a
 bounded number of items. More items remain queued for subsequent runs. An empty
@@ -317,10 +330,11 @@ See [source coverage and remaining features](docs/SOURCE_COVERAGE.md).
 ```sh
 python -m pip install -e '.[test]'
 python -m pytest -q
-node --test tests/*.mjs
 ```
 
 Tests cover unsafe URLs and redirects, DNS rebinding, gzip expansion, timeouts,
 retry caps, hostile XML, malformed responses, pagination recovery, durable queues,
-deduplication/lifecycle changes, model validation, HTML/RSS escaping, and preserving
-the previous site after failed rendering. Apache 2.0; see [`LICENSE`](LICENSE).
+deduplication/lifecycle changes, model validation, HTML/RSS escaping, native HTML
+navigation, full-history topic pages and safe script retirement. Browser rendering
+has no Node or JavaScript test dependency; the separate deployment repository
+tests its server-side Worker with Node. Apache 2.0; see [`LICENSE`](LICENSE).

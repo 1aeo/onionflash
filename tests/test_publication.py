@@ -77,6 +77,14 @@ def test_more_than_1000_stories_are_permanent_and_all_feeds_are_complete(tmp_pat
         assert len(json.loads((output / "feed.json").read_text())["items"]) == 1001
         assert len(ET.parse(output / "tags/release.xml").findall("./channel/item")) == 1001
         assert (output / "page/11/index.html").is_file()
+        assert (output / "topics/release/page/11/index.html").is_file()
+        assert store.db.execute("SELECT COUNT(*) FROM public_story_topics WHERE topic='release'").fetchone()[0] == 1001
+        assert len(list(publication._accepted(store.db, topic="release", batch_size=17))) == 1001
+        plan = " ".join(row[3] for row in store.db.execute("""EXPLAIN QUERY PLAN
+            SELECT c.public_json FROM public_story_topics t JOIN public_catalog c ON c.story_id=t.story_id
+            WHERE t.topic='release' AND (t.added_at,t.updated_at,t.story_id)<('9999','9999','z')
+            ORDER BY t.added_at DESC,t.updated_at DESC,t.story_id DESC LIMIT 17"""))
+        assert "public_story_topics_added" in plan and "TEMP B-TREE" not in plan
         page1 = (output / "index.html").read_text()
         page11 = (output / "page/11/index.html").read_text()
         assert page1.count('class="story"') == 100
