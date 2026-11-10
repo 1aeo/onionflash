@@ -137,6 +137,10 @@ def test_a_short_flagged_statement_removed_once_may_not_come_back():
     first = {**draft, "summary": "The issue reports a crash."}
     assert _kept_claim(["No fix."], [draft], first) is None
     assert _kept_claim(["No fix."], [draft, first], draft) == "No fix."
+    hedged = {**draft, "summary": "The issue reports a crash. It is unclear whether there is no fix."}
+    assert _kept_claim(["No fix."], [draft, first], hedged) is None
+    # Whole words only: "confirmed" inside "unconfirmed" is not the flagged word.
+    assert _kept_claim(["confirmed compromise"], [draft], {**draft, "summary": "An unconfirmed compromise."}) is None
 
 
 def test_a_flagged_statement_may_be_reworded_with_the_same_words(monkeypatch):
