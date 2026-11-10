@@ -61,6 +61,10 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(feed["items"][0]["date_modified"], STORY["updated_at"])
         self.assertTrue((output / "news" / STORY["id"] / "index.html").is_file())
 
+    def test_feed_source_lines_separate_title_and_domain(self):
+        description = ET.parse(self.render() / "feed.xml").find("./channel/item").findtext("description")
+        self.assertIn('Release announcement</a> <span class="source-domain">blog.torproject.org', description)
+
     def test_source_html_and_attributes_are_escaped_in_every_format(self):
         story = copy.deepcopy(STORY)
         story["title"] = '<img src=x onerror="alert(1)"> & news'

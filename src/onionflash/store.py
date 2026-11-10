@@ -81,7 +81,6 @@ def _rank(kind: str, confidence: str, updated_at: str) -> tuple:
 class Store:
     def __init__(self, path: str | Path):
         path = Path(path)
-        self.path = path.absolute()
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if path.is_symlink():
             raise ValueError("Database must not be a symlink")
@@ -89,13 +88,13 @@ class Store:
         os.chmod(path, 0o600)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA foreign_keys=ON")
-        self.db.execute("PRAGMA busy_timeout=10000")
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS source_state (
                 id TEXT PRIMARY KEY, url TEXT NOT NULL, active_url TEXT, watermark TEXT,
                 etag TEXT, last_modified TEXT, last_success TEXT, error TEXT,
-                failures INTEGER NOT NULL DEFAULT 0, next_fetch_at TEXT
+                failures INTEGER NOT NULL DEFAULT 0, next_fetch_at TEXT,
+                scan_lower TEXT, scan_upper TEXT, scan_page INTEGER, scan_cursor TEXT,
+                scan_reconcile INTEGER, last_reconciled TEXT
             );
             CREATE TABLE IF NOT EXISTS items (
                 id TEXT PRIMARY KEY, url TEXT UNIQUE NOT NULL, source_id TEXT NOT NULL,
@@ -103,10 +102,10 @@ class Store:
                 first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
                 next_attempt_at TEXT, last_error TEXT, priority_score INTEGER NOT NULL DEFAULT 0,
-                story_id TEXT
+                story_id TEXT, rejections INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS items_pending ON items(status, next_attempt_at, priority_score);
-            CREATE INDEX IF NOT EXISTS items_cluster ON items(cluster_key);
+            DROP INDEX IF EXISTS items_cluster;
             CREATE TABLE IF NOT EXISTS analyses (
                 cache_key TEXT PRIMARY KEY, result TEXT NOT NULL, created_at TEXT NOT NULL
             );
@@ -117,17 +116,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
         monitoring.initialize(self.db)
-        columns = {row[1] for row in self.db.execute("PRAGMA table_info(source_state)")}
-        for name, kind in [
-            ("scan_lower", "TEXT"),
-            ("scan_upper", "TEXT"),
-            ("scan_page", "INTEGER"),
-            ("scan_cursor", "TEXT"),
-            ("scan_reconcile", "INTEGER"),
-            ("last_reconciled", "TEXT"),
-        ]:
-            if name not in columns:
-                self.db.execute(f"ALTER TABLE source_state ADD COLUMN {name} {kind}")
+        # Databases created before the rejected state lack this column.
         if "rejections" not in {row[1] for row in self.db.execute("PRAGMA table_info(items)")}:
             self.db.execute("ALTER TABLE items ADD COLUMN rejections INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
@@ -441,11 +430,15 @@ class Store:
     def health(
         self, sources: list[dict], stale_seconds: int, observed: str
     ) -> list[dict]:
+        """Read-only: a source without state for its current URL has not succeeded yet."""
         result = []
         for source in sources:
             if not source["enabled"]:
                 continue
-            state = self.source(source)
+            row = self.db.execute(
+                "SELECT url,last_success,error FROM source_state WHERE id=?", (source["id"],)
+            ).fetchone()
+            state = dict(row) if row and row["url"] == source["url"] else {"last_success": None, "error": None}
             stale = (
                 not state["last_success"]
                 or after(stale_seconds, state["last_success"]) < observed
@@ -476,5 +469,3 @@ class Store:
                 values.items(),
             )
 
-    def backup(self, destination: str | Path) -> None:
-        backup_database(self.path, destination)

@@ -89,18 +89,6 @@ def test_failed_backup_closes_source_and_removes_private_partial(tmp_path):
 
 
 
-def test_backup_keeps_original_database_when_cwd_changes(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    with Store("source.db") as store:
-        store.set_meta(original="kept")
-        other = tmp_path / "other"
-        other.mkdir()
-        monkeypatch.chdir(other)
-        store.backup("copy.db")
-    with sqlite3.connect(other / "copy.db") as connection:
-        assert connection.execute("SELECT value FROM metadata WHERE key='original'").fetchone()[0] == "kept"
-
-
 def test_invalid_unicode_cannot_poison_source_or_model_persistence():
     assert plain_text("security\ud800 report", 100) == "security\ufffd report"
     with pytest.raises(ValueError):

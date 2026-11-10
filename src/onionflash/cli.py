@@ -79,14 +79,13 @@ def build(config: dict, store: Store) -> dict:
         for s in health
     ]
     output = Path(config["storage"]["output_dir"])
+    # The marker's presence alone shows Onion Flash created the output, so moving
+    # or restoring an installation keeps working.
     owner = output.parent / ("." + output.name + ".onionflash-owner")
-    identity = "OnionFlash generated output v1\n" + str(output) + "\n"
     if output.is_symlink() or owner.is_symlink():
         raise ValueError("Public output and ownership marker must not be symlinks")
     if output.exists() and not output.is_dir():
         raise ValueError("Public output must be a directory")
-    if owner.exists() and owner.read_text() != identity:
-        raise ValueError("Output ownership marker does not match configured directory")
     if output.exists() and any(output.iterdir()) and not owner.exists():
         raise ValueError(
             "Refusing to replace a nonempty directory not owned by Onion Flash"
@@ -106,7 +105,7 @@ def build(config: dict, store: Store) -> dict:
                 0o600,
             )
             with os.fdopen(fd, "w") as stream:
-                stream.write(identity)
+                stream.write("Onion Flash generated output\n")
         if output.exists():
             os.replace(output, previous)
             replaced = True
@@ -247,12 +246,9 @@ def main(argv: list[str] | None = None) -> int:
         ("build", "Build from saved stories without network requests"),
         ("check", "Validate configuration without network requests"),
         ("status", "Show source and queue status"),
-        ("backup", "Create a consistent private SQLite backup"),
     ]:
         command = commands.add_parser(name, help=help_text)
         command.add_argument("--config", required=True, type=Path)
-        if name == "backup":
-            command.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
@@ -271,32 +267,29 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
+        if args.command == "status":
+            # Read-only, so it needs no lock and works while a run is in progress.
+            with Store(config["storage"]["database"]) as store:
+                print(json.dumps({
+                    "pending_analysis": store.pending_count(),
+                    "rejected_analysis": store.rejected_count(),
+                    # Recorded by the last successful build; None until one has run.
+                    "published_stories": None if store.get_meta("published_stories") is None
+                    else int(store.get_meta("published_stories")),
+                    "monitoring": store.monitoring_status(now_iso()),
+                    "sources": store.health(
+                        config["sources"], config["collection"]["stale_after_seconds"], now_iso()
+                    ),
+                }, ensure_ascii=False))
+            return 0
         with run_lock(config["storage"]["database"]) as acquired:
             if not acquired:
                 print(json.dumps({"status": "already-running"}))
-                return 0
+                # An overlapping scheduled run is normal; a build that did not happen
+                # is reported as a temporary failure (EX_TEMPFAIL).
+                return 0 if args.command == "run" else 75
             with Store(config["storage"]["database"]) as store:
-                if args.command == "run":
-                    result = run(config, store)
-                elif args.command == "build":
-                    result = build(config, store)
-                elif args.command == "status":
-                    result = {
-                        "pending_analysis": store.pending_count(),
-                        "rejected_analysis": store.rejected_count(),
-                        # Recorded by the last successful build; None until one has run.
-                        "published_stories": None if store.get_meta("published_stories") is None
-                        else int(store.get_meta("published_stories")),
-                        "monitoring": store.monitoring_status(now_iso()),
-                        "sources": store.health(
-                            config["sources"],
-                            config["collection"]["stale_after_seconds"],
-                            now_iso(),
-                        ),
-                    }
-                else:
-                    store.backup(args.output)
-                    result = {"backup": "created"}
+                result = run(config, store) if args.command == "run" else build(config, store)
                 print(json.dumps(result, ensure_ascii=False))
         return 0
     except (ValueError, OSError) as exc:
