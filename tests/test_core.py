@@ -347,12 +347,54 @@ def test_utf16_entity_declarations_are_rejected_before_feedparser():
         )
 
 
-def test_deep_or_massive_feed_structure_is_rejected_before_materialization():
-    xml = ("<rss>" + "<a>" * 129 + "</a>" * 129 + "</rss>").encode()
-    with pytest.raises(CollectionError, match="structure"):
-        collect_source(
-            FakeClient([response(xml)]), source(), {}, DEFAULTS["collection"], DATE
-        )
+def test_a_feed_with_too_many_elements_is_rejected_before_feedparser(monkeypatch):
+    from onionflash import collect
+    monkeypatch.setattr(collect, "MAX_FEED_ELEMENTS", 10)
+    monkeypatch.setattr(collect.feedparser, "parse", lambda *args, **kwargs: pytest.fail("feedparser ran"))
+    xml = ("<rss><channel>" + "<item/>" * 20 + "</channel></rss>").encode()
+    with pytest.raises(CollectionError, match="too many XML elements"):
+        collect_source(FakeClient([response(xml)]), source(), {}, DEFAULTS["collection"], DATE)
+
+
+def test_large_attributes_and_a_normal_base_are_accepted():
+    item = '<item data-padding="' + "x" * 40000 + '"><title>Item {n}</title><link>https://example.org/{n}</link></item>'
+    xml = (f'<rss version="2.0" xml:base="https://example.org/"><channel><title>News</title>'
+           f'{item.format(n=1)}{item.format(n=2)}</channel></rss>')
+    result = collect_source(FakeClient([response(xml.encode())]), source(), {}, DEFAULTS["collection"], DATE)
+    assert sorted(row["title"] for row in result["items"]) == ["Item 1", "Item 2"]
+
+
+def test_an_absolute_base_on_every_entry_does_not_accumulate():
+    item = ('<item xml:base="https://example.org/2026/11/10/a-fairly-long-permalink-for-post-{n}/">'
+            '<title>Item {n}</title><link>https://example.org/{n}</link></item>')
+    xml = '<rss version="2.0"><channel><title>News</title>' + "".join(item.format(n=n) for n in range(1000)) + "</channel></rss>"
+    result = collect_source(FakeClient([response(xml.encode())]), source(max_items=1000), {}, DEFAULTS["collection"], DATE)
+    assert len(result["items"]) == 1000
+
+
+def test_deep_nesting_is_rejected_before_feedparser(monkeypatch):
+    from onionflash import collect
+    monkeypatch.setattr(collect.feedparser, "parse", lambda *args, **kwargs: pytest.fail("feedparser ran"))
+    with pytest.raises(CollectionError, match="nested too deeply"):
+        collect_source(FakeClient([response(("<rss>" + "<a>" * 128 + "</a>" * 128 + "</rss>").encode())]),
+                       source(), {}, DEFAULTS["collection"], DATE)
+
+
+def test_base_text_copied_to_every_element_is_bounded_before_feedparser(monkeypatch):
+    from onionflash import collect
+    monkeypatch.setattr(collect.feedparser, "parse", lambda *args, **kwargs: pytest.fail("feedparser ran"))
+    # Feedparser copies the current base into every later element: beneath it, or
+    # after it when a closed element's base stays current under a parent without one.
+    base = "https://example.org/" + "a" * 60000 + "/"
+    for xml in (f'<rss xml:base="{base}">' + "<item/>" * 200 + "</rss>",
+                f'<rss><a BASE="{base}">' + "<b/>" * 200 + "</a></rss>",
+                f'<rss><channel><item xml:base="{base}"/>' + "<item><title>x</title></item>" * 100 + "</channel></rss>",
+                # An absolute base with a scheme feedparser does not accept leaves the long one current.
+                f'<rss><channel><item xml:base="{base}"/>' + '<item xml:base="data://x/"><title>x</title></item>' * 100
+                + "</channel></rss>",
+                "<rss>" + ('<a xml:base="' + "a" * 60000 + '/">') * 100 + "</a>" * 100 + "</rss>"):
+        with pytest.raises(CollectionError, match="xml:base text"):
+            collect_source(FakeClient([response(xml.encode())]), source(), {}, DEFAULTS["collection"], DATE)
 
 
 def test_gitlab_pagination_keeps_partial_items_without_advancing_watermark():

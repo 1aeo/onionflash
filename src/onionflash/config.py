@@ -42,8 +42,6 @@ DEFAULTS = {
         "source_budget_seconds": 60,
         "analysis_reserve_fraction": 0.5,
         "reconcile_seconds": 86400,
-        "max_xml_depth": 128,
-        "max_xml_elements": 50000,
     },
     "http": {
         "timeout_seconds": 30,
@@ -114,8 +112,6 @@ BOUNDS = {
     "analysis_reserve_fraction": (0.1, 0.9),
     "feed_size": (0, 100000),
     "reconcile_seconds": (300, 604800),
-    "max_xml_depth": (8, 256),
-    "max_xml_elements": (100, 100000),
 }
 
 
@@ -125,7 +121,7 @@ RETIRED = {
     "storage": {"max_stories"},
     "http": {"requests_per_minute"},
     "llm": {"retry_attempts"},
-    "collection": {"healthy_poll_tolerance_seconds", "tag_priority_score"},
+    "collection": {"healthy_poll_tolerance_seconds", "tag_priority_score", "max_xml_depth", "max_xml_elements"},
     "monitoring": {
         "min_reports", "min_span_seconds", "window_seconds", "stale_after_seconds", "retention_days",
         "max_observations", "max_groups", "max_source_links", "max_alerts_per_item", "max_future_seconds"},
