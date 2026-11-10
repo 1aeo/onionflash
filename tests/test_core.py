@@ -815,3 +815,20 @@ def test_legacy_story_without_editorial_fields_survives_successive_items(tmp_pat
             store.finish(row, analysis(title=f"Item {index}"), f"k{index}", stamp)
         story = store.stories(10)[0]
     assert story["title"] == "Tor 0.4.9.18 released" and len(story["sources"]) == 3
+
+
+def test_an_older_single_source_story_can_still_be_updated_by_its_source(tmp_path):
+    url = "https://blog.example/tor-0.4.9.19"
+    with Store(tmp_path / "state.db") as store:
+        store.ingest(item(url=url, title="Tor 0.4.9.19 released", kind="feed"), DATE)
+        row = store.pending(1, DATE)[0]
+        legacy = {**analysis(title="Tor 0.4.9.19 released", confidence="confirmed", state="released"),
+                  "id": "legacy111111111111111111", "published_at": DATE, "updated_at": DATE,
+                  "sources": [{"id": row["id"], "url": url, "title": "x", "published_at": DATE}]}
+        legacy.pop("evidence")
+        store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (legacy["id"], row["cluster_key"], json.dumps(legacy), DATE, DATE))
+        later = "2026-11-08T13:00:00Z"
+        store.ingest(item(url=url, title="Tor 0.4.9.19 released", kind="feed", content="Withdrawn.", updated_at=later), later)
+        store.finish(store.pending(1, later)[0], analysis(title="Tor 0.4.9.19 release withdrawn"), "k", later)
+        story = store.stories(1)[0]
+    assert story["title"] == "Tor 0.4.9.19 release withdrawn" and story["editorial_item"] == row["id"]

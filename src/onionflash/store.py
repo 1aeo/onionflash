@@ -354,7 +354,10 @@ class Store:
                 }
                 data["editorial_kind"], data["editorial_item"] = item["kind"], item["id"]
                 data["editorial_updated_at"] = item["updated_at"]
-                if previous and previous.get("editorial_item") != item["id"]:
+                writer = (previous or {}).get("editorial_item")
+                if previous and writer is None and len(previous.get("sources", [])) == 1:
+                    writer = previous["sources"][0].get("id")  # an older story's only source wrote it
+                if previous and writer != item["id"]:
                     # Another item already wrote this story. It keeps the text when it
                     # ranks higher: tag notice < Metrics timeline < primary report, then
                     # a confirmed account, then the newer item. The loser only adds a link.
@@ -365,7 +368,7 @@ class Store:
                     ):
                         data = {key: previous.get(key) for key in data}
                         # Older stories lack the editorial fields; keep usable values.
-                        data["editorial_kind"], data["editorial_updated_at"] = kind, stamp
+                        data.update(editorial_kind=kind, editorial_item=writer, editorial_updated_at=stamp)
                 data.update(
                     {
                         "id": story_id,
