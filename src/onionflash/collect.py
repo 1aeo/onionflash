@@ -113,13 +113,15 @@ def _feed(
     def reject_declaration(*args):
         raise CollectionError("Feed contains disallowed XML declarations")
 
-    # Without a DTD there are no entities to expand. Bytes alone do not bound what
-    # feedparser builds: tiny elements are cheap to send, and it keeps every open
-    # element's resolved xml:base, which nested relative bases grow quadratically.
-    # Capping elements, depth and attribute text on the open path bounds both.
+    # Without a DTD there are no entities to expand.
     parser.StartDoctypeDeclHandler = reject_declaration
     parser.EntityDeclHandler = reject_declaration
     parser.ExternalEntityRefHandler = reject_declaration
+    # Bytes alone do not bound what feedparser builds: tiny elements are cheap to
+    # send, and it keeps every open element's resolved xml:base, which nested
+    # relative bases grow quadratically. Capping elements, depth and attribute text
+    # on the open path bounds both. path holds, for each open element (the root
+    # included), the attribute characters from the root down to it.
     elements, path = 0, []
 
     def start_element(name, attributes):

@@ -356,6 +356,13 @@ def test_a_feed_with_too_many_elements_is_rejected_before_feedparser(monkeypatch
         collect_source(FakeClient([response(xml)]), source(), {}, DEFAULTS["collection"], DATE)
 
 
+def test_large_attributes_on_sibling_items_are_accepted():
+    item = '<item data-padding="' + "x" * 40000 + '"><title>Item {n}</title><link>https://example.org/{n}</link></item>'
+    xml = f'<rss version="2.0"><channel><title>News</title>{item.format(n=1)}{item.format(n=2)}</channel></rss>'
+    result = collect_source(FakeClient([response(xml.encode())]), source(), {}, DEFAULTS["collection"], DATE)
+    assert sorted(row["title"] for row in result["items"]) == ["Item 1", "Item 2"]
+
+
 def test_deep_nesting_or_nested_bases_are_rejected_before_feedparser(monkeypatch):
     from onionflash import collect
     monkeypatch.setattr(collect.feedparser, "parse", lambda *args, **kwargs: pytest.fail("feedparser ran"))
