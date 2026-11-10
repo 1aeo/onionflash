@@ -62,6 +62,21 @@ def test_prepare_is_read_only_and_finish_cannot_bypass_final_review(tmp_path):
         assert store.db.execute("SELECT COUNT(*) FROM analyses").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("field,limit", [("title", 180), ("summary", 1600), ("why_it_matters", 800), ("source_title", 200)])
+def test_truncation_at_space_keeps_reviewed_candidate_stable_through_commit(tmp_path, field, limit):
+    text = "x" * (limit - 1) + " more supported text"
+    incoming = item(content=BODY, **({"title": text} if field == "source_title" else {}))
+    result = analysis(**({field: text} if field != "source_title" else {}))
+    with Store(tmp_path / "db") as store:
+        row = pending(store, incoming)
+        prepared = store.prepare_candidate(row, result, DATE)
+        public = prepared["candidate"]
+        assert render._prepare_story(public) == public
+        receipt = approve(store, prepared)
+        store.commit_candidate(prepared, public, "truncated-source", DATE, **receipt)
+        assert render._prepare_story(store.stories()[0]) == public
+
+
 def test_review_sees_retained_bad_text_and_actual_prior_writer_source(tmp_path):
     with Store(tmp_path / "db") as store:
         old = publish(store, item(content=BODY, updated_at=LATER),
