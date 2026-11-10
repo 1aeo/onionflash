@@ -18,6 +18,8 @@ from .util import (
 
 
 MAX_FEED_ELEMENTS, MAX_FEED_DEPTH, MAX_FEED_BASE_CHARS = 50000, 128, 8_000_000
+# "scheme://..." or "//...": resolving it replaces the inherited base instead of extending it.
+ABSOLUTE_BASE = re.compile(r"(?:[A-Za-z][A-Za-z0-9+.-]*:)?//")
 
 
 class CollectionError(Exception):
@@ -118,28 +120,35 @@ def _feed(
     parser.EntityDeclHandler = reject_declaration
     parser.ExternalEntityRefHandler = reject_declaration
     # Bytes alone do not bound what feedparser builds: tiny elements are cheap to
-    # send, and every element gets its own copy of the resolved xml:base (or base),
-    # kept in the parse stack and in each detail object. A copy is at most the base
-    # text on the element's open path, so the sum of that text over all elements
-    # bounds them, whether bases nest or one long base covers many entries. path
-    # holds that base text for each open element, the root included.
-    elements, base_chars, path = 0, 0, []
+    # send, and every element gets its own copy of the current xml:base (or base),
+    # kept in the parse stack and in each detail object. A closed element's base can
+    # also stay current for later siblings, so charge every element the longest base
+    # feedparser could hold by then: an absolute value, or the longest so far plus a
+    # relative one (and a separator). The sum bounds every copy.
+    elements = depth = base_chars = longest = 0
 
     def start_element(name, attributes):
-        nonlocal elements, base_chars
-        elements += 1
-        path.append((path[-1] if path else 0)
-                    + sum(len(v) for k, v in attributes.items() if k.lower().rpartition(":")[2] == "base"))
-        base_chars += path[-1]
+        nonlocal elements, depth, base_chars, longest
+        elements, depth = elements + 1, depth + 1
+        for key, value in attributes.items():
+            if key.lower().rpartition(":")[2] == "base":
+                # +16 covers the scheme that urljoin adds to "//host" values.
+                grown = len(value) + 16 if ABSOLUTE_BASE.match(value) else longest + len(value) + 1
+                longest = max(longest, grown)
+        base_chars += longest
         if elements > MAX_FEED_ELEMENTS:
             raise CollectionError("Feed has too many XML elements")
-        if len(path) > MAX_FEED_DEPTH:
+        if depth > MAX_FEED_DEPTH:
             raise CollectionError("Feed XML is nested too deeply")
         if base_chars > MAX_FEED_BASE_CHARS:
             raise CollectionError("Feed xml:base text exceeds the limit")
 
+    def end_element(name):
+        nonlocal depth
+        depth -= 1
+
     parser.StartElementHandler = start_element
-    parser.EndElementHandler = lambda name: path.pop()
+    parser.EndElementHandler = end_element
     try:
         parser.Parse(response.body, True)
     except expat.ExpatError as exc:

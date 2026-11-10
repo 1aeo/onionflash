@@ -375,11 +375,13 @@ def test_deep_nesting_is_rejected_before_feedparser(monkeypatch):
 def test_base_text_copied_to_every_element_is_bounded_before_feedparser(monkeypatch):
     from onionflash import collect
     monkeypatch.setattr(collect.feedparser, "parse", lambda *args, **kwargs: pytest.fail("feedparser ran"))
-    # Feedparser copies the resolved base into every element beneath it, nested or not.
+    # Feedparser copies the current base into every later element: beneath it, or
+    # after it when a closed element's base stays current under a parent without one.
     base = "https://example.org/" + "a" * 60000 + "/"
     for xml in (f'<rss xml:base="{base}">' + "<item/>" * 200 + "</rss>",
                 f'<rss><a BASE="{base}">' + "<b/>" * 200 + "</a></rss>",
-                "<rss>" + f'<a xml:base="{base}">' * 100 + "</a>" * 100 + "</rss>"):
+                f'<rss><channel><item xml:base="{base}"/>' + "<item><title>x</title></item>" * 100 + "</channel></rss>",
+                "<rss>" + ('<a xml:base="' + "a" * 60000 + '/">') * 100 + "</a>" * 100 + "</rss>"):
         with pytest.raises(CollectionError, match="xml:base text"):
             collect_source(FakeClient([response(xml.encode())]), source(), {}, DEFAULTS["collection"], DATE)
 
