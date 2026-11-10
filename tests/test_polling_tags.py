@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from onionflash.analyze import AnalysisError, Analyzer, cache_key
+from onionflash.analyze import SCHEMA, AnalysisError, Analyzer, cache_key, tag_notice, validate_analysis
 from onionflash.config import DEFAULTS, load_config
 from onionflash.render import render_site
 from onionflash.store import Store, after, item_priority, source_due
@@ -77,6 +77,14 @@ def test_tag_notice_needs_no_model_credential_or_http_client(name, monkeypatch):
     assert result["evidence"] == [name]
     assert "upstream" in result["summary"]
     assert "released" not in result["summary"] and "verified" not in result["summary"]
+
+
+@pytest.mark.parametrize("product", SCHEMA["properties"]["products"]["items"]["enum"])
+def test_literal_tag_notice_still_passes_the_model_output_checks(product):
+    # tag_notice skips validation, so this catches drift from SCHEMA or its enums.
+    item = tag(product=product)
+    notice = tag_notice(item)
+    assert validate_analysis(copy.deepcopy(notice), item) == notice
 
 
 def test_tag_notice_preserves_publication_dates_and_escapes_hostile_text(tmp_path):
