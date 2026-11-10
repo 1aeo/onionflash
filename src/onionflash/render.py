@@ -169,11 +169,13 @@ def _source_links(story: dict, *, expanded: bool = False) -> str:
 
 def _card(story: dict, base: str) -> str:
     search = " ".join([story["title"], story["summary"], *story["tags"], *story["products"]])
+    # Cards show when Onion Flash added the story, which orders the homepage; the
+    # story page keeps the source's own publication date.
     updated = ""
-    if story["updated_at"] != story["published_at"]:
+    if story["updated_at"] > story["added_at"]:
         updated = f'<span class="updated-note">Updated {_time(story["updated_at"])}</span>'
     return f'''<article class="story" id="story-{story['id']}" data-tags="{_escape(' '.join(story['tags']))}" data-search="{_escape(search.casefold())}">
-      <div class="story-topline">{_badges(story)}<span class="story-date">{_time(story['published_at'])}</span></div>
+      <div class="story-topline">{_badges(story)}<span class="story-date">{_time(story['added_at'])}</span></div>
       <h2><a href="{_escape(_permalink(base, story))}">{_escape(story['title'])}</a></h2>
       <p class="story-summary">{_escape(story['summary'])}</p>
       {f'<p class="why"><strong>Why it matters</strong> {_escape(story["why_it_matters"])}</p>' if story['why_it_matters'] else ''}

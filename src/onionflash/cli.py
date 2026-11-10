@@ -116,7 +116,7 @@ def build(config: dict, store: Store) -> dict:
             if replaced:
                 os.replace(previous, output)
             raise
-        store.set_meta(public_skipped=str(skipped))
+        store.set_meta(published_stories=str(len(stories) - skipped))
     finally:
         if temp.exists():
             shutil.rmtree(temp)
@@ -283,7 +283,9 @@ def main(argv: list[str] | None = None) -> int:
                 elif args.command == "status":
                     result = {
                         "pending_analysis": store.pending_count(),
-                        "published_stories": store.story_count() - int(store.get_meta("public_skipped") or 0),
+                        # Recorded by the last successful build; None until one has run.
+                        "published_stories": None if store.get_meta("published_stories") is None
+                        else int(store.get_meta("published_stories")),
                         "monitoring": store.monitoring_status(config["monitoring"], now_iso()),
                         "sources": store.health(
                             config["sources"],

@@ -111,6 +111,12 @@ class RenderTests(unittest.TestCase):
                    "updated_at": "2026-11-10T12:00:00Z", "added_at": "2026-11-05T12:00:00Z"}
         page = (self.render([earlier, resurfaced]) / "index.html").read_text()
         self.assertLess(page.index('id="story-resurfaced"'), page.index('id="story-earlier"'))
+        # Each card shows the date that orders it; the story page keeps the source date.
+        card = page[page.index('id="story-resurfaced"'):page.index('id="story-earlier"')]
+        self.assertIn('<span class="story-date"><time datetime="2026-11-09T12:00:00Z"', card)
+        self.assertNotIn("updated-note", card)
+        article = (self.root / "site" / "news" / "resurfaced" / "index.html").read_text()
+        self.assertIn('Published <time datetime="2026-09-22T12:00:00Z"', article)
 
     def test_source_panel_shows_only_freshness_not_times_or_errors(self):
         health = [{"name": "Fresh", "website_url": "https://example.org/a", "stale": False, "last_success": "2026-11-08T12:00:00Z", "error": "boom"},

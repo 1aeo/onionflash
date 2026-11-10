@@ -851,3 +851,17 @@ def test_retired_settings_are_accepted_and_ignored(tmp_path):
         '[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n'
     )
     assert "max_stories" not in load_config(path)["storage"]
+
+
+def test_status_reports_the_count_recorded_by_the_last_build(tmp_path, capsys):
+    import json as _json
+    from onionflash.cli import main
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text('[storage]\ndatabase = "db.sqlite3"\noutput_dir = "public"\n'
+                        '[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
+    assert main(["status", "--config", str(cfg_path)]) == 0
+    assert _json.loads(capsys.readouterr().out)["published_stories"] is None
+    assert main(["build", "--config", str(cfg_path)]) == 0
+    capsys.readouterr()
+    assert main(["status", "--config", str(cfg_path)]) == 0
+    assert _json.loads(capsys.readouterr().out)["published_stories"] == 0
