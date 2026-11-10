@@ -117,6 +117,7 @@ def run(config: dict, store: Store) -> dict:
         "analyzed": 0,
         "analysis_failed": 0,
         "budget_reached": False,
+        "entries_skipped": 0,
     }
     started = time.monotonic()
     budget = config["collection"]["run_budget_seconds"]
@@ -154,6 +155,7 @@ def run(config: dict, store: Store) -> dict:
             try:
                 result = collect_source(client, source, state, config["collection"], observed)
                 received = record_items(source, result["items"])
+                report["entries_skipped"] += result.get("skipped", 0)
                 store.source_success(source, result, received, schedule_from=observed)
                 report["sources_ok"] += 1
             except CollectionError as exc:
@@ -171,6 +173,9 @@ def run(config: dict, store: Store) -> dict:
                 if out_of_time:
                     report["budget_reached"] = True
                     break
+            except Exception as exc:  # untrusted input must not stop the other sources
+                store.source_failure(source, f"Unexpected {type(exc).__name__}", config["collection"], now_iso())
+                report["sources_failed"] += 1
     run_deadline = started + budget
     endpoint_failures = 0
     with Analyzer(config, deadline=run_deadline) as analyzer:

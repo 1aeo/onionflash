@@ -3,7 +3,7 @@ from xml.sax.saxutils import escape
 
 import pytest
 
-from onionflash.collect import CollectionError, collect_source
+from onionflash.collect import collect_source
 from onionflash.config import DEFAULTS
 from test_core import DATE, FakeClient, response, source
 
@@ -43,18 +43,19 @@ def test_historic_duplicate_ids_do_not_create_fresh_news_or_warnings():
 
 def test_conflicting_recent_id_fallbacks_are_skipped_without_losing_other_entries():
     url = 'https://metrics.example.org/news.atom#collision'
-    with pytest.raises(CollectionError, match='conflicting') as caught:
-        collect([entry(url, 'First event'), entry(url, 'Different event'),
-                 entry('https://metrics.example.org/news.atom#unique', 'Unambiguous event')])
-    assert caught.value.catching_up
-    assert [item['title'] for item in caught.value.items] == ['Unambiguous event']
+    result = collect([entry(url, 'First event'), entry(url, 'Different event'),
+                      entry('https://metrics.example.org/news.atom#unique', 'Unambiguous event')])
+    # Ambiguous entries are skipped and counted; the feed itself stays healthy.
+    assert [item['title'] for item in result['items']] == ['Unambiguous event']
+    assert result['skipped'] == 2
 
 
 def test_identical_duplicates_and_distinct_update_times_remain_supported():
     url = 'https://metrics.example.org/news.atom#event'
     assert len(collect([entry(url, 'Same event'), entry(url, 'Same event')])['items']) == 2
+    # Collected after the later entry: dates are never later than the poll time.
     assert len(collect([entry(url, 'First version'),
-                        entry(url, 'Updated version', '2026-11-08T12:01:00Z')])['items']) == 2
+                        entry(url, 'Updated version', '2026-11-08T12:01:00Z')], started='2026-11-08T12:05:00Z')['items']) == 2
 
 
 def test_normal_alternate_links_keep_existing_revision_behavior():

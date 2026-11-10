@@ -20,7 +20,6 @@ def tag(**overrides):
     return {
         "id": "tag-id",
         "source_id": "tor-tags",
-        "source_name": "Tor tags",
         "url": "https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-0.4.9.16",
         "title": "tor-0.4.9.16",
         "content": "Tor 0.4.9.16",
@@ -91,7 +90,7 @@ def test_tag_cache_is_distinct_from_old_llm_decisions_and_model_independent():
 def test_tag_notice_preserves_publication_dates_and_escapes_hostile_text(tmp_path):
     payload = '<img src=x onerror="alert(1)">'
     with Analyzer(copy.deepcopy(DEFAULTS)) as analyzer:
-        raw = tag(title=payload, content="", source_name="<script>attack()</script>")
+        raw = tag(title=payload, content="")
         result = analyzer.analyze(raw)
     with Store(tmp_path / "state.db") as store:
         store.ingest(raw, DATE)

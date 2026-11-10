@@ -326,7 +326,10 @@ def load_config(path: str | Path) -> dict:
         ):
             raise ValueError("At most five fallback URLs per source")
         source["url"] = canonical_url(source["url"])
-        source["website_url"] = canonical_url(source.get("website_url", source["url"]))
+        if "website_url" in source:
+            source["website_url"] = canonical_url(source["website_url"])
+        elif source["kind"] == "metrics_timeline":
+            raise ValueError("Timeline sources need website_url (the repository URL)")
         if source["kind"] == "metrics_timeline":
             website = urlsplit(source["website_url"])
             if website.query or website.fragment or not website.path.strip("/"):
