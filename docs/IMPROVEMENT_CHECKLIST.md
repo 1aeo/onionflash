@@ -8,7 +8,7 @@ GitHub identity `1aeo`; preserve existing functionality and publication history.
 | Explain polling frequency and configuration | Complete | Five-minute cron (`interval_minutes=5`), per-source default 300 s; healthy jitter bug reproduced, fixed and deployed. |
 | Match the established 1AEO color theme | Complete | Dark/green palette deployed; live browser, HTTP color/hash and contrast checks passed. |
 | Backtest source-to-publication delay | Complete | See RUNTIME_AUDIT.md and repeatable read-only audit tool; source availability remains unknown, n=1 post-start published example. |
-| Audit important source coverage | Complete | See SOURCE_COVERAGE.md; 18 active sources, including Browser Security issues, Anti-Censorship team, Tor Metrics news and the tor-dev development mailing list. |
+| Audit important source coverage | Complete | See SOURCE_COVERAGE.md; 20 active sources, including consensus-health and anti-censorship alerts with deterministic grouping and publication gates. |
 | Audit SQLite size, efficiency and maintenance | Complete | 0.95 MiB, zero freelist pages; gzip snapshot 26.7%; no immediate VACUUM/compression; growth scenarios documented. |
 | Verify hostedopen cron | Complete | Existing */5 cron verified; successful current run/publication receipts observed. |
 | Identify remaining key features | Complete | SOURCE_COVERAGE.md prioritizes corrections, public-only comments, grouped telemetry, long-term timing/retention, rejected-analysis workflow. |

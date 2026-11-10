@@ -60,6 +60,18 @@ DEFAULTS = {
         "requests_per_minute": 30,
         "user_agent": "OnionFlash/0.1 (+https://github.com/1aeo/onionflash)",
     },
+    "monitoring": {
+        "min_reports": 2,
+        "min_span_seconds": 3600,
+        "window_seconds": 172800,
+        "stale_after_seconds": 259200,
+        "retention_days": 30,
+        "max_observations": 10000,
+        "max_groups": 2000,
+        "max_source_links": 3,
+        "max_alerts_per_item": 100,
+        "max_future_seconds": 300,
+    },
     "llm": {
         "base_url": "",
         "fallback_base_urls": [],
@@ -121,6 +133,15 @@ BOUNDS = {
     "max_xml_elements": (100, 100000),
     "healthy_poll_tolerance_seconds": (0, 60),
     "tag_priority_score": (0, 20),
+    "min_reports": (2, 100),
+    "min_span_seconds": (300, 604800),
+    "window_seconds": (600, 2592000),
+    "retention_days": (1, 365),
+    "max_observations": (100, 100000),
+    "max_groups": (10, 10000),
+    "max_source_links": (2, 10),
+    "max_alerts_per_item": (1, 1000),
+    "max_future_seconds": (0, 3600),
 }
 
 
@@ -154,7 +175,7 @@ def load_config(path: str | Path) -> dict:
                     f"Unknown {section} settings: {', '.join(sorted(unknown))}"
                 )
             config[section].update(values)
-    for section in ("http", "collection", "llm", "storage", "site"):
+    for section in ("http", "collection", "llm", "storage", "site", "monitoring"):
         for key, value in config[section].items():
             if key in BOUNDS:
                 low, high = BOUNDS[key]
@@ -178,6 +199,9 @@ def load_config(path: str | Path) -> dict:
                     raise ValueError(f"{section}.{key} must be an integer")
     if config["http"]["backoff_cap_seconds"] < config["http"]["backoff_base_seconds"]:
         raise ValueError("HTTP backoff cap must be at least its base")
+    monitoring = config["monitoring"]
+    if not monitoring["min_span_seconds"] <= monitoring["window_seconds"] <= monitoring["retention_days"] * 86400:
+        raise ValueError("Monitoring window must cover the minimum span and fit within retention")
     base_url = _expand(config["site"]["base_url"])
     parsed_site = urlsplit(base_url)
     if (
@@ -267,6 +291,8 @@ def load_config(path: str | Path) -> dict:
             "max_pages",
             "max_items",
             "interval_seconds",
+            "alert_format",
+            "monitor_id",
         }
         if not isinstance(source, dict) or set(source) - allowed:
             raise ValueError("Invalid source keys")
@@ -283,6 +309,14 @@ def load_config(path: str | Path) -> dict:
         source.setdefault("authority", "community")
         source.setdefault("enabled", True)
         source.setdefault("interval_seconds", 300)
+        source.setdefault("alert_format", "")
+        source.setdefault("monitor_id", source["id"])
+        if not isinstance(source["alert_format"], str) or source["alert_format"] not in {"", "consensus", "censorship"}:
+            raise ValueError("Unsupported alert format")
+        if not isinstance(source["monitor_id"], str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", source["monitor_id"]):
+            raise ValueError("Invalid monitor identity")
+        if source["alert_format"] and (source["kind"] != "feed" or source["authority"] != "telemetry"):
+            raise ValueError("Alert parsers require a feed classified as telemetry")
         if source["kind"] not in {"feed", "tag", "gitlab_issue", "gitlab_mr"}:
             raise ValueError("Unsupported source kind")
         if source["authority"] not in {

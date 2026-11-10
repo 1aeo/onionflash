@@ -9,6 +9,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .util import after, backoff_seconds, digest, item_cluster
+from . import monitoring
 
 
 def backup_database(source: str | Path, destination: str | Path) -> None:
@@ -111,6 +112,7 @@ class Store:
             );
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
+        monitoring.initialize(self.db)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(source_state)")}
         for name, kind in [
             ("scan_lower", "TEXT"),
@@ -399,6 +401,12 @@ class Store:
                 (limit,),
             )
         ]
+
+    def ingest_alerts(self, source: dict, items: list[dict], settings: dict, observed: str) -> dict:
+        return monitoring.ingest(self.db, source, items, settings, observed)
+
+    def monitoring_status(self, settings: dict, observed: str) -> dict:
+        return monitoring.status(self.db, settings, observed)
 
     def story_count(self, limit: int) -> int:
         return self.db.execute(

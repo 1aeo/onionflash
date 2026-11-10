@@ -50,6 +50,20 @@ max_response_bytes = 2097152
 requests_per_minute = 30
 user_agent = "OnionFlash/0.1 (+https://github.com/1aeo/onionflash)"
 
+[monitoring]
+# Repeated document warnings may become attributed monitoring observations.
+# Probe failures and monitor outages stay private; they never imply an attack.
+min_reports = 2
+min_span_seconds = 3600
+window_seconds = 172800
+stale_after_seconds = 259200
+retention_days = 30
+max_observations = 10000
+max_groups = 2000
+max_source_links = 3
+max_alerts_per_item = 100
+max_future_seconds = 300
+
 [llm]
 # Supply a base URL ending in /v1, or set a literal endpoint here.
 base_url = "${ONIONFLASH_LLM_BASE_URL}"
@@ -244,3 +258,26 @@ url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torpr
 product = "network"
 authority = "community"
 enabled = true
+
+[[sources]]
+id = "consensus-health-alerts"
+name = "Tor Project Consensus Health Monitoring Mailing List"
+website_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/"
+url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/feed/"
+kind = "feed"
+authority = "telemetry"
+product = "network"
+alert_format = "consensus"
+# Mirrors of this monitor must use the same identity.
+monitor_id = "tor-doctor"
+
+[[sources]]
+id = "anti-censorship-alerts"
+name = "Tor Project Anti-Censorship Monitoring Alerts Mailing List"
+website_url = "https://lists.torproject.org/mailman3/hyperkitty/list/anti-censorship-alerts@lists.torproject.org/"
+url = "https://lists.torproject.org/mailman3/hyperkitty/list/anti-censorship-alerts@lists.torproject.org/feed/"
+kind = "feed"
+authority = "telemetry"
+product = "network"
+alert_format = "censorship"
+monitor_id = "tor-anti-censorship-prometheus"

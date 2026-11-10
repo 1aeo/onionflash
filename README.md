@@ -72,6 +72,7 @@ The API key is read only from the variable named by `llm.api_key_env`.
 | `storage` | Private SQLite path, dedicated public output directory, maximum published archive size |
 | `collection` | Lookback, overlap, page/item limits, content limit, staleness, circuit backoff, total/source run budgets, reserved analysis time |
 | `http` | Connect/read/total deadlines, attempts, exponential backoff base/cap/jitter, bounded `Retry-After`, redirect/byte/rate limits, user agent |
+| `monitoring` | Alert persistence/window thresholds, freshness, private retention and storage/parser limits |
 | `llm` | Base URL and fallback URLs, model, key environment variable, private-network allowlist, deadlines, output/input limits, items per run, failed-item retry backoff |
 | `sources` | Stream ID, display name, public website URL, kind, collection URL, fallback URLs, product, authority, optional interval/page/item overrides |
 
@@ -107,6 +108,25 @@ Fallback URLs must represent the **same logical stream**. A changed primary URL
 resets that source's fetch cursor and conditional cache. Disabling a source stops
 collection without erasing already published news. GitLab merged changes are
 collected across branches, including maintenance branches.
+
+### Automated monitoring alerts
+
+Consensus-health and anti-censorship alerts use deterministic parsers selected
+by `alert_format`, with a configured `monitor_id` shared by any mirrors of the
+same monitor. They bypass Qwen. Unknown formats and undated messages cannot
+become news stories.
+
+The private SQLite incident records group repeated notifications. By default,
+eligible directory-document warnings need two reports at least one hour apart
+within a two-day window before publication as **observed anomalies**. Ordinary
+repeats do not create stories, change RSS GUIDs or advance publication dates.
+Missing alerts never establish recovery.
+
+Probe outages, unreachable services and censorship-monitor failures are held
+privately. The current alert feed does not provide independent healthy-vantage
+or control-test evidence, so repeated failures cannot establish country-wide
+blocking or an attack. `onionflash status --config config.toml` includes grouped
+monitoring status. See [monitoring behavior and limits](docs/MONITORING.md).
 
 ## Commands
 

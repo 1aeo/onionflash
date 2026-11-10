@@ -160,8 +160,11 @@ def run(config: dict, store: Store) -> dict:
         1 - config["collection"]["analysis_reserve_fraction"]
     )
 
-    def record_items(items):
+    def record_items(source, items):
         received = now_iso()
+        if source.get("alert_format"):
+            store.ingest_alerts(source, items, config["monitoring"], received)
+            return received
         priority = config["collection"]["tag_priority_score"]
         report["items_changed"] += sum(
             store.ingest(item, received, tag_priority_score=priority) for item in items
@@ -186,11 +189,11 @@ def run(config: dict, store: Store) -> dict:
                     result = collect_source(
                         client, source, state, config["collection"], observed
                     )
-                received = record_items(result["items"])
+                received = record_items(source, result["items"])
                 store.source_success(source, result, received, schedule_from=observed)
                 report["sources_ok"] += 1
             except CollectionError as exc:
-                received = record_items(exc.items)
+                received = record_items(source, exc.items)
                 store.source_failure(
                     source,
                     str(exc),
@@ -246,6 +249,7 @@ def run(config: dict, store: Store) -> dict:
             )
     report["pending_analysis"] = store.pending_count()
     report["published_stories"] = store.story_count(config["storage"]["max_stories"])
+    report["monitoring"] = store.monitoring_status(config["monitoring"], now_iso())
     report["public_changed"] = build(config, store)
     return report
 
@@ -304,6 +308,7 @@ def main(argv: list[str] | None = None) -> int:
                     result = {
                         "pending_analysis": store.pending_count(),
                         "published_stories": store.story_count(config["storage"]["max_stories"]),
+                        "monitoring": store.monitoring_status(config["monitoring"], now_iso()),
                         "sources": store.health(
                             config["sources"],
                             config["collection"]["stale_after_seconds"],

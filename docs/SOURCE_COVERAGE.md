@@ -16,6 +16,8 @@ protocol changes. The additional configured streams are:
 | [Anti-Censorship team issues](https://gitlab.torproject.org/api/v4/projects/549/issues) | `anti-censorship-team`, enabled | Human investigations of blocking and bridge/transport availability, including unlabeled reports. |
 | [Tor Metrics news Atom](https://metrics.torproject.org/news.atom) | `tor-metrics-news`, enabled hourly | Curated network events and explanations of measurement changes; treated conservatively as telemetry/context. |
 | [Tor Project Development Mailing List](https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/) | `tor-dev`, enabled every five minutes | Proposal and protocol-change discussions; the normal importance and evidence checks filter routine messages. |
+| [Consensus-health monitoring](https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/) | `consensus-health-alerts`, enabled | Deterministic grouping; persistent directory-document warnings may publish as attributed observations. |
+| [Anti-censorship monitoring alerts](https://lists.torproject.org/mailman3/hyperkitty/list/anti-censorship-alerts@lists.torproject.org/) | `anti-censorship-alerts`, enabled for private grouping | Monitor outages and single-system service failures remain held; they do not establish network attacks or country-wide blocking. |
 
 Browser release announcements were already present in Tor Blog and tor-announce.
 The Browser issue stream is deliberately filtered; it does not replace those
@@ -55,8 +57,6 @@ that warning. Long entry titles are retained in the bounded analysis context.
 
 | Source | Reason for keeping it outside automatic news publication for now |
 | --- | --- |
-| [Consensus-health alerts](https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/feed/) | Repeated hourly warnings need grouping by authority/condition and persistence/resolution tracking. A missing vote is not proof of compromise. |
-| [Anti-censorship alerts](https://lists.torproject.org/mailman3/hyperkitty/list/anti-censorship-alerts@lists.torproject.org/feed/) | A monitoring vantage point going offline must not become a claim that Tor is blocked. |
 | [Metrics alerts](https://lists.torproject.org/mailman3/hyperkitty/list/metrics-alerts@lists.torproject.org/feed/) | Collector failures need to remain distinct from network failures. |
 | [TPA infrastructure issues](https://gitlab.torproject.org/tpo/tpa/team) | Useful incidents mixed with substantial routine administration; add if infrastructure coverage is desired. |
 | [Tor Browser tags](https://gitlab.torproject.org/tpo/applications/tor-browser/-/tags?format=atom) | Mixes Browser/base-browser and stable/alpha/build tags; needs explicit product/version filtering. |
@@ -71,8 +71,9 @@ that warning. Long entry titles are retained in the bounded analysis context.
 2. **Public-only authenticated discussion updates.** Comments can carry crucial
    confirmations or fixes. A future connector must explicitly exclude private or
    confidential records even if its token can read them.
-3. **Grouped telemetry incidents.** This enables the automated alert streams above
-   without duplicate noise or unsupported claims about attacks.
+3. **Independent monitoring corroboration.** Grouping is implemented; promoting
+   censorship/probe failures requires additional evidence of functioning
+   independent monitoring locations or controls. The current feed lacks it.
 4. **Long-term measurement and retention.** The current audit reconstructs first
    verified publication from immutable receipts. Dedicated per-revision timing
    records would support long-term latency reporting and bounded receipt

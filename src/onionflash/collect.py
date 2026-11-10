@@ -128,7 +128,12 @@ def _feed(
     cutoff = after(-settings["lookback_days"] * 86400, started)
     items = []
     identities, conflicts = {}, set()
+    undated_alert = False
     for entry in feed.entries[: source["max_items"]]:
+        if source.get("alert_format") and not (entry.get("published_parsed") or entry.get("updated_parsed")):
+            # A poll's clock must never manufacture a new monitoring observation.
+            undated_alert = True
+            continue
         published = _entry_time(
             entry, "published", _entry_time(entry, "updated", started)
         )
@@ -169,6 +174,8 @@ def _feed(
                 conflicts.add(identity)
             identities[identity] = content
         items.append(item)
+    if undated_alert:
+        raise CollectionError("Undated monitoring messages skipped", items, catching_up=True)
     if conflicts:
         unambiguous = [item for item in items if (item["url"], item["updated_at"]) not in conflicts]
         raise CollectionError(
