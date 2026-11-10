@@ -176,6 +176,10 @@ def item_identity(item: dict) -> str:
     return item["url"]
 
 
+_PRODUCT_NAMES = {"tor": "tor", "arti": "arti", "tor-browser": "tor browser"}
+_VERSION = re.compile(r"\d+\.\d+(?:\.\d+){0,2}(?:[-.]?(?:alpha|beta|rc|a)\.?\d*)?")
+
+
 def item_cluster(item: dict) -> str:
     """Only merge strong matches: canonical identity, identical body, release version.
 
@@ -190,12 +194,16 @@ def item_cluster(item: dict) -> str:
             product = "arti"
         elif re.search(r"\btor\b", title):
             product = "tor"
-    if item.get("kind") == "tag" or re.search(r"\breleas(?:e|ed|ing)\b", title):
-        match = re.search(
-            r"\b(?:tor[- ]|arti[- ]v?|version\s+)?(\d+\.\d+(?:\.\d+){0,2}(?:[-.]?(?:alpha|beta|rc|a)\d*)?)\b",
-            title,
-        )
-        if match and product in {"tor", "arti", "tor-browser"}:
+    if product in _PRODUCT_NAMES and (item.get("kind") == "tag" or re.search(r"\breleas(?:e|ed|ing)\b", title)):
+        # Only the first version in the title, and only when it directly follows the
+        # product name ("Tor Browser 16.0", "tor-0.4.9.16", "arti-v2.8.0"); titles
+        # such as "Tails 7.16 ... Tor Browser 16.0" keep their own identity.
+        match = re.search(r"(?<![\w.])v?(\d+\.\d+(?:[\w.-]*\w)?)", title)
+        if (
+            match
+            and _VERSION.fullmatch(match.group(1))
+            and re.search(r"\b" + _PRODUCT_NAMES[product] + r"[- ](?:version\s+)?$", title[: match.start()])
+        ):
             return f"release:{product}:{match.group(1)}"
     body = re.sub(r"\s+", " ", item["content"]).strip().lower()
     if len(body) >= 180 and item.get("kind") in {"gitlab_issue", "gitlab_mr"}:

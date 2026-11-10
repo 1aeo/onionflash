@@ -742,7 +742,8 @@ def test_skipped_story_count_is_reported_on_unchanged_builds(tmp_path):
 
 def test_story_precedence_keeps_confirmed_account_but_follows_its_own_updates(tmp_path):
     def publish(store, url, updated, content=item()["content"], **result):
-        store.ingest(item(url=url, title="Arti 2.8.0 released", updated_at=updated, kind="feed", content=content), updated)
+        store.ingest(item(url=url, title="Arti 2.8.0 released", updated_at=updated, kind="feed", content=content,
+                          product="arti"), updated)
         row = next(r for r in store.pending(10, updated) if r["url"] == url)
         store.finish(row, analysis(**result), "key-" + url + updated, updated)
         return store.stories(10)
@@ -773,6 +774,12 @@ def test_release_clusters_include_two_part_versions_and_alpha_suffixes():
     assert key("Tor 0.4.9.16 is released") == "release:tor:0.4.9.16"
     assert key("Tor 0.5.0.1-alpha is released") == "release:tor:0.5.0.1-alpha"
     assert key("New Release: Tor Browser 15.0.26") == "release:tor-browser:15.0.26"
+    assert key("tor-0.4.9.16", kind="tag") == "release:tor:0.4.9.16" and key("arti-v2.8.0", kind="tag") == "release:arti:2.8.0"
+    assert key("Tor Browser 16.0-alpha.1 released") != key("Tor Browser 16.0-alpha.2 released")
+    assert key("Tor Browser 16.0-alpha.1 released") == "release:tor-browser:16.0-alpha.1"
+    # A version that does not directly follow the product name never forms a release cluster.
+    assert key("Tor Browser for Ubuntu 24.04: 15.0.26 released").startswith("url:")
+    assert key("Tails 7.16 released with Tor Browser 16.0 and Tor 0.4.9.15").startswith("url:")
 
 
 def test_precedence_compares_with_the_writing_item_not_later_losers(tmp_path):
