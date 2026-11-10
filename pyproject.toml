@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "onionflash"
-version = "0.2.1"
+version = "0.2.2"
 description = "A small, source-linked Tor news collector and static publisher."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { runInNewContext } from "node:vm";
 
+const appScript = readFileSync(new URL("../src/onionflash/assets/app.js", import.meta.url), "utf8");
+
 function fixture() {
   const nodes = [
     { dataset: { tags: "directory-authority security tor", search: "authority security report" }, hidden: false },
@@ -26,7 +28,7 @@ function fixture() {
     querySelector: () => tools,
     getElementById: (id) => elements[id],
   };
-  runInNewContext(readFileSync(new URL("../src/onionflash/assets/app.js", import.meta.url), "utf8"), {
+  runInNewContext(appScript, {
     document,
     window: { requestAnimationFrame: (callback) => callback() },
   });
@@ -53,4 +55,38 @@ test("Topic membership combines with search and can return to all stories", () =
   ui.buttons.find((button) => button.dataset.filter === "all").click();
   assert.deepEqual(ui.nodes.map((node) => node.hidden), [false, false, false]);
   assert.equal(ui.count.textContent, "3 stories");
+});
+
+test("Site menu opens and Escape restores focus on story pages without news filters", () => {
+  const toggle = {
+    hidden: true,
+    attributes: { "aria-expanded": "false" },
+    getAttribute(key) { return this.attributes[key]; },
+    setAttribute(key, value) { this.attributes[key] = value; },
+    addEventListener(type, callback) { this[type] = callback; },
+    focus() { this.focused = true; },
+  };
+  const classes = new Set();
+  const navigation = {
+    classList: { add(name) { classes.add(name); } },
+    addEventListener(type, callback) { this[type] = callback; },
+  };
+  const elements = { "site-nav": navigation, "site-nav-toggle": toggle };
+  runInNewContext(appScript, {
+    document: {
+      querySelectorAll: () => [],
+      querySelector: () => null,
+      getElementById: (id) => elements[id],
+    },
+  });
+  assert.equal(toggle.hidden, false);
+  assert.equal(classes.has("enhanced"), true);
+  toggle.click();
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  toggle.click();
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  toggle.click();
+  navigation.keydown({ key: "Escape" });
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(toggle.focused, true);
 });

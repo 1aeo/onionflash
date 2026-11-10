@@ -7,6 +7,23 @@
     node.textContent = year;
   });
 
+  // The site menu also runs on story pages, which have no news filters.
+  const navigation = document.getElementById("site-nav");
+  const menuToggle = document.getElementById("site-nav-toggle");
+  if (navigation && menuToggle) {
+    menuToggle.addEventListener("click", () => {
+      menuToggle.setAttribute("aria-expanded", String(menuToggle.getAttribute("aria-expanded") !== "true"));
+    });
+    navigation.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && menuToggle.getAttribute("aria-expanded") === "true") {
+        menuToggle.setAttribute("aria-expanded", "false");
+        menuToggle.focus();
+      }
+    });
+    navigation.classList.add("enhanced");
+    menuToggle.hidden = false;
+  }
+
   const tools = document.querySelector("[data-news-tools]");
   const search = document.getElementById("news-search");
   const list = document.getElementById("news-list");

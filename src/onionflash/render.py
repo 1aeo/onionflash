@@ -199,6 +199,29 @@ def _health_details(health: list[dict]) -> str:
     return '<details class="source-health"><summary>Source availability</summary><p>Collection status, not the status of the Tor network.</p><ul>' + "".join(rows) + "</ul></details>"
 
 
+def _navigation(base: str) -> str:
+    links = (
+        ("Home", "https://1aeo.com/"),
+        ("Onion Vanity", "https://1aeo.com/onionvanity/"),
+        ("Blog", "https://1aeo.com/blog/"),
+        ("Onion Flash", base),
+        ("Metrics", "https://metrics.1aeo.com"),
+        ("Exit DNS Health", "https://exitdnshealth.1aeo.com"),
+        ("AROI Validator", "https://aroivalidator.1aeo.com"),
+        ("RouteFluxMap", "https://routefluxmap.1aeo.com"),
+        ("Contact", "https://1aeo.com/#contact"),
+    )
+    items = "".join(
+        f'<a href="{_escape(url)}"' + (' aria-current="true"' if label == "Onion Flash" else "") + f'>{label}</a>'
+        for label, url in links
+    )
+    return ('<nav class="site-nav" id="site-nav" aria-label="1AEO websites">'
+            '<button class="site-nav-toggle" id="site-nav-toggle" type="button" '
+            'aria-expanded="false" aria-controls="site-nav-links" hidden>'
+            '<span aria-hidden="true">☰</span> <span>Menu</span></button>'
+            f'<div class="site-nav-links" id="site-nav-links">{items}</div></nav>')
+
+
 def _shell(site: dict, base: str, title: str, description: str, body: str, canonical: str) -> str:
     name = _text(site.get("title", "Onion Flash"), 80)
     repository = _safe_url(site.get("repository_url", "https://github.com/1aeo/onionflash"))
@@ -208,7 +231,7 @@ def _shell(site: dict, base: str, title: str, description: str, body: str, canon
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_escape(title)}</title><meta name="description" content="{_escape(description)}">
-<meta name="theme-color" content="#33203f"><link rel="canonical" href="{_escape(canonical)}">
+<meta name="theme-color" content="#121212"><link rel="canonical" href="{_escape(canonical)}">
 <link rel="icon" href="{_escape(base)}mark.svg" type="image/svg+xml">
 <link rel="stylesheet" href="{_escape(base)}style.css">
 <link rel="alternate" type="application/rss+xml" title="{_escape(name)} RSS" href="{_escape(base)}feed.xml">
@@ -216,6 +239,7 @@ def _shell(site: dict, base: str, title: str, description: str, body: str, canon
 <script src="{_escape(base)}app.js" defer></script>
 </head><body>
 <a class="skip-link" href="#main">Skip to news</a>
+{_navigation(base)}
 <header class="masthead"><div class="masthead-inner">
 <a class="brand" href="{_escape(base)}" aria-label="{_escape(name)} home"><img src="{_escape(base)}mark.svg" alt="" width="42" height="42"><span>{_escape(name)}</span></a>
 <span class="edition">Independent Tor news<br><span>by 1AEO</span></span>
