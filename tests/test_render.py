@@ -253,6 +253,7 @@ class RenderTests(unittest.TestCase):
         # Product slugs (here "tor") are not topics; only the category and tags are.
         self.assertIn('data-tags="directory-authority security"', page)
         self.assertIn('data-tags="release security"', page)
+        self.assertIn(' tor"', page)  # products stay searchable through data-search
         def titles(topic):
             return {item.findtext("title") for item in ET.parse(output / f"tags/{topic}.xml").findall("./channel/item")}
         self.assertEqual(titles("security"), {authority["title"], release["title"]})

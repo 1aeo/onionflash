@@ -773,3 +773,20 @@ def test_release_clusters_include_two_part_versions_and_alpha_suffixes():
     assert key("Tor 0.4.9.16 is released") == "release:tor:0.4.9.16"
     assert key("Tor 0.5.0.1-alpha is released") == "release:tor:0.5.0.1-alpha"
     assert key("New Release: Tor Browser 15.0.26") == "release:tor-browser:15.0.26"
+
+
+def test_precedence_compares_with_the_writing_item_not_later_losers(tmp_path):
+    def publish(store, url, updated, **result):
+        store.ingest(item(url=url, title="Tor 0.4.9.17 released", updated_at=updated, kind="feed", content=url), updated)
+        row = next(r for r in store.pending(10, updated) if r["url"] == url)
+        store.finish(row, analysis(title=result.pop("title"), **result), "k" + url, updated)
+        return store.stories(10)[0]
+
+    with Store(tmp_path / "state.db") as store:
+        publish(store, "https://a.example/1", "2026-11-08T12:00:00Z", title="A", confidence="confirmed")
+        # A lower-ranked (unconfirmed) item advances the story's updated_at but not its text.
+        story = publish(store, "https://b.example/1", "2026-11-08T15:00:00Z", title="B", confidence="reported")
+        assert (story["title"], story["updated_at"]) == ("A", "2026-11-08T15:00:00Z")
+        # A newer confirmed item than the writer still replaces the text.
+        story = publish(store, "https://c.example/1", "2026-11-08T13:00:00Z", title="C", confidence="confirmed")
+        assert story["title"] == "C"
