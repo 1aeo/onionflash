@@ -924,6 +924,13 @@ def test_bad_base_url_and_traversal_are_rejected(tmp_path, base):
         load_config(path)
 
 
+@pytest.mark.parametrize("base", ["https://example.com/news?", "https://example.com/news/#", "https://example.com/news"])
+def test_base_url_is_normalized_to_a_clean_directory(tmp_path, base):
+    path = tmp_path / "config.toml"
+    path.write_text(f'[site]\nbase_url = "{base}"\n[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
+    assert load_config(path)["site"]["base_url"] == "https://example.com/news/"
+
+
 def test_retired_settings_are_accepted_and_ignored(tmp_path, caplog):
     path = tmp_path / "config.toml"
     path.write_text(
