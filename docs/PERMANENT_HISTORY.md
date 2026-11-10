@@ -5,6 +5,13 @@ through `/`, `/page/2/`, and subsequent pages. Every story retains
 `/news/<id>/`; its public structured representation is `/news/<id>/story.json`.
 Paths are relative to `site.base_url`.
 
+Static topic pages use `/topics/<topic>/` and
+`/topics/<topic>/page/2/`. A story belongs when either its primary category or a
+secondary tag matches. All eight topics have a page, including an explicit empty
+state when there are no stories. Existing `/tags/<topic>.xml` RSS URLs remain the
+same. Topic links, pagination, mobile navigation and editorial history require no
+browser JavaScript.
+
 `site.page_size` controls pagination. `site.feed_size = 0` includes all accepted
 stories in RSS, JSON Feed and topic feeds. Homepage ordering follows the date
 Onion Flash added the story, with the original source date retained on the
@@ -21,6 +28,10 @@ Unchanged article HTML and JSON are not rewritten. Whole-history feeds require
 a sequential pass when their content changes, but are streamed with bounded
 memory. Pagination indexes can change when new stories shift page boundaries.
 Neither operation requires rerunning the LLM.
+
+An indexed topic-membership table keeps topic pagination bounded in memory.
+Only affected topic listings are refreshed after a content or classification
+change. Obsolete pagination views can be removed; article pages are retained.
 
 The private catalog stores timestamps, hashes and one compact last-good public
 JSON snapshot per article. Raw source text and model evidence are not exported
@@ -61,3 +72,22 @@ Before an installation first switches existing article paths to Spaces, drain
 the render queue and verify every previously published permalink. The deployer
 holds activation if a legacy article is absent from the verified object index.
 Operational byte/time/batch limits hold unfinished work; they do not expire news.
+
+## Upgrade from the browser-script version
+
+Upgrade the application and deployment repositories together, then build until
+`no_browser_js_ready` is true and `articles_pending` is absent. The normal
+scheduler can continue those bounded builds; the new deployer holds publication
+until the transition is complete. It never activates a mixture of older
+script-dependent articles and the new asset set.
+
+The builder verifies the accepted article catalog and owned artifact hashes
+before retiring the old `app.js`. A modified or untracked script, unsafe path or
+unrepresented article blocks retirement instead of deleting unfamiliar data.
+Restore or inspect the affected output before retrying. The private metadata
+flag `publication_no_browser_js_ready` records the completed transition.
+
+Later bounded template and copyright-year rebuilds resume normally. Their
+existing pages are already script-free. The deployer validates new HTML and
+serves a script-blocking CSP; old immutable storage objects and prior deployment
+versions remain available for rollback.

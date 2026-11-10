@@ -8,8 +8,9 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from html.parser import HTMLParser
 
-from onionflash.render import render_site
+from onionflash.render import CATEGORIES, _page_url, render_site
 
 
 CONFIG = {
@@ -34,6 +35,45 @@ STORY = {
     "published_at": "2026-11-08T12:00:00Z",
     "updated_at": "2026-11-08T14:00:00Z",
 }
+
+
+class Page(HTMLParser):
+    """Inspect actual HTML elements and link labels, ignoring escaped source text."""
+    def __init__(self, text):
+        super().__init__()
+        self.tags, self.links, self.summaries = [], [], []
+        self.nav = self.link = self.summary = None
+        self.feed(text)
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        self.tags.append((tag, attrs))
+        if tag == "nav":
+            self.nav = attrs.get("aria-label")
+        elif tag == "a":
+            self.link = {**attrs, "text": "", "nav": self.nav}
+            self.links.append(self.link)
+        elif tag == "summary":
+            self.summary = {"text": ""}
+            self.summaries.append(self.summary)
+
+    def handle_endtag(self, tag):
+        if tag == "nav":
+            self.nav = None
+        elif tag == "a":
+            self.link = None
+        elif tag == "summary":
+            self.summary = None
+
+    def handle_data(self, text):
+        if self.link is not None:
+            self.link["text"] += text
+        if self.summary is not None:
+            self.summary["text"] += text
+
+    def story_ids(self):
+        return [attrs["id"].removeprefix("story-") for tag, attrs in self.tags
+                if tag == "article" and attrs.get("class") == "story"]
 
 
 class RenderTests(unittest.TestCase):
@@ -179,11 +219,12 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(item["tags"], ["release"])
         self.assertIn(STORY["sources"][0]["url"], item["content_text"])
 
-    def test_search_text_lowercases_like_the_page_script(self):
+    def test_unicode_title_is_readable_without_hidden_search_data(self):
         story = copy.deepcopy(STORY)
         story["title"] = "Straße relay notes"
         page = (self.render([story]) / "index.html").read_text()
-        self.assertIn('data-search="straße relay notes', page)
+        self.assertIn('Straße relay notes</a>', page)
+        self.assertNotIn('data-search', page)
 
     def test_malformed_stored_fields_are_skipped(self):
         for index, change in enumerate([{"category": ["security"]}, {"sources": None}, {"tags": None}, {"title": None}]):
@@ -227,13 +268,14 @@ class RenderTests(unittest.TestCase):
         output = self.render()
         page = (output / "index.html").read_text()
         self.assertIn('href="https://example.com/onionflash/style.css"', page)
-        self.assertIn('src="https://example.com/onionflash/app.js"', page)
+        self.assertNotIn('app.js', page)
         self.assertIn('href="https://example.com/onionflash/feed.xml"', page)
-        for name in ["style.css", "app.js", "mark.svg"]:
+        for name in ["style.css", "mark.svg"]:
             self.assertTrue((output / name).is_file())
         headers = (output / "_headers").read_text()
         self.assertTrue(headers.startswith("/onionflash/*\n"))
-        self.assertIn("script-src 'self'", headers)
+        self.assertIn("script-src 'none'", headers)
+        self.assertIn("connect-src 'none'", headers)
         self.assertNotIn("unsafe-inline", headers)
 
     def test_root_and_local_preview_base_urls_are_supported(self):
@@ -279,25 +321,98 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(len(ET.parse(first / "tags/release.xml").findall("./channel/item")), 1)
         self.assertEqual(ET.parse(first / "tags/security.xml").findall("./channel/item"), [])
 
-    def test_secondary_security_tags_appear_in_filters_and_each_relevant_feed(self):
+    def test_topic_pages_include_primary_categories_or_secondary_tags(self):
         authority = copy.deepcopy(STORY)
         authority.update(id="authority123", category="directory-authority", tags=["security"], title="An authority security report")
         release = copy.deepcopy(STORY)
         release.update(id="release456", category="release", tags=["security"], title="A security release")
         output = self.render([authority, release])
         page = (output / "index.html").read_text()
+        self.assertIn('href="https://example.com/onionflash/topics/security/"', page)
+        def story_ids(topic):
+            return set(Page((output / f"topics/{topic}/index.html").read_text()).story_ids())
         # Neither story's primary category is security, but both are relevant.
-        self.assertIn('data-filter="security"', page)
-        # Product slugs (here "tor") are not topics; only the category and tags are.
-        self.assertIn('data-tags="directory-authority security"', page)
-        self.assertIn('data-tags="release security"', page)
-        self.assertIn(' tor"', page)  # products stay searchable through data-search
+        self.assertEqual(story_ids("security"), {authority["id"], release["id"]})
+        self.assertEqual(story_ids("directory-authority"), {authority["id"]})
+        self.assertEqual(story_ids("release"), {release["id"]})
+        self.assertEqual(story_ids("network"), set())
+        self.assertFalse((output / "topics/tor").exists())  # Products are not topics.
         def titles(topic):
             return {item.findtext("title") for item in ET.parse(output / f"tags/{topic}.xml").findall("./channel/item")}
         self.assertEqual(titles("security"), {authority["title"], release["title"]})
         self.assertEqual(titles("directory-authority"), {authority["title"]})
         self.assertEqual(titles("release"), {release["title"]})
         self.assertEqual(titles("network"), set())
+
+    def test_every_page_has_no_browser_script_or_dead_search_controls(self):
+        output = self.render()
+        self.assertFalse(list(output.rglob("*.js")))
+        for file in output.rglob("*.html"):
+            text = file.read_text()
+            parsed = Page(text)
+            self.assertFalse({tag for tag, attrs in parsed.tags} & {"script", "button", "input", "iframe"})
+            for tag, attrs in parsed.tags:
+                self.assertFalse(any(name.startswith("on") for name in attrs))
+                self.assertFalse({"data-tags", "data-search", "data-news-tools", "data-filter"} & attrs.keys())
+                self.assertFalse(any(str(value).startswith("javascript:") for value in attrs.values()))
+            self.assertNotIn("no-results", text)
+            self.assertNotIn("app.js", text)
+
+    def test_native_mobile_menu_and_desktop_header_keep_plain_text_links(self):
+        output = self.render()
+        expected = {"Home", "Onion Vanity", "Blog", "Onion Flash", "Metrics",
+                    "Exit DNS Health", "AROI Validator", "RouteFluxMap", "Contact"}
+        for file in (output / "index.html", output / "news" / STORY["id"] / "index.html"):
+            parsed = Page(file.read_text())
+            menu = [attrs for tag, attrs in parsed.tags if tag == "details" and attrs.get("class") == "site-nav-mobile"]
+            self.assertEqual(len(menu), 1)
+            self.assertNotIn("open", menu[0])
+            self.assertIn({"text": "Menu"}, parsed.summaries)
+            links = [link for link in parsed.links if link["nav"] == "1AEO websites"]
+            self.assertEqual(len(links), 2 * len(expected))
+            self.assertEqual({link["text"] for link in links}, expected)
+            self.assertTrue(all(link["href"].startswith("https://") for link in links))
+            self.assertTrue(all(link.get("aria-current") == "true" for link in links if link["text"] == "Onion Flash"))
+
+    def test_all_topic_links_exist_with_selected_topic_and_empty_pages(self):
+        output = self.render()
+        for topic in [None, *CATEGORIES]:
+            file = output / (_page_url("", 1, topic) + "index.html")
+            parsed = Page(file.read_text())
+            links = [link for link in parsed.links if link["nav"] == "News topics"]
+            self.assertEqual(len(links), 1 + len(CATEGORIES))
+            current = [link for link in links if link.get("aria-current") == "page"]
+            self.assertEqual(len(current), 1)
+            self.assertEqual(current[0]["href"], _page_url(CONFIG["site"]["base_url"], 1, topic))
+            self.assertEqual(current[0]["text"], CATEGORIES.get(topic, "All news"))
+            if topic:
+                self.assertTrue(any(link["href"].endswith(f"tags/{topic}.xml") for link in parsed.links))
+        empty = (output / "topics/network/index.html").read_text()
+        self.assertIn("No stories in this topic yet.", empty)
+        self.assertEqual(Page(empty).story_ids(), [])
+
+    def test_topic_pagination_canonical_urls_and_newest_first_order(self):
+        stories = [dict(STORY, id=f"release{number}", added_at=f"2026-11-{number + 1:02}T12:00:00Z") for number in range(3)]
+        config = {"site": {**CONFIG["site"], "page_size": 1}}
+        output = self.render(stories, config=config)
+        for number, expected in [(1, "release2"), (2, "release1"), (3, "release0")]:
+            page_url = _page_url(CONFIG["site"]["base_url"], number, "release")
+            file = output / _page_url("", number, "release") / "index.html"
+            parsed = Page(file.read_text())
+            self.assertEqual(parsed.story_ids(), [expected])
+            canonical = [attrs["href"] for tag, attrs in parsed.tags if tag == "link" and attrs.get("rel") == "canonical"]
+            self.assertEqual(canonical, [page_url])
+            pagination = [link for link in parsed.links if link["nav"] == "News pages"]
+            self.assertEqual({link["rel"] for link in pagination}, ({"next"} if number == 1 else {"prev"} if number == 3 else {"next", "prev"}))
+            for link in pagination:
+                next_page = number + (1 if link["rel"] == "next" else -1)
+                self.assertEqual(link["href"], _page_url(CONFIG["site"]["base_url"], next_page, "release"))
+        self.assertEqual(len(ET.parse(output / "tags/release.xml").findall("./channel/item")), 3)
+
+    def test_unknown_topic_cannot_become_a_path_or_html(self):
+        for topic in ["../outside", '<script>', "tor", ""]:
+            with self.assertRaises(ValueError):
+                _page_url("https://example.com/", 1, topic)
 
 
 if __name__ == "__main__":

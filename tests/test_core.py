@@ -640,7 +640,7 @@ def test_render_failure_preserves_prior_site(tmp_path, monkeypatch):
         store.source_success(cfg["sources"][0], {"url": cfg["sources"][0]["url"]}, DATE)
         store.ingest(item(), DATE)
         store.finish(store.pending(1, DATE)[0], analysis(), "cache", DATE)
-        assert build(cfg, store) == {"public_changed": True, "published_stories": 1, "stories_skipped": 0}
+        assert build(cfg, store) == {"public_changed": True, "published_stories": 1, "stories_skipped": 0, "no_browser_js_ready": True}
         before = (tmp_path / "public/index.html").read_bytes()
         assert build(cfg, store)["published_stories"] == 1
         assert (tmp_path / "public/index.html").read_bytes() == before  # deterministic output
@@ -714,8 +714,8 @@ def test_skipped_story_count_is_reported_on_every_build(tmp_path):
             store.finish(row, analysis(), "key-" + row["id"], DATE)
         store.db.execute("UPDATE stories SET payload=json_set(payload, '$.priority', 'urgent') "
                          "WHERE rowid=(SELECT MIN(rowid) FROM stories)")
-        assert build(cfg, store) == {"public_changed": True, "published_stories": 1, "stories_skipped": 1}
-        assert build(cfg, store) == {"public_changed": False, "published_stories": 1, "stories_skipped": 1}
+        assert build(cfg, store) == {"public_changed": True, "published_stories": 1, "stories_skipped": 1, "no_browser_js_ready": True}
+        assert build(cfg, store) == {"public_changed": False, "published_stories": 1, "stories_skipped": 1, "no_browser_js_ready": True}
 
 
 def test_story_precedence_keeps_confirmed_account_but_follows_its_own_updates(tmp_path):
