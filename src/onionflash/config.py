@@ -59,6 +59,23 @@ DEFAULTS = {
         "user_agent": "OnionFlash (+https://github.com/1aeo/onionflash)",
     },
     "monitoring": {},
+    "comments": {
+        "enabled": False,
+        "run_budget_seconds": 30,
+        "max_issues_per_run": 12,
+        "max_issues_per_source": 4,
+        "max_pages": 2,
+        "page_size": 20,
+        "max_comments": 12,
+        "comment_chars": 2000,
+        "total_chars": 8000,
+        "interval_seconds": 1800,
+        "candidate_days": 14,
+        "cache_days": 30,
+        "max_cache_entries": 512,
+        "failure_backoff_base_seconds": 300,
+        "failure_backoff_cap_seconds": 21600,
+    },
     "llm": {
         "base_url": "",
         "fallback_base_urls": [],
@@ -117,6 +134,15 @@ BOUNDS = {
     "reconcile_seconds": (300, 604800),
     "max_xml_depth": (8, 256),
     "max_xml_elements": (100, 100000),
+    "max_issues_per_run": (1, 100),
+    "max_issues_per_source": (1, 20),
+    "max_comments": (1, 100),
+    "comment_chars": (100, 10000),
+    "total_chars": (1000, 40000),
+    "interval_seconds": (30, 604800),
+    "candidate_days": (1, 365),
+    "cache_days": (1, 365),
+    "max_cache_entries": (1, 10000),
 }
 
 
@@ -165,7 +191,7 @@ def load_config(path: str | Path) -> dict:
                     f"Unknown {section} settings: {', '.join(sorted(unknown))}"
                 )
             config[section].update(values)
-    for section in ("http", "collection", "llm", "storage", "site"):
+    for section in ("http", "collection", "llm", "storage", "site", "comments"):
         for key, value in config[section].items():
             if key in BOUNDS:
                 low, high = BOUNDS[key]
@@ -189,6 +215,10 @@ def load_config(path: str | Path) -> dict:
                     raise ValueError(f"{section}.{key} must be an integer")
     if config["http"]["backoff_cap_seconds"] < config["http"]["backoff_base_seconds"]:
         raise ValueError("HTTP backoff cap must be at least its base")
+    if not isinstance(config["comments"]["enabled"], bool):
+        raise ValueError("comments.enabled must be a boolean")
+    if config["comments"]["failure_backoff_cap_seconds"] < config["comments"]["failure_backoff_base_seconds"]:
+        raise ValueError("Comments backoff cap must be at least its base")
     base_url = _expand(config["site"]["base_url"])
     parsed_site = urlsplit(base_url)
     if (
@@ -282,6 +312,9 @@ def load_config(path: str | Path) -> dict:
             "interval_seconds",
             "alert_format",
             "monitor_id",
+            "gitlab_project",
+            "comments_graphql_url",
+            "comments_enabled",
         }
         if not isinstance(source, dict) or set(source) - allowed:
             raise ValueError("Invalid source keys")
@@ -338,6 +371,16 @@ def load_config(path: str | Path) -> dict:
             if website.query or website.fragment or not website.path.strip("/"):
                 raise ValueError("Timeline website_url must be a clean repository URL")
         source["fallback_urls"] = [canonical_url(u) for u in source["fallback_urls"]]
+        if any(key in source for key in ("gitlab_project", "comments_graphql_url", "comments_enabled")):
+            if source["kind"] != "gitlab_issue":
+                raise ValueError("Comment configuration requires a GitLab issue source")
+            if not isinstance(source.get("comments_enabled", True), bool):
+                raise ValueError("comments_enabled must be a boolean")
+            from .comments import CommentError, _identity
+            try:
+                _identity(source)
+            except (CommentError, ValueError) as exc:
+                raise ValueError("Invalid anonymous GitLab comments configuration") from exc
         for key, global_key in [
             ("max_pages", "max_pages"),
             ("max_items", "max_items_per_source"),

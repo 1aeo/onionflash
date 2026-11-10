@@ -17,7 +17,7 @@ from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import render
+from . import editorial, render
 from .util import digest, now_iso
 
 
@@ -97,7 +97,7 @@ def publication_year() -> int:
 
 def template_identity(site: dict) -> str:
     root = Path(__file__).parent
-    files = [(name, hashlib.sha256((root / name).read_bytes()).hexdigest()) for name in ("render.py", "publication.py", "schema.py", "util.py")]
+    files = [(name, hashlib.sha256((root / name).read_bytes()).hexdigest()) for name in ("render.py", "publication.py", "editorial.py", "schema.py", "util.py")]
     return digest([SCHEMA_VERSION, files, publication_year(), {key: site.get(key) for key in ("title", "description", "base_url", "repository_url")}])
 
 
@@ -199,7 +199,8 @@ def _public_story(row) -> dict:
     payload = row["public_json"]
     if not isinstance(payload, str) or hashlib.sha256(payload.encode("utf-8")).hexdigest() != row["json_sha256"]:
         raise ValueError("Accepted public story snapshot is missing or changed")
-    story = render._prepare_story(json.loads(payload))
+    decoded = json.loads(payload)
+    story = render._prepare_story(decoded, editorial=decoded.get("editorial"))
     if story["id"] != row["story_id"]:
         raise ValueError("Accepted story identity differs from its catalog entry")
     return story
@@ -233,7 +234,8 @@ def _backfill_public_json(db, output: Path) -> None:
                 if not path.is_file() or _file_hash(path) != row["json_sha256"]:
                     raise ValueError("Cannot migrate missing last-good story snapshot")
                 payload = path.read_text(encoding="utf-8")
-                story = render._prepare_story(json.loads(payload))
+                decoded = json.loads(payload)
+                story = render._prepare_story(decoded, editorial=decoded.get("editorial"))
                 if story["id"] != row["story_id"]:
                     raise ValueError("Invalid last-good story identity")
                 db.execute("UPDATE public_catalog SET public_json=? WHERE story_id=?", (payload, row["story_id"]))
@@ -333,7 +335,8 @@ def build(config: dict, store, *, force: bool = False) -> dict:
                 continue
             source_hash = accepted["source_hash"]
         try:
-            story = _public_story(accepted) if accepted is not None else render._prepare_story(json.loads(row["payload"]))
+            story = _public_story(accepted) if accepted is not None else render._prepare_story(
+                json.loads(row["payload"]), editorial=editorial.public_metadata(db, row["id"]))
             if story["id"] != row["id"]:
                 raise ValueError("Story identity differs from its database row")
             article = render.article_html(site, base, story)

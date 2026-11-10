@@ -64,6 +64,14 @@ def digest(value: object) -> str:
     ).hexdigest()
 
 
+_TYPOGRAPHY = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2013": "-", "\u2014": "-"})
+
+
+def normalize_evidence(text: str) -> str:
+    """Use identical quote matching for validation and deterministic citations."""
+    return " ".join(text.translate(_TYPOGRAPHY).split()).casefold()
+
+
 class _TextParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -205,7 +213,10 @@ def item_cluster(item: dict) -> str:
             and re.search(r"\b" + _PRODUCT_NAMES[product] + r"[- ](?:version\s+)?$", title[: match.start()])
         ):
             return f"release:{product}:{match.group(1)}"
-    body = re.sub(r"\s+", " ", item["content"]).strip().lower()
+    # Related issues can have different discussions. Comments enrich analysis,
+    # but must not split an existing identical-description incident grouping.
+    original = item.get("source_content") if item.get("kind") == "gitlab_issue" else None
+    body = re.sub(r"\s+", " ", original if isinstance(original, str) else item["content"]).strip().lower()
     if len(body) >= 180 and item.get("kind") in {"gitlab_issue", "gitlab_mr"}:
         clean_title = re.sub(r"\s+", " ", title).strip()
         clean_title = re.sub(

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from .util import after, backoff_seconds, digest, item_cluster, item_identity
-from . import monitoring
+from .util import after, backoff_seconds, canonical_url, digest, format_utc, item_cluster, item_identity, normalize_evidence, parse_utc
+from . import editorial, monitoring
 
 
 def backup_database(source: str | Path, destination: str | Path) -> None:
@@ -67,6 +68,37 @@ def _rank(kind: str, confidence: str, updated_at: str) -> tuple:
     return ({"tag": 0, "metrics_timeline": 1}.get(kind, 2), confidence == "confirmed", updated_at)
 
 
+def _comment_sources(item: dict, result: dict, input_chars: int | None, observed: str) -> list[dict]:
+    if type(input_chars) is not int or input_chars <= 0 or not item.get("public_comments"):
+        return []
+    from .comments import analysis_context
+    try:
+        _, supplied = analysis_context(item, input_chars)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return []
+    evidence = [normalize_evidence(quote) for quote in result.get("evidence", []) if isinstance(quote, str)]
+    evidence = [quote for quote in evidence if len(quote) >= 8]
+    sources = []
+    for note in supplied:
+        try:
+            identifier = re.fullmatch(r"gid://gitlab/Note/([0-9]+)", note["id"])
+            url = canonical_url(note["url"])
+            if not identifier or url != canonical_url(item["url"]).split("#", 1)[0] + "#note_" + identifier[1]:
+                continue
+            body = normalize_evidence(note["body"])
+            if not any(quote in body for quote in evidence):
+                continue
+            created = format_utc(parse_utc(note["created_at"]))
+            updated = format_utc(parse_utc(note["updated_at"]))
+            if not created <= updated <= observed:
+                continue
+            sources.append({"id": item["id"] + ":" + note["id"], "source_item_id": item["id"],
+                            "url": url, "title": note["title"], "published_at": created, "updated_at": updated})
+        except (KeyError, TypeError, ValueError, UnicodeError):
+            continue
+    return sources
+
+
 class Store:
     def __init__(self, path: str | Path):
         path = Path(path)
@@ -103,10 +135,11 @@ class Store:
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
         monitoring.initialize(self.db)
+        editorial.initialize(self.db)
         analysis_columns = {row[1] for row in self.db.execute("PRAGMA table_info(analyses)")}
-        for name in ("source_payload", "source_item_id"):
+        for name, kind in (("source_payload", "TEXT"), ("source_item_id", "TEXT"), ("input_chars", "INTEGER")):
             if name not in analysis_columns:
-                self.db.execute(f"ALTER TABLE analyses ADD COLUMN {name} TEXT")
+                self.db.execute(f"ALTER TABLE analyses ADD COLUMN {name} {kind}")
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(source_state)")}
         for name, kind in [
             ("scan_lower", "TEXT"),
@@ -311,13 +344,13 @@ class Store:
     def rejected_count(self) -> int:
         return self.db.execute("SELECT COUNT(*) FROM items WHERE status='rejected'").fetchone()[0]
 
-    def finish(self, row: dict, result: dict, cache_key: str, observed: str) -> None:
+    def finish(self, row: dict, result: dict, cache_key: str, observed: str, *, input_chars: int | None = None) -> None:
         item = json.loads(row["payload"])
         with self.db:
             self.db.execute(
                 """INSERT OR IGNORE INTO analyses
-                (cache_key,result,created_at,source_payload,source_item_id) VALUES(?,?,?,?,?)""",
-                (cache_key, json.dumps(result, ensure_ascii=False), observed, row["payload"], row["id"]),
+                (cache_key,result,created_at,source_payload,source_item_id,input_chars) VALUES(?,?,?,?,?,?)""",
+                (cache_key, json.dumps(result, ensure_ascii=False), observed, row["payload"], row["id"], input_chars),
             )
             story_id = row.get("story_id")
             if result["publish"]:
@@ -335,14 +368,23 @@ class Store:
                 story_id = (
                     existing["id"] if existing else digest(row["cluster_key"])[:24]
                 )
+                if existing is not None and editorial.is_locked(self.db, story_id):
+                    # Keep the new source analysis privately and its grouping
+                    # relationship, but do not overwrite an operator decision.
+                    editorial.record_held(self.db, story_id, observed)
+                    self.db.execute("UPDATE items SET status='published',story_id=?,next_attempt_at=NULL,last_error=NULL WHERE id=?", (story_id, row["id"]))
+                    return
                 source = {
                     "id": item["id"],
                     "url": item["url"],
                     "title": item["title"],
                     "published_at": item["published_at"],
                 }
-                source_map = {s["url"]: s for s in (previous or {}).get("sources", []) if s.get("id") != item["id"]}
+                comments = _comment_sources(item, result, input_chars, observed)
+                effective_updated = max([item["updated_at"], *(s["updated_at"] for s in comments)])
+                source_map = {s["url"]: s for s in (previous or {}).get("sources", []) if s.get("id") != item["id"] and s.get("source_item_id") != item["id"]}
                 source_map[source["url"]] = source
+                source_map.update({comment["url"]: comment for comment in comments})
                 data = {
                     key: result[key]
                     for key in (
@@ -358,7 +400,7 @@ class Store:
                     )
                 }
                 data["editorial_kind"], data["editorial_item"] = item["kind"], item["id"]
-                data["editorial_updated_at"] = item["updated_at"]
+                data["editorial_updated_at"] = effective_updated
                 writer = (previous or {}).get("editorial_item")
                 if previous and writer is None and len(previous.get("sources", [])) == 1:
                     writer = previous["sources"][0].get("id")  # an older story's only source wrote it
@@ -369,7 +411,7 @@ class Store:
                     kind = previous.get("editorial_kind") or ("tag" if previous["state"] == "tagged" else "")
                     stamp = previous.get("editorial_updated_at") or previous["updated_at"]
                     if _rank(kind, previous["confidence"], stamp) > _rank(
-                        item["kind"], data["confidence"], item["updated_at"]
+                        item["kind"], data["confidence"], effective_updated
                     ):
                         data = {key: previous.get(key) for key in data}
                         # Older stories lack the editorial fields; keep usable values.
@@ -385,7 +427,7 @@ class Store:
                         if previous
                         else observed,
                         "updated_at": max(
-                            item["updated_at"],
+                            effective_updated,
                             previous["updated_at"]
                             if previous
                             else item["published_at"],

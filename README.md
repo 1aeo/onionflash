@@ -72,6 +72,7 @@ The API key is read only from the variable named by `llm.api_key_env`.
 | `site` | Title, description, canonical URL, repository link, page/feed sizes |
 | `storage` | Private SQLite path, owned public output directory and bounded article-render batch size |
 | `collection` | Lookback, overlap, page/item limits, content limit, staleness, circuit backoff, total/source run budgets, reserved analysis time |
+| `comments` | Optional anonymous GitLab discussion enrichment, polling/backoff, per-run/page/text limits and bounded watch-cache size |
 | `http` | Connect/read/total deadlines, attempts, exponential backoff base/cap/jitter, bounded `Retry-After`, redirect/byte limits, user agent |
 | `llm` | Base URL and fallback URLs, model, key environment variable, private-network allowlist, deadlines, output/input limits, items per run, failed-item retry backoff |
 | `sources` | Stream ID, display name, public website URL, kind, collection URL, fallback URLs, product, authority, optional interval/page/item overrides |
@@ -115,6 +116,27 @@ It reads the Markdown table without running upstream scripts, validates the
 snapshot and uses conditional HTTP requests. The stale Metrics Atom feed is no
 longer configured, including as a fallback.
 
+### Public GitLab comments
+
+Set `[comments].enabled = true` to enrich relevant GitLab issues with public
+discussion. Each participating `gitlab_issue` source needs its exact
+`gitlab_project`, such as `tpo/core/tor`; the example already identifies the Tor
+projects. `comments_graphql_url` optionally overrides the same-origin GraphQL
+endpoint, and `comments_enabled = false` excludes an individual source.
+
+No GitLab account, token or browser session is used. The collector verifies the
+project identity and public visibility, the issue's non-confidential status,
+and each note's non-internal/non-system status. Unknown visibility never admits
+new comment content. Comment authors and dates stay explicit, and the model's
+grounding pass sees exactly the same bounded text used for evidence validation.
+
+Comments default to a 30-minute per-issue interval. Per-run limits rotate across
+projects and previously published issues, so this is bounded follow-up coverage,
+not an exhaustive discussion mirror. The phase shares collection time and keeps
+the configured analysis reserve; primary sources retain at least half the
+collection window. `onionflash status` reports comment scheduling and failures.
+See [source coverage](docs/SOURCE_COVERAGE.md#anonymous-public-gitlab-discussion-updates).
+
 Timeline entries keep their event dates; repository revisions do not turn old
 open-ended events into new incidents. Citations point to the exact commit and
 table line. Ambiguous recent rows are skipped with a source warning. See
@@ -148,7 +170,42 @@ onionflash run --config config.toml              # Collect → analyze → build
 onionflash build --config config.toml            # Offline build from saved news
 onionflash build --config config.toml --force    # Queue a bounded full-history rebuild
 onionflash status --config config.toml           # Source freshness and queue
+onionflash story show --config config.toml --story STORY_ID
+onionflash rejected list --config config.toml
 ```
+
+### Correct or retract a story
+
+Inspect the story first and copy its current `hash`. Put only the public fields
+to change in a small JSON file, for example:
+
+```json
+{"why_it_matters":"The report says the existing keys cannot be trusted and requests removal of the current entry from the software."}
+```
+
+```sh
+onionflash story correct --config config.toml --story STORY_ID \
+  --expect-hash CURRENT_HASH --patch correction.json \
+  --reason "The previous version included an unsupported operator instruction."
+onionflash build --config config.toml
+```
+
+The correction is locked against later automation. The reason is public; previous
+published text and the operator action are retained in revision history. A stale
+hash fails without changing anything. Retraction keeps the same article URL with
+a clear notice. Explicit restore and unlock commands are available; a retraction
+must be restored before automation can resume. The next scheduled deployment
+publishes pending changes, or use the deployer's `publish` command after building.
+See [editorial commands and recovery](docs/EDITORIAL.md).
+
+### Review a rejected analysis
+
+`onionflash rejected list` shows terminally rejected items with their reason,
+attempt count and current content hash. `rejected show --item ITEM_ID` includes
+the saved source. Explicit `retry` and `dismiss` actions require that hash and a
+private operator reason; neither action invokes the model or publishes anything.
+A dismissed item stays dismissed while its content is unchanged. Substantive new
+source content can queue it again. See [rejected-analysis commands](docs/REJECTED_ANALYSES.md).
 
 Each command returns a compact JSON result. Invalid configuration or a build
 failure returns nonzero. A partial source outage or queued analysis is reported
@@ -209,7 +266,8 @@ database lock while taking their upload snapshot.
 
 ## Deliberate limits
 
-The initial collector reads feed entries and GitLab issue/MR titles and bodies.
+The collector reads feed entries and GitLab issue/MR titles and bodies, with
+optional bounded public issue-comment enrichment.
 It does not scrape arbitrary links, ingest private issues, or claim complete
 coverage of every discussion comment. RSS feeds expose finite recent windows;
 outages longer than those windows can leave gaps. GitLab pagination and source
