@@ -62,10 +62,13 @@ def test_grounding_pass_replaces_unsupported_text(monkeypatch):
 
 
 def test_grounding_rewrite_must_still_pass_validation(monkeypatch):
-    llm = analyzer(monkeypatch, completion(analysis()), completion(grounded(why_it_matters="")))
+    # The failed check gets one repair round; a repair that still fails is rejected.
+    llm = analyzer(monkeypatch, completion(analysis()), completion(grounded(why_it_matters="")),
+                   completion(grounded(why_it_matters="")))
     with pytest.raises(AnalysisError, match="needs text") as caught:
         llm.analyze(item())
     assert not caught.value.retryable
+    assert len(llm.client.requests) == 3
     llm = analyzer(monkeypatch, completion(analysis()), completion({"verdict": "fine"}))
     with pytest.raises(AnalysisError, match="grounding check") as caught:
         llm.analyze(item())
@@ -75,15 +78,29 @@ def test_grounding_rewrite_must_still_pass_validation(monkeypatch):
 def test_a_statement_the_check_flags_but_keeps_is_rejected(monkeypatch):
     claim = "Operators must update their configurations to exclude the node."
     kept = grounded(unsupported=[claim], why_it_matters=claim)
-    llm = analyzer(monkeypatch, completion(analysis(why_it_matters=claim)), completion(kept))
-    with pytest.raises(AnalysisError, match="left an unsupported statement") as caught:
+    llm = analyzer(monkeypatch, completion(analysis(why_it_matters=claim)), completion(kept),
+                   completion(grounded(why_it_matters=claim)))
+    with pytest.raises(AnalysisError, match="left this flagged statement unchanged") as caught:
         llm.analyze(item())
     assert not caught.value.retryable
+    # The repair round was told which statement it kept.
+    assert claim in json.loads(llm.client.requests[2][1]["messages"][1]["content"])["problem"]
     # Editing a different sentence of the same field does not fix the flagged one.
     partly = grounded(unsupported=[claim], why_it_matters="The report concerns trust. " + claim)
-    llm = analyzer(monkeypatch, completion(analysis(why_it_matters="It matters. " + claim)), completion(partly))
-    with pytest.raises(AnalysisError, match="left an unsupported statement"):
+    llm = analyzer(monkeypatch, completion(analysis(why_it_matters="It matters. " + claim)), completion(partly),
+                   completion(partly))
+    with pytest.raises(AnalysisError, match="left this flagged statement unchanged"):
         llm.analyze(item())
+
+
+def test_one_repair_round_fixes_exactly_the_failed_check(monkeypatch):
+    draft = analysis(title="Operator removed the affected keys after reported compromise")
+    fixed = "Operator reports possible compromise and stops trusting its keys"
+    llm = analyzer(monkeypatch, completion(draft), completion(grounded(title=draft["title"])),
+                   completion(grounded(title=fixed)))
+    assert llm.analyze(item())["title"] == fixed
+    problem = json.loads(llm.client.requests[2][1]["messages"][1]["content"])["problem"]
+    assert problem == "The title says 'removed', a completed action the source does not state"
 
 
 def test_a_flagged_statement_may_be_reworded_with_the_same_words(monkeypatch):
