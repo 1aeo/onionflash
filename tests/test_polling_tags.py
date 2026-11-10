@@ -159,7 +159,8 @@ def test_a_success_is_rescheduled_a_few_seconds_early_and_never_more_than_a_tent
             store.source_success(stream, {"url": stream["url"]}, "2026-11-09T15:30:00Z")
             due = store.source(stream)["next_fetch_at"]
             assert due == expected
-            assert not source_due({"next_fetch_at": due}, after(-1, due)) and source_due({"next_fetch_at": due}, due)
+            assert not source_due({"next_fetch_at": due}, after(-1, due))
+            assert source_due({"next_fetch_at": due}, due)
 
 
 def test_failure_and_catching_up_cooldowns_are_never_shortened(tmp_path):
