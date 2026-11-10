@@ -69,6 +69,12 @@ def test_grounding_rewrite_must_still_pass_validation(monkeypatch):
         llm.analyze(item())
     assert not caught.value.retryable
     assert len(llm.client.requests) == 3
+    assert "needs text" in json.loads(llm.client.requests[2][1]["messages"][1]["content"])["problem"]
+    # A repair call that itself returns garbage keeps the original reason.
+    llm = analyzer(monkeypatch, completion(analysis()), completion(grounded(why_it_matters="")),
+                   completion({"verdict": "fine"}))
+    with pytest.raises(AnalysisError, match="needs text"):
+        llm.analyze(item())
     llm = analyzer(monkeypatch, completion(analysis()), completion({"verdict": "fine"}))
     with pytest.raises(AnalysisError, match="grounding check") as caught:
         llm.analyze(item())
@@ -101,6 +107,16 @@ def test_one_repair_round_fixes_exactly_the_failed_check(monkeypatch):
     assert llm.analyze(item())["title"] == fixed
     problem = json.loads(llm.client.requests[2][1]["messages"][1]["content"])["problem"]
     assert problem == "The title says 'removed', a completed action the source does not state"
+
+
+def test_attributing_a_flagged_statement_to_the_source_does_not_fix_it(monkeypatch):
+    claim = "Operators must update their configurations to exclude the node."
+    attributed = "According to the report, operators must update their configurations to exclude the node."
+    llm = analyzer(monkeypatch, completion(analysis(why_it_matters=claim)),
+                   completion(grounded(unsupported=[claim], why_it_matters=attributed)),
+                   completion(grounded(why_it_matters=attributed)))
+    with pytest.raises(AnalysisError, match="left this flagged statement unchanged"):
+        llm.analyze(item())
 
 
 def test_a_flagged_statement_may_be_reworded_with_the_same_words(monkeypatch):

@@ -179,11 +179,23 @@ def _sentences(result: dict) -> set[str]:
     return {s for key in TEXT_FIELDS for s in re.split(r"(?<=[.!?])\s+", _plain(str(result[key]))) if s}
 
 
+_QUALIFIED = re.compile(r"\b(?:not|no|never|unclear|unknown|whether|unconfirmed|may|might|could|possibly)\b")
+
+
 def _kept_claim(claims: list, earlier: list[dict], result: dict) -> str | None:
-    """A flagged statement may be reworded (hedged or denied) but not left as written."""
-    unchanged = _sentences(result) & set().union(*map(_sentences, earlier))
-    return next((claim for claim in claims if isinstance(claim, str) and len(_plain(claim)) >= 8
-                 and any(_plain(claim) in sentence for sentence in unchanged)), None)
+    """A flagged statement may be reworded, hedged or denied, but not left as written.
+
+    It counts as kept in a sentence copied from an earlier version, or when the
+    sentence repeats it word for word without adding a negation or uncertainty
+    ("According to the report, <claim>" still asserts it).
+    """
+    before = set().union(*map(_sentences, earlier))
+    for claim in claims:
+        text = _plain(claim) if isinstance(claim, str) else ""
+        if len(text) >= 8 and any(text in sentence and (sentence in before or not _QUALIFIED.search(
+                sentence.replace(text, " "))) for sentence in _sentences(result)):
+            return claim
+    return None
 
 
 def validate_analysis(result: dict, item: dict, *, editorial: bool = True) -> dict:
@@ -427,7 +439,12 @@ class Analyzer:
             return self._accept(final, [draft], check["unsupported"], source)
         except AnalysisError as problem:
             # One repair round: the model sees exactly which check failed.
-            repair = self._ground(request, key, bounded, final, problem=str(problem))
+            try:
+                repair = self._ground(request, key, bounded, final, problem=str(problem))
+            except AnalysisError as failure:
+                if failure.retryable:
+                    raise
+                raise problem from failure  # keep the check that failed as the recorded reason
             repaired = {**draft, **{k: repair[k] for k in TEXT_FIELDS}}
             return self._accept(repaired, [draft, final], check["unsupported"] + repair["unsupported"], source)
 
