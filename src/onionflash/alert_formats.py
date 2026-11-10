@@ -1,52 +1,53 @@
 """Bounded, deterministic observations from known monitoring message templates.
 
 These parsers describe what a monitor reported. They never infer attacks or
-recovery from silence, and authority names do not become independent monitors.
+recovery, and authority names do not become independent monitors.
 """
 
 from __future__ import annotations
 
 import ipaddress
 import re
-from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit
 
 
 _AUTHORITY = r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
 _LIST = rf"{_AUTHORITY}(?:, {_AUTHORITY})*"
 _LEVEL = r"(?:ERROR|WARNING|NOTICE): "
-_CONSENSUS = (
-    (rf"The following authorities are missing from the consensus: ({_LIST})", "authority-missing", "document", 1),
-    (rf"Consensus fetched from {_AUTHORITY} was missing the following authority signatures: ({_LIST})", "signature-missing", "document", 1),
-    (rf"{_AUTHORITY} is missing the server descriptor of ({_AUTHORITY})", "descriptor-missing", "document", 1),
-    (rf"The consensuses published by the following directory authorities are more than one hour old and therefore not fresh anymore: ({_LIST})", "stale-consensus", "document", 1),
-    (rf"Unable to retrieve the consensus from ({_AUTHORITY}) \([^\n]+\):[^\n]*", "consensus-retrieval-failed", "monitor", 1),
-    (rf"Unable to retrieve the vote from ({_AUTHORITY}) \([^\n]+\):[^\n]*", "vote-retrieval-failed", "monitor", 1),
-    (rf"Unable to reach the ORPort of ({_AUTHORITY}) \([^\n]+\):[^\n]*", "orport-unreachable", "monitor", 1),
-    (rf"Downloading the consensus from ({_AUTHORITY}) took [0-9]+(?:\.[0-9]+)?s\. Median download time is [^\n]+", "download-latency", "monitor", 1),
-    (rf"The following directory authorities are not reporting bandwidth scanner results: ({_LIST})", "bandwidth-results-missing", "service", 1),
-    (r"Authorities disagree about the BadExit flag for ([A-Fa-f0-9]{40}) \(with flag: [^\n]+, without flag: [^\n]+\)", "badexit-disagreement", "service", 1),
-)
+_FLAG = re.compile(_LEVEL + rf"({_AUTHORITY}) had [0-9]+ ([A-Za-z][A-Za-z0-9]{{0,31}}) flags in its vote but the consensus had [0-9]+")
+_CONSENSUS = [(re.compile(_LEVEL + pattern), condition, kind) for pattern, condition, kind in (
+    (rf"The following authorities are missing from the consensus: ({_LIST})", "authority-missing", "document"),
+    (rf"Consensus fetched from {_AUTHORITY} was missing the following authority signatures: ({_LIST})", "signature-missing", "document"),
+    (rf"{_AUTHORITY} is missing the server descriptor of ({_AUTHORITY})", "descriptor-missing", "document"),
+    (rf"The consensuses published by the following directory authorities are more than one hour old and therefore not fresh anymore: ({_LIST})", "stale-consensus", "document"),
+    (rf"Unable to retrieve the consensus from ({_AUTHORITY}) \([^\n]+\):[^\n]*", "consensus-retrieval-failed", "monitor"),
+    (rf"Unable to retrieve the vote from ({_AUTHORITY}) \([^\n]+\):[^\n]*", "vote-retrieval-failed", "monitor"),
+    (rf"Unable to reach the ORPort of ({_AUTHORITY}) \([^\n]+\):[^\n]*", "orport-unreachable", "monitor"),
+    (rf"Downloading the consensus from ({_AUTHORITY}) took [0-9]+(?:\.[0-9]+)?s\. Median download time is [^\n]+", "download-latency", "monitor"),
+    (rf"The following directory authorities are not reporting bandwidth scanner results: ({_LIST})", "bandwidth-results-missing", "service"),
+    (r"Authorities disagree about the BadExit flag for ([A-Fa-f0-9]{40}) \(with flag: [^\n]+, without flag: [^\n]+\)", "badexit-disagreement", "service"),
+)]
+MAX_ALERTS = 100  # distinct observations per message
 
 
-def _observation(target: str, condition: str, kind: str, state: str = "firing") -> dict:
-    return {"target": target, "condition": condition, "kind": kind, "state": state}
+def _observation(target: str, condition: str, kind: str) -> dict:
+    return {"target": target, "condition": condition, "kind": kind}
 
 
 def _consensus(text: str) -> tuple[list[dict], int]:
     observations, unsupported = [], 0
-    for line in text.splitlines():
+    for line in text.split("\n"):
         line = line.strip()
         if not line:
             continue
-        flag = re.fullmatch(_LEVEL + rf"({_AUTHORITY}) had [0-9]+ ([A-Za-z][A-Za-z0-9]{{0,31}}) flags in its vote but the consensus had [0-9]+", line)
+        flag = _FLAG.fullmatch(line)
         if flag:
             observations.append(_observation(flag[1].lower(), "flag-" + flag[2].lower(), "document"))
             continue
-        for pattern, condition, kind, group in _CONSENSUS:
-            match = re.fullmatch(_LEVEL + pattern, line)
+        for pattern, condition, kind in _CONSENSUS:
+            match = pattern.fullmatch(line)
             if match:
-                observations.extend(_observation(target.lower(), condition, kind) for target in match[group].split(", "))
+                observations.extend(_observation(target.lower(), condition, kind) for target in match[1].split(", "))
                 break
         else:
             unsupported += 1
@@ -60,7 +61,7 @@ def _endpoint(value: str) -> str | None:
     try:
         parsed = urlsplit("http://" + value)
         host, port = parsed.hostname, parsed.port
-        if not host or not port or not 1 <= port <= 65535 or parsed.username is not None or parsed.password is not None or parsed.path or parsed.query or parsed.fragment:
+        if not host or not port or parsed.username is not None or parsed.password is not None or parsed.path or parsed.query or parsed.fragment:
             return None
         try:
             address = ipaddress.ip_address(host)
@@ -68,7 +69,7 @@ def _endpoint(value: str) -> str | None:
         except ValueError:
             if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?", host):
                 return None
-        return f"{host.lower()}:{port}"
+        return f"{host}:{port}"  # urlsplit lowercases the host
     except ValueError:
         return None
 
@@ -113,22 +114,22 @@ def _censorship_condition(summary: str, description: str) -> dict | None:
 
 
 def _censorship(text: str) -> tuple[list[dict], int]:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    total = re.fullmatch(r"Total firing alerts: ([0-9]{1,4})", lines[0]) if lines else None
+    # Only firing alerts are read; no resolved notification has appeared on the list.
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    total = re.fullmatch(r"Total firing alerts: ([0-9]{1,4})", lines[0])
     if not total:
         return [], 1
-    state, block, observations, unsupported, firing = None, None, [], 0, 0
+    started, block, observations, unsupported, firing = False, None, [], 0, 0
     for line in lines[1:]:
-        if line in {"## Firing Alerts", "## Resolved Alerts"} and block is None:
-            state = "firing" if line == "## Firing Alerts" else "resolved"
-        elif line == "-----" and state:
+        if line == "## Firing Alerts" and not started:
+            started = True
+        elif line == "-----" and started:
             if block is None:
                 block = []
                 continue
-            if state == "firing":
-                firing += 1
-            # Known blocks may also carry a display-only title annotation.
-            # Only the exact Summary/Description pair determines the observation.
+            firing += 1
+            # Known blocks may also carry a display-only title annotation; the
+            # Summary/Description pair alone determines the observation.
             fields = {}
             for field in block:
                 key, separator, value = field.partition(": ")
@@ -136,15 +137,10 @@ def _censorship(text: str) -> tuple[list[dict], int]:
                     return [], unsupported + 1
                 fields[key] = value
             required = {"Time", "Summary", "Description", "playbook"}
-            if not required <= fields.keys() or fields.keys() - required - {"title"} or not re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? \+0000 UTC", fields["Time"]):
-                return [], unsupported + 1
-            try:
-                datetime.fromisoformat(fields["Time"].replace(" +0000 UTC", "+00:00"))
-            except ValueError:
+            if not required <= fields.keys() or fields.keys() - required - {"title"}:
                 return [], unsupported + 1
             observation = _censorship_condition(fields["Summary"], fields["Description"])
             if observation:
-                observation["state"] = state
                 observations.append(observation)
             else:
                 unsupported += 1
@@ -153,30 +149,23 @@ def _censorship(text: str) -> tuple[list[dict], int]:
             block.append(line)
         else:
             return [], unsupported + 1
-    if block is not None or firing != int(total[1]) or state is None:
+    if block is not None or firing != int(total[1]) or not started:
         return [], unsupported + 1
     return observations, unsupported
 
 
-def parse_alerts(item: dict, format: str, limit: int = 100) -> tuple[list[dict], int]:
+def parse_alerts(item: dict, format: str) -> tuple[list[dict], int]:
     """Return deduplicated bounded observations and the unsupported-unit count."""
     text, title = item.get("content"), item.get("title")
-    if not isinstance(text, str) or not isinstance(title, str) or not text.strip() or len(text) > 65536 or len(text.splitlines()) > 2000 or type(limit) is not int or not 1 <= limit <= 1000:
+    if not isinstance(text, str) or not isinstance(title, str) or not text.strip() or len(text) > 65536:
         return [], 1
     if format == "consensus" and re.fullmatch(r"(?:\[tor-consensus-health\] )?Consensus issues", title, re.I):
         observations, unsupported = _consensus(text)
-    elif format == "censorship" and title.strip() and not re.match(r"(?:re|fwd?):", re.sub(r"^\[[^\]\r\n]{1,80}\]\s*", "", title), re.I):
+    elif format == "censorship" and not re.match(r"(?:re|fwd?):", re.sub(r"^\[[^\]\r\n]{1,80}\]\s*", "", title), re.I):
         observations, unsupported = _censorship(text)
     else:
         return [], 1
-    unique = {}
-    for observation in observations:
-        if len(observation["target"]) > 300:
-            return [], unsupported + 1
-        key = (observation["target"], observation["condition"], observation["kind"])
-        if key in unique and unique[key]["state"] != observation["state"]:
-            return [], unsupported + 1
-        unique[key] = observation
-        if len(unique) > limit:
-            return [], unsupported + len(unique)
+    unique = {(o["target"], o["condition"], o["kind"]): o for o in observations}
+    if len(unique) > MAX_ALERTS:
+        return [], unsupported + 1
     return list(unique.values()), unsupported

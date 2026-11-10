@@ -427,11 +427,11 @@ class Store:
             )
         ]
 
-    def ingest_alerts(self, source: dict, items: list[dict], settings: dict, observed: str) -> dict:
-        return monitoring.ingest(self.db, source, items, settings, observed)
+    def ingest_alerts(self, source: dict, items: list[dict], observed: str) -> dict:
+        return monitoring.ingest(self.db, source, items, observed)
 
-    def monitoring_status(self, settings: dict, observed: str) -> dict:
-        return monitoring.status(self.db, settings, observed)
+    def monitoring_status(self, observed: str) -> dict:
+        return monitoring.status(self.db, observed)
 
     def story_count(self, limit: int = -1) -> int:
         return self.db.execute(

@@ -59,18 +59,7 @@ DEFAULTS = {
         "requests_per_minute": 30,
         "user_agent": "OnionFlash (+https://github.com/1aeo/onionflash)",
     },
-    "monitoring": {
-        "min_reports": 2,
-        "min_span_seconds": 3600,
-        "window_seconds": 172800,
-        "stale_after_seconds": 259200,
-        "retention_days": 30,
-        "max_observations": 10000,
-        "max_groups": 2000,
-        "max_source_links": 3,
-        "max_alerts_per_item": 100,
-        "max_future_seconds": 300,
-    },
+    "monitoring": {},
     "llm": {
         "base_url": "",
         "fallback_base_urls": [],
@@ -131,21 +120,14 @@ BOUNDS = {
     "max_xml_elements": (100, 100000),
     "healthy_poll_tolerance_seconds": (0, 60),
     "tag_priority_score": (0, 20),
-    "min_reports": (2, 100),
-    "min_span_seconds": (300, 604800),
-    "window_seconds": (600, 2592000),
-    "retention_days": (1, 365),
-    "max_observations": (100, 100000),
-    "max_groups": (10, 10000),
-    "max_source_links": (2, 10),
-    "max_alerts_per_item": (1, 1000),
-    "max_future_seconds": (0, 3600),
 }
 
 
 # Settings that older configuration files may still contain. They are accepted
 # and ignored, so a deployment can delete them at its own pace.
-RETIRED = {"storage": {"max_stories"}}
+RETIRED = {"storage": {"max_stories"}, "monitoring": {
+    "min_reports", "min_span_seconds", "window_seconds", "stale_after_seconds", "retention_days",
+    "max_observations", "max_groups", "max_source_links", "max_alerts_per_item", "max_future_seconds"}}
 
 
 def _expand(value: str) -> str:
@@ -179,7 +161,7 @@ def load_config(path: str | Path) -> dict:
                     f"Unknown {section} settings: {', '.join(sorted(unknown))}"
                 )
             config[section].update(values)
-    for section in ("http", "collection", "llm", "storage", "site", "monitoring"):
+    for section in ("http", "collection", "llm", "storage", "site"):
         for key, value in config[section].items():
             if key in BOUNDS:
                 low, high = BOUNDS[key]
@@ -203,9 +185,6 @@ def load_config(path: str | Path) -> dict:
                     raise ValueError(f"{section}.{key} must be an integer")
     if config["http"]["backoff_cap_seconds"] < config["http"]["backoff_base_seconds"]:
         raise ValueError("HTTP backoff cap must be at least its base")
-    monitoring = config["monitoring"]
-    if not monitoring["min_span_seconds"] <= monitoring["window_seconds"] <= monitoring["retention_days"] * 86400:
-        raise ValueError("Monitoring window must cover the minimum span and fit within retention")
     base_url = _expand(config["site"]["base_url"])
     parsed_site = urlsplit(base_url)
     if (

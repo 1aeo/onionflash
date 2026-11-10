@@ -71,7 +71,6 @@ The API key is read only from the variable named by `llm.api_key_env`.
 | `storage` | Private SQLite path, dedicated public output directory |
 | `collection` | Lookback, overlap, page/item limits, content limit, staleness, circuit backoff, total/source run budgets, reserved analysis time |
 | `http` | Connect/read/total deadlines, attempts, exponential backoff base/cap/jitter, bounded `Retry-After`, redirect/byte/rate limits, user agent |
-| `monitoring` | Alert persistence/window thresholds, freshness, private retention and storage/parser limits |
 | `llm` | Base URL and fallback URLs, model, key environment variable, private-network allowlist, deadlines, output/input limits, items per run, failed-item retry backoff |
 | `sources` | Stream ID, display name, public website URL, kind, collection URL, fallback URLs, product, authority, optional interval/page/item overrides |
 
@@ -126,10 +125,11 @@ by `alert_format`, with a configured `monitor_id` shared by any mirrors of the
 same monitor. They bypass the LLM. Unknown formats and undated messages cannot
 become news stories.
 
-The private SQLite incident records group repeated notifications. By default,
-eligible directory-document warnings need two reports at least one hour apart
-within a two-day window before publication as **observed anomalies**. Ordinary
-repeats do not create stories, change RSS GUIDs or advance publication dates.
+The private SQLite incident records group repeated notifications. Eligible
+directory-document warnings about a known directory authority need two reports
+at least one hour apart within a two-day window before publication as
+**observed anomalies**. Ordinary repeats do not create stories, change RSS GUIDs
+or advance publication dates; a warning after two quiet days starts a new episode.
 Missing alerts never establish recovery.
 
 Probe outages, unreachable services and censorship-monitor failures are held
