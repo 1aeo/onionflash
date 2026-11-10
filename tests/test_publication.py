@@ -306,6 +306,17 @@ def test_a_killed_build_leaves_no_temporary_files_in_the_public_tree(tmp_path, m
     assert not any((tmp_path / ".public.onionflash-staging").iterdir())
 
 
+def test_a_staging_directory_others_can_write_is_refused(tmp_path):
+    cfg = settings(tmp_path)
+    staging = tmp_path / ".public.onionflash-staging"
+    staging.mkdir()
+    staging.chmod(0o777)
+    with Store(cfg["storage"]["database"]) as store:
+        put(store.db, story(1))
+        with pytest.raises(ValueError, match="Unsafe public staging directory"):
+            build(cfg, store)
+
+
 def test_the_staging_directory_keeps_files_it_did_not_create(tmp_path):
     cfg = settings(tmp_path)
     staging = tmp_path / ".public.onionflash-staging"

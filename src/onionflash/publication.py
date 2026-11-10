@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 import re
 import tempfile
 from contextlib import ExitStack, contextmanager
@@ -164,9 +165,12 @@ class Artifacts:
         # Temporaries stay beside, never inside, the public tree, so a killed
         # build leaves nothing for the publisher to ship or reject.
         self.staging = output.parent / ("." + output.name + ".onionflash-staging")
-        if self.staging.is_symlink():
+        if not self.staging.is_symlink():
+            self.staging.mkdir(mode=0o700, exist_ok=True)
+        # Ours and writable only by us, so no other user can swap an entry before it is renamed.
+        info = os.lstat(self.staging)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
             raise ValueError("Unsafe public staging directory")
-        self.staging.mkdir(mode=0o700, exist_ok=True)
         # Remove only this module's own leftovers; anything else there is left alone.
         for stale in self.staging.glob(TEMPORARY_PREFIX + "*"):
             if stale.is_file():
