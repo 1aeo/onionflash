@@ -568,6 +568,22 @@ def test_resuming_approved_job_never_temporarily_unpins_its_receipt(context, mon
     assert result["status"] == "published" and result["cache_hit"] and result["review_calls"] == 0
 
 
+def test_a_database_error_during_analysis_is_not_an_item_strike(context, monkeypatch):
+    import sqlite3
+    from onionflash import cli
+    cfg, store = context
+    cfg["sources"] = []
+
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(cli, "process_item", locked)
+    store.ingest(item(url="https://example.org/locked"), DATE)
+    with pytest.raises(sqlite3.OperationalError):
+        cli.run(cfg, store)
+    assert tuple(store.db.execute("SELECT status,rejections FROM items").fetchone()) == ("pending", 0)
+
+
 def test_unusable_replies_and_drafts_take_strikes_and_the_run_still_builds(context, monkeypatch):
     from onionflash import cli
     cfg, store = context
