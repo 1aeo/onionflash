@@ -285,8 +285,12 @@ def _rss(site: dict, base: str, stories: list[dict], path: str, category: str | 
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
-def render_site(config: dict, stories: list[dict], source_health: list[dict], output_dir: Path) -> None:
-    """Render a complete self-contained release into a new, empty directory."""
+def render_site(config: dict, stories: list[dict], source_health: list[dict], output_dir: Path) -> int:
+    """Render a complete self-contained release into a new, empty directory.
+
+    Returns how many stored stories were skipped because they cannot be rendered
+    safely; one bad record must not stop every later publication.
+    """
     output_dir = Path(output_dir).absolute()
     if output_dir.is_symlink():
         raise ValueError("Output directory must not be a symlink")
@@ -296,9 +300,12 @@ def render_site(config: dict, stories: list[dict], source_health: list[dict], ou
         raise ValueError("Output directory must be empty")
     site = config.get("site", {})
     base = _site_base(site.get("base_url", "https://1aeo.com/onionflash/"))
-    public = [_prepare_story(story) for story in stories]
-    if len({story["id"] for story in public}) != len(public):
-        raise ValueError("Duplicate story IDs")
+    public = []
+    for story in stories:
+        try:
+            public.append(_prepare_story(story))
+        except ValueError:
+            continue
     public.sort(key=lambda story: (story["updated_at"], story["published_at"], story["id"]), reverse=True)
     page_size = _limit(site.get("page_size"), 100, 1000)
     feed_size = _limit(site.get("feed_size"), 50, 1000)
@@ -367,3 +374,4 @@ def render_site(config: dict, stories: list[dict], source_health: list[dict], ou
   Cache-Control: public, max-age=60, must-revalidate
 '''
     (output_dir / "_headers").write_text(headers, encoding="utf-8")
+    return len(stories) - len(public)

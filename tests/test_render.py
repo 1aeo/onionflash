@@ -95,6 +95,11 @@ class RenderTests(unittest.TestCase):
         self.assertIn('Latest story update <time datetime="2026-11-09T12:00:00Z"', page)
         self.assertEqual(json.loads((output / "feed.json").read_text())["items"][0]["id"], "https://example.com/onionflash/news/older/")
 
+    def assert_not_published(self, output):
+        self.assertFalse((output / "news").exists() and any((output / "news").iterdir()))
+        self.assertEqual(json.loads((output / "feed.json").read_text())["items"], [])
+        self.assertIn("The feed is getting started.", (output / "index.html").read_text())
+
     def test_unsafe_sources_cannot_be_published(self):
         for index, url in enumerate([
             "javascript:alert(1)", "data:text/html,test", "//example.com/",
@@ -106,8 +111,7 @@ class RenderTests(unittest.TestCase):
             with self.subTest(url=url):
                 story = copy.deepcopy(STORY)
                 story["sources"] = [{"url": url, "title": "bad"}]
-                with self.assertRaises(ValueError):
-                    self.render([story], name=f"unsafe-{index}")
+                self.assert_not_published(self.render([story], name=f"unsafe-{index}"))
 
     def test_unsafe_source_is_omitted_when_valid_source_exists(self):
         story = copy.deepcopy(STORY)
@@ -121,14 +125,8 @@ class RenderTests(unittest.TestCase):
             with self.subTest(value=value):
                 story = copy.deepcopy(STORY)
                 story["id"] = value
-                with self.assertRaises(ValueError):
-                    self.render([story], name=f"id-{index}")
+                self.assert_not_published(self.render([story], name=f"id-{index}"))
         self.assertFalse((self.root / "outside").exists())
-
-    def test_duplicate_ids_fail_before_writing_output(self):
-        with self.assertRaises(ValueError):
-            self.render([STORY, STORY])
-        self.assertFalse((self.root / "site").exists())
 
     def test_invalid_dates_and_classifications_fail(self):
         for index, change in enumerate([
@@ -139,8 +137,16 @@ class RenderTests(unittest.TestCase):
             with self.subTest(change=change):
                 story = copy.deepcopy(STORY)
                 story.update(change)
-                with self.assertRaises(ValueError):
-                    self.render([story], name=f"class-{index}")
+                self.assert_not_published(self.render([story], name=f"class-{index}"))
+
+    def test_one_unrenderable_story_does_not_block_the_others(self):
+        bad = copy.deepcopy(STORY)
+        bad.update(id="badbadbadbadbadbadbadbad", sources=[{"url": "https://news.example.test/a", "title": "x"}])
+        output = self.root / "mixed"
+        self.assertEqual(render_site(CONFIG, [bad, copy.deepcopy(STORY)], [], output), 1)
+        self.assertTrue((output / "news" / STORY["id"] / "index.html").is_file())
+        self.assertFalse((output / "news" / bad["id"]).exists())
+        self.assertEqual(len(json.loads((output / "feed.json").read_text())["items"]), 1)
 
     def test_feed_control_characters_are_removed_and_xml_parses(self):
         story = copy.deepcopy(STORY)

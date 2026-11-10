@@ -666,9 +666,9 @@ def test_render_failure_preserves_prior_site_and_changed_clocks_do_not_rebuild(
         store.source_success(cfg["sources"][0], {"url": cfg["sources"][0]["url"]}, DATE)
         store.ingest(item(), DATE)
         store.finish(store.pending(1, DATE)[0], analysis(), "cache", DATE)
-        assert build(cfg, store)
+        assert build(cfg, store)["public_changed"]
         before = (tmp_path / "public/index.html").read_bytes()
-        assert not build(cfg, store)
+        assert not build(cfg, store)["public_changed"]
 
         def fail(*args):
             raise ValueError("simulated renderer failure")
@@ -697,13 +697,13 @@ def test_source_website_change_rebuilds_without_resetting_collection(tmp_path):
         store.source(source)
         store.source_success(source, {"url": source["url"]}, DATE)
         state = store.source(source)
-        assert build(cfg, store)
+        assert build(cfg, store)["public_changed"]
         assert f'href="{source["url"]}"' in (tmp_path / "public/index.html").read_text()
         source["website_url"] = "https://example.org/mailing-list/"
-        assert build(cfg, store)
+        assert build(cfg, store)["public_changed"]
         assert f'href="{source["website_url"]}"' in (tmp_path / "public/index.html").read_text()
         assert store.source(source) == state
-        assert not build(cfg, store)
+        assert not build(cfg, store)["public_changed"]
 
 
 def test_concurrent_run_lock_is_nonblocking(tmp_path):

@@ -170,7 +170,7 @@ def _prepare_run(monkeypatch, analyze, cleanup=None):
             return analyze(payload)
     monkeypatch.setattr(cli, "Analyzer", FakeAnalyzer)
     monkeypatch.setattr(cli, "now_iso", lambda: DATE)
-    monkeypatch.setattr(cli, "build", lambda *args: False)
+    monkeypatch.setattr(cli, "build", lambda *args: {"public_changed": False})
 
 
 def _budget():

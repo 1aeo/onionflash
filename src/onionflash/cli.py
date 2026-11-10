@@ -71,7 +71,7 @@ def _renderer_identity() -> str:
     )
 
 
-def build(config: dict, store: Store, *, force: bool = False) -> bool:
+def build(config: dict, store: Store, *, force: bool = False) -> dict:
     from .render import render_site
 
     stories = store.stories(config["storage"]["max_stories"])
@@ -107,7 +107,7 @@ def build(config: dict, store: Store, *, force: bool = False) -> bool:
         and store.get_meta("public_signature") == signature
         and (output / "index.html").is_file()
     ):
-        return False
+        return {"public_changed": False}
     output.parent.mkdir(parents=True, exist_ok=True)
     temp = Path(
         tempfile.mkdtemp(prefix="." + output.name + ".build-", dir=output.parent)
@@ -115,7 +115,7 @@ def build(config: dict, store: Store, *, force: bool = False) -> bool:
     previous = output.parent / (temp.name + ".previous")
     replaced = False
     try:
-        render_site(config, stories, health, temp)
+        skipped = render_site(config, stories, health, temp)
         if not owner.exists():
             fd = os.open(
                 owner,
@@ -139,7 +139,10 @@ def build(config: dict, store: Store, *, force: bool = False) -> bool:
             shutil.rmtree(temp)
         if previous.exists() and output.exists():
             shutil.rmtree(previous)
-    return True
+    result = {"public_changed": True}
+    if skipped:
+        result["stories_skipped"] = skipped
+    return result
 
 
 def run(config: dict, store: Store) -> dict:
@@ -250,7 +253,7 @@ def run(config: dict, store: Store) -> dict:
     report["pending_analysis"] = store.pending_count()
     report["published_stories"] = store.story_count(config["storage"]["max_stories"])
     report["monitoring"] = store.monitoring_status(config["monitoring"], now_iso())
-    report["public_changed"] = build(config, store)
+    report.update(build(config, store))
     return report
 
 
@@ -303,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
                 if args.command == "run":
                     result = run(config, store)
                 elif args.command == "build":
-                    result = {"public_changed": build(config, store, force=args.force)}
+                    result = build(config, store, force=args.force)
                 elif args.command == "status":
                     result = {
                         "pending_analysis": store.pending_count(),
