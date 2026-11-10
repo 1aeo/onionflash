@@ -364,6 +364,14 @@ def test_large_attributes_and_a_normal_base_are_accepted():
     assert sorted(row["title"] for row in result["items"]) == ["Item 1", "Item 2"]
 
 
+def test_an_absolute_base_on_every_entry_does_not_accumulate():
+    item = ('<item xml:base="https://example.org/2026/11/10/a-fairly-long-permalink-for-post-{n}/">'
+            '<title>Item {n}</title><link>https://example.org/{n}</link></item>')
+    xml = '<rss version="2.0"><channel><title>News</title>' + "".join(item.format(n=n) for n in range(1000)) + "</channel></rss>"
+    result = collect_source(FakeClient([response(xml.encode())]), source(max_items=1000), {}, DEFAULTS["collection"], DATE)
+    assert len(result["items"]) == 1000
+
+
 def test_deep_nesting_is_rejected_before_feedparser(monkeypatch):
     from onionflash import collect
     monkeypatch.setattr(collect.feedparser, "parse", lambda *args, **kwargs: pytest.fail("feedparser ran"))
