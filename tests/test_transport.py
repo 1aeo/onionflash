@@ -18,7 +18,7 @@ class TransportTests(unittest.TestCase):
     def client(self, handler, **settings):
         sleeps = []
         config = {"retry_attempts": 3, "backoff_base_seconds": 1, "backoff_cap_seconds": 10,
-                  "backoff_jitter": 0, "max_retry_after_seconds": 20, "requests_per_minute": 0,
+                  "backoff_jitter": 0, "max_retry_after_seconds": 20,
                   "max_response_bytes": 1000}
         config.update(settings)
         return HttpClient(config, transport=httpx.MockTransport(handler), resolver=public_dns, sleep=sleeps.append), sleeps
@@ -109,11 +109,12 @@ class TransportTests(unittest.TestCase):
         def handle(request):
             calls.append(request)
             return httpx.Response(200, content=b"ok", headers={"set-cookie": "tracking=secret; Path=/"})
-        client, _ = self.client(handle)
+        client, waits = self.client(handle)
         with client:
             client.request("GET", "https://example.org/one")
             client.request("GET", "https://example.org/two")
         self.assertNotIn("cookie", calls[1].headers)
+        self.assertEqual(waits, [])  # consecutive requests are not spaced out
 
     def test_redirect_loop_bounded(self):
         handler = Mock(return_value=httpx.Response(302, headers={"location": "/again"}))
@@ -160,10 +161,10 @@ class TransportTests(unittest.TestCase):
     def test_private_access_requires_explicit_allowlist(self):
         dns = lambda host, port, *args: [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("192.168.50.10", port))]
         handle = httpx.MockTransport(lambda r: httpx.Response(200, json={"ready": True}))
-        with HttpClient({"requests_per_minute": 0}, transport=handle, resolver=dns,
+        with HttpClient({}, transport=handle, resolver=dns,
                         allow_http=True, allowed_networks=["192.168.50.10/32"]) as client:
             self.assertTrue(client.request("GET", "http://model.example:18000/health").json()["ready"])
-        with HttpClient({"requests_per_minute": 0}, transport=handle, resolver=dns, allow_http=True) as client:
+        with HttpClient({}, transport=handle, resolver=dns, allow_http=True) as client:
             with self.assertRaises(FetchError):
                 client.request("GET", "http://model.example:18000/health")
 
@@ -221,7 +222,7 @@ class TransportTests(unittest.TestCase):
 class PublisherTransportTests(unittest.TestCase):
     def test_strict_origin_policy_rejects_even_get_redirects(self):
         handler = Mock(return_value=httpx.Response(302, headers={"location": "https://other.example/path"}))
-        with HttpClient({"requests_per_minute": 0}, transport=httpx.MockTransport(handler),
+        with HttpClient({}, transport=httpx.MockTransport(handler),
                         resolver=public_dns, same_origin_redirects=True) as client:
             with self.assertRaisesRegex(FetchError, "cross-origin redirect refused"):
                 client.request("GET", "https://example.org/path", headers={"Authorization": "Bearer secret"})
@@ -232,7 +233,7 @@ class PublisherTransportTests(unittest.TestCase):
         def handler(request):
             calls.append(request)
             return httpx.Response(307, headers={"location": "/route/new"}) if len(calls) == 1 else httpx.Response(204)
-        with HttpClient({"requests_per_minute": 0}, transport=httpx.MockTransport(handler),
+        with HttpClient({}, transport=httpx.MockTransport(handler),
                         resolver=public_dns, same_origin_redirects=True) as client:
             self.assertEqual(client.request("DELETE", "https://example.org/route/old").status, 204)
         self.assertEqual([request.method for request in calls], ["DELETE", "DELETE"])

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import ipaddress
+import logging
 import os
 import re
 import tomllib
@@ -56,7 +57,6 @@ DEFAULTS = {
         "max_retry_after_seconds": 60,
         "max_redirects": 4,
         "max_response_bytes": 2097152,
-        "requests_per_minute": 30,
         "user_agent": "OnionFlash (+https://github.com/1aeo/onionflash)",
     },
     "monitoring": {},
@@ -96,7 +96,6 @@ BOUNDS = {
     "max_retry_after_seconds": (0, 600),
     "max_redirects": (0, 10),
     "max_response_bytes": (1024, 16777216),
-    "requests_per_minute": (1, 600),
     "lookback_days": (1, 365),
     "overlap_seconds": (0, 86400),
     "max_pages": (1, 100),
@@ -125,7 +124,7 @@ BOUNDS = {
 
 # Settings that older configuration files may still contain. They are accepted
 # and ignored, so a deployment can delete them at its own pace.
-RETIRED = {"storage": {"max_stories"}, "monitoring": {
+RETIRED = {"storage": {"max_stories"}, "http": {"requests_per_minute"}, "monitoring": {
     "min_reports", "min_span_seconds", "window_seconds", "stale_after_seconds", "retention_days",
     "max_observations", "max_groups", "max_source_links", "max_alerts_per_item", "max_future_seconds"}}
 
@@ -154,6 +153,8 @@ def load_config(path: str | Path) -> dict:
         else:
             if not isinstance(values, dict):
                 raise ValueError(f"{section} must be a table")
+            for key in sorted(set(values) & RETIRED.get(section, set())):
+                logging.getLogger(__name__).warning("Ignoring retired setting %s.%s; it can be deleted", section, key)
             values = {k: v for k, v in values.items() if k not in RETIRED.get(section, ())}
             unknown = set(values) - set(DEFAULTS[section])
             if unknown:

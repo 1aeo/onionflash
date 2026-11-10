@@ -60,7 +60,9 @@ than the job runs; it cannot make the job run more often. A small
 `collection.healthy_poll_tolerance_seconds` handles scheduler start jitter only
 after a successful poll; failure and Retry-After cooldowns remain intact.
 
-All settings are shown in [`config.example.toml`](config.example.toml). Relative
+All settings are shown in [`config.example.toml`](config.example.toml). Settings that
+were removed (such as `http.requests_per_minute`) still load; each is logged as
+ignored and can be deleted. Relative
 database and output paths resolve against the configuration file's directory.
 `${ENVIRONMENT_VARIABLE}` references are expanded for paths and LLM URLs.
 The API key is read only from the variable named by `llm.api_key_env`.
@@ -70,7 +72,7 @@ The API key is read only from the variable named by `llm.api_key_env`.
 | `site` | Title, description, canonical URL, repository link, page/feed sizes |
 | `storage` | Private SQLite path, dedicated public output directory |
 | `collection` | Lookback, overlap, page/item limits, content limit, staleness, circuit backoff, total/source run budgets, reserved analysis time |
-| `http` | Connect/read/total deadlines, attempts, exponential backoff base/cap/jitter, bounded `Retry-After`, redirect/byte/rate limits, user agent |
+| `http` | Connect/read/total deadlines, attempts, exponential backoff base/cap/jitter, bounded `Retry-After`, redirect/byte limits, user agent |
 | `llm` | Base URL and fallback URLs, model, key environment variable, private-network allowlist, deadlines, output/input limits, items per run, failed-item retry backoff |
 | `sources` | Stream ID, display name, public website URL, kind, collection URL, fallback URLs, product, authority, optional interval/page/item overrides |
 
