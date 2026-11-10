@@ -15,7 +15,7 @@ protocol changes. The additional configured streams are:
 | [Tor Browser Security-labeled public issues](https://gitlab.torproject.org/api/v4/projects/472/issues?labels=Security) | `tor-browser-security`, enabled | Earlier visibility into Browser security work; labels do not establish confirmed vulnerabilities or completed fixes. |
 | [Anti-Censorship team issues](https://gitlab.torproject.org/api/v4/projects/549/issues) | `anti-censorship-team`, enabled | Human investigations of blocking and bridge/transport availability, including unlabeled reports. |
 | [Tor Metrics news Atom](https://metrics.torproject.org/news.atom) | `tor-metrics-news`, enabled hourly | Curated network events and explanations of measurement changes; treated conservatively as telemetry/context. |
-| [tor-dev mailing list](https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/feed/) | `tor-dev`, optional and disabled | Proposal/discussion context; enable if that additional development coverage is wanted. |
+| [Tor Project Development Mailing List](https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/) | `tor-dev`, enabled every five minutes | Proposal and protocol-change discussions; the normal importance and evidence checks filter routine messages. |
 
 Browser release announcements were already present in Tor Blog and tor-announce.
 The Browser issue stream is deliberately filtered; it does not replace those

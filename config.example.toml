@@ -235,7 +235,7 @@ interval_seconds = 3600
 # This feed includes its historical archive, rather than a short recent window.
 max_items = 1000
 
-# Optional development discussion; enable if this wider coverage is useful.
+# Development discussion adds proposal and protocol-change context.
 [[sources]]
 id = "tor-dev"
 name = "Tor Project Development Mailing List"
@@ -243,4 +243,4 @@ website_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lis
 url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/feed/"
 product = "network"
 authority = "community"
-enabled = false
+enabled = true

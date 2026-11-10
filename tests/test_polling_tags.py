@@ -272,7 +272,7 @@ def test_new_settings_and_verified_sources_are_in_example(tmp_path, monkeypatch)
     assert sources["tor-browser-security"]["enabled"]
     assert sources["tor-browser-security"]["authority"] == "development"
     assert sources["anti-censorship-team"]["enabled"]
-    assert not sources["tor-dev"]["enabled"]
+    assert sources["tor-dev"]["enabled"]
     path.write_text(
         example.read_text().replace(
             "healthy_poll_tolerance_seconds = 5", "healthy_poll_tolerance_seconds = 61"
