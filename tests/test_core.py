@@ -802,10 +802,12 @@ def test_example_config_resolves_paths_and_rejects_dangerous_settings(
 def test_skipped_story_count_is_reported_on_every_build(tmp_path):
     cfg = config(tmp_path)
     with Store(tmp_path / "state.db") as store:
-        for url in ["https://example.org/news/1", "https://news.example.test/a"]:
+        for url in ["https://example.org/news/1", "https://example.org/news/2"]:
             store.ingest(item(url=url, content=url), DATE)
         for row in store.pending(10, DATE):
             store.finish(row, analysis(), "key-" + row["id"], DATE)
+        store.db.execute("UPDATE stories SET payload=json_set(payload, '$.priority', 'urgent') "
+                         "WHERE rowid=(SELECT MIN(rowid) FROM stories)")
         assert build(cfg, store) == {"published_stories": 1, "stories_skipped": 1}
         assert build(cfg, store) == {"published_stories": 1, "stories_skipped": 1}
 
@@ -911,6 +913,22 @@ def test_new_story_records_when_onion_flash_added_it(tmp_path):
         store.finish(store.pending(1, later)[0], analysis(), "key", later)
         story = store.stories()[0]
     assert (story["published_at"], story["added_at"]) == ("2026-09-22T12:00:00Z", later)
+
+
+@pytest.mark.parametrize("base", ["javascript:bad", "https://example.com/x/../", "https://example.com/%2e%2e/",
+                                  "https://example.com/?token=secret", "https://secret@example.com/"])
+def test_bad_base_url_and_traversal_are_rejected(tmp_path, base):
+    path = tmp_path / "config.toml"
+    path.write_text(f'[site]\nbase_url = "{base}"\n[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
+    with pytest.raises(ValueError, match="base_url"):
+        load_config(path)
+
+
+@pytest.mark.parametrize("base", ["https://example.com/news?", "https://example.com/news/#", "https://example.com/news"])
+def test_base_url_is_normalized_to_a_clean_directory(tmp_path, base):
+    path = tmp_path / "config.toml"
+    path.write_text(f'[site]\nbase_url = "{base}"\n[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
+    assert load_config(path)["site"]["base_url"] == "https://example.com/news/"
 
 
 def test_retired_settings_are_accepted_and_ignored(tmp_path, caplog):

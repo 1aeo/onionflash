@@ -9,7 +9,7 @@ import os
 import re
 import tomllib
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from .util import canonical_url
 from .schema import PRODUCTS
@@ -201,7 +201,9 @@ def load_config(path: str | Path) -> dict:
     ):
         raise ValueError("site.base_url must be a clean absolute HTTP(S) URL")
     _ = parsed_site.port
-    config["site"]["base_url"] = base_url.rstrip("/") + "/"
+    # Rebuilt from its parts, so an empty trailing "?" or "#" cannot swallow the file names.
+    config["site"]["base_url"] = urlunsplit(
+        (parsed_site.scheme, parsed_site.netloc, parsed_site.path.rstrip("/") + "/", "", ""))
     config["site"]["repository_url"] = canonical_url(config["site"]["repository_url"])
     for key in ("title", "description"):
         if not isinstance(config["site"][key], str) or len(config["site"][key]) > 300:
