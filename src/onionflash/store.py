@@ -8,8 +8,9 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from .util import after, backoff_seconds, canonical_url, digest, format_utc, item_cluster, item_identity, normalize_evidence, parse_utc
-from . import editorial, monitoring
+from .util import after, backoff_seconds, digest, item_cluster, item_identity
+from . import candidate, editorial, monitoring, render
+from .candidate import ReviewRequired, StaleCandidate
 
 
 def backup_database(source: str | Path, destination: str | Path) -> None:
@@ -63,39 +64,6 @@ def item_priority(item: dict) -> int:
     return max(score, TAG_PRIORITY if item["kind"] == "tag" else 0)
 
 
-def _rank(kind: str, confidence: str, updated_at: str) -> tuple:
-    return ({"tag": 0, "metrics_timeline": 1}.get(kind, 2), confidence == "confirmed", updated_at)
-
-
-def _comment_sources(item: dict, result: dict, input_chars: int | None, observed: str) -> list[dict]:
-    if type(input_chars) is not int or input_chars <= 0 or not item.get("public_comments"):
-        return []
-    from .comments import analysis_context, parse_note_id
-    try:
-        _, supplied = analysis_context(item, input_chars)
-    except (ValueError, TypeError, KeyError, AttributeError):
-        return []
-    evidence = [normalize_evidence(quote) for quote in result.get("evidence", []) if isinstance(quote, str)]
-    evidence = [quote for quote in evidence if len(quote) >= 8]
-    sources = []
-    for note in supplied:
-        try:
-            identifier = parse_note_id(note["id"])
-            url = canonical_url(note["url"])
-            if identifier is None or url != canonical_url(item["url"]).split("#", 1)[0] + "#note_" + identifier:
-                continue
-            body = normalize_evidence(note["body"])
-            if not any(quote in body for quote in evidence):
-                continue
-            created = format_utc(parse_utc(note["created_at"]))
-            updated = format_utc(parse_utc(note["updated_at"]))
-            if not created <= updated <= observed:
-                continue
-            sources.append({"id": item["id"] + ":" + note["id"], "source_item_id": item["id"],
-                            "url": url, "title": note["title"], "published_at": created, "updated_at": updated})
-        except (KeyError, TypeError, ValueError, UnicodeError):
-            continue
-    return sources
 
 
 class Store:
@@ -136,9 +104,10 @@ class Store:
         monitoring.initialize(self.db)
         editorial.initialize(self.db)
         analysis_columns = {row[1] for row in self.db.execute("PRAGMA table_info(analyses)")}
-        for name, kind in (("source_payload", "TEXT"), ("source_item_id", "TEXT"), ("input_chars", "INTEGER")):
+        for name, kind in (("source_payload", "TEXT"), ("source_item_id", "TEXT"), ("input_chars", "INTEGER"), ("review_record", "TEXT")):
             if name not in analysis_columns:
                 self.db.execute(f"ALTER TABLE analyses ADD COLUMN {name} {kind}")
+        self.db.execute("CREATE INDEX IF NOT EXISTS analyses_source_snapshot ON analyses(source_item_id,created_at DESC,cache_key DESC)")
         if "rejections" not in {row[1] for row in self.db.execute("PRAGMA table_info(items)")}:
             self.db.execute("ALTER TABLE items ADD COLUMN rejections INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
@@ -317,114 +286,110 @@ class Store:
     def rejected_count(self) -> int:
         return self.db.execute("SELECT COUNT(*) FROM items WHERE status='rejected'").fetchone()[0]
 
-    def finish(self, row: dict, result: dict, cache_key: str, observed: str, *, input_chars: int | None = None) -> None:
-        item = json.loads(row["payload"])
+    def record_analysis(self, row: dict, result: dict, cache_key: str, observed: str, *,
+                        input_chars: int | None = None, review_record: dict | None = None) -> str:
+        """Append immutable private evidence; the caller owns the transaction."""
+        result_json = json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        record_json = json.dumps(review_record, ensure_ascii=False, sort_keys=True, allow_nan=False) if review_record is not None else None
+        values = (result_json, row["payload"], row["id"], input_chars, record_json)
+        previous = self.db.execute("SELECT result,source_payload,source_item_id,input_chars,review_record FROM analyses WHERE cache_key=?", (cache_key,)).fetchone()
+        if previous is not None:
+            if tuple(previous) == values:
+                return cache_key
+            cache_key = digest(["analysis-audit", cache_key, values, observed])
+        self.db.execute("""INSERT OR IGNORE INTO analyses
+            (cache_key,result,created_at,source_payload,source_item_id,input_chars,review_record)
+            VALUES(?,?,?,?,?,?,?)""", (cache_key, result_json, observed, row["payload"], row["id"], input_chars, record_json))
+        return cache_key
+
+    def prepare_candidate(self, row: dict, result: dict, observed: str, *, input_chars: int | None = None,
+                          review_settings: dict | None = None) -> dict:
+        return candidate.prepare(self.db, row, result, observed, input_chars=input_chars, review_settings=review_settings)
+
+    def _clear_review_job(self, item_id: str) -> None:
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='review_jobs' AND type='table'").fetchone():
+            self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (item_id,))
+
+    def commit_candidate(self, prepared: dict, approved_candidate: dict | None, cache_key: str, observed: str, *,
+                         approval_key: str | None = None, policy_hash: str | None = None,
+                         review_record: dict | None = None) -> dict:
+        """Publish the approved bytes after CAS checks, without merging again."""
+        if self.db.in_transaction:
+            raise ValueError("Candidate commit requires a fresh transaction")
+        self.db.execute("BEGIN IMMEDIATE")
         with self.db:
-            self.db.execute(
-                """INSERT OR IGNORE INTO analyses
-                (cache_key,result,created_at,source_payload,source_item_id,input_chars) VALUES(?,?,?,?,?,?)""",
-                (cache_key, json.dumps(result, ensure_ascii=False), observed, row["payload"], row["id"], input_chars),
-            )
-            story_id = row.get("story_id")
-            if result["publish"]:
-                existing = None
-                if story_id:
-                    existing = self.db.execute(
-                        "SELECT * FROM stories WHERE id=?", (story_id,)
-                    ).fetchone()
-                if existing is None:
-                    existing = self.db.execute(
-                        "SELECT * FROM stories WHERE cluster_key=?",
-                        (row["cluster_key"],),
-                    ).fetchone()
-                previous = json.loads(existing["payload"]) if existing else None
-                story_id = (
-                    existing["id"] if existing else digest(row["cluster_key"])[:24]
-                )
-                if existing is not None and editorial.is_locked(self.db, story_id):
-                    # Keep the new source analysis privately and its grouping
-                    # relationship, but do not overwrite an operator decision.
-                    editorial.record_held(self.db, story_id, observed)
-                    self.db.execute("UPDATE items SET status='published',story_id=?,next_attempt_at=NULL,last_error=NULL WHERE id=?", (story_id, row["id"]))
-                    return
-                source = {
-                    "id": item["id"],
-                    "url": item["url"],
-                    "title": item["title"],
-                    "published_at": item["published_at"],
-                }
-                comments = _comment_sources(item, result, input_chars, observed)
-                effective_updated = max([item["updated_at"], *(s["updated_at"] for s in comments)])
-                source_map = {s["url"]: s for s in (previous or {}).get("sources", []) if s.get("id") != item["id"] and s.get("source_item_id") != item["id"]}
-                source_map[source["url"]] = source
-                source_map.update({comment["url"]: comment for comment in comments})
-                data = {
-                    key: result[key]
-                    for key in (
-                        "title",
-                        "summary",
-                        "why_it_matters",
-                        "category",
-                        "products",
-                        "priority",
-                        "confidence",
-                        "state",
-                        "tags",
-                    )
-                }
-                data["editorial_kind"], data["editorial_item"] = item["kind"], item["id"]
-                data["editorial_updated_at"] = effective_updated
-                writer = (previous or {}).get("editorial_item")
-                if previous and writer is None and len(previous.get("sources", [])) == 1:
-                    writer = previous["sources"][0].get("id")  # an older story's only source wrote it
-                if previous and writer != item["id"]:
-                    # Another item already wrote this story. It keeps the text when it
-                    # ranks higher: tag notice < Metrics timeline < primary report, then
-                    # a confirmed account, then the newer item. The loser only adds a link.
-                    kind = previous.get("editorial_kind") or ("tag" if previous["state"] == "tagged" else "")
-                    stamp = previous.get("editorial_updated_at") or previous["updated_at"]
-                    if _rank(kind, previous["confidence"], stamp) > _rank(
-                        item["kind"], data["confidence"], effective_updated
-                    ):
-                        data = {key: previous.get(key) for key in data}
-                        # Older stories lack the editorial fields; keep usable values.
-                        data.update(editorial_kind=kind, editorial_item=writer, editorial_updated_at=stamp)
-                data.update(
-                    {
-                        "id": story_id,
-                        "sources": sorted(source_map.values(), key=lambda s: s["url"]),
-                        "published_at": previous["published_at"]
-                        if previous
-                        else item["published_at"],
-                        "added_at": previous.get("added_at", previous["published_at"])
-                        if previous
-                        else observed,
-                        "updated_at": max(
-                            effective_updated,
-                            previous["updated_at"]
-                            if previous
-                            else item["published_at"],
-                        ),
-                    }
-                )
-                # Keep the story's first published_at. The private evidence stays in
-                # analyses; only selected fields go public.
-                cluster = existing["cluster_key"] if existing else row["cluster_key"]
-                self.db.execute(
-                    """INSERT INTO stories(id,cluster_key,payload,published_at,updated_at) VALUES(?,?,?,?,?)
-                    ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at""",
-                    (
-                        story_id,
-                        cluster,
-                        json.dumps(data, ensure_ascii=False),
-                        data["published_at"],
-                        data["updated_at"],
-                    ),
-                )
-            self.db.execute(
-                "UPDATE items SET status=?,story_id=?,next_attempt_at=NULL,last_error=NULL WHERE id=?",
-                ("published" if result["publish"] else "ignored", story_id, row["id"]),
-            )
+            candidate.assert_current(self.db, prepared)
+            binding = prepared["binding"]
+            if (digest(binding) != prepared["binding_hash"] or digest(prepared["packet"]) != prepared["source_hash"]
+                    or digest(prepared["candidate"]) != prepared["candidate_hash"]
+                    or binding["candidate_hash"] != prepared["candidate_hash"] or binding["packet_hash"] != prepared["source_hash"]
+                    or digest(prepared["payload"]) != binding["payload_hash"]):
+                raise StaleCandidate("Prepared candidate or evidence changed after assembly")
+            row, result = prepared["row"], prepared["result"]
+            existing = candidate.existing_story(self.db, row)
+            story_id = existing["id"] if existing else digest(row["cluster_key"])[:24]
+            cluster = existing["cluster_key"] if existing else row["cluster_key"]
+            if story_id != prepared["story_id"] or cluster != prepared["cluster_key"]:
+                raise StaleCandidate("Story grouping changed after assembly")
+            locked = editorial.is_locked(self.db, story_id)
+            payload = None
+            if result["publish"] and not locked:
+                original = prepared["candidate"]
+                if not isinstance(approved_candidate, dict) or set(approved_candidate) != set(original):
+                    raise ReviewRequired("Approval must identify the complete public candidate")
+                if any(approved_candidate[key] != original[key] for key in original if key not in candidate.REPAIR_FIELDS):
+                    raise ReviewRequired("Review cannot change story identity, sources, dates or editorial metadata")
+                normalized = render._prepare_story(approved_candidate, editorial=original.get("editorial"))
+                if normalized != approved_candidate:
+                    raise ReviewRequired("The approved candidate must already be normalized")
+                payload = json.loads(json.dumps(prepared["payload"]))
+                if not candidate.wholly_deterministic(self.db, row, payload, approved_candidate):
+                    if prepared["missing_sources"]:
+                        raise ReviewRequired("Required source material is unavailable")
+                    if not approval_key or not policy_hash or not self.db.execute("SELECT 1 FROM sqlite_master WHERE name='review_approvals'").fetchone():
+                        raise ReviewRequired("Exact final candidate needs a recorded review approval")
+                    receipt = self.db.execute("SELECT * FROM review_approvals WHERE key=?", (approval_key,)).fetchone()
+                    if receipt is None or any(receipt[key] != expected for key, expected in (
+                            ("candidate_hash", digest(approved_candidate)), ("source_hash", prepared["source_hash"]),
+                            ("policy_hash", policy_hash), ("binding_hash", prepared["binding_hash"]))):
+                        raise ReviewRequired("Review approval does not match this candidate and its sources")
+                    from .review import validate_review
+                    verdict = validate_review(json.loads(receipt["result_json"]), approved_candidate, prepared["packet"], verification=True)
+                    if verdict["verdict"] != "approve":
+                        raise ReviewRequired("Final review did not approve publication")
+                    if review_record is None:
+                        review_record = json.loads(receipt["review_record_json"])
+                    self.db.execute("UPDATE review_approvals SET last_used_at=? WHERE key=?", (observed, approval_key))
+                elif approved_candidate != original:
+                    raise ReviewRequired("A deterministic notice cannot accept an unreviewed repair")
+                payload.update({key: approved_candidate[key] for key in candidate.SEMANTIC_FIELDS})
+            if review_record is None and self.db.execute("SELECT 1 FROM sqlite_master WHERE name='review_jobs'").fetchone():
+                job = self.db.execute("SELECT record_json FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
+                review_record = json.loads(job[0]) if job else None
+            analysis_key = self.record_analysis(row, result, cache_key, observed,
+                                                input_chars=prepared["input_chars"], review_record=review_record)
+            if payload is not None:
+                if payload.get("editorial_item") == row["id"]:
+                    payload["editorial_analysis_key"] = analysis_key
+                changed = self.db.execute("""INSERT INTO stories(id,cluster_key,payload,published_at,updated_at)
+                    VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at""",
+                    (story_id, cluster, json.dumps(payload, ensure_ascii=False, allow_nan=False), payload["published_at"], payload["updated_at"]))
+                if changed.rowcount != 1:
+                    raise StaleCandidate("Story became editorially protected before publication")
+            elif locked and result["publish"]:
+                editorial.record_held(self.db, story_id, observed)
+            mapped_id = story_id if result["publish"] else row.get("story_id")
+            self.db.execute("UPDATE items SET status=?,story_id=?,next_attempt_at=NULL,last_error=NULL WHERE id=?",
+                            ("published" if result["publish"] else "ignored", mapped_id, row["id"]))
+            self._clear_review_job(row["id"])
+        return {"story_id": mapped_id, "status": "locked" if locked and result["publish"] else "published" if result["publish"] else "ignored"}
+
+    def finish(self, row: dict, result: dict, cache_key: str, observed: str, *, input_chars: int | None = None) -> None:
+        """Only ignored, locked or wholly deterministic notices bypass review."""
+        prepared = self.prepare_candidate(row, result, observed, input_chars=input_chars)
+        if prepared["requires_review"]:
+            raise ReviewRequired("Automatic publication requires the final review gate")
+        self.commit_candidate(prepared, prepared["candidate"], cache_key, observed)
 
     def stories(self, limit: int = -1) -> list[dict]:
         """Stored stories, newest activity first (all of them by default)."""

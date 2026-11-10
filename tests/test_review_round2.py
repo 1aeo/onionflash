@@ -1,5 +1,6 @@
 """Adversarial regressions and shared-helper parity from review round two."""
 
+from approval_helpers import ApprovingReviewer, finish_reviewed
 import copy
 import json
 from datetime import datetime, timezone
@@ -36,10 +37,10 @@ def test_tag_never_replaces_richer_story_in_same_release_cluster(tmp_path, state
     existing_result = analysis(title="Detailed security release update", state=state)
     with Store(tmp_path / "state.db") as store:
         store.ingest(existing_item, DATE)
-        store.finish(store.pending(1, DATE)[0], existing_result, "detailed", DATE)
+        finish_reviewed(store, store.pending(1, DATE)[0], existing_result, "detailed", DATE)
         later = tag(updated_at="2026-11-09T16:00:00Z")
         store.ingest(later, DATE)
-        store.finish(store.pending(1, DATE)[0], tag_notice(later), "tag", DATE)
+        finish_reviewed(store, store.pending(1, DATE)[0], tag_notice(later), "tag", DATE)
         story = store.stories(1)[0]
     assert story["title"] == existing_result["title"]
     assert story["summary"] == existing_result["summary"]
@@ -152,6 +153,7 @@ def _prepare_run(monkeypatch, analyze):
         def analyze(self, payload):
             return analyze(payload)
     monkeypatch.setattr(cli, "Analyzer", FakeAnalyzer)
+    monkeypatch.setattr(cli, "Reviewer", ApprovingReviewer)
     monkeypatch.setattr(cli, "now_iso", lambda: DATE)
     monkeypatch.setattr(cli, "build", lambda *args: {"published_stories": 0, "stories_skipped": 0})
 
@@ -188,7 +190,7 @@ def test_defer_does_not_change_completed_item_metadata(tmp_path, publish):
     with Store(tmp_path / "state.db") as store:
         store.ingest(item(), DATE)
         row = store.pending(1, DATE)[0]
-        store.finish(row, analysis(publish=publish), "cache", DATE)
+        finish_reviewed(store, row, analysis(publish=publish), "cache", DATE)
         before = dict(store.db.execute("SELECT * FROM items").fetchone())
         store.defer(row["id"], "Late timeout", DEFAULTS["llm"], DATE)
         assert dict(store.db.execute("SELECT * FROM items").fetchone()) == before

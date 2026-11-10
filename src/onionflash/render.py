@@ -35,7 +35,9 @@ def _text(value: object, limit: int) -> str:
     if not isinstance(value, str):
         return ""
     clean = "".join(char for char in value if char in "\t\n\r" or 0x20 <= ord(char) <= 0xD7FF or 0xE000 <= ord(char) <= 0xFFFD or 0x10000 <= ord(char) <= 0x10FFFF)
-    return " ".join(clean.split())[:limit]
+    # Truncation may land on a space. Keep normalization idempotent so a final
+    # candidate cannot change between review and its guarded commit.
+    return " ".join(clean.split())[:limit].rstrip()
 
 
 def _public_url(value: object) -> str:

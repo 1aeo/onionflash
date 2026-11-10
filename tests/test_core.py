@@ -1,3 +1,4 @@
+from approval_helpers import ApprovingReviewer, finish_reviewed
 import copy
 import json
 from pathlib import Path
@@ -191,7 +192,7 @@ def test_queue_is_durable_and_idempotent(tmp_path):
     with Store(db) as store:
         assert store.pending_count() == 1
         row = store.pending(1, "2026-11-09T00:00:00Z")[0]
-        store.finish(row, analysis(), "cache", DATE)
+        finish_reviewed(store, row, analysis(), "cache", DATE)
         assert store.pending_count() == 0
         assert len(store.stories(10)) == 1
         record = store.db.execute("SELECT result FROM analyses WHERE cache_key='cache'").fetchone()
@@ -216,7 +217,7 @@ def test_exact_body_duplicates_merge_but_distinct_claims_do_not(tmp_path):
         for n in (1, 2):
             store.ingest(item(url=f"https://example.org/{n}", content=body), DATE)
             row = store.pending(1, DATE)[0]
-            store.finish(row, analysis(), f"cache{n}", DATE)
+            finish_reviewed(store, row, analysis(), f"cache{n}", DATE)
         stories = store.stories(10)
         assert len(stories) == 1
         assert len(stories[0]["sources"]) == 2
@@ -247,14 +248,14 @@ def test_release_mirrors_merge_and_tags_cannot_downgrade_announced_release(tmp_p
     assert item_cluster(release) == item_cluster(tag)
     with Store(tmp_path / "state.db") as store:
         store.ingest(release, DATE)
-        store.finish(
+        finish_reviewed(store,
             store.pending(1, DATE)[0],
             analysis(title="Tor 0.4.9.16 released", state="released"),
             "release",
             DATE,
         )
         store.ingest(tag, DATE)
-        store.finish(
+        finish_reviewed(store,
             store.pending(1, DATE)[0],
             analysis(title="Tor tag created", state="tagged"),
             "tag",
@@ -277,11 +278,11 @@ def test_older_mirror_only_adds_source_without_editorial_rollback(tmp_path):
         )
         older = item(url="https://example.org/old", content=body)
         store.ingest(newer, DATE)
-        store.finish(
+        finish_reviewed(store,
             store.pending(1, DATE)[0], analysis(title="Newest facts"), "new", DATE
         )
         store.ingest(older, DATE)
-        store.finish(
+        finish_reviewed(store,
             store.pending(1, DATE)[0], analysis(title="Old facts"), "old", DATE
         )
         assert store.stories(1)[0]["title"] == "Newest facts"
@@ -522,6 +523,7 @@ def test_a_failing_source_is_deferred_and_does_not_starve_queued_analysis(
 
     monkeypatch.setattr(cli, "HttpClient", DummyContext)
     monkeypatch.setattr(cli, "Analyzer", DummyContext)
+    monkeypatch.setattr(cli, "Reviewer", ApprovingReviewer)
     monkeypatch.setattr(cli, "collect_source", timeout)
     with Store(tmp_path / "state.db") as store:
         store.ingest(item(), DATE)
@@ -639,7 +641,7 @@ def test_render_failure_preserves_prior_site(tmp_path, monkeypatch):
         store.source(cfg["sources"][0])
         store.source_success(cfg["sources"][0], {"url": cfg["sources"][0]["url"]}, DATE)
         store.ingest(item(), DATE)
-        store.finish(store.pending(1, DATE)[0], analysis(), "cache", DATE)
+        finish_reviewed(store, store.pending(1, DATE)[0], analysis(), "cache", DATE)
         assert build(cfg, store) == {"public_changed": True, "published_stories": 1, "stories_skipped": 0, "no_browser_js_ready": True}
         before = (tmp_path / "public/index.html").read_bytes()
         assert build(cfg, store)["published_stories"] == 1
@@ -711,7 +713,7 @@ def test_skipped_story_count_is_reported_on_every_build(tmp_path):
         for url in ["https://example.org/news/1", "https://example.org/news/2"]:
             store.ingest(item(url=url, content=url), DATE)
         for row in store.pending(10, DATE):
-            store.finish(row, analysis(), "key-" + row["id"], DATE)
+            finish_reviewed(store, row, analysis(), "key-" + row["id"], DATE)
         store.db.execute("UPDATE stories SET payload=json_set(payload, '$.priority', 'urgent') "
                          "WHERE rowid=(SELECT MIN(rowid) FROM stories)")
         assert build(cfg, store) == {"public_changed": True, "published_stories": 1, "stories_skipped": 1, "no_browser_js_ready": True}
@@ -723,7 +725,7 @@ def test_story_precedence_keeps_confirmed_account_but_follows_its_own_updates(tm
         store.ingest(item(url=url, title="Arti 2.8.0 released", updated_at=updated, kind="feed", content=content,
                           product="arti"), updated)
         row = next(r for r in store.pending(10, updated) if r["url"] == url)
-        store.finish(row, analysis(**result), "key-" + url + updated, updated)
+        finish_reviewed(store, row, analysis(**result), "key-" + url + updated, updated)
         return store.stories(10)
 
     later = "2026-11-08T13:00:00Z"
@@ -764,7 +766,7 @@ def test_precedence_compares_with_the_writing_item_not_later_losers(tmp_path):
     def publish(store, url, updated, **result):
         store.ingest(item(url=url, title="Tor 0.4.9.17 released", updated_at=updated, kind="feed", content=url), updated)
         row = next(r for r in store.pending(10, updated) if r["url"] == url)
-        store.finish(row, analysis(title=result.pop("title"), **result), "k" + url, updated)
+        finish_reviewed(store, row, analysis(title=result.pop("title"), **result), "k" + url, updated)
         return store.stories(10)[0]
 
     with Store(tmp_path / "state.db") as store:
@@ -784,13 +786,20 @@ def test_legacy_story_without_editorial_fields_survives_successive_items(tmp_pat
               "sources": [{"id": "old", "url": "https://old.example/1", "title": "Old", "published_at": DATE}]}
     legacy.pop("evidence")
     with Store(tmp_path / "state.db") as store:
+        # Legacy stories lack editorial metadata but still need their actual
+        # collected writer source to support a new review of retained prose.
+        store.ingest(item(url="https://old.example/1", title=legacy["title"], kind="feed",
+                          content="The original Tor release announcement.", updated_at=legacy["updated_at"]), DATE)
+        old_row = store.pending(1, DATE)[0]
+        legacy["sources"][0]["id"] = old_row["id"]
+        store.db.execute("UPDATE items SET status='published',story_id=? WHERE id=?", (legacy["id"], old_row["id"]))
         key = item_cluster(item(title="Tor 0.4.9.18 released", kind="feed"))
         store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (legacy["id"], key, json.dumps(legacy), DATE, legacy["updated_at"]))
         for index, stamp in enumerate(["2026-11-08T13:00:00Z", "2026-11-08T14:00:00Z"]):
             store.ingest(item(url=f"https://new.example/{index}", title="Tor 0.4.9.18 released", kind="feed",
                               content=str(index), updated_at=stamp), stamp)
             row = next(r for r in store.pending(10, stamp) if r["url"].endswith(str(index)))
-            store.finish(row, analysis(title=f"Item {index}"), f"k{index}", stamp)
+            finish_reviewed(store, row, analysis(title=f"Item {index}"), f"k{index}", stamp)
         story = store.stories(10)[0]
     assert story["title"] == "Tor 0.4.9.18 released" and len(story["sources"]) == 3
 
@@ -807,7 +816,7 @@ def test_an_older_single_source_story_can_still_be_updated_by_its_source(tmp_pat
         store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (legacy["id"], row["cluster_key"], json.dumps(legacy), DATE, DATE))
         later = "2026-11-08T13:00:00Z"
         store.ingest(item(url=url, title="Tor 0.4.9.19 released", kind="feed", content="Withdrawn.", updated_at=later), later)
-        store.finish(store.pending(1, later)[0], analysis(title="Tor 0.4.9.19 release withdrawn"), "k", later)
+        finish_reviewed(store, store.pending(1, later)[0], analysis(title="Tor 0.4.9.19 release withdrawn"), "k", later)
         story = store.stories(1)[0]
     assert story["title"] == "Tor 0.4.9.19 release withdrawn" and story["editorial_item"] == row["id"]
 
@@ -816,7 +825,7 @@ def test_new_story_records_when_onion_flash_added_it(tmp_path):
     later = "2026-11-09T12:00:00Z"
     with Store(tmp_path / "state.db") as store:
         store.ingest(item(published_at="2026-09-22T12:00:00Z", updated_at=later), later)
-        store.finish(store.pending(1, later)[0], analysis(), "key", later)
+        finish_reviewed(store, store.pending(1, later)[0], analysis(), "key", later)
         story = store.stories()[0]
     assert (story["published_at"], story["added_at"]) == ("2026-09-22T12:00:00Z", later)
 

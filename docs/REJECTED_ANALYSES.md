@@ -1,8 +1,10 @@
 # Reviewing rejected analyses
 
 Transient failures, such as an unavailable LLM endpoint, remain pending and use
-the normal exponential backoff. Three terminal content/validation failures move
-an item to `rejected`; automation stops retrying that source revision.
+the normal exponential backoff. Three terminal writer content/validation failures
+move an item to `rejected`. A semantic final-review hold rejects the candidate
+immediately, including a repair that does not pass its fresh verification;
+automation does not keep rewriting that source revision.
 
 These local CLI commands act on one item at a time. They do not call the LLM,
 publish a story, retract a story or unlock an editorial correction.
@@ -21,9 +23,25 @@ returns a `next_cursor` for bounded ID-based pagination. Limits are 1–200 item
 Use `--status dismissed` to inspect dismissed revisions.
 
 `show` explicitly includes the saved source item and up to 20 recent operator
-actions. It is a private inspection command; its source text and operator reasons
-are not published. It does not print raw stored model responses. Malformed or
-oversized saved items produce an inspection error field rather than a source dump.
+actions. When a current final-review job exists, `final_review` also shows:
+
+- Its stage and exact candidate text, including a repair waiting for verification.
+- The latest structured verdict, each criterion's outcome and reason, and the
+  issues identified by the reviewer.
+- The bounded numbered source packet, so references such as `S1:P3` can be checked
+  against the actual supplied passage.
+
+`latest_review.phase` distinguishes the first review from verification. Its
+`candidate_hash` identifies the text that verdict evaluated; during `verify`,
+the current candidate may be the repair that has not yet received approval.
+No job is shown after successful publication clears it; its completed audit
+remains in private analysis records.
+
+This is a read-only private inspection command. Source text, review findings and
+operator reasons are not published by it. It does not dump raw provider errors,
+credential fields or superseded analysis JSON. Each saved source/review record is
+bounded to 1 MiB; malformed or oversized records produce an inspection error
+field rather than a source dump.
 
 ## Retry one rejected revision
 
@@ -38,11 +56,17 @@ and cooldown, then queues the item for the normal analysis pipeline. It does not
 bypass validation or approve a publication. A missing or unreadable source body
 must be restored or recollected before retrying.
 
-The next scheduled run analyzes the queued item again; the runtime does not
-reuse previous model results. If an analysis record already exists for the
+The next scheduled run resumes the item. A completed writer draft in its current
+review job is retained, and an explicit retry starts a fresh final review; it does
+not rerun that writer unless its source or writer-input identity changed. Ordinary
+review timeouts or malformed replies resume the unfinished review/verification
+stage automatically using normal backoff. A retry never treats a proposed repair
+as approval.
+
+If an analysis record already exists for the
 current source/model/prompt/input-window key, retry preserves its complete prior value in the
 private action audit as `superseded_analysis_key` and `superseded_analysis_json`,
-then removes that record so the new attempt can save its own analysis. Other
+including its structured held-review audit, then removes that record so the new attempt can save its own analysis. Other
 analysis records and already accepted stories are unchanged.
 
 ## Dismiss one rejected revision

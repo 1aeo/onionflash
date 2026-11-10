@@ -1,5 +1,6 @@
 """One-item operator decisions preserve story state and the private audit trail."""
 
+from approval_helpers import finish_reviewed
 import copy
 import json
 import sqlite3
@@ -100,7 +101,7 @@ def test_retry_supersedes_only_current_analysis_and_saves_evidence_privately(sto
     assert "content" not in result and "reason" not in result and "superseded_analysis_json" not in result
     assert "superseded_analysis_json" not in rejection.show_item(store, row["id"])["actions"][0]
     assert capsys.readouterr().out == ""
-    store.finish(queued[0], analysis(summary="A supported account after retry."), key, after(60, DATE))
+    finish_reviewed(store, queued[0], analysis(summary="A supported account after retry."), key, after(60, DATE))
     assert store.pending_count() == 0
     assert store.stories()[0]["summary"] == "A supported account after retry."
     assert analysis_result(store, key)["summary"] == "A supported account after retry."
@@ -158,7 +159,7 @@ def test_retry_and_dismiss_do_not_mutate_an_existing_story_or_editorial_state(st
     source = item()
     store.ingest(source, DATE)
     first = store.pending(1, DATE)[0]
-    store.finish(first, analysis(), cache_key(first, DEFAULTS["llm"]), DATE)
+    finish_reviewed(store, first, analysis(), cache_key(first, DEFAULTS["llm"]), DATE)
     original_story_id = store.stories()[0]["id"]
     changed = {**source, "content": source["content"] + " A disputed later revision.", "updated_at": after(60, DATE)}
     store.ingest(changed, after(60, DATE))

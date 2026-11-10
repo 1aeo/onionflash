@@ -1,3 +1,4 @@
+from approval_helpers import finish_reviewed
 import json
 from pathlib import Path
 
@@ -23,7 +24,7 @@ url = "https://example.org/feed.xml"
     with Store(cfg["storage"]["database"]) as store:
         store.ingest(item(), DATE)
         row = store.pending(1, DATE)[0]
-        store.finish(row, analysis(), "seed", DATE)
+        finish_reviewed(store, row, analysis(), "seed", DATE)
         story_id = store.stories()[0]["id"]
         cli.build(cfg, store)
     return path, cfg, story_id
@@ -56,7 +57,7 @@ def test_cli_correct_build_lock_and_stale_guard(tmp_path, capsys):
     with Store(cfg["storage"]["database"]) as store:
         store.ingest(item(content="The operator updated the report with a new detail."), "2026-11-09T12:00:00Z")
         row = store.pending(1, "2026-11-09T12:00:00Z")[0]
-        store.finish(row, analysis(why_it_matters="Automation tried to replace the correction."), "later", "2026-11-09T12:00:00Z")
+        finish_reviewed(store, row, analysis(why_it_matters="Automation tried to replace the correction."), "later", "2026-11-09T12:00:00Z")
         assert store.stories()[0]["why_it_matters"] == public["why_it_matters"]
     history = invoke(capsys, "story", "history", "--config", config, "--story", story_id, "--limit", 1)
     assert history["revisions"][0]["reason"] == "Removed an unsupported operator instruction."

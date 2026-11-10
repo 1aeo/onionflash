@@ -1,5 +1,6 @@
 """Repository revisions must preserve story identity and richer reporting."""
 
+from approval_helpers import finish_reviewed
 import copy
 
 import pytest
@@ -22,7 +23,7 @@ def timeline(**changes):
 def finish(store, incoming, result):
     assert store.ingest(incoming, DATE)
     row = dict(store.db.execute("SELECT * FROM items WHERE id=?", (incoming["id"],)).fetchone())
-    store.finish(row, result, incoming["id"] + result["summary"], DATE)
+    finish_reviewed(store, row, result, incoming["id"] + result["summary"], DATE)
     return store.stories(10)[0]
 
 

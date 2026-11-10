@@ -49,6 +49,22 @@ max_items_per_run = 12
 # vLLM understands this optional extension. Set false for providers that do not.
 send_chat_template_kwargs = true
 
+# Every automatic model-written publication needs an approval of its exact final
+# candidate and bounded source packet. These review-specific limits are tunable.
+# The endpoint, credentials and network policy are inherited from [llm].
+[review]
+model = ""                     # Empty uses llm.model.
+timeout_seconds = 90
+connect_timeout_seconds = 10
+total_timeout_seconds = 120
+max_output_tokens = 2200
+max_source_chars = 24000
+max_sources = 8
+max_passages = 64
+passage_chars = 1800
+max_repairs = 1                 # 0 holds any revision request; 1 allows one repair.
+max_cache_entries = 2000
+
 # Source kind is feed, tag, gitlab_issue, gitlab_mr, or metrics_timeline.
 # Fallbacks must offer the same logical stream; they are tried in order.
 # Optional source overrides: enabled, interval_seconds, max_pages, max_items.

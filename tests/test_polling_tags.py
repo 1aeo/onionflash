@@ -1,5 +1,6 @@
 """Regression checks for release coverage and scheduler-boundary behavior."""
 
+from approval_helpers import ApprovingReviewer, finish_reviewed
 import copy
 from pathlib import Path
 
@@ -93,7 +94,7 @@ def test_tag_notice_preserves_publication_dates_and_escapes_hostile_text(tmp_pat
     with Store(tmp_path / "state.db") as store:
         store.ingest(raw, DATE)
         row = store.pending(1, DATE)[0]
-        store.finish(row, result, cache_key(row, DEFAULTS["llm"]), DATE)
+        finish_reviewed(store, row, result, cache_key(row, DEFAULTS["llm"]), DATE)
         story = store.stories(1)[0]
     assert story["published_at"] == raw["published_at"]
     assert story["updated_at"] == raw["updated_at"]
@@ -123,11 +124,11 @@ def test_tag_cannot_downgrade_existing_announced_release(tmp_path):
     with Store(tmp_path / "state.db") as store:
         store.ingest(release_item, DATE)
         row = store.pending(1, DATE)[0]
-        store.finish(row, release_result, "release", DATE)
+        finish_reviewed(store, row, release_result, "release", DATE)
         later_tag = tag(updated_at=DATE)
         store.ingest(later_tag, DATE)
         row = store.pending(1, DATE)[0]
-        store.finish(row, tag_result, "tag", DATE)
+        finish_reviewed(store, row, tag_result, "tag", DATE)
         story = store.stories(1)[0]
     assert story["state"] == "released" and story["title"] == release_result["title"]
     assert len(story["sources"]) == 2
@@ -215,6 +216,7 @@ def test_inference_outage_does_not_block_a_queued_deterministic_tag(
             return super().analyze(item)
 
     monkeypatch.setattr(cli, "Analyzer", UnavailableAnalyzer)
+    monkeypatch.setattr(cli, "Reviewer", ApprovingReviewer)
     monkeypatch.setattr(cli, "now_iso", lambda: DATE)
     monkeypatch.setattr(cli, "build", lambda *args: {"published_stories": 0, "stories_skipped": 0})
     with Store(tmp_path / "state.db") as store:

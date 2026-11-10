@@ -1,3 +1,4 @@
+from approval_helpers import ApprovingReviewer, approved_result
 import copy
 import json
 
@@ -5,11 +6,12 @@ from onionflash import cli
 from onionflash.analyze import Analyzer, cache_key
 from onionflash.comments import analysis_content
 from onionflash.config import DEFAULTS
+from onionflash.review import Reviewer
 from onionflash.store import Store
 from test_core import DATE, analysis, item
 
 
-def test_long_description_keeps_comment_evidence_in_both_model_passes(monkeypatch):
+def test_long_description_keeps_comment_evidence_in_draft_and_final_review(tmp_path, monkeypatch):
     config = copy.deepcopy(DEFAULTS)
     config["llm"].update(base_url="https://example.org/v1", api_key_env="TEST_COMMENT_KEY", max_input_chars=1200)
     monkeypatch.setenv("TEST_COMMENT_KEY", "private-test-key")
@@ -27,17 +29,30 @@ def test_long_description_keeps_comment_evidence_in_both_model_passes(monkeypatc
     class ControlledAnalyzer(Analyzer):
         def _complete(self, request, key):
             requests.append(request)
-            if request["response_format"]["json_schema"]["name"] == "onionflash_news":
-                return copy.deepcopy(draft)
-            return {"unsupported": [], **{name: draft[name] for name in ("title", "summary", "why_it_matters")}}
+            return copy.deepcopy(draft)
+
+    class ControlledReviewer(Reviewer):
+        def _complete(self, request, key):
+            requests.append(request)
+            data = json.loads(request["messages"][1]["content"])
+            return approved_result(data["candidate"], data["packet"])
 
     with ControlledAnalyzer(config) as analyzer:
         result = analyzer.analyze(payload)
+    with Store(tmp_path / "state.db") as store:
+        store.ingest(payload, DATE)
+        row = store.pending(1, DATE)[0]
+        prepared = store.prepare_candidate(row, result, DATE, input_chars=1200,
+                                           review_settings=config["review"])
+        with ControlledReviewer(config) as checker:
+            assert checker.review(prepared["candidate"], prepared["packet"])["verdict"] == "approve"
     assert result["evidence"] == [note["body"]]
     initial = json.loads(requests[0]["messages"][1]["content"])
-    review = json.loads(requests[1]["messages"][1]["content"])["source"]
+    checked = json.loads(requests[1]["messages"][1]["content"])
     expected = analysis_content(payload, 1200)
-    assert initial["content"] == review["content"] == expected
+    assert initial["content"] == expected
+    assert checked["candidate"] == prepared["candidate"]
+    assert any(note["body"] in passage["text"] for source in checked["packet"]["sources"] for passage in source["passages"])
     assert note["body"] in expected and "@maintainer" in expected
     assert len(expected) <= 1200
     assert "private-test-key" not in json.dumps(requests)
@@ -72,6 +87,7 @@ def test_optional_comment_failure_does_not_stop_saved_analysis(tmp_path, monkeyp
             return analysis()
 
     monkeypatch.setattr(cli, "Analyzer", SavedAnalyzer)
+    monkeypatch.setattr(cli, "Reviewer", ApprovingReviewer)
     with Store(tmp_path / "state.db") as store:
         store.ingest(item(), DATE)
         report = cli.run(config, store)
@@ -103,6 +119,7 @@ def test_comments_use_collection_window_without_spending_analysis_reserve(tmp_pa
 
     monkeypatch.setattr(cli, "enrich_comments", comments)
     monkeypatch.setattr(cli, "Analyzer", NoAnalysis)
+    monkeypatch.setattr(cli, "Reviewer", ApprovingReviewer)
     with Store(tmp_path / "state.db") as store:
         cli.run(config, store)
     assert captured == {"comments": 220.0, "analysis": 340.0}

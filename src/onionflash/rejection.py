@@ -9,9 +9,9 @@ from __future__ import annotations
 import json
 import re
 
-from .analyze import cache_key
+from .analyze import AnalysisError, cache_key
 from .schema import PRODUCTS
-from .util import canonical_url, format_utc, now_iso, parse_utc
+from .util import canonical_url, digest, format_utc, now_iso, parse_utc
 
 
 MAX_LIMIT = 200
@@ -76,7 +76,7 @@ def list_items(store, *, status="rejected", limit=50, after=None) -> dict:
 
 
 def show_item(store, item_id) -> dict:
-    """Explicit inspection may include the saved source, but never raw model output."""
+    """Inspect saved source and structured final review, never raw provider output."""
     row = store.db.execute("SELECT * FROM items WHERE id=?", (_identifier(item_id),)).fetchone()
     if row is None:
         raise ValueError("Source item was not found")
@@ -85,6 +85,7 @@ def show_item(store, item_id) -> dict:
         result["saved_item"] = _payload(row)
     except ValueError:
         result["saved_item"] = None
+    result["final_review"] = _final_review(store, item_id)
     result["actions"] = []
     if store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rejection_actions'").fetchone():
         result["actions"] = [dict(action) for action in store.db.execute(
@@ -94,6 +95,55 @@ def show_item(store, item_id) -> dict:
             (item_id, HISTORY_LIMIT),
         )]
     return result
+
+
+def _final_review(store, item_id):
+    """Read one bounded current job, selecting only operator-facing review data."""
+    if not store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_jobs'").fetchone():
+        return None
+    row = store.db.execute("SELECT stage,substr(record_json,1,?) AS payload FROM review_jobs WHERE item_id=?",
+                           (MAX_PAYLOAD_BYTES + 1, item_id)).fetchone()
+    if row is None:
+        return None
+    try:
+        from . import review
+        from .render import _prepare_story
+        if row["stage"] not in {"drafted", "review", "verify", "approved", "held"}:
+            raise ValueError
+        record = _payload(row)
+        prepared = record.get("prepared") or {}
+        candidate = record.get("candidate", prepared.get("candidate"))
+        if candidate is not None:
+            candidate = _prepare_story(candidate, editorial=candidate.get("editorial"))
+        packet = prepared.get("packet")
+        if packet is not None:
+            # Discard unrelated private/provider fields even in a damaged job.
+            fields = {"id", "url", "title", "kind", "authority", "product", "published_at", "updated_at",
+                      "upstream_state", "snapshot", "captured_at", "author", "passages"}
+            packet = {"sources": [{key: value for key, value in source.items() if key in fields}
+                                  for source in packet["sources"]],
+                      "missing_sources": packet["missing_sources"], "truncated": packet["truncated"]}
+            review._packet_refs(packet)
+        entries = record.get("reviews") or (record.get("approval") or {}).get("reviews", [])
+        latest = None
+        if entries:
+            entry = entries[-1]
+            origin = record if record.get("reviews") else record["approval"]
+            phase = entry["stage"]
+            if phase not in {"review", "verification"}:
+                raise ValueError
+            evaluated = origin.get("candidate") if phase == "verification" else origin["prepared"]["candidate"]
+            if digest(evaluated) != entry["candidate_hash"]:
+                raise ValueError
+            response = review.validate_review(entry["result"], evaluated, packet, verification=phase == "verification")
+            latest = {"phase": phase, "candidate_hash": entry["candidate_hash"],
+                      **{key: response[key] for key in ("verdict", "criteria", "issues")}}
+        display = {"stage": row["stage"], "candidate": candidate, "source_packet": packet, "latest_review": latest}
+        if len(json.dumps(display, ensure_ascii=False, allow_nan=False).encode("utf-8")) > MAX_PAYLOAD_BYTES:
+            raise ValueError
+        return display
+    except (ValueError, TypeError, KeyError, AttributeError, IndexError, UnicodeError, RecursionError, AnalysisError):
+        return {"error": "Saved final review cannot be decoded safely"}
 
 
 def _initialize(db):
@@ -184,6 +234,9 @@ def _act(store, item_id, expected_hash, reason, action, llm, observed):
              row["rejections"], row["last_error"], row["next_attempt_at"], key if previous_analysis else None, snapshot))
         if previous_analysis:
             db.execute("DELETE FROM analyses WHERE cache_key=?", (key,))
+        if action == "retry":
+            from .review_gate import reset_review_work
+            reset_review_work(store, item_id)
     return {"item_id": item_id, "content_hash": expected_hash, "action": action,
             "status": "pending" if action == "retry" else "dismissed", "action_id": event.lastrowid}
 
