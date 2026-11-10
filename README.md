@@ -70,7 +70,7 @@ The API key is read only from the variable named by `llm.api_key_env`.
 | Section | Settings |
 | --- | --- |
 | `site` | Title, description, canonical URL, repository link, page/feed sizes |
-| `storage` | Private SQLite path, dedicated public output directory |
+| `storage` | Private SQLite path, owned public output directory and bounded article-render batch size |
 | `collection` | Lookback, overlap, page/item limits, content limit, staleness, circuit backoff, total/source run budgets, reserved analysis time |
 | `http` | Connect/read/total deadlines, attempts, exponential backoff base/cap/jitter, bounded `Retry-After`, redirect/byte limits, user agent |
 | `llm` | Base URL and fallback URLs, model, key environment variable, private-network allowlist, deadlines, output/input limits, items per run, failed-item retry backoff |
@@ -146,6 +146,7 @@ monitoring status. See [monitoring behavior and limits](docs/MONITORING.md).
 onionflash check --config config.toml            # Validate; no network requests
 onionflash run --config config.toml              # Collect → analyze → build
 onionflash build --config config.toml            # Offline build from saved news
+onionflash build --config config.toml --force    # Queue a bounded full-history rebuild
 onionflash status --config config.toml           # Source freshness and queue
 ```
 
@@ -158,9 +159,10 @@ reads and needs no lock.
 
 The public output is a dedicated generated directory. Onion Flash refuses to
 replace an existing nonempty directory without its ownership marker, kept next
-to—not inside—the public directory. Rendering completes in a new sibling
-directory before replacement. A render failure preserves the previous output.
-Publishers should use the same database lock while taking their upload snapshot.
+to—not inside—the public directory. Its presence permits moving or restoring an
+installation. Changed files are replaced atomically, and an unfinished build is
+marked so the publisher keeps the preceding release. Publishers use the same
+database lock while taking their upload snapshot.
 
 ## Reliability and editorial behavior
 
@@ -200,8 +202,8 @@ Publishers should use the same database lock while taking their upload snapshot.
   canonical URLs provide conservative duplicate grouping. Semantic similarity
   alone does not combine unrelated incidents. Original publication dates and
   stable story IDs remain intact when stories are updated.
-- Every run renders the site from the database; the deployment uploads only
-  files whose content changed. The public Source availability panel shows only
+- Every run checks queued article changes and refreshes the homepage; only
+  changed artifact bytes need publication. The public Source availability panel shows only
   Collected or Delayed (no success within `collection.stale_after_seconds`);
   `onionflash status` has current collection timestamps and errors.
 
@@ -214,10 +216,27 @@ outages longer than those windows can leave gaps. GitLab pagination and source
 health make incomplete scans visible, but upstream data can change while a scan
 is in progress. Treat this as a news aid, not an incident-detection guarantee.
 
-Every stored story keeps its page; the homepage and feeds show the newest
-`site.page_size` and `site.feed_size` stories. Keep the SQLite
-database, backups, raw source content, and analysis evidence private. The
-deployment repository can upload backups to private object storage.
+Published stories keep their pages indefinitely. The homepage covers the entire
+history across numbered pages; `site.page_size` controls stories per page, not
+retention. `site.feed_size = 0` includes the complete history in RSS, JSON Feed
+and topic feeds. A positive feed size remains an optional reader-facing limit.
+The retired `storage.max_stories` setting is accepted and ignored.
+
+The incremental builder renders only changed articles, in batches controlled by
+`storage.render_batch_size` (250 by default). Each accepted story has HTML and a
+public `story.json`. The publication catalog retains compact last-good article
+JSON so a damaged source record or database-only restore does not erase a
+previously published page. A rejected source revision remains quarantined.
+
+Full-history feeds are streamed from the catalog in bounded batches. Indexes and
+feeds update when accepted content changes; normal polling does not rewrite old
+article files. Template/year changes and `build --force` queue resumable rebuilds.
+If `articles_pending` is nonzero, subsequent builds continue the work.
+
+Keep the SQLite database, raw source content, analysis evidence and private
+publication metadata outside the webroot. The deployment repository can publish
+durable objects through DigitalOcean Spaces while preserving the existing URLs.
+See [permanent history and recovery](docs/PERMANENT_HISTORY.md).
 
 LLM availability and output quality depend on your model. The prompt and evidence
 checks reduce unsupported statements, but important security conclusions should

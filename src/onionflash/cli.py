@@ -7,9 +7,7 @@ import contextlib
 import fcntl
 import json
 import os
-import shutil
 import sys
-import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -40,73 +38,10 @@ def run_lock(database: str):
         os.close(fd)
 
 
-def build(config: dict, store: Store) -> dict:
-    """Render every stored story into a fresh directory and swap it in atomically.
+def build(config: dict, store: Store, *, force: bool = False) -> dict:
+    from .publication import build as publish_build
 
-    Rendering is deterministic and cheap, so it runs every time; the deployment
-    uploads only output whose hashes changed.
-    """
-    from .render import render_site
-
-    stories = store.stories()
-    health = store.health(
-        config["sources"], config["collection"]["stale_after_seconds"], now_iso()
-    )
-    public_health = [
-        {
-            "id": s["id"],
-            "name": s["name"],
-            "website_url": s["website_url"],
-            "stale": s["stale"],
-        }
-        for s in health
-    ]
-    output = Path(config["storage"]["output_dir"])
-    # The marker's presence alone shows Onion Flash created the output, so moving
-    # or restoring an installation keeps working.
-    owner = output.parent / ("." + output.name + ".onionflash-owner")
-    if output.is_symlink() or owner.is_symlink():
-        raise ValueError("Public output and ownership marker must not be symlinks")
-    if owner.exists() and not owner.is_file():
-        raise ValueError("Output ownership marker must be a regular file")
-    if output.exists() and not output.is_dir():
-        raise ValueError("Public output must be a directory")
-    if output.exists() and any(output.iterdir()) and not owner.exists():
-        raise ValueError(
-            "Refusing to replace a nonempty directory not owned by Onion Flash"
-        )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temp = Path(
-        tempfile.mkdtemp(prefix="." + output.name + ".build-", dir=output.parent)
-    )
-    previous = output.parent / (temp.name + ".previous")
-    replaced = False
-    try:
-        skipped = render_site(config, stories, public_health, temp)
-        if not owner.exists():
-            fd = os.open(
-                owner,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-            )
-            with os.fdopen(fd, "w") as stream:
-                stream.write("Onion Flash generated output\n")
-        if output.exists():
-            os.replace(output, previous)
-            replaced = True
-        try:
-            os.replace(temp, output)
-        except BaseException:
-            if replaced:
-                os.replace(previous, output)
-            raise
-        store.set_meta(published_stories=str(len(stories) - skipped))
-    finally:
-        if temp.exists():
-            shutil.rmtree(temp)
-        if previous.exists() and output.exists():
-            shutil.rmtree(previous)
-    return {"published_stories": len(stories) - skipped, "stories_skipped": skipped}
+    return publish_build(config, store, force=force)
 
 
 def run(config: dict, store: Store) -> dict:
@@ -224,6 +159,8 @@ def main(argv: list[str] | None = None) -> int:
     ]:
         command = commands.add_parser(name, help=help_text)
         command.add_argument("--config", required=True, type=Path)
+        if name == "build":
+            command.add_argument("--force", action="store_true", help="Queue a bounded rebuild of all published articles")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
@@ -264,7 +201,7 @@ def main(argv: list[str] | None = None) -> int:
                 # is reported as a temporary failure (EX_TEMPFAIL).
                 return 0 if args.command == "run" else 75
             with Store(config["storage"]["database"]) as store:
-                result = run(config, store) if args.command == "run" else build(config, store)
+                result = run(config, store) if args.command == "run" else build(config, store, force=args.force)
                 print(json.dumps(result, ensure_ascii=False))
         return 0
     except (ValueError, OSError) as exc:
