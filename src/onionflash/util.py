@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import html
 import ipaddress
 import json
 import re
@@ -118,11 +117,11 @@ def canonical_url(value: str) -> str:
         not isinstance(value, str)
         or len(value) > 4096
         or "\\" in value
-        or any(ord(c) < 33 for c in value)
+        or any(ord(c) < 33 or ord(c) == 127 for c in value)
     ):
         raise ValueError("Invalid source URL")
     value.encode("utf-8")  # Reject invalid Unicode URLs before persistence.
-    parsed = urlsplit(html.unescape(value))
+    parsed = urlsplit(value)
     host = (parsed.hostname or "").lower().rstrip(".")
     if (
         parsed.scheme != "https"

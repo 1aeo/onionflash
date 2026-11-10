@@ -449,11 +449,12 @@ class Store:
         ).fetchone()
         return row[0] if row else None
 
-    def set_meta(self, key: str, value: str) -> None:
+    def set_meta(self, **values: str) -> None:
+        """Write one or more metadata values in a single transaction."""
         with self.db:
-            self.db.execute(
+            self.db.executemany(
                 "INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (key, value),
+                values.items(),
             )
 
     def backup(self, destination: str | Path) -> None:

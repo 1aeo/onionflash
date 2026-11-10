@@ -59,7 +59,7 @@ def test_deep_gitlab_json_can_use_the_configured_fallback():
 def test_private_backup_copies_committed_wal_data(tmp_path):
     source, destination = tmp_path / "source.db", tmp_path / "copy.db"
     with Store(source) as store:
-        store.set_meta("kept", "committed")
+        store.set_meta(kept="committed")
         backup_database(source, destination)
     assert destination.stat().st_mode & 0o777 == 0o600
     with sqlite3.connect(destination) as connection:
@@ -106,7 +106,7 @@ def test_shared_render_dependencies_invalidate_public_build_cache(tmp_path, monk
 def test_backup_keeps_original_database_when_cwd_changes(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     with Store("source.db") as store:
-        store.set_meta("original", "kept")
+        store.set_meta(original="kept")
         other = tmp_path / "other"
         other.mkdir()
         monkeypatch.chdir(other)
