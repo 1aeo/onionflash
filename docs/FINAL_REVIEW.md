@@ -142,10 +142,11 @@ include the review state and audit.
 ## Evaluate the configured model
 
 Mocked tests establish the publication contract and failure behavior. They do not
-establish that a model's semantic judgments are accurate. The controlled corpus
-contains the saved bastet mistake and synthetic negative/positive controls for
-each rubric area, including legitimate operator instructions. Model-visible IDs
-and synthetic URLs are opaque; case names and expected results are not sent.
+establish that a model's semantic judgments are accurate. The controlled corpus,
+`tools/review_cases.json`, contains the saved bastet mistake and synthetic
+negative/positive controls for each rubric area, including legitimate operator
+instructions. Model-visible IDs and synthetic URLs are opaque; case names and
+expected results are not sent.
 
 After loading the same LLM environment used by the application:
 
@@ -154,11 +155,18 @@ PYTHONPATH=src python tools/evaluate_review.py --config config.toml \
   --output /private/path/review-evaluation.jsonl --max-seconds 1800
 ```
 
-Add `--verify-repairs` to independently check proposed repairs, `--case-id NAME`
-to select a case, or `--rounds 2` to repeat controls. Output must be a new private
-file outside the public directory. The tool does not collect sources, open the
-application database or publish stories. It records errors and incomplete runs
-as failures, rather than counting them as successful judgments.
+Add `--verify-repairs` to apply each proposed repair and send it to the same model
+in the gate's verification request. A verified repair of a negative case that
+still contains one of the case's `unsupported` phrases counts as a false approval,
+because the gate would publish it. That check compares wording only. It misses
+paraphrases and new claims, and it also counts a faithful repair that keeps a
+phrase inside a negation, such as "no evidence that ...". So read `repaired` in
+the private report for every verified repair, including each one counted as a
+false approval. Use `--case-id NAME` to select a case, or `--rounds 2` to repeat
+controls. Output must be a new private file outside the public directory. The
+tool does not collect sources, open the application database or publish stories.
+It records errors and incomplete runs as failures, rather than counting them as
+successful judgments.
 
 Using the same model for writing and review can retain shared blind spots.
 Keep the correction workflow and primary-source links, and evaluate changed

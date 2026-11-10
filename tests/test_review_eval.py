@@ -1,13 +1,13 @@
 import copy
 import importlib.util
 import json
+import re
 import stat
 from pathlib import Path
 
 import pytest
 
 from onionflash.config import DEFAULTS
-from onionflash.render import _prepare_story
 from onionflash.review import CRITERIA, _packet_refs
 
 
@@ -22,10 +22,26 @@ def evaluator():
 
 
 def corpus():
-    return json.loads((ROOT / "tests/fixtures/review_cases.json").read_text())["cases"]
+    return evaluator().expand(json.loads((ROOT / "tools/review_cases.json").read_text()))
 
 
-def test_controlled_corpus_is_blinded_canonical_and_covers_rubric():
+def scripted(reply):
+    """A reviewer stand-in whose verdict comes from reply(verification)."""
+    class Reviewer:
+        last_decoded = None
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def review(self, candidate, packet, *, verification=False):
+            return reply(verification)
+    return Reviewer
+
+
+def test_controlled_corpus_is_blinded_and_covers_rubric():
+    kept = evaluator().kept_unsupported
     cases = corpus()
     assert len({c["id"] for c in cases}) == len(cases)
     assert set(CRITERIA) <= {criterion for c in cases for criterion in c["coverage"]}
@@ -33,8 +49,15 @@ def test_controlled_corpus_is_blinded_canonical_and_covers_rubric():
     for case in cases:
         payload = {"candidate": case["candidate"], "packet": case["packet"]}
         assert case["id"] not in json.dumps(payload)
-        assert case["candidate"] == _prepare_story(case["candidate"], editorial=case["candidate"].get("editorial"))
         assert _packet_refs(case["packet"])
+        # A negative case flags wording that it contains and its approved twins do not.
+        assert bool(case.get("unsupported")) == (case["expected"] == "not_approve")
+        assert kept(case, case["candidate"]) == case.get("unsupported", [])
+        assert not any(kept(case, twin["candidate"]) for twin in cases
+                       if twin["expected"] == "approve" and twin["packet"] == case["packet"])
+        # Nor does the smallest faithful repair of "the source confirms that X": "... does not confirm that X".
+        negated, confirms = re.subn(r"\bconfirms?\b", "does not confirm", case["candidate"]["summary"])
+        assert not confirms or not kept(case, {"title": "", "summary": negated, "why_it_matters": ""}), case["id"]
 
 
 def test_evaluation_records_false_approvals_and_writes_private_new_file(tmp_path, monkeypatch, capsys):
@@ -42,18 +65,7 @@ def test_evaluation_records_false_approvals_and_writes_private_new_file(tmp_path
     config = copy.deepcopy(DEFAULTS)
     config["storage"]["output_dir"] = str(tmp_path / "public")
     selected = [c for c in corpus() if c["id"] in {"bastet-original", "legitimate-custom-config"}]
-
-    class AlwaysApproves:
-        def __init__(self, *args, **kwargs):
-            self.last_decoded = None
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            pass
-        def review(self, *args, **kwargs):
-            return {"verdict": "approve"}
-
-    monkeypatch.setattr(module, "EvaluationReviewer", AlwaysApproves)
+    monkeypatch.setattr(module, "EvaluationReviewer", scripted(lambda verification: {"verdict": "approve"}))
     output = tmp_path / "private/report.jsonl"
     result = module.evaluate(config, selected, output)
     assert result["false_approvals"] == 1 and result["matched"] == 1
@@ -64,3 +76,19 @@ def test_evaluation_records_false_approvals_and_writes_private_new_file(tmp_path
     with pytest.raises(ValueError, match="outside public"):
         module.evaluate(config, selected, tmp_path / "public/private-evidence.jsonl")
     assert "candidate" not in capsys.readouterr().out
+
+
+def test_verified_repair_that_keeps_flagged_wording_is_a_false_approval(tmp_path, monkeypatch):
+    module = evaluator()
+    config = copy.deepcopy(DEFAULTS)
+    config["storage"]["output_dir"] = str(tmp_path / "public")
+    selected = [c for c in corpus() if c["id"] == "bastet-original"]
+    # A priority-only repair keeps the unsupported operator advice; clearing why_it_matters removes it.
+    for repair, kept, false_approvals in (({"priority": "high"}, ["update their configurations"], 1),
+                                          ({"why_it_matters": ""}, [], 0)):
+        monkeypatch.setattr(module, "EvaluationReviewer", scripted(
+            lambda verification: {"verdict": "approve"} if verification else {"verdict": "revise", "repair": repair}))
+        output = tmp_path / f"{false_approvals}.jsonl"
+        result = module.evaluate(config, selected, output, verify_repairs=True)
+        assert (result["repairs_verified"], result["false_approvals"], result["matched"]) == (1, false_approvals, 1 - false_approvals)
+        assert json.loads(output.read_text().splitlines()[0])["kept_unsupported"] == kept

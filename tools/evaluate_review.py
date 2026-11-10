@@ -30,6 +30,34 @@ class EvaluationReviewer(Reviewer):
         return result
 
 
+def expand(corpus: dict) -> list[dict]:
+    """Rebuild each compact case as the exact candidate and numbered packet under review.
+
+    Sources and passages are numbered by position, with each source title as its
+    first passage, as build_packet emits them. The candidate is the public rendering
+    of the corpus defaults, the packet's source links and the case's own fields.
+    """
+    cases = []
+    for case in corpus["cases"]:
+        packet, sources = corpus["packets"][case["packet"]], []
+        for i, source in enumerate(packet["sources"], 1):
+            texts = [source["title"], *source["passages"]]
+            sources.append({"id": f"S{i}", **source,
+                            "passages": [{"id": f"S{i}:P{j}", "text": text} for j, text in enumerate(texts, 1)]})
+        story = {**corpus["defaults"], "sources": [{"url": s["url"], "title": s["title"]} for s in sources],
+                 **case["candidate"]}
+        cases.append({**case, "candidate": _prepare_story(story, editorial=story.get("editorial")),
+                      "packet": {"sources": sources, "missing_sources": packet.get("missing_sources", []),
+                                 "truncated": packet.get("truncated", False)}})
+    return cases
+
+
+def kept_unsupported(case: dict, story: dict) -> list[str]:
+    """The case's flagged unsupported phrases that the story's text still contains."""
+    text = "\n".join(story[key] for key in ("title", "summary", "why_it_matters")).casefold()
+    return [phrase for phrase in case.get("unsupported", []) if phrase.casefold() in text]
+
+
 def evaluate(config, cases, output, *, rounds=1, verify_repairs=False, deadline=None):
     output = Path(output).resolve()
     public = Path(config["storage"]["output_dir"]).resolve()
@@ -42,9 +70,6 @@ def evaluate(config, cases, output, *, rounds=1, verify_repairs=False, deadline=
         if case["id"] in identities or case["expected"] not in {"approve", "not_approve"}:
             raise ValueError("Invalid or duplicate evaluation case")
         identities.add(case["id"])
-        canonical = _prepare_story(case["candidate"], editorial=case["candidate"].get("editorial"))
-        if canonical != case["candidate"]:
-            raise ValueError("Evaluation candidate must match exact public rendering")
     output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     totals = {"cases": 0, "matched": 0, "false_approvals": 0, "positive_rejections": 0,
@@ -62,17 +87,21 @@ def evaluate(config, cases, output, *, rounds=1, verify_repairs=False, deadline=
                 totals["cases"] += 1
                 try:
                     result = reviewer.review(case["candidate"], case["packet"])
+                    record["result"] = result
                     approved = result["verdict"] == "approve"
+                    if verify_repairs and result["verdict"] == "revise":
+                        repaired = apply_repair(case["candidate"], result["repair"])
+                        verified = reviewer.review(repaired, case["packet"], verification=True)
+                        record.update(repaired=repaired, verification=verified,
+                                      kept_unsupported=kept_unsupported(case, repaired))
+                        totals["repairs_verified" if verified["verdict"] == "approve" else "repairs_held"] += 1
+                        # The gate publishes a verified repair, so keeping flagged text approves unsupported wording.
+                        approved = verified["verdict"] == "approve" and bool(record["kept_unsupported"])
                     matched = approved == (case["expected"] == "approve")
                     totals["matched"] += matched
                     totals["false_approvals"] += approved and case["expected"] == "not_approve"
                     totals["positive_rejections"] += not approved and case["expected"] == "approve"
-                    record.update(result=result, matched=matched)
-                    if verify_repairs and result["verdict"] == "revise":
-                        repaired = apply_repair(case["candidate"], result["repair"])
-                        verified = reviewer.review(repaired, case["packet"], verification=True)
-                        record.update(repaired=repaired, verification=verified)
-                        totals["repairs_verified" if verified["verdict"] == "approve" else "repairs_held"] += 1
+                    record["matched"] = matched
                 except (AnalysisError, ValueError, TypeError, KeyError) as exc:
                     totals["errors"] += 1
                     record["error"] = type(exc).__name__
@@ -101,7 +130,7 @@ def evaluate(config, cases, output, *, rounds=1, verify_repairs=False, deadline=
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
-    parser.add_argument("--cases", type=Path, default=Path(__file__).resolve().parents[1] / "tests/fixtures/review_cases.json")
+    parser.add_argument("--cases", type=Path, default=Path(__file__).resolve().with_name("review_cases.json"))
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--case-id", action="append", default=[])
     parser.add_argument("--rounds", type=int, default=1)
@@ -112,7 +141,7 @@ def main(argv=None):
     if not 1 <= args.max_seconds <= 7200 or args.cases.stat().st_size > 2097152:
         parser.error("Invalid evaluation time or case-file size")
     config = load_config(args.config)
-    cases = json.loads(args.cases.read_text())["cases"]
+    cases = expand(json.loads(args.cases.read_text()))
     if args.case_id:
         selected = set(args.case_id)
         if selected - {case["id"] for case in cases}:
