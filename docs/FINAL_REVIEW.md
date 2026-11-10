@@ -159,3 +159,13 @@ Using the same Qwen model for writing and review can retain shared blind spots.
 Keep the correction workflow and primary-source links, and evaluate changed
 models or rubric versions before rollout. Passing a finite corpus is not a
 guarantee that all future factual errors will be caught.
+
+The initial 2026-11-10 evaluation against the configured `qwen3.8-27b` endpoint
+produced the expected valid verdict for 28 of 29 blinded cases, with no false
+approvals and no rejected positive controls. One negative status case returned a
+`revise` response that repeated the unchanged candidate; strict validation blocked
+it. The same case remained blocked on repetition. All four selected saved repairs
+passed fresh independent verification, and three repeated positive controls passed.
+These results support fail-closed deployment, not a claim that every rejected
+candidate will be automatically repairable. An unusable repair can require operator
+inspection after the normal bounded retries.
