@@ -1,3 +1,3 @@
 """Onion Flash: collect, summarize, and publish source-linked news."""
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"

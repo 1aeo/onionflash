@@ -114,11 +114,14 @@ An updated URL replaces its current item payload, while new content/model/prompt
 cache keys can add analysis rows. Published summaries and source links are held
 separately from raw input. The database is local; visitors read static files.
 
-Every stored story is considered for rendering (`storage.max_stories` is retired and
-ignored); records that cannot be rendered safely are skipped and reported as
-`stories_skipped`. Nothing limits **database retention**. Items, analysis-cache entries and stories have no age-based
-deletion policy. Long-term growth is therefore expected, but the measured scale
-does not justify compressing the live SQL data or running frequent VACUUM.
+Published stories now have permanent catalog entries (`storage.max_stories` is
+retired and ignored). Changed articles render in bounded batches; invalid new
+revisions are quarantined while the last accepted page remains available.
+The historical size measurements below remain valid for the original snapshot.
+An optional deployment retention policy can move old source bodies, analyses and
+receipts to verified private objects before compacting local data. It never
+expires published stories, their public snapshots or deduplication state. The
+measured scale still does not justify frequent VACUUM.
 
 The current whole-database mix averages about 3.77 KiB per cached source item,
 including its share of cached analyses, published stories and indexes:
