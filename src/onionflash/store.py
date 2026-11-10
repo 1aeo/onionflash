@@ -439,9 +439,6 @@ class Store:
     def ingest_alerts(self, source: dict, items: list[dict], observed: str) -> dict:
         return monitoring.ingest(self.db, source, items, observed)
 
-    def monitoring_status(self, observed: str) -> dict:
-        return monitoring.status(self.db, observed)
-
     def story_count(self, limit: int = -1) -> int:
         return self.db.execute(
             "SELECT COUNT(*) FROM (SELECT 1 FROM stories LIMIT ?)", (limit,)
