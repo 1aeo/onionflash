@@ -15,33 +15,6 @@ output_dir = "build/public"
 # Article work per run, never a published-history retention limit.
 render_batch_size = 250
 
-[collection]
-lookback_days = 14
-overlap_seconds = 900
-max_pages = 5
-page_size = 50
-max_items_per_source = 250
-content_chars = 20000
-stale_after_seconds = 7200
-failure_backoff_base_seconds = 300
-failure_backoff_cap_seconds = 21600
-run_budget_seconds = 240
-source_budget_seconds = 60
-analysis_reserve_fraction = 0.5
-
-[http]
-timeout_seconds = 30
-connect_timeout_seconds = 10
-total_timeout_seconds = 90
-retry_attempts = 3
-backoff_base_seconds = 1
-backoff_cap_seconds = 30
-backoff_jitter = 0.25
-max_retry_after_seconds = 60
-max_redirects = 4
-max_response_bytes = 2097152
-user_agent = "OnionFlash (+https://github.com/1aeo/onionflash)"
-
 # Optional anonymous public issue discussions. Existing installations remain disabled
 # until explicitly enabled. Only issue sources with gitlab_project participate.
 [comments]
@@ -62,25 +35,17 @@ failure_backoff_base_seconds = 300
 failure_backoff_cap_seconds = 21600
 
 [llm]
-# Supply a base URL ending in /v1, or set a literal endpoint here.
+# Supply a base URL ending in /v1, or set a literal endpoint here. The API key is
+# read from the ONIONFLASH_LLM_API_KEY environment variable.
 base_url = "${ONIONFLASH_LLM_BASE_URL}"
 fallback_base_urls = []
 model = "qwen3.8-27b"
-api_key_env = "ONIONFLASH_LLM_API_KEY"
 # For a private LAN endpoint, explicitly set allow_http=true (if necessary)
 # and allowed_networks to the exact server IPs as /32 or /128 CIDRs.
 allow_http = false
 allowed_networks = []
 timeout_seconds = 120
-connect_timeout_seconds = 10
-total_timeout_seconds = 180
-max_response_bytes = 65536
-max_output_tokens = 1200
-max_input_chars = 14000
 max_items_per_run = 12
-retry_base_seconds = 300
-retry_cap_seconds = 21600
-enable_thinking = false
 # vLLM understands this optional extension. Set false for providers that do not.
 send_chat_template_kwargs = true
 

@@ -95,38 +95,21 @@ DEFAULTS = {
     "sources": [],
 }
 
-# Values are bounded even for operator-owned config: an accidental zero must not
-# disable timeouts or turn retry loops into a busy loop.
+# Ranges for the numbers an operator sets, so an accidental zero cannot disable a
+# timeout or turn a retry loop into a busy loop. A name's range applies in every
+# section that uses it; max_pages and max_items_per_source also bound a source's
+# own max_pages and max_items.
 BOUNDS = {
     "timeout_seconds": (1, 600),
-    "connect_timeout_seconds": (1, 120),
-    "total_timeout_seconds": (1, 600),
-    "retry_attempts": (1, 8),
-    "backoff_base_seconds": (0.1, 120),
-    "backoff_cap_seconds": (0.1, 600),
-    "backoff_jitter": (0, 1),
-    "max_retry_after_seconds": (0, 600),
-    "max_redirects": (0, 10),
-    "max_response_bytes": (1024, 16777216),
-    "lookback_days": (1, 365),
-    "overlap_seconds": (0, 86400),
     "max_pages": (1, 100),
     "page_size": (1, 100),
     "max_items_per_source": (1, 10000),
-    "content_chars": (1000, 100000),
-    "stale_after_seconds": (300, 604800),
+    "max_items_per_run": (1, 1000),
+    "render_batch_size": (1, 1000),
+    "feed_size": (0, 100000),
+    "run_budget_seconds": (30, 3600),
     "failure_backoff_base_seconds": (1, 3600),
     "failure_backoff_cap_seconds": (1, 604800),
-    "max_output_tokens": (128, 8192),
-    "max_input_chars": (1000, 100000),
-    "max_items_per_run": (1, 1000),
-    "retry_base_seconds": (1, 3600),
-    "retry_cap_seconds": (1, 604800),
-    "render_batch_size": (1, 1000),
-    "run_budget_seconds": (30, 3600),
-    "source_budget_seconds": (5, 600),
-    "analysis_reserve_fraction": (0.1, 0.9),
-    "feed_size": (0, 100000),
     "max_issues_per_run": (1, 100),
     "max_issues_per_source": (1, 20),
     "max_comments": (1, 100),
@@ -136,6 +119,16 @@ BOUNDS = {
     "candidate_days": (1, 365),
     "cache_days": (1, 365),
     "max_cache_entries": (1, 10000),
+}
+
+
+# The collection, http and llm settings an operator chooses. Their other values are
+# fixed defaults: a file may still set them, and they are logged and ignored.
+OPERATOR_SETTINGS = {
+    "collection": set(),
+    "http": set(),
+    "llm": {"base_url", "fallback_base_urls", "model", "allowed_networks", "allow_http",
+            "send_chat_template_kwargs", "max_items_per_run", "timeout_seconds"},
 }
 
 
@@ -177,9 +170,11 @@ def load_config(path: str | Path) -> dict:
         else:
             if not isinstance(values, dict):
                 raise ValueError(f"{section} must be a table")
-            for key in sorted(set(values) & RETIRED.get(section, set())):
-                logging.getLogger(__name__).warning("Ignoring retired setting %s.%s; it can be deleted", section, key)
-            values = {k: v for k, v in values.items() if k not in RETIRED.get(section, ())}
+            fixed = set(DEFAULTS[section]) - OPERATOR_SETTINGS[section] if section in OPERATOR_SETTINGS else set()
+            ignored = set(values) & (RETIRED.get(section, set()) | fixed)
+            for key in sorted(ignored):
+                logging.getLogger(__name__).warning("Ignoring setting %s.%s: it is no longer configurable and can be deleted", section, key)
+            values = {k: v for k, v in values.items() if k not in ignored}
             unknown = set(values) - set(DEFAULTS[section])
             if unknown:
                 raise ValueError(
@@ -198,18 +193,8 @@ def load_config(path: str | Path) -> dict:
                     raise ValueError(
                         f"{section}.{key} must be between {low} and {high}"
                     )
-                if key not in {
-                    "timeout_seconds",
-                    "connect_timeout_seconds",
-                    "backoff_base_seconds",
-                    "backoff_cap_seconds",
-                    "backoff_jitter",
-                    "max_retry_after_seconds",
-                    "analysis_reserve_fraction",
-                } and not isinstance(value, int):
+                if key != "timeout_seconds" and not isinstance(value, int):
                     raise ValueError(f"{section}.{key} must be an integer")
-    if config["http"]["backoff_cap_seconds"] < config["http"]["backoff_base_seconds"]:
-        raise ValueError("HTTP backoff cap must be at least its base")
     if not isinstance(config["comments"]["enabled"], bool):
         raise ValueError("comments.enabled must be a boolean")
     if config["comments"]["failure_backoff_cap_seconds"] < config["comments"]["failure_backoff_base_seconds"]:

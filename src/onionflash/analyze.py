@@ -365,6 +365,9 @@ class Analyzer:
         self.http_settings = {
             **config["http"],
             **{k: v for k, v in self.llm.items() if k in config["http"]},
+            # The fixed total must not cut short a longer configured response timeout.
+            "total_timeout_seconds": max(self.llm["total_timeout_seconds"],
+                                         self.llm["timeout_seconds"] + self.llm["connect_timeout_seconds"]),
             "retry_attempts": 1,
         }
         self.client: HttpClient | None = None
