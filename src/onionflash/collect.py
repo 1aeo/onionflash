@@ -17,7 +17,7 @@ from .util import (
 )
 
 
-MAX_FEED_ELEMENTS = 50000
+MAX_FEED_ELEMENTS, MAX_FEED_DEPTH, MAX_FEED_PATH_ATTRIBUTE_CHARS = 50000, 128, 65536
 
 
 class CollectionError(Exception):
@@ -113,20 +113,26 @@ def _feed(
     def reject_declaration(*args):
         raise CollectionError("Feed contains disallowed XML declarations")
 
-    # Without a DTD there are no entities to expand. The element cap bounds the
-    # objects feedparser builds: bytes alone do not, as tiny elements are cheap to send.
+    # Without a DTD there are no entities to expand. Bytes alone do not bound what
+    # feedparser builds: tiny elements are cheap to send, and it keeps every open
+    # element's resolved xml:base, which nested relative bases grow quadratically.
+    # Capping elements, depth and attribute text on the open path bounds both.
     parser.StartDoctypeDeclHandler = reject_declaration
     parser.EntityDeclHandler = reject_declaration
     parser.ExternalEntityRefHandler = reject_declaration
-    elements = 0
+    elements, path = 0, []
 
-    def count_element(name, attributes):
+    def start_element(name, attributes):
         nonlocal elements
         elements += 1
+        path.append((path[-1] if path else 0) + sum(map(len, attributes.values())))
         if elements > MAX_FEED_ELEMENTS:
             raise CollectionError("Feed has too many XML elements")
+        if len(path) > MAX_FEED_DEPTH or path[-1] > MAX_FEED_PATH_ATTRIBUTE_CHARS:
+            raise CollectionError("Feed XML nesting exceeds the depth or attribute limits")
 
-    parser.StartElementHandler = count_element
+    parser.StartElementHandler = start_element
+    parser.EndElementHandler = lambda name: path.pop()
     try:
         parser.Parse(response.body, True)
     except expat.ExpatError as exc:

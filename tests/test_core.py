@@ -356,6 +356,17 @@ def test_a_feed_with_too_many_elements_is_rejected_before_feedparser(monkeypatch
         collect_source(FakeClient([response(xml)]), source(), {}, DEFAULTS["collection"], DATE)
 
 
+def test_deep_nesting_or_nested_bases_are_rejected_before_feedparser(monkeypatch):
+    from onionflash import collect
+    monkeypatch.setattr(collect.feedparser, "parse", lambda *args, **kwargs: pytest.fail("feedparser ran"))
+    # Relative xml:base values accumulate down the open path; siblings do not.
+    nested_base = '<a xml:base="' + "b" * 40000 + '/">'
+    for nested in ("<a>" * 128 + "</a>" * 128, nested_base * 2 + "</a>" * 2):
+        with pytest.raises(CollectionError, match="nesting exceeds"):
+            collect_source(FakeClient([response(f"<rss>{nested}</rss>".encode())]), source(), {},
+                           DEFAULTS["collection"], DATE)
+
+
 def test_gitlab_pagination_keeps_partial_items_without_advancing_watermark():
     records = [
         {
