@@ -11,7 +11,6 @@ from .util import digest
 from .schema import CATEGORIES, PRIORITIES, CONFIDENCES, STATES, PRODUCTS
 
 PROMPT_VERSION = "onionflash-5"
-TAG_NOTICE_VERSION = "tag-notice-2"
 SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -134,29 +133,13 @@ class AnalysisError(Exception):
 
 
 def cache_key(row: dict, llm: dict) -> str:
-    if json.loads(row["payload"])["kind"] == "tag":
-        # Old LLM decisions must not suppress the deterministic tag path. Its
-        # result does not depend on the configured inference model.
-        return digest([row["content_hash"], TAG_NOTICE_VERSION])
+    """Key of the write-only record of what the model returned for this content."""
     return digest([row["content_hash"], llm["model"], PROMPT_VERSION])
 
 
 def _json_object(text: str) -> dict:
-    def pairs(values: list) -> dict:
-        result = {}
-        for key, value in values:
-            if key in result:
-                raise ValueError("Duplicate JSON key")
-            result[key] = value
-        return result
-
-    def invalid_constant(value: str):
-        raise ValueError("Invalid JSON constant")
-
     try:
-        result = json.loads(
-            text, object_pairs_hook=pairs, parse_constant=invalid_constant
-        )
+        result = json.loads(text)
         # SQLite text is UTF-8; reject unpaired JSON surrogate escapes before
         # a malformed model response can interrupt a queue transaction.
         json.dumps(result, ensure_ascii=False).encode("utf-8")
@@ -316,22 +299,19 @@ def tag_notice(item: dict) -> dict:
         "network": "Upstream",
     }[item["product"]]
     display_name = name if len(name) <= 96 else name[:95] + "…"
-    return validate_analysis(
-        {
-            "publish": True,
-            "title": f"{product} tag observed: {display_name}",
-            "summary": f"The upstream feed lists the tag “{name}”. This notice records the upstream tag entry linked below.",
-            "why_it_matters": "Use the linked upstream entry for context about this tag.",
-            "category": "release",
-            "priority": "normal",
-            "confidence": "reported",
-            "state": "tagged",
-            "products": [item["product"]],
-            "tags": ["release"],
-            "evidence": [name],
-        },
-        item,
-    )
+    return {
+        "publish": True,
+        "title": f"{product} tag observed: {display_name}",
+        "summary": f"The upstream feed lists the tag “{name}”. This notice records the upstream tag entry linked below.",
+        "why_it_matters": "Use the linked upstream entry for context about this tag.",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "tagged",
+        "products": [item["product"]],
+        "tags": ["release"],
+        "evidence": [name],
+    }
 
 
 def _validate_issue_actions(result: dict, evidence: list[str]) -> None:
@@ -377,9 +357,12 @@ class Analyzer:
     def __init__(self, config: dict, deadline: float | None = None):
         self.deadline = deadline  # absolute time.monotonic() limit for model requests
         self.llm = config["llm"]
+        # One attempt per endpoint: the fallback endpoints are the retry, and a
+        # failed item backs off to a later run instead of stretching this one.
         self.http_settings = {
             **config["http"],
             **{k: v for k, v in self.llm.items() if k in config["http"]},
+            "retry_attempts": 1,
         }
         self.client: HttpClient | None = None
 

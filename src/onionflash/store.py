@@ -280,12 +280,6 @@ class Store:
             "SELECT COUNT(*) FROM items WHERE status='pending'"
         ).fetchone()[0]
 
-    def cached(self, cache_key: str) -> dict | None:
-        row = self.db.execute(
-            "SELECT result FROM analyses WHERE cache_key=?", (cache_key,)
-        ).fetchone()
-        return json.loads(row[0]) if row else None
-
     def defer(self, item_id: str, error: str, llm: dict, observed: str, *, terminal: bool = False) -> None:
         """Retry later; after three failures caused by the item itself, stop retrying.
 
