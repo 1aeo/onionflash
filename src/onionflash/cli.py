@@ -167,7 +167,7 @@ def run(config: dict, store: Store) -> dict:
             report.setdefault("alerts", {})[source["id"]] = store.ingest_alerts(source, items, received)
             return received
         if has_comment_cache:
-            items = (merge_cached_comments(store, item, source) for item in items)
+            items = (merge_cached_comments(store, item, source, received if comments_enabled else None) for item in items)
         report["items_changed"] += sum(store.ingest(item, received) for item in items)
         return received
 

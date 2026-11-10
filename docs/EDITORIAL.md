@@ -51,7 +51,9 @@ The correction locks the story against automated replacement. Later source
 analyses are saved privately and mapped to the existing story, while its accepted
 text and sources stay unchanged. `show` reports the number of held automated
 updates. This lock also covers deterministic monitoring stories and grouped
-reports from another source.
+reports from another source. Public comments on the story's issues are not
+checked while it is locked, so they add no held updates; checks resume after
+unlock.
 
 ## Retract, restore or resume automation
 

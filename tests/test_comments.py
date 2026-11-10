@@ -1,14 +1,17 @@
 import json
 import socket
+import time
 
 import httpx
 import pytest
 
+from onionflash import cli
 from onionflash.comments import (CommentError, _compose, analysis_content, analysis_context, enrich_comments,
                                 fetch_comments, merge_cached_comments, parse_note_id, status)
 from onionflash.config import DEFAULTS, load_config
 from onionflash.store import Store
 from onionflash.transport import FetchError, HttpClient, Response
+from onionflash.util import after
 from test_core import DATE, FakeClient, config, item, source
 
 
@@ -56,6 +59,39 @@ def comments_config(tmp_path, **kw):
     cfg["sources"] = [issue_source()]
     cfg["comments"] = settings(enabled=True, **kw)
     return cfg
+
+
+PROJECT_IDS = {PROJECT: "426", "tpo/core/arti": "647"}
+
+
+class Issues:
+    """Answer every requested issue with no notes; failing iids raise, missing iids answer null."""
+
+    def __init__(self, fail=(), missing=()):
+        self.fail, self.missing, self.seen = fail, missing, []
+
+    def request(self, method, endpoint, **kwargs):
+        project, iid = (kwargs["json_body"]["variables"][key] for key in ("project", "iid"))
+        self.seen.append((project, iid))
+        if iid in self.fail:
+            raise FetchError("HTTP 503")
+        data = payload([], id="gid://gitlab/Project/" + PROJECT_IDS[project], fullPath=project, webUrl=ORIGIN + "/" + project)
+        data["data"]["project"]["issue"].update(iid=iid, webUrl=f"{ORIGIN}/{project}/-/work_items/{iid}")
+        if iid in self.missing:
+            data["data"]["project"]["issue"] = None
+        return response(data)
+
+
+def two_projects(tmp_path, **kw):
+    """Comment settings and a store with two new issues in each of two projects."""
+    cfg = comments_config(tmp_path, **kw)
+    cfg["sources"].append(source(id="arti-issues", kind="gitlab_issue", gitlab_project="tpo/core/arti",
+                                 url=ORIGIN + "/api/v4/projects/647/issues"))
+    store = Store(cfg["storage"]["database"])
+    for iid in ["1", "2"]:
+        store.ingest(issue(url=URL.replace("41473", iid)), DATE)
+        store.ingest(issue(source_id="arti-issues", url=f"{ORIGIN}/tpo/core/arti/-/work_items/{iid}"), DATE)
+    return cfg, store
 
 
 @pytest.mark.parametrize("kind", ["Note", "DiscussionNote"])
@@ -242,8 +278,7 @@ def test_cache_backoff_edits_deletion_and_refresh(tmp_path):
         merged = merge_cached_comments(store, fresh, issue_source())
         assert merged["source_content"] == fresh["content"] and len(merged["public_comments"]) == 1
         store.ingest(merged, "2026-11-08T12:00:10Z")
-        stale = merge_cached_comments(store, issue(), issue_source())
-        assert stale["source_content"] == fresh["content"] and stale["updated_at"] == fresh["updated_at"]
+        assert not store.ingest(merge_cached_comments(store, issue(), issue_source()), "2026-11-08T12:00:20Z")
         edited = payload([note(body="The operator reports a mitigation, without confirming its effectiveness.")])
         assert enrich_comments(cfg, store, "2026-11-08T12:01:00Z", client=FakeClient([response(edited)]))["changed"] == 1
         assert enrich_comments(cfg, store, "2026-11-08T12:02:00Z", client=FakeClient([response(payload([]))]))["changed"] == 1
@@ -266,18 +301,98 @@ def test_old_published_issues_rotate_with_bounded_cache(tmp_path):
             store.ingest(issue(url=URL.replace("41473", str(iid))), "2020-01-01T00:00:00Z")
         store.db.execute("UPDATE items SET story_id='published',status='done'")
         store.db.commit()
-        seen = []
-        class Dynamic:
-            def request(self, method, endpoint, **kw):
-                iid = kw["json_body"]["variables"]["iid"]
-                seen.append(iid)
-                data = payload([])
-                data["data"]["project"]["issue"].update(iid=iid, webUrl=URL.replace("41473", iid))
-                return response(data)
-        enrich_comments(cfg, store, DATE, client=Dynamic())
-        enrich_comments(cfg, store, DATE, client=Dynamic())
-        assert sorted(seen) == ["41473", "41474"]
+        client = Issues()
+        enrich_comments(cfg, store, DATE, client=client)
+        enrich_comments(cfg, store, DATE, client=client)
+        assert sorted(iid for _, iid in client.seen) == ["41473", "41474"]
         assert store.db.execute("SELECT COUNT(*) FROM comment_cache").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("status_value", ["pending", "ignored", "rejected", "dismissed"])
+def test_rest_activity_requests_a_comment_check_whatever_the_status(tmp_path, status_value):
+    cfg = comments_config(tmp_path)
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest(issue(), DATE)
+        enrich_comments(cfg, store, DATE, client=FakeClient([response(payload([]))]))
+        with store.db:
+            store.db.execute("UPDATE items SET status=?", (status_value,))
+        later = after(1200, DATE)  # before the regular interval
+        # An overlapping REST page repeats a checked revision and requests nothing;
+        # a new note only advances updated_at, which leaves the content unchanged.
+        for updated_at, notes in [(DATE, None), (after(600, DATE), payload()), (after(600, DATE), None)]:
+            assert not store.ingest(merge_cached_comments(store, issue(updated_at=updated_at), issue_source(), later), later)
+            client = FakeClient([response(notes)] if notes else [])
+            assert enrich_comments(cfg, store, later, client=client)["changed"] == bool(notes)
+        assert store.db.execute("SELECT status FROM items").fetchone()[0] == "pending"
+
+
+def test_rest_activity_requests_a_first_check_of_an_ignored_issue(tmp_path):
+    cfg = comments_config(tmp_path)
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest(issue(), DATE)
+        with store.db:
+            store.db.execute("UPDATE items SET status='ignored'")
+        assert enrich_comments(cfg, store, DATE, client=FakeClient([]))["checked"] == 0  # only pending issues are new
+        later = after(600, DATE)
+        merge_cached_comments(store, issue(), issue_source(comments_enabled=False), later)  # an excluded source
+        assert enrich_comments(cfg, store, later, client=FakeClient([]))["checked"] == 0
+        assert not store.ingest(merge_cached_comments(store, issue(), issue_source(), later), later)
+        assert enrich_comments(cfg, store, later, client=FakeClient([response(payload())]))["changed"] == 1
+
+
+def test_collection_requests_comment_checks_only_while_comments_are_enabled(tmp_path, monkeypatch):
+    cfg = comments_config(tmp_path)
+    client = FakeClient([response(payload())])
+    monkeypatch.setattr(cli, "source_due", lambda *args: True)
+    monkeypatch.setattr(cli, "collect_source", lambda *args: {"items": [issue(updated_at=after(600, DATE))]})
+    monkeypatch.setattr(cli, "enrich_comments", lambda *args, **kw: enrich_comments(*args, client=client, **kw))
+    monkeypatch.setattr(cli, "build", lambda *args: {})
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest(issue(), DATE)
+        with store.db:
+            store.db.execute("UPDATE items SET status='ignored'")
+        enrich_comments(cfg, store, DATE, client=FakeClient([]))  # nothing to check yet
+        cfg["comments"]["enabled"] = False
+        cli.run(cfg, store)
+        assert status(store)["watched_issues"] == 0
+        cfg["comments"]["enabled"] = True
+        assert cli.run(cfg, store)["comments"]["changed"] == 1
+
+
+def test_requested_checks_go_first_pending_ones_before_others(tmp_path):
+    cfg = comments_config(tmp_path)
+    with Store(cfg["storage"]["database"]) as store:
+        urls = {iid: URL.replace("41473", iid) for iid in ["1", "2", "3", "4"]}
+        for url in urls.values():
+            store.ingest(issue(url=url), DATE)
+        client = Issues()
+        enrich_comments(cfg, store, DATE, client=client)
+        with store.db:
+            store.db.execute("UPDATE items SET status='published',story_id='story' WHERE url=?", (urls["1"],))
+            store.db.execute("UPDATE items SET status='ignored' WHERE url IN (?,?)", (urls["2"], urls["4"]))
+        # REST activity on ignored 2, ignored 4 and pending 3; an overlapping page then repeats 2.
+        for iid, updated, seen in [("2", 600, 600), ("4", 900, 900), ("3", 1200, 1200), ("2", 600, 1500)]:
+            merge_cached_comments(store, issue(url=urls[iid], updated_at=after(updated, DATE)), issue_source(), after(seen, DATE))
+        cfg["comments"]["max_issues_per_source"] = 1
+        for _ in range(4):  # the published issue's timer is overdue as well
+            assert enrich_comments(cfg, store, after(3600, DATE), client=client)["checked"] == 1
+        assert [iid for _, iid in client.seen[4:]] == ["3", "2", "4", "1"]
+
+
+def test_locked_story_comments_wait_for_unlock(tmp_path):
+    cfg = comments_config(tmp_path)
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest(issue(), DATE)  # a requeued revision of a published story
+        with store.db:
+            store.db.execute("UPDATE items SET story_id='story'")
+            store.db.execute("""INSERT INTO editorial_controls(story_id,revision,locked,retracted,notice_action,
+                notice_reason,notice_at) VALUES('story',1,1,0,'correct','Reviewed.',?)""", (DATE,))
+        assert enrich_comments(cfg, store, DATE, client=FakeClient([]))["checked"] == 0
+        merge_cached_comments(store, issue(), issue_source(), DATE)  # REST activity during the lock
+        assert enrich_comments(cfg, store, DATE, client=FakeClient([]))["checked"] == 0
+        with store.db:
+            store.db.execute("UPDATE editorial_controls SET locked=0")
+        assert enrich_comments(cfg, store, DATE, client=FakeClient([response(payload())]))["changed"] == 1
 
 
 def test_context_retains_note_body_after_long_description():
@@ -338,20 +453,28 @@ def test_status_is_read_only_and_contains_only_scheduling_metadata(tmp_path):
         assert not store.db.execute("SELECT name FROM sqlite_master WHERE name='comment_cache'").fetchone()
         store.ingest(issue(), DATE)
         enrich_comments(cfg, store, DATE, client=FakeClient([response(payload())]))
+        other = issue(url=URL.replace("41473", "41474"))
+        store.ingest(other, DATE)
+        merge_cached_comments(store, other, issue_source(), after(60, DATE))  # a requested check has not run
         result = status(store)
-        assert result["watched_issues"] == 1 and result["sources"][0]["cached_issues"] == 1
+        assert result["watched_issues"] == 2 and result["sources"][0]["cached_issues"] == 2
         assert result["sources"][0]["last_checked_at"] == DATE
         assert "body" not in json.dumps(result) and "operator" not in json.dumps(result)
 
 
-def test_visibility_failure_preserves_only_previously_verified_context(tmp_path):
+@pytest.mark.parametrize("answer", [response(payload(visibility="private")),
+                                    response({**payload(), "errors": [{"message": "unavailable"}]}),
+                                    Response(200, json.dumps(payload()).encode(), {}, ORIGIN + "/other")],
+                         ids=["private", "errors", "redirected"])
+def test_project_failure_preserves_only_previously_verified_context(tmp_path, answer):
     cfg = comments_config(tmp_path, interval_seconds=30)
     with Store(cfg["storage"]["database"]) as store:
         store.ingest(issue(), DATE)
         enrich_comments(cfg, store, DATE, client=FakeClient([response(payload())]))
         original = store.db.execute("SELECT payload FROM items").fetchone()[0]
         assert "Public issue comments" in json.loads(original)["content"]
-        enrich_comments(cfg, store, "2026-11-08T12:01:00Z", client=FakeClient([response(payload(visibility="private"))]))
+        enrich_comments(cfg, store, "2026-11-08T12:01:00Z", client=FakeClient([answer]))
+        assert status(store)["sources"][0]["failures"] == 1  # the whole project backs off
         saved = json.loads(store.db.execute("SELECT payload FROM items").fetchone()[0])
         assert saved == json.loads(original)
         retained = merge_cached_comments(store, issue(), issue_source())
@@ -404,7 +527,7 @@ def test_merge_does_not_create_scheduling_tables(tmp_path):
     cfg = comments_config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         store.ingest(issue(), DATE)
-        assert merge_cached_comments(store, issue(), issue_source()) == issue()
+        assert merge_cached_comments(store, issue(), issue_source(), DATE) == issue()  # comments enabled, tables not yet
         assert not store.db.execute("SELECT 1 FROM sqlite_master WHERE name='comment_cache'").fetchone()
 
 
@@ -420,19 +543,10 @@ def test_bad_local_history_does_not_back_off_other_issues(tmp_path, bad_payload)
         with store.db:
             store.db.execute("UPDATE items SET status='published',story_id='accepted'")
             store.db.execute("UPDATE items SET payload=? WHERE id=?", (bad_payload, ids[0]))
-        fetched = []
-
-        class Dynamic:
-            def request(self, method, endpoint, **kwargs):
-                iid = kwargs["json_body"]["variables"]["iid"]
-                fetched.append(iid)
-                data = payload([])
-                data["data"]["project"]["issue"].update(iid=iid, webUrl=URL.replace("41473", iid))
-                return response(data)
-
-        report = enrich_comments(cfg, store, DATE, client=Dynamic())
+        client = Issues()
+        report = enrich_comments(cfg, store, DATE, client=client)
         assert report["skipped"] == 1 and report["checked"] == 1 and report["failed"] == 0
-        assert len(fetched) == 1
+        assert len(client.seen) == 1
         assert store.db.execute("SELECT failures,next_fetch_at FROM comment_sources").fetchone()[:] == (0, None)
 
 
@@ -444,23 +558,14 @@ def test_history_cursor_does_not_advance_past_an_unattempted_tail(tmp_path):
         with store.db:
             store.db.execute("UPDATE items SET status='published',story_id='accepted'")
         ids = [row[0] for row in store.db.execute("SELECT id FROM items ORDER BY id")]
-        fetched = []
-
-        class Dynamic:
-            def request(self, method, endpoint, **kwargs):
-                iid = kwargs["json_body"]["variables"]["iid"]
-                fetched.append(iid)
-                data = payload([])
-                data["data"]["project"]["issue"].update(iid=iid, webUrl=URL.replace("41473", iid))
-                return response(data)
-
-        enrich_comments(cfg, store, DATE, client=Dynamic())
+        client = Issues()
+        enrich_comments(cfg, store, DATE, client=client)
         assert store.db.execute("SELECT rotation_cursor FROM comment_sources").fetchone()[0] == ids[0]
-        enrich_comments(cfg, store, DATE, client=Dynamic())
+        enrich_comments(cfg, store, DATE, client=client)
         assert store.db.execute("SELECT rotation_cursor FROM comment_sources").fetchone()[0] == ids[1]
-        enrich_comments(cfg, store, DATE, client=Dynamic())
+        enrich_comments(cfg, store, DATE, client=client)
         assert store.db.execute("SELECT rotation_cursor FROM comment_sources").fetchone()[0] == ids[2]
-        assert len(set(fetched)) == 3
+        assert len(set(client.seen)) == 3
 
 
 def test_history_and_recent_issues_share_a_single_slot_over_multiple_runs(tmp_path):
@@ -470,24 +575,34 @@ def test_history_and_recent_issues_share_a_single_slot_over_multiple_runs(tmp_pa
             store.ingest(issue(url=URL.replace("41473", str(iid))), DATE)
         with store.db:
             store.db.execute("UPDATE items SET status='published',story_id='accepted'")
-        fetched = []
-
-        class Dynamic:
-            def request(self, method, endpoint, **kwargs):
-                iid = kwargs["json_body"]["variables"]["iid"]
-                fetched.append(iid)
-                data = payload([])
-                data["data"]["project"]["issue"].update(iid=iid, webUrl=URL.replace("41473", iid))
-                return response(data)
-
+        client = Issues()
         for number in range(4):
             observed = f"2026-11-08T12:0{number}:00Z"
             store.ingest(issue(url=URL.replace("41473", str(42000 + number))), observed)
-            assert enrich_comments(cfg, store, observed, client=Dynamic())["checked"] == 1
+            assert enrich_comments(cfg, store, observed, client=client)["checked"] == 1
             with store.db:
                 store.db.execute("UPDATE items SET status='ignored' WHERE story_id IS NULL")
+        fetched = [iid for _, iid in client.seen]
         assert {"41473", "41474"} <= set(fetched)
         assert sum(int(iid) >= 42000 for iid in fetched) == 2
+
+
+def test_a_requested_check_takes_no_rotation_turn(tmp_path):
+    cfg = comments_config(tmp_path, max_issues_per_run=1, max_issues_per_source=1)
+    with Store(cfg["storage"]["database"]) as store:
+        urls = {iid: URL.replace("41473", iid) for iid in ["1", "2", "3", "4"]}
+        for url in urls.values():
+            store.ingest(issue(url=url), DATE)
+        with store.db:
+            store.db.execute("UPDATE items SET status='published',story_id='story' WHERE url IN (?,?)", (urls["1"], urls["4"]))
+            store.db.execute("UPDATE items SET status='ignored' WHERE url=?", (urls["2"],))
+        client = Issues()
+        assert enrich_comments(cfg, store, DATE, client=client)["checked"] == 1  # a published issue's turn
+        merge_cached_comments(store, issue(url=urls["2"], updated_at=after(600, DATE)), issue_source(), after(600, DATE))
+        for seconds in (700, 800):  # the request takes run 2; the next rotation turn is still recent 3's
+            assert enrich_comments(cfg, store, after(seconds, DATE), client=client)["checked"] == 1
+        fetched = [iid for _, iid in client.seen]
+        assert fetched[0] in {"1", "4"} and fetched[1:] == ["2", "3"]
 
 
 def test_success_on_another_issue_does_not_reset_item_failure_backoff(tmp_path):
@@ -499,23 +614,83 @@ def test_success_on_another_issue_does_not_reset_item_failure_backoff(tmp_path):
             store.db.execute("UPDATE items SET status='published',story_id='accepted'")
         rows = store.db.execute("SELECT id,url FROM items ORDER BY id").fetchall()
         failed_id = rows[0]["id"]
-        failed_iid = rows[0]["url"].rsplit("/", 1)[1]
-
-        class Dynamic:
-            def request(self, method, endpoint, **kwargs):
-                iid = kwargs["json_body"]["variables"]["iid"]
-                if iid == failed_iid:
-                    raise FetchError("HTTP 503")
-                data = payload([])
-                data["data"]["project"]["issue"].update(iid=iid, webUrl=URL.replace("41473", iid))
-                return response(data)
-
-        assert enrich_comments(cfg, store, DATE, client=Dynamic())["failed"] == 1
-        assert enrich_comments(cfg, store, "2026-11-08T12:05:00Z", client=Dynamic())["failed"] == 0
-        assert enrich_comments(cfg, store, "2026-11-08T12:06:00Z", client=Dynamic())["failed"] == 1
+        client = Issues(fail={rows[0]["url"].rsplit("/", 1)[1]})
+        assert enrich_comments(cfg, store, DATE, client=client)["failed"] == 1
+        assert enrich_comments(cfg, store, "2026-11-08T12:05:00Z", client=client)["failed"] == 0
+        assert enrich_comments(cfg, store, "2026-11-08T12:06:00Z", client=client)["failed"] == 1
         cached = store.db.execute("SELECT failures,next_fetch_at FROM comment_cache WHERE item_id=?", (failed_id,)).fetchone()
         assert tuple(cached) == (2, "2026-11-08T12:16:00Z")
+        # REST activity requests a check but keeps the failing issue's backoff.
+        merge_cached_comments(store, issue(url=rows[0]["url"], updated_at=after(600, DATE)), issue_source(), after(660, DATE))
         assert enrich_comments(cfg, store, "2026-11-08T12:11:00Z", client=FakeClient([]))["checked"] == 0
+
+
+def test_an_issue_that_no_longer_verifies_backs_off_alone(tmp_path):
+    cfg = comments_config(tmp_path)
+    with Store(cfg["storage"]["database"]) as store:
+        for iid in ["1", "2"]:
+            store.ingest(issue(url=URL.replace("41473", iid)), DATE)
+        with store.db:  # the deleted or hidden issue is checked first
+            store.db.execute("UPDATE items SET priority_score=priority_score+1 WHERE url=?", (URL.replace("41473", "1"),))
+        client = Issues(missing={"1"})
+        assert enrich_comments(cfg, store, DATE, client=client)["failed"] == 1
+        assert [iid for _, iid in client.seen] == ["1", "2"]
+        assert status(store)["sources"][0]["failures"] == 0
+
+
+def test_retries_of_an_issue_that_never_verifies_end_when_its_metadata_expires(tmp_path):
+    cfg = comments_config(tmp_path)
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest(issue(), DATE)
+        with store.db:
+            store.db.execute("UPDATE items SET status='ignored'")
+        enrich_comments(cfg, store, DATE, client=FakeClient([]))
+        merge_cached_comments(store, issue(), issue_source(), DATE)  # REST activity, then every check fails
+        client = Issues(missing={"41473"})
+        for seconds in [0, 60, 31 * 86400, 32 * 86400]:  # checked, in backoff, retried, expired
+            enrich_comments(cfg, store, after(seconds, DATE), client=client)
+        assert len(client.seen) == 2
+
+
+def test_an_outage_costs_one_request_per_project(tmp_path):
+    cfg, store = two_projects(tmp_path)
+    with store:
+        client = FakeClient([FetchError("HTTP 503")] * 4)
+        assert enrich_comments(cfg, store, DATE, client=client)["failed"] == len(client.calls) == 2
+        assert [s["failures"] for s in status(store)["sources"]] == [1, 1]
+
+
+def test_projects_take_turns_and_removed_projects_leave_status(tmp_path):
+    cfg, store = two_projects(tmp_path, max_issues_per_run=1)
+    with store:
+        client = Issues()
+        for _ in range(3):
+            enrich_comments(cfg, store, DATE, client=client)
+        assert [project for project, _ in client.seen] == ["tpo/core/arti", PROJECT, "tpo/core/arti"]
+        for kept in [["tor-issues"], []]:
+            cfg["sources"] = cfg["sources"][:len(kept)]
+            enrich_comments(cfg, store, DATE, client=client)
+            assert [s["id"] for s in status(store)["sources"]] == kept
+
+
+def test_another_project_does_not_take_a_requested_check(tmp_path):
+    cfg, store = two_projects(tmp_path)
+    with store:
+        with store.db:
+            store.db.execute("UPDATE items SET status='ignored'")
+        enrich_comments(cfg, store, DATE, client=FakeClient([]))  # nothing to check yet
+        merge_cached_comments(store, issue(url=URL.replace("41473", "1")), issue_source(), DATE)
+        client = Issues()
+        enrich_comments(cfg, store, DATE, client=client)  # the other project's turn comes first
+        assert client.seen == [(PROJECT, "1")]
+
+
+def test_spent_deadline_stops_before_any_request(tmp_path):
+    cfg = comments_config(tmp_path)
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest(issue(), DATE)
+        report = enrich_comments(cfg, store, DATE, deadline=time.monotonic() - 1, client=FakeClient([]))
+        assert report["budget_reached"] and report["failed"] == 0
 
 
 def test_invalid_issue_and_redirect_destinations_are_never_followed():

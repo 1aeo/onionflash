@@ -61,10 +61,18 @@ old notes outside that window can be omitted. The `comments_truncated` field
 makes this limit explicit. Replacing a snapshot handles note edits and deletions
 within the inspected window. An unavailable or unverifiable response is not a
 new snapshot: it preserves the last verified public evidence and its original
-verification time, applies bounded issue/source backoff, and leaves normal
-collection running. A verified public snapshot with no eligible notes can remove
-previous note enrichment; a transport failure cannot masquerade as that deletion.
+verification time, applies bounded backoff, and leaves normal collection
+running. An unusable answer about one issue backs off only that issue; transport,
+redirect, response and project identity failures back off its source. A verified
+public snapshot with no eligible notes can remove previous note enrichment; a
+transport failure cannot masquerade as that deletion.
 
+GitLab updates an issue when a note is added, so the REST scan returns it even
+when nothing else changed. Activity after an issue's last check, or on an issue
+without a snapshot, requests a check whatever the issue's status, and changed
+notes queue a new revision for analysis. Requested checks go first, pending
+issues first, then in the order first requested. A failed check of an issue
+without a story is retried the same way until its scheduling metadata expires.
 Recent pending issues and a rotating selection of issues already tied to
 published stories alternate under the shared budget, including single-slot runs.
 History cursors advance only for attempted rows. Old published issues remain
