@@ -254,7 +254,7 @@ class CheckedTransportTests(unittest.TestCase):
     """The production path: DNS is checked when the connection opens, then the
     socket backend receives only the vetted literal address."""
 
-    def client(self, addresses, body=b"ok"):
+    def client(self, addresses, body=b"ok", attempts=1):
         resolved, connected = [], []
         def resolver(host, port, *args):
             resolved.append(host)
@@ -263,7 +263,8 @@ class CheckedTransportTests(unittest.TestCase):
             def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
                 connected.append((host, port, timeout))
                 return super().connect_tcp(host, port, timeout, local_address, socket_options)
-        client = HttpClient({"retry_attempts": 1}, resolver=resolver)
+        client = HttpClient({"retry_attempts": attempts, "backoff_base_seconds": 0}, resolver=resolver,
+                            sleep=lambda seconds: None)
         client._client._transport.backend.backend = Backend(
             [b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body])
         return client, resolved, connected
@@ -276,10 +277,12 @@ class CheckedTransportTests(unittest.TestCase):
         self.assertEqual([(host, port) for host, port, _ in connected], [("93.184.216.34", 443)])
 
     def test_a_private_address_at_connect_time_is_refused_before_dialing(self):
-        client, resolved, connected = self.client(["93.184.216.34", "10.0.0.7"])
+        # Retries are available, so a wrongly retried refusal would show a second lookup.
+        client, resolved, connected = self.client(["93.184.216.34", "10.0.0.7"], attempts=3)
         with client, self.assertRaisesRegex(FetchError, "not permitted") as caught:
             client.request("GET", "https://example.org/feed")
         self.assertFalse(caught.exception.retryable)
+        self.assertEqual(resolved, ["example.org"])
         self.assertEqual(connected, [])
 
     def test_the_caller_deadline_bounds_the_connect_timeout(self):
