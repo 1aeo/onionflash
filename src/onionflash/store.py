@@ -291,7 +291,11 @@ class Store:
         ).fetchone()
         return json.loads(row[0]) if row else None
 
-    def defer(self, item_id: str, error: str, llm: dict, observed: str) -> None:
+    def defer(self, item_id: str, error: str, llm: dict, observed: str, *, terminal: bool = False) -> None:
+        """Retry later; after three failures caused by the item itself, stop retrying.
+
+        A rejected item is queued again only when its source content changes.
+        """
         row = self.db.execute(
             "SELECT attempts FROM items WHERE id=? AND status='pending'", (item_id,)
         ).fetchone()
@@ -303,9 +307,13 @@ class Store:
         )
         with self.db:
             self.db.execute(
-                "UPDATE items SET attempts=?,last_error=?,next_attempt_at=? WHERE id=? AND status='pending'",
-                (attempts, error[:160], after(delay, observed), item_id),
+                "UPDATE items SET status=?,attempts=?,last_error=?,next_attempt_at=? WHERE id=? AND status='pending'",
+                ("rejected" if terminal and attempts >= 3 else "pending",
+                 attempts, error[:160], after(delay, observed), item_id),
             )
+
+    def rejected_count(self) -> int:
+        return self.db.execute("SELECT COUNT(*) FROM items WHERE status='rejected'").fetchone()[0]
 
     def finish(self, row: dict, result: dict, cache_key: str, observed: str) -> None:
         item = json.loads(row["payload"])

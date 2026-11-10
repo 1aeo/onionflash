@@ -215,7 +215,7 @@ def run(config: dict, store: Store) -> dict:
                         report["analyzed"] += 1
                     except AnalysisError as exc:
                         active_row = None
-                        store.defer(row["id"], str(exc), config["llm"], now_iso())
+                        store.defer(row["id"], str(exc), config["llm"], now_iso(), terminal=not exc.retryable)
                         report["analysis_failed"] += 1
                         if exc.retryable:
                             # Skip further network analysis, but deterministic tags
@@ -231,6 +231,7 @@ def run(config: dict, store: Store) -> dict:
                 now_iso(),
             )
     report["pending_analysis"] = store.pending_count()
+    report["rejected_analysis"] = store.rejected_count()
     report["monitoring"] = store.monitoring_status(config["monitoring"], now_iso())
     report.update(build(config, store))
     return report
@@ -283,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
                 elif args.command == "status":
                     result = {
                         "pending_analysis": store.pending_count(),
+                        "rejected_analysis": store.rejected_count(),
                         # Recorded by the last successful build; None until one has run.
                         "published_stories": None if store.get_meta("published_stories") is None
                         else int(store.get_meta("published_stories")),

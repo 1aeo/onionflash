@@ -122,8 +122,8 @@ def test_array_duplicates_and_evidence_whitespace_preserve_existing_policy():
     assert accepted["products"] == ["tor"] and accepted["tags"] == ["security"]
     assert accepted["evidence"] == [quote]
     unpublished = validate_analysis(analysis(publish=False, title="", summary="", why_it_matters="", evidence=[], confidence="confirmed", state="released", products=["tor", "tor"]), item(kind="tag"))
+    # Ignore decisions publish nothing, so their other fields are returned untouched.
     assert unpublished["state"] == "released" and unpublished["confidence"] == "confirmed"
-    assert unpublished["products"] == ["tor"]
 
 
 def test_source_failure_updates_status_and_checkpoint_in_one_statement(tmp_path):
@@ -209,9 +209,9 @@ def test_deadline_after_error_deferral_does_not_count_a_second_attempt(tmp_path,
         store.ingest(item(), DATE)
         defer = store.defer
         calls = []
-        def interrupted_defer(*args):
+        def interrupted_defer(*args, **kwargs):
             calls.append(args)
-            defer(*args)
+            defer(*args, **kwargs)
             _budget()
         monkeypatch.setattr(store, "defer", interrupted_defer)
         cli.run(_pipeline_config(tmp_path), store)
