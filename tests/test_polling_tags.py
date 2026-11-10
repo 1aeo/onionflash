@@ -135,7 +135,7 @@ def test_tag_cannot_downgrade_existing_announced_release(tmp_path):
     assert len(story["sources"]) == 2
 
 
-def test_tags_have_configurable_queue_floor_below_serious_security(tmp_path):
+def test_tags_have_a_fixed_queue_floor_below_serious_security(tmp_path):
     assert item_priority(tag()) == 5
     incident = tag(
         kind="gitlab_issue",
