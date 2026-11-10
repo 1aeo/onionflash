@@ -119,6 +119,18 @@ def test_attributing_a_flagged_statement_to_the_source_does_not_fix_it(monkeypat
         llm.analyze(item())
 
 
+def test_a_qualifier_inside_the_flagged_claim_does_not_excuse_it():
+    from onionflash.analyze import _kept_claim
+    claim = "Operators may need to rotate keys."
+    draft = {"title": "t", "summary": claim, "why_it_matters": "w"}
+    copied = {**draft, "title": "New title"}
+    attributed = {**draft, "summary": "According to the report, operators may need to rotate keys."}
+    assert _kept_claim([claim], [draft], copied) == claim
+    assert _kept_claim([claim], [draft], attributed) == claim  # the claim's own "may" is not a hedge
+    hedged = {**draft, "summary": "It is unclear whether operators may need to rotate keys."}
+    assert _kept_claim([claim], [draft], hedged) is None
+
+
 def test_a_flagged_statement_may_be_reworded_with_the_same_words(monkeypatch):
     claim = "plausible compromise of all relays"
     for rewrite in ("The report does not say whether this is a plausible compromise of all relays.",
