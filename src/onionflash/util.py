@@ -13,10 +13,6 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 UTC = timezone.utc
 
 
-class BudgetExceeded(Exception):
-    """Control-flow deadline, deliberately not an OSError/network retry error."""
-
-
 def now_iso() -> str:
     return format_utc(datetime.now(UTC))
 

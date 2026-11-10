@@ -337,7 +337,8 @@ def _validate_issue_actions(result: dict, evidence: list[str]) -> None:
 
 
 class Analyzer:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, deadline: float | None = None):
+        self.deadline = deadline  # absolute time.monotonic() limit for model requests
         self.llm = config["llm"]
         self.http_settings = {
             **config["http"],
@@ -368,6 +369,7 @@ class Analyzer:
                 allowed_networks=self.llm["allowed_networks"],
                 allow_http=self.llm["allow_http"],
             )
+            self.client.deadline = self.deadline
         bounded = {
             k: item.get(k)
             for k in (

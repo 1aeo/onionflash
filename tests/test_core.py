@@ -592,7 +592,7 @@ def test_malformed_gitlab_timestamp_cannot_abort_the_entire_cycle():
     assert result["items"][0]["published_at"] == DATE
 
 
-def test_slow_source_is_deferred_and_does_not_starve_queued_analysis(
+def test_a_failing_source_is_deferred_and_does_not_starve_queued_analysis(
     tmp_path, monkeypatch
 ):
     from onionflash import cli
@@ -613,7 +613,7 @@ def test_slow_source_is_deferred_and_does_not_starve_queued_analysis(
             return analysis()
 
     def timeout(*args):
-        raise cli.RunBudgetReached()
+        raise CollectionError("request deadline reached")
 
     monkeypatch.setattr(cli, "HttpClient", DummyContext)
     monkeypatch.setattr(cli, "Analyzer", DummyContext)
@@ -625,36 +625,124 @@ def test_slow_source_is_deferred_and_does_not_starve_queued_analysis(
         assert store.source(cfg["sources"][0])["next_fetch_at"] is not None
 
 
-def test_transport_cannot_swallow_run_budget_as_a_retryable_network_error():
+def test_request_deadline_is_never_slept_past():
     import socket
-    import time
     import httpx
-    from onionflash.cli import RunBudgetReached, time_budget
     from onionflash.transport import HttpClient
 
-    calls = []
-
-    def slow(request):
+    calls, sleeps = [], []
+    settings = {**DEFAULTS["http"], "retry_attempts": 3, "backoff_base_seconds": 5, "requests_per_minute": 10000}
+    resolver = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+    clock = [100.0]
+    def busy(request):
         calls.append(request)
-        time.sleep(0.15)
-        return httpx.Response(200, content=b"ok")
+        return httpx.Response(503, content=b"busy")
+    with HttpClient(settings, transport=httpx.MockTransport(busy), resolver=resolver,
+                    sleep=sleeps.append, clock=lambda: clock[0]) as client:
+        client.deadline = 102.0  # less than one 5 s retry wait away
+        with pytest.raises(FetchError, match="deadline") as caught:
+            client.request("GET", "https://example.org/")
+        assert caught.value.retryable
+        clock[0] = 103.0
+        with pytest.raises(FetchError, match="deadline"):
+            client.request("GET", "https://example.org/")
+    assert len(calls) == 1 and sleeps == []
 
-    settings = {
-        **DEFAULTS["http"],
-        "retry_attempts": 2,
-        "backoff_base_seconds": 0,
-        "requests_per_minute": 10000,
-    }
-    resolver = lambda *args: [
-        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))
-    ]
-    with HttpClient(
-        settings, transport=httpx.MockTransport(slow), resolver=resolver
-    ) as client:
-        with pytest.raises(RunBudgetReached):
-            with time_budget(0.02):
-                client.request("GET", "https://example.org/")
-    assert len(calls) == 1
+
+def test_retry_after_past_the_deadline_is_not_replaced_by_a_shorter_backoff():
+    import socket
+    import httpx
+    from onionflash.transport import DeadlineReached, HttpClient
+
+    calls, sleeps = [], []
+    settings = {**DEFAULTS["http"], "retry_attempts": 3, "backoff_base_seconds": 1, "requests_per_minute": 10000}
+    resolver = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+    def limited(request):
+        calls.append(request)
+        return httpx.Response(429, headers={"Retry-After": "30"}, content=b"slow down")
+    with HttpClient(settings, transport=httpx.MockTransport(limited), resolver=resolver,
+                    sleep=sleeps.append, clock=lambda: 100.0) as client:
+        client.deadline = 110.0  # the 30 s Retry-After does not fit; a 1 s backoff would
+        with pytest.raises(DeadlineReached):
+            client.request("GET", "https://example.org/")
+        assert client.deadline_reached
+    assert len(calls) == 1 and sleeps == []
+
+
+def test_the_deadline_flag_describes_only_the_latest_request():
+    import socket
+    import httpx
+    from onionflash.transport import DeadlineReached, HttpClient
+
+    settings = {**DEFAULTS["http"], "retry_attempts": 3, "backoff_base_seconds": 1, "requests_per_minute": 10000}
+    resolver = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+    def respond(request):
+        if request.url.path == "/primary":
+            return httpx.Response(429, headers={"Retry-After": "30"}, content=b"slow down")
+        return httpx.Response(404, content=b"missing")
+    with HttpClient(settings, transport=httpx.MockTransport(respond), resolver=resolver,
+                    sleep=lambda seconds: None, clock=lambda: 100.0) as client:
+        client.deadline = 110.0
+        with pytest.raises(DeadlineReached):
+            client.request("GET", "https://example.org/primary")
+        # A fallback that then fails with a 404 while time remains is a real failure.
+        with pytest.raises(FetchError, match="404"):
+            client.request("GET", "https://example.org/fallback")
+        assert not client.deadline_reached
+
+
+def test_rate_limit_wait_stops_at_the_deadline():
+    import socket
+    import httpx
+    from onionflash.transport import DeadlineReached, HttpClient
+
+    sleeps = []
+    settings = {**DEFAULTS["http"], "requests_per_minute": 1}
+    resolver = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+    with HttpClient(settings, transport=httpx.MockTransport(lambda request: httpx.Response(200, content=b"ok")),
+                    resolver=resolver, sleep=sleeps.append, clock=lambda: 100.0) as client:
+        client.request("GET", "https://example.org/")
+        client.deadline = 105.0  # the next request slot is 60 s away
+        with pytest.raises(DeadlineReached):
+            client.request("GET", "https://example.org/")
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("source_budget,shared", [(600, True), (5, False)])
+def test_a_deadline_cutoff_is_penalized_only_when_it_is_the_source_budget(tmp_path, monkeypatch, source_budget, shared):
+    from onionflash import cli
+
+    cfg = config(tmp_path)
+    cfg["collection"]["source_budget_seconds"] = source_budget
+    cfg["sources"] = [source(id="first"), source(id="second", url="https://example.org/second.xml")]
+    collected = []
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    def collect(client, stream, *args):
+        collected.append(stream["id"])
+        client.deadline_reached = True
+        raise CollectionError("request deadline reached")
+
+    monkeypatch.setattr(cli, "HttpClient", Client)
+    monkeypatch.setattr(cli, "collect_source", collect)
+    monkeypatch.setattr(cli, "build", lambda *args: {})
+    with Store(tmp_path / "state.db") as store:
+        result = cli.run(cfg, store)
+        first = store.source(cfg["sources"][0])
+    # The shared window ends collection without a penalty; a source that overran
+    # its own budget is a failure, and the next source still runs.
+    assert bool(result.get("budget_reached")) is shared
+    assert first["failures"] == (0 if shared else 1)
+    assert collected == (["first"] if shared else ["first", "second"])
 
 
 def test_render_failure_preserves_prior_site(tmp_path, monkeypatch):
