@@ -93,7 +93,7 @@ def test_shared_render_dependencies_invalidate_public_build_cache(tmp_path, monk
     package = tmp_path / "package"
     package.mkdir()
     (package / "assets").mkdir()
-    for name in ("render.py", "publication.py", "schema.py", "util.py"):
+    for name in ("render.py", "publication.py", "editorial.py", "schema.py", "util.py"):
         (package / name).write_text("initial")
     monkeypatch.setattr(publication, "__file__", str(package / "publication.py"))
     first = publication.template_identity({})

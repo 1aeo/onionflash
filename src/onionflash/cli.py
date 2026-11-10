@@ -15,6 +15,7 @@ from pathlib import Path
 from . import __version__
 from .analyze import AnalysisError, Analyzer, cache_key
 from .collect import CollectionError, collect_source
+from .comments import enrich_comments, merge_cached_comments, status as comments_status
 from .config import load_config
 from .store import Store, source_due
 from .transport import HttpClient
@@ -44,6 +45,93 @@ def build(config: dict, store: Store, *, force: bool = False) -> dict:
     return publish_build(config, store, force=force)
 
 
+def _operator_parsers(commands) -> None:
+    story = commands.add_parser("story", help="Inspect, correct, or retract a published story")
+    actions = story.add_subparsers(dest="action", required=True)
+    for name in ("show", "history", "correct", "retract", "restore", "unlock"):
+        action = actions.add_parser(name)
+        action.add_argument("--config", required=True, type=Path)
+        action.add_argument("--story", required=True, help="Stable story ID")
+        if name == "history":
+            action.add_argument("--limit", type=int, default=20)
+            action.add_argument("--before", type=int, help="Read revisions before this number")
+        elif name != "show":
+            action.add_argument("--expect-hash", required=True, help="Current hash returned by story show")
+            action.add_argument("--reason", required=True, help="Public reason for this editorial action")
+        if name == "correct":
+            action.add_argument("--patch", required=True, type=Path, help="JSON object containing changed public fields")
+        if name == "restore":
+            action.add_argument("--revision", required=True, type=int, help="Revision to restore and lock")
+
+    rejected = commands.add_parser("rejected", help="Inspect and explicitly retry or dismiss rejected analyses")
+    actions = rejected.add_subparsers(dest="action", required=True)
+    for name in ("list", "show", "retry", "dismiss"):
+        action = actions.add_parser(name)
+        action.add_argument("--config", required=True, type=Path)
+        if name == "list":
+            action.add_argument("--status", choices=("rejected", "dismissed"), default="rejected")
+            action.add_argument("--limit", type=int, default=50)
+            action.add_argument("--after", help="Continuation cursor returned by the previous list")
+        else:
+            action.add_argument("--item", required=True, help="Collected item ID")
+        if name in {"retry", "dismiss"}:
+            action.add_argument("--expect-hash", required=True, help="Current content_hash returned by rejected show")
+            action.add_argument("--reason", required=True, help="Private operator reason for this action")
+
+
+def _patch_file(path: Path) -> dict:
+    def pairs(entries):
+        result = {}
+        for key, value in entries:
+            if key in result:
+                raise ValueError("Correction patch contains duplicate JSON keys")
+            result[key] = value
+        return result
+
+    def invalid_constant(_value):
+        raise ValueError("Correction patch contains a non-finite number")
+
+    with path.open("rb") as stream:
+        raw = stream.read(65537)
+    if len(raw) > 65536:
+        raise ValueError("Correction patch exceeds 64 KiB")
+    try:
+        result = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs, parse_constant=invalid_constant)
+    except (UnicodeError, json.JSONDecodeError, RecursionError):
+        raise ValueError("Correction patch must contain valid UTF-8 JSON") from None
+    if not isinstance(result, dict):
+        raise ValueError("Correction patch must be a JSON object")
+    return result
+
+
+def _operator_command(args, config: dict, store: Store) -> dict:
+    if args.command == "story":
+        from . import editorial
+
+        if args.action == "show":
+            return editorial.show(store.db, args.story)
+        if args.action == "history":
+            return editorial.history(store.db, args.story, limit=args.limit, before=args.before)
+        options = {"reason": args.reason, "expect_hash": args.expect_hash}
+        if args.action == "correct":
+            result = editorial.correct(store.db, args.story, _patch_file(args.patch), **options)
+        elif args.action == "restore":
+            result = editorial.restore(store.db, args.story, revision=args.revision, **options)
+        else:
+            result = getattr(editorial, args.action)(store.db, args.story, **options)
+        return {**result, "publication_pending": True}
+    from . import rejection
+
+    if args.action == "list":
+        return rejection.list_items(store, status=args.status, limit=args.limit, after=args.after)
+    if args.action == "show":
+        return rejection.show_item(store, args.item)
+    options = {"expected_hash": args.expect_hash, "reason": args.reason}
+    if args.action == "retry":
+        return rejection.retry_item(store, args.item, llm=config["llm"], **options)
+    return rejection.dismiss_item(store, args.item, **options)
+
+
 def run(config: dict, store: Store) -> dict:
     observed = now_iso()
     report = {
@@ -57,15 +145,23 @@ def run(config: dict, store: Store) -> dict:
     }
     started = time.monotonic()
     budget = config["collection"]["run_budget_seconds"]
-    collection_deadline = started + budget * (
-        1 - config["collection"]["analysis_reserve_fraction"]
-    )
+    collection_window = budget * (1 - config["collection"]["analysis_reserve_fraction"])
+    comments_enabled = bool(config.get("comments", {}).get("enabled"))
+    # Comments share collection time, preserving the existing analysis reserve.
+    # Keep at least half the collection window available for primary sources.
+    comments_budget = min(config["comments"]["run_budget_seconds"], collection_window / 2) if comments_enabled else 0
+    collection_deadline = started + collection_window - comments_budget
+    has_comment_cache = comments_enabled or bool(store.db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='comment_cache'"
+    ).fetchone())
 
     def record_items(source, items):
         received = now_iso()
         if source.get("alert_format"):
             report.setdefault("alerts", {})[source["id"]] = store.ingest_alerts(source, items, received)
             return received
+        if has_comment_cache:
+            items = (merge_cached_comments(store, item, source) for item in items)
         report["items_changed"] += sum(store.ingest(item, received) for item in items)
         return received
 
@@ -112,6 +208,15 @@ def run(config: dict, store: Store) -> dict:
                 where = f"{Path(frame.filename).name}:{frame.lineno}"
                 store.source_failure(source, f"Unexpected {type(exc).__name__} at {where}", config["collection"], now_iso())
                 report["sources_failed"] += 1
+    try:
+        report["comments"] = enrich_comments(config, store, now_iso(), deadline=started + collection_window)
+    except Exception as exc:
+        # Optional discussion enrichment must not stop primary sources or queued
+        # analysis. Keep diagnostics useful without printing source/API contents.
+        frame = traceback.extract_tb(exc.__traceback__)[-1]
+        report["comments"] = {"enabled": comments_enabled, "checked": 0, "changed": 0,
+                              "failed": 1, "skipped": 0, "budget_reached": False,
+                              "error": f"Unexpected {type(exc).__name__} at {Path(frame.filename).name}:{frame.lineno}"}
     run_deadline = started + budget
     endpoint_failures = 0
     with Analyzer(config, deadline=run_deadline) as analyzer:
@@ -124,7 +229,7 @@ def run(config: dict, store: Store) -> dict:
                 if endpoint_failures >= 2 and item["kind"] != "tag":
                     continue
                 result = analyzer.analyze(item)
-                store.finish(row, result, cache_key(row, config["llm"]), now_iso())
+                store.finish(row, result, cache_key(row, config["llm"]), now_iso(), input_chars=config["llm"]["max_input_chars"])
                 report["analyzed"] += 1
             except AnalysisError as exc:
                 # A request cut off by the run deadline is retryable: the item backs off.
@@ -158,6 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--config", required=True, type=Path)
         if name == "build":
             command.add_argument("--force", action="store_true", help="Queue a bounded rebuild of all published articles")
+    _operator_parsers(commands)
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
@@ -168,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
                         "configuration": "valid",
                         "sources": sum(s["enabled"] for s in config["sources"]),
                         "model": config["llm"]["model"],
+                        "comments_enabled": config["comments"]["enabled"],
                         "llm_endpoint_configured": bool(config["llm"]["base_url"]),
                         "llm_credential_present": bool(
                             os.environ.get(config["llm"]["api_key_env"])
@@ -186,10 +293,18 @@ def main(argv: list[str] | None = None) -> int:
                     "published_stories": None if store.get_meta("published_stories") is None
                     else int(store.get_meta("published_stories")),
                     "monitoring": store.monitoring_status(now_iso()),
+                    "comments": {"enabled": config["comments"]["enabled"], **comments_status(store)},
                     "sources": store.health(
                         config["sources"], config["collection"]["stale_after_seconds"], now_iso()
                     ),
                 }, ensure_ascii=False))
+            return 0
+        operator = args.command in {"story", "rejected"}
+        if operator and args.action in {"show", "history", "list"}:
+            with Store(config["storage"]["database"]) as store:
+                # Explicit source inspection can contain arbitrary Unicode. JSON
+                # escapes keep terminal control/bidi characters visibly inert.
+                print(json.dumps(_operator_command(args, config, store), ensure_ascii=True))
             return 0
         with run_lock(config["storage"]["database"]) as acquired:
             if not acquired:
@@ -198,8 +313,13 @@ def main(argv: list[str] | None = None) -> int:
                 # is reported as a temporary failure (EX_TEMPFAIL).
                 return 0 if args.command == "run" else 75
             with Store(config["storage"]["database"]) as store:
-                result = run(config, store) if args.command == "run" else build(config, store, force=args.force)
-                print(json.dumps(result, ensure_ascii=False))
+                if operator:
+                    result = _operator_command(args, config, store)
+                elif args.command == "run":
+                    result = run(config, store)
+                else:
+                    result = build(config, store, force=args.force)
+                print(json.dumps(result, ensure_ascii=operator))
         return 0
     except (ValueError, OSError) as exc:
         print(f"onionflash: {exc}", file=sys.stderr)

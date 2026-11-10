@@ -56,7 +56,37 @@ def _label(value: str) -> str:
     return value.replace("-", " ").capitalize()
 
 
-def _prepare_story(story: dict) -> dict:
+def _editorial(value: dict | None) -> dict | None:
+    """Validate metadata supplied by the operator ledger, never source output."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"status", "revision", "action", "reason", "at", "history", "history_total"}:
+        raise ValueError("Invalid editorial metadata")
+    if value["status"] not in {"corrected", "retracted"} or value["action"] not in {"correct", "retract", "restore"}:
+        raise ValueError("Invalid editorial state")
+    if type(value["revision"]) is not int or value["revision"] < 1 or type(value["history_total"]) is not int or value["history_total"] != value["revision"]:
+        raise ValueError("Invalid editorial revision")
+    if not isinstance(value["history"], list) or len(value["history"]) > 20:
+        raise ValueError("Invalid editorial history")
+    result = {**value, "reason": _text(value["reason"], 1000), "at": _iso(_date(value["at"])), "history": []}
+    if not result["reason"]:
+        raise ValueError("Editorial reason is required")
+    for entry in value["history"]:
+        if not isinstance(entry, dict) or set(entry) - {"revision", "action", "reason", "created_at", "superseded"}:
+            raise ValueError("Invalid editorial history entry")
+        if type(entry.get("revision")) is not int or not 1 <= entry["revision"] <= result["revision"] or entry.get("action") not in {"correct", "retract", "restore", "unlock"}:
+            raise ValueError("Invalid editorial history action")
+        clean = {"revision": entry["revision"], "action": entry["action"], "reason": _text(entry.get("reason"), 1000), "created_at": _iso(_date(entry.get("created_at")))}
+        if "superseded" in entry:
+            previous = entry["superseded"]
+            if not isinstance(previous, dict) or set(previous) != {"title", "summary", "why_it_matters"}:
+                raise ValueError("Invalid superseded public text")
+            clean["superseded"] = {key: _text(previous[key], limit) for key, limit in (("title", 180), ("summary", 1600), ("why_it_matters", 800))}
+        result["history"].append(clean)
+    return result
+
+
+def _prepare_story(story: dict, *, editorial: dict | None = None) -> dict:
     story_id = story.get("id", "")
     if not isinstance(story_id, str) or not ID_PATTERN.fullmatch(story_id):
         raise ValueError("Unsafe story ID")
@@ -85,7 +115,7 @@ def _prepare_story(story: dict) -> dict:
     updated = _date(story.get("updated_at"))
     if updated < published:
         updated = published
-    return {
+    public = {
         "id": story_id, "title": title, "summary": summary,
         "why_it_matters": _text(story.get("why_it_matters"), 800),
         "category": category, "priority": priority, "confidence": confidence,
@@ -95,6 +125,10 @@ def _prepare_story(story: dict) -> dict:
         # When Onion Flash first published the story; older records fall back to the source date.
         "added_at": _iso(_date(story.get("added_at") or story.get("published_at"))),
     }
+    notice = _editorial(editorial)
+    if notice is not None:
+        public["editorial"] = notice
+    return public
 
 
 def _permalink(base: str, story: dict) -> str:
@@ -103,6 +137,11 @@ def _permalink(base: str, story: dict) -> str:
 
 def _badges(story: dict) -> str:
     parts = [f'<span class="category-label">{CATEGORIES[story["category"]]}</span>']
+    notice = story.get("editorial")
+    if notice:
+        parts.append(f'<span class="editorial-badge">{"Retracted" if notice["status"] == "retracted" else "Corrected"}</span>')
+        if notice["status"] == "retracted":
+            return '<div class="story-labels">' + "".join(parts) + "</div>"
     if story["priority"] in {"critical", "high"}:
         parts.append(f'<span class="priority priority-{story["priority"]}">{_label(story["priority"])} priority</span>')
     parts.append(f'<span class="evidence-label">{_label(story["confidence"])}</span>')
@@ -134,10 +173,38 @@ def _card(story: dict, base: str) -> str:
     return f'''<article class="story" id="story-{story['id']}" data-tags="{_escape(' '.join(story['tags']))}" data-search="{_escape(search.lower())}">
       <div class="story-topline">{_badges(story)}<span class="story-date">{_time(story['added_at'])}</span></div>
       <h2><a href="{_escape(_permalink(base, story))}">{_escape(story['title'])}</a></h2>
+      {_editorial_notice(story)}
       <p class="story-summary">{_escape(story['summary'])}</p>
       {f'<p class="why"><strong>Why it matters</strong> {_escape(story["why_it_matters"])}</p>' if story['why_it_matters'] else ''}
       <div class="story-bottom">{_source_links(story)}{updated}</div>
     </article>'''
+
+
+def _editorial_notice(story: dict) -> str:
+    notice = story.get("editorial")
+    if not notice:
+        return ""
+    label = {"correct": "Correction", "retract": "Retraction", "restore": "Restored"}[notice["action"]]
+    reason = "" if notice["status"] == "retracted" else " " + _escape(notice["reason"])
+    return f'<p class="editorial-notice"><strong>{label} · {_time(notice["at"], full=True)}</strong>{reason}</p>'
+
+
+def _editorial_history(story: dict) -> str:
+    notice = story.get("editorial")
+    if not notice:
+        return ""
+    rows = []
+    labels = {"correct": "Corrected", "retract": "Retracted", "restore": "Restored", "unlock": "Automated updates resumed"}
+    for entry in notice["history"]:
+        previous = entry.get("superseded")
+        old_text = ""
+        if previous:
+            old_text = ('<details class="superseded-text"><summary>Superseded public text — not current reporting</summary>'
+                        f'<h3>{_escape(previous["title"])}</h3><p>{_escape(previous["summary"])}</p>'
+                        + (f'<p><strong>Previous context:</strong> {_escape(previous["why_it_matters"])}</p>' if previous["why_it_matters"] else "") + '</details>')
+        rows.append(f'<li><strong>Revision {entry["revision"]}: {labels[entry["action"]]}</strong> · {_time(entry["created_at"], full=True)}<p>{_escape(entry["reason"])}</p>{old_text}</li>')
+    older = f'<p>Showing the latest {len(rows)} of {notice["history_total"]} changes. Earlier revision records are retained by the publisher.</p>' if notice["history_total"] > len(rows) else ""
+    return f'<details class="editorial-history" data-nosnippet><summary>Editorial history ({notice["history_total"]})</summary><ol>{"".join(rows)}</ol>{older}</details>'
 
 
 def _health_details(health: list[dict]) -> str:
@@ -235,10 +302,11 @@ def _rss_item(story: dict, base: str) -> ET.Element:
     ET.SubElement(item, "pubDate").text = email.utils.format_datetime(_date(story["published_at"]), usegmt=True)
     for tag in story["tags"]:
         ET.SubElement(item, "category").text = tag
-    description = f'<p>{_escape(story["summary"])}</p>'
+    description = _editorial_notice(story) + f'<p>{_escape(story["summary"])}</p>'
     if story["why_it_matters"]:
         description += f'<p><strong>Why it matters:</strong> {_escape(story["why_it_matters"])}</p>'
-    description += f'<p>{_label(story["confidence"])} · {_label(story["priority"])} priority · {_label(story["state"])}</p>'
+    if story.get("editorial", {}).get("status") != "retracted":
+        description += f'<p>{_label(story["confidence"])} · {_label(story["priority"])} priority · {_label(story["state"])}</p>'
     description += _source_links(story, expanded=True)
     ET.SubElement(item, "description").text = description
     return item
@@ -263,6 +331,9 @@ def _rss(site: dict, base: str, stories: list[dict], path: str, category: str | 
 
 def _json_feed_item(story: dict, base: str) -> dict:
     content = story["summary"]
+    notice = story.get("editorial")
+    if notice:
+        content = f'{notice["action"].capitalize()} · {notice["at"]}: {notice["reason"]}\n\n' + content
     if story["why_it_matters"]:
         content += "\n\nWhy it matters: " + story["why_it_matters"]
     content += "\n\nSources:\n" + "\n".join(source["url"] for source in story["sources"])
@@ -329,11 +400,13 @@ def index_html(site: dict, base: str, homepage: list[dict], source_health: list[
 def article_html(site: dict, base: str, story: dict) -> str:
     body = f'''<main id="main" class="page article-page"><a class="back-link" href="{_escape(base)}">← All dispatches</a>
 <article class="full-story">{_badges(story)}<h1>{_escape(story['title'])}</h1>
+{_editorial_notice(story)}
 <div class="article-dates">Published {_time(story['published_at'], full=True)}{f' <span>·</span> Updated {_time(story["updated_at"], full=True)}' if story['updated_at'] != story['published_at'] else ''}</div>
 <p class="article-summary">{_escape(story['summary'])}</p>
 {f'<section class="article-context"><h2>Why it matters</h2><p>{_escape(story["why_it_matters"])}</p></section>' if story['why_it_matters'] else ''}
-<p class="event-state"><span>Event status</span> {_label(story['state'])}</p>
+<p class="event-state"><span>Event status</span> {"Retracted" if story.get("editorial", {}).get("status") == "retracted" else _label(story['state'])}</p>
 <section class="article-sources"><h2>Read the sources</h2>{_source_links(story, expanded=True)}</section>
+{_editorial_history(story)}
 <p class="article-note">This is an AI-assisted summary of the linked public sources. Consult the original reports for details and operator guidance.</p></article></main>'''
     title = _text(site.get("title", "Onion Flash"), 80)
     return _shell(site, base, f"{story['title']} — {title}", story["summary"][:300], body, _permalink(base, story))
