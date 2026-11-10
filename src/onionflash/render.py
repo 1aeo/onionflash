@@ -424,13 +424,25 @@ def article_html(site: dict, base: str, story: dict) -> str:
 
 def headers_text(base: str) -> str:
     prefix = urlsplit(base).path.rstrip("/")
-    return f'''{prefix}/*
+    policy = "default-src 'none'; script-src 'none'; style-src 'self'; img-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    headers = f'''{prefix}/*
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
-  Content-Security-Policy: default-src 'none'; script-src 'none'; style-src 'self'; img-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+  Content-Security-Policy: {policy}
   Permissions-Policy: camera=(), microphone=(), geolocation=()
   Cache-Control: public, max-age=60, must-revalidate
 '''
+    # Browser XML viewers inject inline CSS to hide their original source tree.
+    # Cloudflare joins matching header values, so remove the inherited CSP first.
+    feed_policy = policy.replace("style-src 'self'", "style-src 'unsafe-inline'")
+    for path in ("feed.xml", *(f"tags/{topic}.xml" for topic in CATEGORIES)):
+        headers += f'''
+{prefix}/{path}
+  ! Content-Security-Policy
+  Content-Security-Policy: {feed_policy}
+  Content-Type: application/rss+xml; charset=utf-8
+'''
+    return headers
 
 
 def render_site(config: dict, stories: list[dict], source_health: list[dict], output_dir: Path) -> int:

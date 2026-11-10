@@ -1,6 +1,7 @@
 """Permanent artifacts, bounded publication work and restart-safe indexes."""
 
 import copy
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -189,6 +190,49 @@ def test_uploaded_hash_survives_update_and_json_contains_only_public_fields(tmp_
         assert updated[0] != previous and updated[1] == previous
         text = (Path(cfg["storage"]["output_dir"]) / path).read_text()
         assert all(value not in text for value in ["private-origin", "private evidence", "private-secret", "editorial_kind"])
+
+
+def test_feed_header_fix_invalidates_publication_without_changed_stories(tmp_path, monkeypatch):
+    cfg = settings(tmp_path)
+    current_headers = render.headers_text(cfg["site"]["base_url"])
+    legacy_headers = current_headers.split("\n\n", 1)[0] + "\n"
+    assert legacy_headers != current_headers
+    with Store(cfg["storage"]["database"]) as store:
+        value = story(1)
+        put(store.db, value)
+        # Keep the template identity fixed to exercise header regeneration
+        # independently of article/feed rebuilding or source changes.
+        with monkeypatch.context() as legacy:
+            legacy.setattr(render, "headers_text", lambda _base: legacy_headers)
+            build(cfg, store)
+        output = Path(cfg["storage"]["output_dir"])
+        protected = [output / "feed.xml", output / "feed.json", *sorted((output / "tags").glob("*.xml")),
+                     output / f"news/{value['id']}/index.html", output / f"news/{value['id']}/story.json"]
+        before_files = [(path.read_bytes(), path.stat().st_mtime_ns) for path in protected]
+        before_stories = store.stories()
+        before_hashes = dict(store.db.execute("SELECT path,sha256 FROM public_artifacts"))
+        generation = int(meta(store.db, "publication_generation"))
+        with store.db:
+            store.db.execute("UPDATE public_artifacts SET uploaded_sha256=sha256")
+        monkeypatch.setattr(render, "article_html", lambda *_args: pytest.fail("Unchanged article was regenerated"))
+        monkeypatch.setattr(publication, "_feeds", lambda *_args: pytest.fail("Unchanged feeds were regenerated"))
+
+        result = build(cfg, store)
+
+        assert result["public_changed"] and "articles_pending" not in result
+        assert (output / "_headers").read_text() == current_headers
+        after_hashes = dict(store.db.execute("SELECT path,sha256 FROM public_artifacts"))
+        assert {path for path in after_hashes if after_hashes[path] != before_hashes[path]} == {"_headers"}
+        header = store.db.execute("SELECT sha256,uploaded_sha256 FROM public_artifacts WHERE path='_headers'").fetchone()
+        assert header[0] == hashlib.sha256(current_headers.encode()).hexdigest()
+        assert header[1] == before_hashes["_headers"] and header[0] != header[1]
+        assert int(meta(store.db, "publication_generation")) == generation + 1
+        assert before_files == [(path.read_bytes(), path.stat().st_mtime_ns) for path in protected]
+        assert store.stories() == before_stories
+
+        assert not build(cfg, store)["public_changed"]
+        assert int(meta(store.db, "publication_generation")) == generation + 1
+        assert before_files == [(path.read_bytes(), path.stat().st_mtime_ns) for path in protected]
 
 
 def test_invalid_revision_keeps_last_good_publication_and_can_recover(tmp_path):
