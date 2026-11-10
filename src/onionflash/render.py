@@ -135,6 +135,8 @@ def _prepare_story(story: dict) -> dict:
         "state": state, "tags": tags, "sources": sources,
         "products": [p for p in story.get("products", [])[:10] if isinstance(p, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", p)],
         "published_at": _iso(published), "updated_at": _iso(updated),
+        # When Onion Flash first published the story; older records fall back to the source date.
+        "added_at": _iso(_date(story.get("added_at") or story.get("published_at"))),
     }
 
 
@@ -167,11 +169,13 @@ def _source_links(story: dict, *, expanded: bool = False) -> str:
 
 def _card(story: dict, base: str) -> str:
     search = " ".join([story["title"], story["summary"], *story["tags"], *story["products"]])
+    # Cards show when Onion Flash added the story, which orders the homepage; the
+    # story page keeps the source's own publication date.
     updated = ""
-    if story["updated_at"] != story["published_at"]:
+    if story["updated_at"] > story["added_at"]:
         updated = f'<span class="updated-note">Updated {_time(story["updated_at"])}</span>'
     return f'''<article class="story" id="story-{story['id']}" data-tags="{_escape(' '.join(story['tags']))}" data-search="{_escape(search.casefold())}">
-      <div class="story-topline">{_badges(story)}<span class="story-date">{_time(story['published_at'])}</span></div>
+      <div class="story-topline">{_badges(story)}<span class="story-date">{_time(story['added_at'])}</span></div>
       <h2><a href="{_escape(_permalink(base, story))}">{_escape(story['title'])}</a></h2>
       <p class="story-summary">{_escape(story['summary'])}</p>
       {f'<p class="why"><strong>Why it matters</strong> {_escape(story["why_it_matters"])}</p>' if story['why_it_matters'] else ''}
@@ -187,17 +191,11 @@ def _health_details(health: list[dict]) -> str:
         name = _text(item.get("name") or item.get("id"), 100)
         if not name:
             continue
-        last = "Not collected yet"
-        if item.get("last_success"):
-            try:
-                last = "Last success " + _time(item["last_success"], full=True)
-            except ValueError:
-                last = "Last collection time unavailable"
-        degraded = bool(item.get("stale") or item.get("error"))
-        label = "Delayed" if degraded else ("Collected" if item.get("last_success") else "Pending")
+        # Only freshness is public; operators get times and errors from `onionflash status`.
+        degraded = bool(item.get("stale"))
         url = _safe_url(item.get("website_url"))
         source = f'<a href="{_escape(url)}">{_escape(name)}</a>' if url else f'<span>{_escape(name)}</span>'
-        rows.append(f'<li><div>{source}<span class="health-state{ " delayed" if degraded else ""}">{label}</span></div><small>{last}</small></li>')
+        rows.append(f'<li><div>{source}<span class="health-state{" delayed" if degraded else ""}">{"Delayed" if degraded else "Collected"}</span></div></li>')
     if not rows:
         return ""
     return '<details class="source-health"><summary>Source availability</summary><p>Collection status, not the status of the Tor network.</p><ul>' + "".join(rows) + "</ul></details>"
@@ -320,7 +318,7 @@ def render_site(config: dict, stories: list[dict], source_health: list[dict], ou
     public.sort(key=lambda story: (story["updated_at"], story["published_at"], story["id"]), reverse=True)
     page_size = _limit(site.get("page_size"), 100, 1000)
     feed_size = _limit(site.get("feed_size"), 50, 1000)
-    homepage = sorted(public, key=lambda story: (story["published_at"], story["updated_at"], story["id"]), reverse=True)[:page_size]
+    homepage = sorted(public, key=lambda story: (story["added_at"], story["updated_at"], story["id"]), reverse=True)[:page_size]
     output_dir.mkdir(parents=True, exist_ok=True)
     assets = Path(__file__).with_name("assets")
     for name in ASSET_FILES:

@@ -11,7 +11,6 @@ feed_size = 50
 [storage]
 database = "state/onionflash.sqlite3"
 output_dir = "build/public"
-max_stories = 1000
 
 [collection]
 lookback_days = 14

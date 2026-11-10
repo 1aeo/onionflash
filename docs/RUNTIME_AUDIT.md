@@ -114,8 +114,9 @@ An updated URL replaces its current item payload, while new content/model/prompt
 cache keys can add analysis rows. Published summaries and source links are held
 separately from raw input. The database is local; visitors read static files.
 
-`storage.max_stories = 1000` limits the rendered archive, **not database
-retention**. Items, analysis-cache entries and stories currently have no age-based
+Every stored story is considered for rendering (`storage.max_stories` is retired and
+ignored); records that cannot be rendered safely are skipped and reported as
+`stories_skipped`. Nothing limits **database retention**. Items, analysis-cache entries and stories have no age-based
 deletion policy. Long-term growth is therefore expected, but the measured scale
 does not justify compressing the live SQL data or running frequent VACUUM.
 

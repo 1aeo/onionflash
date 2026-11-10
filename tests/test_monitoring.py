@@ -71,6 +71,7 @@ def test_notifications_must_have_both_count_and_span(db):
     assert story["priority"] == "normal"
     assert story["published_at"] == after(-3600, NOW)
     assert story["updated_at"] == NOW
+    assert story["added_at"] == NOW  # when Onion Flash published it, not the first report
     assert "3 notifications" in story["summary"]
     assert "do not establish a continuous outage" in story["summary"]
 

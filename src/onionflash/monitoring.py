@@ -68,7 +68,7 @@ def _normalized(observation: dict, alert_format: str) -> dict | None:
     return {**observation, "target": target}
 
 
-def _promote(db, group, source, settings, cutoff) -> bool:
+def _promote(db, group, source, settings, cutoff, observed) -> bool:
     if group["kind"] != "document" or group["state"] != "firing" or group["story_id"]:
         return False
     active = set(json.loads(group["conditions"]))
@@ -120,6 +120,7 @@ def _promote(db, group, source, settings, cutoff) -> bool:
         "priority": "normal", "confidence": "observed-anomaly", "state": "developing",
         "tags": ["directory-authority", "network"], "sources": list(links.values()),
         "published_at": stamps[0], "updated_at": stamps[-1],
+        "added_at": observed,  # when Onion Flash published it; orders the homepage
     }
     db.execute(
         "INSERT INTO stories(id,cluster_key,payload,published_at,updated_at) VALUES(?,?,?,?,?)",
@@ -257,7 +258,7 @@ def ingest(db, source: dict, items: list[dict], settings: dict, observed: str) -
             affected.add(key)
         for key in sorted(affected):
             group = db.execute("SELECT * FROM monitoring_groups WHERE group_key=?", (key,)).fetchone()
-            report["published"] += int(_promote(db, group, source, settings, cutoff))
+            report["published"] += int(_promote(db, group, source, settings, cutoff, observed))
         for key in ("unsupported", "rejected", "capacity"):
             if report[key]:
                 db.execute("""INSERT INTO monitoring_counters VALUES(?,?)

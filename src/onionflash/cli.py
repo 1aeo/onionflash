@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
-import hashlib
 import json
 import os
 import shutil
@@ -21,7 +20,7 @@ from .collect import CollectionError, collect_source
 from .config import load_config
 from .store import Store, source_due
 from .transport import HttpClient
-from .util import BudgetExceeded, digest, now_iso
+from .util import BudgetExceeded, now_iso
 
 
 RunBudgetReached = BudgetExceeded
@@ -58,23 +57,15 @@ def time_budget(seconds: int):
         signal.signal(signal.SIGALRM, previous)
 
 
-def _renderer_identity() -> str:
-    root = Path(__file__).parent
-    files = [root / name for name in ("render.py", "schema.py", "util.py")]
-    files.extend(sorted((root / "assets").glob("*")))
-    return digest(
-        [
-            (p.name, hashlib.sha256(p.read_bytes()).hexdigest())
-            for p in files
-            if p.is_file()
-        ]
-    )
+def build(config: dict, store: Store) -> dict:
+    """Render every stored story into a fresh directory and swap it in atomically.
 
-
-def build(config: dict, store: Store, *, force: bool = False) -> dict:
+    Rendering is deterministic and cheap, so it runs every time; the deployment
+    uploads only output whose hashes changed.
+    """
     from .render import render_site
 
-    stories = store.stories(config["storage"]["max_stories"])
+    stories = store.stories()
     health = store.health(
         config["sources"], config["collection"]["stale_after_seconds"], now_iso()
     )
@@ -84,11 +75,9 @@ def build(config: dict, store: Store, *, force: bool = False) -> dict:
             "name": s["name"],
             "website_url": s["website_url"],
             "stale": s["stale"],
-            "error": bool(s["error"]),
         }
         for s in health
     ]
-    signature = digest([stories, public_health, config["site"], _renderer_identity()])
     output = Path(config["storage"]["output_dir"])
     owner = output.parent / ("." + output.name + ".onionflash-owner")
     identity = "OnionFlash generated output v1\n" + str(output) + "\n"
@@ -102,12 +91,6 @@ def build(config: dict, store: Store, *, force: bool = False) -> dict:
         raise ValueError(
             "Refusing to replace a nonempty directory not owned by Onion Flash"
         )
-    if (
-        not force
-        and store.get_meta("public_signature") == signature
-        and (output / "index.html").is_file()
-    ):
-        return _build_result(False, store)
     output.parent.mkdir(parents=True, exist_ok=True)
     temp = Path(
         tempfile.mkdtemp(prefix="." + output.name + ".build-", dir=output.parent)
@@ -115,7 +98,7 @@ def build(config: dict, store: Store, *, force: bool = False) -> dict:
     previous = output.parent / (temp.name + ".previous")
     replaced = False
     try:
-        skipped = render_site(config, stories, health, temp)
+        skipped = render_site(config, stories, public_health, temp)
         if not owner.exists():
             fd = os.open(
                 owner,
@@ -133,28 +116,13 @@ def build(config: dict, store: Store, *, force: bool = False) -> dict:
             if replaced:
                 os.replace(previous, output)
             raise
-        store.set_meta(public_signature=signature, public_skipped=str(skipped))
+        store.set_meta(published_stories=str(len(stories) - skipped))
     finally:
         if temp.exists():
             shutil.rmtree(temp)
         if previous.exists() and output.exists():
             shutil.rmtree(previous)
-    return _build_result(True, store)
-
-
-def _skipped(store: Store) -> int:
-    return int(store.get_meta("public_skipped") or 0)
-
-
-def _build_result(changed: bool, store: Store) -> dict:
-    result = {"public_changed": changed}
-    if _skipped(store):
-        result["stories_skipped"] = _skipped(store)
-    return result
-
-
-def _published_count(config: dict, store: Store) -> int:
-    return store.story_count(config["storage"]["max_stories"]) - _skipped(store)
+    return {"published_stories": len(stories) - skipped, "stories_skipped": skipped}
 
 
 def run(config: dict, store: Store) -> dict:
@@ -265,7 +233,6 @@ def run(config: dict, store: Store) -> dict:
     report["pending_analysis"] = store.pending_count()
     report["monitoring"] = store.monitoring_status(config["monitoring"], now_iso())
     report.update(build(config, store))
-    report["published_stories"] = _published_count(config, store)
     return report
 
 
@@ -284,12 +251,6 @@ def main(argv: list[str] | None = None) -> int:
     ]:
         command = commands.add_parser(name, help=help_text)
         command.add_argument("--config", required=True, type=Path)
-        if name == "build":
-            command.add_argument(
-                "--force",
-                action="store_true",
-                help="Render even if public content is unchanged",
-            )
         if name == "backup":
             command.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
@@ -318,11 +279,13 @@ def main(argv: list[str] | None = None) -> int:
                 if args.command == "run":
                     result = run(config, store)
                 elif args.command == "build":
-                    result = build(config, store, force=args.force)
+                    result = build(config, store)
                 elif args.command == "status":
                     result = {
                         "pending_analysis": store.pending_count(),
-                        "published_stories": _published_count(config, store),
+                        # Recorded by the last successful build; None until one has run.
+                        "published_stories": None if store.get_meta("published_stories") is None
+                        else int(store.get_meta("published_stories")),
                         "monitoring": store.monitoring_status(config["monitoring"], now_iso()),
                         "sources": store.health(
                             config["sources"],

@@ -657,25 +657,24 @@ def test_transport_cannot_swallow_run_budget_as_a_retryable_network_error():
     assert len(calls) == 1
 
 
-def test_render_failure_preserves_prior_site_and_changed_clocks_do_not_rebuild(
-    tmp_path, monkeypatch
-):
+def test_render_failure_preserves_prior_site(tmp_path, monkeypatch):
     cfg = config(tmp_path)
     with Store(tmp_path / "state.db") as store:
         store.source(cfg["sources"][0])
         store.source_success(cfg["sources"][0], {"url": cfg["sources"][0]["url"]}, DATE)
         store.ingest(item(), DATE)
         store.finish(store.pending(1, DATE)[0], analysis(), "cache", DATE)
-        assert build(cfg, store)["public_changed"]
+        assert build(cfg, store) == {"published_stories": 1, "stories_skipped": 0}
         before = (tmp_path / "public/index.html").read_bytes()
-        assert not build(cfg, store)["public_changed"]
+        assert build(cfg, store)["published_stories"] == 1
+        assert (tmp_path / "public/index.html").read_bytes() == before  # deterministic output
 
         def fail(*args):
             raise ValueError("simulated renderer failure")
 
         monkeypatch.setattr("onionflash.render.render_site", fail)
         with pytest.raises(ValueError):
-            build(cfg, store, force=True)
+            build(cfg, store)
         assert (tmp_path / "public/index.html").read_bytes() == before
 
 
@@ -697,13 +696,12 @@ def test_source_website_change_rebuilds_without_resetting_collection(tmp_path):
         store.source(source)
         store.source_success(source, {"url": source["url"]}, DATE)
         state = store.source(source)
-        assert build(cfg, store)["public_changed"]
+        build(cfg, store)
         assert f'href="{source["url"]}"' in (tmp_path / "public/index.html").read_text()
         source["website_url"] = "https://example.org/mailing-list/"
-        assert build(cfg, store)["public_changed"]
+        build(cfg, store)
         assert f'href="{source["website_url"]}"' in (tmp_path / "public/index.html").read_text()
         assert store.source(source) == state
-        assert not build(cfg, store)["public_changed"]
 
 
 def test_concurrent_run_lock_is_nonblocking(tmp_path):
@@ -730,15 +728,16 @@ def test_example_config_resolves_paths_and_rejects_dangerous_settings(
         load_config(p)
 
 
-def test_skipped_story_count_is_reported_on_unchanged_builds(tmp_path):
+def test_skipped_story_count_is_reported_on_every_build(tmp_path):
     cfg = config(tmp_path)
     with Store(tmp_path / "state.db") as store:
         for url in ["https://example.org/news/1", "https://news.example.test/a"]:
             store.ingest(item(url=url, content=url), DATE)
         for row in store.pending(10, DATE):
             store.finish(row, analysis(), "key-" + row["id"], DATE)
-        assert build(cfg, store) == {"public_changed": True, "stories_skipped": 1}
-        assert build(cfg, store) == {"public_changed": False, "stories_skipped": 1}
+        assert build(cfg, store) == {"published_stories": 1, "stories_skipped": 1}
+        assert build(cfg, store) == {"published_stories": 1, "stories_skipped": 1}
+
 
 def test_story_precedence_keeps_confirmed_account_but_follows_its_own_updates(tmp_path):
     def publish(store, url, updated, content=item()["content"], **result):
@@ -832,3 +831,35 @@ def test_an_older_single_source_story_can_still_be_updated_by_its_source(tmp_pat
         store.finish(store.pending(1, later)[0], analysis(title="Tor 0.4.9.19 release withdrawn"), "k", later)
         story = store.stories(1)[0]
     assert story["title"] == "Tor 0.4.9.19 release withdrawn" and story["editorial_item"] == row["id"]
+
+
+def test_new_story_records_when_onion_flash_added_it(tmp_path):
+    later = "2026-11-09T12:00:00Z"
+    with Store(tmp_path / "state.db") as store:
+        store.ingest(item(published_at="2026-09-22T12:00:00Z", updated_at=later), later)
+        store.finish(store.pending(1, later)[0], analysis(), "key", later)
+        story = store.stories()[0]
+    assert (story["published_at"], story["added_at"]) == ("2026-09-22T12:00:00Z", later)
+
+
+def test_retired_settings_are_accepted_and_ignored(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[storage]\nmax_stories = 1000\n'
+        '[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n'
+    )
+    assert "max_stories" not in load_config(path)["storage"]
+
+
+def test_status_reports_the_count_recorded_by_the_last_build(tmp_path, capsys):
+    import json as _json
+    from onionflash.cli import main
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text('[storage]\ndatabase = "db.sqlite3"\noutput_dir = "public"\n'
+                        '[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
+    assert main(["status", "--config", str(cfg_path)]) == 0
+    assert _json.loads(capsys.readouterr().out)["published_stories"] is None
+    assert main(["build", "--config", str(cfg_path)]) == 0
+    capsys.readouterr()
+    assert main(["status", "--config", str(cfg_path)]) == 0
+    assert _json.loads(capsys.readouterr().out)["published_stories"] == 0
