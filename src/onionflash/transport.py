@@ -205,8 +205,7 @@ def retry_delay(attempt: int, settings: dict, retry_after: str | None = None,
     base = float(settings.get("backoff_base_seconds", 1.0))
     cap = float(settings.get("backoff_cap_seconds", 30.0))
     delay = min(cap, base * 2 ** min(attempt, 30))
-    spread = settings.get("backoff_jitter_seconds", delay * float(settings.get("backoff_jitter", 0.25)))
-    delay = min(cap, delay + float(spread) * jitter())
+    delay = min(cap, delay * (1 + float(settings.get("backoff_jitter", 0.25)) * jitter()))
     if retry_after:
         try:
             value = float(retry_after)
@@ -228,11 +227,9 @@ class HttpClient:
 
     def __init__(self, settings: dict, *, allowed_networks: Iterable[str] = (), allow_http: bool = False,
                  transport: httpx.BaseTransport | None = None, resolver: Callable = socket.getaddrinfo,
-                 sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
-                 same_origin_redirects: bool = False):
+                 sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic):
         self.settings = settings
         self.allow_http = allow_http
-        self.same_origin_redirects = same_origin_redirects
         self.policy = AddressPolicy(allowed_networks, resolver=resolver)
         self.sleep = sleep
         self.clock = clock
@@ -347,7 +344,7 @@ class HttpClient:
     def request(self, method: str, url: str, headers: dict[str, str] | None = None,
                 json_body: Any = None) -> Response:
         method = method.upper()
-        if method not in {"GET", "POST", "DELETE"}:
+        if method not in {"GET", "POST"}:
             raise FetchError("unsupported request method")
         self.deadline_reached = False  # describes this request only, e.g. the last fallback
         start_url = self._url(url)
@@ -376,8 +373,6 @@ class HttpClient:
                                 raise FetchError("redirect missing destination")
                             destination = self._url(urljoin(current, location))
                             if self._origin(destination) != self._origin(current):
-                                if self.same_origin_redirects:
-                                    raise FetchError("cross-origin redirect refused")
                                 if active_method != "GET":
                                     raise FetchError("cross-origin request-body redirect refused")
                                 active_headers = {k: v for k, v in active_headers.items() if k in _SAFE_CROSS_ORIGIN_HEADERS}

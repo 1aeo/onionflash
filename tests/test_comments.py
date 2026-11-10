@@ -58,6 +58,29 @@ def comments_config(tmp_path, **kw):
     return cfg
 
 
+@pytest.mark.parametrize("location", [ENDPOINT + "/redirected", "https://other.example/api/graphql"])
+def test_owned_anonymous_client_refuses_redirect_before_following(tmp_path, monkeypatch, location):
+    cfg = comments_config(tmp_path)
+    requests = []
+
+    def respond(request):
+        requests.append(str(request.url))
+        return httpx.Response(302, headers={"Location": location})
+
+    def client(settings):
+        assert settings["max_redirects"] == 0
+        return HttpClient(settings, transport=httpx.MockTransport(respond),
+                          resolver=lambda host, port, *args: [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("8.8.8.8", port))])
+
+    monkeypatch.setattr("onionflash.comments.HttpClient", client)
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest(issue(), DATE)
+        result = enrich_comments(cfg, store, DATE)
+        assert result["failed"] == 1
+    assert requests == [ENDPOINT]
+    assert cfg["http"]["max_redirects"] == DEFAULTS["http"]["max_redirects"]
+
+
 @pytest.mark.parametrize("visibility", [None, "private", "internal", "PUBLIC", False])
 def test_unknown_or_nonpublic_project_fails_closed(visibility):
     with pytest.raises(CommentError, match="Public project"):

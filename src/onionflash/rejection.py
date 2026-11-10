@@ -89,7 +89,7 @@ def show_item(store, item_id) -> dict:
     if store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rejection_actions'").fetchone():
         result["actions"] = [dict(action) for action in store.db.execute(
             """SELECT action_id,action,content_hash,reason,created_at,before_status,
-                before_attempts,before_rejections,invalidated_cache_key
+                before_attempts,before_rejections,superseded_analysis_key
                 FROM rejection_actions WHERE item_id=? ORDER BY action_id DESC LIMIT ?""",
             (item_id, HISTORY_LIMIT),
         )]
@@ -103,8 +103,8 @@ def _initialize(db):
         reason TEXT NOT NULL, created_at TEXT NOT NULL,
         before_status TEXT NOT NULL, before_attempts INTEGER NOT NULL,
         before_rejections INTEGER NOT NULL, before_error TEXT,
-        before_next_attempt_at TEXT, invalidated_cache_key TEXT,
-        invalidated_cache_json TEXT
+        before_next_attempt_at TEXT, superseded_analysis_key TEXT,
+        superseded_analysis_json TEXT
     )""")
     db.execute("CREATE INDEX IF NOT EXISTS rejection_actions_item ON rejection_actions(item_id,action_id)")
 
@@ -160,8 +160,8 @@ def _act(store, item_id, expected_hash, reason, action, llm, observed):
     with db:
         row = _checked(db, item_id, expected_hash)
         key = _retry_key(row, llm) if action == "retry" else None
-        cached = db.execute("SELECT * FROM analyses WHERE cache_key=?", (key,)).fetchone() if key else None
-        snapshot = json.dumps(dict(cached), ensure_ascii=False, allow_nan=False) if cached else None
+        previous_analysis = db.execute("SELECT * FROM analyses WHERE cache_key=?", (key,)).fetchone() if key else None
+        snapshot = json.dumps(dict(previous_analysis), ensure_ascii=False, allow_nan=False) if previous_analysis else None
         if snapshot is not None:
             snapshot.encode("utf-8")
         _initialize(db)
@@ -178,18 +178,18 @@ def _act(store, item_id, expected_hash, reason, action, llm, observed):
             raise ValueError("Source item changed during the action; inspect it again")
         event = db.execute("""INSERT INTO rejection_actions
             (item_id,content_hash,action,reason,created_at,before_status,before_attempts,
-             before_rejections,before_error,before_next_attempt_at,invalidated_cache_key,invalidated_cache_json)
+             before_rejections,before_error,before_next_attempt_at,superseded_analysis_key,superseded_analysis_json)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
             (item_id, expected_hash, action, reason, stamp, row["status"], row["attempts"],
-             row["rejections"], row["last_error"], row["next_attempt_at"], key if cached else None, snapshot))
-        if cached:
+             row["rejections"], row["last_error"], row["next_attempt_at"], key if previous_analysis else None, snapshot))
+        if previous_analysis:
             db.execute("DELETE FROM analyses WHERE cache_key=?", (key,))
     return {"item_id": item_id, "content_hash": expected_hash, "action": action,
             "status": "pending" if action == "retry" else "dismissed", "action_id": event.lastrowid}
 
 
 def retry_item(store, item_id, expected_hash, reason, llm, observed=None) -> dict:
-    """Queue exactly one rejected source revision and bypass its cached decision."""
+    """Queue one rejected revision and retain its superseded analysis for audit."""
     return _act(store, item_id, expected_hash, reason, "retry", llm, observed)
 
 

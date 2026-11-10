@@ -28,6 +28,12 @@ def rejected(store, number=0, **changes):
     return source, dict(store.db.execute("SELECT * FROM items WHERE id=?", (source["id"],)).fetchone())
 
 
+def analysis_result(store, key):
+    """Inspect the stored analysis audit directly; runtime analysis has no cache."""
+    row = store.db.execute("SELECT result FROM analyses WHERE cache_key=?", (key,)).fetchone()
+    return json.loads(row[0]) if row is not None else None
+
+
 def actions(store):
     if not store.db.execute("SELECT 1 FROM sqlite_master WHERE name='rejection_actions'").fetchone():
         return []
@@ -70,32 +76,34 @@ def test_show_is_explicit_source_inspection_and_handles_malformed_payload(store)
     assert rejection.list_items(store)["items"][0]["saved_item_error"]
 
 
-def test_retry_invalidates_only_current_cache_and_saves_evidence_privately(store, capsys):
+def test_retry_supersedes_only_current_analysis_and_saves_evidence_privately(store, capsys):
     source, row = rejected(store)
     key = cache_key(row, DEFAULTS["llm"])
-    cached = analysis()
+    previous_result = analysis()
     with store.db:
         store.db.execute("INSERT INTO analyses(cache_key,result,created_at,source_payload,source_item_id) VALUES(?,?,?,?,?)",
-                         (key, json.dumps(cached), DATE, row["payload"], row["id"]))
+                         (key, json.dumps(previous_result), DATE, row["payload"], row["id"]))
         store.db.execute("INSERT INTO analyses(cache_key,result,created_at) VALUES('other','{}',?)", (DATE,))
     result = rejection.retry_item(store, row["id"], row["content_hash"], "Grounding rule was repaired", DEFAULTS["llm"], DATE)
     queued = store.pending(10, DATE)
     assert len(queued) == 1
     assert (queued[0]["status"], queued[0]["attempts"], queued[0]["rejections"], queued[0]["next_attempt_at"], queued[0]["last_error"]) == ("pending", 0, 0, None, None)
-    assert store.cached(key) is None and store.cached("other") == {}
+    assert analysis_result(store, key) is None and analysis_result(store, "other") == {}
     assert store.stories() == []  # Retrying is not publishing.
     audit = actions(store)[0]
-    snapshot = json.loads(audit["invalidated_cache_json"])
-    assert json.loads(snapshot["result"]) == cached
+    assert audit["superseded_analysis_key"] == key
+    snapshot = json.loads(audit["superseded_analysis_json"])
+    assert json.loads(snapshot["result"]) == previous_result
     assert snapshot["source_payload"] == row["payload"]
     assert audit["before_attempts"] == 3 and audit["before_rejections"] == 3
     assert audit["reason"] == "Grounding rule was repaired"
-    assert "content" not in result and "reason" not in result and "invalidated_cache_json" not in result
-    assert "invalidated_cache_json" not in rejection.show_item(store, row["id"])["actions"][0]
+    assert "content" not in result and "reason" not in result and "superseded_analysis_json" not in result
+    assert "superseded_analysis_json" not in rejection.show_item(store, row["id"])["actions"][0]
     assert capsys.readouterr().out == ""
     store.finish(queued[0], analysis(summary="A supported account after retry."), key, after(60, DATE))
     assert store.pending_count() == 0
     assert store.stories()[0]["summary"] == "A supported account after retry."
+    assert analysis_result(store, key)["summary"] == "A supported account after retry."
     assert len(actions(store)) == 1
 
 
@@ -106,7 +114,7 @@ def test_dismissal_stops_unchanged_and_timestamp_only_replays_but_new_content_re
         store.db.execute("INSERT INTO analyses(cache_key,result,created_at) VALUES(?,?,?)", (key, '{}', DATE))
     result = rejection.dismiss_item(store, row["id"], row["content_hash"], "Routine discussion with no news", DATE)
     assert result["status"] == "dismissed"
-    assert store.cached(key) == {}  # Dismiss does not erase analysis evidence.
+    assert analysis_result(store, key) == {}  # Dismiss does not erase analysis evidence.
     assert store.pending_count() == 0 and store.rejected_count() == 0
     assert not store.ingest(copy.deepcopy(source), after(60, DATE))
     assert not store.ingest({**source, "updated_at": after(120, DATE)}, after(120, DATE))
@@ -183,7 +191,7 @@ def test_retry_refuses_missing_source_body_but_dismiss_still_works(store):
     assert rejection.show_item(store, row["id"])["status"] == "dismissed"
 
 
-def test_failed_audit_insert_rolls_back_queue_and_cache_changes(store):
+def test_failed_audit_insert_rolls_back_queue_and_analysis_changes(store):
     _, row = rejected(store)
     key = cache_key(row, DEFAULTS["llm"])
     with store.db:
@@ -194,7 +202,7 @@ def test_failed_audit_insert_rolls_back_queue_and_cache_changes(store):
     with pytest.raises(sqlite3.IntegrityError):
         rejection.retry_item(store, row["id"], row["content_hash"], "Retry", DEFAULTS["llm"], DATE)
     assert rejection.show_item(store, row["id"])["status"] == "rejected"
-    assert store.cached(key) == {} and actions(store) == []
+    assert analysis_result(store, key) == {} and actions(store) == []
 
 
 def test_content_changed_during_retry_does_not_get_overwritten(store, monkeypatch):
@@ -216,7 +224,7 @@ def test_content_changed_during_retry_does_not_get_overwritten(store, monkeypatc
         rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed", DEFAULTS["llm"], DATE)
     current = rejection.show_item(store, row["id"])
     assert current["status"] == "rejected" and current["content_hash"] == "f" * 64
-    assert store.cached(key) == {} and actions(store) == []
+    assert analysis_result(store, key) == {} and actions(store) == []
 
 
 @pytest.mark.parametrize("reason", ["", "   ", "x" * 1001, "bad\x1bvalue", "bad\ud800value"])

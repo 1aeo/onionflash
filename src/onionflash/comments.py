@@ -314,7 +314,9 @@ def enrich_comments(config, store, observed, *, deadline=None, client=None):
             store.db.execute("DELETE FROM comment_sources")
     own_client = client is None
     # A fresh client has no cookies, authorization, proxy or application session.
-    client = client or HttpClient(config["http"], same_origin_redirects=True)
+    # The verified GraphQL URL is canonical. Refuse every redirect before a
+    # redirected request could leave that endpoint, using the shared limit.
+    client = client or HttpClient({**config["http"], "max_redirects": 0})
     old_deadline = getattr(client, "deadline", None)
     client.deadline = min(old_deadline or float("inf"), deadline)
     try:

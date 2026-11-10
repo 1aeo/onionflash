@@ -176,6 +176,13 @@ def test_a_flagged_statement_may_be_reworded_with_the_same_words(monkeypatch):
         assert llm.analyze(item())["summary"] == rewrite
 
 
+def test_non_finite_numbers_are_invalid_model_json():
+    from onionflash.analyze import _json_object
+    for text in ('{"publish": false, "priority": NaN}', '{"publish": false, "x": 1e999}'):
+        with pytest.raises(AnalysisError, match="invalid JSON"):
+            _json_object(text)
+
+
 def test_ignore_decision_makes_one_call_and_skips_field_checks(monkeypatch):
     ignore = analysis(publish=False, title="x" * 150, evidence=["not in the source at all"])
     llm = analyzer(monkeypatch, completion(ignore))

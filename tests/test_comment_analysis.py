@@ -43,16 +43,12 @@ def test_long_description_keeps_comment_evidence_in_both_model_passes(monkeypatc
     assert "private-test-key" not in json.dumps(requests)
 
 
-def test_input_budget_changes_analysis_cache_identity_but_not_tag_notice():
+def test_input_budget_changes_analysis_record_identity():
     cfg = copy.deepcopy(DEFAULTS)["llm"]
     row = {"content_hash": "same-source", "payload": json.dumps(item())}
     first = cache_key(row, cfg)
     cfg["max_input_chars"] += 1000
     assert cache_key(row, cfg) != first
-    row["payload"] = json.dumps(item(kind="tag"))
-    first = cache_key(row, cfg)
-    cfg["max_input_chars"] += 1000
-    assert cache_key(row, cfg) == first
 
 
 def test_optional_comment_failure_does_not_stop_saved_analysis(tmp_path, monkeypatch):

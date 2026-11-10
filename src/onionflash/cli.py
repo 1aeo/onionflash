@@ -224,15 +224,12 @@ def run(config: dict, store: Store) -> dict:
             if time.monotonic() >= run_deadline:
                 report["budget_reached"] = True
                 break
-            key = cache_key(row, config["llm"])
             try:
-                result = store.cached(key)
-                if result is None:
-                    item = json.loads(row["payload"])
-                    if endpoint_failures >= 2 and item["kind"] != "tag":
-                        continue
-                    result = analyzer.analyze(item)
-                store.finish(row, result, key, now_iso(), input_chars=config["llm"]["max_input_chars"])
+                item = json.loads(row["payload"])
+                if endpoint_failures >= 2 and item["kind"] != "tag":
+                    continue
+                result = analyzer.analyze(item)
+                store.finish(row, result, cache_key(row, config["llm"]), now_iso(), input_chars=config["llm"]["max_input_chars"])
                 report["analyzed"] += 1
             except AnalysisError as exc:
                 # A request cut off by the run deadline is retryable: the item backs off.
@@ -241,7 +238,7 @@ def run(config: dict, store: Store) -> dict:
                 if exc.retryable:
                     # After a second endpoint failure, skip further network
                     # analysis; one failing item alone does not stop the run.
-                    # Deterministic tags and cached results still publish.
+                    # Deterministic tags still publish.
                     endpoint_failures += 1
     report["pending_analysis"] = store.pending_count()
     report["rejected_analysis"] = store.rejected_count()

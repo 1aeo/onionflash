@@ -229,7 +229,7 @@ database lock while taking their upload snapshot.
   decompressed response-size limits. Source content never executes commands.
 - HTTP retries are limited to transient failures. Exponential backoff has a cap,
   jitter, and bounded `Retry-After`. Persisted source cooldowns and failed-analysis
-  delays survive restarts. One failed source does not invalidate cached news.
+  delays survive restarts. One failed source does not invalidate published news.
 - GitLab scans have fixed time windows, overlap, and persistent checkpoints.
   Issues use GitLab's keyset cursor when supplied. Merge requests use the API's
   offset pages; a configurable daily full-lookback reconciliation repairs gaps
@@ -237,8 +237,9 @@ database lock while taking their upload snapshot.
   A capped scan resumes on the next run; its completed watermark advances only
   after the window finishes. XML declarations/entities are rejected with an
   encoding-aware parser before feed parsing.
-- New and changed items are saved before analysis. Analysis results are cached by
-  content hash, model, and prompt version. The application makes one model request
+- New and changed items are saved before analysis. Private analysis records are
+  identified by content hash, model, prompt version and input window; saved results
+  are never reused to skip analysis. The application makes one model request
   at a time, with explicit per-run and token limits. Source polling reserves time
   for pending analysis so an unavailable source cannot monopolize every run.
 - Explicit `kind = "tag"` streams produce attributed tag notices without an LLM

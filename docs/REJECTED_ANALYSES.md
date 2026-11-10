@@ -22,7 +22,7 @@ Use `--status dismissed` to inspect dismissed revisions.
 
 `show` explicitly includes the saved source item and up to 20 recent operator
 actions. It is a private inspection command; its source text and operator reasons
-are not published. It does not print raw cached model responses. Malformed or
+are not published. It does not print raw stored model responses. Malformed or
 oversized saved items produce an inspection error field rather than a source dump.
 
 ## Retry one rejected revision
@@ -38,10 +38,12 @@ and cooldown, then queues the item for the normal analysis pipeline. It does not
 bypass validation or approve a publication. A missing or unreadable source body
 must be restored or recollected before retrying.
 
-The current model/prompt cache entry is invalidated so the next scheduled run
-actually analyzes the item again. If a cache record exists, its complete prior
-value is preserved privately in the action audit before removal. Other cache
-entries and already accepted stories are unchanged.
+The next scheduled run analyzes the queued item again; the runtime does not
+reuse previous model results. If an analysis record already exists for the
+current source/model/prompt/input-window key, retry preserves its complete prior value in the
+private action audit as `superseded_analysis_key` and `superseded_analysis_json`,
+then removes that record so the new attempt can save its own analysis. Other
+analysis records and already accepted stories are unchanged.
 
 ## Dismiss one rejected revision
 
@@ -61,9 +63,9 @@ Both actions require a reason of 1–1,000 characters. Repeating an already-appl
 action returns a state error without resetting the queue or adding another audit
 record. Mutations run under the application's existing run lock and apply an
 additional content-hash/state guard in SQLite. A failed audit write rolls back
-the queue and cache changes.
+the queue and analysis-record changes.
 
 The private `rejection_actions` table records each reason, source-version hash,
-timestamp, prior counters/error, and any invalidated cache evidence. Operator
+timestamp, prior counters/error, and any superseded analysis evidence. Operator
 commands return compact action metadata; these records never enter public pages
 or feeds.
