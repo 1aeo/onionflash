@@ -345,17 +345,15 @@ class HttpClient:
         return bytes(body)
 
     def request(self, method: str, url: str, headers: dict[str, str] | None = None,
-                json_body: Any = None, conditional: dict[str, str] | None = None) -> Response:
+                json_body: Any = None) -> Response:
         method = method.upper()
-        if method not in {"GET", "HEAD", "POST", "DELETE"}:
+        if method not in {"GET", "POST", "DELETE"}:
             raise FetchError("unsupported request method")
         self.deadline_reached = False  # describes this request only, e.g. the last fallback
         start_url = self._url(url)
         start_headers = {"user-agent": self.settings.get("user_agent", "OnionFlash"),
                          "accept-encoding": "gzip, deflate"}
         start_headers.update({str(k).lower(): str(v) for k, v in (headers or {}).items() if k.lower() != "host"})
-        start_headers.update({str(k).lower(): str(v) for k, v in (conditional or {}).items()
-                              if k.lower() in {"if-none-match", "if-modified-since"}})
         attempts = max(1, min(10, int(self.settings.get("retry_attempts", 3))))
         for attempt in range(attempts):
             current, active_headers, active_method, payload = start_url, dict(start_headers), method, json_body
@@ -380,10 +378,10 @@ class HttpClient:
                             if self._origin(destination) != self._origin(current):
                                 if self.same_origin_redirects:
                                     raise FetchError("cross-origin redirect refused")
-                                if active_method not in {"GET", "HEAD"}:
+                                if active_method != "GET":
                                     raise FetchError("cross-origin request-body redirect refused")
                                 active_headers = {k: v for k, v in active_headers.items() if k in _SAFE_CROSS_ORIGIN_HEADERS}
-                            if response.status_code == 303 and active_method != "HEAD":
+                            if response.status_code == 303:
                                 active_method, payload = "GET", None
                             current = destination
                             continue
@@ -394,10 +392,8 @@ class HttpClient:
                             raise FetchError(f"HTTP {response.status_code}", status=response.status_code, retryable=True)
                         if response.status_code >= 400:
                             raise FetchError(f"HTTP {response.status_code}", status=response.status_code)
-                        body = b"" if active_method == "HEAD" or response.status_code in {204, 205, 304} else self._body(response)
+                        body = b"" if response.status_code in {204, 205, 304} else self._body(response)
                         return Response(response.status_code, body, dict(response.headers), current)
-                else:
-                    raise FetchError("redirect limit exceeded")
             except FetchError as exc:
                 # A deadline stop must not fall back to a shorter wait than Retry-After.
                 if isinstance(exc, DeadlineReached) or not exc.retryable or attempt + 1 >= attempts:
