@@ -158,7 +158,9 @@ class RenderTests(unittest.TestCase):
         bad = copy.deepcopy(STORY)
         bad.update(id="badbadbadbadbadbadbadbad", sources=[{"url": "https://news.example.test/a", "title": "x"}])
         output = self.root / "mixed"
-        self.assertEqual(render_site(CONFIG, [bad, copy.deepcopy(STORY)], [], output), 1)
+        with self.assertLogs("onionflash.render", "WARNING") as logs:
+            self.assertEqual(render_site(CONFIG, [bad, copy.deepcopy(STORY)], [], output), 1)
+        self.assertEqual(logs.output, ["WARNING:onionflash.render:Skipping unrenderable story badbadbadbadbadbadbadbad (ValueError)"])
         self.assertTrue((output / "news" / STORY["id"] / "index.html").is_file())
         self.assertFalse((output / "news" / bad["id"]).exists())
         self.assertEqual(len(json.loads((output / "feed.json").read_text())["items"]), 1)

@@ -10,6 +10,7 @@ import email.utils
 import html
 import ipaddress
 import json
+import logging
 import re
 import shutil
 import xml.etree.ElementTree as ET
@@ -304,7 +305,13 @@ def render_site(config: dict, stories: list[dict], source_health: list[dict], ou
     for story in stories:
         try:
             public.append(_prepare_story(story))
-        except (ValueError, TypeError, KeyError, AttributeError):
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            story_id = story.get("id") if isinstance(story, dict) else None
+            logging.getLogger(__name__).warning(
+                "Skipping unrenderable story %s (%s)",
+                story_id if isinstance(story_id, str) and ID_PATTERN.fullmatch(story_id) else "with an invalid id",
+                type(exc).__name__,
+            )
             continue
     if stories and not public:
         # Every story failing points at a systematic problem: keep the previous site.

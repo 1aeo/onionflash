@@ -133,8 +133,7 @@ def build(config: dict, store: Store, *, force: bool = False) -> dict:
             if replaced:
                 os.replace(previous, output)
             raise
-        store.set_meta("public_signature", signature)
-        store.set_meta("public_skipped", str(skipped))
+        store.set_meta(public_signature=signature, public_skipped=str(skipped))
     finally:
         if temp.exists():
             shutil.rmtree(temp)
@@ -161,7 +160,7 @@ def _published_count(config: dict, store: Store) -> int:
 def run(config: dict, store: Store) -> dict:
     observed = now_iso()
     if not store.get_meta("fetch_completion_clock_since"):
-        store.set_meta("fetch_completion_clock_since", observed)
+        store.set_meta(fetch_completion_clock_since=observed)
     report = {
         "sources_ok": 0,
         "sources_failed": 0,
