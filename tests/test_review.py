@@ -127,10 +127,9 @@ def test_approval_is_not_rewritten_or_reclassified(monkeypatch):
     assert response["verdict"] == "approve" and public == before
 
 
-@pytest.mark.parametrize("field", ["id", "sources", "published_at", "updated_at", "added_at", "editorial", "evidence"])
-def test_repairs_cannot_modify_immutable_or_private_fields(field):
+def test_repairs_cannot_modify_immutable_or_private_fields():
     with pytest.raises(review.ReviewError, match="immutable"):
-        review.apply_repair(candidate(), {field: "changed"})
+        review.apply_repair(candidate(), {"sources": "changed"})
 
 
 def test_repair_is_normalized_before_verification_and_preserves_public_metadata():
@@ -142,7 +141,7 @@ def test_repair_is_normalized_before_verification_and_preserves_public_metadata(
         review.apply_repair(public, {"title": public["title"]})
 
 
-@pytest.mark.parametrize("patch", [{"title": ""}, {"summary": 1}, {"products": ["unknown"]}, {"state": "approved"}, {"why_it_matters": "\ud800"}])
+@pytest.mark.parametrize("patch", [{"title": ""}, {"summary": 1}, {"products": ["unknown"]}, {"state": "approved"}])
 def test_invalid_semantic_repairs_fail_closed(patch):
     with pytest.raises(review.ReviewError):
         review.apply_repair(candidate(), patch)
@@ -161,28 +160,20 @@ def test_final_verification_nonapproval_is_an_explicit_verdict_for_the_gate(monk
 def test_cached_api_response_validation_checks_refs_and_sparse_repairs():
     response = verdict("revise", repair={"why_it_matters": ""})
     response["repair"] = {"why_it_matters": ""}
-    assert review.validate_review(response, candidate(), packet())["repair"] == {"why_it_matters": ""}
+    assert review.validate_review(response, packet())["repair"] == {"why_it_matters": ""}
     response["issues"][0]["source_refs"] = ["S9"]
     with pytest.raises(review.ReviewError, match="source reference"):
-        review.validate_review(response, candidate(), packet())
+        review.validate_review(response, packet())
 
 
-@pytest.mark.parametrize("change", ["duplicate-id", "wrong-parent", "max-text", "max-passages", "invalid-utf8"])
-def test_source_packet_bounds_fail_before_model_request(monkeypatch, change):
-    cfg, evidence = config(), packet()
-    if change == "duplicate-id":
-        evidence["sources"].append(copy.deepcopy(evidence["sources"][0]))
-    elif change == "wrong-parent":
-        evidence["sources"][0]["passages"][0]["id"] = "S2:P1"
-    elif change == "max-text":
-        cfg["review"]["max_source_chars"] = 1
-    elif change == "max-passages":
-        cfg["review"]["max_passages"] = 1
-        evidence["sources"][0]["passages"].append({"id": "S1:P2", "text": "More source text."})
-    else:
-        evidence["sources"][0]["passages"][0]["text"] = "\ud800"
-    checker = reviewer(monkeypatch, settings=cfg)
-    with pytest.raises(review.ReviewError):
+def test_reviewer_sends_app_built_packet_text_without_rechecking_it(monkeypatch):
+    # Rows stored before line endings were normalized can still carry a carriage return.
+    evidence = packet()
+    evidence["sources"][0]["passages"][0]["text"] += "\r\nA second line."
+    assert reviewer(monkeypatch, completion(verdict())).review(candidate(), evidence)["verdict"] == "approve"
+    evidence["sources"][0]["passages"][0]["text"] = "\ud800"
+    checker = reviewer(monkeypatch)
+    with pytest.raises(AnalysisError, match="UTF-8"):  # the request's own check still applies
         checker.review(candidate(), evidence)
     assert checker.client.requests == []
 

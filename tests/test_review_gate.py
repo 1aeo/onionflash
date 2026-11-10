@@ -38,6 +38,7 @@ class Writer:
 
 
 class Reviewer:
+    """Returns validated verdicts, as review.Reviewer does."""
     def __init__(self, *responses):
         self.responses, self.calls = list(responses), []
 
@@ -46,7 +47,7 @@ class Reviewer:
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
-        return response() if callable(response) else copy.deepcopy(response)
+        return review.validate_review(response() if callable(response) else copy.deepcopy(response), packet)
 
 
 @pytest.fixture
@@ -367,6 +368,17 @@ def test_operator_retry_preserves_held_audit_and_reuses_the_completed_draft(cont
     assert writer.calls == []
 
 
+def test_a_source_that_reverts_to_a_held_revision_is_held_again_without_a_review(context):
+    cfg, store = context
+    assert run(cfg, store, pending(store), Writer(), Reviewer(verdict("hold")))["status"] == "held"
+    store.ingest(item(content=item()["content"] + " Edited."), DATE)  # a revision that is never drafted
+    assert run(cfg, store, store.pending(1, LATER)[0], Writer(), Reviewer(), allow_network=False)["status"] == "deferred"
+    store.ingest(item(), DATE)
+    checker = Reviewer(verdict())
+    assert run(cfg, store, store.pending(1, LATER)[0], Writer(), checker)["status"] == "held"
+    assert checker.calls == []
+
+
 def test_ignored_writer_result_cannot_overwrite_a_concurrent_source_update(context):
     cfg, store = context
     row = pending(store)
@@ -412,14 +424,16 @@ def test_rejected_show_excludes_unrelated_provider_and_private_audit_fields(cont
     run(cfg, store, row, Writer(), Reviewer(verdict("hold")))
     saved = job(store)
     record = json.loads(saved["record_json"])
-    record["raw_provider_response"] = "DO NOT PRINT PROVIDER RESPONSE"
-    record["prepared"]["candidate"]["api_key"] = "DO NOT PRINT CREDENTIAL"
-    record["prepared"]["packet"]["sources"][0]["provider_response"] = "DO NOT PRINT PROVIDER RESPONSE"
-    # A malformed candidate hash fails closed; neither raw field is returned.
-    with store.db:
-        store.db.execute("UPDATE review_jobs SET record_json=?", (json.dumps(record),))
-    output = json.dumps(rejection.show_item(store, row["id"])["final_review"])
-    assert "DO NOT PRINT" not in output
+    source = record["prepared"]["packet"]["sources"][0]
+    for target in (record, source, source["passages"][0]):
+        target["provider_response"] = "DO NOT PRINT PROVIDER RESPONSE"
+    for change in ({}, {"api_key": "DO NOT PRINT CREDENTIAL"}):
+        record["prepared"]["candidate"].update(change)
+        with store.db:
+            store.db.execute("UPDATE review_jobs SET record_json=?", (json.dumps(record),))
+        shown = rejection.show_item(store, row["id"])["final_review"]
+        # Unknown fields are dropped; a malformed candidate hash fails closed.
+        assert "DO NOT PRINT" not in json.dumps(shown) and ("error" in shown) == bool(change)
 
 
 @pytest.mark.parametrize("saved", ["not JSON", '{"bad":NaN}', '{"bad":"\\ud800"}', "oversized"])
@@ -593,6 +607,20 @@ def test_a_database_error_during_analysis_is_not_an_item_strike(context, monkeyp
     assert tuple(store.db.execute("SELECT status,rejections FROM items").fetchone()) == ("pending", 0)
 
 
+def test_run_report_counts_held_stale_and_cached_reviews(context, monkeypatch):
+    from onionflash import cli
+    cfg, store = context
+    cfg["sources"] = []
+    outcomes = iter([("held", False), ("stale", False), ("published", True)])
+    monkeypatch.setattr(cli, "process_item", lambda *args, **kwargs: dict(zip(("status", "cache_hit"), next(outcomes))))
+    monkeypatch.setattr(cli, "build", lambda *args: {})
+    for name in ("one", "two", "three"):
+        store.ingest(item(url="https://example.org/" + name), DATE)
+    report = cli.run(cfg, store)
+    counts = [report[key] for key in ("analyzed", "analysis_failed", "review_held", "review_stale", "review_cache_hits")]
+    assert counts == [2, 1, 1, 1, 1]
+
+
 def test_unusable_replies_and_drafts_take_strikes_and_the_run_still_builds(context, monkeypatch):
     from onionflash import cli
     cfg, store = context
@@ -605,7 +633,7 @@ def test_unusable_replies_and_drafts_take_strikes_and_the_run_still_builds(conte
 
     class Replies:
         def review(self, candidate, packet, *, verification=False):
-            return {} if "/reply" in packet["sources"][0]["url"] else verdict()
+            return review.validate_review({} if "/reply" in packet["sources"][0]["url"] else verdict(), packet)
 
     built = []
     monkeypatch.setattr(cli, "Analyzer", lambda *args, **kwargs: contextlib.nullcontext(Drafts()))

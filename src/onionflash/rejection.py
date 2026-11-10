@@ -119,11 +119,11 @@ def _final_review(store, item_id):
         if packet is not None:
             # Discard unrelated private/provider fields even in a damaged job.
             fields = {"id", "url", "title", "kind", "authority", "product", "published_at", "updated_at",
-                      "upstream_state", "snapshot", "captured_at", "author", "passages"}
-            packet = {"sources": [{key: value for key, value in source.items() if key in fields}
+                      "upstream_state", "snapshot", "captured_at", "author"}
+            packet = {"sources": [{**{key: value for key, value in source.items() if key in fields},
+                                   "passages": [{"id": p["id"], "text": p["text"]} for p in source["passages"]]}
                                   for source in packet["sources"]],
                       "missing_sources": packet["missing_sources"], "truncated": packet["truncated"]}
-            review._packet_refs(packet)
         entries = record.get("reviews") or (record.get("approval") or {}).get("reviews", [])
         latest = None
         if entries:
@@ -135,7 +135,7 @@ def _final_review(store, item_id):
             evaluated = origin.get("candidate") if phase == "verification" else origin["prepared"]["candidate"]
             if digest(evaluated) != entry["candidate_hash"]:
                 raise ValueError
-            response = review.validate_review(entry["result"], evaluated, packet, verification=phase == "verification")
+            response = review.validate_review(entry["result"], packet)
             latest = {"phase": phase, "candidate_hash": entry["candidate_hash"],
                       **{key: response[key] for key in ("verdict", "criteria", "issues")}}
         display = {"stage": row["stage"], "candidate": candidate, "source_packet": packet, "latest_review": latest}

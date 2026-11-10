@@ -8,8 +8,8 @@ from . import editorial, render, source_packet
 from .util import canonical_url, digest, format_utc, normalize_evidence, parse_utc
 
 
-SEMANTIC_FIELDS = ("title", "summary", "why_it_matters", "category", "products", "priority", "confidence", "state", "tags")
-REPAIR_FIELDS = frozenset(SEMANTIC_FIELDS)
+# Writer fields a review may repair; their order is part of the review policy hash.
+SEMANTIC_FIELDS = ("title", "summary", "why_it_matters", "category", "priority", "confidence", "state", "products", "tags")
 
 
 class ReviewRequired(ValueError):

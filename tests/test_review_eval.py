@@ -34,7 +34,7 @@ def test_controlled_corpus_is_blinded_canonical_and_covers_rubric():
         payload = {"candidate": case["candidate"], "packet": case["packet"]}
         assert case["id"] not in json.dumps(payload)
         assert case["candidate"] == _prepare_story(case["candidate"], editorial=case["candidate"].get("editorial"))
-        assert _packet_refs(case["packet"], DEFAULTS["review"])
+        assert _packet_refs(case["packet"])
 
 
 def test_evaluation_records_false_approvals_and_writes_private_new_file(tmp_path, monkeypatch, capsys):

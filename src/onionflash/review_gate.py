@@ -8,7 +8,6 @@ are not a cache of writer responses for arbitrary future items.
 from __future__ import annotations
 
 import json
-import time
 
 from .analyze import AnalysisError, cache_key
 from .util import digest, now_iso
@@ -58,7 +57,7 @@ def reset_review_work(store, item_id):
         return
     _archive_job(store, row, now_iso(), "explicit operator retry")
     old = json.loads(row["record_json"])
-    record = {"schema_version": 1, "writer": old.get("writer"), "input_row": old.get("input_row"), "reviews": []}
+    record = {"schema_version": 1, "writer": old.get("writer"), "input_row": old["input_row"], "reviews": []}
     store.db.execute("""UPDATE review_jobs SET stage='drafted',envelope_json=NULL,
         record_json=?,approval_key=NULL,updated_at=? WHERE item_id=?""", (_json(record), now_iso(), item_id))
 
@@ -67,11 +66,7 @@ def _archive_job(store, job, observed, reason):
     """Retain an invalidated stage and its original source, in the caller's txn."""
     record = json.loads(job["record_json"])
     envelope = json.loads(job["envelope_json"]) if job["envelope_json"] is not None else None
-    source_row = envelope.get("row") if envelope is not None else record.get("input_row")
-    if source_row is None:
-        # A pre-upgrade draft-only job may lack its original source snapshot.
-        # Preserve what exists without mislabeling today's source as that input.
-        source_row = {"id": job["item_id"], "payload": None}
+    source_row = envelope["row"] if envelope is not None else record["input_row"]
     draft = json.loads(job["draft_json"]) if job["draft_json"] is not None else {}
     audit = {**record, "outcome": "superseded", "stage": job["stage"],
              "superseded_reason": reason, "superseded_at": observed, "source_envelope": envelope}
@@ -124,16 +119,12 @@ def _current(store, row):
             and current["payload"] == row["payload"] and current["status"] == "pending")
 
 
-def _hold(store, row, prepared, draft, writer_key, policy, record, observed, prepared_at, reason):
+def _hold(store, row, prepared, draft, writer_key, record, observed, reason):
     """One semantic hold is terminal; only source change/operator retry requeues."""
     record["outcome"] = "held"
     record["hold_reason"] = reason
-    if store.db.in_transaction:
-        raise ValueError("Review hold requires a fresh transaction")
     store.db.execute("BEGIN IMMEDIATE")
     with store.db:
-        if not _current(store, row):
-            return False
         from .candidate import assert_current
         assert_current(store.db, prepared)
         store.record_analysis(row, draft, writer_key, observed,
@@ -147,15 +138,9 @@ def _hold(store, row, prepared, draft, writer_key, policy, record, observed, pre
             raise StaleCandidate("Source item changed before review hold")
         store.db.execute("""UPDATE review_jobs SET stage='held',record_json=?,approval_key=NULL,
             updated_at=? WHERE item_id=?""", (_json(record), observed, row["id"]))
-    return True
 
 
-def _check_deadline(deadline):
-    if deadline is not None and time.monotonic() >= deadline:
-        raise AnalysisError("Final review run deadline reached", retryable=True)
-
-
-def process_item(config, store, row, writer, reviewer, observed=None, *, deadline=None, allow_network=True):
+def process_item(config, store, row, writer, reviewer, observed=None, *, allow_network=True):
     """Resume writer → exact-candidate review → optional verification → CAS commit.
 
     Transport errors leave the current stage durable and raise a retryable
@@ -189,7 +174,6 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, deadlin
     if draft is None:
         if not allow_network and json.loads(row["payload"])["kind"] != "tag":
             return {**report, "status": "deferred"}
-        _check_deadline(deadline)
         report["writer_calls"] += 1
         draft = writer.analyze(json.loads(row["payload"]))
         record["writer"] = {"key": writer_key, "result": draft, "input_chars": config["llm"]["max_input_chars"]}
@@ -222,20 +206,18 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, deadlin
             store.commit_candidate(prepared, prepared["candidate"], writer_key, now_iso(), review_record=record)
             return {**report, "status": record["outcome"]}
         if prepared.get("missing_sources"):
-            held = _hold(store, row, prepared, draft, writer_key, policy, record, observed, prepared_at,
-                         "required source material is unavailable")
-            return {**report, "status": "held" if held else "stale"}
+            _hold(store, row, prepared, draft, writer_key, record, observed, "required source material is unavailable")
+            return {**report, "status": "held"}
         if stage == "held":
-            # Explicit retries normally use reset_review_work; do not silently
-            # turn an unexplained pending reset into another semantic rewrite.
-            held = _hold(store, row, prepared, draft, writer_key, policy, record, observed, prepared_at,
-                         "operator review is required")
-            return {**report, "status": "held" if held else "stale"}
+            # The same candidate held before: a source reverted to a held revision,
+            # or an item was requeued without reset_review_work. Do not review it again.
+            _hold(store, row, prepared, draft, writer_key, record, observed, "operator review is required")
+            return {**report, "status": "held"}
         key = _approval_key(candidate, prepared, policy)
         cached = store.db.execute("SELECT * FROM review_approvals WHERE key=?", (key,)).fetchone()
         if cached is not None:
             try:
-                verdict = review.validate_review(json.loads(cached["result_json"]), candidate, prepared["packet"], verification=True)
+                verdict = review.validate_review(json.loads(cached["result_json"]), prepared["packet"])
                 valid = (verdict["verdict"] == "approve" and cached["candidate_hash"] == digest(candidate)
                          and cached["source_hash"] == prepared["source_hash"] and cached["policy_hash"] == policy
                          and cached["binding_hash"] == prepared["binding_hash"])
@@ -259,10 +241,8 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, deadlin
             verification = stage == "verify"
             if not allow_network:
                 return {**report, "status": "deferred"}
-            _check_deadline(deadline)
             report["review_calls"] += 1
             verdict = reviewer.review(candidate, prepared["packet"], verification=verification)
-            verdict = review.validate_review(verdict, candidate, prepared["packet"], verification=verification)
             record["reviews"].append({"stage": "verification" if verification else "review",
                                       "candidate_hash": digest(candidate), "source_hash": prepared["source_hash"],
                                       "policy_hash": policy, "result": verdict})
@@ -278,14 +258,13 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, deadlin
                 return {**report, "status": "published"}
             if verdict["verdict"] == "hold" or verification or settings["max_repairs"] == 0:
                 reason = "verification did not approve the repair" if verification else "review did not approve the candidate"
-                held = _hold(store, row, prepared, draft, writer_key, policy, record, observed, prepared_at, reason)
-                return {**report, "status": "held" if held else "stale"}
+                _hold(store, row, prepared, draft, writer_key, record, observed, reason)
+                return {**report, "status": "held"}
             try:
                 candidate = review.apply_repair(candidate, verdict["repair"])
             except review.ReviewError:
-                held = _hold(store, row, prepared, draft, writer_key, policy, record, observed, prepared_at,
-                             "review proposed an unusable repair")
-                return {**report, "status": "held" if held else "stale"}
+                _hold(store, row, prepared, draft, writer_key, record, observed, "review proposed an unusable repair")
+                return {**report, "status": "held"}
             stage = "verify"
             record["candidate"] = candidate
             _save(store, row["id"], writer_key, policy, stage, draft, prepared, record, observed, prepared_at=prepared_at)
