@@ -145,13 +145,14 @@ onionflash check --config config.toml            # Validate; no network requests
 onionflash run --config config.toml              # Collect → analyze → build
 onionflash build --config config.toml            # Offline build from saved news
 onionflash status --config config.toml           # Source freshness and queue
-onionflash backup --config config.toml --output /private/new-backup.sqlite3
 ```
 
 Each command returns a compact JSON result. Invalid configuration or a build
 failure returns nonzero. A partial source outage or queued analysis is reported
-in the result and status without discarding the previous site. Concurrent runs
-use a nonblocking lock at `<database>.lock`; an overlapping run exits cleanly.
+in the result and status without discarding the previous site. Runs and builds
+use a nonblocking lock at `<database>.lock`: an overlapping run exits cleanly,
+and a build that finds the lock held exits 75 without building. `status` only
+reads and needs no lock.
 
 The public output is a dedicated generated directory. Onion Flash refuses to
 replace an existing nonempty directory without its ownership marker, kept next

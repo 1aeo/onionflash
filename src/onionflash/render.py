@@ -154,7 +154,7 @@ def _badges(story: dict) -> str:
 def _source_links(story: dict, *, expanded: bool = False) -> str:
     if expanded:
         return '<ol class="source-list">' + "".join(
-            f'<li><a href="{_escape(source["url"])}" rel="noopener noreferrer">{_escape(source["title"])}</a>'
+            f'<li><a href="{_escape(source["url"])}" rel="noopener noreferrer">{_escape(source["title"])}</a> '
             f'<span class="source-domain">{_escape(urlsplit(source["url"]).hostname)}</span></li>'
             for source in story["sources"]
         ) + "</ol>"

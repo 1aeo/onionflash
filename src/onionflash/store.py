@@ -81,7 +81,6 @@ def _rank(kind: str, confidence: str, updated_at: str) -> tuple:
 class Store:
     def __init__(self, path: str | Path):
         path = Path(path)
-        self.path = path.absolute()
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if path.is_symlink():
             raise ValueError("Database must not be a symlink")
@@ -89,8 +88,6 @@ class Store:
         os.chmod(path, 0o600)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA foreign_keys=ON")
-        self.db.execute("PRAGMA busy_timeout=10000")
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS source_state (
                 id TEXT PRIMARY KEY, url TEXT NOT NULL, active_url TEXT, watermark TEXT,
@@ -106,7 +103,7 @@ class Store:
                 story_id TEXT
             );
             CREATE INDEX IF NOT EXISTS items_pending ON items(status, next_attempt_at, priority_score);
-            CREATE INDEX IF NOT EXISTS items_cluster ON items(cluster_key);
+            DROP INDEX IF EXISTS items_cluster;
             CREATE TABLE IF NOT EXISTS analyses (
                 cache_key TEXT PRIMARY KEY, result TEXT NOT NULL, created_at TEXT NOT NULL
             );
@@ -441,11 +438,15 @@ class Store:
     def health(
         self, sources: list[dict], stale_seconds: int, observed: str
     ) -> list[dict]:
+        """Read-only: a source without state for its current URL has not succeeded yet."""
         result = []
         for source in sources:
             if not source["enabled"]:
                 continue
-            state = self.source(source)
+            row = self.db.execute(
+                "SELECT url,last_success,error FROM source_state WHERE id=?", (source["id"],)
+            ).fetchone()
+            state = dict(row) if row and row["url"] == source["url"] else {"last_success": None, "error": None}
             stale = (
                 not state["last_success"]
                 or after(stale_seconds, state["last_success"]) < observed
@@ -476,5 +477,3 @@ class Store:
                 values.items(),
             )
 
-    def backup(self, destination: str | Path) -> None:
-        backup_database(self.path, destination)

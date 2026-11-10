@@ -851,6 +851,43 @@ def test_retired_settings_are_accepted_and_ignored(tmp_path):
     assert "max_stories" not in load_config(path)["storage"]
 
 
+def test_busy_lock_status_is_read_only_and_a_skipped_build_is_not_success(tmp_path, capsys):
+    import json as _json
+    from onionflash.cli import main
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text('[storage]\ndatabase = "db.sqlite3"\noutput_dir = "public"\n'
+                        '[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
+    with run_lock(str(tmp_path / "db.sqlite3")) as held:
+        assert held
+        assert main(["build", "--config", str(cfg_path)]) == 75
+        assert main(["run", "--config", str(cfg_path)]) == 0
+        capsys.readouterr()
+        assert main(["status", "--config", str(cfg_path)]) == 0
+        assert _json.loads(capsys.readouterr().out)["sources"][0]["last_success"] is None
+    with Store(tmp_path / "db.sqlite3") as store:
+        assert store.db.execute("SELECT COUNT(*) FROM source_state").fetchone()[0] == 0
+
+
+def test_moved_installation_keeps_building(tmp_path):
+    first, moved = tmp_path / "first", tmp_path / "moved"
+    first.mkdir()
+    with Store(first / "state.db") as store:
+        build(config(first), store)
+    first.rename(moved)
+    with Store(moved / "state.db") as store:
+        build(config(moved), store)
+    assert (moved / "public" / "index.html").exists()
+
+
+def test_a_directory_at_the_marker_path_is_not_ownership(tmp_path):
+    (tmp_path / "public").mkdir()
+    (tmp_path / "public" / "operator-file.txt").write_text("keep")
+    (tmp_path / ".public.onionflash-owner").mkdir()
+    with Store(tmp_path / "state.db") as store, pytest.raises(ValueError, match="regular file"):
+        build(config(tmp_path), store)
+    assert (tmp_path / "public" / "operator-file.txt").read_text() == "keep"
+
+
 def test_status_reports_the_count_recorded_by_the_last_build(tmp_path, capsys):
     import json as _json
     from onionflash.cli import main
