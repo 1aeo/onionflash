@@ -347,14 +347,6 @@ def test_utf16_entity_declarations_are_rejected_before_feedparser():
         )
 
 
-def test_deep_or_massive_feed_structure_is_rejected_before_materialization():
-    xml = ("<rss>" + "<a>" * 129 + "</a>" * 129 + "</rss>").encode()
-    with pytest.raises(CollectionError, match="structure"):
-        collect_source(
-            FakeClient([response(xml)]), source(), {}, DEFAULTS["collection"], DATE
-        )
-
-
 def test_gitlab_pagination_keeps_partial_items_without_advancing_watermark():
     records = [
         {

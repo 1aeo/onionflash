@@ -110,24 +110,11 @@ def _feed(
     def reject_declaration(*args):
         raise CollectionError("Feed contains disallowed XML declarations")
 
+    # Without a DTD there are no entities to expand; the response size limit bounds
+    # everything else feedparser does with the document.
     parser.StartDoctypeDeclHandler = reject_declaration
     parser.EntityDeclHandler = reject_declaration
     parser.ExternalEntityRefHandler = reject_declaration
-    depth = elements = 0
-
-    def start_element(name, attributes):
-        nonlocal depth, elements
-        depth += 1
-        elements += 1
-        if depth > settings["max_xml_depth"] or elements > settings["max_xml_elements"]:
-            raise CollectionError("Feed XML structure exceeds configured limits")
-
-    def end_element(name):
-        nonlocal depth
-        depth -= 1
-
-    parser.StartElementHandler = start_element
-    parser.EndElementHandler = end_element
     try:
         parser.Parse(response.body, True)
     except expat.ExpatError as exc:

@@ -30,8 +30,6 @@ source_budget_seconds = 60
 analysis_reserve_fraction = 0.5
 # Rescan the lookback window to repair gaps from changing offset-based MR pages.
 reconcile_seconds = 86400
-max_xml_depth = 128
-max_xml_elements = 50000
 
 [http]
 timeout_seconds = 30
