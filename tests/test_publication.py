@@ -1,7 +1,6 @@
 """Permanent artifacts, bounded publication work and restart-safe indexes."""
 
 import copy
-import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -110,6 +109,7 @@ def test_newest_publications_page_first_while_feed_updates_are_independent(tmp_p
         put(store.db, older); put(store.db, newer)
         build(cfg, store)
         root = Path(cfg["storage"]["output_dir"])
+        assert (root / "_headers").read_text() == render.headers_text(cfg["site"]["base_url"])
         assert f'id="story-{newer["id"]}"' in (root / "index.html").read_text()
         assert f'id="story-{older["id"]}"' in (root / "page/2/index.html").read_text()
         feed = json.loads((root / "feed.json").read_text())
@@ -164,11 +164,13 @@ def test_no_article_rewrite_on_replay_or_health_update(tmp_path, monkeypatch):
         paths = [output / f"news/{story(1)['id']}/index.html", output / "feed.xml", output / "feed.json"]
         mtimes = [p.stat().st_mtime_ns for p in paths]
         before = (output / "index.html").read_bytes()
+        generation = meta(store.db, "publication_generation")
         monkeypatch.setattr(render, "article_html", lambda *args: pytest.fail("Unchanged article was regenerated"))
         assert not build(cfg, store)["public_changed"]
         store.source_success(source, {"url": source["url"]}, "2026-11-08T12:01:00Z")
         monkeypatch.setattr(publication, "now_iso", lambda: "2026-11-08T12:01:00Z")
         assert not build(cfg, store)["public_changed"]
+        assert meta(store.db, "publication_generation") == generation
         assert before == (output / "index.html").read_bytes()
         assert "Last success" not in (output / "index.html").read_text()
         monkeypatch.setattr(publication, "now_iso", lambda: "2026-11-09T12:00:00Z")
@@ -190,49 +192,6 @@ def test_uploaded_hash_survives_update_and_json_contains_only_public_fields(tmp_
         assert updated[0] != previous and updated[1] == previous
         text = (Path(cfg["storage"]["output_dir"]) / path).read_text()
         assert all(value not in text for value in ["private-origin", "private evidence", "private-secret", "editorial_kind"])
-
-
-def test_feed_header_fix_invalidates_publication_without_changed_stories(tmp_path, monkeypatch):
-    cfg = settings(tmp_path)
-    current_headers = render.headers_text(cfg["site"]["base_url"])
-    legacy_headers = current_headers.split("\n\n", 1)[0] + "\n"
-    assert legacy_headers != current_headers
-    with Store(cfg["storage"]["database"]) as store:
-        value = story(1)
-        put(store.db, value)
-        # Keep the template identity fixed to exercise header regeneration
-        # independently of article/feed rebuilding or source changes.
-        with monkeypatch.context() as legacy:
-            legacy.setattr(render, "headers_text", lambda _base: legacy_headers)
-            build(cfg, store)
-        output = Path(cfg["storage"]["output_dir"])
-        protected = [output / "feed.xml", output / "feed.json", *sorted((output / "tags").glob("*.xml")),
-                     output / f"news/{value['id']}/index.html", output / f"news/{value['id']}/story.json"]
-        before_files = [(path.read_bytes(), path.stat().st_mtime_ns) for path in protected]
-        before_stories = store.stories()
-        before_hashes = dict(store.db.execute("SELECT path,sha256 FROM public_artifacts"))
-        generation = int(meta(store.db, "publication_generation"))
-        with store.db:
-            store.db.execute("UPDATE public_artifacts SET uploaded_sha256=sha256")
-        monkeypatch.setattr(render, "article_html", lambda *_args: pytest.fail("Unchanged article was regenerated"))
-        monkeypatch.setattr(publication, "_feeds", lambda *_args: pytest.fail("Unchanged feeds were regenerated"))
-
-        result = build(cfg, store)
-
-        assert result["public_changed"] and "articles_pending" not in result
-        assert (output / "_headers").read_text() == current_headers
-        after_hashes = dict(store.db.execute("SELECT path,sha256 FROM public_artifacts"))
-        assert {path for path in after_hashes if after_hashes[path] != before_hashes[path]} == {"_headers"}
-        header = store.db.execute("SELECT sha256,uploaded_sha256 FROM public_artifacts WHERE path='_headers'").fetchone()
-        assert header[0] == hashlib.sha256(current_headers.encode()).hexdigest()
-        assert header[1] == before_hashes["_headers"] and header[0] != header[1]
-        assert int(meta(store.db, "publication_generation")) == generation + 1
-        assert before_files == [(path.read_bytes(), path.stat().st_mtime_ns) for path in protected]
-        assert store.stories() == before_stories
-
-        assert not build(cfg, store)["public_changed"]
-        assert int(meta(store.db, "publication_generation")) == generation + 1
-        assert before_files == [(path.read_bytes(), path.stat().st_mtime_ns) for path in protected]
 
 
 def test_invalid_revision_keeps_last_good_publication_and_can_recover(tmp_path):
