@@ -150,6 +150,25 @@ def test_page_size_changes_remove_only_obsolete_pagination_artifacts(tmp_path):
         assert len(list((output / "news").glob('*/index.html'))) == 3
 
 
+def test_pages_rewritten_by_a_failed_build_are_still_removed_when_obsolete(tmp_path, monkeypatch):
+    cfg = settings(tmp_path)
+    cfg["site"]["page_size"] = 1
+    output = Path(cfg["storage"]["output_dir"])
+    with Store(cfg["storage"]["database"]) as store:
+        for number in range(3): put(store.db, story(number, added_at=f"2026-11-0{number + 1}T00:00:00Z"))
+        build(cfg, store)
+        # The failed build shifts every page on disk, then rolls back their ledger rows.
+        put(store.db, story(9, added_at="2026-11-09T00:00:00Z"))
+        with monkeypatch.context() as scoped:
+            scoped.setattr(render, "json_feed_header", lambda *args: (_ for _ in ()).throw(RuntimeError("interrupted")))
+            with pytest.raises(RuntimeError, match="interrupted"):
+                build(cfg, store)
+        cfg["site"]["page_size"] = 2
+        assert build(cfg, store)["public_changed"]
+        assert not (output / "page/3/index.html").exists()
+        assert not (output / "topics/release/page/3/index.html").exists()
+
+
 def test_no_article_rewrite_on_replay_or_health_update(tmp_path, monkeypatch):
     cfg = settings(tmp_path)
     monkeypatch.setattr(publication, "now_iso", lambda: "2026-11-08T12:00:00Z")
@@ -271,6 +290,43 @@ def test_interrupted_index_work_resumes_and_generation_advances_once(tmp_path, m
         assert len(ET.parse(Path(cfg["storage"]["output_dir"]) / "feed.xml").findall("./channel/item")) == 2
 
 
+def test_a_killed_build_leaves_no_temporary_files_in_the_public_tree(tmp_path, monkeypatch):
+    cfg = settings(tmp_path)
+    with Store(cfg["storage"]["database"]) as store:
+        put(store.db, story(1)); build(cfg, store)
+        put(store.db, story(2))
+        with monkeypatch.context() as killed:  # A killed process runs no cleanup.
+            killed.setattr(Path, "unlink", lambda *args, **kwargs: None)
+            killed.setattr(render, "json_feed_header", lambda *args: (_ for _ in ()).throw(RuntimeError("killed")))
+            with pytest.raises(RuntimeError, match="killed"):
+                build(cfg, store)
+        build(cfg, store)
+    public = Path(cfg["storage"]["output_dir"])
+    assert not list(public.rglob(".*")) and not list(public.rglob("tmp*"))
+    assert not any((tmp_path / ".public.onionflash-staging").iterdir())
+
+
+def test_a_staging_directory_others_can_write_is_refused(tmp_path):
+    cfg = settings(tmp_path)
+    staging = tmp_path / ".public.onionflash-staging"
+    staging.mkdir()
+    staging.chmod(0o777)
+    with Store(cfg["storage"]["database"]) as store:
+        put(store.db, story(1))
+        with pytest.raises(ValueError, match="Unsafe public staging directory"):
+            build(cfg, store)
+
+
+def test_the_staging_directory_keeps_files_it_did_not_create(tmp_path):
+    cfg = settings(tmp_path)
+    staging = tmp_path / ".public.onionflash-staging"
+    staging.mkdir()
+    (staging / "data.sqlite3").write_text("unrelated")
+    with Store(cfg["storage"]["database"]) as store:
+        put(store.db, story(1)); build(cfg, store)
+    assert (staging / "data.sqlite3").read_text() == "unrelated"
+
+
 def test_template_rebuild_is_bounded_and_resumes_across_connections(tmp_path, monkeypatch):
     cfg = settings(tmp_path, render_batch_size=2)
     with Store(cfg["storage"]["database"]) as store:
@@ -296,6 +352,31 @@ def test_article_symlink_is_never_followed(tmp_path):
         with pytest.raises(ValueError, match="regular file"):
             build(cfg, store)
         assert unrelated.read_text() == "untouched"
+
+
+@pytest.mark.parametrize("case,message", [("article", "real directory"), ("output", "must not be a symlink"),
+                                          ("owner", "ownership marker"), ("staging", "staging directory")])
+def test_symlinked_output_paths_are_refused(tmp_path, case, message):
+    cfg = settings(tmp_path)
+    output, outside = Path(cfg["storage"]["output_dir"]), tmp_path / "outside"
+    outside.mkdir()
+    with Store(cfg["storage"]["database"]) as store:
+        value = story(1); put(store.db, value)
+        if case == "article":
+            build(cfg, store)
+            shutil.rmtree(output / "news" / value["id"])
+            (output / "news" / value["id"]).symlink_to(outside, target_is_directory=True)
+            put(store.db, {**value, "summary": "Changed story."})
+        elif case == "output":
+            output.symlink_to(outside, target_is_directory=True)
+        elif case == "owner":
+            output.mkdir(); (output / "index.html").write_text("operator page")
+            (tmp_path / ".public.onionflash-owner").symlink_to(tmp_path / "db.sqlite3")
+        else:
+            (tmp_path / ".public.onionflash-staging").symlink_to(outside, target_is_directory=True)
+        with pytest.raises(ValueError, match=message):
+            build(cfg, store)
+    assert not any(outside.iterdir())
 
 
 def test_a_new_empty_database_cannot_replace_existing_public_history(tmp_path):

@@ -236,9 +236,10 @@ reads and needs no lock.
 The public output is a dedicated generated directory. Onion Flash refuses to
 replace an existing nonempty directory without its ownership marker, kept next
 to—not inside—the public directory. Its presence permits moving or restoring an
-installation. Changed files are replaced atomically, and an unfinished build is
-marked so the publisher keeps the preceding release. Publishers use the same
-database lock while taking their upload snapshot.
+installation. Changed files are staged beside the public directory, on the same
+filesystem, and replaced atomically. An unfinished build is marked so the
+publisher keeps the preceding release. Publishers use the same database lock
+while taking their upload snapshot.
 
 ## Reliability and editorial behavior
 
