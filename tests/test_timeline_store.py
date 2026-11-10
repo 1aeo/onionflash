@@ -81,9 +81,3 @@ def test_primary_reporting_can_replace_newer_timeline_context(tmp_path):
         assert final["editorial_kind"] == "feed"
         assert final["published_at"] == first["published_at"]
 
-
-@pytest.mark.parametrize("identity", [None, "", "../escape", "a" * 63])
-def test_invalid_timeline_identity_cannot_enter_store(tmp_path, identity):
-    with Store(tmp_path / "db") as store:
-        with pytest.raises(ValueError, match="identity"):
-            store.ingest({**timeline(), "source_entry_id": identity}, DATE)

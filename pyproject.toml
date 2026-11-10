@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "onionflash"
-version = "0.4.0"
+dynamic = ["version"]
 description = "A small, source-linked Tor news collector and static publisher."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,6 +21,9 @@ onionflash = "onionflash.cli:main"
 [project.urls]
 Repository = "https://github.com/1aeo/onionflash"
 Deployment = "https://github.com/1aeo/onionflash-deploy"
+
+[tool.setuptools.dynamic]
+version = { attr = "onionflash.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

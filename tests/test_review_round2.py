@@ -157,15 +157,14 @@ def _pipeline_config(tmp_path):
     return config
 
 
-def _prepare_run(monkeypatch, analyze, cleanup=None):
+def _prepare_run(monkeypatch, analyze):
     class FakeAnalyzer:
-        def __init__(self, config):
+        def __init__(self, *args, **kwargs):
             pass
         def __enter__(self):
             return self
         def __exit__(self, *args):
-            if cleanup:
-                cleanup()
+            pass
         def analyze(self, payload):
             return analyze(payload)
     monkeypatch.setattr(cli, "Analyzer", FakeAnalyzer)
@@ -173,63 +172,28 @@ def _prepare_run(monkeypatch, analyze, cleanup=None):
     monkeypatch.setattr(cli, "build", lambda *args: {"published_stories": 0, "stories_skipped": 0})
 
 
-def _budget():
-    raise cli.RunBudgetReached()
-
-
-@pytest.mark.parametrize("cached", [False, True])
-def test_cleanup_deadline_never_defers_a_finished_or_cached_row(tmp_path, monkeypatch, cached):
-    _prepare_run(monkeypatch, lambda payload: analysis(), cleanup=_budget)
+def test_analysis_stops_at_the_run_deadline_between_items(tmp_path, monkeypatch):
+    analyzed = []
+    _prepare_run(monkeypatch, lambda payload: analyzed.append(payload) or analysis())
+    monkeypatch.setattr(cli.time, "monotonic", lambda: 10**6 if analyzed else 0.0)
     with Store(tmp_path / "state.db") as store:
-        store.ingest(item(), DATE)
-        if cached:
-            monkeypatch.setattr(store, "cached", lambda key: analysis())
+        store.ingest(item(url="https://example.org/first", labels=["Security"]), DATE)
+        store.ingest(item(url="https://example.org/second", labels=[], content="second"), DATE)
         result = cli.run(_pipeline_config(tmp_path), store)
-        row = store.db.execute("SELECT status,attempts,last_error,next_attempt_at FROM items").fetchone()
-    assert result["budget_reached"]
-    assert row["status"] == "published" and row["attempts"] == 0
-    assert row["last_error"] is None and row["next_attempt_at"] is None
+        second = store.db.execute("SELECT status,attempts FROM items WHERE url=?", ("https://example.org/second",)).fetchone()
+    assert result["budget_reached"] and len(analyzed) == 1
+    assert tuple(second) == ("pending", 0)
 
 
-def test_real_analysis_deadline_defers_only_the_active_pending_row(tmp_path, monkeypatch):
-    _prepare_run(monkeypatch, lambda payload: _budget())
-    with Store(tmp_path / "state.db") as store:
-        store.ingest(item(), DATE)
-        result = cli.run(_pipeline_config(tmp_path), store)
-        row = store.db.execute("SELECT status,attempts,last_error FROM items").fetchone()
-    assert result["budget_reached"] and row["status"] == "pending"
-    assert row["attempts"] == 1 and row["last_error"] == "Analysis run budget reached"
-
-
-def test_deadline_after_error_deferral_does_not_count_a_second_attempt(tmp_path, monkeypatch):
+def test_two_endpoint_failures_leave_the_remaining_rows_untouched(tmp_path, monkeypatch):
     def unavailable(payload):
         raise AnalysisError("Unavailable", retryable=True)
     _prepare_run(monkeypatch, unavailable)
-    with Store(tmp_path / "state.db") as store:
-        store.ingest(item(), DATE)
-        defer = store.defer
-        calls = []
-        def interrupted_defer(*args, **kwargs):
-            calls.append(args)
-            defer(*args, **kwargs)
-            _budget()
-        monkeypatch.setattr(store, "defer", interrupted_defer)
-        cli.run(_pipeline_config(tmp_path), store)
-        row = store.db.execute("SELECT attempts,last_error FROM items").fetchone()
-    assert len(calls) == 1 and row["attempts"] == 1
-    assert row["last_error"] == "Unavailable"
-
-
-def test_cleanup_deadline_never_defers_a_skipped_row(tmp_path, monkeypatch):
-    def unavailable(payload):
-        raise AnalysisError("Unavailable", retryable=True)
-    _prepare_run(monkeypatch, unavailable, cleanup=_budget)
     with Store(tmp_path / "state.db") as store:
         store.ingest(item(url="https://example.org/urgent", title="Authority compromised"), DATE)
         store.ingest(item(url="https://example.org/second", title="Second update", labels=["Security"], content="second"), DATE)
         store.ingest(item(url="https://example.org/later", title="Other update", labels=[], content=""), DATE)
         cli.run(_pipeline_config(tmp_path), store)
-        # Two endpoint failures stop network analysis; the remaining row is untouched.
         skipped = store.db.execute("SELECT attempts,last_error,next_attempt_at FROM items WHERE url=?",("https://example.org/later",)).fetchone()
     assert skipped["attempts"] == 0 and skipped["last_error"] is None
     assert skipped["next_attempt_at"] is None

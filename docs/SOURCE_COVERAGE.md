@@ -14,8 +14,8 @@ protocol changes. The additional configured streams are:
 | --- | --- | --- |
 | [Tor Browser Security-labeled public issues](https://gitlab.torproject.org/api/v4/projects/472/issues?labels=Security) | `tor-browser-security`, enabled | Earlier visibility into Browser security work; labels do not establish confirmed vulnerabilities or completed fixes. |
 | [Anti-Censorship team issues](https://gitlab.torproject.org/api/v4/projects/549/issues) | `anti-censorship-team`, enabled | Human investigations of blocking and bridge/transport availability, including unlabeled reports. |
-| [Tor Metrics Timeline repository](https://gitlab.torproject.org/tpo/network-health/metrics/timeline) | `tor-metrics-news`, enabled hourly | Curated event rows from the maintained README; validated repository snapshots replace the stale Atom feed. |
-| [Tor Project Development Mailing List](https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/) | `tor-dev`, enabled every five minutes | Proposal and protocol-change discussions; the normal importance and evidence checks filter routine messages. |
+| [Tor Metrics Timeline repository](https://gitlab.torproject.org/tpo/network-health/metrics/timeline) | `tor-metrics-news`, enabled | Curated event rows from the maintained README; validated repository snapshots replace the stale Atom feed. |
+| [Tor Project Development Mailing List](https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/) | `tor-dev`, enabled | Proposal and protocol-change discussions; the normal importance and evidence checks filter routine messages. |
 | [Consensus-health monitoring](https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/) | `consensus-health-alerts`, enabled | Deterministic grouping; persistent directory-document warnings may publish as attributed observations. |
 | [Anti-censorship monitoring alerts](https://lists.torproject.org/mailman3/hyperkitty/list/anti-censorship-alerts@lists.torproject.org/) | `anti-censorship-alerts`, enabled for private grouping | Monitor outages and single-system service failures remain held; they do not establish network attacks or country-wide blocking. |
 
@@ -35,20 +35,22 @@ March 9; the repository contained November updates. The Atom feed is no longer
 configured, including as a fallback.
 
 The `metrics_timeline` adapter reads the GitLab file JSON API for `README.md`.
-It validates the base64 content, declared size, SHA-256, repository revision and
-seven-column table. It does not clone the repository, execute upstream scripts
+It checks the base64 content, file path, repository revision and seven-column
+table structure. It does not clone the repository, execute upstream scripts
 or fetch the row's external references. The timeline data is CC0; the upstream
 BSD-licensed helper scripts are not bundled or executed.
 
 The November 10 repository check found 804 rows, including the October 28 Tor
 0.4.9.15 event and November 4 Tor 0.4.9.16 event missing from the Atom feed.
-`max_items = 1000` bounds the complete table; exceeding it produces an explicit
-source warning. HTTP response limits, retries and backoff also apply. Conditional
-HTTP requests avoid parsing unchanged snapshots.
+The HTTP response-size limit bounds the table; retries and backoff also apply.
+Conditional HTTP requests avoid parsing unchanged snapshots.
 
 Rows qualify through the configured event-date lookback (14 days by default):
-a recent start or explicit end can qualify, but an old `ongoing` row or a recent
-repository commit cannot. Raw dates, approximation markers, country/protocol
+a recent start or explicit end can qualify, and the date that qualified a row
+dates its item. An old `ongoing` row or a recent repository commit cannot qualify
+a row. Every row's dates must parse, but other fields of historical rows are read
+as leniently as upstream's own parser, so one unusual old row cannot block the
+snapshot. Raw dates, approximation markers, country/protocol
 scope and the unknown-cause `X` marker remain in analysis context. The README
 does not specify a timezone; UTC-normalized values are ordering keys, not claims
 of precise event time. Retrospective changes outside this event window remain
@@ -88,13 +90,14 @@ clustering still adds corroborating citations to existing release stories.
 3. **Independent monitoring corroboration.** Grouping is implemented; promoting
    censorship/probe failures requires additional evidence of functioning
    independent monitoring locations or controls. The current feed lacks it.
-4. **Long-term measurement and retention.** The current audit reconstructs first
-   verified publication from immutable receipts. Dedicated per-revision timing
-   records would support long-term latency reporting and bounded receipt
-   retention. Keep source timestamps distinct from observation/publication time.
+4. **Long-term measurement.** Dedicated per-revision timing records would support
+   latency reporting. Keep source timestamps distinct from observation and
+   publication time.
 5. **A review queue for repeatedly rejected model output.** Invalid evidence and
-   unsupported factual claims must remain rejected. The current CLI and audit
-   expose queue/error counts; an explicit operator workflow would make these
+   unsupported factual claims must remain rejected. `onionflash status` reports
+   the pending and rejected analysis counts and source errors, and each
+   `onionflash run` result reports that run's analysis failures; an explicit
+   operator workflow would make these
    cases easier to resolve.
 
 Tag publication and scheduler jitter are addressed in this update rather than

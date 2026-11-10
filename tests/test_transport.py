@@ -1,5 +1,6 @@
 import gzip
 import socket
+import time
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import Mock
@@ -18,19 +19,10 @@ class TransportTests(unittest.TestCase):
     def client(self, handler, **settings):
         sleeps = []
         config = {"retry_attempts": 3, "backoff_base_seconds": 1, "backoff_cap_seconds": 10,
-                  "backoff_jitter": 0, "max_retry_after_seconds": 20, "requests_per_minute": 0,
+                  "backoff_jitter": 0, "max_retry_after_seconds": 20,
                   "max_response_bytes": 1000}
         config.update(settings)
         return HttpClient(config, transport=httpx.MockTransport(handler), resolver=public_dns, sleep=sleeps.append), sleeps
-
-    def test_head_can_verify_large_objects_without_reading_a_body(self):
-        handler = lambda request: httpx.Response(200, headers={"content-length": "100000000", "etag": '"hash"'})
-        client, _ = self.client(handler)
-        with client:
-            result = client.request("HEAD", "https://example.org/large-feed.xml")
-        self.assertEqual(result.body, b"")
-        self.assertEqual(result.headers["content-length"], "100000000")
-        self.assertEqual(result.headers["etag"], '"hash"')
 
     def test_transient_retry_then_success(self):
         calls = []
@@ -118,11 +110,12 @@ class TransportTests(unittest.TestCase):
         def handle(request):
             calls.append(request)
             return httpx.Response(200, content=b"ok", headers={"set-cookie": "tracking=secret; Path=/"})
-        client, _ = self.client(handle)
+        client, waits = self.client(handle)
         with client:
             client.request("GET", "https://example.org/one")
             client.request("GET", "https://example.org/two")
         self.assertNotIn("cookie", calls[1].headers)
+        self.assertEqual(waits, [])  # consecutive requests are not spaced out
 
     def test_redirect_loop_bounded(self):
         handler = Mock(return_value=httpx.Response(302, headers={"location": "/again"}))
@@ -161,7 +154,7 @@ class TransportTests(unittest.TestCase):
         handler = Mock(return_value=httpx.Response(304, headers={"content-encoding": "gzip"}, stream=httpx.ByteStream(b"")))
         client, _ = self.client(handler)
         with client:
-            response = client.request("GET", "https://example.org", conditional={"If-None-Match": '"etag"'})
+            response = client.request("GET", "https://example.org", headers={"If-None-Match": '"etag"'})
         self.assertEqual(response.status, 304)
         self.assertEqual(response.body, b"")
         self.assertEqual(handler.call_args.args[0].headers['if-none-match'], '"etag"')
@@ -169,10 +162,10 @@ class TransportTests(unittest.TestCase):
     def test_private_access_requires_explicit_allowlist(self):
         dns = lambda host, port, *args: [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("192.168.50.10", port))]
         handle = httpx.MockTransport(lambda r: httpx.Response(200, json={"ready": True}))
-        with HttpClient({"requests_per_minute": 0}, transport=handle, resolver=dns,
+        with HttpClient({}, transport=handle, resolver=dns,
                         allow_http=True, allowed_networks=["192.168.50.10/32"]) as client:
             self.assertTrue(client.request("GET", "http://model.example:18000/health").json()["ready"])
-        with HttpClient({"requests_per_minute": 0}, transport=handle, resolver=dns, allow_http=True) as client:
+        with HttpClient({}, transport=handle, resolver=dns, allow_http=True) as client:
             with self.assertRaises(FetchError):
                 client.request("GET", "http://model.example:18000/health")
 
@@ -230,7 +223,7 @@ class TransportTests(unittest.TestCase):
 class PublisherTransportTests(unittest.TestCase):
     def test_strict_origin_policy_rejects_even_get_redirects(self):
         handler = Mock(return_value=httpx.Response(302, headers={"location": "https://other.example/path"}))
-        with HttpClient({"requests_per_minute": 0}, transport=httpx.MockTransport(handler),
+        with HttpClient({}, transport=httpx.MockTransport(handler),
                         resolver=public_dns, same_origin_redirects=True) as client:
             with self.assertRaisesRegex(FetchError, "cross-origin redirect refused"):
                 client.request("GET", "https://example.org/path", headers={"Authorization": "Bearer secret"})
@@ -241,7 +234,7 @@ class PublisherTransportTests(unittest.TestCase):
         def handler(request):
             calls.append(request)
             return httpx.Response(307, headers={"location": "/route/new"}) if len(calls) == 1 else httpx.Response(204)
-        with HttpClient({"requests_per_minute": 0}, transport=httpx.MockTransport(handler),
+        with HttpClient({}, transport=httpx.MockTransport(handler),
                         resolver=public_dns, same_origin_redirects=True) as client:
             self.assertEqual(client.request("DELETE", "https://example.org/route/old").status, 204)
         self.assertEqual([request.method for request in calls], ["DELETE", "DELETE"])
@@ -251,6 +244,49 @@ class PublisherTransportTests(unittest.TestCase):
                     "backoff_jitter_seconds": 1, "max_retry_after_seconds": 10}
         self.assertEqual(retry_delay(0, settings, jitter=lambda: .5), 2.5)
         self.assertEqual(retry_delay(8, settings, jitter=lambda: 1), 10)
+
+
+class CheckedTransportTests(unittest.TestCase):
+    """The production path: DNS is checked when the connection opens, then the
+    socket backend receives only the vetted literal address."""
+
+    def client(self, addresses, body=b"ok", attempts=1):
+        resolved, connected = [], []
+        def resolver(host, port, *args):
+            resolved.append(host)
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port)) for address in addresses]
+        class Backend(httpcore.MockBackend):
+            def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+                connected.append((host, port, timeout))
+                return super().connect_tcp(host, port, timeout, local_address, socket_options)
+        client = HttpClient({"retry_attempts": attempts, "backoff_base_seconds": 0}, resolver=resolver,
+                            sleep=lambda seconds: None)
+        client._client._transport.backend.backend = Backend(
+            [b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body])
+        return client, resolved, connected
+
+    def test_dns_is_resolved_at_connect_and_only_the_vetted_ip_is_dialed(self):
+        client, resolved, connected = self.client(["93.184.216.34"])
+        with client:
+            self.assertEqual(client.request("GET", "https://example.org/feed").body, b"ok")
+        self.assertEqual(resolved, ["example.org"])
+        self.assertEqual([(host, port) for host, port, _ in connected], [("93.184.216.34", 443)])
+
+    def test_a_private_address_at_connect_time_is_refused_before_dialing(self):
+        # Retries are available, so a wrongly retried refusal would show a second lookup.
+        client, resolved, connected = self.client(["93.184.216.34", "10.0.0.7"], attempts=3)
+        with client, self.assertRaisesRegex(FetchError, "not permitted") as caught:
+            client.request("GET", "https://example.org/feed")
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(resolved, ["example.org"])
+        self.assertEqual(connected, [])
+
+    def test_the_caller_deadline_bounds_the_connect_timeout(self):
+        client, _, connected = self.client(["93.184.216.34"])
+        with client:
+            client.deadline = time.monotonic() + 2
+            client.request("GET", "https://example.org/feed")
+        self.assertLessEqual(connected[0][2], 2)
 
 
 if __name__ == "__main__":

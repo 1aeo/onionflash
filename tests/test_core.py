@@ -592,7 +592,7 @@ def test_malformed_gitlab_timestamp_cannot_abort_the_entire_cycle():
     assert result["items"][0]["published_at"] == DATE
 
 
-def test_slow_source_is_deferred_and_does_not_starve_queued_analysis(
+def test_a_failing_source_is_deferred_and_does_not_starve_queued_analysis(
     tmp_path, monkeypatch
 ):
     from onionflash import cli
@@ -613,7 +613,7 @@ def test_slow_source_is_deferred_and_does_not_starve_queued_analysis(
             return analysis()
 
     def timeout(*args):
-        raise cli.RunBudgetReached()
+        raise CollectionError("request deadline reached")
 
     monkeypatch.setattr(cli, "HttpClient", DummyContext)
     monkeypatch.setattr(cli, "Analyzer", DummyContext)
@@ -625,36 +625,107 @@ def test_slow_source_is_deferred_and_does_not_starve_queued_analysis(
         assert store.source(cfg["sources"][0])["next_fetch_at"] is not None
 
 
-def test_transport_cannot_swallow_run_budget_as_a_retryable_network_error():
+def test_request_deadline_is_never_slept_past():
     import socket
-    import time
     import httpx
-    from onionflash.cli import RunBudgetReached, time_budget
     from onionflash.transport import HttpClient
 
-    calls = []
-
-    def slow(request):
+    calls, sleeps = [], []
+    settings = {**DEFAULTS["http"], "retry_attempts": 3, "backoff_base_seconds": 5}
+    resolver = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+    clock = [100.0]
+    def busy(request):
         calls.append(request)
-        time.sleep(0.15)
-        return httpx.Response(200, content=b"ok")
+        return httpx.Response(503, content=b"busy")
+    with HttpClient(settings, transport=httpx.MockTransport(busy), resolver=resolver,
+                    sleep=sleeps.append, clock=lambda: clock[0]) as client:
+        client.deadline = 102.0  # less than one 5 s retry wait away
+        with pytest.raises(FetchError, match="deadline") as caught:
+            client.request("GET", "https://example.org/")
+        assert caught.value.retryable
+        clock[0] = 103.0
+        with pytest.raises(FetchError, match="deadline"):
+            client.request("GET", "https://example.org/")
+    assert len(calls) == 1 and sleeps == []
 
-    settings = {
-        **DEFAULTS["http"],
-        "retry_attempts": 2,
-        "backoff_base_seconds": 0,
-        "requests_per_minute": 10000,
-    }
-    resolver = lambda *args: [
-        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))
-    ]
-    with HttpClient(
-        settings, transport=httpx.MockTransport(slow), resolver=resolver
-    ) as client:
-        with pytest.raises(RunBudgetReached):
-            with time_budget(0.02):
-                client.request("GET", "https://example.org/")
-    assert len(calls) == 1
+
+def test_retry_after_past_the_deadline_is_not_replaced_by_a_shorter_backoff():
+    import socket
+    import httpx
+    from onionflash.transport import DeadlineReached, HttpClient
+
+    calls, sleeps = [], []
+    settings = {**DEFAULTS["http"], "retry_attempts": 3, "backoff_base_seconds": 1}
+    resolver = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+    def limited(request):
+        calls.append(request)
+        return httpx.Response(429, headers={"Retry-After": "30"}, content=b"slow down")
+    with HttpClient(settings, transport=httpx.MockTransport(limited), resolver=resolver,
+                    sleep=sleeps.append, clock=lambda: 100.0) as client:
+        client.deadline = 110.0  # the 30 s Retry-After does not fit; a 1 s backoff would
+        with pytest.raises(DeadlineReached):
+            client.request("GET", "https://example.org/")
+        assert client.deadline_reached
+    assert len(calls) == 1 and sleeps == []
+
+
+def test_the_deadline_flag_describes_only_the_latest_request():
+    import socket
+    import httpx
+    from onionflash.transport import DeadlineReached, HttpClient
+
+    settings = {**DEFAULTS["http"], "retry_attempts": 3, "backoff_base_seconds": 1}
+    resolver = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+    def respond(request):
+        if request.url.path == "/primary":
+            return httpx.Response(429, headers={"Retry-After": "30"}, content=b"slow down")
+        return httpx.Response(404, content=b"missing")
+    with HttpClient(settings, transport=httpx.MockTransport(respond), resolver=resolver,
+                    sleep=lambda seconds: None, clock=lambda: 100.0) as client:
+        client.deadline = 110.0
+        with pytest.raises(DeadlineReached):
+            client.request("GET", "https://example.org/primary")
+        # A fallback that then fails with a 404 while time remains is a real failure.
+        with pytest.raises(FetchError, match="404"):
+            client.request("GET", "https://example.org/fallback")
+        assert not client.deadline_reached
+
+
+@pytest.mark.parametrize("source_budget,shared", [(600, True), (5, False)])
+def test_a_deadline_cutoff_is_penalized_only_when_it_is_the_source_budget(tmp_path, monkeypatch, source_budget, shared):
+    from onionflash import cli
+
+    cfg = config(tmp_path)
+    cfg["collection"]["source_budget_seconds"] = source_budget
+    cfg["sources"] = [source(id="first"), source(id="second", url="https://example.org/second.xml")]
+    collected = []
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    def collect(client, stream, *args):
+        collected.append(stream["id"])
+        client.deadline_reached = True
+        raise CollectionError("request deadline reached")
+
+    monkeypatch.setattr(cli, "HttpClient", Client)
+    monkeypatch.setattr(cli, "collect_source", collect)
+    monkeypatch.setattr(cli, "build", lambda *args: {})
+    with Store(tmp_path / "state.db") as store:
+        result = cli.run(cfg, store)
+        first = store.source(cfg["sources"][0])
+    # The shared window ends collection without a penalty; a source that overran
+    # its own budget is a failure, and the next source still runs.
+    assert bool(result.get("budget_reached")) is shared
+    assert first["failures"] == (0 if shared else 1)
+    assert collected == (["first"] if shared else ["first", "second"])
 
 
 def test_render_failure_preserves_prior_site(tmp_path, monkeypatch):
@@ -731,10 +802,12 @@ def test_example_config_resolves_paths_and_rejects_dangerous_settings(
 def test_skipped_story_count_is_reported_on_every_build(tmp_path):
     cfg = config(tmp_path)
     with Store(tmp_path / "state.db") as store:
-        for url in ["https://example.org/news/1", "https://news.example.test/a"]:
+        for url in ["https://example.org/news/1", "https://example.org/news/2"]:
             store.ingest(item(url=url, content=url), DATE)
         for row in store.pending(10, DATE):
             store.finish(row, analysis(), "key-" + row["id"], DATE)
+        store.db.execute("UPDATE stories SET payload=json_set(payload, '$.priority', 'urgent') "
+                         "WHERE rowid=(SELECT MIN(rowid) FROM stories)")
         assert build(cfg, store) == {"public_changed": True, "published_stories": 1, "stories_skipped": 1}
         assert build(cfg, store) == {"public_changed": False, "published_stories": 1, "stories_skipped": 1}
 
@@ -842,13 +915,69 @@ def test_new_story_records_when_onion_flash_added_it(tmp_path):
     assert (story["published_at"], story["added_at"]) == ("2026-09-22T12:00:00Z", later)
 
 
-def test_retired_settings_are_accepted_and_ignored(tmp_path):
+@pytest.mark.parametrize("base", ["javascript:bad", "https://example.com/x/../", "https://example.com/%2e%2e/",
+                                  "https://example.com/?token=secret", "https://secret@example.com/"])
+def test_bad_base_url_and_traversal_are_rejected(tmp_path, base):
+    path = tmp_path / "config.toml"
+    path.write_text(f'[site]\nbase_url = "{base}"\n[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
+    with pytest.raises(ValueError, match="base_url"):
+        load_config(path)
+
+
+@pytest.mark.parametrize("base", ["https://example.com/news?", "https://example.com/news/#", "https://example.com/news"])
+def test_base_url_is_normalized_to_a_clean_directory(tmp_path, base):
+    path = tmp_path / "config.toml"
+    path.write_text(f'[site]\nbase_url = "{base}"\n[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
+    assert load_config(path)["site"]["base_url"] == "https://example.com/news/"
+
+
+def test_retired_settings_are_accepted_and_ignored(tmp_path, caplog):
     path = tmp_path / "config.toml"
     path.write_text(
-        '[storage]\nmax_stories = 1000\n'
+        '[storage]\nmax_stories = 1000\n[http]\nrequests_per_minute = 30\n'
         '[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n'
     )
-    assert "max_stories" not in load_config(path)["storage"]
+    with caplog.at_level("WARNING", logger="onionflash.config"):
+        loaded = load_config(path)
+    assert "max_stories" not in loaded["storage"] and "requests_per_minute" not in loaded["http"]
+    assert "Ignoring retired setting http.requests_per_minute" in caplog.text
+
+
+def test_busy_lock_status_is_read_only_and_a_skipped_build_is_not_success(tmp_path, capsys):
+    import json as _json
+    from onionflash.cli import main
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text('[storage]\ndatabase = "db.sqlite3"\noutput_dir = "public"\n'
+                        '[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
+    with run_lock(str(tmp_path / "db.sqlite3")) as held:
+        assert held
+        assert main(["build", "--config", str(cfg_path)]) == 75
+        assert main(["run", "--config", str(cfg_path)]) == 0
+        capsys.readouterr()
+        assert main(["status", "--config", str(cfg_path)]) == 0
+        assert _json.loads(capsys.readouterr().out)["sources"][0]["last_success"] is None
+    with Store(tmp_path / "db.sqlite3") as store:
+        assert store.db.execute("SELECT COUNT(*) FROM source_state").fetchone()[0] == 0
+
+
+def test_moved_installation_keeps_building(tmp_path):
+    first, moved = tmp_path / "first", tmp_path / "moved"
+    first.mkdir()
+    with Store(first / "state.db") as store:
+        build(config(first), store)
+    first.rename(moved)
+    with Store(moved / "state.db") as store:
+        build(config(moved), store)
+    assert (moved / "public" / "index.html").exists()
+
+
+def test_a_directory_at_the_marker_path_is_not_ownership(tmp_path):
+    (tmp_path / "public").mkdir()
+    (tmp_path / "public" / "operator-file.txt").write_text("keep")
+    (tmp_path / ".public.onionflash-owner").mkdir()
+    with Store(tmp_path / "state.db") as store, pytest.raises(ValueError, match="regular file"):
+        build(config(tmp_path), store)
+    assert (tmp_path / "public" / "operator-file.txt").read_text() == "keep"
 
 
 def test_status_reports_the_count_recorded_by_the_last_build(tmp_path, capsys):

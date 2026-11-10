@@ -14,9 +14,8 @@ import os
 import re
 import tempfile
 from contextlib import ExitStack, contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from . import render
 from .util import digest, now_iso
@@ -93,7 +92,7 @@ def _set_meta(db, key: str, value: str) -> None:
 
 
 def publication_year() -> int:
-    return datetime.now(ZoneInfo("America/Los_Angeles")).year
+    return datetime.now(timezone.utc).year
 
 
 def template_identity(site: dict) -> str:
@@ -108,18 +107,17 @@ def _owned_output(value: str) -> Path:
         raise ValueError("Public output must not be a symlink")
     output = output.resolve()
     owner = output.parent / ("." + output.name + ".onionflash-owner")
-    identity = "OnionFlash generated output v1\n" + str(output) + "\n"
     if owner.is_symlink() or (output.exists() and not output.is_dir()):
         raise ValueError("Unsafe public output ownership marker or directory")
-    if owner.exists() and owner.read_text() != identity:
-        raise ValueError("Output ownership marker does not match configured directory")
+    if owner.exists() and not owner.is_file():
+        raise ValueError("Output ownership marker must be a regular file")
     if output.exists() and any(output.iterdir()) and not owner.exists():
         raise ValueError("Refusing to replace a nonempty directory not owned by Onion Flash")
     output.mkdir(parents=True, exist_ok=True)
     if not owner.exists():
         fd = os.open(owner, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
         with os.fdopen(fd, "w") as stream:
-            stream.write(identity)
+            stream.write("Onion Flash generated output\n")
     return output
 
 
@@ -303,7 +301,7 @@ def build(config: dict, store, *, force: bool = False) -> dict:
     output_missing = not Path(config["storage"]["output_dir"]).exists()
     output = _owned_output(config["storage"]["output_dir"])
     _backfill_public_json(db, output)
-    base = render._site_base(site["base_url"])
+    base = site["base_url"].rstrip("/") + "/"  # validated by load_config
     observed = now_iso()
     identity = template_identity(site)
     with db:

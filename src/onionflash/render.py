@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import email.utils
 import html
-import ipaddress
 import json
 import logging
 import re
@@ -16,10 +15,9 @@ import shutil
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import unquote, urlsplit, urlunsplit
-from zoneinfo import ZoneInfo
-from .schema import CATEGORY_LABELS as CATEGORIES, PRIORITIES, CONFIDENCES, STATES
-from .util import parse_utc as _date, format_utc as _iso
+from urllib.parse import urlsplit
+from .schema import CATEGORY_LABELS as CATEGORIES, PRIORITIES, PRODUCTS, CONFIDENCES, STATES
+from .util import canonical_url, parse_utc as _date, format_utc as _iso
 
 
 ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
@@ -40,42 +38,12 @@ def _text(value: object, limit: int) -> str:
     return " ".join(clean.split())[:limit]
 
 
-def _safe_url(value: object, *, allow_local: bool = False) -> str:
-    if not isinstance(value, str) or len(value) > 4096:
-        return ""
-    if any(ord(char) < 32 or ord(char) == 127 for char in value) or "\\" in value:
-        return ""
+def _public_url(value: object) -> str:
+    """The same citation rules as collection; an unsafe link is dropped, not published."""
     try:
-        value.encode("utf-8")
-        parsed = urlsplit(value)
-        if parsed.scheme not in {"https", "http"} or not parsed.hostname:
-            return ""
-        if parsed.username is not None or parsed.password is not None:
-            return ""
-        _ = parsed.port  # Reject malformed and out-of-range ports.
-        hostname = parsed.hostname.lower().rstrip(".")
-        if not allow_local:
-            try:
-                if not ipaddress.ip_address(hostname).is_global:
-                    return ""
-            except ValueError:
-                numeric_parts = hostname.split(".")
-                alternate_ip = all(re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", part) for part in numeric_parts)
-                if alternate_ip or "." not in hostname or hostname.endswith((".localhost", ".local", ".internal", ".home", ".test")):
-                    return ""
-        return value
+        return canonical_url(value)
     except (TypeError, ValueError, UnicodeError):
         return ""
-
-
-def _site_base(value: object) -> str:
-    url = _safe_url(value, allow_local=True)
-    if not url:
-        raise ValueError("site.base_url must be an absolute HTTP(S) URL without credentials")
-    parsed = urlsplit(url)
-    if parsed.query or parsed.fragment or any(part in {".", ".."} for part in unquote(parsed.path).split("/")):
-        raise ValueError("site.base_url must contain a clean path without query or fragment")
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/") + "/", "", ""))
 
 
 def _time(value: str, *, full: bool = False) -> str:
@@ -86,15 +54,6 @@ def _time(value: str, *, full: bool = False) -> str:
 
 def _label(value: str) -> str:
     return value.replace("-", " ").capitalize()
-
-
-def _limit(value: object, default: int, maximum: int) -> int:
-    if isinstance(value, bool):
-        return default
-    try:
-        return max(1, min(int(value), maximum))
-    except (TypeError, ValueError, OverflowError):
-        return default
 
 
 def _prepare_story(story: dict) -> dict:
@@ -111,19 +70,17 @@ def _prepare_story(story: dict) -> dict:
     summary = _text(story.get("summary"), 1600)
     if not title or not summary:
         raise ValueError("Published stories require a title and summary")
-    sources = []
-    for source in story.get("sources", [])[:20]:
+    sources = {}
+    for source in story["sources"][:20]:
         if not isinstance(source, dict):
             continue
-        url = _safe_url(source.get("url"))
-        if url and all(existing["url"] != url for existing in sources):
-            sources.append({"url": url, "title": _text(source.get("title"), 200) or urlsplit(url).hostname})
+        url = _public_url(source.get("url"))
+        if url and url not in sources:
+            sources[url] = {"url": url, "title": _text(source.get("title"), 200) or urlsplit(url).hostname}
     if not sources:
         raise ValueError("Published stories require at least one safe source URL")
-    tags = []
-    for tag in [category, *story.get("tags", [])[:20]]:
-        if isinstance(tag, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", tag) and tag not in tags:
-            tags.append(tag)
+    # Only schema values reach the page, so one malformed stored field cannot break a build.
+    tags = list(dict.fromkeys(tag for tag in [category, *story.get("tags", [])] if isinstance(tag, str) and tag in CATEGORIES))
     published = _date(story.get("published_at"))
     updated = _date(story.get("updated_at"))
     if updated < published:
@@ -132,8 +89,8 @@ def _prepare_story(story: dict) -> dict:
         "id": story_id, "title": title, "summary": summary,
         "why_it_matters": _text(story.get("why_it_matters"), 800),
         "category": category, "priority": priority, "confidence": confidence,
-        "state": state, "tags": tags, "sources": sources,
-        "products": [p for p in story.get("products", [])[:10] if isinstance(p, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", p)],
+        "state": state, "tags": tags, "sources": list(sources.values()),
+        "products": [product for product in story.get("products", []) if isinstance(product, str) and product in PRODUCTS],
         "published_at": _iso(published), "updated_at": _iso(updated),
         # When Onion Flash first published the story; older records fall back to the source date.
         "added_at": _iso(_date(story.get("added_at") or story.get("published_at"))),
@@ -155,7 +112,7 @@ def _badges(story: dict) -> str:
 def _source_links(story: dict, *, expanded: bool = False) -> str:
     if expanded:
         return '<ol class="source-list">' + "".join(
-            f'<li><a href="{_escape(source["url"])}" rel="noopener noreferrer">{_escape(source["title"])}</a>'
+            f'<li><a href="{_escape(source["url"])}" rel="noopener noreferrer">{_escape(source["title"])}</a> '
             f'<span class="source-domain">{_escape(urlsplit(source["url"]).hostname)}</span></li>'
             for source in story["sources"]
         ) + "</ol>"
@@ -174,7 +131,7 @@ def _card(story: dict, base: str) -> str:
     updated = ""
     if story["updated_at"] > story["added_at"]:
         updated = f'<span class="updated-note">Updated {_time(story["updated_at"])}</span>'
-    return f'''<article class="story" id="story-{story['id']}" data-tags="{_escape(' '.join(story['tags']))}" data-search="{_escape(search.casefold())}">
+    return f'''<article class="story" id="story-{story['id']}" data-tags="{_escape(' '.join(story['tags']))}" data-search="{_escape(search.lower())}">
       <div class="story-topline">{_badges(story)}<span class="story-date">{_time(story['added_at'])}</span></div>
       <h2><a href="{_escape(_permalink(base, story))}">{_escape(story['title'])}</a></h2>
       <p class="story-summary">{_escape(story['summary'])}</p>
@@ -193,7 +150,7 @@ def _health_details(health: list[dict]) -> str:
             continue
         # Only freshness is public; operators get times and errors from `onionflash status`.
         degraded = bool(item.get("stale"))
-        url = _safe_url(item.get("website_url"))
+        url = _public_url(item.get("website_url"))
         source = f'<a href="{_escape(url)}">{_escape(name)}</a>' if url else f'<span>{_escape(name)}</span>'
         rows.append(f'<li><div>{source}<span class="health-state{" delayed" if degraded else ""}">{"Delayed" if degraded else "Collected"}</span></div></li>')
     if not rows:
@@ -226,8 +183,8 @@ def _navigation(base: str) -> str:
 
 def _shell(site: dict, base: str, title: str, description: str, body: str, canonical: str) -> str:
     name = _text(site.get("title", "Onion Flash"), 80)
-    repository = _safe_url(site.get("repository_url", "https://github.com/1aeo/onionflash"))
-    year = datetime.now(ZoneInfo("America/Los_Angeles")).year
+    repository = _public_url(site.get("repository_url", "https://github.com/1aeo/onionflash"))
+    year = datetime.now(timezone.utc).year
     repository_link = f'<a href="{_escape(repository)}">Source code ↗</a>' if repository else ""
     return f'''<!doctype html>
 <html lang="en"><head>
@@ -405,7 +362,7 @@ def render_site(config: dict, stories: list[dict], source_health: list[dict], ou
     if output_dir.exists() and (not output_dir.is_dir() or any(output_dir.iterdir())):
         raise ValueError("Output directory must be empty")
     site = config.get("site", {})
-    base = _site_base(site.get("base_url", "https://1aeo.com/onionflash/"))
+    base = site.get("base_url", "https://1aeo.com/onionflash/").rstrip("/") + "/"  # validated by load_config
     public = []
     for story in stories:
         try:
@@ -422,8 +379,8 @@ def render_site(config: dict, stories: list[dict], source_health: list[dict], ou
     if len({story["id"] for story in public}) != len(public):
         raise ValueError("Duplicate story IDs")
     public.sort(key=lambda story: (story["updated_at"], story["published_at"], story["id"]), reverse=True)
-    page_size = _limit(site.get("page_size"), 100, 1000)
-    feed_size = None if site.get("feed_size", 0) == 0 else _limit(site.get("feed_size"), 50, 100000)
+    page_size = site.get("page_size", 100)
+    feed_size = site.get("feed_size", 0) or None
     pages = max(1, (len(public) + page_size - 1) // page_size)
     homepage = sorted(public, key=lambda story: (story["added_at"], story["updated_at"], story["id"]), reverse=True)
     output_dir.mkdir(parents=True, exist_ok=True)

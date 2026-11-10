@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import copy
 import ipaddress
+import logging
 import os
 import re
 import tomllib
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from .util import canonical_url
 from .schema import PRODUCTS
@@ -57,21 +58,9 @@ DEFAULTS = {
         "max_retry_after_seconds": 60,
         "max_redirects": 4,
         "max_response_bytes": 2097152,
-        "requests_per_minute": 30,
-        "user_agent": "OnionFlash/0.1 (+https://github.com/1aeo/onionflash)",
+        "user_agent": "OnionFlash (+https://github.com/1aeo/onionflash)",
     },
-    "monitoring": {
-        "min_reports": 2,
-        "min_span_seconds": 3600,
-        "window_seconds": 172800,
-        "stale_after_seconds": 259200,
-        "retention_days": 30,
-        "max_observations": 10000,
-        "max_groups": 2000,
-        "max_source_links": 3,
-        "max_alerts_per_item": 100,
-        "max_future_seconds": 300,
-    },
+    "monitoring": {},
     "llm": {
         "base_url": "",
         "fallback_base_urls": [],
@@ -108,7 +97,6 @@ BOUNDS = {
     "max_retry_after_seconds": (0, 600),
     "max_redirects": (0, 10),
     "max_response_bytes": (1024, 16777216),
-    "requests_per_minute": (1, 600),
     "lookback_days": (1, 365),
     "overlap_seconds": (0, 86400),
     "max_pages": (1, 100),
@@ -133,21 +121,14 @@ BOUNDS = {
     "max_xml_elements": (100, 100000),
     "healthy_poll_tolerance_seconds": (0, 60),
     "tag_priority_score": (0, 20),
-    "min_reports": (2, 100),
-    "min_span_seconds": (300, 604800),
-    "window_seconds": (600, 2592000),
-    "retention_days": (1, 365),
-    "max_observations": (100, 100000),
-    "max_groups": (10, 10000),
-    "max_source_links": (2, 10),
-    "max_alerts_per_item": (1, 1000),
-    "max_future_seconds": (0, 3600),
 }
 
 
 # Settings that older configuration files may still contain. They are accepted
 # and ignored, so a deployment can delete them at its own pace.
-RETIRED = {"storage": {"max_stories"}}
+RETIRED = {"storage": {"max_stories"}, "http": {"requests_per_minute"}, "monitoring": {
+    "min_reports", "min_span_seconds", "window_seconds", "stale_after_seconds", "retention_days",
+    "max_observations", "max_groups", "max_source_links", "max_alerts_per_item", "max_future_seconds"}}
 
 
 def _expand(value: str) -> str:
@@ -174,6 +155,8 @@ def load_config(path: str | Path) -> dict:
         else:
             if not isinstance(values, dict):
                 raise ValueError(f"{section} must be a table")
+            for key in sorted(set(values) & RETIRED.get(section, set())):
+                logging.getLogger(__name__).warning("Ignoring retired setting %s.%s; it can be deleted", section, key)
             values = {k: v for k, v in values.items() if k not in RETIRED.get(section, ())}
             unknown = set(values) - set(DEFAULTS[section])
             if unknown:
@@ -181,7 +164,7 @@ def load_config(path: str | Path) -> dict:
                     f"Unknown {section} settings: {', '.join(sorted(unknown))}"
                 )
             config[section].update(values)
-    for section in ("http", "collection", "llm", "storage", "site", "monitoring"):
+    for section in ("http", "collection", "llm", "storage", "site"):
         for key, value in config[section].items():
             if key in BOUNDS:
                 low, high = BOUNDS[key]
@@ -205,9 +188,6 @@ def load_config(path: str | Path) -> dict:
                     raise ValueError(f"{section}.{key} must be an integer")
     if config["http"]["backoff_cap_seconds"] < config["http"]["backoff_base_seconds"]:
         raise ValueError("HTTP backoff cap must be at least its base")
-    monitoring = config["monitoring"]
-    if not monitoring["min_span_seconds"] <= monitoring["window_seconds"] <= monitoring["retention_days"] * 86400:
-        raise ValueError("Monitoring window must cover the minimum span and fit within retention")
     base_url = _expand(config["site"]["base_url"])
     parsed_site = urlsplit(base_url)
     if (
@@ -223,7 +203,9 @@ def load_config(path: str | Path) -> dict:
     ):
         raise ValueError("site.base_url must be a clean absolute HTTP(S) URL")
     _ = parsed_site.port
-    config["site"]["base_url"] = base_url.rstrip("/") + "/"
+    # Rebuilt from its parts, so an empty trailing "?" or "#" cannot swallow the file names.
+    config["site"]["base_url"] = urlunsplit(
+        (parsed_site.scheme, parsed_site.netloc, parsed_site.path.rstrip("/") + "/", "", ""))
     config["site"]["repository_url"] = canonical_url(config["site"]["repository_url"])
     for key in ("title", "description"):
         if not isinstance(config["site"][key], str) or len(config["site"][key]) > 300:

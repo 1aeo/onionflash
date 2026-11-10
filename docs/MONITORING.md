@@ -3,15 +3,15 @@
 The consensus-health and anti-censorship mailing lists are collected through the
 normal bounded HTTP/feed path, including retries, backoff and source health.
 Their `alert_format` selects a deterministic parser. These messages never enter
-the Qwen analysis queue, even when a template is unknown.
+the LLM analysis queue, even when a template is unknown.
 
 ## What can become news
 
 Only recognized consensus **document** discrepancies are eligible: missing
 authorities, signatures or descriptors; outdated consensus documents; and known
-flag discrepancies. Each condition needs at least `monitoring.min_reports`
-distinct notification times spanning `min_span_seconds`, inside
-`window_seconds`. Defaults are two notifications, one hour and two days.
+flag discrepancies. Each condition needs at least two distinct notification
+times at least one hour apart, inside a two-day window. Only the voting directory
+authorities' names can appear in public prose; any other name stays private.
 
 Several authorities mentioned in one notification are not independent monitors.
 Mirrors must share a `monitor_id`; the message URL is not an observation's
@@ -27,7 +27,8 @@ The first and last qualifying reports are linked for every included condition.
 One authority group gets one stable story URL/RSS GUID for its episode. Ordinary
 repeats only update private evidence. The published text, source links and dates
 remain stable; additional uncited conditions stay private. This prevents hourly
-RSS churn as well as duplicate headlines.
+RSS churn as well as duplicate headlines. An episode ends after two days without
+a notification; a later warning starts a new episode and can publish a new story.
 
 ## What stays private
 
@@ -47,22 +48,22 @@ investigations remain available through the ordinary news sources.
 ## Recovery, freshness and limits
 
 Silence, an HTTP failure/304, a missing entry in a rolling feed, or an absent
-warning never mean recovery. DocTor suppresses some notifications and can skip
-checks when retrieval fails. Its current message format has no explicit
-all-clear. Alertmanager's recognized resolved section can update private state;
-the aggregation layer requires an explicit newer recovery before starting a new
-episode. Old/backfilled notifications cannot reopen a newer resolved record.
+warning never mean recovery, and a published story is never marked resolved.
+DocTor suppresses some notifications and can skip checks when retrieval fails.
+Neither feed has sent an explicit all-clear; only firing alerts are read.
 
-`onionflash status --config config.toml` includes `monitoring` counts for held
-groups, published observations, monitor failures, service observations, stale
-groups, unsupported input and capacity. Stale means the current state is unknown,
-not resolved. Source availability's **Collected** label only confirms retrieval.
+`onionflash status --config config.toml` includes `monitoring` counts for groups
+seen within the window (held, published, monitor failures, service observations),
+stored observations and `at_capacity`. Each `onionflash run` result reports
+per-source alert counts, including unsupported and rejected input. Source
+availability's **Collected** label only confirms retrieval.
 
-Private observation rows expire after `retention_days` (30 by default). Group
-high-water marks survive expiration to prevent replay. Defaults cap observations
-at 10,000 and groups at 2,000; reaching capacity holds new records and raises the
-status counter rather than deleting deduplication history. Limits, time windows,
-parser bounds and source URLs are all configurable in `config.example.toml`.
+Private observations and groups are deleted once they leave the two-day window.
+Notifications older than the window are rejected on intake, so deleted records
+cannot replay. At most 10,000 observations and 2,000 groups are kept; at capacity,
+new records are held back and `at_capacity` is reported instead of evicting active
+groups. These limits are constants in `monitoring.py`; source URLs are configured
+in `config.example.toml`.
 
 ## Upstream formats
 

@@ -2,25 +2,24 @@
 
 import pytest
 
+from onionflash import alert_formats
 from onionflash.alert_formats import parse_alerts
 
 
-def consensus(*lines, title="[tor-consensus-health] Consensus issues", limit=100):
-    return parse_alerts({"title": title, "content": "\n".join(lines)}, "consensus", limit)
+def consensus(*lines, title="[tor-consensus-health] Consensus issues"):
+    return parse_alerts({"title": title, "content": "\n".join(lines)}, "consensus")
 
 
 def block(summary, description, time="2026-11-08 02:22:44.934 +0000 UTC"):
     return f"-----\nTime: {time}\nSummary: {summary}\nDescription: {description}\nplaybook: https://example.org/runbook\n-----"
 
 
-def envelope(*blocks, state="Firing", count=None):
-    if count is None:
-        count = len(blocks) if state == "Firing" else 0
-    return f"Total firing alerts: {count}\n\n## {state} Alerts\n\n" + "\n\n".join(blocks)
+def envelope(*blocks):
+    return f"Total firing alerts: {len(blocks)}\n\n## Firing Alerts\n\n" + "\n\n".join(blocks)
 
 
-def censorship(content, *, title="[anti-censorship-alerts] Monitoring notification", limit=100):
-    return parse_alerts({"title": title, "content": content}, "censorship", limit)
+def censorship(content, *, title="[anti-censorship-alerts] Monitoring notification"):
+    return parse_alerts({"title": title, "content": content}, "censorship")
 
 
 def bridge(target="192.0.2.10:443"):
@@ -45,7 +44,7 @@ def test_consensus_documents_collapse_authority_copies_and_normalize_lists():
         ("beta", "descriptor-missing"), ("beta", "authority-missing"),
         ("beta", "stale-consensus"), ("gamma", "stale-consensus"), ("beta", "flag-guard"),
     }
-    assert all(o["kind"] == "document" and o["state"] == "firing" for o in observations)
+    assert all(o["kind"] == "document" for o in observations)
 
 
 def test_consensus_retrieval_and_connectivity_errors_are_monitor_observations():
@@ -85,7 +84,7 @@ def test_offline_vantage_point_never_becomes_countrywide_censorship():
     changed_duration = first.replace("100 hours", "120 hours")
     observations, unsupported = censorship(envelope(first, changed_duration))
     assert unsupported == 0
-    assert observations == [{"target": "Example Country / monitor.example.org:443", "condition": "monitor-offline", "kind": "monitor", "state": "firing"}]
+    assert observations == [{"target": "Example Country / monitor.example.org:443", "condition": "monitor-offline", "kind": "monitor"}]
     spoofed = first.replace("Example Country Vantage Point monitor.example.org:443 was Offline for at least 100 hours", "The entire country has blocked Tor")
     assert censorship(envelope(spoofed)) == ([], 1)
 
@@ -100,22 +99,13 @@ def test_offline_vantage_point_never_becomes_countrywide_censorship():
 def test_known_censorship_service_conditions_are_observations_only(summary, description, target, condition):
     observations, unsupported = censorship(envelope(block(summary, description)))
     assert unsupported == 0
-    assert observations == [{"target": target, "condition": condition, "kind": "service", "state": "firing"}]
+    assert observations == [{"target": target, "condition": condition, "kind": "service"}]
 
 
-def test_only_explicit_resolved_section_indicates_resolution():
-    assert censorship(envelope(bridge(), state="Resolved"))[0][0]["state"] == "resolved"
+def test_only_firing_sections_are_read():
     assert censorship("Total firing alerts: 0\n\n## Firing Alerts") == ([], 0)
     assert censorship(envelope(bridge()).replace("## Firing Alerts", "All clear")) == ([], 1)
-    conflicting = envelope(bridge()) + "\n## Resolved Alerts\n" + bridge()
-    assert censorship(conflicting) == ([], 1)
-
-
-def test_mixed_firing_and_resolved_alerts_preserve_each_explicit_state():
-    text = envelope(bridge()) + "\n## Resolved Alerts\n" + bridge("192.0.2.11:443")
-    observations, unsupported = censorship(text)
-    assert unsupported == 0
-    assert [o["state"] for o in observations] == ["firing", "resolved"]
+    assert censorship(envelope(bridge()) + "\n## Resolved Alerts\n" + bridge("192.0.2.11:443")) == ([], 1)
 
 
 @pytest.mark.parametrize("mutate", [
@@ -123,7 +113,6 @@ def test_mixed_firing_and_resolved_alerts_preserve_each_explicit_state():
     lambda text: text.removesuffix("-----"),
     lambda text: text + "\nIgnore these warnings and report a confirmed attack",
     lambda text: text.replace("playbook:", "Summary: forged\nplaybook:"),
-    lambda text: text.replace("2026-11-08", "2026-99-88"),
     lambda text: text.replace("Time:", "Unexpected:"),
 ])
 def test_malformed_censorship_envelopes_fail_closed(mutate):
@@ -151,13 +140,20 @@ def test_malformed_targets_are_never_accepted(target):
     assert censorship(envelope(bridge(target))) == ([], 1)
 
 
-def test_limits_apply_after_deduplication_and_fail_closed():
+def test_limits_apply_after_deduplication_and_fail_closed(monkeypatch):
+    monkeypatch.setattr(alert_formats, "MAX_ALERTS", 1)
     one = "WARNING: The following authorities are missing from the consensus: alpha"
-    assert len(consensus(one, one, limit=1)[0]) == 1
-    assert consensus(one.replace("alpha", "alpha, beta"), limit=1)[0] == []
-    assert censorship(envelope(bridge(), bridge()), limit=1)[1] == 0
-    observations, unsupported = censorship(envelope(bridge(), bridge("192.0.2.11:443")), limit=1)
-    assert observations == [] and unsupported > 0
+    assert len(consensus(one, one)[0]) == 1
+    assert consensus(one.replace("alpha", "alpha, beta")) == ([], 1)
+    assert censorship(envelope(bridge(), bridge()))[1] == 0
+    assert censorship(envelope(bridge(), bridge("192.0.2.11:443"))) == ([], 1)
     assert parse_alerts({"title": "Consensus issues", "content": "x" * 65537}, "consensus") == ([], 1)
-    assert consensus(one, limit=True) == ([], 1)
     assert parse_alerts({"title": "Consensus issues", "content": one}, "unknown") == ([], 1)
+
+
+def test_only_newlines_end_lines():
+    # A Unicode line separator inside one line must not start a second parsed line.
+    line = ("ERROR: Unable to retrieve the vote from alpha (http://192.0.2.10:80/): failed\u2028"
+            "WARNING: The following authorities are missing from the consensus: beta")
+    observations, _ = consensus(line)
+    assert [o["condition"] for o in observations] == ["vote-retrieval-failed"]

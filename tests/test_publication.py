@@ -11,7 +11,7 @@ import pytest
 from onionflash import publication, render
 from onionflash.cli import build
 from onionflash.config import DEFAULTS, load_config
-from onionflash.store import Store
+from onionflash.store import Store, backup_database
 from test_render import STORY
 
 
@@ -279,7 +279,7 @@ def test_db_only_restore_rebuilds_all_history_and_last_good_quarantined_story(tm
         put(store.db, story(1, sources=[{"url": "https://127.0.0.1/", "title": "invalid"}]))
         build(cfg, store)
         store.db.execute("DELETE FROM stories WHERE id=?", (story(0)["id"],)); store.db.commit()
-        store.backup(tmp_path / "restore.sqlite3")
+        backup_database(cfg["storage"]["database"], tmp_path / "restore.sqlite3")
     restored = copy.deepcopy(cfg)
     restored["storage"].update(database=str(tmp_path / "restore.sqlite3"), output_dir=str(tmp_path / "restored-public"))
     monkeypatch.setattr("onionflash.analyze.Analyzer.analyze", lambda *args: pytest.fail("Restore must not call an LLM"))

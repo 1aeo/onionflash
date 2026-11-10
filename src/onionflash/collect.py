@@ -13,7 +13,7 @@ import feedparser
 
 from .transport import FetchError, HttpClient
 from .util import (
-    UTC, BudgetExceeded, after, canonical_url, format_utc, parse_utc, plain_text, timestamp,
+    UTC, after, canonical_url, format_utc, parse_utc, plain_text, timestamp,
 )
 
 
@@ -24,13 +24,11 @@ class CollectionError(Exception):
         items: list[dict] | None = None,
         checkpoint: dict | None = None,
         catching_up: bool = False,
-        timed_out: bool = False,
     ):
         super().__init__(message)
         self.items = items or []
         self.checkpoint = checkpoint
         self.catching_up = catching_up
-        self.timed_out = timed_out
 
 
 def _entry_time(entry: dict, name: str, fallback: str) -> str:
@@ -71,6 +69,17 @@ def _item(
     }
 
 
+def _get(client: HttpClient, url: str, state: dict):
+    """GET with the cache validators saved for this exact URL."""
+    headers = {}
+    if state.get("active_url") == url:
+        if state.get("etag"):
+            headers["If-None-Match"] = state["etag"]
+        if state.get("last_modified"):
+            headers["If-Modified-Since"] = state["last_modified"]
+    return client.request("GET", url, headers=headers)
+
+
 def _feed(
     client: HttpClient,
     source: dict,
@@ -79,13 +88,7 @@ def _feed(
     settings: dict,
     started: str,
 ) -> dict:
-    headers = {}
-    if state.get("active_url") == url:
-        if state.get("etag"):
-            headers["If-None-Match"] = state["etag"]
-        if state.get("last_modified"):
-            headers["If-Modified-Since"] = state["last_modified"]
-    response = client.request("GET", url, headers=headers)
+    response = _get(client, url, state)
     if response.status == 304:
         return {
             "items": [],
@@ -122,7 +125,7 @@ def _feed(
         parser.Parse(response.body, True)
     except expat.ExpatError as exc:
         raise CollectionError("Invalid RSS/Atom XML") from exc
-    feed = feedparser.parse(response.body)
+    feed = feedparser.parse(response.body, sanitize_html=False, resolve_relative_uris=False)
     if not feed.get("version") or feed.get("bozo"):
         raise CollectionError("Invalid RSS/Atom document")
     cutoff = after(-settings["lookback_days"] * 86400, started)
@@ -261,10 +264,6 @@ def _gitlab(
         )
         try:
             response = client.request("GET", request_url)
-        except BudgetExceeded as exc:
-            raise CollectionError(
-                "Source time budget exceeded", items, checkpoint, timed_out=True
-            ) from exc
         except FetchError as exc:
             raise CollectionError(str(exc), items, checkpoint) from exc
         try:
@@ -381,7 +380,7 @@ def collect_source(
                 return _feed(client, source, url, state, settings, started)
             if source["kind"] == "metrics_timeline":
                 from .timeline import collect_timeline
-                return collect_timeline(client, {**source, "url": url}, state, settings, started)
+                return collect_timeline(client, source, url, state, settings, started)
             return _gitlab(client, source, url, state, settings, started)
         except CollectionError as exc:
             errors.append(str(exc))
@@ -389,7 +388,7 @@ def collect_source(
             if exc.checkpoint:
                 checkpoint = exc.checkpoint
             catching_up = exc.catching_up
-            if exc.catching_up or exc.timed_out:
+            if exc.catching_up:
                 # Another mirror cannot make this bounded scan finish faster.
                 break
         except FetchError as exc:
