@@ -1,7 +1,8 @@
-"""Model output validation, endpoint failure handling, grounding pass and the rejected state."""
+"""Draft schema/evidence, shared transport, retained baseline checks and rejection."""
 
 from __future__ import annotations
 
+from approval_helpers import ApprovingReviewer
 import copy
 import json
 
@@ -43,80 +44,16 @@ def analyzer(monkeypatch, *responses, fallbacks=()):
     return result
 
 
-def grounded(**changes):
-    text = {key: analysis()[key] for key in ("title", "summary", "why_it_matters")}
-    return {"unsupported": [], **text, **changes}
 
 
-def test_grounding_pass_replaces_unsupported_text(monkeypatch):
-    claim = "Operators must update their configurations to exclude the node."
-    revised = "Scope and consequences remain subject to the linked upstream discussion."
-    llm = analyzer(monkeypatch, completion(analysis(why_it_matters=claim)),
-                   completion(grounded(unsupported=[claim], why_it_matters=revised)))
-    result = llm.analyze(item())
-    assert result["why_it_matters"] == revised
-    draft, check = (body for _, body in llm.client.requests)
-    assert check["response_format"]["json_schema"]["name"] == "onionflash_grounding"
-    sent = json.loads(check["messages"][1]["content"])
-    assert sent["draft"]["why_it_matters"] == claim and sent["source"]["content"] == item()["content"]
 
 
-def test_grounding_rewrite_must_still_pass_validation(monkeypatch):
-    # The failed check gets one repair round; a repair that still fails is rejected.
-    llm = analyzer(monkeypatch, completion(analysis()), completion(grounded(why_it_matters="")),
-                   completion(grounded(why_it_matters="")))
-    with pytest.raises(AnalysisError, match="needs text") as caught:
-        llm.analyze(item())
-    assert not caught.value.retryable
-    assert len(llm.client.requests) == 3
-    assert "needs text" in json.loads(llm.client.requests[2][1]["messages"][1]["content"])["problem"]
-    # A repair call that itself returns garbage keeps the original reason.
-    llm = analyzer(monkeypatch, completion(analysis()), completion(grounded(why_it_matters="")),
-                   completion({"verdict": "fine"}))
-    with pytest.raises(AnalysisError, match="needs text"):
-        llm.analyze(item())
-    llm = analyzer(monkeypatch, completion(analysis()), completion({"verdict": "fine"}))
-    with pytest.raises(AnalysisError, match="grounding check") as caught:
-        llm.analyze(item())
-    assert not caught.value.retryable
 
 
-def test_a_statement_the_check_flags_but_keeps_is_rejected(monkeypatch):
-    claim = "Operators must update their configurations to exclude the node."
-    kept = grounded(unsupported=[claim], why_it_matters=claim)
-    llm = analyzer(monkeypatch, completion(analysis(why_it_matters=claim)), completion(kept),
-                   completion(grounded(why_it_matters=claim)))
-    with pytest.raises(AnalysisError, match="left this flagged statement unchanged") as caught:
-        llm.analyze(item())
-    assert not caught.value.retryable
-    # The repair round was told which statement it kept.
-    assert claim in json.loads(llm.client.requests[2][1]["messages"][1]["content"])["problem"]
-    # Editing a different sentence of the same field does not fix the flagged one.
-    partly = grounded(unsupported=[claim], why_it_matters="The report concerns trust. " + claim)
-    llm = analyzer(monkeypatch, completion(analysis(why_it_matters="It matters. " + claim)), completion(partly),
-                   completion(partly))
-    with pytest.raises(AnalysisError, match="left this flagged statement unchanged"):
-        llm.analyze(item())
 
 
-def test_one_repair_round_fixes_exactly_the_failed_check(monkeypatch):
-    draft = analysis(title="Operator removed the affected keys after reported compromise")
-    fixed = "Operator reports possible compromise and stops trusting its keys"
-    llm = analyzer(monkeypatch, completion(draft), completion(grounded(title=draft["title"])),
-                   completion(grounded(title=fixed)))
-    assert llm.analyze(item())["title"] == fixed
-    problem = json.loads(llm.client.requests[2][1]["messages"][1]["content"])["problem"]
-    assert problem == "The title says 'removed', a completed action the source does not state"
 
 
-def test_attributing_a_flagged_statement_to_the_source_does_not_fix_it(monkeypatch):
-    claim = "Operators must update their configurations to exclude the node."
-    attributed = "According to the report, operators must update their configurations to exclude the node."
-    llm = analyzer(monkeypatch, completion(analysis(why_it_matters=claim)),
-                   completion(grounded(unsupported=[claim], why_it_matters=attributed)),
-                   completion(grounded(why_it_matters=attributed)))
-    with pytest.raises(AnalysisError, match="left this flagged statement unchanged"):
-        llm.analyze(item())
 
 
 def test_a_qualifier_inside_the_flagged_claim_does_not_excuse_it():
@@ -161,19 +98,8 @@ def test_a_short_flagged_statement_left_unchanged_is_kept():
     assert _kept_claim(["Safe."], [draft], {**draft, "title": "New title"}) == "Safe."
 
 
-def test_malformed_unsupported_entries_are_a_schema_error(monkeypatch):
-    llm = analyzer(monkeypatch, completion(analysis()), completion(grounded(unsupported=[123])))
-    with pytest.raises(AnalysisError, match="does not match schema"):
-        llm.analyze(item())
 
 
-def test_a_flagged_statement_may_be_reworded_with_the_same_words(monkeypatch):
-    claim = "plausible compromise of all relays"
-    for rewrite in ("The report does not say whether this is a plausible compromise of all relays.",
-                    "It is unclear whether this is a plausible compromise of all relays."):
-        draft = analysis(summary="The operator reported a plausible compromise of all relays.")
-        llm = analyzer(monkeypatch, completion(draft), completion(grounded(unsupported=[claim], summary=rewrite)))
-        assert llm.analyze(item())["summary"] == rewrite
 
 
 def test_non_finite_numbers_are_invalid_model_json():
@@ -201,7 +127,7 @@ def test_endpoint_failures_are_retryable_and_validation_is_not_resent(monkeypatc
         llm.analyze(item())
     assert not caught.value.retryable and len(llm.client.requests) == 1
     llm = analyzer(monkeypatch, FetchError("network request failed", retryable=True),
-                   completion(analysis()), completion(grounded()), fallbacks=["https://fallback.example/v1"])
+                   completion(analysis()), fallbacks=["https://fallback.example/v1"])
     assert llm.analyze(item())["title"] == analysis()["title"]
     assert [url for url, _ in llm.client.requests][0].startswith("https://llm.example")
 
@@ -271,6 +197,7 @@ def test_one_failing_item_does_not_stop_the_run_but_two_endpoint_failures_do(tmp
             return analysis()
 
     monkeypatch.setattr(cli, "Analyzer", FlakyAnalyzer)
+    monkeypatch.setattr(cli, "Reviewer", ApprovingReviewer)
     monkeypatch.setattr(cli, "build", lambda *args: {})
     config = copy.deepcopy(DEFAULTS)
     config["sources"] = []
@@ -281,3 +208,27 @@ def test_one_failing_item_does_not_stop_the_run_but_two_endpoint_failures_do(tmp
                 store.ingest(item(url=url, content=url, labels=["Security"] if url.endswith("bad") else []), DATE)
             cli.run(config, store)
         assert len(calls) == expected
+
+
+def test_writer_produces_one_draft_without_premerge_grounding(monkeypatch):
+    claim = "Operators must update their configurations to exclude the node."
+    draft = analysis(why_it_matters=claim, confidence="confirmed", state="released")
+    llm = analyzer(monkeypatch, completion(draft))
+    assert llm.analyze(item()) == draft
+    assert len(llm.client.requests) == 1
+    # The separate exact-candidate reviewer, not a hidden pre-merge rewrite,
+    # now owns semantic approval and correction of the unsupported claim.
+
+
+def test_empty_optional_context_is_a_valid_draft(monkeypatch):
+    draft = analysis(why_it_matters="")
+    llm = analyzer(monkeypatch, completion(draft))
+    assert llm.analyze(item())["why_it_matters"] == ""
+    assert len(llm.client.requests) == 1
+
+
+def test_duplicate_model_json_fields_are_rejected():
+    from onionflash.analyze import _json_object
+    for text in ('{"publish":false,"publish":true}', '{"nested":{"verdict":"hold","verdict":"approve"}}'):
+        with pytest.raises(AnalysisError, match="invalid JSON"):
+            _json_object(text)

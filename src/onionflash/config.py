@@ -92,6 +92,19 @@ DEFAULTS = {
         "enable_thinking": False,
         "send_chat_template_kwargs": True,
     },
+    "review": {
+        "model": "",
+        "timeout_seconds": 90,
+        "connect_timeout_seconds": 10,
+        "total_timeout_seconds": 120,
+        "max_output_tokens": 2200,
+        "max_source_chars": 24000,
+        "max_sources": 8,
+        "max_passages": 64,
+        "passage_chars": 1800,
+        "max_repairs": 1,
+        "max_cache_entries": 2000,
+    },
     "sources": [],
 }
 
@@ -101,6 +114,14 @@ DEFAULTS = {
 # own max_pages and max_items.
 BOUNDS = {
     "timeout_seconds": (1, 600),
+    "connect_timeout_seconds": (1, 120),
+    "total_timeout_seconds": (1, 600),
+    "max_output_tokens": (128, 8192),
+    "max_source_chars": (1000, 100000),
+    "max_sources": (1, 16),
+    "max_passages": (1, 256),
+    "passage_chars": (100, 4000),
+    "max_repairs": (0, 1),
     "max_pages": (1, 100),
     "page_size": (1, 100),
     "max_items_per_source": (1, 10000),
@@ -181,7 +202,7 @@ def load_config(path: str | Path) -> dict:
                     f"Unknown {section} settings: {', '.join(sorted(unknown))}"
                 )
             config[section].update(values)
-    for section in ("http", "collection", "llm", "storage", "site", "comments"):
+    for section in ("http", "collection", "llm", "storage", "site", "comments", "review"):
         for key, value in config[section].items():
             if key in BOUNDS:
                 low, high = BOUNDS[key]
@@ -272,6 +293,14 @@ def load_config(path: str | Path) -> dict:
         raise ValueError("llm.api_key_env must name an environment variable")
     if not isinstance(llm["model"], str) or not llm["model"] or len(llm["model"]) > 200:
         raise ValueError("llm.model must be a nonempty model identifier")
+    review = config["review"]
+    if not isinstance(review["model"], str) or len(review["model"]) > 200 or any(ord(c) < 32 for c in review["model"]):
+        raise ValueError("review.model must be a short model identifier, or empty to inherit llm.model")
+    review["model"] = review["model"].strip()
+    if review["total_timeout_seconds"] < review["connect_timeout_seconds"]:
+        raise ValueError("review.total_timeout_seconds must cover its connection timeout")
+    if review["passage_chars"] > review["max_source_chars"]:
+        raise ValueError("review.passage_chars must fit within max_source_chars")
     sources = config["sources"]
     if not isinstance(sources, list) or not sources or len(sources) > 100:
         raise ValueError("Configure between 1 and 100 sources")

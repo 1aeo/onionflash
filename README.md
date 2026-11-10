@@ -86,11 +86,13 @@ The API key is read only from the `ONIONFLASH_LLM_API_KEY` environment variable.
 | `storage` | Private SQLite path, owned public output directory and bounded article-render batch size |
 | `comments` | Optional anonymous GitLab discussion enrichment, polling/backoff, per-run/page/text limits and bounded watch-cache size |
 | `llm` | Base URL and fallback URLs, model, private-network allowlist (`allowed_networks`, `allow_http`), request timeout, items per run, chat-template flag |
+| `review` | Reviewer model override, request/token/source bounds, one-repair limit and approval-cache size |
 | `sources` | Stream ID, display name, public website URL, kind, collection URL, fallback URLs, product, authority, optional interval/page/item overrides |
 
-Collection, HTTP and other model limits (lookback, budgets, retries, response sizes,
+Collection, HTTP and writer model limits (lookback, budgets, retries, response sizes,
 backoff) are fixed defaults in `onionflash/config.py`; a file that still sets them
-loads, with each one logged as ignored.
+loads, with each one logged as ignored. The separate final-review settings are
+operator-configurable in `[review]`.
 
 Public sources must use HTTPS. Private inference endpoints require explicit
 `llm.allowed_networks` CIDRs and `llm.allow_http = true` when using HTTP. Prefer
@@ -142,8 +144,9 @@ endpoint, and `comments_enabled = false` excludes an individual source.
 No GitLab account, token or browser session is used. The collector verifies the
 project identity and public visibility, the issue's non-confidential status,
 and each note's non-internal/non-system status. Unknown visibility never admits
-new comment content. Comment authors and dates stay explicit, and the model's
-grounding pass sees exactly the same bounded text used for evidence validation.
+new comment content. Comment authors and dates stay explicit. Final review receives
+the bounded verified discussion independently of the quotes selected by the writer,
+so an uncited corrective comment is still available to the reviewer.
 
 Comments default to a 30-minute per-issue interval. Per-run limits rotate across
 projects and previously published issues, so this is bounded follow-up coverage,
@@ -238,6 +241,19 @@ database lock while taking their upload snapshot.
 
 ## Reliability and editorial behavior
 
+Automatic model-written news must pass a final source-bound publication review.
+The application drafts once, assembles the exact story using its existing grouping
+and precedence rules, then reviews that candidate against numbered source passages.
+The rubric checks support, actor/action, status, uncertainty, scope/timing,
+operational advice and technical details separately. All seven must pass.
+
+A proposed repair receives a fresh verification request before publication. There
+is at most one repair, so a normal successful path uses two model calls and a
+repaired path uses three. Timeouts or malformed verdicts retain completed stages
+and back off; a semantic hold enters the rejected queue. The context sentence
+(`why_it_matters`) may be empty when the sources do not support it. See
+[final review, configuration and evaluation](docs/FINAL_REVIEW.md).
+
 - Public HTTP and private inference share the same transport helper. It validates
   addresses at TCP connection time, pins connections to vetted IPs while retaining
   TLS hostname verification, rechecks redirects, and enforces compressed and
@@ -258,20 +274,24 @@ database lock while taking their upload snapshot.
   than repeat it forever. A completed scan moves the watermark to the poll start
   minus a 15-minute overlap. XML declarations/entities are rejected with an
   encoding-aware parser before feed parsing.
-- New and changed items are saved before analysis. Private analysis records are
-  identified by content hash, model, prompt version and input window; saved results
-  are never reused to skip analysis. The application makes one model request
-  at a time, with explicit per-run and token limits. Source polling reserves time
-  for pending analysis so an unavailable source cannot monopolize every run.
+- New and changed items are saved before analysis. Private analysis records remain
+  an audit, not a general runtime analysis cache. Unfinished review jobs retain
+  their completed writer draft and current review/verification stage. Exact
+  approval receipts are reused only when candidate, evidence, policy and source
+  bindings still match. The application makes one model request at a time, within
+  the existing run budget, and preserves the analysis time reserve.
 - Explicit `kind = "tag"` streams produce attributed tag notices without an LLM
   request. These notices remain `tagged`, have a fixed queue-priority
   floor, and cannot replace a richer announcement already grouped with that
-  version. Repeated identical model labels are normalized rather than retried;
+  version. If a tag joins existing model-written coverage, that final merged
+  candidate still needs review. Repeated identical model labels are normalized rather than retried;
   invalid labels and unsupported evidence are still rejected.
 - Summaries need schema-valid fields and exact supporting excerpts from the
   supplied source. The excerpts stay private; public citations are created from
   collected URLs, never model-proposed URLs. Source text is treated as untrusted
-  data. Evidence matching is an automated check, **not proof of factual accuracy**.
+  data. The final commit checks the approval hashes and current source/story/lock
+  state in one transaction, then writes the approved candidate without remerging.
+  Model review reduces unsupported claims; it is **not proof of factual accuracy**.
 - Reports and suspected compromises retain explicit uncertainty; monitoring
   alerts publish only as attributed `observed-anomaly` notices. GitLab issue
   hosting alone does not establish confirmation. Tags

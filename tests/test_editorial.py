@@ -1,5 +1,6 @@
 """Editorial decisions survive late inputs, retries, backup and publication."""
 
+from approval_helpers import finish_reviewed
 import copy
 import json
 import shutil
@@ -28,7 +29,7 @@ def seeded(tmp_path):
     with Store(cfg["storage"]["database"]) as store:
         store.ingest(item(content=item()["content"] * 3), DATE)
         row = store.pending(1, DATE)[0]
-        store.finish(row, analysis(why_it_matters="Unsupported operator configuration instruction."), "seed", DATE)
+        finish_reviewed(store, row, analysis(why_it_matters="Unsupported operator configuration instruction."), "seed", DATE)
         story_id = store.stories()[0]["id"]
         build(cfg, store)
         yield cfg, store, story_id
@@ -94,7 +95,7 @@ def test_late_automation_is_cached_and_grouped_but_cannot_overwrite_locked_story
         incoming["content"] += " The source has been updated."
     store.ingest(incoming, LATER)
     row = store.pending(1, LATER)[0]
-    store.finish(row, analysis(why_it_matters="New automation advice."), "late", LATER)
+    finish_reviewed(store, row, analysis(why_it_matters="New automation advice."), "late", LATER)
     saved = editorial.show(store.db, story_id)
     assert saved["hash"] == locked["hash"]
     assert saved["held_updates"] == 1
@@ -169,7 +170,7 @@ def test_retraction_tombstone_restore_and_explicit_unlock(seeded):
     act(editorial.unlock, store, story_id)
     assert not editorial.show(store.db, story_id)["locked"]
     store.ingest(item(content="An updated source report after explicit review.", updated_at=LATER), LATER)
-    store.finish(store.pending(1, LATER)[0], analysis(summary="New source-supported text."), "after-unlock", LATER)
+    finish_reviewed(store, store.pending(1, LATER)[0], analysis(summary="New source-supported text."), "after-unlock", LATER)
     build(cfg, store)
     files = current_files(cfg, story_id)
     assert files["json"]["summary"] == "New source-supported text."
@@ -305,7 +306,7 @@ def test_only_supplied_evidence_linked_notes_add_citations_and_update_time(tmp_p
         incoming = note_item(id=f"gid://gitlab/{note_kind}/123")
         store.ingest(incoming, LATER)
         row = store.pending(1, LATER)[0]
-        store.finish(row, analysis(evidence=[evidence]), "note", LATER, input_chars=budget)
+        finish_reviewed(store, row, analysis(evidence=[evidence]), "note", LATER, input_chars=budget)
         story = store.stories()[0]
         assert len(story["sources"]) == (2 if cited else 1)
         assert story["updated_at"] == (EDIT if cited else DATE)
@@ -320,7 +321,7 @@ def test_unknown_note_type_cannot_supply_story_citations_or_update_time(tmp_path
     cfg = config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         store.ingest(note_item(id="gid://gitlab/OtherNote/123"), LATER)
-        store.finish(store.pending(1, LATER)[0], analysis(evidence=["The report’s old keys remain untrusted"]),
+        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=["The report’s old keys remain untrusted"]),
                      "unknown-note", LATER, input_chars=4000)
         story = store.stories()[0]
         assert len(story["sources"]) == 1 and story["updated_at"] == DATE
@@ -333,11 +334,11 @@ def test_unseen_note_tail_or_mismatched_url_cannot_be_cited(tmp_path):
         text, notes = analysis_context(incoming, 500)
         assert "Only in unseen tail." not in text
         store.ingest(incoming, LATER)
-        store.finish(store.pending(1, LATER)[0], analysis(evidence=["Only in unseen tail."]), "tail", LATER, input_chars=500)
+        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=["Only in unseen tail."]), "tail", LATER, input_chars=500)
         assert len(store.stories()[0]["sources"]) == 1
         incoming = note_item(url="https://evil.example/#note_123")
         store.ingest(incoming, LATER)
-        store.finish(store.pending(1, LATER)[0], analysis(evidence=["The report’s old keys remain untrusted"]), "wrong-url", LATER, input_chars=4000)
+        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=["The report’s old keys remain untrusted"]), "wrong-url", LATER, input_chars=4000)
         assert len(store.stories()[0]["sources"]) == 1
 
 
@@ -347,12 +348,12 @@ def test_note_only_edits_advance_story_time_and_removed_citations_are_refreshed(
         incoming = note_item()
         evidence = ["The report’s old keys remain untrusted"]
         store.ingest(incoming, EDIT)
-        store.finish(store.pending(1, EDIT)[0], analysis(evidence=evidence), "first", EDIT, input_chars=4000)
+        finish_reviewed(store, store.pending(1, EDIT)[0], analysis(evidence=evidence), "first", EDIT, input_chars=4000)
         first = copy.deepcopy(store.stories()[0])
         incoming["public_comments"][0].update(body="The report’s old keys remain untrusted. Added a detail.", updated_at=LATER)
         incoming = _compose(incoming, incoming["public_comments"], LATER)
         store.ingest(incoming, LATER)
-        store.finish(store.pending(1, LATER)[0], analysis(evidence=evidence), "edit", LATER, input_chars=4000)
+        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=evidence), "edit", LATER, input_chars=4000)
         current = store.stories()[0]
         assert current["updated_at"] == LATER
         assert current["added_at"] == first["added_at"] and current["published_at"] == first["published_at"]
@@ -360,6 +361,6 @@ def test_note_only_edits_advance_story_time_and_removed_citations_are_refreshed(
         incoming["public_comments"] = []
         incoming = _compose(incoming, [], LATER)
         store.ingest(incoming, LATER)
-        store.finish(store.pending(1, LATER)[0], analysis(), "removed", LATER, input_chars=4000)
+        finish_reviewed(store, store.pending(1, LATER)[0], analysis(), "removed", LATER, input_chars=4000)
         assert len(store.stories()[0]["sources"]) == 1
         assert store.stories()[0]["updated_at"] == LATER
