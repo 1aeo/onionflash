@@ -87,9 +87,18 @@ class _TextParser(HTMLParser):
             self.parts.append(data)
 
 
-def plain_text(value: object, limit: int) -> str:
+def plain_text(value: object, limit: int, *, html: bool = True) -> str:
+    """Normalize untrusted text; with html=True, also strip markup.
+
+    Plain-text fields (such as GitLab titles) keep literal text like "Vec<u8>".
+    """
     if not isinstance(value, str):
         return ""
+    if not html:
+        text = value[: limit * 4].replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"[\ud800-\udfff]", "\ufffd", text)
+        text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+        return re.sub(r"[ \t]+", " ", re.sub(r"\n{3,}", "\n\n", text)).strip()[:limit]
     parser = _TextParser()
     parser.feed(value[: limit * 4])
     pending, parts, hidden = parser.rawdata, len(parser.parts), parser.hidden

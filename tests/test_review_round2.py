@@ -8,7 +8,7 @@ import pytest
 
 from onionflash import cli
 from onionflash.analyze import AnalysisError, SCHEMA, tag_notice, validate_analysis
-from onionflash.collect import CollectionError, collect_source
+from onionflash.collect import collect_source
 from onionflash.config import DEFAULTS
 from onionflash.store import Store, after as store_after
 from onionflash.util import after, backoff_seconds, format_utc, parse_utc, plain_text, timestamp
@@ -25,13 +25,6 @@ def test_plain_text_flushes_incomplete_html_and_normalizes_line_endings():
     cleaned = plain_text("v1\r\n<word", 100)
     assert tag_notice(tag(title=cleaned, content=""))["evidence"] == [cleaned]
 
-
-def test_generic_tag_notice_is_independent_of_source_display_name():
-    first = tag_notice(tag(source_name="Original label"))
-    second = tag_notice(tag(source_name="Renamed label"))
-    assert first == second
-    assert "upstream feed" in first["summary"]
-    assert "Original label" not in json.dumps(first)
 
 
 @pytest.mark.parametrize("state", ["developing", "fixed", "resolved", "mitigation-available", "merged", "released"])
@@ -61,18 +54,11 @@ def test_oversized_feed_keeps_bounded_items_and_uses_normal_catchup_interval(tmp
     <description>Second body</description><pubDate>Sun, 08 Nov 2026 11:00:00 GMT</pubDate></item>
     </channel></rss>'''
     stream = source(max_items=1)
-    with pytest.raises(CollectionError, match="item limit") as failure:
-        collect_source(FakeClient([response(xml)]), stream, {}, DEFAULTS["collection"], DATE)
-    error = failure.value
-    assert error.catching_up and len(error.items) == 1
-    assert error.items[0]["title"] == "First report"
-    with Store(tmp_path / "state.db") as store:
-        store.source(stream)
-        for _ in range(3):
-            store.source_failure(stream, str(error), DEFAULTS["collection"], DATE, error.checkpoint, error.catching_up)
-        state = store.source(stream)
-    assert state["failures"] == 0
-    assert state["next_fetch_at"] == after(stream["interval_seconds"], DATE)
+    # A longer feed is bounded by its max_items newest entries, even when it lists
+    # them oldest first; it is not an error, so the feed stays healthy and keeps
+    # its conditional-request validators.
+    result = collect_source(FakeClient([response(xml)]), stream, {}, DEFAULTS["collection"], DATE)
+    assert [item["title"] for item in result["items"]] == ["Second report"]
 
 
 def test_utc_helpers_normalize_offsets_and_preserve_store_after_import():

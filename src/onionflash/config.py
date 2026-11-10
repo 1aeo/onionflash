@@ -44,8 +44,6 @@ DEFAULTS = {
         "reconcile_seconds": 86400,
         "max_xml_depth": 128,
         "max_xml_elements": 50000,
-        "healthy_poll_tolerance_seconds": 5,
-        "tag_priority_score": 5,
     },
     "http": {
         "timeout_seconds": 30,
@@ -119,16 +117,19 @@ BOUNDS = {
     "reconcile_seconds": (300, 604800),
     "max_xml_depth": (8, 256),
     "max_xml_elements": (100, 100000),
-    "healthy_poll_tolerance_seconds": (0, 60),
-    "tag_priority_score": (0, 20),
 }
 
 
 # Settings that older configuration files may still contain. They are accepted
 # and ignored, so a deployment can delete them at its own pace.
-RETIRED = {"storage": {"max_stories"}, "http": {"requests_per_minute"}, "monitoring": {
-    "min_reports", "min_span_seconds", "window_seconds", "stale_after_seconds", "retention_days",
-    "max_observations", "max_groups", "max_source_links", "max_alerts_per_item", "max_future_seconds"}}
+RETIRED = {
+    "storage": {"max_stories"},
+    "http": {"requests_per_minute"},
+    "collection": {"healthy_poll_tolerance_seconds", "tag_priority_score"},
+    "monitoring": {
+        "min_reports", "min_span_seconds", "window_seconds", "stale_after_seconds", "retention_days",
+        "max_observations", "max_groups", "max_source_links", "max_alerts_per_item", "max_future_seconds"},
+}
 
 
 def _expand(value: str) -> str:
@@ -328,7 +329,10 @@ def load_config(path: str | Path) -> dict:
         ):
             raise ValueError("At most five fallback URLs per source")
         source["url"] = canonical_url(source["url"])
-        source["website_url"] = canonical_url(source.get("website_url", source["url"]))
+        if "website_url" in source:
+            source["website_url"] = canonical_url(source["website_url"])
+        elif source["kind"] == "metrics_timeline":
+            raise ValueError("Timeline sources need website_url (the repository URL)")
         if source["kind"] == "metrics_timeline":
             website = urlsplit(source["website_url"])
             if website.query or website.fragment or not website.path.strip("/"):

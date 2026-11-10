@@ -37,7 +37,6 @@ def item(**kw):
     return {
         "id": "example",
         "source_id": "test",
-        "source_name": "Test source",
         "url": "https://example.org/news/1",
         "title": "A reported security incident",
         "content": "The operator reported a plausible compromise and said its keys must no longer be trusted.",
@@ -354,15 +353,6 @@ def test_deep_or_massive_feed_structure_is_rejected_before_materialization():
     with pytest.raises(CollectionError, match="structure"):
         collect_source(
             FakeClient([response(xml)]), source(), {}, DEFAULTS["collection"], DATE
-        )
-    xml = b"<rss><channel><item/><item/></channel></rss>"
-    with pytest.raises(CollectionError, match="item limit"):
-        collect_source(
-            FakeClient([response(xml)]),
-            source(max_items=1),
-            {},
-            DEFAULTS["collection"],
-            DATE,
         )
 
 
@@ -768,7 +758,8 @@ def test_source_website_change_rebuilds_without_resetting_collection(tmp_path):
         store.source_success(source, {"url": source["url"]}, DATE)
         state = store.source(source)
         build(cfg, store)
-        assert f'href="{source["url"]}"' in (tmp_path / "public/index.html").read_text()
+        # Without website_url the label is not linked (never to the raw feed/API URL).
+        assert f'href="{source["url"]}"' not in (tmp_path / "public/index.html").read_text()
         source["website_url"] = "https://example.org/mailing-list/"
         build(cfg, store)
         assert f'href="{source["website_url"]}"' in (tmp_path / "public/index.html").read_text()
@@ -992,3 +983,77 @@ def test_status_reports_the_count_recorded_by_the_last_build(tmp_path, capsys):
     capsys.readouterr()
     assert main(["status", "--config", str(cfg_path)]) == 0
     assert _json.loads(capsys.readouterr().out)["published_stories"] == 0
+
+
+def test_plain_titles_keep_angle_brackets_and_html_titles_are_stripped():
+    from onionflash.collect import _item
+    stream = source(kind="gitlab_issue")
+    plain = _item(stream, "https://example.org/1", "Use Vec<u8> instead of String", "", DATE, DATE, title_html=False)
+    assert plain["title"] == "Use Vec<u8> instead of String"
+    marked = _item(stream, "https://example.org/2", "A <b>bold</b> claim", "", DATE, DATE)
+    assert marked["title"] == "A bold claim"
+    assert _item(stream, "https://example.org/3", "t", "", DATE, DATE, labels=["ok", "\ud800bad"])["labels"] == ["ok", "\ufffdbad"]
+
+
+def test_xhtml_atom_titles_are_stripped_and_plain_ones_kept():
+    xml = (b'<feed xmlns="http://www.w3.org/2005/Atom"><title>T</title><id>urn:t</id><updated>2026-11-08T12:00:00Z</updated>'
+           b'<entry><title type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml">A <b>bold</b> title</div></title>'
+           b'<link href="https://example.org/a"/><id>urn:a</id><updated>2026-11-08T12:00:00Z</updated></entry>'
+           b'<entry><title type="text">Use Vec&lt;u8&gt; here</title>'
+           b'<link href="https://example.org/b"/><id>urn:b</id><updated>2026-11-08T11:00:00Z</updated></entry></feed>')
+    items = collect_source(FakeClient([response(xml)]), source(), {}, DEFAULTS["collection"], DATE)["items"]
+    assert [item["title"] for item in items] == ["A bold title", "Use Vec<u8> here"]
+
+
+def test_website_url_has_no_default_but_timeline_sources_require_one(tmp_path):
+    path = tmp_path / "config.toml"
+    feed = '[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n'
+    path.write_text(feed)
+    assert "website_url" not in load_config(path)["sources"][0]
+    path.write_text('[[sources]]\nid = "t"\nkind = "metrics_timeline"\nauthority = "telemetry"\n'
+                    'url = "https://gitlab.example.org/api/v4/projects/1/repository/files/README.md?ref=main"\n')
+    with pytest.raises(ValueError, match="website_url"):
+        load_config(path)
+
+
+def test_a_long_plain_text_title_keeps_its_brackets_in_the_content():
+    long_title = "Use Vec<u8> " + "x" * 600
+    xml = ('<feed xmlns="http://www.w3.org/2005/Atom"><title>T</title><id>urn:t</id><updated>2026-11-08T12:00:00Z</updated>'
+           f'<entry><title type="text">{long_title.replace("<", "&lt;").replace(">", "&gt;")}</title>'
+           '<link href="https://example.org/a"/><id>urn:a</id><updated>2026-11-08T12:00:00Z</updated></entry></feed>').encode()
+    item_ = collect_source(FakeClient([response(xml)]), source(), {}, DEFAULTS["collection"], DATE)["items"][0]
+    assert "Use Vec<u8>" in item_["content"]
+
+
+def test_future_dates_are_clamped_to_the_poll_except_for_alert_parsers():
+    from onionflash.collect import _item
+    later = "2062-01-01T00:00:00Z"
+    item_ = _item(source(), "https://example.org/1", "t", "", later, later, observed=DATE)
+    assert (item_["published_at"], item_["updated_at"]) == (DATE, DATE)
+    alert = _item(source(alert_format="consensus"), "https://example.org/2", "t", "", later, later, observed=DATE)
+    assert alert["published_at"] == later
+
+
+def test_rss_guid_that_is_not_a_permalink_is_never_a_citation():
+    xml = (b'<rss version="2.0"><channel><title>T</title><link>https://example.org/</link><description>D</description>'
+           b'<item><title>No link</title><guid isPermaLink="false">https://example.org/?p=123</guid>'
+           b'<pubDate>Sun, 08 Nov 2026 12:00:00 GMT</pubDate></item></channel></rss>')
+    assert collect_source(FakeClient([response(xml)]), source(), {}, DEFAULTS["collection"], DATE)["items"] == []
+
+
+def test_an_unexpected_source_error_is_recorded_and_other_sources_still_run(tmp_path, monkeypatch):
+    from onionflash import cli
+    cfg = config(tmp_path)
+    cfg["sources"] = [source(id="broken", url="https://broken.example/feed.xml"), source(id="fine")]
+    def collect(client, stream, *args):
+        if stream["id"] == "broken":
+            raise RuntimeError("unexpected parser crash")
+        return {"items": [], "url": stream["url"]}
+    monkeypatch.setattr(cli, "collect_source", collect)
+    monkeypatch.setattr(cli, "build", lambda *args: {})
+    with Store(tmp_path / "state.db") as store:
+        report = cli.run(cfg, store)
+        broken = store.source(cfg["sources"][0])
+    assert report["sources_failed"] == 1 and report["sources_ok"] == 1
+    assert broken["error"].startswith("Unexpected RuntimeError at test_core.py:")
+    assert "parser crash" not in broken["error"] and broken["failures"] == 1

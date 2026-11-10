@@ -31,27 +31,16 @@ def backup_database(source: str | Path, destination: str | Path) -> None:
         raise
 
 
-def source_due(source: dict, state: dict, collection: dict, observed: str) -> bool:
-    """Forgive small scheduler skew only after a completed successful poll."""
+TAG_PRIORITY = 5  # queue floor for deterministic tag notices
+POLL_TOLERANCE_SECONDS = 5  # absorbs scheduler start jitter after a successful poll
+
+
+def source_due(state: dict, observed: str) -> bool:
     due = state.get("next_fetch_at")
-    if not due or due <= observed:
-        return True
-    healthy = (
-        bool(state.get("last_success"))
-        and state.get("error") is None
-        and not state.get("failures")
-        and not state.get("scan_upper")
-        and not state.get("scan_page")
-    )
-    if not healthy:
-        return False
-    tolerance = min(
-        collection["healthy_poll_tolerance_seconds"], source["interval_seconds"] / 10
-    )
-    return after(tolerance, observed) >= due
+    return not due or due <= observed
 
 
-def item_priority(item: dict, tag_priority_score: int = 5) -> int:
+def item_priority(item: dict) -> int:
     words = (
         item["title"]
         + " "
@@ -71,7 +60,7 @@ def item_priority(item: dict, tag_priority_score: int = 5) -> int:
         ]
         if word in words
     )
-    return max(score, tag_priority_score if item["kind"] == "tag" else 0)
+    return max(score, TAG_PRIORITY if item["kind"] == "tag" else 0)
 
 
 def _rank(kind: str, confidence: str, updated_at: str) -> tuple:
@@ -177,7 +166,10 @@ class Store:
                     result.get("etag"),
                     result.get("last_modified"),
                     observed,
-                    after(source["interval_seconds"], schedule_from or observed),
+                    # Only a success is rescheduled slightly early: failure and
+                    # catching-up cooldowns are never shortened.
+                    after(source["interval_seconds"] - min(POLL_TOLERANCE_SECONDS, source["interval_seconds"] / 10),
+                          schedule_from or observed),
                     bool(result.get("reconciled")),
                     result.get("watermark"),
                     source["id"],
@@ -225,7 +217,7 @@ class Store:
                 (*fields.values(), source["id"]),
             )
 
-    def ingest(self, item: dict, observed: str, *, tag_priority_score: int = 5) -> bool:
+    def ingest(self, item: dict, observed: str) -> bool:
         item_id = digest(item_identity(item))[:24]
         item["id"] = item_id
         content_hash = digest(
@@ -252,7 +244,7 @@ class Store:
         if row and item["updated_at"] < json.loads(row["payload"])["updated_at"]:
             # A stale cache/fallback must not roll a newer incident back in time.
             return False
-        score = item_priority(item, tag_priority_score)
+        score = item_priority(item)
         with self.db:
             self.db.execute(
                 """INSERT INTO items(id,url,source_id,payload,content_hash,cluster_key,first_seen,last_seen,priority_score)
@@ -460,7 +452,7 @@ class Store:
                 {
                     "id": source["id"],
                     "name": source["name"],
-                    "website_url": source.get("website_url", source["url"]),
+                    "website_url": source.get("website_url"),
                     "last_success": state["last_success"],
                     "error": state["error"],
                     "stale": bool(stale),

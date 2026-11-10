@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 
 from . import __version__
@@ -52,6 +53,7 @@ def run(config: dict, store: Store) -> dict:
         "analyzed": 0,
         "analysis_failed": 0,
         "budget_reached": False,
+        "entries_skipped": 0,
     }
     started = time.monotonic()
     budget = config["collection"]["run_budget_seconds"]
@@ -64,10 +66,7 @@ def run(config: dict, store: Store) -> dict:
         if source.get("alert_format"):
             report.setdefault("alerts", {})[source["id"]] = store.ingest_alerts(source, items, received)
             return received
-        priority = config["collection"]["tag_priority_score"]
-        report["items_changed"] += sum(
-            store.ingest(item, received, tag_priority_score=priority) for item in items
-        )
+        report["items_changed"] += sum(store.ingest(item, received) for item in items)
         return received
 
     with HttpClient(config["http"]) as client:
@@ -75,7 +74,7 @@ def run(config: dict, store: Store) -> dict:
             if not source["enabled"]:
                 continue
             state = store.source(source)
-            if not source_due(source, state, config["collection"], observed):
+            if not source_due(state, observed):
                 continue
             remaining = collection_deadline - time.monotonic()
             if remaining < 1:
@@ -89,6 +88,7 @@ def run(config: dict, store: Store) -> dict:
             try:
                 result = collect_source(client, source, state, config["collection"], observed)
                 received = record_items(source, result["items"])
+                report["entries_skipped"] += result.get("skipped", 0)
                 store.source_success(source, result, received, schedule_from=observed)
                 report["sources_ok"] += 1
             except CollectionError as exc:
@@ -106,6 +106,12 @@ def run(config: dict, store: Store) -> dict:
                 if out_of_time:
                     report["budget_reached"] = True
                     break
+            except Exception as exc:  # untrusted input must not stop the other sources
+                # Record where it failed (file:line), never the exception text.
+                frame = traceback.extract_tb(exc.__traceback__)[-1]
+                where = f"{Path(frame.filename).name}:{frame.lineno}"
+                store.source_failure(source, f"Unexpected {type(exc).__name__} at {where}", config["collection"], now_iso())
+                report["sources_failed"] += 1
     run_deadline = started + budget
     endpoint_failures = 0
     with Analyzer(config, deadline=run_deadline) as analyzer:

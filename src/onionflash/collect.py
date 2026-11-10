@@ -50,19 +50,26 @@ def _item(
     updated: str,
     labels: list | None = None,
     upstream_state: str = "",
+    *,
+    title_html: bool = True,
+    observed: str | None = None,
 ) -> dict:
+    if observed and not source.get("alert_format"):
+        # A future date (a typo or a scheduled event) must not pin a story to the
+        # top or block later corrections. Alert parsers judge future dates themselves.
+        # All three are format_utc strings, so string order is time order.
+        published, updated = min(published, observed), min(updated, observed)
     return {
         "source_id": source["id"],
-        "source_name": source["name"],
         "url": canonical_url(url),
-        "title": plain_text(title, 500),
+        "title": plain_text(title, 500, html=title_html),
         "content": content,
         "published_at": published,
         "updated_at": max(updated, published),
         "kind": source["kind"],
         "product": source["product"],
         "authority": source["authority"],
-        "labels": [str(x)[:100] for x in (labels or [])[:30]],
+        "labels": [plain_text(str(x), 100, html=False) for x in (labels or [])[:30]],
         "upstream_state": upstream_state
         if upstream_state in {"opened", "closed", "merged"}
         else "",
@@ -130,12 +137,11 @@ def _feed(
         raise CollectionError("Invalid RSS/Atom document")
     cutoff = after(-settings["lookback_days"] * 86400, started)
     items = []
-    identities, conflicts = {}, set()
-    undated_alert = False
-    for entry in feed.entries[: source["max_items"]]:
+    identities, conflicts, skipped = {}, set(), 0
+    for entry in feed.entries:
         if source.get("alert_format") and not (entry.get("published_parsed") or entry.get("updated_parsed")):
             # A poll's clock must never manufacture a new monitoring observation.
-            undated_alert = True
+            skipped += 1
             continue
         published = _entry_time(
             entry, "published", _entry_time(entry, "updated", started)
@@ -148,13 +154,18 @@ def _feed(
             content_parts[0].get("value", "") if content_parts else entry.get("summary", ""),
             settings["content_chars"],
         )
+        # Only an explicit text/plain title keeps its angle brackets; HTML and
+        # XHTML titles are stripped.
+        title_html = (entry.get("title_detail") or {}).get("type", "text/html") != "text/plain"
         # Some curated feeds put their complete description in an Atom title.
         title = entry.get("title", "")
         if isinstance(title, str) and len(title) > 500:
-            full_title = plain_text(title, settings["content_chars"])
+            full_title = plain_text(title, settings["content_chars"], html=title_html)
             if len(full_title) > 500:
                 text = (text + "\n" + full_title)[: settings["content_chars"]]
-        link = entry.get("link") or entry.get("id", "")
+        # feedparser already uses an Atom entry's id as its link when no alternate
+        # link exists; an RSS guid that is not a permalink is never a citation.
+        link = entry.get("link", "")
         try:
             item = _item(
                 source,
@@ -163,6 +174,8 @@ def _feed(
                 text,
                 published,
                 updated,
+                title_html=title_html,
+                observed=started,
             )
         except ValueError:
             continue
@@ -177,21 +190,17 @@ def _feed(
                 conflicts.add(identity)
             identities[identity] = content
         items.append(item)
-    if undated_alert:
-        raise CollectionError("Undated monitoring messages skipped", items, catching_up=True)
     if conflicts:
         unambiguous = [item for item in items if (item["url"], item["updated_at"]) not in conflicts]
-        raise CollectionError(
-            "Feed has conflicting entries with the same URL and timestamp; ambiguous entries skipped",
-            unambiguous, catching_up=True,
-        )
-    # Oversized feed windows are visible as a coverage warning, never silently truncated.
-    if len(feed.entries) > source["max_items"]:
-        raise CollectionError(
-            "Feed item limit reached; increase source max_items", items, catching_up=True
-        )
+        skipped += len(items) - len(unambiguous)
+        items = unambiguous
+    # An archive feed is bounded by its newest entries, whatever order it lists them in.
+    items = sorted(items, key=lambda item: item["updated_at"], reverse=True)[: source["max_items"]]
+    # Skipped entries are counted in the run report instead of leaving a healthy
+    # feed in a permanent error state that also discards its ETag.
     return {
         "items": items,
+        "skipped": skipped,
         "url": url,
         "etag": response.headers.get("etag"),
         "last_modified": response.headers.get("last-modified"),
@@ -304,6 +313,8 @@ def _gitlab(
                     updated,
                     record.get("labels"),
                     record.get("state", ""),
+                    title_html=False,
+                    observed=started,
                 )
             except (KeyError, ValueError, TypeError):
                 continue

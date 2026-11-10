@@ -32,11 +32,6 @@ analysis_reserve_fraction = 0.5
 reconcile_seconds = 86400
 max_xml_depth = 128
 max_xml_elements = 50000
-# Forgive small scheduler skew after successful polls, capped at 10% of interval.
-# Failed requests and incomplete scans always retain their full cooldown.
-healthy_poll_tolerance_seconds = 5
-# Queue priority floor for tag entries; serious security reports remain ahead.
-tag_priority_score = 5
 
 [http]
 timeout_seconds = 30
