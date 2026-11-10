@@ -669,11 +669,29 @@ def test_retry_after_past_the_deadline_is_not_replaced_by_a_shorter_backoff():
     assert len(calls) == 1 and sleeps == []
 
 
-def test_a_source_cut_off_by_the_shared_window_is_not_penalized(tmp_path, monkeypatch):
+def test_rate_limit_wait_stops_at_the_deadline():
+    import socket
+    import httpx
+    from onionflash.transport import DeadlineReached, HttpClient
+
+    sleeps = []
+    settings = {**DEFAULTS["http"], "requests_per_minute": 1}
+    resolver = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+    with HttpClient(settings, transport=httpx.MockTransport(lambda request: httpx.Response(200, content=b"ok")),
+                    resolver=resolver, sleep=sleeps.append, clock=lambda: 100.0) as client:
+        client.request("GET", "https://example.org/")
+        client.deadline = 105.0  # the next request slot is 60 s away
+        with pytest.raises(DeadlineReached):
+            client.request("GET", "https://example.org/")
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("source_budget,shared", [(600, True), (5, False)])
+def test_a_deadline_cutoff_is_penalized_only_when_it_is_the_source_budget(tmp_path, monkeypatch, source_budget, shared):
     from onionflash import cli
 
     cfg = config(tmp_path)
-    cfg["collection"]["source_budget_seconds"] = 600  # longer than the window: the window binds
+    cfg["collection"]["source_budget_seconds"] = source_budget
     cfg["sources"] = [source(id="first"), source(id="second", url="https://example.org/second.xml")]
     collected = []
 
@@ -698,8 +716,11 @@ def test_a_source_cut_off_by_the_shared_window_is_not_penalized(tmp_path, monkey
     with Store(tmp_path / "state.db") as store:
         result = cli.run(cfg, store)
         first = store.source(cfg["sources"][0])
-    assert result["budget_reached"] and collected == ["first"]
-    assert first["failures"] == 0
+    # The shared window ends collection without a penalty; a source that overran
+    # its own budget is a failure, and the next source still runs.
+    assert bool(result.get("budget_reached")) is shared
+    assert first["failures"] == (0 if shared else 1)
+    assert collected == (["first"] if shared else ["first", "second"])
 
 
 def test_render_failure_preserves_prior_site(tmp_path, monkeypatch):

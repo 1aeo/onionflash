@@ -309,7 +309,7 @@ class HttpClient:
             return
         remaining = self._next_request - self.clock()
         if remaining > 0:
-            self.sleep(remaining)
+            self._pause(remaining)  # never waits past the caller's deadline
         self._next_request = self.clock() + 60.0 / rate
 
     def _body(self, response: httpx.Response) -> bytes:
