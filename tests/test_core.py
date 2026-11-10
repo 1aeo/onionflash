@@ -821,6 +821,16 @@ def test_new_story_records_when_onion_flash_added_it(tmp_path):
     assert (story["published_at"], story["added_at"]) == ("2026-09-22T12:00:00Z", later)
 
 
+def test_a_longer_llm_timeout_extends_the_fixed_attempt_total():
+    from onionflash.analyze import Analyzer
+    config = copy.deepcopy(DEFAULTS)
+    with Analyzer(config) as analyzer:
+        assert analyzer.http_settings["total_timeout_seconds"] == 180
+    config["llm"]["timeout_seconds"] = 240
+    with Analyzer(config) as analyzer:
+        assert analyzer.http_settings["total_timeout_seconds"] == 250
+
+
 def test_only_operator_settings_are_configurable_and_the_rest_are_ignored(tmp_path, caplog):
     path = tmp_path / "config.toml"
     path.write_text('[collection]\nlookback_days = 3\n[http]\nretry_attempts = 7\n'
