@@ -1,5 +1,6 @@
 import gzip
 import socket
+import time
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import Mock
@@ -247,3 +248,43 @@ class PublisherTransportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CheckedTransportTests(unittest.TestCase):
+    """The production path: DNS is checked when the connection opens, then the
+    socket backend receives only the vetted literal address."""
+
+    def client(self, addresses, body=b"ok"):
+        resolved, connected = [], []
+        def resolver(host, port, *args):
+            resolved.append(host)
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port)) for address in addresses]
+        class Backend(httpcore.MockBackend):
+            def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+                connected.append((host, port, timeout))
+                return super().connect_tcp(host, port, timeout, local_address, socket_options)
+        client = HttpClient({"retry_attempts": 1}, resolver=resolver)
+        client._client._transport.backend.backend = Backend(
+            [b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body])
+        return client, resolved, connected
+
+    def test_dns_is_resolved_at_connect_and_only_the_vetted_ip_is_dialed(self):
+        client, resolved, connected = self.client(["93.184.216.34"])
+        with client:
+            self.assertEqual(client.request("GET", "https://example.org/feed").body, b"ok")
+        self.assertEqual(resolved, ["example.org"])
+        self.assertEqual([(host, port) for host, port, _ in connected], [("93.184.216.34", 443)])
+
+    def test_a_private_address_at_connect_time_is_refused_before_dialing(self):
+        client, resolved, connected = self.client(["93.184.216.34", "10.0.0.7"])
+        with client, self.assertRaisesRegex(FetchError, "not permitted") as caught:
+            client.request("GET", "https://example.org/feed")
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(connected, [])
+
+    def test_the_caller_deadline_bounds_the_connect_timeout(self):
+        client, _, connected = self.client(["93.184.216.34"])
+        with client:
+            client.deadline = time.monotonic() + 2
+            client.request("GET", "https://example.org/feed")
+        self.assertLessEqual(connected[0][2], 2)
