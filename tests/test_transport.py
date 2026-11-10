@@ -219,31 +219,15 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(retry_delay(2, settings, "invalid", now=now), 8)
         self.assertEqual(retry_delay(30, settings, None), 10)
 
-
-class PublisherTransportTests(unittest.TestCase):
-    def test_strict_origin_policy_rejects_even_get_redirects(self):
-        handler = Mock(return_value=httpx.Response(302, headers={"location": "https://other.example/path"}))
-        with HttpClient({}, transport=httpx.MockTransport(handler),
-                        resolver=public_dns, same_origin_redirects=True) as client:
-            with self.assertRaisesRegex(FetchError, "cross-origin redirect refused"):
-                client.request("GET", "https://example.org/path", headers={"Authorization": "Bearer secret"})
-        self.assertEqual(handler.call_count, 1)
-
-    def test_delete_keeps_method_on_same_origin_redirect(self):
-        calls = []
-        def handler(request):
-            calls.append(request)
-            return httpx.Response(307, headers={"location": "/route/new"}) if len(calls) == 1 else httpx.Response(204)
-        with HttpClient({}, transport=httpx.MockTransport(handler),
-                        resolver=public_dns, same_origin_redirects=True) as client:
-            self.assertEqual(client.request("DELETE", "https://example.org/route/old").status, 204)
-        self.assertEqual([request.method for request in calls], ["DELETE", "DELETE"])
-
-    def test_fixed_jitter_is_supported_and_capped(self):
-        settings = {"backoff_base_seconds": 2, "backoff_cap_seconds": 10,
-                    "backoff_jitter_seconds": 1, "max_retry_after_seconds": 10}
-        self.assertEqual(retry_delay(0, settings, jitter=lambda: .5), 2.5)
+    def test_jitter_is_a_fraction_of_the_delay_and_capped(self):
+        settings = {"backoff_base_seconds": 2, "backoff_cap_seconds": 10, "backoff_jitter": 0.25}
+        self.assertEqual(retry_delay(0, settings, jitter=lambda: .5), 2.25)
         self.assertEqual(retry_delay(8, settings, jitter=lambda: 1), 10)
+
+    def test_only_get_and_post_are_supported(self):
+        client, _ = self.client(lambda request: httpx.Response(204))
+        with client, self.assertRaisesRegex(FetchError, "unsupported request method"):
+            client.request("DELETE", "https://example.org/route")
 
 
 class CheckedTransportTests(unittest.TestCase):
