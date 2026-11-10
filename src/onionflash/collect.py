@@ -57,6 +57,7 @@ def _item(
     if observed and not source.get("alert_format"):
         # A future date (a typo or a scheduled event) must not pin a story to the
         # top or block later corrections. Alert parsers judge future dates themselves.
+        # All three are format_utc strings, so string order is time order.
         published, updated = min(published, observed), min(updated, observed)
     return {
         "source_id": source["id"],
@@ -138,8 +139,6 @@ def _feed(
     items = []
     identities, conflicts, skipped = {}, set(), 0
     for entry in feed.entries:
-        if len(items) >= source["max_items"]:
-            break  # an archive feed is bounded by its recent entries, not an error
         if source.get("alert_format") and not (entry.get("published_parsed") or entry.get("updated_parsed")):
             # A poll's clock must never manufacture a new monitoring observation.
             skipped += 1
@@ -193,6 +192,8 @@ def _feed(
         unambiguous = [item for item in items if (item["url"], item["updated_at"]) not in conflicts]
         skipped += len(items) - len(unambiguous)
         items = unambiguous
+    # An archive feed is bounded by its newest entries, whatever order it lists them in.
+    items = sorted(items, key=lambda item: item["updated_at"], reverse=True)[: source["max_items"]]
     # Skipped entries are counted in the run report instead of leaving a healthy
     # feed in a permanent error state that also discards its ETag.
     return {

@@ -54,10 +54,11 @@ def test_oversized_feed_keeps_bounded_items_and_uses_normal_catchup_interval(tmp
     <description>Second body</description><pubDate>Sun, 08 Nov 2026 11:00:00 GMT</pubDate></item>
     </channel></rss>'''
     stream = source(max_items=1)
-    # A longer feed is bounded by max_items recent entries; it is not an error,
-    # so the feed stays healthy and keeps its conditional-request validators.
+    # A longer feed is bounded by its max_items newest entries, even when it lists
+    # them oldest first; it is not an error, so the feed stays healthy and keeps
+    # its conditional-request validators.
     result = collect_source(FakeClient([response(xml)]), stream, {}, DEFAULTS["collection"], DATE)
-    assert [item["title"] for item in result["items"]] == ["First report"]
+    assert [item["title"] for item in result["items"]] == ["Second report"]
 
 
 def test_utc_helpers_normalize_offsets_and_preserve_store_after_import():

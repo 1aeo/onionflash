@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 
 from . import __version__
@@ -174,7 +175,10 @@ def run(config: dict, store: Store) -> dict:
                     report["budget_reached"] = True
                     break
             except Exception as exc:  # untrusted input must not stop the other sources
-                store.source_failure(source, f"Unexpected {type(exc).__name__}", config["collection"], now_iso())
+                # Record where it failed (file:line), never the exception text.
+                frame = traceback.extract_tb(exc.__traceback__)[-1]
+                where = f"{Path(frame.filename).name}:{frame.lineno}"
+                store.source_failure(source, f"Unexpected {type(exc).__name__} at {where}", config["collection"], now_iso())
                 report["sources_failed"] += 1
     run_deadline = started + budget
     endpoint_failures = 0

@@ -1025,4 +1025,5 @@ def test_an_unexpected_source_error_is_recorded_and_other_sources_still_run(tmp_
         report = cli.run(cfg, store)
         broken = store.source(cfg["sources"][0])
     assert report["sources_failed"] == 1 and report["sources_ok"] == 1
-    assert broken["error"] == "Unexpected RuntimeError" and broken["failures"] == 1
+    assert broken["error"].startswith("Unexpected RuntimeError at test_core.py:")
+    assert "parser crash" not in broken["error"] and broken["failures"] == 1
