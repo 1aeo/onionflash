@@ -127,25 +127,31 @@ def _feed(
         raise CollectionError("Invalid RSS/Atom document")
     cutoff = after(-settings["lookback_days"] * 86400, started)
     items = []
+    identities, conflicts = {}, set()
     for entry in feed.entries[: source["max_items"]]:
-        content_parts = entry.get("content") or []
-        text = (
-            content_parts[0].get("value", "")
-            if content_parts
-            else entry.get("summary", "")
-        )
-        text = plain_text(text, settings["content_chars"])
         published = _entry_time(
             entry, "published", _entry_time(entry, "updated", started)
         )
         updated = _entry_time(entry, "updated", published)
         if updated < cutoff:
             continue
+        content_parts = entry.get("content") or []
+        text = plain_text(
+            content_parts[0].get("value", "") if content_parts else entry.get("summary", ""),
+            settings["content_chars"],
+        )
+        # Some curated feeds put their complete description in an Atom title.
+        title = entry.get("title", "")
+        if isinstance(title, str) and len(title) > 500:
+            full_title = plain_text(title, settings["content_chars"])
+            if len(full_title) > 500:
+                text = (text + "\n" + full_title)[: settings["content_chars"]]
+        link = entry.get("link") or entry.get("id", "")
         try:
             item = _item(
                 source,
-                entry.get("link", ""),
-                entry.get("title", ""),
+                link,
+                title,
                 text,
                 published,
                 updated,
@@ -154,7 +160,21 @@ def _feed(
             continue
         if not item["title"]:
             continue
+        # Some Atom archives omit alternate links and reuse an ID for distinct
+        # events. Do not silently choose one event when that fallback is ambiguous.
+        if feed.version.startswith("atom") and not entry.get("links") and entry.get("id") == link:
+            identity = (item["url"], item["updated_at"])
+            content = (item["title"], item["content"])
+            if identity in identities and identities[identity] != content:
+                conflicts.add(identity)
+            identities[identity] = content
         items.append(item)
+    if conflicts:
+        unambiguous = [item for item in items if (item["url"], item["updated_at"]) not in conflicts]
+        raise CollectionError(
+            "Feed has conflicting entries with the same URL and timestamp; ambiguous entries skipped",
+            unambiguous, catching_up=True,
+        )
     # Oversized feed windows are visible as a coverage warning, never silently truncated.
     if len(feed.entries) > source["max_items"]:
         raise CollectionError(
