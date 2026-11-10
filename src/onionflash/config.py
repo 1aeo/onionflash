@@ -69,7 +69,6 @@ DEFAULTS = {
         "timeout_seconds": 120,
         "connect_timeout_seconds": 10,
         "total_timeout_seconds": 180,
-        "retry_attempts": 2,
         "max_response_bytes": 65536,
         "max_output_tokens": 1200,
         "max_input_chars": 14000,
@@ -125,6 +124,7 @@ BOUNDS = {
 RETIRED = {
     "storage": {"max_stories"},
     "http": {"requests_per_minute"},
+    "llm": {"retry_attempts"},
     "collection": {"healthy_poll_tolerance_seconds", "tag_priority_score"},
     "monitoring": {
         "min_reports", "min_span_seconds", "window_seconds", "stale_after_seconds", "retention_days",

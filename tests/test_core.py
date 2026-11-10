@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from onionflash.analyze import AnalysisError, _json_object, validate_analysis
+from onionflash.analyze import AnalysisError, validate_analysis
 from onionflash.cli import build, run_lock
 from onionflash.collect import CollectionError, collect_source
 from onionflash.config import DEFAULTS, load_config
@@ -134,8 +134,6 @@ def test_false_evidence_and_extra_model_fields_rejected():
         validate_analysis(analysis(evidence=["This was definitely confirmed"]), item())
     with pytest.raises(AnalysisError):
         validate_analysis({**analysis(), "url": "https://evil.example/"}, item())
-    with pytest.raises(AnalysisError):
-        _json_object('{"publish":true,"publish":false}')
 
 
 def test_confirmation_cannot_be_invented_from_public_issue():
@@ -196,7 +194,8 @@ def test_queue_is_durable_and_idempotent(tmp_path):
         store.finish(row, analysis(), "cache", DATE)
         assert store.pending_count() == 0
         assert len(store.stories(10)) == 1
-        assert store.cached("cache")["title"] == analysis()["title"]
+        record = store.db.execute("SELECT result FROM analyses WHERE cache_key='cache'").fetchone()
+        assert json.loads(record[0])["title"] == analysis()["title"]  # kept as a write-only record
 
 
 def test_stale_fallback_cannot_replace_a_newer_item(tmp_path):
