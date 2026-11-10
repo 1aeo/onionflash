@@ -30,8 +30,10 @@ sizes belong in code as constants. Some sections, such as `[comments]` and
 with the code that reads it.
 
 When a section setting is removed, add its key to `RETIRED` so existing files
-keep loading. Source entries have no such list: keep a removed source key in the
-allowed set and ignore it, or existing files stop loading.
+keep loading. A section that loses its last setting stays in `DEFAULTS` as an
+empty table, as `monitoring` does, so files that still contain it load. Source
+entries have no such list: keep a removed source key in the allowed set and
+ignore it, or existing files stop loading.
 
 ## Code
 
