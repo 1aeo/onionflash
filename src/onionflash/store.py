@@ -128,6 +128,8 @@ class Store:
         ]:
             if name not in columns:
                 self.db.execute(f"ALTER TABLE source_state ADD COLUMN {name} {kind}")
+        if "rejections" not in {row[1] for row in self.db.execute("PRAGMA table_info(items)")}:
+            self.db.execute("ALTER TABLE items ADD COLUMN rejections INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
 
     def __enter__(self) -> Store:
@@ -255,7 +257,7 @@ class Store:
                 """INSERT INTO items(id,url,source_id,payload,content_hash,cluster_key,first_seen,last_seen,priority_score)
                 VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
                 url=excluded.url,source_id=excluded.source_id,payload=excluded.payload,content_hash=excluded.content_hash,
-                cluster_key=excluded.cluster_key,last_seen=excluded.last_seen,status='pending',attempts=0,
+                cluster_key=excluded.cluster_key,last_seen=excluded.last_seen,status='pending',attempts=0,rejections=0,
                 next_attempt_at=NULL,last_error=NULL,priority_score=excluded.priority_score""",
                 (
                     item_id,
@@ -291,21 +293,30 @@ class Store:
         ).fetchone()
         return json.loads(row[0]) if row else None
 
-    def defer(self, item_id: str, error: str, llm: dict, observed: str) -> None:
+    def defer(self, item_id: str, error: str, llm: dict, observed: str, *, terminal: bool = False) -> None:
+        """Retry later; after three failures caused by the item itself, stop retrying.
+
+        A rejected item is queued again only when its source content changes.
+        """
         row = self.db.execute(
-            "SELECT attempts FROM items WHERE id=? AND status='pending'", (item_id,)
+            "SELECT attempts, rejections FROM items WHERE id=? AND status='pending'", (item_id,)
         ).fetchone()
         if row is None:
             return
-        attempts = row[0] + 1
+        attempts, rejections = row[0] + 1, row[1] + terminal
         delay = backoff_seconds(
             attempts, llm["retry_base_seconds"], llm["retry_cap_seconds"]
         )
         with self.db:
             self.db.execute(
-                "UPDATE items SET attempts=?,last_error=?,next_attempt_at=? WHERE id=? AND status='pending'",
-                (attempts, error[:160], after(delay, observed), item_id),
+                "UPDATE items SET status=?,attempts=?,rejections=?,last_error=?,next_attempt_at=? "
+                "WHERE id=? AND status='pending'",
+                ("rejected" if rejections >= 3 else "pending",
+                 attempts, rejections, error[:160], after(delay, observed), item_id),
             )
+
+    def rejected_count(self) -> int:
+        return self.db.execute("SELECT COUNT(*) FROM items WHERE status='rejected'").fetchone()[0]
 
     def finish(self, row: dict, result: dict, cache_key: str, observed: str) -> None:
         item = json.loads(row["payload"])

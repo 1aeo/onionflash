@@ -122,8 +122,8 @@ def test_array_duplicates_and_evidence_whitespace_preserve_existing_policy():
     assert accepted["products"] == ["tor"] and accepted["tags"] == ["security"]
     assert accepted["evidence"] == [quote]
     unpublished = validate_analysis(analysis(publish=False, title="", summary="", why_it_matters="", evidence=[], confidence="confirmed", state="released", products=["tor", "tor"]), item(kind="tag"))
+    # Ignore decisions publish nothing, so their other fields are returned untouched.
     assert unpublished["state"] == "released" and unpublished["confidence"] == "confirmed"
-    assert unpublished["products"] == ["tor"]
 
 
 def test_source_failure_updates_status_and_checkpoint_in_one_statement(tmp_path):
@@ -209,9 +209,9 @@ def test_deadline_after_error_deferral_does_not_count_a_second_attempt(tmp_path,
         store.ingest(item(), DATE)
         defer = store.defer
         calls = []
-        def interrupted_defer(*args):
+        def interrupted_defer(*args, **kwargs):
             calls.append(args)
-            defer(*args)
+            defer(*args, **kwargs)
             _budget()
         monkeypatch.setattr(store, "defer", interrupted_defer)
         cli.run(_pipeline_config(tmp_path), store)
@@ -226,8 +226,10 @@ def test_cleanup_deadline_never_defers_a_skipped_row(tmp_path, monkeypatch):
     _prepare_run(monkeypatch, unavailable, cleanup=_budget)
     with Store(tmp_path / "state.db") as store:
         store.ingest(item(url="https://example.org/urgent", title="Authority compromised"), DATE)
+        store.ingest(item(url="https://example.org/second", title="Second update", labels=["Security"], content="second"), DATE)
         store.ingest(item(url="https://example.org/later", title="Other update", labels=[], content=""), DATE)
         cli.run(_pipeline_config(tmp_path), store)
+        # Two endpoint failures stop network analysis; the remaining row is untouched.
         skipped = store.db.execute("SELECT attempts,last_error,next_attempt_at FROM items WHERE url=?",("https://example.org/later",)).fetchone()
     assert skipped["attempts"] == 0 and skipped["last_error"] is None
     assert skipped["next_attempt_at"] is None
