@@ -28,8 +28,6 @@ failure_backoff_cap_seconds = 21600
 run_budget_seconds = 240
 source_budget_seconds = 60
 analysis_reserve_fraction = 0.5
-# Rescan the lookback window to repair gaps from changing offset-based MR pages.
-reconcile_seconds = 86400
 
 [http]
 timeout_seconds = 30

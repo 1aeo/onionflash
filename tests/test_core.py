@@ -10,7 +10,7 @@ from onionflash.collect import CollectionError, collect_source
 from onionflash.config import DEFAULTS, load_config
 from onionflash.store import Store
 from onionflash.transport import FetchError, Response
-from onionflash.util import canonical_url, item_cluster, plain_text
+from onionflash.util import after, canonical_url, item_cluster, plain_text
 
 
 DATE = "2026-11-08T12:00:00Z"
@@ -397,210 +397,84 @@ def test_base_text_copied_to_every_element_is_bounded_before_feedparser(monkeypa
             collect_source(FakeClient([response(xml.encode())]), source(), {}, DEFAULTS["collection"], DATE)
 
 
-def test_gitlab_pagination_keeps_partial_items_without_advancing_watermark():
-    records = [
-        {
-            "web_url": "https://gitlab.torproject.org/tpo/core/tor/-/issues/1",
-            "title": "Security report",
-            "description": "Body",
-            "created_at": DATE,
-            "updated_at": DATE,
-        }
-    ]
-    client = FakeClient([response(json.dumps(records).encode(), {"x-next-page": "2"})])
-    with pytest.raises(CollectionError) as exc:
-        collect_source(
-            client,
-            source(kind="gitlab_issue", max_pages=1),
-            {},
-            DEFAULTS["collection"],
-            DATE,
-        )
-    assert len(exc.value.items) == 1
-    assert "watermark retained" in str(exc.value)
-    assert "updated_before=" in client.calls[0][1]
+def gitlab_records(*stamps):
+    return json.dumps([
+        {"web_url": f"https://example.org/issues/{n}", "title": f"Report {n}", "description": "Body",
+         "created_at": stamp, "updated_at": stamp}
+        for n, stamp in enumerate(stamps)
+    ]).encode()
 
 
-def test_gitlab_scan_resumes_next_page_then_advances_fixed_watermark(tmp_path):
-    s = source(kind="gitlab_issue", max_pages=1)
-    records = [
-        {
-            "web_url": "https://gitlab.torproject.org/tpo/core/tor/-/issues/1",
-            "title": "Security report",
-            "description": "Body",
-            "created_at": DATE,
-            "updated_at": DATE,
-        }
-    ]
-    with Store(tmp_path / "state.db") as store:
-        state = store.source(s)
-        with pytest.raises(CollectionError) as exc:
-            collect_source(
-                FakeClient(
-                    [response(json.dumps(records).encode(), {"x-next-page": "2"})]
-                ),
-                s,
-                state,
-                DEFAULTS["collection"],
-                DATE,
-            )
-        store.source_failure(
-            s,
-            str(exc.value),
-            DEFAULTS["collection"],
-            DATE,
-            exc.value.checkpoint,
-            exc.value.catching_up,
-        )
-        state = store.source(s)
-        assert state["watermark"] is None and state["scan_page"] == 2
-        client = FakeClient([response(b"[]", {"x-next-page": ""})])
-        result = collect_source(
-            client, s, state, DEFAULTS["collection"], "2026-11-09T12:00:00Z"
-        )
-        assert "page=2" in client.calls[0][1] and result["watermark"] == DATE
-        store.source_success(s, result, "2026-11-09T12:00:00Z")
-        assert (
-            store.source(s)["scan_page"] is None
-            and store.source(s)["watermark"] == DATE
-        )
-
-
-def test_issue_keyset_cursor_resumes_without_offset_shift(tmp_path):
+def gitlab_queries(client):
     from urllib.parse import parse_qs, urlsplit
+    return [parse_qs(urlsplit(call[1]).query) for call in client.calls]
 
-    s = source(kind="gitlab_issue", max_pages=1, url="https://example.org/issues")
+
+def test_gitlab_first_poll_uses_the_lookback_and_sets_an_overlapping_watermark():
+    client = FakeClient([response(gitlab_records(DATE))])
+    result = collect_source(client, source(kind="gitlab_issue"), {}, DEFAULTS["collection"], DATE)
+    query = gitlab_queries(client)[0]
+    assert query["updated_after"] == [after(-DEFAULTS["collection"]["lookback_days"] * 86400, DATE)]
+    assert query["updated_before"] == [DATE] and query["sort"] == ["asc"] and query["page"] == ["1"]
+    assert result["watermark"] == after(-DEFAULTS["collection"]["overlap_seconds"], DATE)
+
+
+def test_gitlab_catch_up_keeps_partial_items_and_resumes_from_the_last_row(tmp_path):
+    stream = source(kind="gitlab_issue", max_pages=1)
     settings = {**DEFAULTS["collection"], "page_size": 2}
-
-    def records(ids):
-        return [
-            {
-                "web_url": f"https://example.org/issues/{n}",
-                "title": f"Report {n}",
-                "description": "Body",
-                "created_at": DATE,
-                "updated_at": DATE,
-            }
-            for n in ids
-        ]
-
     with Store(tmp_path / "state.db") as store:
-        client = FakeClient(
-            [
-                response(
-                    json.dumps(records([1, 2])).encode(),
-                    {
-                        "link": '<https://example.org/issues?cursor=after-two>; rel="next"'
-                    },
-                )
-            ]
-        )
+        client = FakeClient([response(gitlab_records("2026-11-01T00:00:00Z", "2026-11-02T00:00:00.250Z"))])
+        with pytest.raises(CollectionError, match="catching up") as exc:
+            collect_source(client, stream, store.source(stream), settings, DATE)
+        assert len(exc.value.items) == 2 and exc.value.catching_up
+        store.source_failure(stream, str(exc.value), settings, DATE, exc.value.watermark, exc.value.catching_up)
+        client = FakeClient([response(gitlab_records("2026-11-03T00:00:00Z"))])
+        result = collect_source(client, stream, store.source(stream), settings, "2026-11-08T12:05:00Z")
+        query = gitlab_queries(client)[0]
+        assert query["updated_after"] == ["2026-11-02T00:00:00.250Z"] and query["page"] == ["1"]
+        store.source_success(stream, result, "2026-11-08T12:05:00Z")
+        assert store.source(stream)["watermark"] == after(-settings["overlap_seconds"], "2026-11-08T12:05:00Z")
+
+
+def test_gitlab_full_page_sharing_one_timestamp_steps_through_the_tie():
+    tie = "2026-11-02T00:00:00.000Z"
+    client = FakeClient([response(gitlab_records(tie, tie)), response(gitlab_records(tie, tie)),
+                         response(gitlab_records(tie))])
+    collect_source(client, source(kind="gitlab_issue", max_pages=3),
+                   {"watermark": "2026-11-01T00:00:00Z"}, {**DEFAULTS["collection"], "page_size": 2}, DATE)
+    assert [(q["updated_after"][0], q["page"][0]) for q in gitlab_queries(client)] == [
+        ("2026-11-01T00:00:00Z", "1"), (tie, "1"), (tie, "2")]
+
+
+def test_only_a_run_spent_entirely_inside_one_timestamp_skips_past_it():
+    tie, settings = "2026-11-02T00:00:00.000Z", {**DEFAULTS["collection"], "page_size": 2}
+    stream = source(kind="gitlab_issue", max_pages=2)
+    # Moving into a large tie resumes at the tie: the next run has its whole budget for it.
+    client = FakeClient([response(gitlab_records("2026-11-01T00:00:00Z", tie)), response(gitlab_records(tie, tie))])
+    with pytest.raises(CollectionError, match="catching up") as exc:
+        collect_source(client, stream, {"watermark": "2026-10-31T00:00:00Z"}, settings, DATE)
+    assert exc.value.watermark == tie
+    # A whole run inside the tie would restart it at page 1 forever, so it skips past it.
+    client = FakeClient([response(gitlab_records(tie, tie)), response(gitlab_records(tie, tie))])
+    with pytest.raises(CollectionError, match="same-timestamp") as exc:
+        collect_source(client, stream, {"watermark": tie}, settings, DATE)
+    assert exc.value.watermark == "2026-11-02T00:00:00.001Z" and exc.value.catching_up
+
+
+def test_a_gitlab_fetch_error_keeps_items_and_resumes_where_the_failed_request_began():
+    from onionflash.transport import DeadlineReached
+    settings, stream = {**DEFAULTS["collection"], "page_size": 2}, source(kind="gitlab_issue", max_pages=2)
+    for error in (FetchError("HTTP 503", retryable=True), DeadlineReached()):
+        client = FakeClient([response(gitlab_records("2026-11-01T00:00:00Z", "2026-11-02T00:00:00Z")), error])
         with pytest.raises(CollectionError) as exc:
-            collect_source(client, s, store.source(s), settings, DATE)
-        store.source_failure(
-            s, str(exc.value), settings, DATE, exc.value.checkpoint, True
-        )
-        assert store.source(s)["scan_cursor"] == "after-two"
-        # Record 1 can leave the window; cursor is still after record 2, not offset 2.
-        client = FakeClient(
-            [response(json.dumps(records([3, 4])).encode(), {"x-next-page": ""})]
-        )
-        result = collect_source(
-            client, s, store.source(s), settings, "2026-11-09T12:00:00Z"
-        )
-        query = parse_qs(urlsplit(client.calls[0][1]).query)
-        assert query["cursor"] == ["after-two"] and "page" not in query
-        assert [x["title"] for x in result["items"]] == ["Report 3", "Report 4"]
-
-
-def test_untrusted_pagination_link_cannot_change_destination():
-    client = FakeClient(
-        [
-            response(
-                b"[]", {"link": '<https://internal.invalid/steal?cursor=x>; rel="next"'}
-            )
-        ]
-    )
-    with pytest.raises(CollectionError, match="changed destination"):
-        collect_source(
-            client, source(kind="gitlab_issue"), {}, DEFAULTS["collection"], DATE
-        )
-    assert len(client.calls) == 1
-
-
-@pytest.mark.parametrize("cursor", [None, "after-first"])
-def test_exact_full_final_keyset_page_without_pagination_headers_is_terminal(cursor):
-    records = [
-        {
-            "web_url": "https://example.org/issues/41473",
-            "title": "Security report",
-            "description": "Body",
-            "created_at": DATE,
-            "updated_at": DATE,
-        }
-    ]
-    client = FakeClient([response(json.dumps(records).encode())])
-    state = (
-        {}
-        if cursor is None
-        else {
-            "scan_cursor": cursor,
-            "scan_page": 2,
-            "scan_lower": "2026-10-25T12:00:00Z",
-            "scan_upper": DATE,
-            "scan_reconcile": True,
-        }
-    )
-    result = collect_source(
-        client,
-        source(kind="gitlab_issue", max_pages=1),
-        state,
-        {**DEFAULTS["collection"], "page_size": 1},
-        DATE,
-    )
-    assert result["watermark"] == DATE
-    assert len(result["items"]) == 1 and len(client.calls) == 1
-    if cursor:
-        assert "cursor=after-first" in client.calls[0][1]
-
-
-def test_full_offset_page_with_next_header_still_requires_continuation():
-    records = [
-        {
-            "web_url": "https://example.org/issues/41473",
-            "title": "Security report",
-            "description": "Body",
-            "created_at": DATE,
-            "updated_at": DATE,
-        }
-    ]
-    client = FakeClient([response(json.dumps(records).encode(), {"x-next-page": "2"})])
+            collect_source(client, stream, {"watermark": "2026-10-31T00:00:00Z"}, settings, DATE)
+        assert len(exc.value.items) == 2 and exc.value.watermark == "2026-11-02T00:00:00Z"
+        assert not exc.value.catching_up  # an ordinary failure still backs off
+    # Without progress the stored watermark stays as it was.
     with pytest.raises(CollectionError) as exc:
-        collect_source(
-            client,
-            source(kind="gitlab_issue", max_pages=1),
-            {},
-            {**DEFAULTS["collection"], "page_size": 1},
-            DATE,
-        )
-    assert exc.value.checkpoint["page"] == 2
-
-
-def test_periodic_reconciliation_rechecks_full_lookback():
-    from urllib.parse import parse_qs, urlsplit
-
-    s = source(kind="gitlab_mr")
-    client = FakeClient([response(b"[]", {"x-next-page": ""})])
-    result = collect_source(
-        client,
-        s,
-        {"watermark": DATE, "last_reconciled": "2026-11-01T12:00:00Z"},
-        DEFAULTS["collection"],
-        DATE,
-    )
-    query = parse_qs(urlsplit(client.calls[0][1]).query)
-    assert query["updated_after"][0].startswith("2026-10-25")
-    assert result["reconciled"] is True
+        collect_source(FakeClient([FetchError("HTTP 503", retryable=True)]), stream,
+                       {"watermark": "2026-10-31T00:00:00Z"}, settings, DATE)
+    assert exc.value.watermark is None
 
 
 def test_malformed_gitlab_timestamp_cannot_abort_the_entire_cycle():

@@ -230,13 +230,20 @@ database lock while taking their upload snapshot.
 - HTTP retries are limited to transient failures. Exponential backoff has a cap,
   jitter, and bounded `Retry-After`. Persisted source cooldowns and failed-analysis
   delays survive restarts. One failed source does not invalidate published news.
-- GitLab scans have fixed time windows, overlap, and persistent checkpoints.
-  Issues use GitLab's keyset cursor when supplied. Merge requests use the API's
-  offset pages; a configurable daily full-lookback reconciliation repairs gaps
-  caused by records moving between pages while they are being edited.
-  A capped scan resumes on the next run; its completed watermark advances only
-  after the window finishes. XML declarations/entities are rejected with an
-  encoding-aware parser before feed parsing.
+- GitLab scans read issues and merge requests in ascending `updated_at` order from
+  one inclusive watermark. Each request starts a fresh query from the last row
+  seen, so a record edited mid-scan cannot shift an offset and be skipped. The
+  exception is a full page whose rows all share one timestamp; with the default
+  page size that takes 50 records updated in the same millisecond, in practice a
+  bulk update. GitLab offers no finer cursor, so such a tie is stepped by page,
+  and an edit that moves one of its rows during the scan can shift another past
+  it. A scan that is capped, cut off by its deadline or interrupted by an error
+  resumes from the last row on the next run. An interrupted tie restarts from its
+  first page, and a run whose whole page budget falls inside one tie skips the
+  rest of it rather than repeat it forever, so a very small page size and page
+  budget can skip records that share a timestamp. A completed scan moves the
+  watermark to the poll start minus `collection.overlap_seconds`. XML declarations/entities are
+  rejected with an encoding-aware parser before feed parsing.
 - New and changed items are saved before analysis. Private analysis records are
   identified by content hash, model, prompt version and input window; saved results
   are never reused to skip analysis. The application makes one model request

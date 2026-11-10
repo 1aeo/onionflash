@@ -50,8 +50,6 @@ def successful_state(**overrides):
         "next_fetch_at": "2026-11-09T15:35:02Z",
         "error": None,
         "failures": 0,
-        "scan_upper": None,
-        "scan_page": None,
         **overrides,
     }
 
