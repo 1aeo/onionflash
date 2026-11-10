@@ -384,7 +384,8 @@ def build(config: dict, store, *, force: bool = False) -> dict:
     pages = max(1, (count + page_size - 1) // page_size)
     index_settings = digest([page_size, site, identity])
     revision = _meta(db, "publication_catalog_revision") or "0"
-    refresh_indexes = template_changed or output_missing or force or _meta(db, "publication_indexes") != index_settings or _meta(db, "publication_index_revision") != revision
+    refresh_requested = force and restart_rebuild
+    refresh_indexes = template_changed or output_missing or refresh_requested or _meta(db, "publication_indexes") != index_settings or _meta(db, "publication_index_revision") != revision
     health = store.health(config["sources"], config["collection"]["stale_after_seconds"], observed)
     with db:
         for name in render.ASSET_FILES:
@@ -407,7 +408,7 @@ def build(config: dict, store, *, force: bool = False) -> dict:
         if refresh_indexes:
             _remove_obsolete_pages(artifacts, pages)
         feed_settings = digest([feed_size, site, identity])
-        if output_missing or force or _meta(db, "publication_feeds") != feed_settings or _meta(db, "publication_feed_revision") != revision:
+        if output_missing or refresh_requested or _meta(db, "publication_feeds") != feed_settings or _meta(db, "publication_feed_revision") != revision:
             _feeds(artifacts, db, site, base, feed_size)
             _set_meta(db, "publication_feeds", feed_settings)
             _set_meta(db, "publication_feed_revision", revision)

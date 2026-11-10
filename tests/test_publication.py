@@ -39,6 +39,25 @@ def meta(db, key):
     return db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()[0]
 
 
+def test_resuming_forced_rebuild_does_not_rewrite_all_feeds_each_batch(tmp_path, monkeypatch):
+    cfg = settings(tmp_path, render_batch_size=5)
+    with Store(cfg["storage"]["database"]) as store:
+        for number in range(5):
+            put(store.db, story(number))
+        build(cfg, store)
+        cfg["storage"]["render_batch_size"] = 2
+        calls = []
+        original = publication._feeds
+        def counted(*args):
+            calls.append(1)
+            return original(*args)
+        monkeypatch.setattr(publication, "_feeds", counted)
+        assert build(cfg, store, force=True)["articles_pending"] == 3
+        assert build(cfg, store, force=True)["articles_pending"] == 1
+        assert "articles_pending" not in build(cfg, store, force=True)
+        assert len(calls) == 1
+
+
 def test_more_than_1000_stories_are_permanent_and_all_feeds_are_complete(tmp_path):
     cfg = settings(tmp_path, max_stories=1, render_batch_size=250)
     cfg["site"]["page_size"] = 100
