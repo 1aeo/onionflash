@@ -879,6 +879,15 @@ def test_moved_installation_keeps_building(tmp_path):
     assert (moved / "public" / "index.html").exists()
 
 
+def test_a_directory_at_the_marker_path_is_not_ownership(tmp_path):
+    (tmp_path / "public").mkdir()
+    (tmp_path / "public" / "operator-file.txt").write_text("keep")
+    (tmp_path / ".public.onionflash-owner").mkdir()
+    with Store(tmp_path / "state.db") as store, pytest.raises(ValueError, match="regular file"):
+        build(config(tmp_path), store)
+    assert (tmp_path / "public" / "operator-file.txt").read_text() == "keep"
+
+
 def test_status_reports_the_count_recorded_by_the_last_build(tmp_path, capsys):
     import json as _json
     from onionflash.cli import main

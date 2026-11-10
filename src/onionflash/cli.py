@@ -84,6 +84,8 @@ def build(config: dict, store: Store) -> dict:
     owner = output.parent / ("." + output.name + ".onionflash-owner")
     if output.is_symlink() or owner.is_symlink():
         raise ValueError("Public output and ownership marker must not be symlinks")
+    if owner.exists() and not owner.is_file():
+        raise ValueError("Output ownership marker must be a regular file")
     if output.exists() and not output.is_dir():
         raise ValueError("Public output must be a directory")
     if output.exists() and any(output.iterdir()) and not owner.exists():
