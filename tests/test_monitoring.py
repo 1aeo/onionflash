@@ -141,6 +141,13 @@ def test_silence_never_resolves_and_old_notifications_cannot_replay_after_expiry
     assert tuple(db.execute("SELECT * FROM stories").fetchone()) == before
 
 
+def test_status_counts_only_the_window_even_before_expired_rows_are_deleted(db):
+    ingest(db, [item(-2), item(-1)])
+    later = after(3 * 86400, NOW)
+    status = monitoring.status(db, later)  # no ingest yet at `later`, so nothing was deleted
+    assert status["observations"] == status["groups"] == 0 and not status["at_capacity"]
+
+
 def test_recurrence_after_the_window_is_a_new_episode(db):
     ingest(db, [item(-2), item(-1)])
     later = 120 * 24

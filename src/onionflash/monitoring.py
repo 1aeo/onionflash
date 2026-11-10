@@ -190,6 +190,8 @@ def status(db, observed: str) -> dict:
         COALESCE(SUM(kind='service'),0) AS service_observations
         FROM monitoring_groups WHERE highwater>=?""", (cutoff,)).fetchone()
     result = dict(row)
-    result["observations"] = db.execute("SELECT COUNT(*) FROM monitoring_observations").fetchone()[0]
+    # Only the window counts; expired rows wait for the next ingest to delete them.
+    result["observations"] = db.execute(
+        "SELECT COUNT(*) FROM monitoring_observations WHERE stamp>=?", (cutoff,)).fetchone()[0]
     result["at_capacity"] = result["groups"] >= MAX_GROUPS or result["observations"] >= MAX_OBSERVATIONS
     return result
