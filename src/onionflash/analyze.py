@@ -140,9 +140,10 @@ def cache_key(row: dict, llm: dict) -> str:
 def _json_object(text: str) -> dict:
     try:
         result = json.loads(text)
-        # SQLite text is UTF-8; reject unpaired JSON surrogate escapes before
-        # a malformed model response can interrupt a queue transaction.
-        json.dumps(result, ensure_ascii=False).encode("utf-8")
+        # Stored analyses must be standard UTF-8 JSON: reject unpaired surrogate
+        # escapes and non-finite numbers (NaN, Infinity, 1e999) before a malformed
+        # model response reaches the queue, even in an ignore decision.
+        json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8")
     except (ValueError, TypeError, RecursionError) as exc:
         raise AnalysisError("Model returned invalid JSON") from exc
     if not isinstance(result, dict):
