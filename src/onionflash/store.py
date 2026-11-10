@@ -363,6 +363,8 @@ class Store:
                 elif approved_candidate != original:
                     raise ReviewRequired("A deterministic notice cannot accept an unreviewed repair")
                 payload.update({key: approved_candidate[key] for key in candidate.SEMANTIC_FIELDS})
+                if existing is None:  # Date a new story when it is published, not when it was first drafted.
+                    payload["added_at"] = observed
             if review_record is None and self.db.execute("SELECT 1 FROM sqlite_master WHERE name='review_jobs'").fetchone():
                 job = self.db.execute("SELECT record_json FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
                 review_record = json.loads(job[0]) if job else None

@@ -69,7 +69,9 @@ Approvals bind the exact normalized candidate, supplied source packet, reviewer
 policy and current item/source/story/editorial-lock fingerprints. A commit takes
 an immediate SQLite transaction and checks those bindings again. Changed inputs
 invalidate the approval. The approved candidate is written directly; no later
-merge or semantic rewrite can restore an old unsupported sentence.
+merge or semantic rewrite can restore an old unsupported sentence. Only a new
+story's `added_at`, its publishing date, is set at commit instead, so a retried
+review cannot backdate it.
 
 ## Configuration
 

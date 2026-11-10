@@ -98,6 +98,15 @@ def test_approved_exact_candidate_commits_and_keeps_private_complete_audit(conte
     assert len(audit["reviews"]) == 1 and audit["outcome"] == "approved"
 
 
+def test_a_new_story_is_dated_when_the_review_commits_not_when_the_item_started(context, monkeypatch):
+    cfg, store = context
+    row = pending(store)
+    # The item starts before midnight; the review returns and commits after it.
+    monkeypatch.setattr(review_gate, "now_iso", lambda: "2026-11-11T00:01:00Z")
+    review_gate.process_item(cfg, store, row, Writer(), Reviewer(verdict()), "2026-11-10T23:59:00Z")
+    assert store.stories()[0]["added_at"] == "2026-11-11T00:01:00Z"
+
+
 @pytest.mark.parametrize("failure", [AnalysisError("timeout", retryable=True), {}])
 def test_review_timeout_or_malformed_verdict_resumes_without_regenerating_writer(context, failure):
     cfg, store = context

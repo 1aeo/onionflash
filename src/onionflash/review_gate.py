@@ -219,7 +219,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, deadlin
               approval_key=job["approval_key"] if same else None)
         if prepared.get("locked") or not prepared["requires_review"]:
             record["outcome"] = "locked" if prepared.get("locked") else "deterministic"
-            store.commit_candidate(prepared, prepared["candidate"], writer_key, observed, review_record=record)
+            store.commit_candidate(prepared, prepared["candidate"], writer_key, now_iso(), review_record=record)
             return {**report, "status": record["outcome"]}
         if prepared.get("missing_sources"):
             held = _hold(store, row, prepared, draft, writer_key, policy, record, observed, prepared_at,
@@ -249,7 +249,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, deadlin
                       prepared_at=prepared_at, approval_key=key)
                 with store.db:
                     store.db.execute("UPDATE review_approvals SET last_used_at=? WHERE key=?", (observed, key))
-                store.commit_candidate(prepared, candidate, writer_key, observed, approval_key=key,
+                store.commit_candidate(prepared, candidate, writer_key, now_iso(), approval_key=key,
                                        policy_hash=policy, review_record=record)
                 report.update(status="published", cache_hit=True)
                 return report
@@ -273,7 +273,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, deadlin
                            _json(verdict), _json(record), observed, observed)
                 _save(store, row["id"], writer_key, policy, "approved", draft, prepared, record, observed,
                       prepared_at=prepared_at, approval_key=key, approval_receipt=receipt)
-                store.commit_candidate(prepared, candidate, writer_key, observed, approval_key=key,
+                store.commit_candidate(prepared, candidate, writer_key, now_iso(), approval_key=key,
                                        policy_hash=policy, review_record=record)
                 return {**report, "status": "published"}
             if verdict["verdict"] == "hold" or verification or settings["max_repairs"] == 0:
