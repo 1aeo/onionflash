@@ -10,7 +10,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from html.parser import HTMLParser
 
-from onionflash.render import CATEGORIES, _page_url, headers_text, render_site
+from onionflash.render import CATEGORIES, _page_url, render_site
 
 
 CONFIG = {
@@ -276,35 +276,25 @@ class RenderTests(unittest.TestCase):
         self.assertTrue(headers.startswith("/onionflash/*\n"))
         self.assertIn("script-src 'none'", headers)
         self.assertIn("connect-src 'none'", headers)
-        self.assertNotIn("unsafe-inline", headers.split("\n\n", 1)[0])
-
-    def test_only_known_xml_feeds_replace_the_inherited_style_policy(self):
-        for prefix in ("", "/onionflash", "/nested/news"):
-            with self.subTest(prefix=prefix):
-                blocks = headers_text("https://example.com" + prefix + "/").strip().split("\n\n")
-                self.assertEqual(blocks[0].splitlines()[0], prefix + "/*")
-                self.assertIn("style-src 'self'", blocks[0])
-                self.assertNotIn("unsafe-inline", blocks[0])
-                self.assertNotIn("Content-Type:", blocks[0])
-                self.assertEqual({b.splitlines()[0] for b in blocks[1:]},
-                                 {prefix + "/feed.xml", *(prefix + f"/tags/{topic}.xml" for topic in CATEGORIES)})
-                for block in blocks:
-                    self.assertIn("script-src 'none'", block)
-                    self.assertIn("connect-src 'none'", block)
-                    self.assertNotIn("unsafe-eval", block)
-                for block in blocks[1:]:
-                    lines = block.splitlines()
-                    self.assertEqual(lines[1], "  ! Content-Security-Policy")
-                    self.assertTrue(lines[2].startswith("  Content-Security-Policy:"))
-                    self.assertIn("style-src 'unsafe-inline'", lines[2])
-                    self.assertNotIn("style-src 'self'", lines[2])
-                    self.assertEqual(lines[3], "  Content-Type: application/rss+xml; charset=utf-8")
+        site, feeds = headers.strip().split("\n\n")
+        self.assertIn("style-src 'self'", site)
+        self.assertNotIn("unsafe-inline", site)
+        self.assertTrue(feeds.startswith("/onionflash/*.xml\n"))
+        self.assertIn("\n  ! Content-Security-Policy\n", feeds)
+        # Replaced, not appended: a policy's first style-src and img-src apply.
+        self.assertIn("style-src 'unsafe-inline'", feeds)
+        self.assertIn("img-src data:", feeds)
+        self.assertNotIn("'self'", feeds)
+        # Browsers download, or show as text, feeds served as application/rss+xml.
+        self.assertNotIn("Content-Type:", headers)
 
     def test_root_and_local_preview_base_urls_are_supported(self):
         config = {"site": {"base_url": "http://127.0.0.1:8788/"}}
         output = self.render(config=config)
         self.assertIn('href="http://127.0.0.1:8788/feed.xml"', (output / "index.html").read_text())
-        self.assertTrue((output / "_headers").read_text().startswith("/*\n"))
+        headers = (output / "_headers").read_text()
+        self.assertTrue(headers.startswith("/*\n"))
+        self.assertIn("\n/*.xml\n  ! Content-Security-Policy\n", headers)  # the empty prefix
 
     def test_private_health_errors_are_never_exposed(self):
         output = self.render(health=[{"name": "Tor releases", "last_success": "2026-11-08T12:00:00Z", "stale": True, "error": "Bearer top-secret at 192.168.50.10"}])

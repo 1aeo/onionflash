@@ -52,9 +52,9 @@ the currently loaded page. The publisher generates the copyright year and queues
 a bounded rebuild when the year changes. Content Security Policy blocks browser
 scripts with `script-src 'none'`. Cloudflare's routing Worker is server-side
 JavaScript and does not run in visitors' browsers.
-XML feeds alone allow the browser's inline XML-viewer styling and use
-`application/rss+xml; charset=utf-8`. Scripts remain blocked, and HTML pages
-retain their stricter stylesheet policy.
+XML feeds alone allow the browser XML viewer's inline styling and `data:` icons,
+and keep the generic XML type so browsers show them instead of downloading them.
+Scripts remain blocked, and HTML pages retain their stricter stylesheet policy.
 
 The first run collects up to the configured lookback window and analyzes a
 bounded number of items. More items remain queued for subsequent runs. An empty
