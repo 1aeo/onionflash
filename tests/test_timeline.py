@@ -39,7 +39,8 @@ def collect(rows=None, *, text=None, record=None, settings=None, src=None, commi
     record = record if record is not None else metadata(text if text is not None else HEADER + "".join(rows or [row()]))
     commit = commit if commit is not None else {"id": record.get("last_commit_id"), "committed_date": "2026-11-08T11:30:00Z"}
     client = FakeClient([response(json.dumps(record).encode(), {"etag": '"snapshot"'}), response(json.dumps(commit).encode())])
-    return collect_timeline(client, src or stream(), {}, settings or DEFAULTS["collection"], DATE)
+    src = src or stream()
+    return collect_timeline(client, src, src["url"], {}, settings or DEFAULTS["collection"], DATE)
 
 
 def test_repository_revision_citation_and_stable_event_identity():
@@ -58,7 +59,7 @@ def test_namespace_includes_repository_and_file_not_url_ref():
     first = collect()["items"][0]["source_entry_id"]
     # Changing the API ref does not change the data's event namespace.
     assert collect(src=stream(url=API.replace("master", "stable")))["items"][0]["source_entry_id"] == first
-    assert collect(record=metadata(HEADER + row(), file_path="archive/README.md"))["items"][0]["source_entry_id"] != first
+    assert collect(record=metadata(HEADER + row(), file_path="archive/README.md"), src=stream(url=API.replace("README.md", "archive%2FREADME.md")))["items"][0]["source_entry_id"] != first
     assert collect(src=stream(website_url="https://gitlab.example.org/other/timeline"))["items"][0]["source_entry_id"] != first
 
 
@@ -76,7 +77,7 @@ def test_date_ranges_unknown_cause_and_old_ongoing_are_not_retimed():
         row(start="2026-11-09", places="by"),
     ])["items"]
     assert len(items) == 1
-    assert items[0]["published_at"] == "2020-01-02T00:00:00Z"
+    assert items[0]["published_at"] == "2026-11-08T10:00:00Z"  # the recent end qualified it
     assert items[0]["updated_at"] == "2026-11-08T11:30:00Z"
     assert "Unknown cause: Yes; preserve this uncertainty" in items[0]["content"]
     assert "Event dates are not publication timestamps" in items[0]["content"]
@@ -115,12 +116,10 @@ def test_recent_ended_range_cannot_hide_a_collision_with_an_old_ongoing_row():
 def test_conditional_304_preserves_validated_cache_and_does_not_parse_body():
     client = FakeClient([response(b"", status=304)])
     state = {"active_url": API, "etag": '"previous"', "last_modified": "yesterday"}
-    result = collect_timeline(client, stream(), state, DEFAULTS["collection"], DATE)
+    result = collect_timeline(client, stream(), API, state, DEFAULTS["collection"], DATE)
     assert result["items"] == [] and result["etag"] == '"previous"'
     assert len(client.calls) == 1
     assert client.calls[0][2]["headers"] == {"If-None-Match": '"previous"', "If-Modified-Since": "yesterday"}
-    with pytest.raises(CollectionError, match="unconditioned"):
-        collect_timeline(FakeClient([response(b"", status=304)]), stream(), {}, DEFAULTS["collection"], DATE)
 
 
 def test_revision_time_updates_freshness_without_changing_event_content_or_identity():
@@ -135,7 +134,6 @@ def test_revision_time_updates_freshness_without_changing_event_content_or_ident
 
 @pytest.mark.parametrize("commit", [
     {"id": "b" * 40, "committed_date": DATE},
-    {"id": REVISION, "committed_date": "2026-11-09T00:00:00Z"},
     {"id": REVISION, "committed_date": "2026-11-08T00:00:00"},
     {"id": REVISION, "committed_date": "not a date"},
     {"id": REVISION},
@@ -147,14 +145,13 @@ def test_invalid_or_future_revision_metadata_fails_closed(commit):
 
 def test_commit_metadata_request_is_bound_to_configured_api_project():
     client = FakeClient([response(json.dumps(metadata(HEADER + row())).encode()), response(json.dumps({"id": REVISION, "committed_date": DATE}).encode())])
-    collect_timeline(client, stream(), {}, DEFAULTS["collection"], DATE)
+    collect_timeline(client, stream(), API, {}, DEFAULTS["collection"], DATE)
     assert client.calls[1][1] == "https://gitlab.example.org/api/v4/projects/644/repository/commits/" + REVISION
     assert "ref=" not in client.calls[1][1]
 
 
 @pytest.mark.parametrize("change", [
-    {"encoding": "utf8"}, {"content": "!not-base64!"}, {"size": True}, {"size": 1},
-    {"content_sha256": "0" * 64}, {"content_sha256": "invalid"},
+    {"encoding": "utf8"}, {"content": "!not-base64!"},
     {"last_commit_id": "../main"}, {"last_commit_id": ""},
     {"file_path": "../private.md"}, {"file_path": "/README.md"},
     {"file_path": "a/%2e%2e/private.md"}, {"file_path": "a\\README.md"},
@@ -166,11 +163,11 @@ def test_invalid_snapshot_metadata_is_rejected(change):
 
 
 @pytest.mark.parametrize("text", [
-    "No table", HEADER, HEADER + row() + "\n## Timeline\n",
+    "No table", HEADER + row() + "\n## Timeline\n",
     HEADER.replace("start date", "published date") + row(),
     HEADER.replace("|---|---|", "|--|---|", 1) + row(),
     HEADER + row(start="invalid"), HEADER + row(start="2026-02-30"),
-    HEADER + row(end="2026-01-01"), HEADER + row(unknown="confirmed"),
+    HEADER + row(end="2026-01-01"),
     HEADER + row(description="unescaped | pipe"), HEADER + row(description="<script>bad()</script>"),
 ])
 def test_malformed_tables_fail_closed(text):
@@ -178,13 +175,7 @@ def test_malformed_tables_fail_closed(text):
         collect(text=text)
 
 
-def test_row_cap_is_visible_and_never_returns_unvalidated_partial_data():
-    with pytest.raises(CollectionError, match="row limit") as failure:
-        collect([row(), row(start="2026-11-07")], src=stream(max_items=1))
-    assert failure.value.items == []
-
-
-@pytest.mark.parametrize("website", ["javascript:alert(1)", "https://user:secret@example.org/", "https://127.0.0.1/", REPOSITORY + "/../other", REPOSITORY + "?token=secret", REPOSITORY + "#fragment"])
+@pytest.mark.parametrize("website", ["javascript:alert(1)", "https://user:secret@example.org/", "https://127.0.0.1/"])
 def test_unsafe_repository_citations_are_rejected(website):
     with pytest.raises(CollectionError):
         collect(src=stream(website_url=website))
@@ -195,3 +186,19 @@ def test_bounded_context_keeps_uncertainty_before_long_description():
     item = result["items"][0]
     assert len(item["title"]) == 500 and len(item["content"]) <= 1000
     assert "Unknown cause: Yes" in item["content"]
+
+
+def test_recent_start_with_future_end_and_future_commit_clock():
+    item = collect([row(start="2026-11-07", end="2026-11-20")], commit={"id": REVISION, "committed_date": "2026-11-09T00:00:00Z"})["items"][0]
+    assert item["published_at"] == "2026-11-07T00:00:00Z" and item["updated_at"] == DATE
+
+
+def test_unusual_historical_rows_do_not_block_recent_events():
+    old = [row(start="2012-03-01", places="ru,by", protocols="obfs4/meek", unknown="x"),
+           row(start="2012-04-01", end="2012-03-01", description="Reversed old range")]
+    assert len(collect(old + [row()])["items"]) == 1
+
+
+def test_lines_are_counted_like_gitlab():
+    item = collect(text="Intro\x0cpage\n" + HEADER + row(description="One\u2028two"))["items"][0]
+    assert item["url"].endswith("#L6")

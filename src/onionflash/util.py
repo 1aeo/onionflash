@@ -168,12 +168,7 @@ def canonical_url(value: str) -> str:
 
 def item_identity(item: dict) -> str:
     """Keep repository entries stable while their immutable citation changes."""
-    if item.get("kind") == "metrics_timeline":
-        identity = item.get("source_entry_id")
-        if not isinstance(identity, str) or not re.fullmatch(r"[a-f0-9]{64}", identity):
-            raise ValueError("Timeline item needs a stable source entry identity")
-        return "timeline:" + identity
-    return item["url"]
+    return "timeline:" + item["source_entry_id"] if item.get("kind") == "metrics_timeline" else item["url"]
 
 
 _PRODUCT_NAMES = {"tor": "tor", "arti": "arti", "tor-browser": "tor browser"}
