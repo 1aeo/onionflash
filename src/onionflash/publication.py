@@ -154,6 +154,9 @@ def _file_hash(path: Path) -> str:
         return result.hexdigest()
 
 
+TEMPORARY_PREFIX = ".onionflash-"
+
+
 class Artifacts:
     def __init__(self, db, output: Path, observed: str):
         self.db, self.output, self.observed = db, output, observed
@@ -164,13 +167,15 @@ class Artifacts:
         if self.staging.is_symlink():
             raise ValueError("Unsafe public staging directory")
         self.staging.mkdir(mode=0o700, exist_ok=True)
-        for stale in self.staging.iterdir():
-            stale.unlink()
+        # Remove only this module's own leftovers; anything else there is left alone.
+        for stale in self.staging.glob(TEMPORARY_PREFIX + "*"):
+            if stale.is_file():
+                stale.unlink()
 
     @contextmanager
     def stream(self, relative: str, content_type: str):
         target = _target(self.output, relative)
-        descriptor, temporary_name = tempfile.mkstemp(dir=self.staging)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=TEMPORARY_PREFIX, dir=self.staging)
         temporary = Path(temporary_name)
         try:
             with os.fdopen(descriptor, "wb") as stream:

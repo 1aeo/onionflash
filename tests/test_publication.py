@@ -301,8 +301,19 @@ def test_a_killed_build_leaves_no_temporary_files_in_the_public_tree(tmp_path, m
             with pytest.raises(RuntimeError, match="killed"):
                 build(cfg, store)
         build(cfg, store)
-    assert not list(Path(cfg["storage"]["output_dir"]).rglob(".*"))
+    public = Path(cfg["storage"]["output_dir"])
+    assert not list(public.rglob(".*")) and not list(public.rglob("tmp*"))
     assert not any((tmp_path / ".public.onionflash-staging").iterdir())
+
+
+def test_the_staging_directory_keeps_files_it_did_not_create(tmp_path):
+    cfg = settings(tmp_path)
+    staging = tmp_path / ".public.onionflash-staging"
+    staging.mkdir()
+    (staging / "data.sqlite3").write_text("unrelated")
+    with Store(cfg["storage"]["database"]) as store:
+        put(store.db, story(1)); build(cfg, store)
+    assert (staging / "data.sqlite3").read_text() == "unrelated"
 
 
 def test_template_rebuild_is_bounded_and_resumes_across_connections(tmp_path, monkeypatch):
