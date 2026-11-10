@@ -3,7 +3,7 @@
 The consensus-health and anti-censorship mailing lists are collected through the
 normal bounded HTTP/feed path, including retries, backoff and source health.
 Their `alert_format` selects a deterministic parser. These messages never enter
-the Qwen analysis queue, even when a template is unknown.
+the LLM analysis queue, even when a template is unknown.
 
 ## What can become news
 

@@ -17,7 +17,6 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlsplit, urlunsplit
-from zoneinfo import ZoneInfo
 from .schema import CATEGORY_LABELS as CATEGORIES, PRIORITIES, CONFIDENCES, STATES
 from .util import parse_utc as _date, format_utc as _iso
 
@@ -227,7 +226,7 @@ def _navigation(base: str) -> str:
 def _shell(site: dict, base: str, title: str, description: str, body: str, canonical: str) -> str:
     name = _text(site.get("title", "Onion Flash"), 80)
     repository = _safe_url(site.get("repository_url", "https://github.com/1aeo/onionflash"))
-    year = datetime.now(ZoneInfo("America/Los_Angeles")).year
+    year = datetime.now(timezone.utc).year
     repository_link = f'<a href="{_escape(repository)}">Source code ↗</a>' if repository else ""
     return f'''<!doctype html>
 <html lang="en"><head>
