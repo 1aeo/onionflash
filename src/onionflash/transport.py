@@ -230,6 +230,9 @@ class HttpClient:
         self.sleep = sleep
         self.clock = clock
         self._next_request = 0.0
+        # Absolute time.monotonic() deadline set by the caller (None: no limit).
+        # Every attempt is capped by it and no retry sleeps past it.
+        self.deadline: float | None = None
         self._injected_transport = transport is not None
         self._client = httpx.Client(
             transport=transport or _CheckedTransport(self.policy),
@@ -281,6 +284,11 @@ class HttpClient:
     def _origin(value: str) -> tuple[str, str, int]:
         parts = urlsplit(value)
         return parts.scheme, parts.hostname or "", parts.port or (443 if parts.scheme == "https" else 80)
+
+    def _pause(self, seconds: float) -> None:
+        if self.deadline is not None and self.clock() + seconds >= self.deadline:
+            raise FetchError("request deadline reached", retryable=True)
+        self.sleep(seconds)
 
     def _rate_limit(self) -> None:
         rate = float(self.settings.get("requests_per_minute", 120.0))
@@ -348,6 +356,10 @@ class HttpClient:
         for attempt in range(attempts):
             current, active_headers, active_method, payload = start_url, dict(start_headers), method, json_body
             deadline = self.clock() + float(self.settings.get("total_timeout_seconds", 90.0))
+            if self.deadline is not None:
+                if self.deadline <= self.clock():
+                    raise FetchError("request deadline reached", retryable=True)
+                deadline = min(deadline, self.deadline)
             try:
                 for redirects in range(int(self.settings.get("max_redirects", 4)) + 1):
                     self._rate_limit()
@@ -375,7 +387,7 @@ class HttpClient:
                             continue
                         if response.status_code in RETRY_STATUSES:
                             if attempt + 1 < attempts:
-                                self.sleep(retry_delay(attempt, self.settings, response.headers.get("retry-after")))
+                                self._pause(retry_delay(attempt, self.settings, response.headers.get("retry-after")))
                                 break
                             raise FetchError(f"HTTP {response.status_code}", status=response.status_code, retryable=True)
                         if response.status_code >= 400:
@@ -387,12 +399,12 @@ class HttpClient:
             except FetchError as exc:
                 if not exc.retryable or attempt + 1 >= attempts:
                     raise
-                self.sleep(retry_delay(attempt, self.settings))
+                self._pause(retry_delay(attempt, self.settings))
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError,
                     httpcore.TimeoutException, httpcore.NetworkError, httpcore.RemoteProtocolError, OSError):
                 if attempt + 1 >= attempts:
                     raise FetchError("network request failed", retryable=True) from None
-                self.sleep(retry_delay(attempt, self.settings))
+                self._pause(retry_delay(attempt, self.settings))
             except (httpx.HTTPError, httpcore.ProtocolError, ValueError):
                 raise FetchError("invalid HTTP response") from None
         raise FetchError("request retries exhausted", retryable=True)

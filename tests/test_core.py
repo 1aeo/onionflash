@@ -613,7 +613,7 @@ def test_slow_source_is_deferred_and_does_not_starve_queued_analysis(
             return analysis()
 
     def timeout(*args):
-        raise cli.RunBudgetReached()
+        raise CollectionError("request deadline reached")
 
     monkeypatch.setattr(cli, "HttpClient", DummyContext)
     monkeypatch.setattr(cli, "Analyzer", DummyContext)
@@ -625,37 +625,28 @@ def test_slow_source_is_deferred_and_does_not_starve_queued_analysis(
         assert store.source(cfg["sources"][0])["next_fetch_at"] is not None
 
 
-def test_transport_cannot_swallow_run_budget_as_a_retryable_network_error():
+def test_request_deadline_is_never_slept_past():
     import socket
-    import time
     import httpx
-    from onionflash.cli import RunBudgetReached, time_budget
     from onionflash.transport import HttpClient
 
-    calls = []
-
-    def slow(request):
+    calls, sleeps = [], []
+    settings = {**DEFAULTS["http"], "retry_attempts": 3, "backoff_base_seconds": 5, "requests_per_minute": 10000}
+    resolver = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+    clock = [100.0]
+    def busy(request):
         calls.append(request)
-        time.sleep(0.15)
-        return httpx.Response(200, content=b"ok")
-
-    settings = {
-        **DEFAULTS["http"],
-        "retry_attempts": 2,
-        "backoff_base_seconds": 0,
-        "requests_per_minute": 10000,
-    }
-    resolver = lambda *args: [
-        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))
-    ]
-    with HttpClient(
-        settings, transport=httpx.MockTransport(slow), resolver=resolver
-    ) as client:
-        with pytest.raises(RunBudgetReached):
-            with time_budget(0.02):
-                client.request("GET", "https://example.org/")
-    assert len(calls) == 1
-
+        return httpx.Response(503, content=b"busy")
+    with HttpClient(settings, transport=httpx.MockTransport(busy), resolver=resolver,
+                    sleep=sleeps.append, clock=lambda: clock[0]) as client:
+        client.deadline = 102.0  # less than one 5 s retry wait away
+        with pytest.raises(FetchError, match="deadline") as caught:
+            client.request("GET", "https://example.org/")
+        assert caught.value.retryable
+        clock[0] = 103.0
+        with pytest.raises(FetchError, match="deadline"):
+            client.request("GET", "https://example.org/")
+    assert len(calls) == 1 and sleeps == []
 
 def test_render_failure_preserves_prior_site(tmp_path, monkeypatch):
     cfg = config(tmp_path)

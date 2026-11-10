@@ -8,7 +8,6 @@ import fcntl
 import json
 import os
 import shutil
-import signal
 import sys
 import tempfile
 import time
@@ -20,10 +19,7 @@ from .collect import CollectionError, collect_source
 from .config import load_config
 from .store import Store, source_due
 from .transport import HttpClient
-from .util import BudgetExceeded, now_iso
-
-
-RunBudgetReached = BudgetExceeded
+from .util import now_iso
 
 
 @contextlib.contextmanager
@@ -41,20 +37,6 @@ def run_lock(database: str):
         yield True
     finally:
         os.close(fd)
-
-
-@contextlib.contextmanager
-def time_budget(seconds: int):
-    def expired(signum, frame):
-        raise RunBudgetReached()
-
-    previous = signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
 
 
 def build(config: dict, store: Store) -> dict:
@@ -163,72 +145,55 @@ def run(config: dict, store: Store) -> dict:
             if remaining < 1:
                 report["budget_reached"] = True
                 break
+            # Requests stop at this deadline; a source cut off only by the shared
+            # collection deadline is not penalized and resumes next run.
+            client.deadline = time.monotonic() + min(remaining, config["collection"]["source_budget_seconds"])
             try:
-                with time_budget(
-                    min(remaining, config["collection"]["source_budget_seconds"])
-                ):
-                    result = collect_source(
-                        client, source, state, config["collection"], observed
-                    )
+                result = collect_source(client, source, state, config["collection"], observed)
                 received = record_items(source, result["items"])
                 store.source_success(source, result, received, schedule_from=observed)
                 report["sources_ok"] += 1
             except CollectionError as exc:
                 received = record_items(source, exc.items)
+                out_of_time = time.monotonic() >= collection_deadline
                 store.source_failure(
                     source,
                     str(exc),
                     config["collection"],
                     received,
                     exc.checkpoint,
-                    exc.catching_up,
+                    exc.catching_up or out_of_time,
                 )
                 report["sources_failed"] += 1
-            except RunBudgetReached:
-                store.source_failure(
-                    source,
-                    "Source time budget exceeded",
-                    config["collection"],
-                    now_iso(),
-                )
-                report["sources_failed"] += 1
-    remaining = budget - (time.monotonic() - started)
-    active_row = None
+                if out_of_time:
+                    report["budget_reached"] = True
+                    break
+    run_deadline = started + budget
     endpoint_failures = 0
-    try:
-        with time_budget(max(1, remaining)):
-            with Analyzer(config) as analyzer:
-                for row in store.pending(config["llm"]["max_items_per_run"], now_iso()):
-                    key = cache_key(row, config["llm"])
-                    try:
-                        result = store.cached(key)
-                        if result is None:
-                            item = json.loads(row["payload"])
-                            if endpoint_failures >= 2 and item["kind"] != "tag":
-                                continue
-                            active_row = row
-                            result = analyzer.analyze(item)
-                            active_row = None
-                        store.finish(row, result, key, now_iso())
-                        report["analyzed"] += 1
-                    except AnalysisError as exc:
-                        active_row = None
-                        store.defer(row["id"], str(exc), config["llm"], now_iso(), terminal=not exc.retryable)
-                        report["analysis_failed"] += 1
-                        if exc.retryable:
-                            # After a second endpoint failure, skip further network
-                            # analysis; one failing item alone does not stop the run.
-                            # Deterministic tags and cached results still publish.
-                            endpoint_failures += 1
-    except RunBudgetReached:
-        report["budget_reached"] = True
-        if active_row is not None:
-            store.defer(
-                active_row["id"],
-                "Analysis run budget reached",
-                config["llm"],
-                now_iso(),
-            )
+    with Analyzer(config, deadline=run_deadline) as analyzer:
+        for row in store.pending(config["llm"]["max_items_per_run"], now_iso()):
+            if time.monotonic() >= run_deadline:
+                report["budget_reached"] = True
+                break
+            key = cache_key(row, config["llm"])
+            try:
+                result = store.cached(key)
+                if result is None:
+                    item = json.loads(row["payload"])
+                    if endpoint_failures >= 2 and item["kind"] != "tag":
+                        continue
+                    result = analyzer.analyze(item)
+                store.finish(row, result, key, now_iso())
+                report["analyzed"] += 1
+            except AnalysisError as exc:
+                # A request cut off by the run deadline is retryable: the item backs off.
+                store.defer(row["id"], str(exc), config["llm"], now_iso(), terminal=not exc.retryable)
+                report["analysis_failed"] += 1
+                if exc.retryable:
+                    # After a second endpoint failure, skip further network
+                    # analysis; one failing item alone does not stop the run.
+                    # Deterministic tags and cached results still publish.
+                    endpoint_failures += 1
     report["pending_analysis"] = store.pending_count()
     report["rejected_analysis"] = store.rejected_count()
     report["monitoring"] = store.monitoring_status(now_iso())
