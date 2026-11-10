@@ -415,7 +415,12 @@ class Analyzer:
         }, key)
         if set(check) != set(GROUNDING_SCHEMA["properties"]) or not isinstance(check["unsupported"], list):
             raise AnalysisError("Model grounding check does not match schema")
-        return validate_analysis({**draft, **{k: check[k] for k in TEXT_FIELDS}}, source)
+        final = {**draft, **{k: check[k] for k in TEXT_FIELDS}}
+        text = _plain(" ".join(str(final[k]) for k in TEXT_FIELDS))
+        if any(isinstance(claim, str) and len(_plain(claim)) >= 8 and _plain(claim) in text
+               for claim in check["unsupported"]):
+            raise AnalysisError("Model grounding check left an unsupported statement in place")
+        return validate_analysis(final, source)
 
     def _complete(self, request: dict, key: str) -> dict:
         """POST one chat completion; only transport failures move on to a fallback."""

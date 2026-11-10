@@ -72,6 +72,15 @@ def test_grounding_rewrite_must_still_pass_validation(monkeypatch):
     assert not caught.value.retryable
 
 
+def test_a_statement_the_check_flags_but_keeps_is_rejected(monkeypatch):
+    claim = "Operators must update their configurations to exclude the node."
+    kept = grounded(unsupported=[claim], why_it_matters=claim)
+    llm = analyzer(monkeypatch, completion(analysis(why_it_matters=claim)), completion(kept))
+    with pytest.raises(AnalysisError, match="left an unsupported statement") as caught:
+        llm.analyze(item())
+    assert not caught.value.retryable
+
+
 def test_ignore_decision_makes_one_call_and_skips_field_checks(monkeypatch):
     ignore = analysis(publish=False, title="x" * 150, evidence=["not in the source at all"])
     llm = analyzer(monkeypatch, completion(ignore))
