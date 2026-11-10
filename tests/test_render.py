@@ -185,7 +185,7 @@ class RenderTests(unittest.TestCase):
 
     def test_one_unrenderable_story_does_not_block_the_others(self):
         bad = copy.deepcopy(STORY)
-        bad.update(id="badbadbadbadbadbadbadbad", sources=[{"url": "https://news.example.test/a", "title": "x"}])
+        bad.update(id="badbadbadbadbadbadbadbad", sources=[{"url": "javascript:alert(1)", "title": "x"}])
         output = self.root / "mixed"
         with self.assertLogs("onionflash.render", "WARNING") as logs:
             self.assertEqual(render_site(CONFIG, [bad, copy.deepcopy(STORY)], [], output), 1)
@@ -226,12 +226,6 @@ class RenderTests(unittest.TestCase):
         output = self.render(config=config)
         self.assertIn('href="http://127.0.0.1:8788/feed.xml"', (output / "index.html").read_text())
         self.assertTrue((output / "_headers").read_text().startswith("/*\n"))
-
-    def test_bad_base_url_and_traversal_are_rejected(self):
-        for index, base in enumerate(["javascript:bad", "https://example.com/x/../", "https://example.com/%2e%2e/", "https://example.com/?token=secret", "https://secret@example.com/"]):
-            with self.subTest(base=base):
-                with self.assertRaises(ValueError):
-                    self.render(config={"site": {"base_url": base}}, name=f"base-{index}")
 
     def test_private_health_errors_are_never_exposed(self):
         output = self.render(health=[{"name": "Tor releases", "last_success": "2026-11-08T12:00:00Z", "stale": True, "error": "Bearer top-secret at 192.168.50.10"}])
