@@ -131,10 +131,7 @@ def run(config: dict, store: Store) -> dict:
         if source.get("alert_format"):
             report.setdefault("alerts", {})[source["id"]] = store.ingest_alerts(source, items, received)
             return received
-        priority = config["collection"]["tag_priority_score"]
-        report["items_changed"] += sum(
-            store.ingest(item, received, tag_priority_score=priority) for item in items
-        )
+        report["items_changed"] += sum(store.ingest(item, received) for item in items)
         return received
 
     with HttpClient(config["http"]) as client:
@@ -142,7 +139,7 @@ def run(config: dict, store: Store) -> dict:
             if not source["enabled"]:
                 continue
             state = store.source(source)
-            if not source_due(source, state, config["collection"], observed):
+            if not source_due(state, observed):
                 continue
             remaining = collection_deadline - time.monotonic()
             if remaining < 1:

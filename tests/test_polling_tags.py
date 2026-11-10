@@ -135,66 +135,44 @@ def test_tag_cannot_downgrade_existing_announced_release(tmp_path):
     assert len(story["sources"]) == 2
 
 
-def test_tags_have_configurable_queue_floor_below_serious_security(tmp_path):
+def test_tags_have_a_fixed_queue_floor_below_serious_security(tmp_path):
     assert item_priority(tag()) == 5
-    assert item_priority(tag(), 0) == 0
-    assert item_priority(tag(), 9) == 9
     incident = tag(
         kind="gitlab_issue",
         title="Directory authority plausibly compromised",
         content="",
         labels=["Security"],
     )
-    assert item_priority(incident) > item_priority(tag(), 20)
+    assert item_priority(incident) > item_priority(tag())
     announcement = tag(kind="feed", title="Tor 0.4.9.16 released", content="")
     assert item_priority(announcement) == 5
     with Store(tmp_path / "state.db") as store:
-        store.ingest(tag(), DATE, tag_priority_score=9)
-        assert store.pending(1, DATE)[0]["priority_score"] == 9
+        store.ingest(tag(), DATE)
+        assert store.pending(1, DATE)[0]["priority_score"] == 5
 
 
-def test_healthy_source_is_eligible_two_seconds_early_but_not_far_early():
-    settings = DEFAULTS["collection"]
-    assert source_due(source(), successful_state(), settings, "2026-11-09T15:35:00Z")
-    assert not source_due(
-        source(), successful_state(), settings, "2026-11-09T15:34:50Z"
-    )
-    assert not source_due(
-        source(), successful_state(), settings, "2026-11-09T14:35:00Z"
-    )
+def test_a_success_is_rescheduled_a_few_seconds_early_and_never_more_than_a_tenth(tmp_path):
+    with Store(tmp_path / "state.db") as store:
+        for interval, expected in [(300, "2026-11-09T15:34:55Z"), (30, "2026-11-09T15:30:27Z")]:
+            stream = source(id=f"s{interval}", interval_seconds=interval)
+            store.source(stream)
+            store.source_success(stream, {"url": stream["url"]}, "2026-11-09T15:30:00Z")
+            due = store.source(stream)["next_fetch_at"]
+            assert due == expected
+            assert not source_due({"next_fetch_at": due}, after(-1, due))
+            assert source_due({"next_fetch_at": due}, due)
 
 
-@pytest.mark.parametrize(
-    "changes",
-    [
-        {"error": "HTTP 429", "failures": 2},
-        {"error": "GitLab scan catching up", "failures": 0},
-        {"error": None, "failures": 1},
-        {"scan_upper": DATE, "scan_page": 2},
-        {"last_success": None},
-    ],
-)
-def test_failure_and_catching_up_cooldowns_are_never_shortened(changes):
-    state = successful_state(**changes)
-    assert not source_due(
-        source(), state, DEFAULTS["collection"], "2026-11-09T15:35:00Z"
-    )
-    assert source_due(source(), state, DEFAULTS["collection"], "2026-11-09T15:35:02Z")
-
-
-def test_zero_tolerance_disables_forgiveness_and_interval_fraction_caps_it():
-    settings = {**DEFAULTS["collection"], "healthy_poll_tolerance_seconds": 0}
-    assert not source_due(
-        source(), successful_state(), settings, "2026-11-09T15:35:00Z"
-    )
-    settings["healthy_poll_tolerance_seconds"] = 60
-    short_source = source(interval_seconds=30)
-    assert source_due(
-        short_source, successful_state(), settings, "2026-11-09T15:35:00Z"
-    )
-    assert not source_due(
-        short_source, successful_state(), settings, "2026-11-09T15:34:58Z"
-    )
+def test_failure_and_catching_up_cooldowns_are_never_shortened(tmp_path):
+    stream = source(interval_seconds=300)
+    with Store(tmp_path / "state.db") as store:
+        store.source(stream)
+        store.source_failure(stream, "GitLab scan catching up", DEFAULTS["collection"], "2026-11-09T15:30:00Z",
+                             catching_up=True)
+        assert store.source(stream)["next_fetch_at"] == "2026-11-09T15:35:00Z"
+        store.source_failure(stream, "HTTP 429", DEFAULTS["collection"], "2026-11-09T15:30:00Z")
+        backoff = DEFAULTS["collection"]["failure_backoff_base_seconds"]
+        assert store.source(stream)["next_fetch_at"] == after(backoff, "2026-11-09T15:30:00Z")
 
 
 def test_late_fetch_records_actual_observation_but_keeps_schedule_anchor(
@@ -218,7 +196,7 @@ def test_late_fetch_records_actual_observation_but_keeps_schedule_anchor(
         state = store.source(source())
     assert row["first_seen"] == row["last_seen"] == "2026-11-09T15:30:07Z"
     assert state["last_success"] == "2026-11-09T15:30:07Z"
-    assert state["next_fetch_at"] == after(300, DATE)
+    assert state["next_fetch_at"] == after(300 - 5, DATE)  # anchored to the run start, minus the tolerance
 
 
 def test_inference_outage_does_not_block_a_queued_deterministic_tag(
@@ -265,17 +243,8 @@ def test_new_settings_and_verified_sources_are_in_example(tmp_path, monkeypatch)
     path = tmp_path / "config.toml"
     path.write_text(example.read_text())
     config = load_config(path)
-    assert config["collection"]["healthy_poll_tolerance_seconds"] == 5
-    assert config["collection"]["tag_priority_score"] == 5
     sources = {s["id"]: s for s in config["sources"]}
     assert sources["tor-browser-security"]["enabled"]
     assert sources["tor-browser-security"]["authority"] == "development"
     assert sources["anti-censorship-team"]["enabled"]
     assert sources["tor-dev"]["enabled"]
-    path.write_text(
-        example.read_text().replace(
-            "healthy_poll_tolerance_seconds = 5", "healthy_poll_tolerance_seconds = 61"
-        )
-    )
-    with pytest.raises(ValueError):
-        load_config(path)

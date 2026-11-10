@@ -56,9 +56,9 @@ only creates local files.
 The deployment repository schedules `onionflash run` (`interval_minutes` in its
 `deployment.toml`; apply changes with `./deploy.sh schedule`). Each source also
 has `interval_seconds` (default 300), so a slower source can be polled less often
-than the job runs; it cannot make the job run more often. A small
-`collection.healthy_poll_tolerance_seconds` handles scheduler start jitter only
-after a successful poll; failure and Retry-After cooldowns remain intact.
+than the job runs; it cannot make the job run more often. A successful poll is
+rescheduled a few seconds early (at most a tenth of the interval) to absorb
+scheduler start jitter; failure and Retry-After cooldowns are never shortened.
 
 All settings are shown in [`config.example.toml`](config.example.toml). Settings that
 were removed (such as `http.requests_per_minute`) still load; each is logged as
@@ -183,7 +183,7 @@ Publishers should use the same database lock while taking their upload snapshot.
   at a time, with explicit per-run and token limits. Source polling reserves time
   for pending analysis so an unavailable source cannot monopolize every run.
 - Explicit `kind = "tag"` streams produce attributed tag notices without an LLM
-  request. These notices remain `tagged`, have a configurable queue-priority
+  request. These notices remain `tagged`, have a fixed queue-priority
   floor, and cannot replace a richer announcement already grouped with that
   version. Repeated identical model labels are normalized rather than retried;
   invalid labels and unsupported evidence are still rejected.
