@@ -25,7 +25,6 @@ DEFAULTS = {
     "storage": {
         "database": "state/onionflash.sqlite3",
         "output_dir": "build/public",
-        "max_stories": 1000,
     },
     "collection": {
         "lookback_days": 14,
@@ -123,7 +122,6 @@ BOUNDS = {
     "max_items_per_run": (1, 1000),
     "retry_base_seconds": (1, 3600),
     "retry_cap_seconds": (1, 604800),
-    "max_stories": (1, 100000),
     "run_budget_seconds": (30, 3600),
     "source_budget_seconds": (5, 600),
     "analysis_reserve_fraction": (0.1, 0.9),
@@ -143,6 +141,11 @@ BOUNDS = {
     "max_alerts_per_item": (1, 1000),
     "max_future_seconds": (0, 3600),
 }
+
+
+# Settings that older configuration files may still contain. They are accepted
+# and ignored, so a deployment can delete them at its own pace.
+RETIRED = {"storage": {"max_stories"}}
 
 
 def _expand(value: str) -> str:
@@ -169,6 +172,7 @@ def load_config(path: str | Path) -> dict:
         else:
             if not isinstance(values, dict):
                 raise ValueError(f"{section} must be a table")
+            values = {k: v for k, v in values.items() if k not in RETIRED.get(section, ())}
             unknown = set(values) - set(DEFAULTS[section])
             if unknown:
                 raise ValueError(

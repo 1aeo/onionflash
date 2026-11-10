@@ -376,6 +376,9 @@ class Store:
                         "published_at": previous["published_at"]
                         if previous
                         else item["published_at"],
+                        "added_at": previous.get("added_at", previous["published_at"])
+                        if previous
+                        else observed,
                         "updated_at": max(
                             item["updated_at"],
                             previous["updated_at"]
@@ -403,7 +406,8 @@ class Store:
                 ("published" if result["publish"] else "ignored", story_id, row["id"]),
             )
 
-    def stories(self, limit: int) -> list[dict]:
+    def stories(self, limit: int = -1) -> list[dict]:
+        """Stored stories, newest activity first (all of them by default)."""
         return [
             json.loads(row[0])
             for row in self.db.execute(
@@ -418,7 +422,7 @@ class Store:
     def monitoring_status(self, settings: dict, observed: str) -> dict:
         return monitoring.status(self.db, settings, observed)
 
-    def story_count(self, limit: int) -> int:
+    def story_count(self, limit: int = -1) -> int:
         return self.db.execute(
             "SELECT COUNT(*) FROM (SELECT 1 FROM stories LIMIT ?)", (limit,)
         ).fetchone()[0]

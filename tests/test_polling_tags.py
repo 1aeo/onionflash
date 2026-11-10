@@ -212,7 +212,7 @@ def test_late_fetch_records_actual_observation_but_keeps_schedule_anchor(
     monkeypatch.setattr(
         cli, "collect_source", lambda *args: {"items": [tag()], "url": source()["url"]}
     )
-    monkeypatch.setattr(cli, "build", lambda *args: {"public_changed": False})
+    monkeypatch.setattr(cli, "build", lambda *args: {"published_stories": 0, "stories_skipped": 0})
     with Store(tmp_path / "state.db") as store:
         cli.run(config, store)
         row = store.db.execute("SELECT first_seen,last_seen FROM items").fetchone()
@@ -241,7 +241,7 @@ def test_inference_outage_does_not_block_a_queued_deterministic_tag(
 
     monkeypatch.setattr(cli, "Analyzer", UnavailableAnalyzer)
     monkeypatch.setattr(cli, "now_iso", lambda: DATE)
-    monkeypatch.setattr(cli, "build", lambda *args: {"public_changed": False})
+    monkeypatch.setattr(cli, "build", lambda *args: {"published_stories": 0, "stories_skipped": 0})
     with Store(tmp_path / "state.db") as store:
         store.source(source())
         store.source_success(source(), {"url": source()["url"]}, DATE)

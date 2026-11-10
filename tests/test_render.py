@@ -102,6 +102,25 @@ class RenderTests(unittest.TestCase):
         self.assertEqual([p.name for p in (output / "news").iterdir()], [STORY["id"]])
         self.assertEqual(len(json.loads((output / "feed.json").read_text())["items"]), 1)
 
+    def test_homepage_orders_by_when_onion_flash_added_the_story(self):
+        # An old issue first published today is new on Onion Flash; an edit to an
+        # earlier story does not move it above newer additions.
+        resurfaced = {**STORY, "id": "resurfaced", "published_at": "2026-09-22T12:00:00Z",
+                      "updated_at": "2026-11-09T12:00:00Z", "added_at": "2026-11-09T12:00:00Z"}
+        earlier = {**STORY, "id": "earlier", "published_at": "2026-11-05T12:00:00Z",
+                   "updated_at": "2026-11-10T12:00:00Z", "added_at": "2026-11-05T12:00:00Z"}
+        page = (self.render([earlier, resurfaced]) / "index.html").read_text()
+        self.assertLess(page.index('id="story-resurfaced"'), page.index('id="story-earlier"'))
+
+    def test_source_panel_shows_only_freshness_not_times_or_errors(self):
+        health = [{"name": "Fresh", "website_url": "https://example.org/a", "stale": False, "last_success": "2026-11-08T12:00:00Z", "error": "boom"},
+                  {"name": "Old", "website_url": "https://example.org/b", "stale": True}]
+        page = (self.render(health=health) / "index.html").read_text()
+        self.assertIn('Fresh</a><span class="health-state">Collected</span>', page)
+        self.assertIn('Old</a><span class="health-state delayed">Delayed</span>', page)
+        self.assertNotIn("Last success", page)
+        self.assertNotIn("boom", page)
+
     def test_unsafe_sources_cannot_be_published(self):
         for index, url in enumerate([
             "javascript:alert(1)", "data:text/html,test", "//example.com/",

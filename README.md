@@ -145,7 +145,6 @@ monitoring status. See [monitoring behavior and limits](docs/MONITORING.md).
 onionflash check --config config.toml            # Validate; no network requests
 onionflash run --config config.toml              # Collect → analyze → build
 onionflash build --config config.toml            # Offline build from saved news
-onionflash build --config config.toml --force    # Refresh public status display
 onionflash status --config config.toml           # Source freshness and queue
 onionflash backup --config config.toml --output /private/new-backup.sqlite3
 ```
@@ -198,10 +197,10 @@ Publishers should use the same database lock while taking their upload snapshot.
   canonical URLs provide conservative duplicate grouping. Semantic similarity
   alone does not combine unrelated incidents. Original publication dates and
   stable story IDs remain intact when stories are updated.
-- Public files rebuild only when stories, rendering code, configuration, or
-  meaningful source-health state change. A successful poll timestamp alone does
-  not trigger a deployment. The Sources display therefore reflects the last
-  public build; CLI status has current collection timestamps.
+- Every run renders the site from the database; the deployment uploads only
+  files whose content changed. The public Source availability panel shows only
+  Collected or Delayed (no success within `collection.stale_after_seconds`);
+  `onionflash status` has current collection timestamps and errors.
 
 ## Deliberate limits
 
@@ -212,8 +211,8 @@ outages longer than those windows can leave gaps. GitLab pagination and source
 health make incomplete scans visible, but upstream data can change while a scan
 is in progress. Treat this as a news aid, not an incident-detection guarantee.
 
-The website publishes up to `storage.max_stories`; older records remain in SQLite
-but are outside the generated archive until that limit is raised. Keep the SQLite
+Every stored story keeps its page; the homepage and feeds show the newest
+`site.page_size` and `site.feed_size` stories. Keep the SQLite
 database, backups, raw source content, and analysis evidence private. The
 deployment defaults place backups in private DigitalOcean Spaces storage.
 
