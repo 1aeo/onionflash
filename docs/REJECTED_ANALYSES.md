@@ -1,9 +1,10 @@
 # Reviewing rejected analyses
 
 Transient failures, such as an unavailable LLM endpoint, remain pending and use
-the normal exponential backoff. Three terminal writer content/validation failures
-move an item to `rejected`. A semantic final-review hold rejects the candidate
-immediately, including a repair that does not pass its fresh verification;
+the normal exponential backoff. Three terminal writer or final-review
+content/validation failures, or unexpected processing errors, move an item to
+`rejected`. A semantic final-review hold rejects the candidate immediately,
+including an unusable repair or one that does not pass its fresh verification;
 automation does not keep rewriting that source revision.
 
 These local CLI commands act on one item at a time. They do not call the LLM,
@@ -58,10 +59,10 @@ must be restored or recollected before retrying.
 
 The next scheduled run resumes the item. A completed writer draft in its current
 review job is retained, and an explicit retry starts a fresh final review; it does
-not rerun that writer unless its source or writer-input identity changed. Ordinary
-review timeouts or malformed replies resume the unfinished review/verification
-stage automatically using normal backoff. A retry never treats a proposed repair
-as approval.
+not rerun that writer unless its source or writer-input identity changed. Review
+timeouts and endpoint failures resume the unfinished review/verification stage
+automatically using normal backoff; a malformed reply resumes it too, but counts
+toward the three failures. A retry never treats a proposed repair as approval.
 
 If an analysis record already exists for the
 current source/model/prompt/input-window key, retry preserves its complete prior value in the

@@ -1,5 +1,6 @@
 """The final-candidate gate resumes completed stages and never publishes unchecked."""
 
+import contextlib
 import copy
 import json
 import sqlite3
@@ -104,8 +105,12 @@ def test_review_timeout_or_malformed_verdict_resumes_without_regenerating_writer
     writer, checker = Writer(), Reviewer(failure)
     with pytest.raises(AnalysisError) as caught:
         run(cfg, store, row, writer, checker)
-    assert caught.value.retryable and job(store)["stage"] == "review"
+    # A timeout backs off; a malformed verdict is one of the item's three strikes.
+    assert caught.value.retryable == isinstance(failure, AnalysisError) and job(store)["stage"] == "review"
     assert store.story_count() == 0
+    paused = Reviewer(verdict())
+    assert run(cfg, store, row, Writer(), paused, allow_network=False)["status"] == "deferred"
+    assert paused.calls == [] and job(store)["stage"] == "review"
     next_writer, next_checker = Writer(), Reviewer(verdict())
     result = run(cfg, store, row, next_writer, next_checker)
     assert result["status"] == "published" and result["writer_calls"] == 0
@@ -131,12 +136,12 @@ def test_repair_requires_fresh_verification_and_resumes_that_exact_stage(context
     assert [entry["stage"] for entry in audit["reviews"]] == ["review", "verification"]
 
 
-@pytest.mark.parametrize("action", ["hold", "revise"])
-def test_second_nonapproval_holds_once_and_never_rewrites_again(context, action):
+@pytest.mark.parametrize("second", [verdict("hold"), verdict("revise", repair={"summary": "A different proposed rewrite."}),
+                                    verdict("revise")], ids=["hold", "revise", "revise-without-repair"])
+def test_second_nonapproval_holds_once_and_never_rewrites_again(context, second):
     cfg, store = context
     row = pending(store)
-    checker = Reviewer(verdict("revise", repair={"why_it_matters": ""}),
-                       verdict(action, repair={"summary": "A different proposed rewrite."} if action == "revise" else None))
+    checker = Reviewer(verdict("revise", repair={"why_it_matters": ""}), second)
     result = run(cfg, store, row, Writer(), checker)
     assert result["status"] == "held" and result["review_calls"] == 2
     assert store.pending_count() == 0 and store.rejected_count() == 1 and store.story_count() == 0
@@ -158,6 +163,17 @@ def test_zero_repairs_holds_and_explicit_retry_reuses_writer(context):
     writer = Writer()
     result = run(cfg, store, retry, writer, Reviewer(verdict()))
     assert result["status"] == "published" and writer.calls == []
+
+
+@pytest.mark.parametrize("repair", [None, {"title": analysis()["title"]}, {"title": ""}],
+                         ids=["missing", "unchanged", "invalid"])
+def test_unusable_repair_holds_after_one_call_for_operator_inspection(context, repair):
+    cfg, store = context
+    row = pending(store)
+    result = run(cfg, store, row, Writer(), Reviewer(verdict("revise", repair=repair)))
+    assert result["status"] == "held" and result["review_calls"] == 1
+    assert [entry["id"] for entry in rejection.list_items(store)["items"]] == [row["id"]]
+    assert rejection.show_item(store, row["id"])["final_review"]["latest_review"]["verdict"] == "revise"
 
 
 def test_completed_approval_resumes_after_crash_without_any_model_call(context, monkeypatch):
@@ -550,3 +566,52 @@ def test_resuming_approved_job_never_temporarily_unpins_its_receipt(context, mon
     monkeypatch.setattr(review_gate, "_save", save)
     result = run(cfg, store, row, Writer(), Reviewer(), allow_network=False)
     assert result["status"] == "published" and result["cache_hit"] and result["review_calls"] == 0
+
+
+def test_a_database_error_during_analysis_is_not_an_item_strike(context, monkeypatch):
+    import sqlite3
+    from onionflash import cli
+    cfg, store = context
+    cfg["sources"] = []
+
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(cli, "process_item", locked)
+    store.ingest(item(url="https://example.org/locked"), DATE)
+    with pytest.raises(sqlite3.OperationalError):
+        cli.run(cfg, store)
+    assert tuple(store.db.execute("SELECT status,rejections FROM items").fetchone()) == ("pending", 0)
+
+
+def test_unusable_replies_and_drafts_take_strikes_and_the_run_still_builds(context, monkeypatch):
+    from onionflash import cli
+    cfg, store = context
+    cfg["sources"] = []
+
+    class Drafts:
+        def analyze(self, incoming):
+            # Publishing drops U+FFFF, so this draft cannot form a public story.
+            return analysis(title="\uffff") if incoming["url"].endswith("/draft") else analysis()
+
+    class Replies:
+        def review(self, candidate, packet, *, verification=False):
+            return {} if "/reply" in packet["sources"][0]["url"] else verdict()
+
+    built = []
+    monkeypatch.setattr(cli, "Analyzer", lambda *args, **kwargs: contextlib.nullcontext(Drafts()))
+    monkeypatch.setattr(cli, "Reviewer", lambda *args, **kwargs: contextlib.nullcontext(Replies()))
+    monkeypatch.setattr(cli, "build", lambda *args: built.append(True) or {})
+    for name in ("reply-1", "reply-2", "draft"):
+        store.ingest(item(url="https://example.org/" + name), DATE)
+    # No security title or label, so this item sorts after both unusable replies.
+    store.ingest(item(url="https://example.org/good", title="A routine report", labels=[]), DATE)
+    report = cli.run(cfg, store)
+    states = {url.rsplit("/", 1)[1]: (status, rejections, error)
+              for url, status, rejections, error in store.db.execute("SELECT url,status,rejections,last_error FROM items")}
+    assert built == [True] and report["analysis_failed"] == 3
+    status, rejections, error = states.pop("draft")
+    assert (status, rejections) == ("pending", 1) and error.startswith("Unexpected ValueError at render.py:")
+    assert states == {"reply-1": ("pending", 1, "Review response fields do not match schema"),
+                      "reply-2": ("pending", 1, "Review response fields do not match schema"),
+                      "good": ("published", 0, None)}

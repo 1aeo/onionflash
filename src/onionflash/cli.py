@@ -7,6 +7,7 @@ import contextlib
 import fcntl
 import json
 import os
+import sqlite3
 import sys
 import time
 import traceback
@@ -250,6 +251,15 @@ def run(config: dict, store: Store) -> dict:
                     # Deterministic notices and completed cached approvals can
                     # still finish; unfinished network stages resume next run.
                     endpoint_failures += 1
+            except sqlite3.Error:
+                raise  # a database problem is not the item's fault and must not be a strike
+            except Exception as exc:  # e.g. a draft that cannot form a public story
+                # One item must not stop the run before build: count a strike and
+                # record where it failed (file:line), never the exception text.
+                frame = traceback.extract_tb(exc.__traceback__)[-1]
+                store.defer(row["id"], f"Unexpected {type(exc).__name__} at {Path(frame.filename).name}:{frame.lineno}",
+                            config["llm"], now_iso(), terminal=True)
+                report["analysis_failed"] += 1
     report["pending_analysis"] = store.pending_count()
     report["rejected_analysis"] = store.rejected_count()
     report["final_review"] = review_status(store)
