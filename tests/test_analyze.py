@@ -143,10 +143,11 @@ def test_truncated_and_malformed_completions(monkeypatch):
     assert caught.value.retryable
 
 
-def test_draft_text_that_publishing_would_drop_is_a_strike_before_review():
+@pytest.mark.parametrize("noncharacter", ["\ufffe", "\uffff"])
+def test_draft_text_that_publishing_would_drop_is_a_strike_before_review(noncharacter):
     # Rendering removes U+FFFE and U+FFFF, so this headline would publish empty.
     with pytest.raises(AnalysisError, match="Invalid model title") as caught:
-        validate_analysis(analysis(title=" \ufffe\uffff "), item(), editorial=False)
+        validate_analysis(analysis(title=f" {noncharacter} "), item(), editorial=False)
     assert not caught.value.retryable
 
 
