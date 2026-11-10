@@ -172,7 +172,9 @@ def _feed(
                 text,
                 published,
                 updated,
-                title_html=title_detail.get("type") == "text/html",
+                # Only an explicit text/plain title keeps its angle brackets;
+                # HTML and XHTML titles are stripped.
+                title_html=title_detail.get("type", "text/html") != "text/plain",
                 observed=started,
             )
         except ValueError:

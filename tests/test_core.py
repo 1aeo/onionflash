@@ -995,6 +995,16 @@ def test_plain_titles_keep_angle_brackets_and_html_titles_are_stripped():
     assert _item(stream, "https://example.org/3", "t", "", DATE, DATE, labels=["ok", "\ud800bad"])["labels"] == ["ok", "\ufffdbad"]
 
 
+def test_xhtml_atom_titles_are_stripped_and_plain_ones_kept():
+    xml = (b'<feed xmlns="http://www.w3.org/2005/Atom"><title>T</title><id>urn:t</id><updated>2026-11-08T12:00:00Z</updated>'
+           b'<entry><title type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml">A <b>bold</b> title</div></title>'
+           b'<link href="https://example.org/a"/><id>urn:a</id><updated>2026-11-08T12:00:00Z</updated></entry>'
+           b'<entry><title type="text">Use Vec&lt;u8&gt; here</title>'
+           b'<link href="https://example.org/b"/><id>urn:b</id><updated>2026-11-08T11:00:00Z</updated></entry></feed>')
+    items = collect_source(FakeClient([response(xml)]), source(), {}, DEFAULTS["collection"], DATE)["items"]
+    assert [item["title"] for item in items] == ["A bold title", "Use Vec<u8> here"]
+
+
 def test_future_dates_are_clamped_to_the_poll_except_for_alert_parsers():
     from onionflash.collect import _item
     later = "2062-01-01T00:00:00Z"
