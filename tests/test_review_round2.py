@@ -226,8 +226,10 @@ def test_cleanup_deadline_never_defers_a_skipped_row(tmp_path, monkeypatch):
     _prepare_run(monkeypatch, unavailable, cleanup=_budget)
     with Store(tmp_path / "state.db") as store:
         store.ingest(item(url="https://example.org/urgent", title="Authority compromised"), DATE)
+        store.ingest(item(url="https://example.org/second", title="Second update", labels=["Security"], content="second"), DATE)
         store.ingest(item(url="https://example.org/later", title="Other update", labels=[], content=""), DATE)
         cli.run(_pipeline_config(tmp_path), store)
+        # Two endpoint failures stop network analysis; the remaining row is untouched.
         skipped = store.db.execute("SELECT attempts,last_error,next_attempt_at FROM items WHERE url=?",("https://example.org/later",)).fetchone()
     assert skipped["attempts"] == 0 and skipped["last_error"] is None
     assert skipped["next_attempt_at"] is None

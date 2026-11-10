@@ -129,11 +129,44 @@ def test_items_are_rejected_after_three_failures_and_requeued_when_content_chang
     with Store(tmp_path / "state.db") as store:
         store.ingest(item(), DATE)
         row_id = store.pending(1, DATE)[0]["id"]
-        store.defer(row_id, "Model evidence is not present in source", llm, DATE, terminal=False)
-        for _ in range(3):
+        for _ in range(4):  # endpoint failures (retryable) never count toward rejection
+            store.defer(row_id, "LLM request failed (HTTP 503)", llm, DATE, terminal=False)
+        for _ in range(2):
             store.defer(row_id, "Model evidence is not present in source", llm, DATE, terminal=True)
-        status = store.db.execute("SELECT status, attempts FROM items WHERE id=?", (row_id,)).fetchone()
-        assert tuple(status) == ("rejected", 3) and store.rejected_count() == 1 and store.pending_count() == 0
+        assert store.db.execute("SELECT status FROM items WHERE id=?", (row_id,)).fetchone()[0] == "pending"
+        store.defer(row_id, "Model evidence is not present in source", llm, DATE, terminal=True)
+        status = store.db.execute("SELECT status, attempts, rejections FROM items WHERE id=?", (row_id,)).fetchone()
+        assert tuple(status) == ("rejected", 7, 3) and store.rejected_count() == 1 and store.pending_count() == 0
         store.ingest(item(content="Edited: the operator now confirms the compromise."), DATE)
-        status = store.db.execute("SELECT status, attempts FROM items WHERE id=?", (row_id,)).fetchone()
-        assert tuple(status) == ("pending", 0) and store.rejected_count() == 0
+        status = store.db.execute("SELECT status, attempts, rejections FROM items WHERE id=?", (row_id,)).fetchone()
+        assert tuple(status) == ("pending", 0, 0) and store.rejected_count() == 0
+
+
+def test_one_failing_item_does_not_stop_the_run_but_two_endpoint_failures_do(tmp_path, monkeypatch):
+    from onionflash import cli
+    calls = []
+
+    class FlakyAnalyzer:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def analyze(self, payload):
+            calls.append(payload["url"])
+            if payload["url"].endswith("/bad") or failing_endpoint:
+                raise AnalysisError("LLM request failed (HTTP 400)", retryable=True)
+            return analysis()
+
+    monkeypatch.setattr(cli, "Analyzer", FlakyAnalyzer)
+    monkeypatch.setattr(cli, "build", lambda *args: {})
+    config = copy.deepcopy(DEFAULTS)
+    config["sources"] = []
+    for failing_endpoint, expected in [(False, 3), (True, 2)]:
+        calls.clear()
+        with Store(tmp_path / f"state-{failing_endpoint}.db") as store:
+            for url in ["https://example.org/bad", "https://example.org/a", "https://example.org/b"]:
+                store.ingest(item(url=url, content=url, labels=["Security"] if url.endswith("bad") else []), DATE)
+            cli.run(config, store)
+        assert len(calls) == expected

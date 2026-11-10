@@ -196,7 +196,7 @@ def run(config: dict, store: Store) -> dict:
                 report["sources_failed"] += 1
     remaining = budget - (time.monotonic() - started)
     active_row = None
-    inference_unavailable = False
+    endpoint_failures = 0
     try:
         with time_budget(max(1, remaining)):
             with Analyzer(config) as analyzer:
@@ -206,7 +206,7 @@ def run(config: dict, store: Store) -> dict:
                         result = store.cached(key)
                         if result is None:
                             item = json.loads(row["payload"])
-                            if inference_unavailable and item["kind"] != "tag":
+                            if endpoint_failures >= 2 and item["kind"] != "tag":
                                 continue
                             active_row = row
                             result = analyzer.analyze(item)
@@ -218,9 +218,10 @@ def run(config: dict, store: Store) -> dict:
                         store.defer(row["id"], str(exc), config["llm"], now_iso(), terminal=not exc.retryable)
                         report["analysis_failed"] += 1
                         if exc.retryable:
-                            # Skip further network analysis, but deterministic tags
-                            # and already-cached results remain publishable.
-                            inference_unavailable = True
+                            # After a second endpoint failure, skip further network
+                            # analysis; one failing item alone does not stop the run.
+                            # Deterministic tags and cached results still publish.
+                            endpoint_failures += 1
     except RunBudgetReached:
         report["budget_reached"] = True
         if active_row is not None:
