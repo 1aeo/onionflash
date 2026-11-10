@@ -210,8 +210,9 @@ onionflash build --config config.toml
 The correction is locked against later automation. The reason is public; previous
 published text and the operator action are retained in revision history. A stale
 hash fails without changing anything. Retraction keeps the same article URL with
-a clear notice and publishes none of the story's earlier text until it is
-restored. Explicit restore and unlock commands are available; a retraction
+a clear notice, and its pages and feeds publish none of the story's earlier text
+until it is restored; copies made before the retraction, including an enabled
+permanent archive, are not withdrawn. Explicit restore and unlock commands are available; a retraction
 must be restored before automation can resume. The next scheduled deployment
 publishes pending changes, or use the deployer's `publish` command after building.
 See [editorial commands and recovery](docs/EDITORIAL.md).

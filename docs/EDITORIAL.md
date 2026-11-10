@@ -57,9 +57,14 @@ reports from another source.
 
 Retraction replaces current reporting with a clearly labeled tombstone at the
 same URL. The homepage, RSS and JSON Feed show the retraction and its reason.
-While the story is retracted, it publishes none of its earlier headline or
-text, not even as superseded history. A correction keeps replaced text public
-as superseded history; when text must not stay public, retract:
+While the story is retracted, its pages and feeds publish none of its earlier
+headline or text, not even as superseded history or in earlier correction
+reasons. Copies made before the retraction are not withdrawn: feed readers and
+caches keep theirs, and so does an enabled permanent archive. The notice keeps
+the story's source links: they are the upstream records it cited, not Onion
+Flash's text. A correction keeps
+replaced text public as superseded history; when text must not stay public,
+retract:
 
 ```sh
 onionflash story retract --config config.toml --story STORY_ID \

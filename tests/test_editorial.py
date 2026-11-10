@@ -147,7 +147,8 @@ def test_failed_operator_write_rolls_back_revision_and_cannot_leave_permit_open(
 def test_retraction_tombstone_restore_and_explicit_unlock(seeded):
     cfg, store, story_id = seeded
     original = editorial.show(store.db, story_id)["story"]
-    edit(store, story_id)
+    quoting = "Replaced the claim " + original["title"]  # an operator reason may quote the old text
+    edit(store, story_id, reason=quoting)
     build(cfg, store)
     withdrawn = act(editorial.retract, store, story_id, reason="The source withdrew this report.")
     build(cfg, store)
@@ -155,10 +156,11 @@ def test_retraction_tombstone_restore_and_explicit_unlock(seeded):
     assert files["json"]["id"] == story_id
     assert files["json"]["editorial"]["status"] == "retracted"
     assert files["json"]["title"] == "Retracted story"
-    # Neither the original nor the corrected text stays public, not even as superseded history.
+    # Neither the original nor the corrected text stays public, not even as superseded
+    # history or in an earlier correction's reason.
     for text in (files["home"], files["rss"], files["feed"]["content_text"], files["article"], json.dumps(files["json"])):
         assert "The source withdrew this report." in text
-        for old in (original["title"], original["summary"], original["why_it_matters"], FIX):
+        for old in (original["title"], original["summary"], original["why_it_matters"], FIX, quoting):
             assert old not in text
     with pytest.raises(ValueError, match="Restore a retracted"):
         edit(store, story_id, patch={"summary": "New text."}, observed=LATER)
@@ -184,6 +186,7 @@ def test_retraction_tombstone_restore_and_explicit_unlock(seeded):
     assert files["json"]["editorial"]["revision"] == 4
     assert files["json"]["editorial"]["history"][0]["action"] == "unlock"
     assert "Restored" in files["article"] and "Superseded public text" in files["article"]
+    assert quoting in json.dumps(files["json"])  # restoring brings earlier reasons back
 
 
 def test_restore_original_and_backup_recover_last_good_public_revision(seeded, tmp_path):

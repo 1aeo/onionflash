@@ -177,6 +177,8 @@ def public_metadata(db, story_id: str) -> dict | None:
     entries = []
     for row in rows:
         entry = {key: row[key] for key in ("revision", "action", "reason", "created_at")}
+        if control["retracted"] and row["revision"] != control["revision"]:
+            entry["reason"] = ""  # an earlier reason may quote the withdrawn text
         if row["before_public_json"] is not None and row["action"] != "unlock" and not control["retracted"]:
             before = json.loads(row["before_public_json"])
             entry["superseded"] = {key: before.get(key, "") for key in ("title", "summary", "why_it_matters")}
