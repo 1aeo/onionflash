@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
-from .schema import CATEGORY_LABELS as CATEGORIES, PRIORITIES, CONFIDENCES, STATES
+from .schema import CATEGORY_LABELS as CATEGORIES, PRIORITIES, PRODUCTS, CONFIDENCES, STATES
 from .util import canonical_url, parse_utc as _date, format_utc as _iso
 
 
@@ -72,13 +72,15 @@ def _prepare_story(story: dict) -> dict:
         raise ValueError("Published stories require a title and summary")
     sources = {}
     for source in story["sources"][:20]:
+        if not isinstance(source, dict):
+            continue
         url = _public_url(source.get("url"))
         if url and url not in sources:
             sources[url] = {"url": url, "title": _text(source.get("title"), 200) or urlsplit(url).hostname}
     if not sources:
         raise ValueError("Published stories require at least one safe source URL")
-    # Tags and products are schema enums checked when the story was written.
-    tags = list(dict.fromkeys([category, *story.get("tags", [])]))
+    # Only schema values reach the page, so one malformed stored field cannot break a build.
+    tags = [tag for tag in dict.fromkeys([category, *story.get("tags", [])]) if tag in CATEGORIES]
     published = _date(story.get("published_at"))
     updated = _date(story.get("updated_at"))
     if updated < published:
@@ -88,7 +90,7 @@ def _prepare_story(story: dict) -> dict:
         "why_it_matters": _text(story.get("why_it_matters"), 800),
         "category": category, "priority": priority, "confidence": confidence,
         "state": state, "tags": tags, "sources": list(sources.values()),
-        "products": list(story.get("products", [])),
+        "products": [product for product in story.get("products", []) if product in PRODUCTS],
         "published_at": _iso(published), "updated_at": _iso(updated),
         # When Onion Flash first published the story; older records fall back to the source date.
         "added_at": _iso(_date(story.get("added_at") or story.get("published_at"))),

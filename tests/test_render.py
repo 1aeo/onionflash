@@ -170,6 +170,15 @@ class RenderTests(unittest.TestCase):
                 story.update(change)
                 self.assert_skipped(story, f"class-{index}")
 
+    def test_malformed_list_entries_are_dropped_without_hiding_the_story(self):
+        story = copy.deepcopy(STORY)
+        story.update(tags=["release", 7, "not-a-topic"], products=["tor", None, "elsewhere"],
+                     sources=["not a source", *STORY["sources"]])
+        output = self.render([story])
+        item = json.loads((output / "feed.json").read_text())["items"][0]
+        self.assertEqual(item["tags"], ["release"])
+        self.assertIn(STORY["sources"][0]["url"], item["content_text"])
+
     def test_malformed_stored_fields_are_skipped(self):
         for index, change in enumerate([{"category": ["security"]}, {"sources": None}, {"tags": None}, {"title": None}]):
             with self.subTest(change=change):
