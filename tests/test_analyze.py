@@ -79,6 +79,20 @@ def test_a_statement_the_check_flags_but_keeps_is_rejected(monkeypatch):
     with pytest.raises(AnalysisError, match="left an unsupported statement") as caught:
         llm.analyze(item())
     assert not caught.value.retryable
+    # Editing a different sentence of the same field does not fix the flagged one.
+    partly = grounded(unsupported=[claim], why_it_matters="The report concerns trust. " + claim)
+    llm = analyzer(monkeypatch, completion(analysis(why_it_matters="It matters. " + claim)), completion(partly))
+    with pytest.raises(AnalysisError, match="left an unsupported statement"):
+        llm.analyze(item())
+
+
+def test_a_flagged_statement_may_be_reworded_with_the_same_words(monkeypatch):
+    claim = "plausible compromise of all relays"
+    for rewrite in ("The report does not say whether this is a plausible compromise of all relays.",
+                    "It is unclear whether this is a plausible compromise of all relays."):
+        draft = analysis(summary="The operator reported a plausible compromise of all relays.")
+        llm = analyzer(monkeypatch, completion(draft), completion(grounded(unsupported=[claim], summary=rewrite)))
+        assert llm.analyze(item())["summary"] == rewrite
 
 
 def test_ignore_decision_makes_one_call_and_skips_field_checks(monkeypatch):

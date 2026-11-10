@@ -111,9 +111,11 @@ summarizes what the source states. Unsupported: inferences, general knowledge or
 background, consequences, impacts or operator actions the source does not state, and
 versions, dates, counts, causes, completed actions or certainty the source does not
 express. Quote each unsupported statement briefly in "unsupported".
-Return title, summary and why_it_matters with the smallest edits that remove or hedge
-each unsupported statement. Keep supported wording and the draft's headline (never
-substitute the source's raw title), and keep the source's uncertainty qualifiers.
+Return title, summary and why_it_matters with the smallest edits that remove each
+unsupported statement or reword it to what the source supports, such as the source's
+own uncertainty; attributing it to the source ("the report suggests ...") does not fix
+it. Keep supported wording and the draft's headline (never substitute the source's raw
+title), and keep the source's uncertainty qualifiers.
 Write news copy: attribute claims to who made them (for example "the report says"),
 never "the source states". why_it_matters must say why the item matters using only a
 consequence, concern or requested action the source states; if it states none, write
@@ -169,6 +171,10 @@ _TYPOGRAPHY = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201
 def _plain(text: str) -> str:
     """Compare quotes by words: whitespace, typographic quotes/dashes and case do not matter."""
     return " ".join(text.translate(_TYPOGRAPHY).split()).casefold()
+
+
+def _sentences(result: dict) -> set[str]:
+    return {s for key in TEXT_FIELDS for s in re.split(r"(?<=[.!?])\s+", _plain(str(result[key]))) if s}
 
 
 def validate_analysis(result: dict, item: dict, *, editorial: bool = True) -> dict:
@@ -416,8 +422,9 @@ class Analyzer:
         if set(check) != set(GROUNDING_SCHEMA["properties"]) or not isinstance(check["unsupported"], list):
             raise AnalysisError("Model grounding check does not match schema")
         final = {**draft, **{k: check[k] for k in TEXT_FIELDS}}
-        text = _plain(" ".join(str(final[k]) for k in TEXT_FIELDS))
-        if any(isinstance(claim, str) and len(_plain(claim)) >= 8 and _plain(claim) in text
+        # A flagged statement may be reworded (hedged or denied) but not left as drafted.
+        unchanged = _sentences(final) & _sentences(draft)
+        if any(isinstance(claim, str) and len(_plain(claim)) >= 8 and any(_plain(claim) in s for s in unchanged)
                for claim in check["unsupported"]):
             raise AnalysisError("Model grounding check left an unsupported statement in place")
         return validate_analysis(final, source)
