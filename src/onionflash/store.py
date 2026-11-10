@@ -455,7 +455,7 @@ class Store:
                 {
                     "id": source["id"],
                     "name": source["name"],
-                    "website_url": source.get("website_url", source["url"]),
+                    "website_url": source.get("website_url"),
                     "last_success": state["last_success"],
                     "error": state["error"],
                     "stale": bool(stale),

@@ -35,9 +35,9 @@ def test_undated_monitor_message_is_not_retimestamped_on_each_poll():
     feed = b'<rss version="2.0"><channel><title>Alerts</title><link>https://example.org/</link><description>Alerts</description><item><title>Consensus issues</title><link>https://example.org/report/1</link><description>WARNING: The following authorities are missing from the consensus: bastet</description></item></channel></rss>'
     from onionflash.config import DEFAULTS
     client = FakeClient([response(feed)])
-    with pytest.raises(CollectionError, match="Undated monitoring") as failure:
-        collect_source(client, alert_source(), {}, copy.deepcopy(DEFAULTS["collection"]), DATE)
-    assert failure.value.items == []
+    result = collect_source(client, alert_source(), {}, copy.deepcopy(DEFAULTS["collection"]), DATE)
+    # Skipped and counted in the run report; the feed is not left in an error state.
+    assert result["items"] == [] and result["skipped"] == 1
 
 
 @pytest.mark.parametrize("before,after", [
