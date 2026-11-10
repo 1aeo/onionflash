@@ -88,7 +88,7 @@ enable_thinking = false
 # vLLM understands this optional extension. Set false for providers that do not.
 send_chat_template_kwargs = true
 
-# Source kind is feed, tag, gitlab_issue, or gitlab_mr.
+# Source kind is feed, tag, gitlab_issue, gitlab_mr, or metrics_timeline.
 # Fallbacks must offer the same logical stream; they are tried in order.
 # Optional source overrides: enabled, interval_seconds, max_pages, max_items.
 # website_url links to the public source page; url is the collection endpoint.
@@ -237,16 +237,16 @@ authority = "development"
 
 [[sources]]
 id = "tor-metrics-news"
-name = "Tor Project Metrics News Timeline"
-website_url = "https://metrics.torproject.org/news.html"
-kind = "feed"
-url = "https://metrics.torproject.org/news.atom"
+name = "Tor Project Metrics Timeline Repository"
+website_url = "https://gitlab.torproject.org/tpo/network-health/metrics/timeline"
+kind = "metrics_timeline"
+url = "https://gitlab.torproject.org/api/v4/projects/644/repository/files/README.md?ref=master"
 fallback_urls = []
 product = "network"
 # Curated context may include unknown causes and historical event ranges.
 authority = "telemetry"
 interval_seconds = 3600
-# This feed includes its historical archive, rather than a short recent window.
+# Bound the entire repository table; the event-date window filters news candidates.
 max_items = 1000
 
 # Development discussion adds proposal and protocol-change context.

@@ -317,7 +317,7 @@ def load_config(path: str | Path) -> dict:
             raise ValueError("Invalid monitor identity")
         if source["alert_format"] and (source["kind"] != "feed" or source["authority"] != "telemetry"):
             raise ValueError("Alert parsers require a feed classified as telemetry")
-        if source["kind"] not in {"feed", "tag", "gitlab_issue", "gitlab_mr"}:
+        if source["kind"] not in {"feed", "tag", "gitlab_issue", "gitlab_mr", "metrics_timeline"}:
             raise ValueError("Unsupported source kind")
         if source["authority"] not in {
             "official",
@@ -341,6 +341,10 @@ def load_config(path: str | Path) -> dict:
             raise ValueError("At most five fallback URLs per source")
         source["url"] = canonical_url(source["url"])
         source["website_url"] = canonical_url(source.get("website_url", source["url"]))
+        if source["kind"] == "metrics_timeline":
+            website = urlsplit(source["website_url"])
+            if website.query or website.fragment or not website.path.strip("/"):
+                raise ValueError("Timeline website_url must be a clean repository URL")
         source["fallback_urls"] = [canonical_url(u) for u in source["fallback_urls"]]
         for key, global_key in [
             ("max_pages", "max_pages"),

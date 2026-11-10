@@ -167,6 +167,16 @@ def canonical_url(value: str) -> str:
     return urlunsplit(("https", authority, path, query, parsed.fragment))
 
 
+def item_identity(item: dict) -> str:
+    """Keep repository entries stable while their immutable citation changes."""
+    if item.get("kind") == "metrics_timeline":
+        identity = item.get("source_entry_id")
+        if not isinstance(identity, str) or not re.fullmatch(r"[a-f0-9]{64}", identity):
+            raise ValueError("Timeline item needs a stable source entry identity")
+        return "timeline:" + identity
+    return item["url"]
+
+
 def item_cluster(item: dict) -> str:
     """Only merge strong matches: canonical identity, identical body, release version.
 
@@ -195,4 +205,4 @@ def item_cluster(item: dict) -> str:
             r"^(?:dirauth|authority|security|tor|arti):\s*", "", clean_title
         )
         return "body:" + digest([clean_title, body])
-    return "url:" + digest(item["url"])
+    return "url:" + digest(item_identity(item))

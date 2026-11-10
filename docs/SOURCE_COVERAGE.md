@@ -14,7 +14,7 @@ protocol changes. The additional configured streams are:
 | --- | --- | --- |
 | [Tor Browser Security-labeled public issues](https://gitlab.torproject.org/api/v4/projects/472/issues?labels=Security) | `tor-browser-security`, enabled | Earlier visibility into Browser security work; labels do not establish confirmed vulnerabilities or completed fixes. |
 | [Anti-Censorship team issues](https://gitlab.torproject.org/api/v4/projects/549/issues) | `anti-censorship-team`, enabled | Human investigations of blocking and bridge/transport availability, including unlabeled reports. |
-| [Tor Metrics news Atom](https://metrics.torproject.org/news.atom) | `tor-metrics-news`, enabled hourly | Curated network events and explanations of measurement changes; treated conservatively as telemetry/context. |
+| [Tor Metrics Timeline repository](https://gitlab.torproject.org/tpo/network-health/metrics/timeline) | `tor-metrics-news`, enabled hourly | Curated event rows from the maintained README; validated repository snapshots replace the stale Atom feed. |
 | [Tor Project Development Mailing List](https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/) | `tor-dev`, enabled every five minutes | Proposal and protocol-change discussions; the normal importance and evidence checks filter routine messages. |
 | [Consensus-health monitoring](https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/) | `consensus-health-alerts`, enabled | Deterministic grouping; persistent directory-document warnings may publish as attributed observations. |
 | [Anti-censorship monitoring alerts](https://lists.torproject.org/mailman3/hyperkitty/list/anti-censorship-alerts@lists.torproject.org/) | `anti-censorship-alerts`, enabled for private grouping | Monitor outages and single-system service failures remain held; they do not establish network attacks or country-wide blocking. |
@@ -24,34 +24,48 @@ The Browser issue stream is deliberately filtered; it does not replace those
 announcements or promise comprehensive vulnerability coverage.
 
 All source URLs, fallback URLs, intervals and enable flags are editable in TOML.
-The public issue-note API currently returns 401 anonymously. Do not assume that
+The REST issue-note API currently returns 401 anonymously. Do not assume that
 issue descriptions include later confirmations or mitigations posted in comments.
 
-### Tor Metrics timeline caveats
+### Tor Metrics timeline
 
-The [news page](https://metrics.torproject.org/news.html) and Atom feed are useful
-for interpreting network changes, blocking, bridge outages and measurement bugs.
-On November 9, 2026 the served feed contained 799 entries (about 1.06 MB), but its
-newest event was March 9. The [backing timeline repository](https://gitlab.torproject.org/tpo/network-health/metrics/timeline)
-had newer November updates, so this is supplementary context, not a reliable
-breaking-news channel. Its timestamps describe event dates rather than the time
-an entry became publicly available. Historical "to present" notes must not be
-assumed to describe current conditions.
+The maintained [timeline repository](https://gitlab.torproject.org/tpo/network-health/metrics/timeline)
+is the active source. On November 9, 2026 the former Atom feed's newest event was
+March 9; the repository contained November updates. The Atom feed is no longer
+configured, including as a fallback.
 
-The hourly source allows 1,000 entries within the existing response/XML limits.
-The normal recent-event cutoff prevents importing the old archive as new news.
-Because upstream timestamps are event dates, retrospective edits outside that
-window can be missed by the ordinary feed collector.
-There is no verified Atom fallback: the HTML page and Markdown repository are
-different formats. A future repository adapter could provide fresher timeline
-data without pretending either is a feed mirror.
+The `metrics_timeline` adapter reads the GitLab file JSON API for `README.md`.
+It validates the base64 content, declared size, SHA-256, repository revision and
+seven-column table. It does not clone the repository, execute upstream scripts
+or fetch the row's external references. The timeline data is CC0; the upstream
+BSD-licensed helper scripts are not bundled or executed.
 
-The feed also contains duplicate Atom IDs for distinct events. When an Atom ID
-is used because there is no alternate link, conflicting recent entries sharing
-that URL and update timestamp are skipped with a coverage
-warning instead of silently replacing one another; unambiguous entries continue
-through the normal pipeline. Old entries outside the lookback do not trigger
-that warning. Long entry titles are retained in the bounded analysis context.
+The November 10 repository check found 804 rows, including the October 28 Tor
+0.4.9.15 event and November 4 Tor 0.4.9.16 event missing from the Atom feed.
+`max_items = 1000` bounds the complete table; exceeding it produces an explicit
+source warning. HTTP response limits, retries and backoff also apply. Conditional
+HTTP requests avoid parsing unchanged snapshots.
+
+Rows qualify through the configured event-date lookback (14 days by default):
+a recent start or explicit end can qualify, but an old `ongoing` row or a recent
+repository commit cannot. Raw dates, approximation markers, country/protocol
+scope and the unknown-cause `X` marker remain in analysis context. The README
+does not specify a timezone; UTC-normalized values are ordering keys, not claims
+of precise event time. Retrospective changes outside this event window remain
+outside ordinary collection.
+
+Each citation points to the exact repository commit and table line. Private
+entry identities use the repository/file, normalized start date and scope;
+line movement, description edits, changed references and repository revisions
+do not create a new identity. Because upstream has no event IDs, distinct rows
+sharing that key are ambiguous: recent collisions are skipped with a warning,
+while unambiguous rows continue. They are never silently merged.
+
+Repository revision time orders corrections separately from event dates.
+Unchanged row content is not reanalyzed when another row changes. Timeline
+context can update its own story, but cannot replace a richer existing news
+summary merely because the repository was edited later. Release-version
+clustering still adds corroborating citations to existing release stories.
 
 ## Important sources that need more handling first
 

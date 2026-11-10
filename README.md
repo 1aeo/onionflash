@@ -90,7 +90,7 @@ To replace or add a source, edit its entry:
 id = "my-release-feed"
 name = "My release announcements"
 website_url = "https://example.org/releases/"
-kind = "feed"                     # feed, tag, gitlab_issue, gitlab_mr
+kind = "feed"                     # feed, tag, gitlab_issue, gitlab_mr, metrics_timeline
 url = "https://example.org/feed.xml"
 fallback_urls = ["https://mirror.example.org/feed.xml"]
 product = "tor"                   # tor, arti, tor-browser, torspec, network
@@ -108,6 +108,17 @@ Fallback URLs must represent the **same logical stream**. A changed primary URL
 resets that source's fetch cursor and conditional cache. Disabling a source stops
 collection without erasing already published news. GitLab merged changes are
 collected across branches, including maintenance branches.
+
+The Metrics Timeline source uses `kind = "metrics_timeline"` with the maintained
+repository's GitLab file JSON API URL and its repository root as `website_url`.
+It reads the Markdown table without running upstream scripts, validates the
+snapshot and uses conditional HTTP requests. The stale Metrics Atom feed is no
+longer configured, including as a fallback.
+
+Timeline entries keep their event dates; repository revisions do not turn old
+open-ended events into new incidents. Citations point to the exact commit and
+table line. Ambiguous recent rows are skipped with a source warning. See
+[timeline coverage and identity rules](docs/SOURCE_COVERAGE.md#tor-metrics-timeline).
 
 ### Automated monitoring alerts
 

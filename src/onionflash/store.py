@@ -8,7 +8,7 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from .util import after, backoff_seconds, digest, item_cluster
+from .util import after, backoff_seconds, digest, item_cluster, item_identity
 from . import monitoring
 
 
@@ -219,7 +219,7 @@ class Store:
             )
 
     def ingest(self, item: dict, observed: str, *, tag_priority_score: int = 5) -> bool:
-        item_id = digest(item["url"])[:24]
+        item_id = digest(item_identity(item))[:24]
         item["id"] = item_id
         content_hash = digest(
             {
@@ -250,7 +250,7 @@ class Store:
             self.db.execute(
                 """INSERT INTO items(id,url,source_id,payload,content_hash,cluster_key,first_seen,last_seen,priority_score)
                 VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
-                source_id=excluded.source_id,payload=excluded.payload,content_hash=excluded.content_hash,
+                url=excluded.url,source_id=excluded.source_id,payload=excluded.payload,content_hash=excluded.content_hash,
                 cluster_key=excluded.cluster_key,last_seen=excluded.last_seen,status='pending',attempts=0,
                 next_attempt_at=NULL,last_error=NULL,priority_score=excluded.priority_score""",
                 (
@@ -332,7 +332,7 @@ class Store:
                     "title": item["title"],
                     "published_at": item["published_at"],
                 }
-                source_map = {s["url"]: s for s in (previous or {}).get("sources", [])}
+                source_map = {s["url"]: s for s in (previous or {}).get("sources", []) if s.get("id") != item["id"]}
                 source_map[source["url"]] = source
                 data = {
                     key: result[key]
@@ -348,13 +348,19 @@ class Store:
                         "tags",
                     )
                 }
+                editorial_kind = item["kind"]
+                previous_timeline = previous and previous.get("editorial_kind") == "metrics_timeline"
+                primary_replaces_timeline = previous_timeline and item["kind"] not in {"metrics_timeline", "tag"}
                 if previous and (
-                    item["updated_at"] < previous["updated_at"]
+                    (item["updated_at"] < previous["updated_at"] and not primary_replaces_timeline)
                     or (item["kind"] == "tag" and previous["state"] != "tagged")
+                    or (item["kind"] == "metrics_timeline" and not previous_timeline)
                 ):
                     # A newly discovered older mirror adds corroborating links, not an
                     # editorial rollback. The evidence still remains in the private cache.
                     data = {key: previous[key] for key in data}
+                    editorial_kind = previous.get("editorial_kind", "")
+                data["editorial_kind"] = editorial_kind
                 if previous:
                     data["products"] = sorted(
                         set(data["products"]) | set(previous["products"])

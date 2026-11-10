@@ -379,6 +379,9 @@ def collect_source(
         try:
             if source["kind"] in {"feed", "tag"}:
                 return _feed(client, source, url, state, settings, started)
+            if source["kind"] == "metrics_timeline":
+                from .timeline import collect_timeline
+                return collect_timeline(client, {**source, "url": url}, state, settings, started)
             return _gitlab(client, source, url, state, settings, started)
         except CollectionError as exc:
             errors.append(str(exc))
