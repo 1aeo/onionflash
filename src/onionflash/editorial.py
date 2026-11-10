@@ -177,7 +177,9 @@ def public_metadata(db, story_id: str) -> dict | None:
     entries = []
     for row in rows:
         entry = {key: row[key] for key in ("revision", "action", "reason", "created_at")}
-        if row["before_public_json"] is not None and row["action"] != "unlock":
+        if control["retracted"] and row["revision"] != control["revision"]:
+            entry["reason"] = ""  # an earlier reason may quote the withdrawn text
+        if row["before_public_json"] is not None and row["action"] != "unlock" and not control["retracted"]:
             before = json.loads(row["before_public_json"])
             entry["superseded"] = {key: before.get(key, "") for key in ("title", "summary", "why_it_matters")}
         entries.append(entry)
@@ -255,13 +257,11 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
         if action == "correct":
             if retracted:
                 raise ValueError("Restore a retracted story before correcting it")
-            changes = _validated_patch(patch)
-            if all(public.get(key) == value for key, value in changes.items()):
+            public.update(_validated_patch(patch))
+            if _public(public) == current["public"]:
                 raise ValueError("Correction does not change any public field")
-            public.update(changes)
         elif action == "retract":
-            original_title = public["title"].removeprefix("Retracted: ") if retracted else public["title"]
-            public.update(title="Retracted: " + original_title[:169], summary="This story has been retracted by the publisher. " + reason,
+            public.update(title="Retracted story", summary="This story has been retracted by the publisher. " + reason,
                           why_it_matters="", priority="low")
             retracted = True
         elif action == "restore":

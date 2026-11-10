@@ -56,7 +56,15 @@ reports from another source.
 ## Retract, restore or resume automation
 
 Retraction replaces current reporting with a clearly labeled tombstone at the
-same URL. The homepage, RSS and JSON Feed show the retraction and its reason:
+same URL. The homepage, RSS and JSON Feed show the retraction and its reason.
+While the story is retracted, its pages and feeds publish none of its earlier
+headline or text, not even as superseded history or in earlier correction
+reasons. Copies made before the retraction are not withdrawn: feed readers and
+caches keep theirs, and so does an enabled permanent archive. The notice keeps
+the story's source links: they are the upstream records it cited, not Onion
+Flash's text. A correction keeps
+replaced text public as superseded history; when text must not stay public,
+retract:
 
 ```sh
 onionflash story retract --config config.toml --story STORY_ID \
@@ -105,9 +113,10 @@ correction notice and revision history remain available after automated updates.
 The article displays the current correction/retraction notice and a native HTML
 revision-history disclosure. It needs no JavaScript. Up to the latest 20 actions
 are shown, with the total count when more exist. Previously accepted public text
-is labeled **superseded** inside a separate disclosure. Homepage and feed summaries
-contain the current account and notice, never the obsolete full text. Canonical
-article JSON includes the same public notice/history as its article.
+is labeled **superseded** inside a separate disclosure, which a retracted story
+omits until it is restored. Homepage and feed summaries contain the current
+account and notice, never the obsolete full text. Canonical article JSON includes
+the same public notice/history as its article.
 
 All revisions remain in the private SQLite ledger; the history command reads it
 in pages of at most 100. Raw collected sources, unaccepted drafts, model evidence

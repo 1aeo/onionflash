@@ -147,18 +147,23 @@ def test_failed_operator_write_rolls_back_revision_and_cannot_leave_permit_open(
 def test_retraction_tombstone_restore_and_explicit_unlock(seeded):
     cfg, store, story_id = seeded
     original = editorial.show(store.db, story_id)["story"]
-    edit(store, story_id)
+    quoting = "Replaced the claim " + original["title"]  # an operator reason may quote the old text
+    edit(store, story_id, reason=quoting)
     build(cfg, store)
     withdrawn = act(editorial.retract, store, story_id, reason="The source withdrew this report.")
     build(cfg, store)
     files = current_files(cfg, story_id)
     assert files["json"]["id"] == story_id
     assert files["json"]["editorial"]["status"] == "retracted"
-    assert files["json"]["title"].startswith("Retracted: ")
-    for text in (files["home"], files["rss"], files["feed"]["content_text"]):
+    assert files["json"]["title"] == "Retracted story"
+    # Neither the original nor the corrected text stays public, not even as superseded
+    # history or in an earlier correction's reason.
+    for text in (files["home"], files["rss"], files["feed"]["content_text"], files["article"], json.dumps(files["json"])):
         assert "The source withdrew this report." in text
-        assert original["summary"] not in text
-        assert FIX not in text
+        for old in (original["title"], original["summary"], original["why_it_matters"], FIX, quoting):
+            assert old not in text
+    with pytest.raises(ValueError, match="Restore a retracted"):
+        edit(store, story_id, patch={"summary": "New text."}, observed=LATER)
     with pytest.raises(ValueError, match="restore"):
         act(editorial.unlock, store, story_id)
     assert editorial.show(store.db, story_id)["hash"] == withdrawn["hash"]
@@ -168,15 +173,20 @@ def test_retraction_tombstone_restore_and_explicit_unlock(seeded):
     with pytest.raises(ValueError, match="accepted public text"):
         act(editorial.restore, store, story_id, 2)
     act(editorial.unlock, store, story_id)
-    assert not editorial.show(store.db, story_id)["locked"]
+    reviewed = editorial.show(store.db, story_id)
+    assert not reviewed["locked"]
     store.ingest(item(content="An updated source report after explicit review.", updated_at=LATER), LATER)
     finish_reviewed(store, store.pending(1, LATER)[0], analysis(summary="New source-supported text."), "after-unlock", LATER)
+    # The rewrite keeps the row's update time; only its payload invalidates the reviewed hash.
+    with pytest.raises(ValueError, match="changed since it was reviewed"):
+        editorial.correct(store.db, story_id, {"why_it_matters": FIX}, reason="Reviewed.", expect_hash=reviewed["hash"], observed=LATER)
     build(cfg, store)
     files = current_files(cfg, story_id)
     assert files["json"]["summary"] == "New source-supported text."
     assert files["json"]["editorial"]["revision"] == 4
     assert files["json"]["editorial"]["history"][0]["action"] == "unlock"
-    assert "Restored" in files["article"]
+    assert "Restored" in files["article"] and "Superseded public text" in files["article"]
+    assert quoting in json.dumps(files["json"])  # restoring brings earlier reasons back
 
 
 def test_restore_original_and_backup_recover_last_good_public_revision(seeded, tmp_path):
@@ -214,7 +224,10 @@ def test_mismatched_draft_identity_uses_last_good_snapshot_without_moving_permal
     with store.db:
         store.db.execute("UPDATE stories SET payload=? WHERE id=?", (json.dumps(raw), story_id))
     assert editorial.show(store.db, story_id)["using_last_published_snapshot"]
-    edit(store, story_id); build(cfg, store)
+    assert build(cfg, store)["stories_skipped"] == 1
+    assert not (Path(cfg["storage"]["output_dir"]) / "news" / "incorrect-draft-id").exists()
+    edit(store, story_id)
+    assert build(cfg, store)["stories_skipped"] == 0
     assert current_files(cfg, story_id)["json"]["id"] == story_id
 
 
@@ -223,7 +236,9 @@ def test_mismatched_draft_identity_uses_last_good_snapshot_without_moving_permal
     {"summary": []}, {"priority": []}, {"products": "tor"}, {"tags": ["fake"]}, {"sources": []},
     {"sources": [{"url": "http://example.org", "title": "Bad"}]},
     {"sources": [{"url": "https://127.0.0.1/", "title": "Private"}]},
-    {"sources": [{"url": "https://example.org", "title": "Source", "secret": "hidden"}]}])
+    {"sources": [{"url": "https://example.org", "title": "Source", "secret": "hidden"}]},
+    # No-ops once normalized: the category is always a tag, and whitespace collapses.
+    {"category": "security"}, {"tags": []}, {"title": "Operator reports  possible compromise"}])
 def test_invalid_patch_cannot_mutate_or_unlock_story(seeded, patch):
     cfg, store, story_id = seeded
     before = editorial.show(store.db, story_id)
@@ -231,6 +246,17 @@ def test_invalid_patch_cannot_mutate_or_unlock_story(seeded, patch):
         edit(store, story_id, patch=patch)
     assert editorial.show(store.db, story_id)["hash"] == before["hash"]
     assert not store.db.in_transaction
+
+
+def test_list_field_correction_publishes_canonical_sources_tags_and_products(seeded):
+    cfg, store, story_id = seeded
+    edit(store, story_id, patch={"tags": ["relay", "relay"], "products": ["arti", "arti"], "sources": [
+        {"url": "https://example.org/news/1", "title": "Original"}, {"url": "https://example.org/news/2?utm_source=x", "title": "Follow-up"}]})
+    build(cfg, store)
+    story = current_files(cfg, story_id)["json"]
+    assert [source["url"] for source in story["sources"]] == ["https://example.org/news/1", "https://example.org/news/2"]
+    assert story["tags"] == ["security", "relay"] and story["products"] == ["arti"]
+    assert story_id in (Path(cfg["storage"]["output_dir"]) / "topics" / "relay" / "index.html").read_text()
 
 
 @pytest.mark.parametrize("changes", [{"reason": ""}, {"reason": "x" * 1001}, {"expect_hash": ""},
