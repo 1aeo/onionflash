@@ -350,6 +350,7 @@ def test_utf16_entity_declarations_are_rejected_before_feedparser():
 def test_a_feed_with_too_many_elements_is_rejected_before_feedparser(monkeypatch):
     from onionflash import collect
     monkeypatch.setattr(collect, "MAX_FEED_ELEMENTS", 10)
+    monkeypatch.setattr(collect.feedparser, "parse", lambda *args, **kwargs: pytest.fail("feedparser ran"))
     xml = ("<rss><channel>" + "<item/>" * 20 + "</channel></rss>").encode()
     with pytest.raises(CollectionError, match="too many XML elements"):
         collect_source(FakeClient([response(xml)]), source(), {}, DEFAULTS["collection"], DATE)
