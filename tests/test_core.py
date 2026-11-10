@@ -739,3 +739,96 @@ def test_skipped_story_count_is_reported_on_unchanged_builds(tmp_path):
             store.finish(row, analysis(), "key-" + row["id"], DATE)
         assert build(cfg, store) == {"public_changed": True, "stories_skipped": 1}
         assert build(cfg, store) == {"public_changed": False, "stories_skipped": 1}
+
+def test_story_precedence_keeps_confirmed_account_but_follows_its_own_updates(tmp_path):
+    def publish(store, url, updated, content=item()["content"], **result):
+        store.ingest(item(url=url, title="Arti 2.8.0 released", updated_at=updated, kind="feed", content=content,
+                          product="arti"), updated)
+        row = next(r for r in store.pending(10, updated) if r["url"] == url)
+        store.finish(row, analysis(**result), "key-" + url + updated, updated)
+        return store.stories(10)
+
+    later = "2026-11-08T13:00:00Z"
+    latest = "2026-11-08T14:00:00Z"
+    with Store(tmp_path / "state.db") as store:
+        official = dict(title="Arti 2.8.0 released", confidence="confirmed", state="released")
+        publish(store, "https://blog.example/arti", DATE, **official)
+        # A later, unconfirmed item in the same release cluster adds a source but not its text.
+        stories = publish(store, "https://gitlab.example/arti/1", later,
+                          title="Arti 2.8.0 release checklist completed", confidence="reported")
+        assert len(stories) == 1 and len(stories[0]["sources"]) == 2
+        assert (stories[0]["title"], stories[0]["confidence"]) == ("Arti 2.8.0 released", "confirmed")
+        # The item that wrote the story can still update it, even to an unconfirmed account.
+        stories = publish(store, "https://blog.example/arti", latest, content="Update: the release was withdrawn.",
+                          title="Arti 2.8.0 release withdrawn",
+                          confidence="reported", state="developing")
+        assert (stories[0]["title"], stories[0]["confidence"]) == ("Arti 2.8.0 release withdrawn", "reported")
+
+
+def test_release_clusters_include_two_part_versions_and_alpha_suffixes():
+    def key(title, kind="feed"):
+        return item_cluster({"title": title, "kind": kind, "product": "network", "content": "", "url": "https://example.org/" + title})
+
+    assert key("New Release: Tor Browser 16.0") == key("Tor Browser 16.0 is released") == "release:tor-browser:16.0"
+    assert key("New Alpha Release: Tor Browser 16.0a14") == "release:tor-browser:16.0a14"
+    assert key("Tor 0.4.9.16 is released") == "release:tor:0.4.9.16"
+    assert key("Tor 0.5.0.1-alpha is released") == "release:tor:0.5.0.1-alpha"
+    assert key("New Release: Tor Browser 15.0.26") == "release:tor-browser:15.0.26"
+    assert key("tor-0.4.9.16", kind="tag") == "release:tor:0.4.9.16" and key("arti-v2.8.0", kind="tag") == "release:arti:2.8.0"
+    assert key("Tor Browser 16.0-alpha.1 released") != key("Tor Browser 16.0-alpha.2 released")
+    assert key("Tor Browser 16.0-alpha.1 released") == "release:tor-browser:16.0-alpha.1"
+    # A version that does not directly follow the product name never forms a release cluster.
+    assert key("Tor Browser for Ubuntu 24.04: 15.0.26 released").startswith("url:")
+    assert key("Tails 7.16 released with Tor Browser 16.0 and Tor 0.4.9.15").startswith("url:")
+
+
+def test_precedence_compares_with_the_writing_item_not_later_losers(tmp_path):
+    def publish(store, url, updated, **result):
+        store.ingest(item(url=url, title="Tor 0.4.9.17 released", updated_at=updated, kind="feed", content=url), updated)
+        row = next(r for r in store.pending(10, updated) if r["url"] == url)
+        store.finish(row, analysis(title=result.pop("title"), **result), "k" + url, updated)
+        return store.stories(10)[0]
+
+    with Store(tmp_path / "state.db") as store:
+        publish(store, "https://a.example/1", "2026-11-08T12:00:00Z", title="A", confidence="confirmed")
+        # A lower-ranked (unconfirmed) item advances the story's updated_at but not its text.
+        story = publish(store, "https://b.example/1", "2026-11-08T15:00:00Z", title="B", confidence="reported")
+        assert (story["title"], story["updated_at"]) == ("A", "2026-11-08T15:00:00Z")
+        # A newer confirmed item than the writer still replaces the text.
+        story = publish(store, "https://c.example/1", "2026-11-08T13:00:00Z", title="C", confidence="confirmed")
+        assert story["title"] == "C"
+
+
+def test_legacy_story_without_editorial_fields_survives_successive_items(tmp_path):
+    # Same tier and confidence, so the timestamps decide (and must be comparable).
+    legacy = {**analysis(title="Tor 0.4.9.18 released"),
+              "id": "legacy000000000000000000", "published_at": DATE, "updated_at": "2026-11-08T15:00:00Z",
+              "sources": [{"id": "old", "url": "https://old.example/1", "title": "Old", "published_at": DATE}]}
+    legacy.pop("evidence")
+    with Store(tmp_path / "state.db") as store:
+        key = item_cluster(item(title="Tor 0.4.9.18 released", kind="feed"))
+        store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (legacy["id"], key, json.dumps(legacy), DATE, legacy["updated_at"]))
+        for index, stamp in enumerate(["2026-11-08T13:00:00Z", "2026-11-08T14:00:00Z"]):
+            store.ingest(item(url=f"https://new.example/{index}", title="Tor 0.4.9.18 released", kind="feed",
+                              content=str(index), updated_at=stamp), stamp)
+            row = next(r for r in store.pending(10, stamp) if r["url"].endswith(str(index)))
+            store.finish(row, analysis(title=f"Item {index}"), f"k{index}", stamp)
+        story = store.stories(10)[0]
+    assert story["title"] == "Tor 0.4.9.18 released" and len(story["sources"]) == 3
+
+
+def test_an_older_single_source_story_can_still_be_updated_by_its_source(tmp_path):
+    url = "https://blog.example/tor-0.4.9.19"
+    with Store(tmp_path / "state.db") as store:
+        store.ingest(item(url=url, title="Tor 0.4.9.19 released", kind="feed"), DATE)
+        row = store.pending(1, DATE)[0]
+        legacy = {**analysis(title="Tor 0.4.9.19 released", confidence="confirmed", state="released"),
+                  "id": "legacy111111111111111111", "published_at": DATE, "updated_at": DATE,
+                  "sources": [{"id": row["id"], "url": url, "title": "x", "published_at": DATE}]}
+        legacy.pop("evidence")
+        store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (legacy["id"], row["cluster_key"], json.dumps(legacy), DATE, DATE))
+        later = "2026-11-08T13:00:00Z"
+        store.ingest(item(url=url, title="Tor 0.4.9.19 released", kind="feed", content="Withdrawn.", updated_at=later), later)
+        store.finish(store.pending(1, later)[0], analysis(title="Tor 0.4.9.19 release withdrawn"), "k", later)
+        story = store.stories(1)[0]
+    assert story["title"] == "Tor 0.4.9.19 release withdrawn" and story["editorial_item"] == row["id"]

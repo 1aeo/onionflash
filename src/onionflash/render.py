@@ -121,7 +121,7 @@ def _prepare_story(story: dict) -> dict:
     if not sources:
         raise ValueError("Published stories require at least one safe source URL")
     tags = []
-    for tag in [category, *story.get("tags", [])[:20], *story.get("products", [])[:10]]:
+    for tag in [category, *story.get("tags", [])[:20]]:
         if isinstance(tag, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", tag) and tag not in tags:
             tags.append(tag)
     published = _date(story.get("published_at"))
@@ -133,6 +133,7 @@ def _prepare_story(story: dict) -> dict:
         "why_it_matters": _text(story.get("why_it_matters"), 800),
         "category": category, "priority": priority, "confidence": confidence,
         "state": state, "tags": tags, "sources": sources,
+        "products": [p for p in story.get("products", [])[:10] if isinstance(p, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", p)],
         "published_at": _iso(published), "updated_at": _iso(updated),
     }
 
@@ -165,7 +166,7 @@ def _source_links(story: dict, *, expanded: bool = False) -> str:
 
 
 def _card(story: dict, base: str) -> str:
-    search = " ".join([story["title"], story["summary"], *story["tags"]])
+    search = " ".join([story["title"], story["summary"], *story["tags"], *story["products"]])
     updated = ""
     if story["updated_at"] != story["published_at"]:
         updated = f'<span class="updated-note">Updated {_time(story["updated_at"])}</span>'
