@@ -389,6 +389,9 @@ def test_base_text_copied_to_every_element_is_bounded_before_feedparser(monkeypa
     for xml in (f'<rss xml:base="{base}">' + "<item/>" * 200 + "</rss>",
                 f'<rss><a BASE="{base}">' + "<b/>" * 200 + "</a></rss>",
                 f'<rss><channel><item xml:base="{base}"/>' + "<item><title>x</title></item>" * 100 + "</channel></rss>",
+                # An absolute base with a scheme feedparser does not accept leaves the long one current.
+                f'<rss><channel><item xml:base="{base}"/>' + '<item xml:base="data://x/"><title>x</title></item>' * 100
+                + "</channel></rss>",
                 "<rss>" + ('<a xml:base="' + "a" * 60000 + '/">') * 100 + "</a>" * 100 + "</rss>"):
         with pytest.raises(CollectionError, match="xml:base text"):
             collect_source(FakeClient([response(xml.encode())]), source(), {}, DEFAULTS["collection"], DATE)

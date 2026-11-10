@@ -122,9 +122,11 @@ def _feed(
     # Bytes alone do not bound what feedparser builds: tiny elements are cheap to
     # send, and every element gets its own copy of the current xml:base (or base),
     # kept in the parse stack and in each detail object. A closed element's base can
-    # also stay current for later siblings, so charge every element the longest base
-    # feedparser could hold by then: an absolute value, or the longest so far plus a
-    # relative one (and a separator). The sum bounds every copy.
+    # stay current for later siblings, and a new base does not always replace it
+    # (feedparser keeps the old one when the new scheme is not accepted), so the
+    # bound only grows: the longest base feedparser could hold by then is an absolute
+    # value, or the longest so far plus a relative one and a separator. Every element
+    # is charged that bound, and the sum bounds every copy.
     elements = depth = base_chars = longest = 0
 
     def start_element(name, attributes):
