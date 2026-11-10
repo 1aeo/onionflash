@@ -180,6 +180,14 @@ def _sentences(result: dict) -> set[str]:
 
 
 _QUALIFIED = re.compile(r"\b(?:not|no|never|unclear|unknown|whether|unconfirmed|may|might|could|possibly)\b")
+_CLAUSE = re.compile(r"[,;:]|\bbut\b")
+
+
+def _qualified(sentence: str, match: re.Match) -> bool:
+    """A negation or uncertainty word in the claim's own clause, before or after it."""
+    before = _CLAUSE.split(sentence[: match.start()])[-1]
+    after = _CLAUSE.split(sentence[match.end():])[0]
+    return bool(_QUALIFIED.search(before) or _QUALIFIED.search(after))
 
 
 def _kept_claim(claims: list, earlier: list[dict], result: dict) -> str | None:
@@ -199,9 +207,9 @@ def _kept_claim(claims: list, earlier: list[dict], result: dict) -> str | None:
         pattern = re.compile(r"(?<!\w)" + re.escape(text) + r"(?!\w)")
         checked = len(text) >= 8 or not pattern.search(latest)
         for sentence in _sentences(result):
-            if checked and pattern.search(sentence) and (
-                    (len(text) >= 8 and sentence in before) or not _QUALIFIED.search(pattern.sub(" ", sentence))):
-                return claim
+            for match in pattern.finditer(sentence) if checked else ():
+                if (len(text) >= 8 and sentence in before) or not _qualified(sentence, match):
+                    return claim
     return None
 
 
@@ -475,7 +483,9 @@ class Analyzer:
             "response_format": {"type": "json_schema", "json_schema": {
                 "name": "onionflash_grounding", "strict": True, "schema": GROUNDING_SCHEMA}},
         }, key)
-        if set(check) != set(GROUNDING_SCHEMA["properties"]) or not isinstance(check["unsupported"], list):
+        unsupported = check.get("unsupported")
+        if set(check) != set(GROUNDING_SCHEMA["properties"]) or not isinstance(unsupported, list) or len(unsupported) > 5 \
+                or any(not isinstance(claim, str) or len(claim) > 300 for claim in unsupported):
             raise AnalysisError("Model grounding check does not match schema")
         return check
 

@@ -143,6 +143,24 @@ def test_a_short_flagged_statement_removed_once_may_not_come_back():
     assert _kept_claim(["confirmed compromise"], [draft], {**draft, "summary": "An unconfirmed compromise."}) is None
 
 
+def test_a_qualifier_must_belong_to_the_claims_own_clause():
+    from onionflash.analyze import _kept_claim
+    claim = "Operators must update their configurations to exclude the node."
+    draft = {"title": "t", "summary": claim, "why_it_matters": "w"}
+    elsewhere = {**draft, "summary": "It is unclear whether the node is compromised, but operators must "
+                                      "update their configurations to exclude the node."}
+    assert _kept_claim([claim], [draft], elsewhere) == claim
+    after = {**draft, "summary": "The report says operators must update their configurations to exclude "
+                                  "the node is unconfirmed."}
+    assert _kept_claim([claim], [draft], after) is None
+
+
+def test_malformed_unsupported_entries_are_a_schema_error(monkeypatch):
+    llm = analyzer(monkeypatch, completion(analysis()), completion(grounded(unsupported=[123])))
+    with pytest.raises(AnalysisError, match="does not match schema"):
+        llm.analyze(item())
+
+
 def test_a_flagged_statement_may_be_reworded_with_the_same_words(monkeypatch):
     claim = "plausible compromise of all relays"
     for rewrite in ("The report does not say whether this is a plausible compromise of all relays.",
