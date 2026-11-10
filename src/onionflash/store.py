@@ -139,17 +139,6 @@ class Store:
         for name, kind in (("source_payload", "TEXT"), ("source_item_id", "TEXT"), ("input_chars", "INTEGER")):
             if name not in analysis_columns:
                 self.db.execute(f"ALTER TABLE analyses ADD COLUMN {name} {kind}")
-        columns = {row[1] for row in self.db.execute("PRAGMA table_info(source_state)")}
-        for name, kind in [
-            ("scan_lower", "TEXT"),
-            ("scan_upper", "TEXT"),
-            ("scan_page", "INTEGER"),
-            ("scan_cursor", "TEXT"),
-            ("scan_reconcile", "INTEGER"),
-            ("last_reconciled", "TEXT"),
-        ]:
-            if name not in columns:
-                self.db.execute(f"ALTER TABLE source_state ADD COLUMN {name} {kind}")
         if "rejections" not in {row[1] for row in self.db.execute("PRAGMA table_info(items)")}:
             self.db.execute("ALTER TABLE items ADD COLUMN rejections INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
@@ -189,9 +178,8 @@ class Store:
         with self.db:
             self.db.execute(
                 """UPDATE source_state SET active_url=?, watermark=COALESCE(?,watermark),
-                etag=?,last_modified=?,last_success=?,error=NULL,failures=0,next_fetch_at=?,
-                scan_lower=NULL,scan_upper=NULL,scan_page=NULL,scan_cursor=NULL,scan_reconcile=NULL,
-                last_reconciled=CASE WHEN ? THEN ? ELSE last_reconciled END WHERE id=?""",
+                etag=?,last_modified=?,last_success=?,error=NULL,failures=0,next_fetch_at=?
+                WHERE id=?""",
                 (
                     result.get("url"),
                     result.get("watermark"),
@@ -202,8 +190,6 @@ class Store:
                     # catching-up cooldowns are never shortened.
                     after(source["interval_seconds"] - min(POLL_TOLERANCE_SECONDS, source["interval_seconds"] / 10),
                           schedule_from or observed),
-                    bool(result.get("reconciled")),
-                    result.get("watermark"),
                     source["id"],
                 ),
             )
@@ -214,7 +200,7 @@ class Store:
         error: str,
         collection: dict,
         observed: str,
-        checkpoint: dict | None = None,
+        watermark: str | None = None,
         catching_up: bool = False,
     ) -> None:
         state = self.source(source)
@@ -233,14 +219,8 @@ class Store:
             "error": error[:160],
             "next_fetch_at": after(delay, observed),
         }
-        if checkpoint:
-            fields.update({
-                "scan_lower": checkpoint["lower"],
-                "scan_upper": checkpoint["upper"],
-                "scan_page": checkpoint["page"],
-                "scan_cursor": checkpoint.get("cursor"),
-                "scan_reconcile": bool(checkpoint.get("reconcile")),
-            })
+        if watermark:  # a GitLab scan resumes from the last row it saw
+            fields["watermark"] = watermark
         # Column names are only the literal keys above, never source data.
         assignments = ",".join(f"{name}=?" for name in fields)
         with self.db:

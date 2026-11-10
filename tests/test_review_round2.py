@@ -112,20 +112,18 @@ def test_array_duplicates_and_evidence_whitespace_preserve_existing_policy():
     assert unpublished["state"] == "released" and unpublished["confidence"] == "confirmed"
 
 
-def test_source_failure_updates_status_and_checkpoint_in_one_statement(tmp_path):
+def test_source_failure_updates_status_and_watermark_in_one_statement(tmp_path):
     stream = source()
-    checkpoint = {"lower":DATE, "upper":DATE, "page":2, "cursor":"opaque", "reconcile":True}
     with Store(tmp_path / "state.db") as store:
         store.source(stream)
         statements = []
         store.db.set_trace_callback(statements.append)
-        store.source_failure(stream, "HTTP 503", DEFAULTS["collection"], DATE, checkpoint)
+        store.source_failure(stream, "HTTP 503", DEFAULTS["collection"], DATE, DATE)
         assert len([s for s in statements if s.startswith("UPDATE source_state")]) == 1
         state = store.source(stream)
-        assert state["scan_cursor"] == "opaque" and state["failures"] == 1
+        assert state["watermark"] == DATE and state["failures"] == 1
         store.source_failure(stream, "HTTP 503 again", DEFAULTS["collection"], DATE)
-        assert store.source(stream)["scan_cursor"] == "opaque"
-
+        assert store.source(stream)["watermark"] == DATE
 
 def test_story_count_does_not_deserialize_payloads(tmp_path):
     with Store(tmp_path / "state.db") as store:
