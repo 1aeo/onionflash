@@ -461,13 +461,20 @@ def test_only_a_run_spent_entirely_inside_one_timestamp_skips_past_it():
     assert exc.value.watermark == "2026-11-02T00:00:00.001Z" and exc.value.catching_up
 
 
-def test_a_gitlab_fetch_error_keeps_items_and_the_old_watermark():
-    client = FakeClient([response(gitlab_records("2026-11-01T00:00:00Z", "2026-11-02T00:00:00Z")),
-                         FetchError("HTTP 503", retryable=True)])
-    with pytest.raises(CollectionError, match="503") as exc:
-        collect_source(client, source(kind="gitlab_issue", max_pages=2), {"watermark": "2026-10-31T00:00:00Z"},
-                       {**DEFAULTS["collection"], "page_size": 2}, DATE)
-    assert len(exc.value.items) == 2 and exc.value.watermark is None and not exc.value.catching_up
+def test_a_gitlab_fetch_error_keeps_items_and_resumes_where_the_failed_request_began():
+    from onionflash.transport import DeadlineReached
+    settings, stream = {**DEFAULTS["collection"], "page_size": 2}, source(kind="gitlab_issue", max_pages=2)
+    for error in (FetchError("HTTP 503", retryable=True), DeadlineReached()):
+        client = FakeClient([response(gitlab_records("2026-11-01T00:00:00Z", "2026-11-02T00:00:00Z")), error])
+        with pytest.raises(CollectionError) as exc:
+            collect_source(client, stream, {"watermark": "2026-10-31T00:00:00Z"}, settings, DATE)
+        assert len(exc.value.items) == 2 and exc.value.watermark == "2026-11-02T00:00:00Z"
+        assert not exc.value.catching_up  # an ordinary failure still backs off
+    # Without progress the stored watermark stays as it was.
+    with pytest.raises(CollectionError) as exc:
+        collect_source(FakeClient([FetchError("HTTP 503", retryable=True)]), stream,
+                       {"watermark": "2026-10-31T00:00:00Z"}, settings, DATE)
+    assert exc.value.watermark is None
 
 
 def test_malformed_gitlab_timestamp_cannot_abort_the_entire_cycle():

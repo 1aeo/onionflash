@@ -233,9 +233,10 @@ database lock while taking their upload snapshot.
 - GitLab scans read issues and merge requests in ascending `updated_at` order from
   one inclusive watermark. Each request starts a fresh query from the last row
   seen, so records edited mid-scan cannot shift an offset and be skipped; only a
-  full page that shares one timestamp is stepped by page. A capped scan resumes
-  from the last row on the next run, except that a run spent entirely inside one
-  timestamp skips the rest of that group rather than repeat it forever. A
+  full page that shares one timestamp is stepped by page. A scan that is capped,
+  cut off by its deadline or interrupted by an error resumes from the last row on
+  the next run, except that a run spent entirely inside one timestamp skips the
+  rest of that group rather than repeat it forever. A
   completed scan moves the watermark to the poll start minus
   `collection.overlap_seconds`. XML declarations/entities are
   rejected with an encoding-aware parser before feed parsing.

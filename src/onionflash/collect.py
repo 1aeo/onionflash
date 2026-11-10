@@ -263,14 +263,16 @@ def _gitlab(
     items, start = [], params["updated_after"]
     for _ in range(min(source["max_pages"], max(1, source["max_items"] // page_size))):
         request_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(params), ""))
+        # A failed request keeps the rows already read, and a later run resumes where it began.
+        resume = params["updated_after"] if params["updated_after"] != start else None
         try:
             records = json.loads(client.request("GET", request_url).body)
-        except FetchError as exc:
-            raise CollectionError(str(exc), items) from exc
+        except FetchError as exc:  # including a deadline cutoff
+            raise CollectionError(str(exc), items, resume) from exc
         except (ValueError, UnicodeError, RecursionError) as exc:
-            raise CollectionError("GitLab returned invalid JSON", items) from exc
+            raise CollectionError("GitLab returned invalid JSON", items, resume) from exc
         if not isinstance(records, list) or any(not isinstance(r, dict) for r in records) or len(records) > page_size:
-            raise CollectionError("GitLab returned an unexpected response", items)
+            raise CollectionError("GitLab returned an unexpected response", items, resume)
         for record in records:
             if source["kind"] == "gitlab_mr" and record.get("state") != "merged":
                 continue
@@ -301,7 +303,7 @@ def _gitlab(
         try:
             moved = parse_utc(last) > parse_utc(params["updated_after"])
         except (TypeError, ValueError):
-            raise CollectionError("GitLab returned an invalid timestamp", items) from None
+            raise CollectionError("GitLab returned an invalid timestamp", items, resume) from None
         # A full page that shares one timestamp is a tie group: step through it by page.
         params.update({"updated_after": last, "page": "1"} if moved else {"page": str(int(params["page"]) + 1)})
     if params["page"] != "1" and params["updated_after"] == start:
