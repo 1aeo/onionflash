@@ -697,7 +697,7 @@ def test_example_config_resolves_paths_and_rejects_dangerous_settings(
     cfg = load_config(p)
     assert cfg["storage"]["database"] == str(tmp_path / "state/onionflash.sqlite3")
     assert len(cfg["sources"]) >= 10
-    p.write_text(text.replace("retry_attempts = 3", "retry_attempts = 0"))
+    p.write_text(text.replace("max_items_per_run = 12", "max_items_per_run = 0"))
     with pytest.raises(ValueError):
         load_config(p)
     p.write_text(text.replace('output_dir = "build/public"', 'output_dir = "."'))
@@ -821,6 +821,24 @@ def test_new_story_records_when_onion_flash_added_it(tmp_path):
     assert (story["published_at"], story["added_at"]) == ("2026-09-22T12:00:00Z", later)
 
 
+def test_only_operator_settings_are_configurable_and_the_rest_are_ignored(tmp_path, caplog):
+    path = tmp_path / "config.toml"
+    path.write_text('[collection]\nlookback_days = 3\n[http]\nretry_attempts = 7\n'
+                    '[llm]\nmax_items_per_run = 20\nmax_input_chars = 5000\n'
+                    '[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
+    with caplog.at_level("WARNING", logger="onionflash.config"):
+        config = load_config(path)
+    assert config["llm"]["max_items_per_run"] == 20  # an operator setting
+    assert config["collection"]["lookback_days"] == DEFAULTS["collection"]["lookback_days"]
+    assert config["http"]["retry_attempts"] == DEFAULTS["http"]["retry_attempts"]
+    assert config["llm"]["max_input_chars"] == DEFAULTS["llm"]["max_input_chars"]
+    for key in ("collection.lookback_days", "http.retry_attempts", "llm.max_input_chars"):
+        assert f"Ignoring setting {key}" in caplog.text
+    path.write_text('[http]\nnot_a_setting = 1\n[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
+    with pytest.raises(ValueError, match="Unknown http settings"):
+        load_config(path)
+
+
 @pytest.mark.parametrize("base", ["javascript:bad", "https://example.com/x/../", "https://example.com/%2e%2e/",
                                   "https://example.com/?token=secret", "https://secret@example.com/"])
 def test_bad_base_url_and_traversal_are_rejected(tmp_path, base):
@@ -846,7 +864,7 @@ def test_retired_settings_are_accepted_and_ignored(tmp_path, caplog):
     with caplog.at_level("WARNING", logger="onionflash.config"):
         loaded = load_config(path)
     assert "max_stories" not in loaded["storage"] and "requests_per_minute" not in loaded["http"]
-    assert "Ignoring retired setting http.requests_per_minute" in caplog.text
+    assert "Ignoring setting http.requests_per_minute" in caplog.text
 
 
 def test_busy_lock_status_is_read_only_and_a_skipped_build_is_not_success(tmp_path, capsys):

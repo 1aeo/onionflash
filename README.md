@@ -65,17 +65,19 @@ were removed (such as `http.requests_per_minute`) still load; each is logged as
 ignored and can be deleted. Relative
 database and output paths resolve against the configuration file's directory.
 `${ENVIRONMENT_VARIABLE}` references are expanded for paths and LLM URLs.
-The API key is read only from the variable named by `llm.api_key_env`.
+The API key is read only from the `ONIONFLASH_LLM_API_KEY` environment variable.
 
 | Section | Settings |
 | --- | --- |
 | `site` | Title, description, canonical URL, repository link, page/feed sizes |
 | `storage` | Private SQLite path, owned public output directory and bounded article-render batch size |
-| `collection` | Lookback, overlap, page/item limits, content limit, staleness, circuit backoff, total/source run budgets, reserved analysis time |
 | `comments` | Optional anonymous GitLab discussion enrichment, polling/backoff, per-run/page/text limits and bounded watch-cache size |
-| `http` | Connect/read/total deadlines, attempts, exponential backoff base/cap/jitter, bounded `Retry-After`, redirect/byte limits, user agent |
-| `llm` | Base URL and fallback URLs, model, key environment variable, private-network allowlist, deadlines, output/input limits, items per run, failed-item retry backoff |
+| `llm` | Base URL and fallback URLs, model, private-network allowlist (`allowed_networks`, `allow_http`), request timeout, items per run, chat-template flag |
 | `sources` | Stream ID, display name, public website URL, kind, collection URL, fallback URLs, product, authority, optional interval/page/item overrides |
+
+Collection, HTTP and other model limits (lookback, budgets, retries, response sizes,
+backoff) are fixed defaults in `onionflash/config.py`; a file that still sets them
+loads, with each one logged as ignored.
 
 Public sources must use HTTPS. Private inference endpoints require explicit
 `llm.allowed_networks` CIDRs and `llm.allow_http = true` when using HTTP. Prefer
@@ -269,7 +271,7 @@ database lock while taking their upload snapshot.
   stable story IDs remain intact when stories are updated.
 - Every run checks queued article changes and refreshes the homepage; only
   changed artifact bytes need publication. The public Source availability panel shows only
-  Collected or Delayed (no success within `collection.stale_after_seconds`);
+  Collected or Delayed (no success within two hours);
   `onionflash status` has current collection timestamps and errors.
 
 ## Deliberate limits
