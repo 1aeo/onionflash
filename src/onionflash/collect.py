@@ -154,16 +154,18 @@ def _feed(
             content_parts[0].get("value", "") if content_parts else entry.get("summary", ""),
             settings["content_chars"],
         )
+        # Only an explicit text/plain title keeps its angle brackets; HTML and
+        # XHTML titles are stripped.
+        title_html = (entry.get("title_detail") or {}).get("type", "text/html") != "text/plain"
         # Some curated feeds put their complete description in an Atom title.
         title = entry.get("title", "")
         if isinstance(title, str) and len(title) > 500:
-            full_title = plain_text(title, settings["content_chars"])
+            full_title = plain_text(title, settings["content_chars"], html=title_html)
             if len(full_title) > 500:
                 text = (text + "\n" + full_title)[: settings["content_chars"]]
         # feedparser already uses an Atom entry's id as its link when no alternate
         # link exists; an RSS guid that is not a permalink is never a citation.
         link = entry.get("link", "")
-        title_detail = entry.get("title_detail") or {}
         try:
             item = _item(
                 source,
@@ -172,9 +174,7 @@ def _feed(
                 text,
                 published,
                 updated,
-                # Only an explicit text/plain title keeps its angle brackets;
-                # HTML and XHTML titles are stripped.
-                title_html=title_detail.get("type", "text/html") != "text/plain",
+                title_html=title_html,
                 observed=started,
             )
         except ValueError:

@@ -1005,6 +1005,26 @@ def test_xhtml_atom_titles_are_stripped_and_plain_ones_kept():
     assert [item["title"] for item in items] == ["A bold title", "Use Vec<u8> here"]
 
 
+def test_website_url_has_no_default_but_timeline_sources_require_one(tmp_path):
+    path = tmp_path / "config.toml"
+    feed = '[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n'
+    path.write_text(feed)
+    assert "website_url" not in load_config(path)["sources"][0]
+    path.write_text('[[sources]]\nid = "t"\nkind = "metrics_timeline"\nauthority = "telemetry"\n'
+                    'url = "https://gitlab.example.org/api/v4/projects/1/repository/files/README.md?ref=main"\n')
+    with pytest.raises(ValueError, match="website_url"):
+        load_config(path)
+
+
+def test_a_long_plain_text_title_keeps_its_brackets_in_the_content():
+    long_title = "Use Vec<u8> " + "x" * 600
+    xml = ('<feed xmlns="http://www.w3.org/2005/Atom"><title>T</title><id>urn:t</id><updated>2026-11-08T12:00:00Z</updated>'
+           f'<entry><title type="text">{long_title.replace("<", "&lt;").replace(">", "&gt;")}</title>'
+           '<link href="https://example.org/a"/><id>urn:a</id><updated>2026-11-08T12:00:00Z</updated></entry></feed>').encode()
+    item_ = collect_source(FakeClient([response(xml)]), source(), {}, DEFAULTS["collection"], DATE)["items"][0]
+    assert "Use Vec<u8>" in item_["content"]
+
+
 def test_future_dates_are_clamped_to_the_poll_except_for_alert_parsers():
     from onionflash.collect import _item
     later = "2062-01-01T00:00:00Z"
