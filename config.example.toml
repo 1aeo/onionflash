@@ -49,20 +49,6 @@ max_response_bytes = 2097152
 requests_per_minute = 30
 user_agent = "OnionFlash (+https://github.com/1aeo/onionflash)"
 
-[monitoring]
-# Repeated document warnings may become attributed monitoring observations.
-# Probe failures and monitor outages stay private; they never imply an attack.
-min_reports = 2
-min_span_seconds = 3600
-window_seconds = 172800
-stale_after_seconds = 259200
-retention_days = 30
-max_observations = 10000
-max_groups = 2000
-max_source_links = 3
-max_alerts_per_item = 100
-max_future_seconds = 300
-
 [llm]
 # Supply a base URL ending in /v1, or set a literal endpoint here.
 base_url = "${ONIONFLASH_LLM_BASE_URL}"

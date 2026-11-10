@@ -144,7 +144,7 @@ def run(config: dict, store: Store) -> dict:
     def record_items(source, items):
         received = now_iso()
         if source.get("alert_format"):
-            store.ingest_alerts(source, items, config["monitoring"], received)
+            report.setdefault("alerts", {})[source["id"]] = store.ingest_alerts(source, items, received)
             return received
         priority = config["collection"]["tag_priority_score"]
         report["items_changed"] += sum(
@@ -231,7 +231,7 @@ def run(config: dict, store: Store) -> dict:
             )
     report["pending_analysis"] = store.pending_count()
     report["rejected_analysis"] = store.rejected_count()
-    report["monitoring"] = store.monitoring_status(config["monitoring"], now_iso())
+    report["monitoring"] = store.monitoring_status(now_iso())
     report.update(build(config, store))
     return report
 
@@ -287,7 +287,7 @@ def main(argv: list[str] | None = None) -> int:
                         # Recorded by the last successful build; None until one has run.
                         "published_stories": None if store.get_meta("published_stories") is None
                         else int(store.get_meta("published_stories")),
-                        "monitoring": store.monitoring_status(config["monitoring"], now_iso()),
+                        "monitoring": store.monitoring_status(now_iso()),
                         "sources": store.health(
                             config["sources"],
                             config["collection"]["stale_after_seconds"],

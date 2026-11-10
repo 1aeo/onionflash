@@ -28,7 +28,7 @@ def test_unknown_monitor_messages_never_reach_qwen(tmp_path, monkeypatch):
         assert result["analyzed"] == 0
         assert store.pending_count() == 0
         assert store.stories(10) == []
-        assert result["monitoring"]["unsupported"] > 0
+        assert result["alerts"]["test"]["unsupported"] > 0
 
 
 def test_undated_monitor_message_is_not_retimestamped_on_each_poll():
@@ -41,9 +41,6 @@ def test_undated_monitor_message_is_not_retimestamped_on_each_poll():
 
 
 @pytest.mark.parametrize("before,after", [
-    ('min_reports = 2', 'min_reports = 1'),
-    ('window_seconds = 172800', 'window_seconds = 1800'),
-    ('retention_days = 30', 'retention_days = 1'),
     ('alert_format = "consensus"', 'alert_format = "guess-with-llm"'),
     ('monitor_id = "tor-doctor"', 'monitor_id = ""'),
 ])
