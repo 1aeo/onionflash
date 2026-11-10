@@ -230,13 +230,15 @@ database lock while taking their upload snapshot.
 - HTTP retries are limited to transient failures. Exponential backoff has a cap,
   jitter, and bounded `Retry-After`. Persisted source cooldowns and failed-analysis
   delays survive restarts. One failed source does not invalidate published news.
-- GitLab scans have fixed time windows, overlap, and persistent checkpoints.
-  Issues use GitLab's keyset cursor when supplied. Merge requests use the API's
-  offset pages; a configurable daily full-lookback reconciliation repairs gaps
-  caused by records moving between pages while they are being edited.
-  A capped scan resumes on the next run; its completed watermark advances only
-  after the window finishes. XML declarations/entities are rejected with an
-  encoding-aware parser before feed parsing.
+- GitLab scans read issues and merge requests in ascending `updated_at` order from
+  one inclusive watermark. Each request starts a fresh query from the last row
+  seen, so records edited mid-scan cannot shift an offset and be skipped; only a
+  full page that shares one timestamp is stepped by page. A capped scan resumes
+  from the last row on the next run, except that a run spent entirely inside one
+  timestamp skips the rest of that group rather than repeat it forever. A
+  completed scan moves the watermark to the poll start minus
+  `collection.overlap_seconds`. XML declarations/entities are
+  rejected with an encoding-aware parser before feed parsing.
 - New and changed items are saved before analysis. Private analysis records are
   identified by content hash, model, prompt version and input window; saved results
   are never reused to skip analysis. The application makes one model request

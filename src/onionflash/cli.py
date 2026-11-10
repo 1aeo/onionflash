@@ -195,7 +195,7 @@ def run(config: dict, store: Store) -> dict:
                     str(exc),
                     config["collection"],
                     received,
-                    exc.checkpoint,
+                    exc.watermark,
                     exc.catching_up or out_of_time,
                 )
                 report["sources_failed"] += 1
