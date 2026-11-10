@@ -300,7 +300,7 @@ def note_item(body="The report’s old keys remain untrusted.", **changes):
     (None, "The report’s old keys remain untrusted", False), (499, "The report’s old keys remain untrusted", False),
     (4000, "The operator reported a plausible compromise", False), (4000, "keys", False)])
 @pytest.mark.parametrize("note_kind", ["Note", "DiscussionNote"])
-def test_only_supplied_evidence_linked_notes_add_citations_and_update_time(tmp_path, budget, evidence, cited, note_kind):
+def test_writer_quotes_select_citations_while_supplied_review_notes_date_story(tmp_path, budget, evidence, cited, note_kind):
     cfg = config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         incoming = note_item(id=f"gid://gitlab/{note_kind}/123")
@@ -309,7 +309,7 @@ def test_only_supplied_evidence_linked_notes_add_citations_and_update_time(tmp_p
         finish_reviewed(store, row, analysis(evidence=[evidence]), "note", LATER, input_chars=budget)
         story = store.stories()[0]
         assert len(story["sources"]) == (2 if cited else 1)
-        assert story["updated_at"] == (EDIT if cited else DATE)
+        assert story["updated_at"] == EDIT  # Final review sees the verified note even when the draft did not cite it.
         assert story["editorial_updated_at"] == story["updated_at"]
         assert story["published_at"] == DATE and story["added_at"] == LATER
         assert json.loads(store.db.execute("SELECT payload FROM items").fetchone()[0])["updated_at"] == DATE

@@ -154,7 +154,13 @@ def prepare(db, row: dict, result: dict, observed: str, *, input_chars: int | No
         # collection identities privately for future grouping and source lookup.
         data.update({key: value for key, value in public.items() if key not in {"sources", "editorial"}})
         writer = data["editorial_item"]
-        packet, bindings = source_packet.build_packet(db, item, data, public, writer, review_settings)
+        packet, bindings, note_updates = source_packet.build_packet(db, item, data, public, writer, review_settings)
+        # Final review can repair a draft using a corrective note the writer did
+        # not quote. Date the exact candidate from the verified note material
+        # actually supplied to that review, never collection/poll timestamps.
+        data["updated_at"] = public["updated_at"] = max([data["updated_at"], *note_updates.values()])
+        if writer in note_updates:
+            data["editorial_updated_at"] = max(data["editorial_updated_at"], note_updates[writer])
         deterministic = wholly_deterministic(db, row, data, public)
         binding["sources"] = bindings
         envelope.update(candidate=public, payload=data, packet=packet, writer_item_id=writer,

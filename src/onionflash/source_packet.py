@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from .util import canonical_url, digest
+from .util import canonical_url, digest, format_utc, parse_utc
 
 
 DEFAULT_LIMITS = {"max_sources": 8, "max_source_chars": 24000, "max_passages": 64, "passage_chars": 1800}
@@ -23,7 +23,9 @@ def _decode(value):
         if not isinstance(item, dict) or not isinstance(item.get("title"), str):
             return None
         body = item.get("source_content", item.get("content"))
-        if not isinstance(body, str) or (not body.strip() and item.get("kind") != "tag"):
+        # An explicit empty body is a valid title-only source. An absent body
+        # is a compacted/missing snapshot, not evidence of an empty document.
+        if not isinstance(body, str) or not (body.strip() or item["title"].strip()):
             return None
         return item
     except (ValueError, TypeError):
@@ -139,7 +141,7 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
                 missing.append(source["url"])
             continue
         item, source_bindings, snapshot, captured = loaded
-        body = item.get("source_content", item.get("content", ""))
+        body = item.get("source_content", item.get("content"))
         unit = {key: item.get(key) for key in ("kind", "authority", "product", "published_at", "updated_at", "upstream_state")}
         unit.update(url=canonical_url(item["url"]), title=item["title"], snapshot=snapshot)
         if captured:
@@ -154,7 +156,7 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
             # All available verified notes are supplied under their parent
             # source, independently of which quotes the writer selected.
             continue
-        if not isinstance(body, str) or (not body.strip() and item.get("kind") != "tag"):
+        if not isinstance(body, str) or not (body.strip() or item["title"].strip()):
             truncated = True
             if required:
                 missing.append(source["url"])
@@ -171,7 +173,7 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
             missing.append(unit["url"])
     truncated |= len(units) > cap
     units = units[:cap]
-    sources, remaining_chars, remaining_passages = [], limits["max_source_chars"], limits["max_passages"]
+    sources, note_updates, remaining_chars, remaining_passages = [], {}, limits["max_source_chars"], limits["max_passages"]
     for index, (unit, item, required, source_bindings) in enumerate(units):
         for binding in source_bindings:
             bindings[(binding["table"], binding["key"])] = binding
@@ -182,8 +184,19 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
         passages = [{"id": source_id + ":P1", "text": title}] if title.strip() else []
         available = min(allowance - len(title), (passage_allowance - 1) * limits["passage_chars"])
         from .comments import analysis_context
-        body = item.get("source_content", item.get("content", ""))
+        body = item.get("source_content", item.get("content"))
         bounded, notes = analysis_context(item, available)
+        from .comments import parse_note_id
+        for note in notes:
+            try:
+                identifier = parse_note_id(note["id"])
+                created, updated = format_utc(parse_utc(note["created_at"])), format_utc(parse_utc(note["updated_at"]))
+                if (identifier is not None and created <= updated and canonical_url(note["url"]) ==
+                        canonical_url(item["url"]).split("#", 1)[0] + "#note_" + identifier):
+                    key = item.get("id") or unit["url"]
+                    note_updates[key] = max(note_updates.get(key, updated), updated)
+            except (KeyError, TypeError, ValueError):
+                continue
         supplied_description = len(bounded) if not notes else len(bounded.split("\n\nPublic issue comments", 1)[0])
         all_notes = [note for note in item.get("public_comments", []) if note.get("body")]
         truncated |= (supplied_description < len(body) or len(notes) < len(all_notes)
@@ -198,4 +211,4 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
         remaining_chars -= sum(len(p["text"]) for p in passages)
         remaining_passages -= len(passages)
         sources.append({"id": source_id, **unit, "passages": passages})
-    return {"sources": sources, "missing_sources": list(dict.fromkeys(missing)), "truncated": truncated}, list(bindings.values())
+    return {"sources": sources, "missing_sources": list(dict.fromkeys(missing)), "truncated": truncated}, list(bindings.values()), note_updates

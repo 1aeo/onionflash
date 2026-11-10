@@ -299,6 +299,8 @@ def test_uncited_corrective_note_survives_long_description_and_binds_approval(tm
         assert note["body"] in text and "@maintainer" in text
         assert "The operator reports" in text
         assert prepared["packet"]["truncated"]
+        assert prepared["candidate"]["updated_at"] == LATER
+        assert prepared["candidate"]["published_at"] == DATE
         receipt = approve(store, prepared)
         incoming["public_comments"][0]["body"] += " The change is not released yet."
         incoming = _compose(incoming, incoming["public_comments"], LATER)
@@ -395,3 +397,70 @@ def test_stable_timeline_identity_cannot_label_new_commit_bytes_with_old_citatio
             with pytest.raises(StaleCandidate):
                 store.commit_candidate(prepared, prepared["candidate"], "source-moved-again", LATER, **receipt)
         assert store.stories()[0]["summary"] == old["summary"]
+
+
+@pytest.mark.parametrize("body", ["", None])
+def test_title_only_source_is_reviewable_but_compacted_snapshot_is_missing(tmp_path, body):
+    with Store(tmp_path / "db") as store:
+        source = item(kind="feed", title="Tor 0.4.9.16 released", content="")
+        row = pending(store, source)
+        if body is None:
+            cold = json.loads(row["payload"])
+            cold.pop("content")
+            row["payload"] = json.dumps(cold)
+            with store.db:
+                store.db.execute("UPDATE items SET payload=? WHERE id=?", (row["payload"], row["id"]))
+        draft = analysis(title=source["title"], summary="The release feed announces Tor 0.4.9.16.",
+                         why_it_matters="", category="release", tags=["release"], state="released", evidence=[source["title"]])
+        prepared = store.prepare_candidate(row, draft, DATE)
+        assert prepared["requires_review"]
+        if body is None:
+            assert prepared["missing_sources"] == [source["url"]]
+            assert prepared["packet"]["sources"] == []
+        else:
+            assert not prepared["missing_sources"]
+            assert prepared["packet"]["sources"][0]["passages"] == [{"id": "S1:P1", "text": source["title"]}]
+            store.commit_candidate(prepared, prepared["candidate"], "title-only", DATE, **approve(store, prepared))
+            assert store.stories()[0]["title"] == source["title"]
+
+
+def test_only_review_supplied_note_dates_advance_candidate_not_poll_receipts(tmp_path):
+    from onionflash.comments import _compose
+    from onionflash.util import after
+    url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41473"
+    note = {"id": "gid://gitlab/Note/42", "url": url + "#note_42", "title": "Public comment by @maintainer",
+            "author": "maintainer", "created_at": LATER, "updated_at": LATER,
+            "body": "Correction: relay operators do not need to edit their configurations."}
+    incoming = _compose(item(url=url, content=BODY), [note], after(3600, LATER))
+    with Store(tmp_path / "db") as store:
+        row = pending(store, incoming, after(3600, LATER))
+        draft = analysis(evidence=["The operator reports that old directory-authority keys cannot be trusted"])
+        supplied = store.prepare_candidate(row, draft, after(3600, LATER), input_chars=14000)
+        assert len(supplied["candidate"]["sources"]) == 1
+        assert supplied["candidate"]["updated_at"] == LATER
+        assert supplied["payload"]["editorial_updated_at"] == LATER
+        excluded = store.prepare_candidate(row, draft, after(3600, LATER), input_chars=14000,
+                                           review_settings={**DEFAULT_LIMITS, "max_source_chars": 400})
+        assert excluded["candidate"]["updated_at"] == DATE  # Context too small to supply the note.
+        assert excluded["packet"]["truncated"]
+        poll = json.loads(row["payload"])
+        poll["comments_checked_at"] = after(7200, LATER)
+        with store.db:
+            store.db.execute("UPDATE items SET payload=?,last_seen=? WHERE id=?", (json.dumps(poll), after(7200, LATER), row["id"]))
+        refreshed_row = dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone())
+        refreshed = store.prepare_candidate(refreshed_row, draft, after(3600, LATER), input_chars=14000)
+        assert refreshed["candidate_hash"] == supplied["candidate_hash"]
+        assert refreshed["source_hash"] == supplied["source_hash"]
+        repaired = review.apply_repair(supplied["candidate"], {"why_it_matters": ""})
+        store.commit_candidate(supplied, repaired, "later-note-repair", after(7200, LATER), **approve(store, supplied, repaired))
+        saved = store.stories()[0]
+        assert saved["updated_at"] == LATER and saved["published_at"] == DATE
+        assert render._json_feed_item(render._prepare_story(saved), "https://example.org/")["date_modified"] == LATER
+
+
+def test_empty_title_and_body_are_not_review_evidence(tmp_path):
+    with Store(tmp_path / "db") as store:
+        row = pending(store, item(kind="feed", title="", content=""))
+        prepared = store.prepare_candidate(row, analysis(), DATE)
+        assert prepared["missing_sources"]
+        assert prepared["packet"]["sources"] == []

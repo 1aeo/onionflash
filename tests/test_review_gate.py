@@ -274,7 +274,7 @@ def test_missing_retained_source_holds_without_a_review_call(context):
     seed_legacy(store, original)
     with store.db:
         body = json.loads(store.db.execute("SELECT payload FROM items WHERE id=?", (original["id"],)).fetchone()[0])
-        body["content"] = ""
+        body.pop("content")
         store.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps(body), original["id"]))
     row = pending(store, item(url="https://example.org/news/mirror", source_id="mirror", content=original["content"]))
     result = run(cfg, store, row, Writer(), Reviewer())
@@ -504,3 +504,49 @@ def test_hold_final_update_guard_rolls_back_an_in_transaction_source_change(cont
     current = store.db.execute("SELECT content_hash,status FROM items WHERE id=?", (row["id"],)).fetchone()
     assert tuple(current) == (row["content_hash"], "pending")
     assert store.db.execute("SELECT COUNT(*) FROM analyses").fetchone()[0] == 0
+
+
+def test_approval_receipt_and_job_pin_roll_back_together_if_job_save_fails(context):
+    cfg, store = context
+    row = pending(store)
+    review_gate.initialize(store)
+    store.db.execute("""CREATE TRIGGER fail_approved_job BEFORE INSERT ON review_jobs
+        WHEN NEW.stage='approved' BEGIN SELECT RAISE(ABORT,'job save unavailable'); END""")
+    store.db.commit()
+    with pytest.raises(sqlite3.IntegrityError, match="job save unavailable"):
+        run(cfg, store, row, Writer(), Reviewer(verdict()))
+    assert store.db.execute("SELECT COUNT(*) FROM review_approvals").fetchone()[0] == 0
+    assert job(store)["stage"] == "review" and job(store)["approval_key"] is None
+    assert store.story_count() == 0
+    store.db.execute("DROP TRIGGER fail_approved_job")
+    store.db.commit()
+    result = run(cfg, store, row, Writer(), Reviewer(verdict()))
+    assert result["status"] == "published" and result["writer_calls"] == 0
+
+
+def test_resuming_approved_job_never_temporarily_unpins_its_receipt(context, monkeypatch):
+    cfg, store = context
+    cfg["review"]["max_cache_entries"] = 1
+    row = pending(store)
+    commit = store.commit_candidate
+    monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("crash before commit")))
+    with pytest.raises(RuntimeError):
+        run(cfg, store, row, Writer(), Reviewer(verdict()))
+    key = job(store)["approval_key"]
+    monkeypatch.setattr(store, "commit_candidate", commit)
+    save = review_gate._save
+    def crash_during_resume(*args, **kwargs):
+        save(*args, **kwargs)
+        raise RuntimeError("crash after initial resume save")
+    monkeypatch.setattr(review_gate, "_save", crash_during_resume)
+    with pytest.raises(RuntimeError):
+        run(cfg, store, row, Writer(), Reviewer(), allow_network=False)
+    assert job(store)["approval_key"] == key
+    with store.db:
+        store.db.execute("INSERT INTO review_approvals VALUES(?,?,?,?,?,?,?,?,?)", (
+            "newer-unused", "c", "s", "p", "b", "{}", "{}", LATER, "2099-01-01T00:00:00Z"))
+    review_gate._prune(store, 1)
+    assert store.db.execute("SELECT 1 FROM review_approvals WHERE key=?", (key,)).fetchone()
+    monkeypatch.setattr(review_gate, "_save", save)
+    result = run(cfg, store, row, Writer(), Reviewer(), allow_network=False)
+    assert result["status"] == "published" and result["cache_hit"] and result["review_calls"] == 0

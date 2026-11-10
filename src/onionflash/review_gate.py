@@ -81,10 +81,15 @@ def _archive_job(store, job, observed, reason):
 
 
 def _save(store, item_id, writer_key, policy_hash, stage, draft, prepared, record, observed,
-          *, prepared_at, approval_key=None, supersede=None, reason=None):
+          *, prepared_at, approval_key=None, supersede=None, reason=None, approval_receipt=None):
     with store.db:
         if supersede is not None:
             _archive_job(store, supersede, observed, reason)
+        if approval_receipt is not None:
+            # Receipt and the unfinished job's pin become durable together.
+            store.db.execute("""INSERT OR REPLACE INTO review_approvals
+                (key,candidate_hash,source_hash,policy_hash,binding_hash,result_json,
+                 review_record_json,created_at,last_used_at) VALUES(?,?,?,?,?,?,?,?,?)""", approval_receipt)
         store.db.execute("""INSERT INTO review_jobs
             (item_id,writer_key,policy_hash,stage,draft_json,envelope_json,record_json,
              approval_key,prepared_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)
@@ -208,7 +213,8 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, deadlin
                       "prepared": {key: prepared[key] for key in ("candidate", "packet", "candidate_hash", "source_hash", "binding_hash")}}
         candidate = record.get("candidate", prepared["candidate"])
         _save(store, row["id"], writer_key, policy, stage, draft, prepared, record, observed, prepared_at=prepared_at,
-              supersede=superseded_context, reason="candidate context or review policy changed")
+              supersede=superseded_context, reason="candidate context or review policy changed",
+              approval_key=job["approval_key"] if same else None)
         if prepared.get("locked") or not prepared["requires_review"]:
             record["outcome"] = "locked" if prepared.get("locked") else "deterministic"
             store.commit_candidate(prepared, prepared["candidate"], writer_key, observed, review_record=record)
@@ -265,14 +271,10 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, deadlin
             if verdict["verdict"] == "approve":
                 key = _approval_key(candidate, prepared, policy)
                 record.update(candidate=candidate, approval_key=key, outcome="approved")
-                with store.db:
-                    store.db.execute("""INSERT OR REPLACE INTO review_approvals
-                        (key,candidate_hash,source_hash,policy_hash,binding_hash,result_json,
-                         review_record_json,created_at,last_used_at) VALUES(?,?,?,?,?,?,?,?,?)""",
-                        (key, digest(candidate), prepared["source_hash"], policy, prepared["binding_hash"],
-                         _json(verdict), _json(record), observed, observed))
+                receipt = (key, digest(candidate), prepared["source_hash"], policy, prepared["binding_hash"],
+                           _json(verdict), _json(record), observed, observed)
                 _save(store, row["id"], writer_key, policy, "approved", draft, prepared, record, observed,
-                      prepared_at=prepared_at, approval_key=key)
+                      prepared_at=prepared_at, approval_key=key, approval_receipt=receipt)
                 store.commit_candidate(prepared, candidate, writer_key, observed, approval_key=key,
                                        policy_hash=policy, review_record=record)
                 return {**report, "status": "published"}
