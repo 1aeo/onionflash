@@ -1,7 +1,8 @@
-"""Deterministic monitoring observations; never an LLM news source.
+"""Deterministic consensus-health observations; never an LLM news source.
 
-Only repeated consensus document warnings publish. A story is frozen once
-published, so an hourly notification does not become an hourly RSS update.
+Only directory-document warnings about known authorities are kept, and they
+publish once repeated. A story is frozen once published, so an hourly
+notification does not become an hourly RSS update.
 """
 
 from __future__ import annotations
@@ -51,15 +52,13 @@ def initialize(db) -> None:
     """)
 
 
-def _eligible(observation: dict, alert_format: str) -> bool:
+def _eligible(observation: dict) -> bool:
     # Public eligibility is a narrow allowlist, independent of parser output.
-    return observation["kind"] != "document" or (
-        alert_format == "consensus" and observation["condition"] in DOCUMENT_CONDITIONS
-        and observation["target"] in DIRECTORY_AUTHORITIES)
+    return observation["condition"] in DOCUMENT_CONDITIONS and observation["target"] in DIRECTORY_AUTHORITIES
 
 
 def _promote(db, group, source, cutoff, observed) -> bool:
-    if group["kind"] != "document" or group["story_id"]:
+    if group["story_id"]:
         return False
     rows = db.execute(
         """SELECT stamp,condition,url,title FROM monitoring_observations
@@ -136,7 +135,7 @@ def ingest(db, source: dict, items: list[dict], observed: str) -> dict:
         report["unsupported"] += unsupported
         title = " ".join(str(item.get("title")).split())[:200]
         for observation in observations:
-            if not _eligible(observation, source["alert_format"]):
+            if not _eligible(observation):
                 report["unsupported"] += 1
             elif len(batch) >= MAX_OBSERVATIONS:
                 report["capacity"] += 1
@@ -151,9 +150,9 @@ def ingest(db, source: dict, items: list[dict], observed: str) -> dict:
         group_count = db.execute("SELECT COUNT(*) FROM monitoring_groups").fetchone()[0]
         affected = set()
         for stamp, url, title, fact in batch:
-            kind, condition = fact["kind"], fact["condition"]
-            key = digest([source["monitor_id"], source["alert_format"], kind,
-                          fact["target"], "documents" if kind == "document" else condition])
+            condition = fact["condition"]
+            # Unchanged from when other kinds were kept, so existing groups continue.
+            key = digest([source["monitor_id"], source["alert_format"], "document", fact["target"], "documents"])
             group = db.execute("SELECT highwater FROM monitoring_groups WHERE group_key=?", (key,)).fetchone()
             if (group is not None and stamp < group["highwater"]) or db.execute(
                 "SELECT 1 FROM monitoring_observations WHERE group_key=? AND stamp=? AND condition=?",
@@ -166,8 +165,8 @@ def ingest(db, source: dict, items: list[dict], observed: str) -> dict:
                 continue
             if group is None:
                 db.execute(
-                    "INSERT INTO monitoring_groups VALUES(?,?,?,?,?,'firing',?,?,'[]',NULL)",
-                    (key, source["monitor_id"], source["alert_format"], fact["target"], kind, stamp, stamp),
+                    "INSERT INTO monitoring_groups VALUES(?,?,?,?,'document','firing',?,?,'[]',NULL)",
+                    (key, source["monitor_id"], source["alert_format"], fact["target"], stamp, stamp),
                 )
                 group_count += 1
             db.execute("UPDATE monitoring_groups SET highwater=? WHERE group_key=?", (stamp, key))
@@ -180,18 +179,3 @@ def ingest(db, source: dict, items: list[dict], observed: str) -> dict:
             report["published"] += int(_promote(db, group, source, cutoff, observed))
     return report
 
-
-def status(db, observed: str) -> dict:
-    cutoff = after(-WINDOW_SECONDS, format_utc(parse_utc(observed)))
-    row = db.execute("""SELECT COUNT(*) AS groups,
-        COALESCE(SUM(story_id IS NULL),0) AS held,
-        COALESCE(SUM(story_id IS NOT NULL),0) AS published,
-        COALESCE(SUM(kind='monitor'),0) AS monitor_failures,
-        COALESCE(SUM(kind='service'),0) AS service_observations
-        FROM monitoring_groups WHERE highwater>=?""", (cutoff,)).fetchone()
-    result = dict(row)
-    # Only the window counts; expired rows wait for the next ingest to delete them.
-    result["observations"] = db.execute(
-        "SELECT COUNT(*) FROM monitoring_observations WHERE stamp>=?", (cutoff,)).fetchone()[0]
-    result["at_capacity"] = result["groups"] >= MAX_GROUPS or result["observations"] >= MAX_OBSERVATIONS
-    return result

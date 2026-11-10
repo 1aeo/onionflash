@@ -162,23 +162,19 @@ table line. Ambiguous recent rows are skipped with a source warning. See
 
 ### Automated monitoring alerts
 
-Consensus-health and anti-censorship alerts use deterministic parsers selected
-by `alert_format`, with a configured `monitor_id` shared by any mirrors of the
-same monitor. They bypass the LLM. Unknown formats and undated messages cannot
+Consensus-health notifications use a deterministic parser selected by
+`alert_format = "consensus"`, with a configured `monitor_id` shared by any
+mirrors of the same monitor. They bypass the LLM, and undated messages cannot
 become news stories.
 
-The private SQLite incident records group repeated notifications. Eligible
-directory-document warnings about a known directory authority need two reports
-at least one hour apart within a two-day window before publication as
-**observed anomalies**. Ordinary repeats do not create stories, change RSS GUIDs
-or advance publication dates; a warning after two quiet days starts a new episode.
-Missing alerts never establish recovery.
-
-Probe outages, unreachable services and censorship-monitor failures are held
-privately. The current alert feed does not provide independent healthy-vantage
-or control-test evidence, so repeated failures cannot establish country-wide
-blocking or an attack. `onionflash status --config config.toml` includes grouped
-monitoring status. See [monitoring behavior and limits](docs/MONITORING.md).
+Only directory-document warnings about a known directory authority are kept.
+They need two reports at least one hour apart within a two-day window before
+publication as **observed anomalies**. Ordinary repeats do not create stories,
+change RSS GUIDs or advance publication dates; a warning after two quiet days
+starts a new episode. Missing alerts never establish recovery. Monitor-side
+failures and routine service checks cannot establish an outage or attack, so they
+are not kept; each run's result counts them as unsupported. See
+[monitoring behavior and limits](docs/MONITORING.md).
 
 ## Commands
 

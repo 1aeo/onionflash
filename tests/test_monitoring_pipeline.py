@@ -51,3 +51,23 @@ def test_unsafe_monitoring_configuration_is_rejected(tmp_path, monkeypatch, befo
     path.write_text(text.replace(before, after))
     with pytest.raises(ValueError):
         load_config(path)
+
+
+def test_a_retired_censorship_source_still_loads_disabled(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("ONIONFLASH_LLM_BASE_URL", "https://model.example/v1")
+    text = (Path(__file__).parents[1] / "config.example.toml").read_text()
+    path = tmp_path / "config.toml"
+    path.write_text(text + '''
+[[sources]]
+id = "anti-censorship-alerts"
+url = "https://lists.example.org/anti-censorship-alerts/feed/"
+kind = "feed"
+authority = "telemetry"
+product = "network"
+alert_format = "censorship"
+monitor_id = "tor-anti-censorship-prometheus"
+''')
+    with caplog.at_level("WARNING"):
+        sources = {s["id"]: s for s in load_config(path)["sources"]}
+    assert sources["anti-censorship-alerts"]["enabled"] is False
+    assert "anti-censorship alerts are no longer collected" in caplog.text

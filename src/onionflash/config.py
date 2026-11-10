@@ -342,7 +342,12 @@ def load_config(path: str | Path) -> dict:
         source.setdefault("interval_seconds", 300)
         source.setdefault("alert_format", "")
         source.setdefault("monitor_id", source["id"])
-        if not isinstance(source["alert_format"], str) or source["alert_format"] not in {"", "consensus", "censorship"}:
+        if source["alert_format"] == "censorship":
+            # Retired: those alerts could never publish. An old file still loads.
+            logging.getLogger(__name__).warning(
+                "Ignoring source %s: anti-censorship alerts are no longer collected; it can be deleted", source["id"])
+            source["enabled"] = False
+        elif not isinstance(source["alert_format"], str) or source["alert_format"] not in {"", "consensus"}:
             raise ValueError("Unsupported alert format")
         if not isinstance(source["monitor_id"], str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", source["monitor_id"]):
             raise ValueError("Invalid monitor identity")

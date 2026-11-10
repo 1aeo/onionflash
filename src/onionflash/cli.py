@@ -253,7 +253,6 @@ def run(config: dict, store: Store) -> dict:
     report["pending_analysis"] = store.pending_count()
     report["rejected_analysis"] = store.rejected_count()
     report["final_review"] = review_status(store)
-    report["monitoring"] = store.monitoring_status(now_iso())
     report.update(build(config, store))
     return report
 
@@ -305,7 +304,6 @@ def main(argv: list[str] | None = None) -> int:
                     # Recorded by the last successful build; None until one has run.
                     "published_stories": None if store.get_meta("published_stories") is None
                     else int(store.get_meta("published_stories")),
-                    "monitoring": store.monitoring_status(now_iso()),
                     "comments": {"enabled": config["comments"]["enabled"], **comments_status(store)},
                     "final_review": review_status(store),
                     "sources": store.health(

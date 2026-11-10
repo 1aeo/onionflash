@@ -273,7 +273,7 @@ def test_model_or_raw_story_cannot_forge_editorial_notice(seeded):
 
 def test_reconstructed_monitor_group_reuses_locked_story(seeded, monkeypatch):
     cfg, store, ignored_story_id = seeded
-    monkeypatch.setattr(monitoring, "parse_alerts", lambda item, name: ([{"kind": "document", "target": "bastet", "condition": "authority-missing"}], 0))
+    monkeypatch.setattr(monitoring, "parse_alerts", lambda item, name: ([{"target": "bastet", "condition": "authority-missing"}], 0))
     source = {"id": "health", "monitor_id": "test", "alert_format": "consensus", "name": "Consensus health"}
     notices = [{"published_at": after(offset, EDIT), "url": f"https://example.org/health/{offset}", "title": "Warning"} for offset in (-7200, -3600)]
     store.ingest_alerts(source, notices, EDIT)

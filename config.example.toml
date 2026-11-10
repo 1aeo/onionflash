@@ -254,14 +254,3 @@ product = "network"
 alert_format = "consensus"
 # Mirrors of this monitor must use the same identity.
 monitor_id = "tor-doctor"
-
-[[sources]]
-id = "anti-censorship-alerts"
-name = "Tor Project Anti-Censorship Monitoring Alerts Mailing List"
-website_url = "https://lists.torproject.org/mailman3/hyperkitty/list/anti-censorship-alerts@lists.torproject.org/"
-url = "https://lists.torproject.org/mailman3/hyperkitty/list/anti-censorship-alerts@lists.torproject.org/feed/"
-kind = "feed"
-authority = "telemetry"
-product = "network"
-alert_format = "censorship"
-monitor_id = "tor-anti-censorship-prometheus"
