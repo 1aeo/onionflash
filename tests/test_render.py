@@ -173,6 +173,18 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn("top-secret", text)
         self.assertNotIn("192.168.50.10", text)
 
+    def test_health_links_escape_labels_and_reject_unsafe_destinations(self):
+        name = '<img src=x onerror="alert(1)">'
+        health = [{"name": name, "website_url": "https://example.org/list/?a=1&b=2"}]
+        page = (self.render(health=health) / "index.html").read_text()
+        self.assertIn('href="https://example.org/list/?a=1&amp;b=2">&lt;img', page)
+        self.assertNotIn('<img src=x', page)
+        for i, url in enumerate(["javascript:alert(1)", "https://user:secret@example.org/", "http://127.0.0.1/"]):
+            with self.subTest(url=url):
+                page = (self.render(health=[{"name": "Source", "website_url": url}], name=f"health-{i}") / "index.html").read_text()
+                self.assertIn('<span>Source</span>', page)
+                self.assertNotIn(url, page)
+
     def test_existing_output_or_symlink_is_rejected(self):
         output = self.render()
         with self.assertRaises(ValueError):

@@ -259,6 +259,7 @@ def load_config(path: str | Path) -> dict:
             "name",
             "kind",
             "url",
+            "website_url",
             "fallback_urls",
             "product",
             "authority",
@@ -305,6 +306,7 @@ def load_config(path: str | Path) -> dict:
         ):
             raise ValueError("At most five fallback URLs per source")
         source["url"] = canonical_url(source["url"])
+        source["website_url"] = canonical_url(source.get("website_url", source["url"]))
         source["fallback_urls"] = [canonical_url(u) for u in source["fallback_urls"]]
         for key, global_key in [
             ("max_pages", "max_pages"),

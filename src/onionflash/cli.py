@@ -82,6 +82,7 @@ def build(config: dict, store: Store, *, force: bool = False) -> bool:
         {
             "id": s["id"],
             "name": s["name"],
+            "website_url": s["website_url"],
             "stale": s["stale"],
             "error": bool(s["error"]),
         }

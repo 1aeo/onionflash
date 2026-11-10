@@ -690,6 +690,22 @@ def test_existing_unowned_output_is_never_deleted(tmp_path):
     assert (out / "keep.txt").read_text() == "mine"
 
 
+def test_source_website_change_rebuilds_without_resetting_collection(tmp_path):
+    cfg = config(tmp_path)
+    source = cfg["sources"][0]
+    with Store(tmp_path / "state.db") as store:
+        store.source(source)
+        store.source_success(source, {"url": source["url"]}, DATE)
+        state = store.source(source)
+        assert build(cfg, store)
+        assert f'href="{source["url"]}"' in (tmp_path / "public/index.html").read_text()
+        source["website_url"] = "https://example.org/mailing-list/"
+        assert build(cfg, store)
+        assert f'href="{source["website_url"]}"' in (tmp_path / "public/index.html").read_text()
+        assert store.source(source) == state
+        assert not build(cfg, store)
+
+
 def test_concurrent_run_lock_is_nonblocking(tmp_path):
     with run_lock(str(tmp_path / "db")) as first:
         with run_lock(str(tmp_path / "db")) as second:

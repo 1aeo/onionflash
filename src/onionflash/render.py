@@ -193,7 +193,9 @@ def _health_details(health: list[dict]) -> str:
                 last = "Last collection time unavailable"
         degraded = bool(item.get("stale") or item.get("error"))
         label = "Delayed" if degraded else ("Collected" if item.get("last_success") else "Pending")
-        rows.append(f'<li><div><span>{_escape(name)}</span><span class="health-state{ " delayed" if degraded else ""}">{label}</span></div><small>{last}</small></li>')
+        url = _safe_url(item.get("website_url"))
+        source = f'<a href="{_escape(url)}">{_escape(name)}</a>' if url else f'<span>{_escape(name)}</span>'
+        rows.append(f'<li><div>{source}<span class="health-state{ " delayed" if degraded else ""}">{label}</span></div><small>{last}</small></li>')
     if not rows:
         return ""
     return '<details class="source-health"><summary>Source availability</summary><p>Collection status, not the status of the Tor network.</p><ul>' + "".join(rows) + "</ul></details>"

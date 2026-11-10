@@ -73,7 +73,7 @@ The API key is read only from the variable named by `llm.api_key_env`.
 | `collection` | Lookback, overlap, page/item limits, content limit, staleness, circuit backoff, total/source run budgets, reserved analysis time |
 | `http` | Connect/read/total deadlines, attempts, exponential backoff base/cap/jitter, bounded `Retry-After`, redirect/byte/rate limits, user agent |
 | `llm` | Base URL and fallback URLs, model, key environment variable, private-network allowlist, deadlines, output/input limits, items per run, failed-item retry backoff |
-| `sources` | Stream ID, name, kind, URL, fallback URLs, product, authority, optional interval/page/item overrides |
+| `sources` | Stream ID, display name, public website URL, kind, collection URL, fallback URLs, product, authority, optional interval/page/item overrides |
 
 Public sources must use HTTPS. Private inference endpoints require explicit
 `llm.allowed_networks` CIDRs and `llm.allow_http = true` when using HTTP. Prefer
@@ -88,6 +88,7 @@ To replace or add a source, edit its entry:
 [[sources]]
 id = "my-release-feed"
 name = "My release announcements"
+website_url = "https://example.org/releases/"
 kind = "feed"                     # feed, tag, gitlab_issue, gitlab_mr
 url = "https://example.org/feed.xml"
 fallback_urls = ["https://mirror.example.org/feed.xml"]
@@ -97,6 +98,10 @@ interval_seconds = 300
 max_pages = 5
 max_items = 250
 ```
+
+`name` is the descriptive label in Source availability. Optional `website_url`
+links that label to a public page readers can browse, such as a mailing-list
+archive or GitLab issue list; `url` remains the feed or API collection endpoint.
 
 Fallback URLs must represent the **same logical stream**. A changed primary URL
 resets that source's fetch cursor and conditional cache. Disabling a source stops
