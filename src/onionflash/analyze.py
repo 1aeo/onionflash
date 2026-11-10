@@ -195,7 +195,8 @@ def validate_analysis(result: dict, item: dict, *, editorial: bool = True) -> di
             valid = isinstance(value, str) and (
                 value in allowed if allowed is not None else (
                     len(value) <= rule["maxLength"]
-                    and not any(ord(c) < 32 and c not in "\n\t" for c in value)
+                    # Publishing drops these noncharacters; a field of them would render empty.
+                    and not any((ord(c) < 32 and c not in "\n\t") or c in "\ufffe\uffff" for c in value)
                 )
             )
             if not valid:

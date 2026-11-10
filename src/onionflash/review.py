@@ -112,9 +112,7 @@ or hold. Never propose a repair, request another rewrite, or rely on an earlier 
 
 
 class ReviewError(AnalysisError):
-    def __init__(self, message: str):
-        # Protocol failures are not semantic verdicts: keep the candidate queued.
-        super().__init__(message, retryable=True)
+    """An unusable review reply counts against the item, like an invalid draft."""
 
 
 def _settings(config: dict) -> dict:
@@ -247,12 +245,12 @@ def _validate(result: dict, candidate: dict, refs: set[str], *, verification: bo
             raise ReviewError("Review approval requires all criteria to pass without edits")
     elif not failed:
         raise ReviewError("Review refusal requires an explicit failed criterion")
-    if verdict == "revise":
+    if verdict == "revise" and repair is not None:
+        # The gate applies a repair only when it will verify it; an unusable one holds.
         if (not isinstance(repair, dict) or set(repair) - set(EDITABLE)
                 or (wire and set(repair) != set(EDITABLE))):
             raise ReviewError("Review repair fields do not match schema")
         repair = {key: value for key, value in repair.items() if value is not None}
-        apply_repair(candidate, repair)
     elif repair is not None:
         raise ReviewError("Only a revise verdict can propose repair")
     return {**result, "repair": repair}
@@ -284,11 +282,6 @@ class Reviewer(CompletionClient):
                 check["properties"]["source_refs"]["items"]["enum"] = sorted(refs)
         # Each call starts with only the rubric and this exact candidate/packet.
         # A prior model response, critique or approval is never part of its history.
-        try:
-            result = self.complete(VERIFY_PROMPT if verification else SYSTEM_PROMPT,
-                                   {"candidate": candidate_public, "packet": packet}, schema, "onionflash_review")
-        except AnalysisError as exc:
-            if exc.retryable:
-                raise
-            raise ReviewError(str(exc)) from exc
+        result = self.complete(VERIFY_PROMPT if verification else SYSTEM_PROMPT,
+                               {"candidate": candidate_public, "packet": packet}, schema, "onionflash_review")
         return _validate(result, candidate_public, refs, verification=verification, wire=True)

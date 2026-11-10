@@ -250,8 +250,10 @@ operational advice and technical details separately. All seven must pass.
 
 A proposed repair receives a fresh verification request before publication. There
 is at most one repair, so a normal successful path uses two model calls and a
-repaired path uses three. Timeouts or malformed verdicts retain completed stages
-and back off; a semantic hold enters the rejected queue. The context sentence
+repaired path uses three. Timeouts retain completed stages and back off.
+Malformed verdicts also retain them but count toward the item's three failed
+attempts; a semantic hold, including an unusable repair, enters the rejected
+queue at once. The context sentence
 (`why_it_matters`) may be empty when the sources do not support it. See
 [final review, configuration and evaluation](docs/FINAL_REVIEW.md).
 

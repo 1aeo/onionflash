@@ -158,9 +158,11 @@ def _check_deadline(deadline):
 def process_item(config, store, row, writer, reviewer, observed=None, *, deadline=None, allow_network=True):
     """Resume writer → exact-candidate review → optional verification → CAS commit.
 
-    Protocol/transport errors leave the current stage durable and raise a
-    retryable AnalysisError for the existing queue's backoff. Semantic rejection
-    marks the item rejected immediately; it never starts an endless rewrite loop.
+    Transport errors leave the current stage durable and raise a retryable
+    AnalysisError for the existing queue's backoff. An unusable reply keeps the
+    stage too, but its AnalysisError counts toward the item's three failures.
+    Semantic rejection, including an unusable repair, marks the item rejected
+    immediately; it never starts an endless rewrite loop.
     """
     from . import review
     from .store import ReviewRequired, StaleCandidate
@@ -259,12 +261,8 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, deadlin
                 return {**report, "status": "deferred"}
             _check_deadline(deadline)
             report["review_calls"] += 1
-            try:
-                verdict = reviewer.review(candidate, prepared["packet"], verification=verification)
-                verdict = review.validate_review(verdict, candidate, prepared["packet"], verification=verification)
-            except (AnalysisError, ValueError, TypeError, KeyError) as exc:
-                # Do not copy arbitrary provider exception text into queue logs.
-                raise AnalysisError("Final review request or response unavailable", retryable=True) from exc
+            verdict = reviewer.review(candidate, prepared["packet"], verification=verification)
+            verdict = review.validate_review(verdict, candidate, prepared["packet"], verification=verification)
             record["reviews"].append({"stage": "verification" if verification else "review",
                                       "candidate_hash": digest(candidate), "source_hash": prepared["source_hash"],
                                       "policy_hash": policy, "result": verdict})
@@ -284,8 +282,10 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, deadlin
                 return {**report, "status": "held" if held else "stale"}
             try:
                 candidate = review.apply_repair(candidate, verdict["repair"])
-            except (AnalysisError, ValueError, TypeError, KeyError) as exc:
-                raise AnalysisError("Final review repair is invalid", retryable=True) from exc
+            except review.ReviewError:
+                held = _hold(store, row, prepared, draft, writer_key, policy, record, observed, prepared_at,
+                             "review proposed an unusable repair")
+                return {**report, "status": "held" if held else "stale"}
             stage = "verify"
             record["candidate"] = candidate
             _save(store, row["id"], writer_key, policy, stage, draft, prepared, record, observed, prepared_at=prepared_at)

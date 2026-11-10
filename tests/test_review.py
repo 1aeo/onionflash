@@ -193,10 +193,11 @@ def test_duplicate_verdict_and_truncated_review_are_never_approved(monkeypatch):
     checker = reviewer(monkeypatch, Response(200, json.dumps(raw).encode(), {}, "https://llm.example/v1"))
     with pytest.raises(AnalysisError, match="invalid JSON") as caught:
         checker.review(candidate(), packet())
-    assert caught.value.retryable
+    assert not caught.value.retryable  # a strike against the item, as for the writer
     checker = reviewer(monkeypatch, completion(verdict(), finish_reason="length"))
-    with pytest.raises(AnalysisError, match="truncated"):
+    with pytest.raises(AnalysisError, match="truncated") as caught:
         checker.review(candidate(), packet())
+    assert not caught.value.retryable
 
 
 def test_review_reuses_endpoint_fallback_and_effective_timeout_policy(monkeypatch):
