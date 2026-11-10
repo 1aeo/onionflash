@@ -17,6 +17,9 @@ from .util import (
 )
 
 
+MAX_FEED_ELEMENTS = 50000
+
+
 class CollectionError(Exception):
     def __init__(
         self,
@@ -110,11 +113,20 @@ def _feed(
     def reject_declaration(*args):
         raise CollectionError("Feed contains disallowed XML declarations")
 
-    # Without a DTD there are no entities to expand; the response size limit bounds
-    # everything else feedparser does with the document.
+    # Without a DTD there are no entities to expand. The element cap bounds the
+    # objects feedparser builds: bytes alone do not, as tiny elements are cheap to send.
     parser.StartDoctypeDeclHandler = reject_declaration
     parser.EntityDeclHandler = reject_declaration
     parser.ExternalEntityRefHandler = reject_declaration
+    elements = 0
+
+    def count_element(name, attributes):
+        nonlocal elements
+        elements += 1
+        if elements > MAX_FEED_ELEMENTS:
+            raise CollectionError("Feed has too many XML elements")
+
+    parser.StartElementHandler = count_element
     try:
         parser.Parse(response.body, True)
     except expat.ExpatError as exc:

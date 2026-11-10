@@ -347,6 +347,14 @@ def test_utf16_entity_declarations_are_rejected_before_feedparser():
         )
 
 
+def test_a_feed_with_too_many_elements_is_rejected_before_feedparser(monkeypatch):
+    from onionflash import collect
+    monkeypatch.setattr(collect, "MAX_FEED_ELEMENTS", 10)
+    xml = ("<rss><channel>" + "<item/>" * 20 + "</channel></rss>").encode()
+    with pytest.raises(CollectionError, match="too many XML elements"):
+        collect_source(FakeClient([response(xml)]), source(), {}, DEFAULTS["collection"], DATE)
+
+
 def test_gitlab_pagination_keeps_partial_items_without_advancing_watermark():
     records = [
         {
