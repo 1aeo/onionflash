@@ -193,10 +193,10 @@ def _qualified(sentence: str, match: re.Match) -> bool:
 def _kept_claim(claims: list, earlier: list[dict], result: dict) -> str | None:
     """A flagged statement may be reworded, hedged or denied, but not left as written.
 
-    It counts as kept, matched as whole words, when it sits in a sentence copied
-    from an earlier version, or in a sentence that adds no negation or uncertainty
-    ("According to the report, <claim>" still asserts it). Short statements count
-    only when an earlier rewrite had removed them and they came back.
+    Matched as whole words, it counts as kept in a sentence copied unchanged from
+    an earlier version, or in a sentence that adds no negation or uncertainty to it
+    ("According to the report, <claim>" still asserts it). The second check skips
+    short statements unless an earlier rewrite had removed them and they came back.
     """
     before = set().union(*map(_sentences, earlier))
     latest = _plain(" ".join(str(earlier[-1][key]) for key in TEXT_FIELDS))
@@ -207,8 +207,8 @@ def _kept_claim(claims: list, earlier: list[dict], result: dict) -> str | None:
         pattern = re.compile(r"(?<!\w)" + re.escape(text) + r"(?!\w)")
         checked = len(text) >= 8 or not pattern.search(latest)
         for sentence in _sentences(result):
-            for match in pattern.finditer(sentence) if checked else ():
-                if (len(text) >= 8 and sentence in before) or not _qualified(sentence, match):
+            for match in pattern.finditer(sentence):
+                if sentence in before or (checked and not _qualified(sentence, match)):
                     return claim
     return None
 

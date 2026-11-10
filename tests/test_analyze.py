@@ -152,7 +152,13 @@ def test_a_qualifier_must_belong_to_the_claims_own_clause():
     assert _kept_claim([claim], [draft], elsewhere) == claim
     after = {**draft, "summary": "The report says operators must update their configurations to exclude "
                                   "the node is unconfirmed."}
-    assert _kept_claim([claim], [draft], after) is None
+    assert _kept_claim([claim.rstrip(".")], [draft], after) is None
+
+
+def test_a_short_flagged_statement_left_unchanged_is_kept():
+    from onionflash.analyze import _kept_claim
+    draft = {"title": "t", "summary": "The patch is merged. Safe.", "why_it_matters": "w"}
+    assert _kept_claim(["Safe."], [draft], {**draft, "title": "New title"}) == "Safe."
 
 
 def test_malformed_unsupported_entries_are_a_schema_error(monkeypatch):
