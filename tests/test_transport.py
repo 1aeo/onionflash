@@ -154,7 +154,7 @@ class TransportTests(unittest.TestCase):
         handler = Mock(return_value=httpx.Response(304, headers={"content-encoding": "gzip"}, stream=httpx.ByteStream(b"")))
         client, _ = self.client(handler)
         with client:
-            response = client.request("GET", "https://example.org", conditional={"If-None-Match": '"etag"'})
+            response = client.request("GET", "https://example.org", headers={"If-None-Match": '"etag"'})
         self.assertEqual(response.status, 304)
         self.assertEqual(response.body, b"")
         self.assertEqual(handler.call_args.args[0].headers['if-none-match'], '"etag"')
