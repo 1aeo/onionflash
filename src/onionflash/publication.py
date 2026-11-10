@@ -158,24 +158,32 @@ class Artifacts:
     def __init__(self, db, output: Path, observed: str):
         self.db, self.output, self.observed = db, output, observed
         self.changed = 0
+        # Temporaries stay beside, never inside, the public tree, so a killed
+        # build leaves nothing for the publisher to ship or reject.
+        self.staging = output.parent / ("." + output.name + ".onionflash-staging")
+        if self.staging.is_symlink():
+            raise ValueError("Unsafe public staging directory")
+        self.staging.mkdir(mode=0o700, exist_ok=True)
+        for stale in self.staging.iterdir():
+            stale.unlink()
 
     @contextmanager
     def stream(self, relative: str, content_type: str):
         target = _target(self.output, relative)
-        descriptor, temporary_name = tempfile.mkstemp(prefix=".onionflash-", dir=target.parent)
+        descriptor, temporary_name = tempfile.mkstemp(dir=self.staging)
         temporary = Path(temporary_name)
         try:
             with os.fdopen(descriptor, "wb") as stream:
                 sink = _Sink(stream)
                 yield sink
-                stream.flush()
-                os.fsync(stream.fileno())
-            value, size = sink.checksum.hexdigest(), sink.size
-            old = self.db.execute("SELECT sha256,size,content_type FROM public_artifacts WHERE path=?", (relative,)).fetchone()
-            changed = old is None or tuple(old) != (value, size, content_type)
-            if changed or not target.is_file() or _file_hash(target) != value:
-                os.chmod(temporary, 0o644)
-                os.replace(temporary, target)
+                value, size = sink.checksum.hexdigest(), sink.size
+                old = self.db.execute("SELECT sha256,size,content_type FROM public_artifacts WHERE path=?", (relative,)).fetchone()
+                changed = old is None or tuple(old) != (value, size, content_type)
+                if changed or not target.is_file() or _file_hash(target) != value:
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    os.chmod(temporary, 0o644)
+                    os.replace(temporary, target)
             if changed:
                 self.db.execute("""INSERT INTO public_artifacts(path,sha256,size,content_type,updated_at)
                     VALUES(?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET
@@ -323,8 +331,6 @@ def _feeds(artifacts: Artifacts, db, site: dict, base: str, limit: int) -> None:
 def _remove_owned_file(artifacts: Artifacts, row, target: Path) -> None:
     if target.is_symlink() or (target.exists() and not target.is_file()):
         raise ValueError("Retired public artifact must be a regular file")
-    if target.exists() and _file_hash(target) != row["sha256"]:
-        raise ValueError("Retired public artifact changed outside the builder")
     target.unlink(missing_ok=True)
     artifacts.db.execute("DELETE FROM public_artifacts WHERE path=?", (row["path"],))
     artifacts.changed += 1
@@ -335,6 +341,8 @@ def _retire_script(artifacts: Artifacts) -> None:
     target = artifacts.output / "app.js"
     row = artifacts.db.execute("SELECT path,sha256 FROM public_artifacts WHERE path='app.js'").fetchone()
     if row is not None:
+        if target.is_file() and not target.is_symlink() and _file_hash(target) != row["sha256"]:
+            raise ValueError("Retired public artifact changed outside the builder")
         _remove_owned_file(artifacts, row, target)
     elif target.exists() or target.is_symlink():
         raise ValueError("Refusing to remove an untracked legacy app.js")
@@ -374,10 +382,12 @@ def _migration_ready(artifacts: Artifacts, identity: str, pending: int) -> bool:
 def _remove_obsolete_pages(artifacts: Artifacts, pages: int, topic: str | None = None) -> None:
     # Pagination is a view, not a story permalink. Its old pages can disappear
     # when the configured page size grows; article artifacts are never removed.
+    # A failed build may have rewritten a page after its last committed hash,
+    # so an obsolete page is removed whatever it contains.
     prefix = "page/" if topic is None else f"topics/{topic}/page/"
     cursor = ""
     while True:
-        rows = artifacts.db.execute("SELECT path,sha256 FROM public_artifacts WHERE path LIKE ? AND path>? ORDER BY path LIMIT 100", (prefix + "%", cursor)).fetchall()
+        rows = artifacts.db.execute("SELECT path FROM public_artifacts WHERE path LIKE ? AND path>? ORDER BY path LIMIT 100", (prefix + "%", cursor)).fetchall()
         if not rows:
             return
         cursor = rows[-1]["path"]
