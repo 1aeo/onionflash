@@ -17,7 +17,6 @@ protocol changes. The additional configured streams are:
 | [Tor Metrics Timeline repository](https://gitlab.torproject.org/tpo/network-health/metrics/timeline) | `tor-metrics-news`, enabled | Curated event rows from the maintained README; validated repository snapshots replace the stale Atom feed. |
 | [Tor Project Development Mailing List](https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/) | `tor-dev`, enabled | Proposal and protocol-change discussions; the normal importance and evidence checks filter routine messages. |
 | [Consensus-health monitoring](https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/) | `consensus-health-alerts`, enabled | Deterministic grouping; persistent directory-document warnings may publish as attributed observations. |
-| [Anti-censorship monitoring alerts](https://lists.torproject.org/mailman3/hyperkitty/list/anti-censorship-alerts@lists.torproject.org/) | `anti-censorship-alerts`, enabled for private grouping | Monitor outages and single-system service failures remain held; they do not establish network attacks or country-wide blocking. |
 
 Browser release announcements were already present in Tor Blog and tor-announce.
 The Browser issue stream is deliberately filtered; it does not replace those
@@ -152,9 +151,9 @@ publication are documented in the deployment repository.
 
 1. **Broader discussion coverage.** Merge-request discussions and older comments
    beyond the bounded newest-note window remain outside the anonymous issue adapter.
-2. **Independent monitoring corroboration.** Grouping is implemented; promoting
-   censorship/probe failures requires additional evidence of functioning
-   independent monitoring locations or controls. The current feed lacks it.
+2. **Independent monitoring corroboration.** Anti-censorship probe alerts are
+   not collected: publishing them would need evidence from functioning independent
+   monitoring locations or controls, which the current feed lacks.
 3. **Long-term measurement.** Dedicated per-revision timing records would support
    latency reporting. Keep source timestamps distinct from observation and
    publication time. Accuracy and preserved articles take priority over latency analytics.

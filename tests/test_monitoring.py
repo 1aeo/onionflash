@@ -28,8 +28,8 @@ def parsed_facts(monkeypatch):
     monkeypatch.setattr(monitoring, "parse_alerts", lambda item, name: (item.get("facts", []), item.get("unsupported", 0)))
 
 
-def fact(target="bastet", condition="authority-missing", kind="document"):
-    return {"target": target, "condition": condition, "kind": kind}
+def fact(target="bastet", condition="authority-missing"):
+    return {"target": target, "condition": condition}
 
 
 def item(hour=0, *, facts=None, url=None, **extra):
@@ -45,6 +45,12 @@ def stories(db):
     return [json.loads(row[0]) for row in db.execute("SELECT payload FROM stories ORDER BY published_at,id")]
 
 
+def counts(db):
+    groups, held = db.execute("SELECT COUNT(*), COALESCE(SUM(story_id IS NULL),0) FROM monitoring_groups").fetchone()
+    return {"groups": groups, "held": held, "published": groups - held,
+            "observations": db.execute("SELECT COUNT(*) FROM monitoring_observations").fetchone()[0]}
+
+
 def test_replay_and_mirrors_do_not_establish_persistence(db):
     first = item(-2)
     assert ingest(db, [first])["observations"] == 1
@@ -52,7 +58,15 @@ def test_replay_and_mirrors_do_not_establish_persistence(db):
     mirror = {**SOURCE, "id": "mirror", "name": "Mirror"}
     assert ingest(db, [item(-2, url="https://mirror.example/messages/a/")], source=mirror)["duplicates"] == 1
     assert stories(db) == []
-    assert monitoring.status(db, NOW)["observations"] == 1
+    assert counts(db)["observations"] == 1
+
+
+def test_document_group_keys_stay_stable_so_existing_episodes_continue(db):
+    # Stored groups and their published stories are keyed by this value; a new
+    # formula would orphan them and publish duplicates for ongoing episodes.
+    ingest(db, [item(0)])
+    assert db.execute("SELECT group_key FROM monitoring_groups").fetchone()[0] == (
+        "6290a2a4af2727d189f59cd40a6fbba7f24b3ec871213c806d48db7affd85f3a")
 
 
 def test_notifications_must_have_both_count_and_span(db):
@@ -80,16 +94,13 @@ def test_repeat_counts_new_conditions_and_source_links_do_not_churn_story(db):
     before = tuple(db.execute("SELECT * FROM stories").fetchone())
     ingest(db, [item(0, facts=[fact(), fact(condition="descriptor-missing")])])
     assert tuple(db.execute("SELECT * FROM stories").fetchone()) == before
-    status = monitoring.status(db, NOW)
-    assert status["observations"] == 4
-    assert status["groups"] == 1
-    assert status["published"] == 1
+    assert counts(db) == {"groups": 1, "held": 0, "published": 1, "observations": 4}
 
 
 def test_one_bundle_is_one_notification_not_multiple_independent_reports(db):
     ingest(db, [item(0, facts=[fact(), fact(condition="descriptor-missing"), fact(condition="signature-missing")])])
     assert stories(db) == []
-    assert monitoring.status(db, NOW)["held"] == 1
+    assert counts(db)["held"] == 1
 
 
 def test_different_transient_conditions_cannot_establish_persistence(db):
@@ -112,40 +123,13 @@ def test_public_scope_needs_boundary_citations_within_link_budget(db, monkeypatc
     assert {link["url"] for link in story["sources"]} == {item(-4)["url"], item(-1)["url"]}
 
 
-def test_censorship_services_and_monitor_failures_always_stay_private(db):
-    source = {**SOURCE, "alert_format": "censorship", "monitor_id": "alertmanager"}
-    observations = [fact("china / monitor.example:443", "monitor-offline", "monitor"),
-                    fact("https://target.example/", "http-unreachable", "service")]
-    ingest(db, [item(-2, facts=observations), item(-1, facts=observations)], source=source)
-    status = monitoring.status(db, NOW)
-    assert status["monitor_failures"] == status["service_observations"] == 1
-    assert status["held"] == 2
-    assert stories(db) == []
-    # Even parser output cannot make a censorship feed eligible as consensus evidence.
-    assert ingest(db, [item(0)], source=source)["unsupported"] == 1
-
-
-def test_case_sensitive_http_targets_are_not_merged(db):
-    source = {**SOURCE, "alert_format": "censorship"}
-    ingest(db, [item(0, facts=[fact("https://target.example/A", "http-unreachable", "service"),
-                              fact("https://target.example/a", "http-unreachable", "service")])], source=source)
-    assert monitoring.status(db, NOW)["groups"] == 2
-
-
 def test_silence_never_resolves_and_old_notifications_cannot_replay_after_expiry(db):
     ingest(db, [item(-2), item(-1)])
     before = tuple(db.execute("SELECT * FROM stories").fetchone())
     later = after(3 * 86400, NOW)
     assert ingest(db, [item(-2), item(-1)], observed=later)["rejected"] == 2
-    assert monitoring.status(db, later)["groups"] == 0
+    assert counts(db)["groups"] == 0
     assert tuple(db.execute("SELECT * FROM stories").fetchone()) == before
-
-
-def test_status_counts_only_the_window_even_before_expired_rows_are_deleted(db):
-    ingest(db, [item(-2), item(-1)])
-    later = after(3 * 86400, NOW)
-    status = monitoring.status(db, later)  # no ingest yet at `later`, so nothing was deleted
-    assert status["observations"] == status["groups"] == 0 and not status["at_capacity"]
 
 
 def test_recurrence_after_the_window_is_a_new_episode(db):
@@ -161,7 +145,7 @@ def test_timestamps_and_source_links_fail_closed(db):
     invalid = [item(-49), item(1), item(0, published_at="2026-11-10T12:00:00"),
                item(0, published_at="bad"), item(0, url="https://user:secret@example.org/")]
     assert ingest(db, invalid)["rejected"] == len(invalid)
-    assert monitoring.status(db, NOW)["observations"] == 0
+    assert counts(db)["observations"] == 0
 
 
 def test_capacity_fails_closed_without_evicting_active_groups(db, monkeypatch):
@@ -170,26 +154,26 @@ def test_capacity_fails_closed_without_evicting_active_groups(db, monkeypatch):
     ingest(db, [item(-2)])
     assert ingest(db, [item(-1)])["capacity"] == 1
     assert ingest(db, [item(-1, facts=[fact(target="moria1")])])["capacity"] == 1
-    status = monitoring.status(db, NOW)
-    assert status["groups"] == 1 and status["at_capacity"]
+    assert counts(db)["groups"] == 1
     assert stories(db) == []
 
 
-def test_unknown_and_unallowlisted_document_conditions_stay_private(db):
-    result = ingest(db, [item(-2, unsupported=1, facts=[]), item(-1, facts=[fact(condition="invented")])])
-    assert result["unsupported"] == 2
-    assert stories(db) == []
+def test_conditions_that_cannot_publish_are_not_kept(db):
+    # Monitor-side failures and unknown conditions are counted, never stored.
+    result = ingest(db, [item(-2, unsupported=1, facts=[]), item(-1, facts=[fact(condition="invented")]),
+                         item(0, facts=[fact(condition="vote-retrieval-failed")])])
+    assert result["unsupported"] == 3
+    assert stories(db) == [] and counts(db)["groups"] == 0
 
 
 def test_only_known_directory_authorities_can_be_named_publicly(db):
     unknown = [fact(target="not-an-authority")]
     assert ingest(db, [item(-2, facts=unknown), item(-1, facts=unknown)])["unsupported"] == 2
-    assert stories(db) == []
+    assert stories(db) == [] and counts(db)["groups"] == 0
 
 
 def test_failed_publication_rolls_back_observations_and_groups(db):
     db.execute("CREATE TRIGGER reject_story BEFORE INSERT ON stories BEGIN SELECT RAISE(ABORT, 'test failure'); END")
     with pytest.raises(sqlite3.IntegrityError):
         ingest(db, [item(-2), item(-1)])
-    status = monitoring.status(db, NOW)
-    assert status["groups"] == status["observations"] == 0
+    assert counts(db)["groups"] == counts(db)["observations"] == 0
