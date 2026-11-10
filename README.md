@@ -235,9 +235,9 @@ database lock while taking their upload snapshot.
 - GitLab scans read issues and merge requests in ascending `updated_at` order from
   one inclusive watermark. Each request starts a fresh query from the last row
   seen, so a record edited mid-scan cannot shift an offset and be skipped. The
-  exception is a full page whose rows all share one timestamp, which takes 50
-  records updated in the same millisecond, in practice a bulk update. GitLab
-  offers no finer cursor, so such a tie is stepped by page, and an edit that
+  exception is a full page whose rows all share one timestamp: 50 records updated
+  in the same millisecond, or a source's `max_items` if that is smaller. With the
+  default limits that means a bulk update. GitLab offers no finer cursor, so such a tie is stepped by page, and an edit that
   moves one of its rows during the scan can shift another past it. A scan that
   is capped, cut off by its deadline or interrupted by an error resumes from the
   last row on the next run. An interrupted tie restarts from its first page, and
