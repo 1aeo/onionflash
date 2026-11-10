@@ -146,6 +146,14 @@ def test_poll_only_metadata_does_not_invalidate_approval(tmp_path):
         assert store.commit_candidate(prepared, prepared["candidate"], "approved", LATER, **receipt)["status"] == "published"
 
 
+def test_new_story_is_dated_when_published_not_when_first_prepared(tmp_path):
+    # A retried review or an operator retry commits a candidate prepared earlier.
+    with Store(tmp_path / "db") as store:
+        prepared = store.prepare_candidate(pending(store), analysis(), DATE)
+        store.commit_candidate(prepared, prepared["candidate"], "retried", LATER, **approve(store, prepared))
+        assert store.stories()[0]["added_at"] == LATER
+
+
 def test_locked_story_skips_model_prose_but_records_analysis_and_grouping(tmp_path):
     with Store(tmp_path / "db") as store:
         old = publish(store)
