@@ -22,10 +22,12 @@ operations steps go to the operator, not into PR text.
 ## Settings
 
 A setting exists only for a real operator choice: the site's identity and paths,
-the sources, and the model endpoint, model and network allowlist
-(`OPERATOR_SETTINGS` in `src/onionflash/config.py`). Budgets, limits, timeouts,
-retries, batch and cache sizes are constants in the module that uses them. When a
-setting is removed, add its key to `RETIRED` so existing files keep loading.
+the sources, the model endpoint, model and network allowlist, and the two limits
+that depend on the operator's model, `llm.timeout_seconds` and
+`llm.max_items_per_run` (`OPERATOR_SETTINGS` in `src/onionflash/config.py`). Other
+budgets, limits, timeouts, retries, batch and cache sizes are constants in the
+module that uses them. When a setting is removed, add its key to `RETIRED` so
+existing files keep loading.
 
 ## Code
 
