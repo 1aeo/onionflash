@@ -631,7 +631,7 @@ def test_request_deadline_is_never_slept_past():
     from onionflash.transport import HttpClient
 
     calls, sleeps = [], []
-    settings = {**DEFAULTS["http"], "retry_attempts": 3, "backoff_base_seconds": 5, "requests_per_minute": 10000}
+    settings = {**DEFAULTS["http"], "retry_attempts": 3, "backoff_base_seconds": 5}
     resolver = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
     clock = [100.0]
     def busy(request):
@@ -655,7 +655,7 @@ def test_retry_after_past_the_deadline_is_not_replaced_by_a_shorter_backoff():
     from onionflash.transport import DeadlineReached, HttpClient
 
     calls, sleeps = [], []
-    settings = {**DEFAULTS["http"], "retry_attempts": 3, "backoff_base_seconds": 1, "requests_per_minute": 10000}
+    settings = {**DEFAULTS["http"], "retry_attempts": 3, "backoff_base_seconds": 1}
     resolver = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
     def limited(request):
         calls.append(request)
@@ -674,7 +674,7 @@ def test_the_deadline_flag_describes_only_the_latest_request():
     import httpx
     from onionflash.transport import DeadlineReached, HttpClient
 
-    settings = {**DEFAULTS["http"], "retry_attempts": 3, "backoff_base_seconds": 1, "requests_per_minute": 10000}
+    settings = {**DEFAULTS["http"], "retry_attempts": 3, "backoff_base_seconds": 1}
     resolver = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
     def respond(request):
         if request.url.path == "/primary":
@@ -689,23 +689,6 @@ def test_the_deadline_flag_describes_only_the_latest_request():
         with pytest.raises(FetchError, match="404"):
             client.request("GET", "https://example.org/fallback")
         assert not client.deadline_reached
-
-
-def test_rate_limit_wait_stops_at_the_deadline():
-    import socket
-    import httpx
-    from onionflash.transport import DeadlineReached, HttpClient
-
-    sleeps = []
-    settings = {**DEFAULTS["http"], "requests_per_minute": 1}
-    resolver = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
-    with HttpClient(settings, transport=httpx.MockTransport(lambda request: httpx.Response(200, content=b"ok")),
-                    resolver=resolver, sleep=sleeps.append, clock=lambda: 100.0) as client:
-        client.request("GET", "https://example.org/")
-        client.deadline = 105.0  # the next request slot is 60 s away
-        with pytest.raises(DeadlineReached):
-            client.request("GET", "https://example.org/")
-    assert sleeps == []
 
 
 @pytest.mark.parametrize("source_budget,shared", [(600, True), (5, False)])
@@ -933,10 +916,11 @@ def test_new_story_records_when_onion_flash_added_it(tmp_path):
 def test_retired_settings_are_accepted_and_ignored(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text(
-        '[storage]\nmax_stories = 1000\n'
+        '[storage]\nmax_stories = 1000\n[http]\nrequests_per_minute = 30\n'
         '[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n'
     )
-    assert "max_stories" not in load_config(path)["storage"]
+    loaded = load_config(path)
+    assert "max_stories" not in loaded["storage"] and "requests_per_minute" not in loaded["http"]
 
 
 def test_busy_lock_status_is_read_only_and_a_skipped_build_is_not_success(tmp_path, capsys):

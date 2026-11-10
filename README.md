@@ -70,7 +70,7 @@ The API key is read only from the variable named by `llm.api_key_env`.
 | `site` | Title, description, canonical URL, repository link, page/feed sizes |
 | `storage` | Private SQLite path, dedicated public output directory |
 | `collection` | Lookback, overlap, page/item limits, content limit, staleness, circuit backoff, total/source run budgets, reserved analysis time |
-| `http` | Connect/read/total deadlines, attempts, exponential backoff base/cap/jitter, bounded `Retry-After`, redirect/byte/rate limits, user agent |
+| `http` | Connect/read/total deadlines, attempts, exponential backoff base/cap/jitter, bounded `Retry-After`, redirect/byte limits, user agent |
 | `llm` | Base URL and fallback URLs, model, key environment variable, private-network allowlist, deadlines, output/input limits, items per run, failed-item retry backoff |
 | `sources` | Stream ID, display name, public website URL, kind, collection URL, fallback URLs, product, authority, optional interval/page/item overrides |
 

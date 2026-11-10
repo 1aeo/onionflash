@@ -46,7 +46,6 @@ backoff_jitter = 0.25
 max_retry_after_seconds = 60
 max_redirects = 4
 max_response_bytes = 2097152
-requests_per_minute = 30
 user_agent = "OnionFlash (+https://github.com/1aeo/onionflash)"
 
 [llm]

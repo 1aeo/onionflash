@@ -236,7 +236,6 @@ class HttpClient:
         self.policy = AddressPolicy(allowed_networks, resolver=resolver)
         self.sleep = sleep
         self.clock = clock
-        self._next_request = 0.0
         # Absolute time.monotonic() deadline set by the caller (None: no limit).
         # Every attempt is capped by it and no retry sleeps past it; deadline_reached
         # records that the deadline, not the server, ended the latest request.
@@ -303,15 +302,6 @@ class HttpClient:
         self._check_deadline(seconds)
         self.sleep(seconds)
 
-    def _rate_limit(self) -> None:
-        rate = float(self.settings.get("requests_per_minute", 120.0))
-        if rate <= 0:
-            return
-        remaining = self._next_request - self.clock()
-        if remaining > 0:
-            self._pause(remaining)  # never waits past the caller's deadline
-        self._next_request = self.clock() + 60.0 / rate
-
     def _body(self, response: httpx.Response) -> bytes:
         limit = int(self.settings.get("max_response_bytes", 4 * 1024 * 1024))
         if self._injected_transport and response.is_stream_consumed:
@@ -375,7 +365,6 @@ class HttpClient:
                 deadline = min(deadline, self.deadline)
             try:
                 for redirects in range(int(self.settings.get("max_redirects", 4)) + 1):
-                    self._rate_limit()
                     # Cookies are unnecessary for source collection and must not
                     # make independently configured source requests stateful.
                     self._client.cookies.clear()
