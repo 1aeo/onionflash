@@ -356,22 +356,32 @@ def test_a_feed_with_too_many_elements_is_rejected_before_feedparser(monkeypatch
         collect_source(FakeClient([response(xml)]), source(), {}, DEFAULTS["collection"], DATE)
 
 
-def test_large_attributes_on_sibling_items_are_accepted():
+def test_large_attributes_and_a_normal_base_are_accepted():
     item = '<item data-padding="' + "x" * 40000 + '"><title>Item {n}</title><link>https://example.org/{n}</link></item>'
-    xml = f'<rss version="2.0"><channel><title>News</title>{item.format(n=1)}{item.format(n=2)}</channel></rss>'
+    xml = (f'<rss version="2.0" xml:base="https://example.org/"><channel><title>News</title>'
+           f'{item.format(n=1)}{item.format(n=2)}</channel></rss>')
     result = collect_source(FakeClient([response(xml.encode())]), source(), {}, DEFAULTS["collection"], DATE)
     assert sorted(row["title"] for row in result["items"]) == ["Item 1", "Item 2"]
 
 
-def test_deep_nesting_or_nested_bases_are_rejected_before_feedparser(monkeypatch):
+def test_deep_nesting_is_rejected_before_feedparser(monkeypatch):
     from onionflash import collect
     monkeypatch.setattr(collect.feedparser, "parse", lambda *args, **kwargs: pytest.fail("feedparser ran"))
-    # Relative xml:base values accumulate down the open path; siblings do not.
-    nested_base = '<a xml:base="' + "b" * 40000 + '/">'
-    for nested in ("<a>" * 128 + "</a>" * 128, nested_base * 2 + "</a>" * 2):
-        with pytest.raises(CollectionError, match="nesting exceeds"):
-            collect_source(FakeClient([response(f"<rss>{nested}</rss>".encode())]), source(), {},
-                           DEFAULTS["collection"], DATE)
+    with pytest.raises(CollectionError, match="nested too deeply"):
+        collect_source(FakeClient([response(("<rss>" + "<a>" * 128 + "</a>" * 128 + "</rss>").encode())]),
+                       source(), {}, DEFAULTS["collection"], DATE)
+
+
+def test_base_text_copied_to_every_element_is_bounded_before_feedparser(monkeypatch):
+    from onionflash import collect
+    monkeypatch.setattr(collect.feedparser, "parse", lambda *args, **kwargs: pytest.fail("feedparser ran"))
+    # Feedparser copies the resolved base into every element beneath it, nested or not.
+    base = "https://example.org/" + "a" * 60000 + "/"
+    for xml in (f'<rss xml:base="{base}">' + "<item/>" * 200 + "</rss>",
+                f'<rss><a BASE="{base}">' + "<b/>" * 200 + "</a></rss>",
+                "<rss>" + f'<a xml:base="{base}">' * 100 + "</a>" * 100 + "</rss>"):
+        with pytest.raises(CollectionError, match="xml:base text"):
+            collect_source(FakeClient([response(xml.encode())]), source(), {}, DEFAULTS["collection"], DATE)
 
 
 def test_gitlab_pagination_keeps_partial_items_without_advancing_watermark():

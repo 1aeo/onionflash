@@ -17,7 +17,7 @@ from .util import (
 )
 
 
-MAX_FEED_ELEMENTS, MAX_FEED_DEPTH, MAX_FEED_PATH_ATTRIBUTE_CHARS = 50000, 128, 65536
+MAX_FEED_ELEMENTS, MAX_FEED_DEPTH, MAX_FEED_BASE_CHARS = 50000, 128, 8_000_000
 
 
 class CollectionError(Exception):
@@ -118,20 +118,25 @@ def _feed(
     parser.EntityDeclHandler = reject_declaration
     parser.ExternalEntityRefHandler = reject_declaration
     # Bytes alone do not bound what feedparser builds: tiny elements are cheap to
-    # send, and it keeps every open element's resolved xml:base, which nested
-    # relative bases grow quadratically. Capping elements, depth and attribute text
-    # on the open path bounds both. path holds, for each open element (the root
-    # included), the attribute characters from the root down to it.
-    elements, path = 0, []
+    # send, and every element gets its own copy of the resolved xml:base (or base),
+    # kept in the parse stack and in each detail object. A copy is at most the base
+    # text on the element's open path, so the sum of that text over all elements
+    # bounds them, whether bases nest or one long base covers many entries. path
+    # holds that base text for each open element, the root included.
+    elements, base_chars, path = 0, 0, []
 
     def start_element(name, attributes):
-        nonlocal elements
+        nonlocal elements, base_chars
         elements += 1
-        path.append((path[-1] if path else 0) + sum(map(len, attributes.values())))
+        path.append((path[-1] if path else 0)
+                    + sum(len(v) for k, v in attributes.items() if k.lower().rpartition(":")[2] == "base"))
+        base_chars += path[-1]
         if elements > MAX_FEED_ELEMENTS:
             raise CollectionError("Feed has too many XML elements")
-        if len(path) > MAX_FEED_DEPTH or path[-1] > MAX_FEED_PATH_ATTRIBUTE_CHARS:
-            raise CollectionError("Feed XML nesting exceeds the depth or attribute limits")
+        if len(path) > MAX_FEED_DEPTH:
+            raise CollectionError("Feed XML is nested too deeply")
+        if base_chars > MAX_FEED_BASE_CHARS:
+            raise CollectionError("Feed xml:base text exceeds the limit")
 
     parser.StartElementHandler = start_element
     parser.EndElementHandler = lambda name: path.pop()
