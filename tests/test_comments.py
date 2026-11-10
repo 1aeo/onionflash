@@ -5,7 +5,7 @@ import httpx
 import pytest
 
 from onionflash.comments import (CommentError, _compose, analysis_content, analysis_context, enrich_comments,
-                                fetch_comments, merge_cached_comments, status)
+                                fetch_comments, merge_cached_comments, parse_note_id, status)
 from onionflash.config import DEFAULTS, load_config
 from onionflash.store import Store
 from onionflash.transport import FetchError, HttpClient, Response
@@ -56,6 +56,44 @@ def comments_config(tmp_path, **kw):
     cfg["sources"] = [issue_source()]
     cfg["comments"] = settings(enabled=True, **kw)
     return cfg
+
+
+@pytest.mark.parametrize("kind", ["Note", "DiscussionNote"])
+def test_supported_public_note_types_preserve_provenance(kind):
+    ident = f"gid://gitlab/{kind}/123"
+    notes, truncated = fetch_comments(FakeClient([response(payload([note("123", id=ident)]))]),
+                                     issue_source(), issue(), settings(), observed=DATE)
+    assert parse_note_id(ident) == "123"
+    assert len(notes) == 1 and notes[0]["id"] == ident
+    assert notes[0]["url"] == URL + "#note_123" and not truncated
+
+
+@pytest.mark.parametrize("ident", [None, 123, "gid://gitlab/OtherNote/123", "gid://gitlab/Issue/123",
+                                  "gid://other/DiscussionNote/123", "gid://gitlab/DiscussionNote/123/extra",
+                                  "gid://gitlab/DiscussionNote/١٢٣", "gid://gitlab/Note/123\n"])
+def test_unknown_or_malformed_note_gid_types_are_rejected(ident):
+    assert parse_note_id(ident) is None
+    with pytest.raises(CommentError, match="identity"):
+        fetch_comments(FakeClient([response(payload([note("123", id=ident)]))]),
+                       issue_source(), issue(), settings(), observed=DATE)
+
+
+def test_note_type_aliases_are_one_numeric_identity():
+    first = payload([note("123")])
+    first["data"]["project"]["issue"]["notes"]["pageInfo"] = {"hasPreviousPage": True, "startCursor": "older"}
+    second = payload([note("123", id="gid://gitlab/DiscussionNote/123")])
+    notes, truncated = fetch_comments(FakeClient([response(first), response(second)]),
+                                     issue_source(), issue(), settings(), observed=DATE)
+    assert len(notes) == 1 and notes[0]["url"] == URL + "#note_123" and not truncated
+    assert notes[0]["id"] in {"gid://gitlab/Note/123", "gid://gitlab/DiscussionNote/123"}
+
+
+@pytest.mark.parametrize("conflict", [{"body": "A conflicting account at the same update time."},
+                                     {"createdAt": "2026-11-08T11:59:00Z"}])
+def test_conflicting_versions_cannot_hide_behind_note_type_alias(conflict):
+    data = payload([note("123"), note("123", id="gid://gitlab/DiscussionNote/123", **conflict)])
+    with pytest.raises(CommentError, match="Conflicting"):
+        fetch_comments(FakeClient([response(data)]), issue_source(), issue(), settings(), observed=DATE)
 
 
 @pytest.mark.parametrize("location", [ENDPOINT + "/redirected", "https://other.example/api/graphql"])
@@ -151,10 +189,11 @@ def test_repeated_cursor_and_partial_failure_discard_entire_snapshot():
         fetch_comments(FakeClient([response(data), FetchError("HTTP 503")]), issue_source(), issue(), settings())
 
 
-def test_overlapping_note_versions_cannot_replace_new_text_with_an_older_page():
+@pytest.mark.parametrize("older_kind", ["Note", "DiscussionNote"])
+def test_overlapping_note_versions_cannot_replace_new_text_with_an_older_page(older_kind):
     newer = payload([note(body="Newer public evidence", updatedAt="2026-11-08T12:01:00Z")])
     newer["data"]["project"]["issue"]["notes"]["pageInfo"] = {"hasPreviousPage": True, "startCursor": "older-page"}
-    older = payload([note(body="Older public evidence")])
+    older = payload([note(body="Older public evidence", id=f"gid://gitlab/{older_kind}/1")])
     notes, _ = fetch_comments(FakeClient([response(newer), response(older)]), issue_source(), issue(), settings(), observed="2026-11-08T12:02:00Z")
     assert len(notes) == 1 and notes[0]["body"] == "Newer public evidence"
     with pytest.raises(CommentError, match="Conflicting"):

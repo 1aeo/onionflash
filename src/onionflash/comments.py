@@ -35,6 +35,14 @@ class CommentError(Exception):
     """Messages are fixed strings; never include upstream bodies or error text."""
 
 
+def parse_note_id(value):
+    """Return the shared numeric identity for explicitly supported public note GIDs."""
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"gid://gitlab/(?:Note|DiscussionNote)/([0-9]+)", value)
+    return match[1] if match else None
+
+
 def _initialize(store):
     store.db.executescript("""
         CREATE TABLE IF NOT EXISTS comment_cache (
@@ -127,9 +135,9 @@ def fetch_comments(client, source, item, settings, *, observed=None):
             if note.get("internal") is not False or note.get("system") is not False:
                 raise CommentError("Public note visibility is unknown")
             ident = note.get("id")
-            if not isinstance(ident, str) or not re.fullmatch(r"gid://gitlab/Note/\d+", ident):
+            note_id = parse_note_id(ident)
+            if note_id is None:
                 raise CommentError("Invalid public note identity")
-            note_id = ident.rsplit("/", 1)[1]
             url = canonical_url(note.get("url", ""))
             if url != canonical_url(item["url"]) + "#note_" + note_id:
                 raise CommentError("Public note URL does not match issue")
@@ -146,13 +154,13 @@ def fetch_comments(client, source, item, settings, *, observed=None):
                 # A malformed/future timestamp must not date or promote a story.
                 continue
             body = plain_text(note["body"], settings["comment_chars"], html=False)
-            previous = notes.get(ident)
+            previous = notes.get(note_id)
             if previous:
                 if created != previous["created_at"] or (updated == previous["updated_at"] and body != previous["body"]):
                     raise CommentError("Conflicting public note versions")
                 if updated < previous["updated_at"]:
                     continue
-            notes[ident] = {"id": ident, "url": url, "title": "Public comment by @" + author,
+            notes[note_id] = {"id": ident, "url": url, "title": "Public comment by @" + author,
                             "author": author, "created_at": created, "updated_at": updated, "body": body}
         truncated = page["hasPreviousPage"]
         if not truncated:
