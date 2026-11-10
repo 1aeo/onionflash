@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -71,7 +70,7 @@ def _rank(kind: str, confidence: str, updated_at: str) -> tuple:
 def _comment_sources(item: dict, result: dict, input_chars: int | None, observed: str) -> list[dict]:
     if type(input_chars) is not int or input_chars <= 0 or not item.get("public_comments"):
         return []
-    from .comments import analysis_context
+    from .comments import analysis_context, parse_note_id
     try:
         _, supplied = analysis_context(item, input_chars)
     except (ValueError, TypeError, KeyError, AttributeError):
@@ -81,9 +80,9 @@ def _comment_sources(item: dict, result: dict, input_chars: int | None, observed
     sources = []
     for note in supplied:
         try:
-            identifier = re.fullmatch(r"gid://gitlab/Note/([0-9]+)", note["id"])
+            identifier = parse_note_id(note["id"])
             url = canonical_url(note["url"])
-            if not identifier or url != canonical_url(item["url"]).split("#", 1)[0] + "#note_" + identifier[1]:
+            if identifier is None or url != canonical_url(item["url"]).split("#", 1)[0] + "#note_" + identifier:
                 continue
             body = normalize_evidence(note["body"])
             if not any(quote in body for quote in evidence):

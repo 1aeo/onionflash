@@ -298,10 +298,11 @@ def note_item(body="The report’s old keys remain untrusted.", **changes):
 @pytest.mark.parametrize("budget,evidence,cited", [(4000, "the report's OLD keys remain untrusted", True),
     (None, "The report’s old keys remain untrusted", False), (499, "The report’s old keys remain untrusted", False),
     (4000, "The operator reported a plausible compromise", False), (4000, "keys", False)])
-def test_only_supplied_evidence_linked_notes_add_citations_and_update_time(tmp_path, budget, evidence, cited):
+@pytest.mark.parametrize("note_kind", ["Note", "DiscussionNote"])
+def test_only_supplied_evidence_linked_notes_add_citations_and_update_time(tmp_path, budget, evidence, cited, note_kind):
     cfg = config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
-        incoming = note_item()
+        incoming = note_item(id=f"gid://gitlab/{note_kind}/123")
         store.ingest(incoming, LATER)
         row = store.pending(1, LATER)[0]
         store.finish(row, analysis(evidence=[evidence]), "note", LATER, input_chars=budget)
@@ -313,6 +314,16 @@ def test_only_supplied_evidence_linked_notes_add_citations_and_update_time(tmp_p
         assert json.loads(store.db.execute("SELECT payload FROM items").fetchone()[0])["updated_at"] == DATE
         saved = store.db.execute("SELECT input_chars FROM analyses WHERE cache_key='note'").fetchone()
         assert saved[0] == budget
+
+
+def test_unknown_note_type_cannot_supply_story_citations_or_update_time(tmp_path):
+    cfg = config(tmp_path)
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest(note_item(id="gid://gitlab/OtherNote/123"), LATER)
+        store.finish(store.pending(1, LATER)[0], analysis(evidence=["The report’s old keys remain untrusted"]),
+                     "unknown-note", LATER, input_chars=4000)
+        story = store.stories()[0]
+        assert len(story["sources"]) == 1 and story["updated_at"] == DATE
 
 
 def test_unseen_note_tail_or_mismatched_url_cannot_be_cited(tmp_path):
