@@ -57,7 +57,7 @@ DEFAULTS = {
         "max_redirects": 4,
         "max_response_bytes": 2097152,
         "requests_per_minute": 30,
-        "user_agent": "OnionFlash/0.1 (+https://github.com/1aeo/onionflash)",
+        "user_agent": "OnionFlash (+https://github.com/1aeo/onionflash)",
     },
     "monitoring": {
         "min_reports": 2,

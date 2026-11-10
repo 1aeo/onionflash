@@ -339,7 +339,7 @@ class HttpClient:
         if method not in {"GET", "HEAD", "POST", "DELETE"}:
             raise FetchError("unsupported request method")
         start_url = self._url(url)
-        start_headers = {"user-agent": self.settings.get("user_agent", "OnionFlash/0.1"),
+        start_headers = {"user-agent": self.settings.get("user_agent", "OnionFlash"),
                          "accept-encoding": "gzip, deflate"}
         start_headers.update({str(k).lower(): str(v) for k, v in (headers or {}).items() if k.lower() != "host"})
         start_headers.update({str(k).lower(): str(v) for k, v in (conditional or {}).items()

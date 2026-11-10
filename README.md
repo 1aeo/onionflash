@@ -12,8 +12,8 @@ does not call an LLM or need a database server. Deployment and scheduling live i
 ## Quick start
 
 Requirements: **Python 3.11 or newer**, a Linux/macOS host, and an API endpoint
-supporting chat completions with JSON Schema output. The deployed model is Qwen
-through vLLM; the endpoint and model are configurable.
+supporting chat completions with JSON Schema output. The endpoint and model are
+configurable.
 
 ```bash
 git clone https://github.com/1aeo/onionflash.git
@@ -44,7 +44,7 @@ The first run collects up to the configured lookback window and analyzes a
 bounded number of items. More items remain queued for subsequent runs. An empty
 first page can mean the LLM is not configured or the queue has not yielded a
 publishable story yet; `onionflash status --config config.toml` explains queue
-and source status. No sample or invented news is published.
+and source status. No sample stories are published.
 
 For server installation, use the deployment repository's `install.sh` and quick
 start. It installs the recurring job, protects credentials, checks publication,
@@ -53,11 +53,10 @@ only creates local files.
 
 ## Configuration
 
-The deployed scheduler runs every five minutes. Its `interval_minutes` setting
-lives in the deployment repository's `deployment.toml`; apply schedule changes
-with `./deploy.sh schedule`. Each source also has `interval_seconds` (default
-300), so a slower source can be polled less often than the job runs. The source
-interval cannot make a five-minute job execute more frequently. A small
+The deployment repository schedules `onionflash run` (`interval_minutes` in its
+`deployment.toml`; apply changes with `./deploy.sh schedule`). Each source also
+has `interval_seconds` (default 300), so a slower source can be polled less often
+than the job runs; it cannot make the job run more often. A small
 `collection.healthy_poll_tolerance_seconds` handles scheduler start jitter only
 after a successful poll; failure and Retry-After cooldowns remain intact.
 
@@ -69,7 +68,7 @@ The API key is read only from the variable named by `llm.api_key_env`.
 | Section | Settings |
 | --- | --- |
 | `site` | Title, description, canonical URL, repository link, page/feed sizes |
-| `storage` | Private SQLite path, dedicated public output directory, maximum published archive size |
+| `storage` | Private SQLite path, dedicated public output directory |
 | `collection` | Lookback, overlap, page/item limits, content limit, staleness, circuit backoff, total/source run budgets, reserved analysis time |
 | `http` | Connect/read/total deadlines, attempts, exponential backoff base/cap/jitter, bounded `Retry-After`, redirect/byte/rate limits, user agent |
 | `monitoring` | Alert persistence/window thresholds, freshness, private retention and storage/parser limits |
@@ -124,7 +123,7 @@ table line. Ambiguous recent rows are skipped with a source warning. See
 
 Consensus-health and anti-censorship alerts use deterministic parsers selected
 by `alert_format`, with a configured `monitor_id` shared by any mirrors of the
-same monitor. They bypass Qwen. Unknown formats and undated messages cannot
+same monitor. They bypass the LLM. Unknown formats and undated messages cannot
 become news stories.
 
 The private SQLite incident records group repeated notifications. By default,
@@ -189,8 +188,9 @@ Publishers should use the same database lock while taking their upload snapshot.
   supplied source. The excerpts stay private; public citations are created from
   collected URLs, never model-proposed URLs. Source text is treated as untrusted
   data. Evidence matching is an automated check, **not proof of factual accuracy**.
-- Reports, suspected compromise, and telemetry anomalies retain explicit
-  uncertainty. GitLab issue hosting alone does not establish confirmation. Tags
+- Reports and suspected compromises retain explicit uncertainty; monitoring
+  alerts publish only as attributed `observed-anomaly` notices. GitLab issue
+  hosting alone does not establish confirmation. Tags
   are marked `tagged`; merges are marked `merged`. A later tag cannot downgrade an
   already announced release.
 - Matching release versions/products, identical titled issue bodies, and
@@ -214,32 +214,21 @@ is in progress. Treat this as a news aid, not an incident-detection guarantee.
 Every stored story keeps its page; the homepage and feeds show the newest
 `site.page_size` and `site.feed_size` stories. Keep the SQLite
 database, backups, raw source content, and analysis evidence private. The
-deployment defaults place backups in private DigitalOcean Spaces storage.
+deployment repository can upload backups to private object storage.
 
 LLM availability and output quality depend on your model. The prompt and evidence
 checks reduce unsupported statements, but important security conclusions should
 always be checked against the linked primary source. Personal alert delivery is
 intentionally outside this initial website/RSS release.
 
-## Measured behavior and review work
-
-- [Tracked improvement checklist](docs/IMPROVEMENT_CHECKLIST.md)
-- [Publication-delay backtest and SQLite growth audit](docs/RUNTIME_AUDIT.md)
-- [Source coverage and remaining features](docs/SOURCE_COVERAGE.md)
-- [Gemini critique results and simplification decisions](docs/REVIEW_RESULTS.md)
-
-The historical audit distinguishes source timestamps, observation markers,
-startup backfill and verified website publication. New collection runs record
-post-fetch observation times and preserve a metadata boundary identifying the
-older cycle-start markers. Source timestamps still do not prove when a feed
-first made an item available. Backups are already gzip-compressed; the small
-measured database does not currently need compression or routine compaction.
+See [source coverage and remaining features](docs/SOURCE_COVERAGE.md).
 
 ## Development
 
 ```sh
-python -m pip install '.[test]'
+python -m pip install -e '.[test]'
 python -m pytest -q
+node --test tests/*.mjs
 ```
 
 Tests cover unsafe URLs and redirects, DNS rebinding, gzip expansion, timeouts,

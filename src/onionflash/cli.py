@@ -127,8 +127,6 @@ def build(config: dict, store: Store) -> dict:
 
 def run(config: dict, store: Store) -> dict:
     observed = now_iso()
-    if not store.get_meta("fetch_completion_clock_since"):
-        store.set_meta(fetch_completion_clock_since=observed)
     report = {
         "sources_ok": 0,
         "sources_failed": 0,
