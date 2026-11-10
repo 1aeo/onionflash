@@ -250,8 +250,9 @@ class RenderTests(unittest.TestCase):
         page = (output / "index.html").read_text()
         # Neither story's primary category is security, but both are relevant.
         self.assertIn('data-filter="security"', page)
-        self.assertIn('data-tags="directory-authority security tor"', page)
-        self.assertIn('data-tags="release security tor"', page)
+        # Product slugs (here "tor") are not topics; only the category and tags are.
+        self.assertIn('data-tags="directory-authority security"', page)
+        self.assertIn('data-tags="release security"', page)
         def titles(topic):
             return {item.findtext("title") for item in ET.parse(output / f"tags/{topic}.xml").findall("./channel/item")}
         self.assertEqual(titles("security"), {authority["title"], release["title"]})

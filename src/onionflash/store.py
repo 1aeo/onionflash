@@ -74,6 +74,10 @@ def item_priority(item: dict, tag_priority_score: int = 5) -> int:
     return max(score, tag_priority_score if item["kind"] == "tag" else 0)
 
 
+def _rank(kind: str, confidence: str, updated_at: str) -> tuple:
+    return ({"tag": 0, "metrics_timeline": 1}.get(kind, 2), confidence == "confirmed", updated_at)
+
+
 class Store:
     def __init__(self, path: str | Path):
         path = Path(path)
@@ -348,23 +352,16 @@ class Store:
                         "tags",
                     )
                 }
-                editorial_kind = item["kind"]
-                previous_timeline = previous and previous.get("editorial_kind") == "metrics_timeline"
-                primary_replaces_timeline = previous_timeline and item["kind"] not in {"metrics_timeline", "tag"}
-                if previous and (
-                    (item["updated_at"] < previous["updated_at"] and not primary_replaces_timeline)
-                    or (item["kind"] == "tag" and previous["state"] != "tagged")
-                    or (item["kind"] == "metrics_timeline" and not previous_timeline)
-                ):
-                    # A newly discovered older mirror adds corroborating links, not an
-                    # editorial rollback. The evidence still remains in the private cache.
-                    data = {key: previous[key] for key in data}
-                    editorial_kind = previous.get("editorial_kind", "")
-                data["editorial_kind"] = editorial_kind
-                if previous:
-                    data["products"] = sorted(
-                        set(data["products"]) | set(previous["products"])
-                    )
+                data["editorial_kind"], data["editorial_item"] = item["kind"], item["id"]
+                if previous and previous.get("editorial_item") != item["id"]:
+                    # Another item already wrote this story. It keeps the text when it
+                    # ranks higher: tag notice < Metrics timeline < primary report, then
+                    # a confirmed account, then the newer item. The loser only adds a link.
+                    kind = previous.get("editorial_kind") or ("tag" if previous["state"] == "tagged" else "")
+                    if _rank(kind, previous["confidence"], previous["updated_at"]) > _rank(
+                        item["kind"], data["confidence"], item["updated_at"]
+                    ):
+                        data = {key: previous.get(key) for key in data}
                 data.update(
                     {
                         "id": story_id,
@@ -380,8 +377,8 @@ class Store:
                         ),
                     }
                 )
-                # Keep the earliest already-published timestamp, including across mirrors.
-                # The private evidence remains in analyses; only selected fields go public.
+                # Keep the story's first published_at. The private evidence stays in
+                # analyses; only selected fields go public.
                 cluster = existing["cluster_key"] if existing else row["cluster_key"]
                 self.db.execute(
                     """INSERT INTO stories(id,cluster_key,payload,published_at,updated_at) VALUES(?,?,?,?,?)

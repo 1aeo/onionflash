@@ -192,7 +192,7 @@ def item_cluster(item: dict) -> str:
             product = "tor"
     if item.get("kind") == "tag" or re.search(r"\breleas(?:e|ed|ing)\b", title):
         match = re.search(
-            r"\b(?:tor[- ]|arti[- ]v?|version\s+)?(\d+\.\d+\.\d+(?:\.\d+)?(?:[-.](?:alpha|beta|rc)\d*)?)\b",
+            r"\b(?:tor[- ]|arti[- ]v?|version\s+)?(\d+\.\d+(?:\.\d+){0,2}(?:[-.]?(?:alpha|beta|rc|a)\d*)?)\b",
             title,
         )
         if match and product in {"tor", "arti", "tor-browser"}:

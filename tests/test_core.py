@@ -739,3 +739,37 @@ def test_skipped_story_count_is_reported_on_unchanged_builds(tmp_path):
             store.finish(row, analysis(), "key-" + row["id"], DATE)
         assert build(cfg, store) == {"public_changed": True, "stories_skipped": 1}
         assert build(cfg, store) == {"public_changed": False, "stories_skipped": 1}
+
+def test_story_precedence_keeps_confirmed_account_but_follows_its_own_updates(tmp_path):
+    def publish(store, url, updated, content=item()["content"], **result):
+        store.ingest(item(url=url, title="Arti 2.8.0 released", updated_at=updated, kind="feed", content=content), updated)
+        row = next(r for r in store.pending(10, updated) if r["url"] == url)
+        store.finish(row, analysis(**result), "key-" + url + updated, updated)
+        return store.stories(10)
+
+    later = "2026-11-08T13:00:00Z"
+    latest = "2026-11-08T14:00:00Z"
+    with Store(tmp_path / "state.db") as store:
+        official = dict(title="Arti 2.8.0 released", confidence="confirmed", state="released")
+        publish(store, "https://blog.example/arti", DATE, **official)
+        # A later, unconfirmed item in the same release cluster adds a source but not its text.
+        stories = publish(store, "https://gitlab.example/arti/1", later,
+                          title="Arti 2.8.0 release checklist completed", confidence="reported")
+        assert len(stories) == 1 and len(stories[0]["sources"]) == 2
+        assert (stories[0]["title"], stories[0]["confidence"]) == ("Arti 2.8.0 released", "confirmed")
+        # The item that wrote the story can still update it, even to an unconfirmed account.
+        stories = publish(store, "https://blog.example/arti", latest, content="Update: the release was withdrawn.",
+                          title="Arti 2.8.0 release withdrawn",
+                          confidence="reported", state="developing")
+        assert (stories[0]["title"], stories[0]["confidence"]) == ("Arti 2.8.0 release withdrawn", "reported")
+
+
+def test_release_clusters_include_two_part_versions_and_alpha_suffixes():
+    def key(title, kind="feed"):
+        return item_cluster({"title": title, "kind": kind, "product": "network", "content": "", "url": "https://example.org/" + title})
+
+    assert key("New Release: Tor Browser 16.0") == key("Tor Browser 16.0 is released") == "release:tor-browser:16.0"
+    assert key("New Alpha Release: Tor Browser 16.0a14") == "release:tor-browser:16.0a14"
+    assert key("Tor 0.4.9.16 is released") == "release:tor:0.4.9.16"
+    assert key("Tor 0.5.0.1-alpha is released") == "release:tor:0.5.0.1-alpha"
+    assert key("New Release: Tor Browser 15.0.26") == "release:tor-browser:15.0.26"

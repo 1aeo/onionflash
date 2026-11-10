@@ -121,7 +121,7 @@ def _prepare_story(story: dict) -> dict:
     if not sources:
         raise ValueError("Published stories require at least one safe source URL")
     tags = []
-    for tag in [category, *story.get("tags", [])[:20], *story.get("products", [])[:10]]:
+    for tag in [category, *story.get("tags", [])[:20]]:
         if isinstance(tag, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", tag) and tag not in tags:
             tags.append(tag)
     published = _date(story.get("published_at"))
