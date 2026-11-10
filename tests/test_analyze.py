@@ -62,10 +62,19 @@ def test_grounding_pass_replaces_unsupported_text(monkeypatch):
 
 
 def test_grounding_rewrite_must_still_pass_validation(monkeypatch):
-    llm = analyzer(monkeypatch, completion(analysis()), completion(grounded(why_it_matters="")))
+    # The failed check gets one repair round; a repair that still fails is rejected.
+    llm = analyzer(monkeypatch, completion(analysis()), completion(grounded(why_it_matters="")),
+                   completion(grounded(why_it_matters="")))
     with pytest.raises(AnalysisError, match="needs text") as caught:
         llm.analyze(item())
     assert not caught.value.retryable
+    assert len(llm.client.requests) == 3
+    assert "needs text" in json.loads(llm.client.requests[2][1]["messages"][1]["content"])["problem"]
+    # A repair call that itself returns garbage keeps the original reason.
+    llm = analyzer(monkeypatch, completion(analysis()), completion(grounded(why_it_matters="")),
+                   completion({"verdict": "fine"}))
+    with pytest.raises(AnalysisError, match="needs text"):
+        llm.analyze(item())
     llm = analyzer(monkeypatch, completion(analysis()), completion({"verdict": "fine"}))
     with pytest.raises(AnalysisError, match="grounding check") as caught:
         llm.analyze(item())
@@ -75,14 +84,86 @@ def test_grounding_rewrite_must_still_pass_validation(monkeypatch):
 def test_a_statement_the_check_flags_but_keeps_is_rejected(monkeypatch):
     claim = "Operators must update their configurations to exclude the node."
     kept = grounded(unsupported=[claim], why_it_matters=claim)
-    llm = analyzer(monkeypatch, completion(analysis(why_it_matters=claim)), completion(kept))
-    with pytest.raises(AnalysisError, match="left an unsupported statement") as caught:
+    llm = analyzer(monkeypatch, completion(analysis(why_it_matters=claim)), completion(kept),
+                   completion(grounded(why_it_matters=claim)))
+    with pytest.raises(AnalysisError, match="left this flagged statement unchanged") as caught:
         llm.analyze(item())
     assert not caught.value.retryable
+    # The repair round was told which statement it kept.
+    assert claim in json.loads(llm.client.requests[2][1]["messages"][1]["content"])["problem"]
     # Editing a different sentence of the same field does not fix the flagged one.
     partly = grounded(unsupported=[claim], why_it_matters="The report concerns trust. " + claim)
-    llm = analyzer(monkeypatch, completion(analysis(why_it_matters="It matters. " + claim)), completion(partly))
-    with pytest.raises(AnalysisError, match="left an unsupported statement"):
+    llm = analyzer(monkeypatch, completion(analysis(why_it_matters="It matters. " + claim)), completion(partly),
+                   completion(partly))
+    with pytest.raises(AnalysisError, match="left this flagged statement unchanged"):
+        llm.analyze(item())
+
+
+def test_one_repair_round_fixes_exactly_the_failed_check(monkeypatch):
+    draft = analysis(title="Operator removed the affected keys after reported compromise")
+    fixed = "Operator reports possible compromise and stops trusting its keys"
+    llm = analyzer(monkeypatch, completion(draft), completion(grounded(title=draft["title"])),
+                   completion(grounded(title=fixed)))
+    assert llm.analyze(item())["title"] == fixed
+    problem = json.loads(llm.client.requests[2][1]["messages"][1]["content"])["problem"]
+    assert problem == "The title says 'removed', a completed action the source does not state"
+
+
+def test_attributing_a_flagged_statement_to_the_source_does_not_fix_it(monkeypatch):
+    claim = "Operators must update their configurations to exclude the node."
+    attributed = "According to the report, operators must update their configurations to exclude the node."
+    llm = analyzer(monkeypatch, completion(analysis(why_it_matters=claim)),
+                   completion(grounded(unsupported=[claim], why_it_matters=attributed)),
+                   completion(grounded(why_it_matters=attributed)))
+    with pytest.raises(AnalysisError, match="left this flagged statement unchanged"):
+        llm.analyze(item())
+
+
+def test_a_qualifier_inside_the_flagged_claim_does_not_excuse_it():
+    from onionflash.analyze import _kept_claim
+    claim = "Operators may need to rotate keys."
+    draft = {"title": "t", "summary": claim, "why_it_matters": "w"}
+    copied = {**draft, "title": "New title"}
+    attributed = {**draft, "summary": "According to the report, operators may need to rotate keys."}
+    assert _kept_claim([claim], [draft], copied) == claim
+    assert _kept_claim([claim], [draft], attributed) == claim  # the claim's own "may" is not a hedge
+    hedged = {**draft, "summary": "It is unclear whether operators may need to rotate keys."}
+    assert _kept_claim([claim], [draft], hedged) is None
+
+
+def test_a_short_flagged_statement_removed_once_may_not_come_back():
+    from onionflash.analyze import _kept_claim
+    draft = {"title": "t", "summary": "The issue reports a crash. No fix.", "why_it_matters": "w"}
+    first = {**draft, "summary": "The issue reports a crash."}
+    assert _kept_claim(["No fix."], [draft], first) is None
+    assert _kept_claim(["No fix."], [draft, first], draft) == "No fix."
+    hedged = {**draft, "summary": "The issue reports a crash. It is unclear whether there is no fix."}
+    assert _kept_claim(["No fix."], [draft, first], hedged) is None
+    # Whole words only: "confirmed" inside "unconfirmed" is not the flagged word.
+    assert _kept_claim(["confirmed compromise"], [draft], {**draft, "summary": "An unconfirmed compromise."}) is None
+
+
+def test_a_qualifier_must_belong_to_the_claims_own_clause():
+    from onionflash.analyze import _kept_claim
+    claim = "Operators must update their configurations to exclude the node."
+    draft = {"title": "t", "summary": claim, "why_it_matters": "w"}
+    elsewhere = {**draft, "summary": "It is unclear whether the node is compromised, but operators must "
+                                      "update their configurations to exclude the node."}
+    assert _kept_claim([claim], [draft], elsewhere) == claim
+    after = {**draft, "summary": "The report says operators must update their configurations to exclude "
+                                  "the node is unconfirmed."}
+    assert _kept_claim([claim.rstrip(".")], [draft], after) is None
+
+
+def test_a_short_flagged_statement_left_unchanged_is_kept():
+    from onionflash.analyze import _kept_claim
+    draft = {"title": "t", "summary": "The patch is merged. Safe.", "why_it_matters": "w"}
+    assert _kept_claim(["Safe."], [draft], {**draft, "title": "New title"}) == "Safe."
+
+
+def test_malformed_unsupported_entries_are_a_schema_error(monkeypatch):
+    llm = analyzer(monkeypatch, completion(analysis()), completion(grounded(unsupported=[123])))
+    with pytest.raises(AnalysisError, match="does not match schema"):
         llm.analyze(item())
 
 

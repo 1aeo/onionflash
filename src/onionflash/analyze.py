@@ -10,7 +10,7 @@ from .transport import FetchError, HttpClient
 from .util import digest
 from .schema import CATEGORIES, PRIORITIES, CONFIDENCES, STATES, PRODUCTS
 
-PROMPT_VERSION = "onionflash-4"
+PROMPT_VERSION = "onionflash-5"
 TAG_NOTICE_VERSION = "tag-notice-2"
 SCHEMA = {
     "type": "object",
@@ -121,6 +121,8 @@ never "the source states". why_it_matters must say why the item matters using on
 consequence, concern or requested action the source states; if it states none, write
 "Scope and consequences remain subject to the linked upstream discussion."
 If everything is supported, return the draft unchanged with an empty list.
+If the JSON has "problem", the draft failed that automated check: fix exactly that,
+using only what the source states.
 Return only the requested JSON object.
 """
 
@@ -175,6 +177,40 @@ def _plain(text: str) -> str:
 
 def _sentences(result: dict) -> set[str]:
     return {s for key in TEXT_FIELDS for s in re.split(r"(?<=[.!?])\s+", _plain(str(result[key]))) if s}
+
+
+_QUALIFIED = re.compile(r"\b(?:not|no|never|unclear|unknown|whether|unconfirmed|may|might|could|possibly)\b")
+_CLAUSE = re.compile(r"[,;:]|\bbut\b")
+
+
+def _qualified(sentence: str, match: re.Match) -> bool:
+    """A negation or uncertainty word in the claim's own clause, before or after it."""
+    before = _CLAUSE.split(sentence[: match.start()])[-1]
+    after = _CLAUSE.split(sentence[match.end():])[0]
+    return bool(_QUALIFIED.search(before) or _QUALIFIED.search(after))
+
+
+def _kept_claim(claims: list, earlier: list[dict], result: dict) -> str | None:
+    """A flagged statement may be reworded, hedged or denied, but not left as written.
+
+    Matched as whole words, it counts as kept in a sentence copied unchanged from
+    an earlier version, or in a sentence that adds no negation or uncertainty to it
+    ("According to the report, <claim>" still asserts it). The second check skips
+    short statements unless an earlier rewrite had removed them and they came back.
+    """
+    before = set().union(*map(_sentences, earlier))
+    latest = _plain(" ".join(str(earlier[-1][key]) for key in TEXT_FIELDS))
+    for claim in claims:
+        text = _plain(claim) if isinstance(claim, str) else ""
+        if not text:
+            continue
+        pattern = re.compile(r"(?<!\w)" + re.escape(text) + r"(?!\w)")
+        checked = len(text) >= 8 or not pattern.search(latest)
+        for sentence in _sentences(result):
+            for match in pattern.finditer(sentence):
+                if sentence in before or (checked and not _qualified(sentence, match)):
+                    return claim
+    return None
 
 
 def validate_analysis(result: dict, item: dict, *, editorial: bool = True) -> dict:
@@ -301,8 +337,8 @@ def tag_notice(item: dict) -> dict:
 def _validate_issue_actions(result: dict, evidence: list[str]) -> None:
     """An imperative issue title must not become a completed security action."""
     actions = r"removed|fixed|patched|resolved|deployed|disabled|revoked|rotated"
-    text = " ".join(result[k] for k in ("title", "summary", "why_it_matters"))
-    for match in re.finditer(r"\b(" + actions + r")\b", text, re.I):
+    for field, match in ((f, m) for f in TEXT_FIELDS for m in re.finditer(r"\b(" + actions + r")\b", result[f], re.I)):
+        text = result[field]
         preceding = text[max(0, match.start() - 90) : match.start()]
         # These are explicitly proposed/necessary actions rather than completion.
         if re.search(
@@ -323,7 +359,8 @@ def _validate_issue_actions(result: dict, evidence: list[str]) -> None:
                 ):
                     supported = True
         if not supported:
-            raise AnalysisError("Issue summary asserts an unsupported completed action")
+            # Naming the field and word lets the repair round fix exactly this.
+            raise AnalysisError(f"The {field} says '{action}', a completed action the source does not state")
     if result["state"] in {
         "fixed",
         "resolved",
@@ -411,25 +448,46 @@ class Analyzer:
             return draft
         # The model re-reads its own draft against the same source and must remove
         # anything the source does not state, including in why_it_matters.
+        check = self._ground(request, key, bounded, draft)
+        final = {**draft, **{k: check[k] for k in TEXT_FIELDS}}
+        try:
+            return self._accept(final, [draft], check["unsupported"], source)
+        except AnalysisError as problem:
+            # One repair round: the model sees exactly which check failed.
+            try:
+                repair = self._ground(request, key, bounded, final, problem=str(problem))
+            except AnalysisError as failure:
+                if failure.retryable:
+                    raise
+                raise problem from failure  # keep the check that failed as the recorded reason
+            repaired = {**draft, **{k: repair[k] for k in TEXT_FIELDS}}
+            return self._accept(repaired, [draft, final], check["unsupported"] + repair["unsupported"], source)
+
+    @staticmethod
+    def _accept(result: dict, earlier: list[dict], claims: list, source: dict) -> dict:
+        kept = _kept_claim(claims, earlier, result)
+        if kept:
+            raise AnalysisError("The rewrite left this flagged statement unchanged: " + kept[:200])
+        return validate_analysis(result, source)
+
+    def _ground(self, request: dict, key: str, bounded: dict, result: dict, problem: str | None = None) -> dict:
+        payload = {"source": bounded, "draft": {k: result[k] for k in TEXT_FIELDS}}
+        if problem:
+            payload["problem"] = problem
         check = self._complete({
             **request,
             "messages": [
                 {"role": "system", "content": GROUNDING_PROMPT},
-                {"role": "user", "content": json.dumps(
-                    {"source": bounded, "draft": {k: draft[k] for k in TEXT_FIELDS}}, ensure_ascii=False)},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
             "response_format": {"type": "json_schema", "json_schema": {
                 "name": "onionflash_grounding", "strict": True, "schema": GROUNDING_SCHEMA}},
         }, key)
-        if set(check) != set(GROUNDING_SCHEMA["properties"]) or not isinstance(check["unsupported"], list):
+        unsupported = check.get("unsupported")
+        if set(check) != set(GROUNDING_SCHEMA["properties"]) or not isinstance(unsupported, list) or len(unsupported) > 5 \
+                or any(not isinstance(claim, str) or len(claim) > 300 for claim in unsupported):
             raise AnalysisError("Model grounding check does not match schema")
-        final = {**draft, **{k: check[k] for k in TEXT_FIELDS}}
-        # A flagged statement may be reworded (hedged or denied) but not left as drafted.
-        unchanged = _sentences(final) & _sentences(draft)
-        if any(isinstance(claim, str) and len(_plain(claim)) >= 8 and any(_plain(claim) in s for s in unchanged)
-               for claim in check["unsupported"]):
-            raise AnalysisError("Model grounding check left an unsupported statement in place")
-        return validate_analysis(final, source)
+        return check
 
     def _complete(self, request: dict, key: str) -> dict:
         """POST one chat completion; only transport failures move on to a fallback."""
