@@ -735,8 +735,9 @@ def test_skipped_story_count_is_reported_on_every_build(tmp_path):
             store.ingest(item(url=url, content=url), DATE)
         for row in store.pending(10, DATE):
             store.finish(row, analysis(), "key-" + row["id"], DATE)
-        assert build(cfg, store) == {"public_changed": True, "stories_skipped": 1}
-        assert build(cfg, store) == {"public_changed": False, "stories_skipped": 1}
+        assert build(cfg, store) == {"published_stories": 1, "stories_skipped": 1}
+        assert build(cfg, store) == {"published_stories": 1, "stories_skipped": 1}
+
 
 def test_story_precedence_keeps_confirmed_account_but_follows_its_own_updates(tmp_path):
     def publish(store, url, updated, content=item()["content"], **result):
@@ -830,9 +831,6 @@ def test_an_older_single_source_story_can_still_be_updated_by_its_source(tmp_pat
         store.finish(store.pending(1, later)[0], analysis(title="Tor 0.4.9.19 release withdrawn"), "k", later)
         story = store.stories(1)[0]
     assert story["title"] == "Tor 0.4.9.19 release withdrawn" and story["editorial_item"] == row["id"]
-
-        assert build(cfg, store) == {"published_stories": 1, "stories_skipped": 1}
-        assert build(cfg, store) == {"published_stories": 1, "stories_skipped": 1}
 
 
 def test_new_story_records_when_onion_flash_added_it(tmp_path):
