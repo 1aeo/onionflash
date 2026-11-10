@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import ipaddress
+import logging
 import os
 import re
 import tomllib
@@ -152,6 +153,8 @@ def load_config(path: str | Path) -> dict:
         else:
             if not isinstance(values, dict):
                 raise ValueError(f"{section} must be a table")
+            for key in sorted(set(values) & RETIRED.get(section, set())):
+                logging.getLogger(__name__).warning("Ignoring retired setting %s.%s; it can be deleted", section, key)
             values = {k: v for k, v in values.items() if k not in RETIRED.get(section, ())}
             unknown = set(values) - set(DEFAULTS[section])
             if unknown:

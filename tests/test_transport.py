@@ -109,11 +109,12 @@ class TransportTests(unittest.TestCase):
         def handle(request):
             calls.append(request)
             return httpx.Response(200, content=b"ok", headers={"set-cookie": "tracking=secret; Path=/"})
-        client, _ = self.client(handle)
+        client, waits = self.client(handle)
         with client:
             client.request("GET", "https://example.org/one")
             client.request("GET", "https://example.org/two")
         self.assertNotIn("cookie", calls[1].headers)
+        self.assertEqual(waits, [])  # consecutive requests are not spaced out
 
     def test_redirect_loop_bounded(self):
         handler = Mock(return_value=httpx.Response(302, headers={"location": "/again"}))

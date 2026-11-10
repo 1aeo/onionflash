@@ -913,14 +913,16 @@ def test_new_story_records_when_onion_flash_added_it(tmp_path):
     assert (story["published_at"], story["added_at"]) == ("2026-09-22T12:00:00Z", later)
 
 
-def test_retired_settings_are_accepted_and_ignored(tmp_path):
+def test_retired_settings_are_accepted_and_ignored(tmp_path, caplog):
     path = tmp_path / "config.toml"
     path.write_text(
         '[storage]\nmax_stories = 1000\n[http]\nrequests_per_minute = 30\n'
         '[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n'
     )
-    loaded = load_config(path)
+    with caplog.at_level("WARNING", logger="onionflash.config"):
+        loaded = load_config(path)
     assert "max_stories" not in loaded["storage"] and "requests_per_minute" not in loaded["http"]
+    assert "Ignoring retired setting http.requests_per_minute" in caplog.text
 
 
 def test_busy_lock_status_is_read_only_and_a_skipped_build_is_not_success(tmp_path, capsys):
