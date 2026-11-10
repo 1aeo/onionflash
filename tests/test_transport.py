@@ -246,10 +246,6 @@ class PublisherTransportTests(unittest.TestCase):
         self.assertEqual(retry_delay(8, settings, jitter=lambda: 1), 10)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class CheckedTransportTests(unittest.TestCase):
     """The production path: DNS is checked when the connection opens, then the
     socket backend receives only the vetted literal address."""
@@ -291,3 +287,7 @@ class CheckedTransportTests(unittest.TestCase):
             client.deadline = time.monotonic() + 2
             client.request("GET", "https://example.org/feed")
         self.assertLessEqual(connected[0][2], 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
