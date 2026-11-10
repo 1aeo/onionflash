@@ -311,7 +311,8 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
              _json(current["published"]) if current["published"] is not None else None,
              after_story, _json(public), current["hash"], after_hash))
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_render_queue'").fetchone():
-            db.execute("INSERT INTO public_render_queue(story_id,last_error) VALUES(?,NULL) ON CONFLICT(story_id) DO UPDATE SET last_error=NULL", (story_id,))
+            # Like a changed story, an editorial action renders before any rebuild backlog.
+            db.execute("INSERT OR REPLACE INTO public_render_queue(rowid,story_id) SELECT IFNULL(MIN(rowid),0)-1,? FROM public_render_queue", (story_id,))
     return {"story_id": story_id, "revision": next_revision, "hash": after_hash,
             "action": action, "locked": locked, "retracted": retracted, "updated_at": stamp}
 

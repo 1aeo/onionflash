@@ -57,17 +57,23 @@ def initialize(db) -> None:
             story_id TEXT PRIMARY KEY, last_error TEXT
         );
         CREATE INDEX IF NOT EXISTS public_render_queue_pending ON public_render_queue(last_error);
-        CREATE TRIGGER IF NOT EXISTS public_story_insert AFTER INSERT ON stories BEGIN
-            INSERT INTO public_render_queue(story_id,last_error) VALUES(NEW.id,NULL)
-            ON CONFLICT(story_id) DO UPDATE SET last_error=NULL;
+        DROP TRIGGER IF EXISTS public_story_insert;
+        DROP TRIGGER IF EXISTS public_story_update;
+        DROP TRIGGER IF EXISTS public_story_delete;
+        -- New and changed stories get a rowid below every queued one, ahead of any rebuild backlog.
+        -- Delete, then insert: inside a trigger, OR REPLACE yields to the outer statement's conflict policy.
+        CREATE TRIGGER IF NOT EXISTS public_queue_insert AFTER INSERT ON stories BEGIN
+            DELETE FROM public_render_queue WHERE story_id=NEW.id;
+            INSERT INTO public_render_queue(rowid,story_id) SELECT IFNULL(MIN(rowid),0)-1,NEW.id FROM public_render_queue;
         END;
-        CREATE TRIGGER IF NOT EXISTS public_story_update AFTER UPDATE OF payload ON stories
+        CREATE TRIGGER IF NOT EXISTS public_queue_update AFTER UPDATE OF payload ON stories
             WHEN OLD.payload IS NOT NEW.payload BEGIN
-            INSERT INTO public_render_queue(story_id,last_error) VALUES(NEW.id,NULL)
-            ON CONFLICT(story_id) DO UPDATE SET last_error=NULL;
+            DELETE FROM public_render_queue WHERE story_id=NEW.id;
+            INSERT INTO public_render_queue(rowid,story_id) SELECT IFNULL(MIN(rowid),0)-1,NEW.id FROM public_render_queue;
         END;
-        CREATE TRIGGER IF NOT EXISTS public_story_delete AFTER DELETE ON stories BEGIN
-            DELETE FROM public_render_queue WHERE story_id=OLD.id;
+        -- A queued story whose source row is removed still renders, from its catalog entry.
+        CREATE TRIGGER IF NOT EXISTS public_queue_delete AFTER DELETE ON stories BEGIN
+            UPDATE public_render_queue SET last_error=NULL WHERE story_id=OLD.id;
         END;
     """)
     columns = {row[1] for row in db.execute("PRAGMA table_info(public_catalog)")}
@@ -223,12 +229,24 @@ class _Sink:
         self.size += len(chunk)
 
 
-def _public_story(row) -> dict:
+def _public_story(row, current: str | None = None) -> dict | None:
+    """A verified catalog snapshot, checked again unless the `current` template rendered it.
+
+    Views pass `current` and leave out, rather than fail on, a snapshot that an
+    older release accepted and this one rejects; its article stays.
+    """
     payload = row["public_json"]
     if not isinstance(payload, str) or hashlib.sha256(payload.encode("utf-8")).hexdigest() != row["json_sha256"]:
         raise ValueError("Accepted public story snapshot is missing or changed")
-    decoded = json.loads(payload)
-    story = render._prepare_story(decoded, editorial=decoded.get("editorial"))
+    story = json.loads(payload)
+    if row["template_hash"] != current:
+        try:
+            story = render._prepare_story(story, editorial=story.get("editorial"))
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            if current is None:
+                raise
+            logging.getLogger(__name__).warning("Left story %s out of listings and feeds (%s)", row["story_id"], type(exc).__name__)
+            return None
     if story["id"] != row["story_id"]:
         raise ValueError("Accepted story identity differs from its catalog entry")
     return story
@@ -241,22 +259,25 @@ def _accepted(db, *, order: str = "added_at", batch_size: int = 100, topic: str 
         raise ValueError("Invalid topic catalog ordering")
     cursor = None
     secondary = "updated_at" if order == "added_at" else "published_at"
+    current = _meta(db, "publication_template")
     while True:
         if topic is None:
             where = "" if cursor is None else f"WHERE ({order},{secondary},story_id) < (?,?,?)"
             parameters = (batch_size,) if cursor is None else (*cursor, batch_size)
-            query = f"SELECT story_id,published_at,updated_at,added_at,json_sha256,public_json FROM public_catalog {where} ORDER BY {order} DESC,{secondary} DESC,story_id DESC LIMIT ?"
+            query = f"SELECT story_id,published_at,updated_at,added_at,template_hash,json_sha256,public_json FROM public_catalog {where} ORDER BY {order} DESC,{secondary} DESC,story_id DESC LIMIT ?"
         else:
             where = "" if cursor is None else "AND (t.added_at,t.updated_at,t.story_id) < (?,?,?)"
             parameters = (topic, *(() if cursor is None else cursor), batch_size)
-            query = f"""SELECT c.story_id,c.published_at,c.updated_at,c.added_at,c.json_sha256,c.public_json
+            query = f"""SELECT c.story_id,c.published_at,c.updated_at,c.added_at,c.template_hash,c.json_sha256,c.public_json
                 FROM public_story_topics t JOIN public_catalog c ON c.story_id=t.story_id
                 WHERE t.topic=? {where} ORDER BY t.added_at DESC,t.updated_at DESC,t.story_id DESC LIMIT ?"""
         rows = db.execute(query, parameters).fetchall()
         if not rows:
             return
         for row in rows:
-            yield _public_story(row)
+            story = _public_story(row, current)
+            if story is not None:
+                yield story
         cursor = (rows[-1][order], rows[-1][secondary], rows[-1]["story_id"])
 
 
@@ -449,7 +470,8 @@ def build(config: dict, store, *, force: bool = False) -> dict:
     ))
     if restart_rebuild:
         with db:
-            db.execute("INSERT OR REPLACE INTO public_render_queue(story_id,last_error) SELECT id,NULL FROM stories UNION SELECT story_id,NULL FROM public_catalog")
+            # Queued work keeps its place ahead of the rebuild; "WHERE true" lets SQLite parse the upsert.
+            db.execute("INSERT INTO public_render_queue(story_id) SELECT id FROM stories UNION SELECT story_id FROM public_catalog WHERE true ON CONFLICT(story_id) DO UPDATE SET last_error=NULL")
             _set_meta(db, "publication_template", identity)
             _set_meta(db, "publication_rebuild_active", identity)
     artifacts = Artifacts(db, output, observed)
@@ -474,23 +496,24 @@ def build(config: dict, store, *, force: bool = False) -> dict:
             if story["id"] != row["id"]:
                 raise ValueError("Story identity differs from its database row")
             article = render.article_html(site, base, story)
-            public_json = json.dumps(story, ensure_ascii=False, sort_keys=True) + "\n"
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             with db:
                 db.execute("UPDATE public_render_queue SET last_error=? WHERE story_id=?", (type(exc).__name__, row["id"]))
-            logging.getLogger(__name__).warning("Quarantined unrenderable story (%s)", type(exc).__name__)
+            logging.getLogger(__name__).warning("Quarantined unrenderable story %s (%s)", row["id"], type(exc).__name__)
             accepted = db.execute("SELECT * FROM public_catalog WHERE story_id=?", (row["id"],)).fetchone()
             if accepted is None:
                 continue
-            # Restore the last accepted version even if the latest private
-            # source revision is corrupt. It remains visibly quarantined.
+            # Restore the last accepted version, checked by this release, even if the
+            # latest private source revision is corrupt. It remains visibly quarantined.
             try:
                 story = _public_story(accepted)
                 article = render.article_html(site, base, story)
             except (ValueError, TypeError, KeyError, AttributeError):
                 continue
-            public_json, source_hash = accepted["public_json"], accepted["source_hash"]
+            source_hash = accepted["source_hash"]
             quarantined = True
+        # Views trust a current catalog row, so it holds exactly what this release rendered.
+        public_json = json.dumps(story, ensure_ascii=False, sort_keys=True) + "\n"
         with db:
             artifacts.text(f"news/{story['id']}/index.html", article, "text/html; charset=utf-8")
             checksum = artifacts.text(f"news/{story['id']}/story.json", public_json, "application/json; charset=utf-8")

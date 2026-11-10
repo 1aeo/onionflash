@@ -114,6 +114,8 @@ def test_plain_text_never_keeps_script_or_controls():
         "https://localhost/",
         "https://foo.internal/",
         "https://example.org/\nheader",
+        "https://example.org/a\ufffeb",  # XML feeds cannot carry it
+        "https://example.org/#\uffff",
     ],
 )
 def test_bad_citation_urls_are_rejected(url):

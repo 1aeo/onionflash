@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 
 import pytest
 
-from onionflash import publication, render
+from onionflash import editorial, publication, render
 from onionflash.cli import build
 from onionflash.config import DEFAULTS, load_config
 from onionflash.store import Store, backup_database
@@ -231,6 +231,43 @@ def test_invalid_revision_keeps_last_good_publication_and_can_recover(tmp_path):
         assert "Repaired source record." in path.read_text()
 
 
+def test_views_reuse_accepted_snapshots_instead_of_preparing_each_story_again(tmp_path, monkeypatch):
+    cfg = settings(tmp_path)
+    with Store(cfg["storage"]["database"]) as store:
+        for number in range(3):
+            put(store.db, story(number))
+        build(cfg, store)
+        calls, prepare = [], render._prepare_story
+        monkeypatch.setattr(render, "_prepare_story", lambda *args, **kwargs: calls.append(1) or prepare(*args, **kwargs))
+        put(store.db, story(3))
+        build(cfg, store)
+        assert len(calls) == 1  # the new story; the listings and feeds reuse the catalog
+
+
+def test_a_snapshot_an_older_release_accepted_and_this_one_rejects_cannot_stop_builds(tmp_path, monkeypatch):
+    cfg = settings(tmp_path)
+    output = Path(cfg["storage"]["output_dir"])
+    plain = {"url": "http://example.org/report", "title": "Report"}
+    with Store(cfg["storage"]["database"]) as store:
+        put(store.db, story(1))
+        with monkeypatch.context() as older:  # an older release accepted plain-HTTP sources
+            older.setattr(render, "_public_url", lambda url: url)
+            put(store.db, story(2, sources=[plain]))
+            put(store.db, story(3, sources=[plain, *STORY["sources"]]))
+            build(cfg, store)
+        monkeypatch.setattr(publication, "publication_year", lambda: 2030)  # this release rebuilds
+        put(store.db, story(3, sources=[{"url": "https://127.0.0.1/", "title": "Invalid"}]))
+        put(store.db, story(4))
+        assert build(cfg, store)["stories_skipped"] == 2
+        home = (output / "index.html").read_text()
+        assert all(story(n)["id"] in home for n in (1, 3, 4)) and story(2)["id"] not in home
+        feed = (output / "feed.xml").read_text()
+        assert len(ET.fromstring(feed).findall("./channel/item")) == 3
+        # The quarantined story is restored from its snapshot under this release's rules.
+        assert plain["url"] not in feed and plain["url"] not in (output / f"news/{story(3)['id']}/story.json").read_text()
+        assert (output / f"news/{story(2)['id']}/index.html").is_file()
+
+
 def test_interrupted_index_work_resumes_and_generation_advances_once(tmp_path, monkeypatch):
     cfg = settings(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
@@ -298,6 +335,55 @@ def test_template_rebuild_is_bounded_and_resumes_across_connections(tmp_path, mo
         assert build(cfg, store)["articles_pending"] == 3
         assert build(cfg, store)["articles_pending"] == 1
         assert "articles_pending" not in build(cfg, store)
+
+
+def test_new_stories_and_editorial_actions_render_before_a_rebuild_backlog(tmp_path, monkeypatch):
+    cfg = settings(tmp_path, render_batch_size=2)
+    output = Path(cfg["storage"]["output_dir"])
+    stamp = "2026-11-10T00:00:00Z"
+    def published(number):
+        return json.loads((output / f"news/{story(number)['id']}/story.json").read_text())
+    with Store(cfg["storage"]["database"]) as store:
+        def reviewed(number):
+            return {"reason": "Reviewed the sources.", "observed": stamp,
+                    "expect_hash": editorial.show(store.db, story(number)["id"])["hash"]}
+        for number in range(8):
+            put(store.db, story(number))
+        for _ in range(4):
+            build(cfg, store)
+        editorial.correct(store.db, story(7)["id"], {"summary": "Corrected summary."}, **reviewed(7))
+        build(cfg, store)
+        # A story analysed in the run that starts a rebuild keeps its place ahead of it.
+        put(store.db, story(9))
+        monkeypatch.setattr(publication, "publication_year", lambda: 2030)
+        build(cfg, store)
+        assert published(9)["title"] == "News 9"
+        put(store.db, story(10)); put(store.db, story(6, summary="Updated summary."))
+        build(cfg, store)
+        assert published(10)["title"] == "News 10" and published(6)["summary"] == "Updated summary."
+        editorial.retract(store.db, story(5)["id"], **reviewed(5))
+        editorial.unlock(store.db, story(7)["id"], **reviewed(7))  # same time as the correction: only its record changes
+        assert build(cfg, store)["articles_pending"] == 4
+        assert published(5)["title"] == "Retracted story" and published(7)["editorial"]["revision"] == 2
+
+
+def test_removing_a_source_row_keeps_its_queued_rebuild_and_clears_its_quarantine(tmp_path, monkeypatch):
+    cfg = settings(tmp_path, render_batch_size=1)
+    with Store(cfg["storage"]["database"]) as store:
+        for number in range(3):
+            put(store.db, story(number))
+        for _ in range(3):
+            build(cfg, store)
+        monkeypatch.setattr(publication, "publication_year", lambda: 2030)
+        build(cfg, store)
+        put(store.db, story(9, sources=[{"url": "https://127.0.0.1/", "title": "Invalid"}]))
+        assert build(cfg, store)["stories_skipped"] == 1
+        # One row still waits for the rebuild; the other is quarantined and was never published.
+        store.db.execute("DELETE FROM stories WHERE id IN (?,?)", (story(2)["id"], story(9)["id"])); store.db.commit()
+        for _ in range(3):
+            result = build(cfg, store)
+        assert "articles_pending" not in result and result["stories_skipped"] == 0
+        assert not store.db.execute("SELECT 1 FROM public_catalog WHERE template_hash<>?", (meta(store.db, "publication_template"),)).fetchone()
 
 
 def test_article_symlink_is_never_followed(tmp_path):

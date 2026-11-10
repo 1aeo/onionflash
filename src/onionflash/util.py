@@ -130,7 +130,8 @@ def canonical_url(value: str) -> str:
         not isinstance(value, str)
         or len(value) > 4096
         or "\\" in value
-        or any(ord(c) < 33 or ord(c) == 127 for c in value)
+        # XML feeds cannot carry U+FFFE or U+FFFF, which draft text also rejects.
+        or any(ord(c) < 33 or ord(c) == 127 or c in "\ufffe\uffff" for c in value)
     ):
         raise ValueError("Invalid source URL")
     value.encode("utf-8")  # Reject invalid Unicode URLs before persistence.

@@ -22,7 +22,8 @@ article and in RSS. Older records without `added_at` keep their existing date.
 SQLite queues a story when its stored payload changes. One build processes at
 most `storage.render_batch_size` articles, then refreshes the necessary views.
 The default is 250, adjustable from 1 to 1,000. There is no corresponding limit
-on how many accepted stories the catalog retains.
+on how many accepted stories the catalog retains. New and changed stories and
+editorial actions render ahead of a template, year or forced rebuild.
 
 Unchanged article HTML and JSON are not rewritten. Whole-history feeds require
 a sequential pass when their content changes, but are streamed with bounded
@@ -37,7 +38,9 @@ The private catalog stores timestamps, hashes and one compact last-good public
 JSON snapshot per article. Raw source text and model evidence are not exported
 to public JSON. Render failures quarantine the new source revision; an existing
 accepted article remains available. Removing a private source row does not
-remove an accepted article.
+remove an accepted article. Indexes and feeds are built from these snapshots; one
+that a later release rejects is left out of them with a logged warning, and its
+article remains.
 
 `public_artifacts` records generated paths and their hashes. The deployer owns
 `uploaded_sha256`; the builder preserves it so only changed objects need upload.
