@@ -92,9 +92,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS source_state (
                 id TEXT PRIMARY KEY, url TEXT NOT NULL, active_url TEXT, watermark TEXT,
                 etag TEXT, last_modified TEXT, last_success TEXT, error TEXT,
-                failures INTEGER NOT NULL DEFAULT 0, next_fetch_at TEXT,
-                scan_lower TEXT, scan_upper TEXT, scan_page INTEGER, scan_cursor TEXT,
-                scan_reconcile INTEGER, last_reconciled TEXT
+                failures INTEGER NOT NULL DEFAULT 0, next_fetch_at TEXT
             );
             CREATE TABLE IF NOT EXISTS items (
                 id TEXT PRIMARY KEY, url TEXT UNIQUE NOT NULL, source_id TEXT NOT NULL,
@@ -102,7 +100,7 @@ class Store:
                 first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
                 next_attempt_at TEXT, last_error TEXT, priority_score INTEGER NOT NULL DEFAULT 0,
-                story_id TEXT, rejections INTEGER NOT NULL DEFAULT 0
+                story_id TEXT
             );
             CREATE INDEX IF NOT EXISTS items_pending ON items(status, next_attempt_at, priority_score);
             DROP INDEX IF EXISTS items_cluster;
@@ -116,7 +114,17 @@ class Store:
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
         monitoring.initialize(self.db)
-        # Databases created before the rejected state lack this column.
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(source_state)")}
+        for name, kind in [
+            ("scan_lower", "TEXT"),
+            ("scan_upper", "TEXT"),
+            ("scan_page", "INTEGER"),
+            ("scan_cursor", "TEXT"),
+            ("scan_reconcile", "INTEGER"),
+            ("last_reconciled", "TEXT"),
+        ]:
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE source_state ADD COLUMN {name} {kind}")
         if "rejections" not in {row[1] for row in self.db.execute("PRAGMA table_info(items)")}:
             self.db.execute("ALTER TABLE items ADD COLUMN rejections INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
