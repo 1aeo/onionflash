@@ -292,7 +292,9 @@ class RenderTests(unittest.TestCase):
         config = {"site": {"base_url": "http://127.0.0.1:8788/"}}
         output = self.render(config=config)
         self.assertIn('href="http://127.0.0.1:8788/feed.xml"', (output / "index.html").read_text())
-        self.assertTrue((output / "_headers").read_text().startswith("/*\n"))
+        headers = (output / "_headers").read_text()
+        self.assertTrue(headers.startswith("/*\n"))
+        self.assertIn("\n/*.xml\n  ! Content-Security-Policy\n", headers)  # the empty prefix
 
     def test_private_health_errors_are_never_exposed(self):
         output = self.render(health=[{"name": "Tor releases", "last_success": "2026-11-08T12:00:00Z", "stale": True, "error": "Bearer top-secret at 192.168.50.10"}])
