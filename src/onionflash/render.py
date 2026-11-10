@@ -304,8 +304,11 @@ def render_site(config: dict, stories: list[dict], source_health: list[dict], ou
     for story in stories:
         try:
             public.append(_prepare_story(story))
-        except ValueError:
+        except (ValueError, TypeError, KeyError, AttributeError):
             continue
+    if stories and not public:
+        # Every story failing points at a systematic problem: keep the previous site.
+        raise ValueError("No stored story can be rendered")
     public.sort(key=lambda story: (story["updated_at"], story["published_at"], story["id"]), reverse=True)
     page_size = _limit(site.get("page_size"), 100, 1000)
     feed_size = _limit(site.get("feed_size"), 50, 1000)

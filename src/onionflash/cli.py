@@ -107,7 +107,7 @@ def build(config: dict, store: Store, *, force: bool = False) -> dict:
         and store.get_meta("public_signature") == signature
         and (output / "index.html").is_file()
     ):
-        return {"public_changed": False}
+        return _build_result(False, store)
     output.parent.mkdir(parents=True, exist_ok=True)
     temp = Path(
         tempfile.mkdtemp(prefix="." + output.name + ".build-", dir=output.parent)
@@ -134,15 +134,28 @@ def build(config: dict, store: Store, *, force: bool = False) -> dict:
                 os.replace(previous, output)
             raise
         store.set_meta("public_signature", signature)
+        store.set_meta("public_skipped", str(skipped))
     finally:
         if temp.exists():
             shutil.rmtree(temp)
         if previous.exists() and output.exists():
             shutil.rmtree(previous)
-    result = {"public_changed": True}
-    if skipped:
-        result["stories_skipped"] = skipped
+    return _build_result(True, store)
+
+
+def _skipped(store: Store) -> int:
+    return int(store.get_meta("public_skipped") or 0)
+
+
+def _build_result(changed: bool, store: Store) -> dict:
+    result = {"public_changed": changed}
+    if _skipped(store):
+        result["stories_skipped"] = _skipped(store)
     return result
+
+
+def _published_count(config: dict, store: Store) -> int:
+    return store.story_count(config["storage"]["max_stories"]) - _skipped(store)
 
 
 def run(config: dict, store: Store) -> dict:
@@ -251,9 +264,9 @@ def run(config: dict, store: Store) -> dict:
                 now_iso(),
             )
     report["pending_analysis"] = store.pending_count()
-    report["published_stories"] = store.story_count(config["storage"]["max_stories"])
     report["monitoring"] = store.monitoring_status(config["monitoring"], now_iso())
     report.update(build(config, store))
+    report["published_stories"] = _published_count(config, store)
     return report
 
 
@@ -310,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
                 elif args.command == "status":
                     result = {
                         "pending_analysis": store.pending_count(),
-                        "published_stories": store.story_count(config["storage"]["max_stories"]),
+                        "published_stories": _published_count(config, store),
                         "monitoring": store.monitoring_status(config["monitoring"], now_iso()),
                         "sources": store.health(
                             config["sources"],

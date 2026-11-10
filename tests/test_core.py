@@ -728,3 +728,14 @@ def test_example_config_resolves_paths_and_rejects_dangerous_settings(
     p.write_text(text.replace('output_dir = "build/public"', 'output_dir = "."'))
     with pytest.raises(ValueError):
         load_config(p)
+
+
+def test_skipped_story_count_is_reported_on_unchanged_builds(tmp_path):
+    cfg = config(tmp_path)
+    with Store(tmp_path / "state.db") as store:
+        for url in ["https://example.org/news/1", "https://news.example.test/a"]:
+            store.ingest(item(url=url, content=url), DATE)
+        for row in store.pending(10, DATE):
+            store.finish(row, analysis(), "key-" + row["id"], DATE)
+        assert build(cfg, store) == {"public_changed": True, "stories_skipped": 1}
+        assert build(cfg, store) == {"public_changed": False, "stories_skipped": 1}
