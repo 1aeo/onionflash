@@ -71,6 +71,17 @@ def _item(
     }
 
 
+def _get(client: HttpClient, url: str, state: dict):
+    """GET with the cache validators saved for this exact URL."""
+    headers = {}
+    if state.get("active_url") == url:
+        if state.get("etag"):
+            headers["If-None-Match"] = state["etag"]
+        if state.get("last_modified"):
+            headers["If-Modified-Since"] = state["last_modified"]
+    return client.request("GET", url, headers=headers)
+
+
 def _feed(
     client: HttpClient,
     source: dict,
@@ -79,13 +90,7 @@ def _feed(
     settings: dict,
     started: str,
 ) -> dict:
-    headers = {}
-    if state.get("active_url") == url:
-        if state.get("etag"):
-            headers["If-None-Match"] = state["etag"]
-        if state.get("last_modified"):
-            headers["If-Modified-Since"] = state["last_modified"]
-    response = client.request("GET", url, headers=headers)
+    response = _get(client, url, state)
     if response.status == 304:
         return {
             "items": [],
@@ -381,7 +386,7 @@ def collect_source(
                 return _feed(client, source, url, state, settings, started)
             if source["kind"] == "metrics_timeline":
                 from .timeline import collect_timeline
-                return collect_timeline(client, {**source, "url": url}, state, settings, started)
+                return collect_timeline(client, source, url, state, settings, started)
             return _gitlab(client, source, url, state, settings, started)
         except CollectionError as exc:
             errors.append(str(exc))

@@ -245,8 +245,6 @@ product = "network"
 # Curated context may include unknown causes and historical event ranges.
 authority = "telemetry"
 interval_seconds = 3600
-# Bound the entire repository table; the event-date window filters news candidates.
-max_items = 1000
 
 # Development discussion adds proposal and protocol-change context.
 [[sources]]

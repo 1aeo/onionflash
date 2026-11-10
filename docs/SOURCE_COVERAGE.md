@@ -35,20 +35,22 @@ March 9; the repository contained November updates. The Atom feed is no longer
 configured, including as a fallback.
 
 The `metrics_timeline` adapter reads the GitLab file JSON API for `README.md`.
-It validates the base64 content, declared size, SHA-256, repository revision and
-seven-column table. It does not clone the repository, execute upstream scripts
+It checks the base64 content, file path, repository revision and seven-column
+table structure. It does not clone the repository, execute upstream scripts
 or fetch the row's external references. The timeline data is CC0; the upstream
 BSD-licensed helper scripts are not bundled or executed.
 
 The November 10 repository check found 804 rows, including the October 28 Tor
 0.4.9.15 event and November 4 Tor 0.4.9.16 event missing from the Atom feed.
-`max_items = 1000` bounds the complete table; exceeding it produces an explicit
-source warning. HTTP response limits, retries and backoff also apply. Conditional
-HTTP requests avoid parsing unchanged snapshots.
+The HTTP response-size limit bounds the table; retries and backoff also apply.
+Conditional HTTP requests avoid parsing unchanged snapshots.
 
 Rows qualify through the configured event-date lookback (14 days by default):
-a recent start or explicit end can qualify, but an old `ongoing` row or a recent
-repository commit cannot. Raw dates, approximation markers, country/protocol
+a recent start or explicit end can qualify, and the date that qualified a row
+dates its item. An old `ongoing` row or a recent repository commit cannot qualify
+a row. Every row's dates must parse, but other fields of historical rows are read
+as leniently as upstream's own parser, so one unusual old row cannot block the
+snapshot. Raw dates, approximation markers, country/protocol
 scope and the unknown-cause `X` marker remain in analysis context. The README
 does not specify a timezone; UTC-normalized values are ordering keys, not claims
 of precise event time. Retrospective changes outside this event window remain
