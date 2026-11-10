@@ -187,11 +187,16 @@ def _kept_claim(claims: list, earlier: list[dict], result: dict) -> str | None:
 
     It counts as kept in a sentence copied from an earlier version, or when the
     sentence repeats it word for word without adding a negation or uncertainty
-    ("According to the report, <claim>" still asserts it).
+    ("According to the report, <claim>" still asserts it). A statement that an
+    earlier rewrite removed may not come back, however short.
     """
     before = set().union(*map(_sentences, earlier))
+    latest = _plain(" ".join(str(earlier[-1][key]) for key in TEXT_FIELDS))
+    current = _plain(" ".join(str(result[key]) for key in TEXT_FIELDS))
     for claim in claims:
         text = _plain(claim) if isinstance(claim, str) else ""
+        if text and text not in latest and text in current:
+            return claim
         if len(text) >= 8 and any(text in sentence and (sentence in before or not _QUALIFIED.search(
                 sentence.replace(text, " "))) for sentence in _sentences(result)):
             return claim

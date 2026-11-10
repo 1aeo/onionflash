@@ -131,6 +131,14 @@ def test_a_qualifier_inside_the_flagged_claim_does_not_excuse_it():
     assert _kept_claim([claim], [draft], hedged) is None
 
 
+def test_a_short_flagged_statement_removed_once_may_not_come_back():
+    from onionflash.analyze import _kept_claim
+    draft = {"title": "t", "summary": "The issue reports a crash. No fix.", "why_it_matters": "w"}
+    first = {**draft, "summary": "The issue reports a crash."}
+    assert _kept_claim(["No fix."], [draft], first) is None
+    assert _kept_claim(["No fix."], [draft, first], draft) == "No fix."
+
+
 def test_a_flagged_statement_may_be_reworded_with_the_same_words(monkeypatch):
     claim = "plausible compromise of all relays"
     for rewrite in ("The report does not say whether this is a plausible compromise of all relays.",
