@@ -116,7 +116,8 @@ archive or GitLab issue list; `url` remains the feed or API collection endpoint.
 Fallback URLs must represent the **same logical stream**. A changed primary URL
 resets that source's fetch cursor and conditional cache. Disabling a source stops
 collection without erasing already published news. GitLab merged changes are
-collected across branches, including maintenance branches.
+collected across branches, including maintenance branches. For older source
+files, see [retired source compatibility](docs/SOURCE_COVERAGE.md#retired-monitoring-sources).
 
 The Metrics Timeline source uses `kind = "metrics_timeline"` with the maintained
 repository's GitLab file JSON API URL and its repository root as `website_url`.
@@ -137,8 +138,6 @@ participating `gitlab_issue` source needs its exact `gitlab_project`, such as
 session is used. This is bounded follow-up coverage, not an exhaustive discussion
 mirror; `onionflash status` reports comment scheduling and failures. See
 [source coverage](docs/SOURCE_COVERAGE.md#anonymous-public-gitlab-discussion-updates).
-
-For older source files, see [retired source compatibility](docs/SOURCE_COVERAGE.md#retired-monitoring-sources).
 
 ## Commands
 
@@ -171,17 +170,15 @@ while taking their upload snapshot.
 
 `onionflash story show|history|correct|retract|restore|unlock` corrects or
 retracts a published story; `onionflash rejected list|show|retry|dismiss`
-handles failed analyses and, with `retry --reconsider-ignored`, an ignored item. See
+handles failed analyses and ignored items. See
 [editorial commands and recovery](docs/EDITORIAL.md) and
 [rejected-analysis commands](docs/REJECTED_ANALYSES.md).
 
 ## Reliability and editorial behavior
 
-New stories use a concise factual summary without a separate generated impact
-paragraph. The reviewer decides whether the account adds worthwhile news.
-Automatic stories need a source-grounded critique and fresh final
-verification of the exact candidate. Routine and duplicate items are skipped;
-unsupported important claims are held. See
+Automatic stories, tag notices included, publish only after a model critique of
+the exact candidate against its numbered sources and recent coverage, then a
+fresh verification. See
 [selection, final review and evaluation](docs/FINAL_REVIEW.md).
 
 - Public HTTP and private inference share the same transport helper. It validates
@@ -211,12 +208,12 @@ unsupported important claims are held. See
 - Explicit `kind = "tag"` streams produce attributed drafts locally, then use the
   same publication reviews. These notices remain `tagged`, have a fixed queue-priority
   floor, and cannot replace a richer announcement already grouped with that
-  version. Repeated identical model labels are normalized rather than retried;
-  invalid labels and unsupported evidence are still rejected.
+  version.
 - Summaries need schema-valid fields and exact supporting excerpts from the
   supplied source. The excerpts stay private; public citations are created from
   collected URLs, never model-proposed URLs. Source text is treated as untrusted
-  data.
+  data. Repeated identical model labels are normalized rather than retried;
+  invalid labels and unsupported evidence are still rejected.
 - Reports and suspected compromises retain explicit uncertainty. GitLab issue
   hosting alone does not establish confirmation. Tags
   are marked `tagged`; merges are marked `merged`. A later tag cannot downgrade an

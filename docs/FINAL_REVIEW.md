@@ -27,10 +27,12 @@ name their author, so comment text cannot pose as another comment. Previous
 generated summaries are never factual evidence.
 
 A separate, bounded coverage background contains the existing article for a
-known update and compact recent articles. It is used only to compare novelty.
-It is not an authoritative source or an instruction, and cannot support claims
-missing from the source packet. The background reads committed stories, so an
-article accepted earlier in the same run is visible before the site rebuild.
+known update and compact entries for the most recently created stories. It is
+used only to compare novelty. The review prompt marks it as data, not an
+instruction, and forbids using it as evidence; validation checks the structure
+of a verdict, not the reasoning behind it. The background reads committed
+stories, so an article accepted earlier in the same run is visible before the
+site rebuild.
 
 The reviewer evaluates nine independent criteria:
 
@@ -53,27 +55,21 @@ may appear in the summary with its audience, scope and prerequisites preserved.
 Historical impact text remains readable. A review repair may clear it, but cannot
 create or rewrite an impact paragraph; operator corrections remain separate.
 Automatic approvals also require consistent metadata: a `release` category or
-tag needs state `released` or `tagged`. An inconsistent approval is held, including
-when loading a cached decision. This check does not infer facts from source text.
-
-The model must not invent impact or advice to make a weak source seem important.
-An open checklist cannot negate an explicit release announcement, and checked
-conditional template steps do not prove that security fixes shipped. Counter
-inactivity or unresponsive diagnostics alone do not establish an attack or a
-mitigation bypass.
+tag needs state `released` or `tagged`. An inconsistent approval is held. This
+check does not infer facts from source text.
 
 Existing issue/release identities allow meaningful updates to the same article.
-Semantic similarity alone never merges unrelated events. A potentially important
-follow-up with no established article match can be a concise standalone story
-when it adds a material, supported development. It does not change another
-article's identity or overwrite a protected correction.
+A potentially important follow-up with no established article match can be a
+concise standalone story when it adds a material, supported development. It does
+not change another article's identity or overwrite a protected correction.
 
 ## Decisions and calls
 
 - `approve`: every criterion passes, with no issues or edits. An initial approval
   advances to fresh final verification; it cannot publish by itself.
 - `revise`: one minimal repair is allowed, followed by fresh verification of its
-  exact normalized text. No rewrite loop or second repair is applied.
+  exact normalized text. No rewrite loop or second repair is applied. Tag notices
+  stay literal, so a repair proposed for one holds the item.
 - `skip`: low-value or redundant material is recorded as ignored. It creates no
   article or revision and leaves existing coverage intact.
 - `hold`: potentially useful material is unsupported, ambiguous or not ready to
@@ -83,25 +79,18 @@ A normal publication uses one writer request and two review requests. A repair
 uses the same number: writer, critique/repair, verification. Deterministic tag
 text skips the writer call but still needs both reviews; a tag is not an official
 release announcement. A first-round skip or hold ends without final verification.
-Historical ignored drafts remain readable; new writer requests cannot silently
-skip a source before editorial review.
-
-Completed stages survive interruptions. Transport failures use the normal
-backoff; malformed replies count against the item rather than retrying forever.
-Human corrections and retractions retain their separate trusted, locked workflow.
-Raw monitoring feeds are not collected or published.
 
 ## Exact decisions and private state
 
 Decisions bind the normalized candidate, source packet, coverage background,
-review policy, and current source/story/editorial state. The commit rechecks
-these bindings in an immediate SQLite transaction. Changed context invalidates
-the decision; publication never remerges different wording afterward.
+review policy, and current source/story/editorial state. A job resumed in a
+later run starts a new review if any of them changed. A candidate is prepared
+and committed in the same run, under the run lock, so the commit does not
+recheck them; publication never remerges different wording afterward.
 
-Private review jobs retain unfinished work. The bounded decision cache and
-analysis audit retain the source/context and reviews used for the decision.
-Only a recorded successful final verification can authorize publication.
-Skipped candidates are audited without changing articles or editorial controls.
+Private review jobs keep unfinished work, and a decision's receipt lasts until
+that decision commits. The analysis audit keeps the source, packet, coverage and
+reviews of each outcome.
 
 Use the existing `status`, `rejected show`, `retry` and `dismiss` controls to
 inspect failures. See [operator controls](REJECTED_ANALYSES.md) and
@@ -126,11 +115,10 @@ PYTHONPATH=src python tools/evaluate_review.py --config config.toml \
   --output /private/path/review-evaluation.jsonl --max-seconds 3600
 ```
 
-Use `--case-id` for selected cases and `--rounds` for repeated trials. The older
-`--verify-repairs` option remains accepted; final verification always runs.
-Expected results and case labels are not sent to the model. Inspect approved
-articles and repairs against the sources as well as checking the automatic
-scores: phrase checks cannot establish semantic correctness.
+Use `--case-id` for selected cases and `--rounds` for repeated trials. Expected
+results and case labels are not sent to the model. Inspect approved articles and
+repairs against the sources as well as checking the automatic scores: phrase
+checks cannot establish semantic correctness.
 
 Using the same model for drafting and review can retain shared blind spots.
 Finite tests are not a production accuracy estimate. Keep primary-source links,
