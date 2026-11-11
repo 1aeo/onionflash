@@ -19,6 +19,7 @@ from .review import Reviewer
 from .review_gate import process_item, status as review_status
 from .collect import CollectionError, collect_source
 from .comments import enrich_comments, merge_cached_comments, status as comments_status
+from .monitoring import candidates as monitoring_candidates
 from .config import load_config
 from .store import Store, source_due
 from .transport import HttpClient
@@ -316,6 +317,7 @@ def main(argv: list[str] | None = None) -> int:
                     else int(store.get_meta("published_stories")),
                     "comments": {"enabled": config["comments"]["enabled"], **comments_status(store)},
                     "final_review": review_status(store),
+                    "monitoring_candidates": monitoring_candidates(store.db, now_iso()),
                     "sources": store.health(
                         config["sources"], config["collection"]["stale_after_seconds"], now_iso()
                     ),

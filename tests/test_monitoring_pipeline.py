@@ -1,7 +1,9 @@
 """Monitoring notifications cannot silently enter the LLM news queue."""
 
 import copy
+import json
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -9,6 +11,7 @@ from onionflash import cli
 from onionflash.collect import CollectionError, collect_source
 from onionflash.config import load_config
 from onionflash.store import Store
+from onionflash.util import after
 from test_core import DATE, FakeClient, config, item, response, source
 
 
@@ -29,6 +32,56 @@ def test_unknown_monitor_messages_never_reach_qwen(tmp_path, monkeypatch):
         assert store.pending_count() == 0
         assert store.stories(10) == []
         assert result["alerts"]["test"]["unsupported"] > 0
+
+
+def test_qualifying_monitor_candidates_never_add_articles_or_feed_entries(tmp_path, monkeypatch):
+    cfg = config(tmp_path)
+    cfg["sources"] = [alert_source()]
+    warnings = [item(kind="feed", title="Consensus issues", url=f"https://example.org/report/{hour}",
+                     published_at=after(-hour * 3600, DATE), updated_at=after(-hour * 3600, DATE),
+                     content="WARNING: The following authorities are missing from the consensus: bastet")
+                for hour in range(10)]
+    monkeypatch.setattr(cli, "collect_source", lambda *args: {"items": warnings, "url": cfg["sources"][0]["url"]})
+    monkeypatch.setattr(cli, "now_iso", lambda: DATE)
+    monkeypatch.setattr(cli.Analyzer, "analyze", lambda *args: pytest.fail("Raw monitoring reached the model"))
+    with Store(cfg["storage"]["database"]) as store:
+        report = cli.run(cfg, store)
+        assert report["alerts"]["test"]["candidates"] == 1
+        assert report["alerts"]["test"]["published"] == 0
+        assert store.story_count() == store.pending_count() == 0
+        assert store.db.execute("SELECT COUNT(*) FROM analyses").fetchone()[0] == 0
+    public = Path(cfg["storage"]["output_dir"])
+    assert ET.parse(public / "feed.xml").findall("./channel/item") == []
+    assert json.loads((public / "feed.json").read_text())["items"] == []
+    assert not list(public.glob("news/*/index.html"))
+    assert "bastet" not in (public / "index.html").read_text()
+
+
+def test_status_exposes_bounded_private_candidates_without_mutating_them(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "config.toml"
+    path.write_text('''[storage]
+database="state.sqlite3"
+output_dir="public"
+[[sources]]
+id="test"
+url="https://example.org/feed.xml"
+''')
+    cfg = load_config(path)
+    monkeypatch.setattr(cli, "now_iso", lambda: DATE)
+    warnings = [item(title="Consensus issues", url=f"https://example.org/report/{hour}",
+                     published_at=after(-hour * 3600, DATE),
+                     content="WARNING: The following authorities are missing from the consensus: bastet")
+                for hour in range(10)]
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest_alerts(alert_source(), warnings, DATE)
+        before = sorted(store.db.iterdump())
+    assert cli.main(["status", "--config", str(path)]) == 0
+    shown = json.loads(capsys.readouterr().out)["monitoring_candidates"]
+    assert len(shown) == 1 and shown[0]["reports"] == 10
+    assert shown[0]["status"] == "needs-source-context"
+    assert shown[0]["sources"] and shown[0]["story_id"] is None
+    with Store(cfg["storage"]["database"]) as store:
+        assert sorted(store.db.iterdump()) == before
 
 
 def test_undated_monitor_message_is_not_retimestamped_on_each_poll():

@@ -297,20 +297,29 @@ def test_model_or_raw_story_cannot_forge_editorial_notice(seeded):
     assert "editorial" not in current_files(cfg, story_id)["json"]
 
 
-def test_reconstructed_monitor_group_reuses_locked_story(seeded, monkeypatch):
+def test_monitor_replay_preserves_a_locked_legacy_story(seeded, monkeypatch):
     cfg, store, ignored_story_id = seeded
     monkeypatch.setattr(monitoring, "parse_alerts", lambda item, name: ([{"target": "bastet", "condition": "authority-missing"}], 0))
     source = {"id": "health", "monitor_id": "test", "alert_format": "consensus", "name": "Consensus health"}
     notices = [{"published_at": after(offset, EDIT), "url": f"https://example.org/health/{offset}", "title": "Warning"} for offset in (-7200, -3600)]
     store.ingest_alerts(source, notices, EDIT)
-    row = store.db.execute("SELECT story_id FROM monitoring_groups").fetchone()
-    story_id = row[0]
+    group = store.db.execute("SELECT group_key FROM monitoring_groups").fetchone()[0]
+    # A pre-policy article keeps its permalink and operator correction. New
+    # monitor observations cannot create or replace public story text.
+    legacy = {**store.stories()[0], "id": "legacy-monitoring", "title": "An earlier monitoring observation"}
+    story_id = legacy["id"]
+    with store.db:
+        store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (story_id, "legacy-monitoring", json.dumps(legacy), legacy["published_at"], legacy["updated_at"]))
+        store.db.execute("UPDATE monitoring_groups SET story_id=? WHERE group_key=?", (story_id, group))
     receipt = edit(store, story_id)
+    store.ingest_alerts(source, notices, EDIT)
+    assert store.db.execute("SELECT story_id FROM monitoring_groups").fetchone()[0] == story_id
+    assert editorial.show(store.db, story_id)["hash"] == receipt["hash"]
+    assert store.story_count() == 2
     with store.db:
         store.db.execute("DELETE FROM monitoring_observations")
         store.db.execute("DELETE FROM monitoring_groups")
     store.ingest_alerts(source, notices, EDIT)
-    assert store.db.execute("SELECT story_id FROM monitoring_groups").fetchone()[0] == story_id
     assert editorial.show(store.db, story_id)["hash"] == receipt["hash"]
     assert store.story_count() == 2
 

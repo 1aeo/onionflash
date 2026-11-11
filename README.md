@@ -165,19 +165,12 @@ table line. Ambiguous recent rows are skipped with a source warning. See
 
 ### Automated monitoring alerts
 
-Consensus-health notifications use a deterministic parser selected by
-`alert_format = "consensus"`, with a configured `monitor_id` shared by any
-mirrors of the same monitor. They bypass the LLM, and undated messages cannot
-become news stories.
-
-Only directory-document warnings about a known directory authority are kept.
-They need two reports at least one hour apart within a two-day window before
-publication as **observed anomalies**. Ordinary repeats do not create stories,
-change RSS GUIDs or advance publication dates; a warning after two quiet days
-starts a new episode. Missing alerts never establish recovery. Monitor-side
-failures and routine service checks cannot establish an outage or attack, so they
-are not kept; each run's result counts them as unsupported. See
-[monitoring behavior and limits](docs/MONITORING.md).
+Consensus-health notifications remain private. The deterministic parser groups
+them into candidates for source-backed context; repeated warnings alone do not
+create headlines or enter the model queue. `onionflash status` exposes current
+private candidates. Ordinary incident reports and release announcements retain
+their existing publication path. See [monitoring qualification, inspection and
+episode rules](docs/MONITORING.md).
 
 ## Commands
 
@@ -296,8 +289,8 @@ queue at once. The context sentence
   data. The final commit checks the approval hashes and current source/story/lock
   state in one transaction, then writes the approved candidate without remerging.
   Model review reduces unsupported claims; it is **not proof of factual accuracy**.
-- Reports and suspected compromises retain explicit uncertainty; monitoring
-  alerts publish only as attributed `observed-anomaly` notices. GitLab issue
+- Reports and suspected compromises retain explicit uncertainty. Raw monitoring
+  follows the separate [private-candidate policy](docs/MONITORING.md). GitLab issue
   hosting alone does not establish confirmation. Tags
   are marked `tagged`; merges are marked `merged`. A later tag cannot downgrade an
   already announced release.
