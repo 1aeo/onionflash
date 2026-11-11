@@ -368,6 +368,7 @@ def test_operator_retry_preserves_held_audit_and_reuses_the_completed_draft(cont
     assert writer.calls == []
     final = json.loads(store.db.execute("SELECT review_record FROM analyses ORDER BY rowid DESC").fetchone()[0])
     assert final["outcome"] == "approved" and final["writer"] == {"key": cache_key(row, cfg["llm"])}
+    assert rejection.show_item(store, row["id"])["final_review"]["latest_review"]["verdict"] == "approve"
 
 
 def test_a_source_that_reverts_to_a_held_revision_is_held_again_without_a_review(context):
@@ -523,18 +524,21 @@ def test_a_database_error_during_analysis_is_not_an_item_strike(context, monkeyp
     assert tuple(store.db.execute("SELECT status,rejections FROM items").fetchone()) == ("pending", 0)
 
 
-def test_run_report_counts_held_stale_and_cached_reviews(context, monkeypatch):
+def test_run_report_counts_review_outcomes_and_model_calls(context, monkeypatch):
     from onionflash import cli
     cfg, store = context
     cfg["sources"] = []
-    outcomes = iter([("held", False), ("stale", False), ("published", True)])
-    monkeypatch.setattr(cli, "process_item", lambda *args, **kwargs: dict(zip(("status", "cache_hit"), next(outcomes))))
+    outcomes = iter([("held", False, 1, 2), ("stale", False, 0, 1), ("published", True, 0, 0),
+                     ("ignored", False, 1, 1), ("ignored", True, 0, 0)])
+    monkeypatch.setattr(cli, "process_item", lambda *args, **kwargs: dict(zip(
+        ("status", "cache_hit", "writer_calls", "review_calls"), next(outcomes))))
     monkeypatch.setattr(cli, "build", lambda *args: {})
-    for name in ("one", "two", "three"):
+    for name in ("one", "two", "three", "four", "five"):
         store.ingest(item(url="https://example.org/" + name), DATE)
     report = cli.run(cfg, store)
-    counts = [report[key] for key in ("analyzed", "analysis_failed", "review_held", "review_stale", "review_cache_hits")]
-    assert counts == [2, 1, 1, 1, 1]
+    counts = [report[key] for key in ("analyzed", "analysis_failed", "review_held", "review_stale",
+                                      "review_cache_hits", "review_skipped", "model_calls")]
+    assert counts == [4, 1, 1, 1, 2, 2, 6]
 
 
 def test_unusable_replies_and_drafts_take_strikes_and_the_run_still_builds(context, monkeypatch):

@@ -94,9 +94,12 @@ def test_rejected_cli_retry_has_no_publication_or_model_call(tmp_path, capsys):
     listed = invoke(capsys, "rejected", "list", "--config", config)
     assert len(listed["items"]) == 1
     assert listed["items"][0]["attempts"] == 3
+    assert invoke(capsys, "rejected", "list", "--config", config, "--status", "ignored")["items"] == []
     assert cli.main(["rejected", "show", "--config", str(config), "--item", row["id"]]) == 0
     raw = capsys.readouterr().out
     assert "\\u202e" in raw and "\u202e" not in raw
+    assert invoke(capsys, "rejected", "dismiss", "--config", config, "--item", row["id"], "--expect-hash",
+                  row["content_hash"], "--reason", "Dismissed by mistake")["status"] == "dismissed"
     retried = invoke(capsys, "rejected", "retry", "--config", config, "--item", row["id"],
                      "--expect-hash", row["content_hash"], "--reason", "Review rule corrected")
     assert retried["status"] == "pending"

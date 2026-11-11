@@ -74,7 +74,7 @@ def test_a_damaged_saved_item_stays_listable_and_inspectable(store, kind):
 def test_a_damaged_saved_item_can_be_dismissed_but_not_retried(store, kind):
     _, row = rejected(store)
     damage(store, row, kind)
-    with pytest.raises(ValueError, match="restore or recollect it first"):
+    with pytest.raises(ValueError, match="incomplete or unreadable"):
         rejection.retry_item(store, row["id"], row["content_hash"], "try again")
     assert rejection.dismiss_item(store, row["id"], row["content_hash"], "damaged copy")["status"] == "dismissed"
 
@@ -220,6 +220,7 @@ def test_retry_and_dismiss_do_not_mutate_an_existing_story_or_editorial_state(st
         store.defer(source["id"], "Unsupported later claim", DEFAULTS["llm"], DATE, terminal=True)
     before = editorial.show(store.db, original_story_id)  # its hash covers the story row, revision, lock and retraction
     current = rejection.show_item(store, source["id"])
+    assert current["final_review"] is None  # the earlier revision's decision is not this one's
     rejection.retry_item(store, source["id"], current["content_hash"], "Check repaired reviewer", DATE)
     for _ in range(failures):
         store.defer(source["id"], "Still unsupported", DEFAULTS["llm"], DATE, terminal=True)
@@ -235,7 +236,7 @@ def test_retry_refuses_an_incomplete_saved_item_but_dismiss_still_works(store, f
     payload.pop(field)
     with store.db:
         store.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps(payload), row["id"]))
-    with pytest.raises(ValueError, match="restore or recollect"):
+    with pytest.raises(ValueError, match="incomplete or unreadable"):
         rejection.retry_item(store, row["id"], row["content_hash"], "Try again", DATE)
     assert actions(store) == []
     rejection.dismiss_item(store, row["id"], row["content_hash"], "No usable stored body", DATE)
@@ -333,7 +334,7 @@ def test_failed_pending_actions_preserve_audit_and_do_not_repeat(store, action, 
     ("pending", 0, None), ("pending", 0, "old error"), ("pending", 1, None),
     ("pending", 1, "  \t"), ("pending", -1, "old error"),
     ("published", 2, "old error"), ("ignored", 2, "old error"), ("dismissed", 2, "old error"),
-] if (action, case[0]) != ("retry", "dismissed")])  # retry undoes a dismissal
+] if action == "dismiss" or case[0] not in {"dismissed", "ignored"}])  # retry undoes a dismissal or reconsiders an ignored item
 def test_new_or_completed_items_cannot_be_acted_on(store, action, status, attempts, error):
     _, row = failed_pending(store)
     with store.db:
@@ -383,7 +384,7 @@ def test_dismissed_failed_pending_revision_only_requeues_on_source_change(store)
 
 @pytest.mark.parametrize("action", ["retry", "dismiss"])
 @pytest.mark.parametrize("change", ["status='published'", "attempts=attempts+1", "rejections=rejections+1",
-                                    "last_error=NULL", "next_attempt_at=NULL", "source_id='retired-alerts'",
+                                    "last_error=NULL", "next_attempt_at=NULL",
                                     # Comment refreshes rewrite only the payload, so the swap compares its exact bytes.
                                     "payload='{\"other\": 1}'", "payload=replace(payload, 'title', 'título')",
                                     "payload=CAST(x'7b22ff22' AS TEXT)"])
@@ -413,11 +414,10 @@ def test_ignored_reconsideration_is_explicit_audited_and_one_item_only(store):
     _, row = ignored(store)
     _, other = ignored(store, 1)
     key = cache_key(row, DEFAULTS["llm"])
-    with pytest.raises(ValueError, match="reconsider-ignored"):
-        rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DATE)
+    with pytest.raises(ValueError, match="previously failed pending"):  # only a retry reconsiders it
+        rejection.dismiss_item(store, row["id"], row["content_hash"], "Reviewed selection", DATE)
     assert actions(store) == []
-    result = rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DATE,
-                                  reconsider_ignored=True, retired_source_ids={"retired-alerts"})
+    result = rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DATE)
     assert result["status"] == "pending" and store.stories() == []
     current = dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone())
     assert current["attempts"] == current["rejections"] == 0
@@ -432,143 +432,39 @@ def test_ignored_reconsideration_is_explicit_audited_and_one_item_only(store):
     assert audit["superseded_analysis_key"] is None and audit["superseded_analysis_json"] is None
     assert analysis_result(store, key) == analysis()
     with pytest.raises(ValueError, match="previously failed pending"):
-        rejection.retry_item(store, row["id"], row["content_hash"], "Duplicate retry", DATE,
-                              reconsider_ignored=True)
+        rejection.retry_item(store, row["id"], row["content_hash"], "Duplicate retry", DATE)
     assert len(actions(store)) == 1
 
 
-@pytest.mark.parametrize("status", ["pending", "published"])  # a dismissed revision can always be retried
-def test_reconsider_flag_does_not_allow_new_pending_or_other_completed_states(store, status):
-    _, row = ignored(store)
-    with store.db:
-        store.db.execute("UPDATE items SET status=? WHERE id=?", (status, row["id"]))
-    with pytest.raises(ValueError, match="previously failed pending"):
-        rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DATE,
-                              reconsider_ignored=True)
-    assert store.db.execute("SELECT status FROM items WHERE id=?", (row["id"],)).fetchone()[0] == status
-    assert actions(store) == []
-
-
-@pytest.mark.parametrize("problem", ["stale", "cold", "reason", "audit"])
-def test_ignored_reconsideration_retains_existing_guards_and_transactional_audit(store, problem):
-    """Invalid or unauditable reconsideration leaves the queue and saved analysis intact."""
-    _, row = ignored(store)
-    expected, reason = row["content_hash"], "Reviewed selection"
-    if problem == "stale":
-        expected = "f" * 64
-    elif problem == "cold":
-        payload = json.loads(row["payload"])
-        payload.pop("content")
-        with store.db:
-            store.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps(payload), row["id"]))
-    elif problem == "reason":
-        reason = ""
-    else:
-        with store.db:
-            store.db.execute("CREATE TRIGGER fail_audit BEFORE INSERT ON rejection_actions BEGIN SELECT RAISE(ABORT,'unavailable'); END")
-    before = dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone())
-    previous = analysis_result(store, cache_key(row, DEFAULTS["llm"]))
-    with pytest.raises((ValueError, sqlite3.IntegrityError)):
-        rejection.retry_item(store, row["id"], expected, reason, DATE, reconsider_ignored=True)
-    assert dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()) == before
-    assert analysis_result(store, cache_key(row, DEFAULTS["llm"])) == previous
-    assert actions(store) == []
-
-
-def test_ignored_reconsideration_rechecks_concurrent_state(store, monkeypatch):
-    _, row = ignored(store)
-    original = rejection._checked
-    database = store.db.execute("PRAGMA database_list").fetchone()[2]
-    def changed_after_read(db, item_id, expected_hash, **kwargs):
-        captured = original(db, item_id, expected_hash, **kwargs)
-        with sqlite3.connect(database) as other:
-            other.execute("UPDATE items SET status='published' WHERE id=?", (item_id,))
-        return captured
-    monkeypatch.setattr(rejection, "_checked", changed_after_read)
-    with pytest.raises(ValueError, match="changed during"):
-        rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DATE,
-                              reconsider_ignored=True)
-    assert store.db.execute("SELECT status FROM items WHERE id=?", (row["id"],)).fetchone()[0] == "published"
-    assert actions(store) == []
-
-
-def test_cli_reconsider_flag_is_available_only_on_retry(store, tmp_path, monkeypatch, capsys):
-    from onionflash import cli
-    _, row = ignored(store)
-    path = tmp_path / "config.toml"
-    path.write_text('''[storage]
-database="queue.sqlite3"
-output_dir="public"
-[[sources]]
-id="test"
-url="https://example.org/feed.xml"
-''')
-    monkeypatch.setattr(cli.Analyzer, "analyze", lambda *_args: pytest.fail("Retry must not call a model"))
-    options = ["--config", str(path), "--item", row["id"], "--expect-hash", row["content_hash"], "--reason", "Reviewed selection"]
-    assert cli.main(["rejected", "retry", *options]) == 2
-    assert "reconsider-ignored" in capsys.readouterr().err
-    with pytest.raises(SystemExit) as rejected_flag:
-        cli.main(["rejected", "dismiss", *options, "--reconsider-ignored"])
-    assert rejected_flag.value.code == 2
-    capsys.readouterr()
-    assert cli.main(["rejected", "retry", *options, "--reconsider-ignored"]) == 0
-    assert json.loads(capsys.readouterr().out)["status"] == "pending"
-    assert actions(store)[0]["before_status"] == "ignored"
-
-
 def reviewed_skip(store):
-    """Commit a reviewed skip, which leaves neither its job nor its receipt."""
+    """Commit a skip for insufficient new information, which leaves neither its job nor its receipt."""
     from onionflash import review_gate
     from test_review_gate import Reviewer, Writer, verdict
     source = item(url="https://example.org/reconsidered-report")
     store.ingest(source, DATE)
     row = store.pending(1, DATE)[0]
-    checker = Reviewer(verdict("skip", criterion="new_information"))
+    reply = verdict("skip", criterion="new_information")
+    reply["criteria"]["new_information"]["outcome"] = "insufficient"
+    checker = Reviewer(reply)
     assert review_gate.process_item(DEFAULTS, store, row, Writer(), checker, DATE)["status"] == "ignored"
     assert not store.db.execute("SELECT 1 FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
     assert not store.db.execute("SELECT 1 FROM review_approvals").fetchone()
     return row, checker.calls[0][0]
 
 
-@pytest.mark.parametrize("status", ["ignored", "rejected", "pending"])
-def test_retry_refuses_configured_retired_sources_without_mutating_saved_state(store, status):
-    """Reject retired retries before queue changes, audit creation or evidence deletion."""
+def test_a_skip_is_listed_with_its_reason_and_shows_its_decision_and_coverage(store):
+    store.ingest(item(url="https://example.org/earlier-report"), DATE)
+    first = store.pending(1, DATE)[0]
+    finish_reviewed(store, first, analysis(), cache_key(first, DEFAULTS["llm"]), DATE)
     row, _ = reviewed_skip(store)
-    with store.db:
-        store.db.execute("UPDATE items SET status=?,attempts=1,last_error='Earlier failure' WHERE id=?",
-                         (status, row["id"]))
-    before = sorted(store.db.iterdump())
-    with pytest.raises(ValueError, match="Retired alert sources cannot be retried"):
-        rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DATE,
-                             reconsider_ignored=status == "ignored", retired_source_ids={row["source_id"]})
-    assert sorted(store.db.iterdump()) == before
-    assert actions(store) == []
-
-
-@pytest.mark.parametrize("alert_format", ["consensus", "censorship"])
-def test_cli_refuses_retired_alert_reconsideration_before_queue_or_audit_changes(store, tmp_path, monkeypatch, capsys, alert_format):
-    """Apply configured retirement to operator retries without invoking a model."""
-    from onionflash import cli
-    row, _ = reviewed_skip(store)
-    path = tmp_path / "config.toml"
-    path.write_text(f'''[storage]
-database="queue.sqlite3"
-output_dir="public"
-[[sources]]
-id="test"
-url="https://example.org/feed.xml"
-kind="feed"
-authority="telemetry"
-alert_format="{alert_format}"
-''')
-    monkeypatch.setattr(cli.Analyzer, "analyze", lambda *_args: pytest.fail("Retry must not call a model"))
-    before = sorted(store.db.iterdump())
-    assert cli.main(["rejected", "retry", "--config", str(path), "--item", row["id"],
-                     "--expect-hash", row["content_hash"], "--reason", "Reviewed selection", "--reconsider-ignored"]) == 2
-    output = capsys.readouterr()
-    assert output.out == "" and "Retired alert sources cannot be retried" in output.err
-    assert sorted(store.db.iterdump()) == before
-    assert actions(store) == []
+    listed = rejection.list_items(store, status="ignored")["items"]
+    assert [(entry["id"], entry["rejection_reason"]) for entry in listed] == [(row["id"], "Final review skipped: new_information")]
+    shown = rejection.show_item(store, row["id"])["final_review"]
+    assert shown["stage"] == "finished" and shown["latest_review"]["criteria"]["new_information"]["outcome"] == "insufficient"
+    assert [entry["id"] for entry in shown["coverage"]["recent"]] == [store.stories()[0]["id"]]
+    with store.db:  # earlier releases committed some revisions without a review record
+        store.record_analysis(row, analysis(), "commit-without-a-record", DATE)
+    assert rejection.show_item(store, row["id"])["final_review"] is None
 
 
 def test_explicit_reconsideration_gets_a_fresh_decision(store):
@@ -576,8 +472,7 @@ def test_explicit_reconsideration_gets_a_fresh_decision(store):
     from onionflash import review_gate
     from test_review_gate import Reviewer, Writer, verdict
     row, candidate = reviewed_skip(store)
-    rejection.retry_item(store, row["id"], row["content_hash"], "Reconsider this editorial decision", DATE,
-                         reconsider_ignored=True)
+    rejection.retry_item(store, row["id"], row["content_hash"], "Reconsider this editorial decision", DATE)
     checker = Reviewer(verdict())
     result = review_gate.process_item(DEFAULTS, store, store.pending(1, DATE)[0], Writer(), checker, DATE)
     assert result["status"] == "published" and not result["cache_hit"]

@@ -138,9 +138,6 @@ class Store:
                 superseded_analysis_key TEXT, superseded_analysis_json TEXT
             );
             CREATE INDEX IF NOT EXISTS rejection_actions_item ON rejection_actions(item_id,action_id);
-            DROP TABLE IF EXISTS monitoring_observations;
-            DROP TABLE IF EXISTS monitoring_counters;
-            DROP TABLE IF EXISTS monitoring_groups;
         """)
         editorial.initialize(self.db)
         analysis_columns = {row[1] for row in self.db.execute("PRAGMA table_info(analyses)")}
@@ -346,7 +343,7 @@ class Store:
         self.db.execute("BEGIN IMMEDIATE")
         with self.db:
             row, result, story_id, locked = prepared["row"], prepared["result"], prepared["story_id"], prepared["locked"]
-            payload = None
+            payload = skipped = None
             if not locked:
                 original = prepared["candidate"]
                 if not isinstance(approved_candidate, dict) or set(approved_candidate) != set(original):
@@ -375,6 +372,9 @@ class Store:
                     payload.update({key: approved_candidate[key] for key in candidate.SEMANTIC_FIELDS})
                     if candidate.existing_story(self.db, row) is None:  # Date publication, not the first draft.
                         payload["added_at"] = observed
+                else:
+                    skipped = ("Final review skipped: " + ", ".join(
+                        name for name, check in verdict["criteria"].items() if check["outcome"] != "pass"))[:160]
             analysis_key = self.record_analysis(row, result, cache_key, observed, review_record=review_record)
             if payload is not None:
                 if payload.get("editorial_item") == row["id"]:
@@ -386,8 +386,8 @@ class Store:
                 editorial.record_held(self.db, story_id)
             published = decision == "approve"
             mapped_id = story_id if published else row.get("story_id")
-            self.db.execute("UPDATE items SET status=?,story_id=?,next_attempt_at=NULL,last_error=NULL WHERE id=?",
-                            ("published" if published else "ignored", mapped_id, row["id"]))
+            self.db.execute("UPDATE items SET status=?,story_id=?,next_attempt_at=NULL,last_error=? WHERE id=?",
+                            ("published" if published else "ignored", mapped_id, skipped, row["id"]))
             self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
         return {"story_id": mapped_id, "status": "locked" if locked and published else "published" if published else "ignored"}
 
