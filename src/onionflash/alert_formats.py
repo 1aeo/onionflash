@@ -1,7 +1,7 @@
 """Bounded, deterministic observations from consensus-health notifications.
 
-Only directory-document warnings are read: they are the only lines that can
-publish. The parser describes what the monitor reported; it never infers
+Only directory-document warnings are retained for private candidate checks.
+The parser describes what the monitor reported; it never infers impact,
 attacks or recovery, and authority names do not become independent monitors.
 """
 
