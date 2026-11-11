@@ -76,9 +76,19 @@ def test_writer_rejects_separate_impact_text_even_when_endpoint_ignores_schema(m
     with pytest.raises(AnalysisError, match="leave why_it_matters empty") as caught:
         llm.analyze(item())
     assert not caught.value.retryable
-    assert len(llm.client.requests) == 1 + use_fallback
+    assert len(llm.client.requests) == llm.calls == 1 + use_fallback  # the run report counts each endpoint request
     assert all(request[1]["response_format"]["json_schema"]["schema"]["properties"]["why_it_matters"]["enum"] == [""]
                for request in llm.client.requests)
+
+
+@pytest.mark.parametrize("sent", [0, 1])
+def test_endpoint_attempts_refused_at_the_deadline_are_not_counted(monkeypatch, sent):
+    from onionflash.transport import DeadlineReached
+    responses = [FetchError("network request failed", retryable=True)] * sent + [DeadlineReached()] * (3 - sent)
+    llm = analyzer(monkeypatch, *responses, fallbacks=["https://fallback.example/v1", "https://third.example/v1"])
+    with pytest.raises(AnalysisError, match="LLM request failed") as caught:
+        llm.analyze(item())
+    assert caught.value.retryable and llm.calls == sent and len(llm.client.requests) == sent + 1
 
 
 def test_endpoint_failures_are_retryable_and_validation_is_not_resent(monkeypatch):

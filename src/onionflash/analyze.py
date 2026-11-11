@@ -6,7 +6,7 @@ import copy
 import json
 import os
 
-from .transport import FetchError, HttpClient
+from .transport import DeadlineReached, FetchError, HttpClient
 from .util import digest, normalize_evidence as _plain
 from .comments import analysis_context
 from .schema import CATEGORIES, PRIORITIES, CONFIDENCES, STATES, PRODUCTS
@@ -273,13 +273,13 @@ class CompletionClient:
         }
         if self.llm["send_chat_template_kwargs"]:
             request["chat_template_kwargs"] = {"enable_thinking": self.llm["enable_thinking"]}
-        self.calls += 1
         return self._complete(request, key)
 
     def _complete(self, request: dict, key: str) -> dict:
         """POST one chat completion; only transport failures move on to a fallback."""
         failure = AnalysisError("All LLM endpoints failed", retryable=True)
         for base_url in [self.llm["base_url"], *self.llm["fallback_base_urls"]]:
+            self.calls += 1
             try:
                 response = self.client.request(
                     "POST",
@@ -294,6 +294,9 @@ class CompletionClient:
                     "LLM request failed" + (f" (HTTP {exc.status})" if exc.status else ""),
                     retryable=True,
                 )
+                if isinstance(exc, DeadlineReached):  # refused unsent, as every later endpoint would be
+                    self.calls -= 1
+                    raise failure from None
         else:
             raise failure
         try:

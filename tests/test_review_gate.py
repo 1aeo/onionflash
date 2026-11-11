@@ -562,19 +562,23 @@ def test_run_report_counts_review_outcomes(context, monkeypatch):
 
 
 def test_run_report_counts_the_model_requests_of_items_that_fail(context, monkeypatch):
-    from onionflash import cli
-    from onionflash.analyze import CompletionClient
+    from onionflash import analyze, cli
+    from onionflash.transport import FetchError, Response
     cfg, store = context
     cfg["sources"] = []
     cfg["llm"]["base_url"] = "https://llm.example/v1"
     monkeypatch.setenv(cfg["llm"]["api_key_env"], "test-key")
 
-    def complete(client, request, key):
-        if request["response_format"]["json_schema"]["name"] == "onionflash_news":
-            return analysis(why_it_matters="")
-        raise AnalysisError("LLM request failed", retryable=True)
+    class Transport:  # the writer's requests succeed; every review request fails in transport
+        def request(self, method, url, headers=None, json_body=None):
+            if json_body["response_format"]["json_schema"]["name"] != "onionflash_news":
+                raise FetchError("network request failed", retryable=True)
+            body = {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(analysis(why_it_matters=""))}}]}
+            return Response(200, json.dumps(body).encode(), {}, url)
+        def close(self):
+            pass
 
-    monkeypatch.setattr(CompletionClient, "_complete", complete)
+    monkeypatch.setattr(analyze, "HttpClient", lambda *args, **kwargs: Transport())
     monkeypatch.setattr(cli, "build", lambda *args: {})
     for name in ("one", "two"):
         store.ingest(item(url="https://example.org/" + name), DATE)
