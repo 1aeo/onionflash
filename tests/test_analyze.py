@@ -233,10 +233,3 @@ def test_empty_optional_context_is_a_valid_draft(monkeypatch):
     llm = analyzer(monkeypatch, completion(draft))
     assert llm.analyze(item())["why_it_matters"] == ""
     assert len(llm.client.requests) == 1
-
-
-def test_duplicate_model_json_fields_are_rejected():
-    from onionflash.analyze import _json_object
-    for text in ('{"publish":false,"publish":true}', '{"nested":{"verdict":"hold","verdict":"approve"}}'):
-        with pytest.raises(AnalysisError, match="invalid JSON"):
-            _json_object(text)

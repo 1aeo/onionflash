@@ -242,20 +242,9 @@ while taking their upload snapshot.
 
 ## Reliability and editorial behavior
 
-Automatic model-written news must pass a final source-bound publication review.
-The application drafts once, assembles the exact story using its existing grouping
-and precedence rules, then reviews that candidate against numbered source passages.
-The rubric checks support, actor/action, status, uncertainty, scope/timing,
-operational advice and technical details separately. All seven must pass.
-
-A proposed repair receives a fresh verification request before publication. There
-is at most one repair, so a normal successful path uses two model calls and a
-repaired path uses three. Timeouts retain completed stages and back off.
-Malformed verdicts also retain them but count toward the item's three failed
-attempts; a semantic hold, including an unusable repair, enters the rejected
-queue at once. The context sentence
-(`why_it_matters`) may be empty when the sources do not support it. See
-[final review, configuration and evaluation](docs/FINAL_REVIEW.md).
+Automatic model-written stories publish only after a separate model call approves
+the exact final story against numbered source passages; a hold enters the rejected
+queue. See [final review, configuration and evaluation](docs/FINAL_REVIEW.md).
 
 - Public HTTP and private inference share the same transport helper. It validates
   addresses at TCP connection time, pins connections to vetted IPs while retaining
@@ -278,23 +267,18 @@ queue at once. The context sentence
   minus a 15-minute overlap. XML declarations/entities are rejected with an
   encoding-aware parser before feed parsing.
 - New and changed items are saved before analysis. Private analysis records remain
-  an audit, not a general runtime analysis cache. Unfinished review jobs retain
-  their completed writer draft and current review/verification stage. Exact
-  approval receipts are reused only when candidate, evidence, policy and source
-  bindings still match. The application makes one model request at a time, within
-  the existing run budget, and preserves the analysis time reserve.
+  an audit, not a general runtime analysis cache. The application makes one model
+  request at a time, within the existing run budget, and preserves the analysis
+  time reserve.
 - Explicit `kind = "tag"` streams produce attributed tag notices without an LLM
   request. These notices remain `tagged`, have a fixed queue-priority
   floor, and cannot replace a richer announcement already grouped with that
-  version. If a tag joins existing model-written coverage, that final merged
-  candidate still needs review. Repeated identical model labels are normalized rather than retried;
+  version. Repeated identical model labels are normalized rather than retried;
   invalid labels and unsupported evidence are still rejected.
 - Summaries need schema-valid fields and exact supporting excerpts from the
   supplied source. The excerpts stay private; public citations are created from
   collected URLs, never model-proposed URLs. Source text is treated as untrusted
-  data. The final commit checks the approval hashes and current source/story/lock
-  state in one transaction, then writes the approved candidate without remerging.
-  Model review reduces unsupported claims; it is **not proof of factual accuracy**.
+  data.
 - Reports and suspected compromises retain explicit uncertainty; monitoring
   alerts publish only as attributed `observed-anomaly` notices. GitLab issue
   hosting alone does not establish confirmation. Tags
@@ -343,10 +327,11 @@ publication metadata outside the webroot. The deployment repository can publish
 durable objects through DigitalOcean Spaces while preserving the existing URLs.
 See [permanent history and recovery](docs/PERMANENT_HISTORY.md).
 
-LLM availability and output quality depend on your model. The prompt and evidence
-checks reduce unsupported statements, but important security conclusions should
-always be checked against the linked primary source. Personal alert delivery is
-intentionally outside this initial website/RSS release.
+LLM availability and output quality depend on your model. The prompt, evidence
+checks and final review reduce unsupported statements but are **not proof of
+factual accuracy**; check important security conclusions against the linked
+primary source. Personal alert delivery is intentionally outside this initial
+website/RSS release.
 
 See [source coverage and remaining features](docs/SOURCE_COVERAGE.md).
 
