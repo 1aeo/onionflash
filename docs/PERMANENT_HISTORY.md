@@ -23,7 +23,7 @@ SQLite queues a story when its stored payload changes. One build processes at
 most `storage.render_batch_size` articles, then refreshes the necessary views.
 The default is 250, adjustable from 1 to 1,000. There is no corresponding limit
 on how many accepted stories the catalog retains. New and changed stories and
-editorial actions render ahead of a template, year or forced rebuild.
+editorial actions render ahead of a template or forced rebuild.
 
 Unchanged article HTML and JSON are not rewritten. Whole-history feeds require
 a sequential pass when their content changes, but are streamed with bounded
@@ -31,8 +31,9 @@ memory. Pagination indexes can change when new stories shift page boundaries.
 Neither operation requires rerunning the LLM.
 
 An indexed topic-membership table keeps topic pagination bounded in memory.
-Only affected topic listings are refreshed after a content or classification
-change. Obsolete pagination views can be removed; article pages are retained.
+Topic listings are regenerated with the homepage after a catalog change;
+unchanged pages are not rewritten. Obsolete pagination views can be removed;
+article pages are retained.
 
 The private catalog stores timestamps, hashes and one compact last-good public
 JSON snapshot per article. Raw source text and model evidence are not exported
@@ -90,7 +91,7 @@ unrepresented article blocks retirement instead of deleting unfamiliar data.
 Restore or inspect the affected output before retrying. The private metadata
 flag `publication_no_browser_js_ready` records the completed transition.
 
-Later bounded template and copyright-year rebuilds resume normally. Their
+Later bounded rebuilds resume normally. Their
 existing pages are already script-free. The deployer validates new HTML and
 serves a script-blocking CSP; old immutable storage objects and prior deployment
 versions remain available for rollback.

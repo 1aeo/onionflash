@@ -5,9 +5,9 @@ import copy
 
 import pytest
 
-from onionflash.render import render_site
 from onionflash.store import Store
 from test_core import DATE, analysis, item
+from test_render import publish
 
 
 def timeline(**changes):
@@ -42,7 +42,7 @@ def test_line_moves_do_not_requeue_but_corrections_replace_the_citation(tmp_path
         assert final["sources"] == [{"id": corrected["id"], "url": corrected["url"], "title": corrected["title"], "published_at": corrected["published_at"]}]
         assert store.db.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 1
         assert store.db.execute("SELECT url FROM items").fetchone()[0] == corrected["url"]
-        render_site({"site": {"base_url": "https://example.org/"}}, [final], [], tmp_path / "public")
+        publish([final], tmp_path / "public")
         for name in ["index.html", "feed.xml", "feed.json"]:
             assert "editorial_kind" not in (tmp_path / "public" / name).read_text()
 

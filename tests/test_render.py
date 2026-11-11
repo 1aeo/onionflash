@@ -9,8 +9,12 @@ import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from html.parser import HTMLParser
+from unittest.mock import patch
 
-from onionflash.render import CATEGORIES, _page_url, render_site
+from onionflash.cli import build
+from onionflash.config import DEFAULTS
+from onionflash.render import CATEGORIES, _page_url
+from onionflash.store import Store
 
 
 CONFIG = {
@@ -35,6 +39,19 @@ STORY = {
     "published_at": "2026-11-08T12:00:00Z",
     "updated_at": "2026-11-08T14:00:00Z",
 }
+
+
+def publish(stories, output, *, health=(), **site):
+    """Store the stories and publish them through the production build; returns the skipped count."""
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["site"].update(CONFIG["site"], **site)
+    cfg["storage"].update(database=f"{output}.sqlite3", output_dir=str(output))
+    with Store(cfg["storage"]["database"]) as store, patch.object(Store, "health", return_value=list(health)):
+        for number, story in enumerate(stories):
+            store.db.execute("INSERT INTO stories(id,cluster_key,payload,published_at,updated_at) VALUES(?,?,?,'','')",
+                             (story["id"], f"test:{number}", json.dumps(story)))
+        store.db.commit()
+        return build(cfg, store)["stories_skipped"]
 
 
 class Page(HTMLParser):
@@ -84,9 +101,9 @@ class RenderTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def render(self, stories=None, *, health=None, config=None, name="site"):
+    def render(self, stories=None, *, health=(), name="site", **site):
         output = self.root / name
-        render_site(config or CONFIG, [copy.deepcopy(STORY)] if stories is None else stories, health or [], output)
+        publish([copy.deepcopy(STORY)] if stories is None else stories, output, health=health, **site)
         return output
 
     def test_valid_feeds_stable_permalink_original_publication_date(self):
@@ -131,8 +148,7 @@ class RenderTests(unittest.TestCase):
         page = (output / "index.html").read_text()
         self.assertLess(page.index('id="story-newer"'), page.index('id="story-older"'))
         # A small homepage must select the newest publication before truncation.
-        config = {"site": {**CONFIG["site"], "page_size": 1}}
-        limited = self.render([older, newer], config=config, name="limited")
+        limited = self.render([older, newer], page_size=1, name="limited")
         page = (limited / "index.html").read_text()
         self.assertIn('id="story-newer"', page)
         self.assertNotIn('id="story-older"', page)
@@ -142,7 +158,8 @@ class RenderTests(unittest.TestCase):
     def assert_skipped(self, bad, name):
         """Render a bad story next to a valid one: only the valid story is published."""
         output = self.root / name
-        self.assertEqual(render_site(CONFIG, [bad, copy.deepcopy(STORY)], [], output), 1)
+        bad = {**bad, "id": "rejected"} if bad["id"] == STORY["id"] else bad
+        self.assertEqual(publish([bad, copy.deepcopy(STORY)], output), 1)
         self.assertEqual([p.name for p in (output / "news").iterdir()], [STORY["id"]])
         self.assertEqual(len(json.loads((output / "feed.json").read_text())["items"]), 1)
 
@@ -236,16 +253,16 @@ class RenderTests(unittest.TestCase):
     def test_build_fails_instead_of_publishing_an_empty_site_when_every_story_fails(self):
         bad = copy.deepcopy(STORY)
         bad["sources"] = [{"url": "javascript:alert(1)", "title": "bad"}]
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "No stored story can be rendered"):
             self.render([bad])
 
     def test_one_unrenderable_story_does_not_block_the_others(self):
         bad = copy.deepcopy(STORY)
         bad.update(id="badbadbadbadbadbadbadbad", sources=[{"url": "javascript:alert(1)", "title": "x"}])
         output = self.root / "mixed"
-        with self.assertLogs("onionflash.render", "WARNING") as logs:
-            self.assertEqual(render_site(CONFIG, [bad, copy.deepcopy(STORY)], [], output), 1)
-        self.assertEqual(logs.output, ["WARNING:onionflash.render:Skipping unrenderable story badbadbadbadbadbadbadbad (ValueError)"])
+        with self.assertLogs("onionflash.publication", "WARNING") as logs:
+            self.assertEqual(publish([bad, copy.deepcopy(STORY)], output), 1)
+        self.assertEqual(logs.output, ["WARNING:onionflash.publication:Quarantined unrenderable story badbadbadbadbadbadbadbad (ValueError)"])
         self.assertTrue((output / "news" / STORY["id"] / "index.html").is_file())
         self.assertFalse((output / "news" / bad["id"]).exists())
         self.assertEqual(len(json.loads((output / "feed.json").read_text())["items"]), 1)
@@ -289,8 +306,7 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn("Content-Type:", headers)
 
     def test_root_and_local_preview_base_urls_are_supported(self):
-        config = {"site": {"base_url": "http://127.0.0.1:8788/"}}
-        output = self.render(config=config)
+        output = self.render(base_url="http://127.0.0.1:8788/")
         self.assertIn('href="http://127.0.0.1:8788/feed.xml"', (output / "index.html").read_text())
         headers = (output / "_headers").read_text()
         self.assertTrue(headers.startswith("/*\n"))
@@ -315,21 +331,14 @@ class RenderTests(unittest.TestCase):
                 self.assertIn('<span>Source</span>', page)
                 self.assertNotIn(url, page)
 
-    def test_existing_output_or_symlink_is_rejected(self):
-        output = self.render()
-        with self.assertRaises(ValueError):
-            render_site(CONFIG, [], [], output)
-        link = self.root / "link"
-        link.symlink_to(output, target_is_directory=True)
-        with self.assertRaises(ValueError):
-            render_site(CONFIG, [], [], link)
-
     def test_output_deterministic_and_category_feed_is_filtered(self):
         first = self.render(name="a")
         second = self.render(name="b")
         for file in first.rglob("*"):
             if file.is_file():
                 self.assertEqual(file.read_bytes(), (second / file.relative_to(first)).read_bytes())
+        # No page carries the current year, so a new year rewrites nothing.
+        self.assertNotRegex((first / "index.html").read_text(), r"© \d{4}")
         self.assertEqual(len(ET.parse(first / "tags/release.xml").findall("./channel/item")), 1)
         self.assertEqual(ET.parse(first / "tags/security.xml").findall("./channel/item"), [])
 
@@ -405,8 +414,7 @@ class RenderTests(unittest.TestCase):
 
     def test_topic_pagination_canonical_urls_and_newest_first_order(self):
         stories = [dict(STORY, id=f"release{number}", added_at=f"2026-11-{number + 1:02}T12:00:00Z") for number in range(3)]
-        config = {"site": {**CONFIG["site"], "page_size": 1}}
-        output = self.render(stories, config=config)
+        output = self.render(stories, page_size=1)
         for number, expected in [(1, "release2"), (2, "release1"), (3, "release0")]:
             page_url = _page_url(CONFIG["site"]["base_url"], number, "release")
             file = output / _page_url("", number, "release") / "index.html"

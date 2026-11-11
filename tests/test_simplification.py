@@ -1,5 +1,7 @@
 import pytest
+import shutil
 import sqlite3
+from pathlib import Path
 from unittest.mock import patch
 
 from onionflash.analyze import AnalysisError, validate_analysis, _json_object
@@ -88,20 +90,15 @@ def test_failed_backup_closes_source_and_removes_private_partial(tmp_path):
         opened[0].execute("SELECT 1")
 
 
-def test_shared_render_dependencies_invalidate_public_build_cache(tmp_path, monkeypatch):
+def test_every_render_dependency_invalidates_the_public_build_cache(tmp_path, monkeypatch):
     from onionflash import publication
-    package = tmp_path / "package"
-    package.mkdir()
-    (package / "assets").mkdir()
-    for name in ("render.py", "publication.py", "editorial.py", "schema.py", "util.py"):
-        (package / name).write_text("initial")
+    package = shutil.copytree(Path(publication.__file__).parent, tmp_path / "package")
     monkeypatch.setattr(publication, "__file__", str(package / "publication.py"))
-    first = publication.template_identity({})
-    (package / "schema.py").write_text("changed labels")
-    second = publication.template_identity({})
-    assert first != second
-    (package / "util.py").write_text("changed timestamp formatting")
-    assert second != publication.template_identity({})
+    seen = {publication.template_identity({})}
+    for name in ("render.py", "publication.py", "editorial.py", "schema.py", "util.py"):
+        (package / name).write_text("changed")
+        seen.add(publication.template_identity({}))
+    assert len(seen) == 6
 
 
 def test_invalid_unicode_cannot_poison_source_or_model_persistence():

@@ -126,14 +126,6 @@ def test_source_failure_updates_status_and_watermark_in_one_statement(tmp_path):
         store.source_failure(stream, "HTTP 503 again", DEFAULTS["collection"], DATE)
         assert store.source(stream)["watermark"] == DATE
 
-def test_story_count_does_not_deserialize_payloads(tmp_path):
-    with Store(tmp_path / "state.db") as store:
-        with store.db:
-            for n in range(3):
-                store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (str(n),str(n),"not JSON",DATE,DATE))
-        assert store.story_count(2) == 2 and store.story_count(5) == 3
-        assert store.story_count(0) == 0
-
 
 def _pipeline_config(tmp_path):
     config = copy.deepcopy(DEFAULTS)

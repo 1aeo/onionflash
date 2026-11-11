@@ -39,99 +39,92 @@ def meta(db, key):
     return db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()[0]
 
 
-def test_resuming_forced_rebuild_does_not_rewrite_all_feeds_each_batch(tmp_path, monkeypatch):
+def upgrade(db):
+    """As after an upgrade: an older release rendered the catalog, so the next build rebuilds it."""
+    db.execute("UPDATE public_catalog SET template_hash='old-template'")
+    db.execute("UPDATE metadata SET value='old-template' WHERE key='publication_template'")
+    db.commit()
+
+
+@pytest.mark.parametrize("trigger", ["upgrade", "missing-output", "force"])
+def test_full_rebuild_is_bounded_and_rewrites_feeds_once(tmp_path, monkeypatch, trigger):
     cfg = settings(tmp_path, render_batch_size=5)
+    output = Path(cfg["storage"]["output_dir"])
     with Store(cfg["storage"]["database"]) as store:
         for number in range(5):
             put(store.db, story(number))
         build(cfg, store)
         cfg["storage"]["render_batch_size"] = 2
-        calls = []
-        original = publication._feeds
-        def counted(*args):
-            calls.append(1)
-            return original(*args)
-        monkeypatch.setattr(publication, "_feeds", counted)
-        assert build(cfg, store, force=True)["articles_pending"] == 3
-        assert build(cfg, store, force=True)["articles_pending"] == 1
-        assert "articles_pending" not in build(cfg, store, force=True)
-        assert len(calls) == 1
+        if trigger == "upgrade":
+            upgrade(store.db)
+        elif trigger == "missing-output":
+            shutil.rmtree(output)
+        calls, feeds = [], publication._feeds
+        monkeypatch.setattr(publication, "_feeds", lambda *args: calls.append(1) or feeds(*args))
+        pending = [build(cfg, store, force=trigger == "force").get("articles_pending") for _ in range(3)]
+        assert pending == [3, 1, None] and len(calls) == 1
+        assert len(list((output / "news").glob("*/index.html"))) == 5
 
 
-def test_more_than_1000_stories_are_permanent_and_all_feeds_are_complete(tmp_path):
-    cfg = settings(tmp_path, max_stories=1, render_batch_size=250)
-    cfg["site"]["page_size"] = 100
+def test_history_beyond_one_catalog_batch_is_permanent_and_all_feeds_are_complete(tmp_path):
+    cfg = settings(tmp_path, render_batch_size=25)
+    cfg["site"]["page_size"] = 10
     output = Path(cfg["storage"]["output_dir"])
     with Store(cfg["storage"]["database"]) as store:
-        for number in range(1001):
+        for number in range(101):
             put(store.db, story(number))
         first = build(cfg, store)
-        assert first["articles_pending"] == 751
+        assert first["articles_pending"] == 76
         for _ in range(4):
             build(cfg, store)
-        assert store.db.execute("SELECT COUNT(*) FROM public_catalog").fetchone()[0] == 1001
+        assert store.db.execute("SELECT COUNT(*) FROM public_catalog").fetchone()[0] == 101
         assert store.db.execute("SELECT COUNT(*) FROM public_render_queue").fetchone()[0] == 0
         assert (output / "news" / story(0)["id"] / "index.html").is_file()
-        assert (output / "news" / story(1000)["id"] / "story.json").is_file()
-        assert len(ET.parse(output / "feed.xml").findall("./channel/item")) == 1001
-        assert len(json.loads((output / "feed.json").read_text())["items"]) == 1001
-        assert len(ET.parse(output / "tags/release.xml").findall("./channel/item")) == 1001
+        assert (output / "news" / story(100)["id"] / "story.json").is_file()
+        assert len(ET.parse(output / "feed.xml").findall("./channel/item")) == 101
+        assert len(json.loads((output / "feed.json").read_text())["items"]) == 101
+        assert len(ET.parse(output / "tags/release.xml").findall("./channel/item")) == 101
         assert (output / "page/11/index.html").is_file()
         assert (output / "topics/release/page/11/index.html").is_file()
-        assert store.db.execute("SELECT COUNT(*) FROM public_story_topics WHERE topic='release'").fetchone()[0] == 1001
-        assert len(list(publication._accepted(store.db, topic="release", batch_size=17))) == 1001
-        plan = " ".join(row[3] for row in store.db.execute("""EXPLAIN QUERY PLAN
-            SELECT c.public_json FROM public_story_topics t JOIN public_catalog c ON c.story_id=t.story_id
-            WHERE t.topic='release' AND (t.added_at,t.updated_at,t.story_id)<('9999','9999','z')
-            ORDER BY t.added_at DESC,t.updated_at DESC,t.story_id DESC LIMIT 17"""))
-        assert "public_story_topics_added" in plan and "TEMP B-TREE" not in plan
+        assert store.db.execute("SELECT COUNT(*) FROM public_story_topics WHERE topic='release'").fetchone()[0] == 101
+        # Each catalog walk follows an index instead of sorting the history in a temporary table.
+        statements = []
+        store.db.set_trace_callback(statements.append)
+        for order in ({"topic": "release"}, {}, {"order": "updated_at"}):
+            assert len(list(publication._accepted(store.db, batch_size=17, **order))) == 101
+        store.db.set_trace_callback(None)
+        plans = [row[3] for sql in set(statements) for row in store.db.execute("EXPLAIN QUERY PLAN " + sql)]
+        assert plans and not [plan for plan in plans if "TEMP B-TREE" in plan]
         page1 = (output / "index.html").read_text()
         page11 = (output / "page/11/index.html").read_text()
-        assert page1.count('class="story"') == 100
+        assert page1.count('class="story"') == 10
         assert page11.count('class="story"') == 1
         assert 'href="https://example.org/onionflash/page/2/" rel="next"' in page1
         assert 'href="https://example.org/onionflash/page/10/" rel="prev"' in page11
         assert 'href="https://example.org/onionflash/page/11/"' in page11
-        assert "1001 stories in the complete history" in page1
+        assert "101 stories in the complete history" in page1
         # A missing private source row never expires its already published URL.
         store.db.execute("DELETE FROM stories WHERE id=?", (story(0)["id"],)); store.db.commit()
         build(cfg, store)
         assert (output / "news" / story(0)["id"] / "index.html").is_file()
-        assert len(ET.parse(output / "feed.xml").findall("./channel/item")) == 1001
+        assert len(ET.parse(output / "feed.xml").findall("./channel/item")) == 101
 
 
-def test_newest_publications_page_first_while_feed_updates_are_independent(tmp_path):
+def test_homepage_follows_added_dates_while_feeds_follow_updates_and_keep_source_dates(tmp_path):
     cfg = settings(tmp_path)
     cfg["site"]["page_size"] = 1
     with Store(cfg["storage"]["database"]) as store:
-        older = story(1, published_at="2025-01-01T00:00:00Z", updated_at="2026-11-10T00:00:00Z")
-        newer = story(2)
-        put(store.db, older); put(store.db, newer)
-        build(cfg, store)
-        root = Path(cfg["storage"]["output_dir"])
-        assert (root / "_headers").read_text() == render.headers_text(cfg["site"]["base_url"])
-        assert f'id="story-{newer["id"]}"' in (root / "index.html").read_text()
-        assert f'id="story-{older["id"]}"' in (root / "page/2/index.html").read_text()
-        feed = json.loads((root / "feed.json").read_text())
-        assert feed["items"][0]["id"].endswith(older["id"] + "/")
-
-
-def test_homepage_pages_follow_added_at_but_rss_keeps_source_dates(tmp_path):
-    cfg = settings(tmp_path)
-    cfg["site"]["page_size"] = 1
-    with Store(cfg["storage"]["database"]) as store:
-        recently_added = story(1, published_at="2025-01-01T00:00:00Z", added_at="2026-11-10T12:00:00Z")
-        earlier_added = story(2, added_at="2026-11-09T12:00:00Z")
-        put(store.db, recently_added); put(store.db, earlier_added)
+        added = story(1, published_at="2025-01-01T00:00:00Z", added_at="2026-11-10T12:00:00Z")
+        updated = story(2, updated_at="2026-11-10T00:00:00Z")
+        put(store.db, added); put(store.db, updated)
         build(cfg, store)
         output = Path(cfg["storage"]["output_dir"])
         first = (output / "index.html").read_text()
-        second = (output / "page/2/index.html").read_text()
-        assert f'id="story-{recently_added["id"]}"' in first
-        assert 'datetime="2026-11-10T12:00:00Z"' in first
-        assert f'id="story-{earlier_added["id"]}"' in second
+        assert f'id="story-{added["id"]}"' in first and 'datetime="2026-11-10T12:00:00Z"' in first
+        assert f'id="story-{updated["id"]}"' in (output / "page/2/index.html").read_text()
+        assert json.loads((output / "feed.json").read_text())["items"][0]["id"].endswith(updated["id"] + "/")
         items = ET.parse(output / "feed.xml").findall("./channel/item")
-        rss_story = next(item for item in items if item.findtext("guid").endswith(recently_added["id"] + "/"))
+        rss_story = next(item for item in items if item.findtext("guid").endswith(added["id"] + "/"))
         assert rss_story.findtext("pubDate") == "Wed, 01 Jan 2025 00:00:00 GMT"
 
 
@@ -142,12 +135,29 @@ def test_page_size_changes_remove_only_obsolete_pagination_artifacts(tmp_path):
         for number in range(3): put(store.db, story(number))
         build(cfg, store)
         output = Path(cfg["storage"]["output_dir"])
-        assert (output / "page/3/index.html").is_file()
+        assert (output / "page/3/index.html").is_file() and (output / "topics/release/page/3/index.html").is_file()
         cfg["site"]["page_size"] = 3
         assert build(cfg, store)["public_changed"]
-        assert not (output / "page/3/index.html").exists()
-        assert store.db.execute("SELECT COUNT(*) FROM public_artifacts WHERE path LIKE 'page/%'").fetchone()[0] == 0
+        assert not (output / "page/2/index.html").exists() and not (output / "topics/release/page/2/index.html").exists()
+        assert store.db.execute("SELECT COUNT(*) FROM public_artifacts WHERE path LIKE '%page/%'").fetchone()[0] == 0
+        assert (output / "topics/release/index.html").read_text().count('class="story"') == 3
         assert len(list((output / "news").glob('*/index.html'))) == 3
+
+
+def test_updating_a_story_leaves_archive_pages_without_it_unchanged(tmp_path):
+    cfg = settings(tmp_path)
+    cfg["site"]["page_size"] = 1
+    output = Path(cfg["storage"]["output_dir"])
+    with Store(cfg["storage"]["database"]) as store:
+        for number in range(3):
+            put(store.db, story(number, added_at=f"2026-11-0{number + 1}T00:00:00Z"))
+        build(cfg, store)
+        archive = [output / "page/2/index.html", output / "topics/release/page/3/index.html"]
+        before = [path.read_bytes() for path in archive]
+        put(store.db, story(2, added_at="2026-11-03T00:00:00Z", summary="Updated summary.", updated_at="2026-11-10T00:00:00Z"))
+        assert build(cfg, store)["public_changed"]
+        assert "Updated summary." in (output / "index.html").read_text()
+        assert [path.read_bytes() for path in archive] == before
 
 
 def test_pages_rewritten_by_a_failed_build_are_still_removed_when_obsolete(tmp_path, monkeypatch):
@@ -255,7 +265,7 @@ def test_a_snapshot_an_older_release_accepted_and_this_one_rejects_cannot_stop_b
             put(store.db, story(2, sources=[plain]))
             put(store.db, story(3, sources=[plain, *STORY["sources"]]))
             build(cfg, store)
-        monkeypatch.setattr(publication, "publication_year", lambda: 2030)  # this release rebuilds
+        upgrade(store.db)  # this release rebuilds
         put(store.db, story(3, sources=[{"url": "https://127.0.0.1/", "title": "Invalid"}]))
         put(store.db, story(4))
         assert build(cfg, store)["stories_skipped"] == 2
@@ -276,7 +286,7 @@ def test_topic_backfill_after_an_upgrade_skips_a_snapshot_this_release_rejects(t
             older.setattr(render, "_public_url", lambda url: url)
             put(store.db, story(2, sources=[{"url": "http://example.org/report", "title": "Report"}]))
             build(cfg, store)
-        monkeypatch.setattr(publication, "publication_year", lambda: 2030)  # this release rebuilds
+        upgrade(store.db)  # this release rebuilds
         with store.db:  # as after an upgrade from a release without topic tables
             store.db.execute("DELETE FROM public_story_topics")
             store.db.execute("DELETE FROM metadata WHERE key='publication_topics'")
@@ -341,7 +351,7 @@ def test_the_staging_directory_keeps_files_it_did_not_create(tmp_path):
     assert (staging / "data.sqlite3").read_text() == "unrelated"
 
 
-def test_template_rebuild_is_bounded_and_resumes_across_connections(tmp_path, monkeypatch):
+def test_template_rebuild_is_bounded_and_resumes_across_connections(tmp_path):
     cfg = settings(tmp_path, render_batch_size=2)
     with Store(cfg["storage"]["database"]) as store:
         for number in range(5): put(store.db, story(number))
@@ -349,13 +359,9 @@ def test_template_rebuild_is_bounded_and_resumes_across_connections(tmp_path, mo
     with Store(cfg["storage"]["database"]) as store:
         assert build(cfg, store)["articles_pending"] == 1
         assert "articles_pending" not in build(cfg, store)
-        monkeypatch.setattr(publication, "publication_year", lambda: 2030)
-        assert build(cfg, store)["articles_pending"] == 3
-        assert build(cfg, store)["articles_pending"] == 1
-        assert "articles_pending" not in build(cfg, store)
 
 
-def test_new_stories_and_editorial_actions_render_before_a_rebuild_backlog(tmp_path, monkeypatch):
+def test_new_stories_and_editorial_actions_render_before_a_rebuild_backlog(tmp_path):
     cfg = settings(tmp_path, render_batch_size=2)
     output = Path(cfg["storage"]["output_dir"])
     stamp = "2026-11-10T00:00:00Z"
@@ -373,7 +379,7 @@ def test_new_stories_and_editorial_actions_render_before_a_rebuild_backlog(tmp_p
         build(cfg, store)
         # A story analysed in the run that starts a rebuild keeps its place ahead of it.
         put(store.db, story(9))
-        monkeypatch.setattr(publication, "publication_year", lambda: 2030)
+        upgrade(store.db)
         build(cfg, store)
         assert published(9)["title"] == "News 9"
         put(store.db, story(10)); put(store.db, story(6, summary="Updated summary."))
@@ -385,14 +391,14 @@ def test_new_stories_and_editorial_actions_render_before_a_rebuild_backlog(tmp_p
         assert published(5)["title"] == "Retracted story" and published(7)["editorial"]["revision"] == 2
 
 
-def test_removing_a_source_row_keeps_its_queued_rebuild_and_clears_its_quarantine(tmp_path, monkeypatch):
+def test_removing_a_source_row_keeps_its_queued_rebuild_and_clears_its_quarantine(tmp_path):
     cfg = settings(tmp_path, render_batch_size=1)
     with Store(cfg["storage"]["database"]) as store:
         for number in range(3):
             put(store.db, story(number))
         for _ in range(3):
             build(cfg, store)
-        monkeypatch.setattr(publication, "publication_year", lambda: 2030)
+        upgrade(store.db)
         build(cfg, store)
         put(store.db, story(9, sources=[{"url": "https://127.0.0.1/", "title": "Invalid"}]))
         assert build(cfg, store)["stories_skipped"] == 1
@@ -490,19 +496,6 @@ def test_db_only_restore_rebuilds_all_history_and_last_good_quarantined_story(tm
         assert len(list((output / "news").glob('*/story.json'))) == 5
         assert len(ET.parse(output / "feed.xml").findall("./channel/item")) == 5
         assert "127.0.0.1" not in (output / f"news/{story(1)['id']}/story.json").read_text()
-
-
-def test_missing_output_directory_automatically_queues_bounded_recovery(tmp_path):
-    cfg = settings(tmp_path, render_batch_size=2)
-    with Store(cfg["storage"]["database"]) as store:
-        for number in range(5): put(store.db, story(number))
-        for _ in range(3): build(cfg, store)
-        output = Path(cfg["storage"]["output_dir"])
-        shutil.rmtree(output)
-        assert build(cfg, store)["articles_pending"] == 3
-        assert build(cfg, store)["articles_pending"] == 1
-        assert "articles_pending" not in build(cfg, store)
-        assert len(list((output / "news").glob('*/index.html'))) == 5
 
 
 @pytest.mark.parametrize("setting", ["render_batch_size = 0", "render_batch_size = 1001", "render_batch_size = true"])
