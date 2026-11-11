@@ -2,6 +2,7 @@
 
 from approval_helpers import finish_reviewed
 import copy
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -14,7 +15,6 @@ from onionflash import editorial, render
 from onionflash.cli import build
 from onionflash.comments import _compose
 from onionflash.store import Store, backup_database
-from onionflash.util import after
 from test_core import DATE, analysis, config, item
 
 
@@ -106,29 +106,19 @@ def test_late_automation_is_cached_and_grouped_but_cannot_overwrite_locked_story
     assert len(store.stories()) == 1
 
 
-def test_sql_guard_covers_update_delete_insert_replace_and_raw_connections(seeded):
+def test_story_guards_left_by_an_earlier_release_cannot_stop_other_writers(seeded):
     cfg, store, story_id = seeded
-    edit(store, story_id)
-    row = dict(store.db.execute("SELECT * FROM stories WHERE id=?", (story_id,)).fetchone())
-    with store.db:
-        store.db.execute("UPDATE stories SET payload='bad' WHERE id=?", (story_id,))
-        store.db.execute("DELETE FROM stories WHERE id=?", (story_id,))
-        store.db.execute("INSERT OR REPLACE INTO stories VALUES(?,?,?,?,?)", (story_id, row["cluster_key"], "bad", DATE, DATE))
-        store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", ("other-id", row["cluster_key"], "bad", DATE, DATE))
-        store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", ("unlocked", "unlocked", "unrelated", DATE, DATE))
-        store.db.execute("UPDATE OR REPLACE stories SET id=? WHERE id='unlocked'", (story_id,))
-        store.db.execute("UPDATE OR REPLACE stories SET cluster_key=? WHERE id='unlocked'", (row["cluster_key"],))
-        assert store.db.execute("SELECT payload FROM stories WHERE id='unlocked'").fetchone()[0] == "unrelated"
-        store.db.execute("DELETE FROM stories WHERE id='unlocked'")
-    assert dict(store.db.execute("SELECT * FROM stories WHERE id=?", (story_id,)).fetchone()) == row
-    with sqlite3.connect(cfg["storage"]["database"]) as raw:
-        assert raw.execute("SELECT COUNT(*) FROM stories").fetchone()[0] == 1
-        with pytest.raises(sqlite3.OperationalError, match="onionflash_editorial_permit"):
-            raw.execute("UPDATE stories SET payload='bad' WHERE id=?", (story_id,))
-    assert len(store.stories()) == 1
+    with store.db:  # earlier releases guarded stories with a function only they register
+        for event, row in (("INSERT", "NEW"), ("UPDATE", "OLD"), ("DELETE", "OLD")):
+            store.db.execute(f"CREATE TRIGGER IF NOT EXISTS editorial_story_{event.lower()} BEFORE {event} ON stories "
+                             f"WHEN onionflash_editorial_permit({row}.id)=0 BEGIN SELECT RAISE(IGNORE); END")
+    with Store(cfg["storage"]["database"]), sqlite3.connect(cfg["storage"]["database"]) as raw:
+        assert raw.execute("INSERT INTO stories VALUES('other','other','{}',?,?)", (DATE, DATE)).rowcount == 1
+        assert raw.execute("UPDATE stories SET updated_at=updated_at WHERE id=?", (story_id,)).rowcount == 1
+        assert raw.execute("DELETE FROM stories WHERE id='other'").rowcount == 1
 
 
-def test_failed_operator_write_rolls_back_revision_and_cannot_leave_permit_open(seeded):
+def test_failed_operator_write_rolls_back_revision(seeded):
     cfg, store, story_id = seeded
     before = edit(store, story_id)
     store.db.execute("CREATE TRIGGER fail_revision BEFORE INSERT ON editorial_revisions BEGIN SELECT RAISE(ABORT,'injected failure'); END")
@@ -136,10 +126,6 @@ def test_failed_operator_write_rolls_back_revision_and_cannot_leave_permit_open(
     with pytest.raises(sqlite3.IntegrityError, match="injected failure"):
         edit(store, story_id, patch={"title": "A change that must roll back"}, observed=LATER)
     assert not store.db.in_transaction
-    assert editorial.show(store.db, story_id)["hash"] == before["hash"]
-    assert store.db.execute("SELECT onionflash_editorial_permit(?)", (story_id,)).fetchone()[0] == 0
-    with store.db:
-        store.db.execute("UPDATE stories SET payload='bad' WHERE id=?", (story_id,))
     assert editorial.show(store.db, story_id)["hash"] == before["hash"]
     assert len(editorial.history(store.db, story_id)["revisions"]) == 1
 
@@ -259,8 +245,8 @@ def test_list_field_correction_publishes_canonical_sources_tags_and_products(see
     assert story_id in (Path(cfg["storage"]["output_dir"]) / "topics" / "relay" / "index.html").read_text()
 
 
-@pytest.mark.parametrize("changes", [{"reason": ""}, {"reason": "x" * 1001}, {"expect_hash": ""},
-    {"expect_hash": "0" * 64}, {"observed": "not a date"}, {"observed": "2020-01-01T00:00:00Z"}])
+@pytest.mark.parametrize("changes", [{"reason": ""}, {"reason": "x" * 1001}, {"reason": "Fixed a claim.\uffff"},
+    {"expect_hash": ""}, {"expect_hash": "0" * 64}, {"observed": "not a date"}, {"observed": "2020-01-01T00:00:00Z"}])
 def test_reason_hash_and_time_are_required_and_validated(seeded, changes):
     cfg, store, story_id = seeded
     before = editorial.show(store.db, story_id)
@@ -270,20 +256,33 @@ def test_reason_hash_and_time_are_required_and_validated(seeded, changes):
     assert editorial.show(store.db, story_id)["hash"] == before["hash"]
 
 
-def test_private_history_paginates_and_public_history_is_bounded(seeded):
+def test_private_history_is_complete_and_public_history_is_bounded(seeded):
     cfg, store, story_id = seeded
     for number in range(23):
         edit(store, story_id, patch={"summary": f"Correction {number}."})
-    first = editorial.history(store.db, story_id, limit=2)
-    second = editorial.history(store.db, story_id, limit=2, before=first["next_before"])
-    assert [r["revision"] for r in first["revisions"]] == [23, 22]
-    assert [r["revision"] for r in second["revisions"]] == [21, 20]
-    metadata = editorial.public_metadata(store.db, story_id)
-    assert metadata["history_total"] == 23 and len(metadata["history"]) == 20
+    assert [r["revision"] for r in editorial.history(store.db, story_id)["revisions"]] == list(range(23, 0, -1))
     build(cfg, store)
-    assert len(current_files(cfg, story_id)["json"]["editorial"]["history"]) == 20
-    with pytest.raises(ValueError):
-        editorial.history(store.db, story_id, limit=101)
+    files = current_files(cfg, story_id)
+    assert len(files["json"]["editorial"]["history"]) == 20
+    assert files["json"]["editorial"]["history_total"] == 23  # earlier releases require it after a rollback
+    assert "Editorial history (23)" in files["article"] and "latest 20 of 23 changes" in files["article"]
+
+
+def test_a_catalog_snapshot_with_other_editorial_fields_still_renders(seeded):
+    cfg, store, story_id = seeded
+    edit(store, story_id)
+    act(editorial.unlock, store, story_id)
+    build(cfg, store)
+    # As another release may write it; with its private row gone, only this snapshot renders the story.
+    public = current_files(cfg, story_id)["json"]
+    public["editorial"]["later_field"] = 1
+    text = json.dumps(public, ensure_ascii=False, sort_keys=True) + "\n"
+    with store.db:
+        store.db.execute("UPDATE public_catalog SET public_json=?,json_sha256=?,template_hash='earlier' WHERE story_id=?",
+                         (text, hashlib.sha256(text.encode()).hexdigest(), story_id))
+        store.db.execute("DELETE FROM stories WHERE id=?", (story_id,))
+    assert build(cfg, store, force=True)["stories_skipped"] == 0
+    assert f'id="story-{story_id}"' in current_files(cfg, story_id)["home"]
 
 
 def test_model_or_raw_story_cannot_forge_editorial_notice(seeded):

@@ -1,6 +1,7 @@
 from approval_helpers import ApprovingReviewer, finish_reviewed
 import copy
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -838,13 +839,15 @@ def test_base_url_is_normalized_to_a_clean_directory(tmp_path, base):
 def test_retired_settings_are_accepted_and_ignored(tmp_path, caplog):
     path = tmp_path / "config.toml"
     path.write_text(
-        '[storage]\nmax_stories = 1000\n[http]\nrequests_per_minute = 30\n'
+        '[site]\nfeed_size = 0\n[storage]\nmax_stories = 1000\nrender_batch_size = 7\n[http]\nrequests_per_minute = 30\n'
         '[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n'
     )
     with caplog.at_level("WARNING", logger="onionflash.config"):
         loaded = load_config(path)
     assert "max_stories" not in loaded["storage"] and "requests_per_minute" not in loaded["http"]
-    assert "Ignoring setting http.requests_per_minute" in caplog.text
+    assert "feed_size" not in loaded["site"] and loaded["storage"]["render_batch_size"] == DEFAULTS["storage"]["render_batch_size"]
+    for key in ("http.requests_per_minute", "site.feed_size", "storage.render_batch_size"):
+        assert f"Ignoring setting {key}" in caplog.text
 
 
 def test_busy_lock_status_is_read_only_and_a_skipped_build_is_not_success(tmp_path, capsys):
@@ -862,6 +865,13 @@ def test_busy_lock_status_is_read_only_and_a_skipped_build_is_not_success(tmp_pa
         assert _json.loads(capsys.readouterr().out)["sources"][0]["last_success"] is None
     with Store(tmp_path / "db.sqlite3") as store:
         assert store.db.execute("SELECT COUNT(*) FROM source_state").fetchone()[0] == 0
+    writer = sqlite3.connect(tmp_path / "db.sqlite3", isolation_level=None)
+    writer.execute("BEGIN IMMEDIATE")  # as a run or build holds the write lock, inspection still opens
+    try:
+        assert main(["status", "--config", str(cfg_path)]) == 0
+        assert main(["rejected", "list", "--config", str(cfg_path)]) == 0
+    finally:
+        writer.close()
 
 
 def test_moved_installation_keeps_building(tmp_path):

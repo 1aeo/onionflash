@@ -13,13 +13,14 @@ import time
 import traceback
 from pathlib import Path
 
-from . import __version__
+from . import __version__, editorial, rejection
 from .analyze import AnalysisError, Analyzer
 from .review import Reviewer
 from .review_gate import process_item, status as review_status
 from .collect import CollectionError, collect_source
 from .comments import RUN_BUDGET_SECONDS as COMMENTS_BUDGET, enrich_comments, merge_cached_comments, status as comments_status
 from .config import load_config
+from .publication import build
 from .store import Store, source_due
 from .transport import HttpClient
 from .util import now_iso
@@ -42,12 +43,6 @@ def run_lock(database: str):
         os.close(fd)
 
 
-def build(config: dict, store: Store, *, force: bool = False) -> dict:
-    from .publication import build as publish_build
-
-    return publish_build(config, store, force=force)
-
-
 def _operator_parsers(commands) -> None:
     """Register explicit inspection and guarded editorial or retry commands."""
     story = commands.add_parser("story", help="Inspect, correct, or retract a published story")
@@ -56,10 +51,7 @@ def _operator_parsers(commands) -> None:
         action = actions.add_parser(name)
         action.add_argument("--config", required=True, type=Path)
         action.add_argument("--story", required=True, help="Stable story ID")
-        if name == "history":
-            action.add_argument("--limit", type=int, default=20)
-            action.add_argument("--before", type=int, help="Read revisions before this number")
-        elif name != "show":
+        if name not in {"show", "history"}:
             action.add_argument("--expect-hash", required=True, help="Current hash returned by story show")
             action.add_argument("--reason", required=True, help="Public reason for this editorial action")
         if name == "correct":
@@ -85,31 +77,6 @@ def _operator_parsers(commands) -> None:
             action.add_argument("--reconsider-ignored", action="store_true", help="Explicitly reconsider one inspected ignored item")
 
 
-def _patch_file(path: Path) -> dict:
-    def pairs(entries):
-        result = {}
-        for key, value in entries:
-            if key in result:
-                raise ValueError("Correction patch contains duplicate JSON keys")
-            result[key] = value
-        return result
-
-    def invalid_constant(_value):
-        raise ValueError("Correction patch contains a non-finite number")
-
-    with path.open("rb") as stream:
-        raw = stream.read(65537)
-    if len(raw) > 65536:
-        raise ValueError("Correction patch exceeds 64 KiB")
-    try:
-        result = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs, parse_constant=invalid_constant)
-    except (UnicodeError, json.JSONDecodeError, RecursionError):
-        raise ValueError("Correction patch must contain valid UTF-8 JSON") from None
-    if not isinstance(result, dict):
-        raise ValueError("Correction patch must be a JSON object")
-    return result
-
-
 def _retired_alert_source_ids(config: dict) -> set[str]:
     """Identify configured legacy alert sources that cannot enter news analysis."""
     return {source["id"] for source in config["sources"]
@@ -119,22 +86,18 @@ def _retired_alert_source_ids(config: dict) -> set[str]:
 def _operator_command(args, config: dict, store: Store) -> dict:
     """Dispatch one operator action with its required hash and reason."""
     if args.command == "story":
-        from . import editorial
-
         if args.action == "show":
             return editorial.show(store.db, args.story)
         if args.action == "history":
-            return editorial.history(store.db, args.story, limit=args.limit, before=args.before)
+            return editorial.history(store.db, args.story)
         options = {"reason": args.reason, "expect_hash": args.expect_hash}
         if args.action == "correct":
-            result = editorial.correct(store.db, args.story, _patch_file(args.patch), **options)
+            result = editorial.correct(store.db, args.story, json.loads(args.patch.read_text(encoding="utf-8")), **options)
         elif args.action == "restore":
             result = editorial.restore(store.db, args.story, revision=args.revision, **options)
         else:
             result = getattr(editorial, args.action)(store.db, args.story, **options)
         return {**result, "publication_pending": True}
-    from . import rejection
-
     if args.action == "list":
         return rejection.list_items(store, status=args.status, limit=args.limit, after=args.after)
     if args.action == "show":

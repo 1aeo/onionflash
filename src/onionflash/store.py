@@ -400,11 +400,9 @@ class Store:
             if payload is not None:
                 if payload.get("editorial_item") == row["id"]:
                     payload["editorial_analysis_key"] = analysis_key
-                changed = self.db.execute("""INSERT INTO stories(id,cluster_key,payload,published_at,updated_at)
+                self.db.execute("""INSERT INTO stories(id,cluster_key,payload,published_at,updated_at)
                     VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at""",
                     (story_id, cluster, json.dumps(payload, ensure_ascii=False, allow_nan=False), payload["published_at"], payload["updated_at"]))
-                if changed.rowcount != 1:
-                    raise StaleCandidate("Story became editorially protected before publication")
             elif locked and result["publish"]:
                 editorial.record_held(self.db, story_id)
             published = result["publish"] and decision == "approve"

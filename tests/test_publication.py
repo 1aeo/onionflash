@@ -10,7 +10,7 @@ import pytest
 
 from onionflash import editorial, publication, render
 from onionflash.cli import build
-from onionflash.config import DEFAULTS, load_config
+from onionflash.config import DEFAULTS
 from onionflash.store import Store, backup_database
 from test_render import STORY
 
@@ -66,13 +66,13 @@ def test_full_rebuild_is_bounded_and_rewrites_feeds_once(tmp_path, monkeypatch, 
         assert len(list((output / "news").glob("*/index.html"))) == 5
 
 
-def test_history_beyond_one_catalog_batch_is_permanent_and_all_feeds_are_complete(tmp_path):
+def test_history_beyond_one_catalog_batch_is_permanent_and_feeds_carry_the_newest(tmp_path):
     cfg = settings(tmp_path, render_batch_size=25)
     cfg["site"]["page_size"] = 10
     output = Path(cfg["storage"]["output_dir"])
     with Store(cfg["storage"]["database"]) as store:
-        for number in range(101):
-            put(store.db, story(number))
+        for number in range(101):  # story(0) sorts last everywhere
+            put(store.db, story(number, tags=["release", "security"] if number == 0 else ["release"]))
         first = build(cfg, store)
         assert first["articles_pending"] == 76
         for _ in range(4):
@@ -81,9 +81,12 @@ def test_history_beyond_one_catalog_batch_is_permanent_and_all_feeds_are_complet
         assert store.db.execute("SELECT COUNT(*) FROM public_render_queue").fetchone()[0] == 0
         assert (output / "news" / story(0)["id"] / "index.html").is_file()
         assert (output / "news" / story(100)["id"] / "story.json").is_file()
-        assert len(ET.parse(output / "feed.xml").findall("./channel/item")) == 101
-        assert len(json.loads((output / "feed.json").read_text())["items"]) == 101
-        assert len(ET.parse(output / "tags/release.xml").findall("./channel/item")) == 101
+        def guids(path):
+            return [guid.text for guid in ET.parse(output / path).iter("guid")]
+        assert len(guids("feed.xml")) == len(guids("tags/release.xml")) == publication.FEED_ITEMS
+        assert [item["id"] for item in json.loads((output / "feed.json").read_text())["items"]] == guids("feed.xml")
+        assert not [guid for guid in guids("feed.xml") if story(0)["id"] in guid]
+        assert story(0)["id"] in guids("tags/security.xml")[0]  # each topic feed has its own newest stories
         assert (output / "page/11/index.html").is_file()
         assert (output / "topics/release/page/11/index.html").is_file()
         assert store.db.execute("SELECT COUNT(*) FROM public_story_topics WHERE topic='release'").fetchone()[0] == 101
@@ -107,7 +110,22 @@ def test_history_beyond_one_catalog_batch_is_permanent_and_all_feeds_are_complet
         store.db.execute("DELETE FROM stories WHERE id=?", (story(0)["id"],)); store.db.commit()
         build(cfg, store)
         assert (output / "news" / story(0)["id"] / "index.html").is_file()
-        assert len(ET.parse(output / "feed.xml").findall("./channel/item")) == 101
+        assert len(guids("feed.xml")) == publication.FEED_ITEMS
+
+
+def test_once_every_feed_is_full_each_keeps_exactly_its_newest_stories(tmp_path, monkeypatch):
+    monkeypatch.setattr(publication, "FEED_ITEMS", 2)
+    cfg = settings(tmp_path)
+    output = Path(cfg["storage"]["output_dir"])
+    with Store(cfg["storage"]["database"]) as store:
+        for number in range(3):  # story(0) was updated last; publication dates precede every update
+            put(store.db, story(number, tags=render.CATEGORIES, published_at="2026-01-01T00:00:00Z",
+                                updated_at=f"2026-11-0{3 - number}T00:00:00Z"))
+        build(cfg, store)
+    newest = [f"https://example.org/onionflash/news/{story(number)['id']}/" for number in (0, 1)]
+    for path in ["feed.xml", *(f"tags/{topic}.xml" for topic in render.CATEGORIES)]:
+        assert [guid.text for guid in ET.parse(output / path).iter("guid")] == newest, path
+    assert [item["id"] for item in json.loads((output / "feed.json").read_text())["items"]] == newest
 
 
 def test_homepage_follows_added_dates_while_feeds_follow_updates_and_keep_source_dates(tmp_path):
@@ -496,12 +514,3 @@ def test_db_only_restore_rebuilds_all_history_and_last_good_quarantined_story(tm
         assert len(list((output / "news").glob('*/story.json'))) == 5
         assert len(ET.parse(output / "feed.xml").findall("./channel/item")) == 5
         assert "127.0.0.1" not in (output / f"news/{story(1)['id']}/story.json").read_text()
-
-
-@pytest.mark.parametrize("setting", ["render_batch_size = 0", "render_batch_size = 1001", "render_batch_size = true"])
-def test_render_batch_bounds_are_validated(tmp_path, monkeypatch, setting):
-    monkeypatch.setenv("ONIONFLASH_LLM_BASE_URL", "https://model.example/v1")
-    text = (Path(__file__).parents[1] / "config.example.toml").read_text()
-    path = tmp_path / "config.toml"
-    path.write_text(text.replace("render_batch_size = 250", setting))
-    with pytest.raises(ValueError): load_config(path)

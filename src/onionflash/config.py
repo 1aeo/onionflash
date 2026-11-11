@@ -21,7 +21,6 @@ DEFAULTS = {
         "description": "Important Tor news, distilled.",
         "repository_url": "https://github.com/1aeo/onionflash",
         "page_size": 100,
-        "feed_size": 0,
     },
     "storage": {
         "database": "state/onionflash.sqlite3",
@@ -79,7 +78,7 @@ DEFAULTS = {
     "sources": [],
 }
 
-# Ranges for the numbers an operator sets in llm, storage and site, so an accidental
+# Ranges for the numbers an operator sets in llm and site, so an accidental
 # zero cannot disable a timeout or turn a retry loop into a busy loop. max_pages and
 # max_items_per_source bound a source's own max_pages and max_items.
 BOUNDS = {
@@ -88,24 +87,24 @@ BOUNDS = {
     "page_size": (1, 100),
     "max_items_per_source": (1, 10000),
     "max_items_per_run": (1, 1000),
-    "render_batch_size": (1, 1000),
-    "feed_size": (0, 100000),
 }
 
 
-# The collection, http and llm settings an operator chooses. Their other values are
-# fixed defaults: a file may still set them, and they are logged and ignored.
+# The collection, http, llm and storage settings an operator chooses. Their other values
+# are fixed defaults: a file may still set them, and they are logged and ignored.
 OPERATOR_SETTINGS = {
     "collection": set(),
     "http": set(),
     "llm": {"base_url", "fallback_base_urls", "model", "allowed_networks", "allow_http",
             "send_chat_template_kwargs", "max_items_per_run", "timeout_seconds"},
+    "storage": {"database", "output_dir"},
 }
 
 
 # Settings that older configuration files may still contain. They are accepted
 # and ignored, so a deployment can delete them at its own pace.
 RETIRED = {
+    "site": {"feed_size"},
     "storage": {"max_stories"},
     "http": {"requests_per_minute"},
     "llm": {"retry_attempts", "max_input_chars"},
@@ -158,7 +157,7 @@ def load_config(path: str | Path) -> dict:
                     f"Unknown {section} settings: {', '.join(sorted(unknown))}"
                 )
             config[section].update(values)
-    for section in ("llm", "storage", "site"):
+    for section in ("llm", "site"):
         for key, value in config[section].items():
             if key in BOUNDS:
                 low, high = BOUNDS[key]
