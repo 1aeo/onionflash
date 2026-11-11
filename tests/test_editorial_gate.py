@@ -6,7 +6,7 @@ import json
 import pytest
 
 from approval_helpers import approve, verdict
-from onionflash import candidate, editorial, review, review_gate
+from onionflash import candidate, editorial, rejection, review, review_gate
 from onionflash.analyze import Analyzer, AnalysisError, tag_notice
 from onionflash.store import ReviewRequired, StaleCandidate
 from test_core import DATE, analysis, item
@@ -224,6 +224,24 @@ def test_initial_approval_resumes_only_final_verification_after_interruption(con
     assert [call[2] for call in resumed.calls] == [True]
 
 
+@pytest.mark.parametrize("final", ["approve", "hold"])
+def test_reconciled_critique_still_requires_fresh_verification(context, final):
+    """Repairing a contradictory critique never substitutes for final approval."""
+    cfg, store = context
+    row = pending(store)
+    critique = verdict("revise", criterion="technical_details", repair={"tags": ["release"]})
+    critique["criteria"]["technical_details"]["outcome"] = "pass"
+    checker = Reviewer(critique, verdict(final))
+    draft = analysis(category="release", tags=["release", "security"], why_it_matters="")
+    result = run(cfg, store, row, Writer(draft), checker)
+    assert result["review_calls"] == 2 and [call[2] for call in checker.calls] == [False, True]
+    assert checker.calls[1][0]["tags"] == ["release"]
+    assert result["status"] == ("published" if final == "approve" else "held")
+    assert len(store.stories()) == (1 if final == "approve" else 0)
+    record = json.loads(store.db.execute("SELECT review_record FROM analyses").fetchone()[0])
+    assert record["reviews"][0]["result"]["criteria"]["technical_details"]["outcome"] == "fail"
+
+
 def test_store_refuses_an_approval_receipt_without_final_verification(context):
     """Enforce fresh verification at the store boundary as well as in the worker."""
     _, store = context
@@ -278,3 +296,78 @@ def test_store_requires_a_complete_matching_initial_review_as_well_as_final_appr
     with pytest.raises(ReviewRequired, match="final verification"):
         store.commit_candidate(prepared, prepared["candidate"], "damaged-first-review", LATER, **receipt)
     assert store.stories() == [] and store.pending_count() == 1
+
+
+def alter_receipt_input(proof, change):
+    """Vary stored provenance without changing the receipt's decision or hashes."""
+    if change == "missing":
+        proof.pop("input_row")
+    elif change == "non-object":
+        proof["input_row"] = []
+    elif change == "wrong-item":
+        proof["input_row"]["id"] = "another-item"
+    elif change == "invalid-json":
+        proof["input_row"]["payload"] = "{"
+    elif change == "non-object-payload":
+        proof["input_row"]["payload"] = "[]"
+    elif change == "changed-source":
+        payload = json.loads(proof["input_row"]["payload"])
+        payload["content"] += " A different source claim."
+        proof["input_row"]["payload"] = json.dumps(payload)
+    else:
+        assert change == "queue-progress"
+        proof["input_row"].update(attempts=7, rejections=2, next_attempt_at=LATER)
+
+
+@pytest.mark.parametrize("decision", ["approve", "skip"])
+@pytest.mark.parametrize("change", ["missing", "non-object", "wrong-item", "invalid-json",
+                                     "non-object-payload", "changed-source", "queue-progress"])
+def test_cached_decision_requires_matching_input_provenance_but_allows_queue_progress(context, monkeypatch, decision, change):
+    """Damaged provenance forces fresh review; scheduling progress preserves valid recovery."""
+    cfg, store = context
+    row = pending(store)
+    method = "commit_candidate" if decision == "approve" else "skip_candidate"
+    commit = getattr(store, method)
+    monkeypatch.setattr(store, method, lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("interrupted")))
+    reply = verdict() if decision == "approve" else skipped()
+    with pytest.raises(RuntimeError):
+        run(cfg, store, row, Writer(), Reviewer(reply))
+    saved = job(store)
+    with store.db:
+        proof = json.loads(store.db.execute("SELECT review_record_json FROM review_approvals WHERE key=?",
+                                           (saved["approval_key"],)).fetchone()[0])
+        alter_receipt_input(proof, change)
+        store.db.execute("UPDATE review_approvals SET review_record_json=? WHERE key=?",
+                         (json.dumps(proof), saved["approval_key"]))
+    monkeypatch.setattr(store, method, commit)
+    if change != "queue-progress":
+        prepared = json.loads(saved["envelope_json"])
+        with pytest.raises(ReviewRequired, match="final verification or skip record"):
+            commit(prepared, prepared["candidate"], saved["writer_key"], LATER,
+                   approval_key=saved["approval_key"], policy_hash=saved["policy_hash"])
+    checker = Reviewer(reply)
+    result = run(cfg, store, row, Writer(), checker)
+    assert result["status"] == ("published" if decision == "approve" else "ignored")
+    assert result["writer_calls"] == 0
+    assert result["cache_hit"] is (change == "queue-progress")
+    assert result["review_calls"] == (0 if change == "queue-progress" else 2 if decision == "approve" else 1)
+
+
+@pytest.mark.parametrize("change", ["missing", "non-object", "wrong-item"])
+def test_unidentified_skip_receipt_cannot_bypass_explicit_reconsideration(context, change):
+    """A receipt that cannot be identified for invalidation cannot authorize another skip."""
+    cfg, store = context
+    row = pending(store)
+    assert run(cfg, store, row, Writer(), Reviewer(skipped()))["status"] == "ignored"
+    saved = store.db.execute("SELECT key,review_record_json FROM review_approvals").fetchone()
+    with store.db:
+        proof = json.loads(saved["review_record_json"])
+        alter_receipt_input(proof, change)
+        store.db.execute("UPDATE review_approvals SET review_record_json=? WHERE key=?",
+                         (json.dumps(proof), saved["key"]))
+    rejection.retry_item(store, row["id"], row["content_hash"], "Reconsider the inspected item", cfg["llm"], LATER,
+                         reconsider_ignored=True)
+    # Invalidation deliberately cannot infer ownership from the damaged record.
+    assert store.db.execute("SELECT 1 FROM review_approvals WHERE key=?", (saved["key"],)).fetchone()
+    result = run(cfg, store, store.pending(1, LATER)[0], Writer(), Reviewer(verdict()))
+    assert result["status"] == "published" and result["review_calls"] == 2 and not result["cache_hit"]

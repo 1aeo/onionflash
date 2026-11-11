@@ -10,7 +10,7 @@ from .candidate import SEMANTIC_FIELDS as EDITABLE
 from .render import _prepare_story
 from .util import digest
 
-REVIEW_VERSION = "onionflash-review-6"
+REVIEW_VERSION = "onionflash-review-7"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details", "news_value", "new_information")
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
@@ -136,13 +136,18 @@ A different URL, repeated announcement, recent edit or quoted parent message is 
 a new development. In replies, identify the author's new unquoted contribution and
 whether it materially changes the account. Mere corroborating anecdotes, requests
 for logging, praise and generic advice do not justify another incident headline.
-A meaningful fix, resolution, release announcement after a tag, or measured followup
-to a concretely identified already-covered issue or event must update its known
-prior_story. If important followup material clearly concerns an already-covered
-item but prior_story is absent, mark new_information insufficient and hold for
-operator association rather than create another headline. Mere duplicates still
-skip. A shared authority name or topic alone is not an association; an important
-distinct event or a different release version may justify a new story.
+The application has already chosen the publication action:
+- When prior_story is present, this candidate UPDATES that same article and
+  permalink. A changed title is not a new article. A supported meaningful fix,
+  resolution, merged change or release announcement can pass new_information;
+  do not demand a separate association or reject it for being a followup.
+  Skip only when the candidate adds no material facts to that prior account.
+- When prior_story is null, this candidate would be a NEW article. If recent
+  coverage describes the same concrete event and the source adds a material
+  lifecycle change, hold with new_information insufficient for operator association.
+  If it merely repeats covered facts, skip. Distinct events can still be news.
+A shared authority name or topic alone does not establish the same event; a
+different release version is a distinct release event.
 Compare lifecycle states explicitly: prior coverage requesting a change does not
 already cover a later merge completing it. Source metadata marking a merge complete
 is material new information even if the description still discusses planned work.
@@ -254,12 +259,13 @@ def apply_repair(candidate: dict, repair: dict) -> dict:
 
 
 def _validate(result: dict, refs: set[str], *, wire: bool = False) -> dict:
-    """Require consistent verdicts, complete criteria and valid packet references."""
+    """Validate complete reviews, conservatively reconciling issues in refusals."""
     if (not isinstance(result, dict) or set(result) != set(SCHEMA["properties"])
             or result["verdict"] not in ("approve", "revise", "hold", "skip")
             or not isinstance(result["criteria"], dict) or set(result["criteria"]) != set(CRITERIA)
             or not isinstance(result["issues"], list) or len(result["issues"]) > 14):
         raise ReviewError("Review response fields do not match schema")
+    result = copy.deepcopy(result)
 
     def references(values):
         if (not isinstance(values, list) or len(values) > 12
@@ -279,10 +285,19 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False) -> dict:
     issues = set()
     for issue in result["issues"]:
         if (not isinstance(issue, dict) or set(issue) != {"criterion", "explanation", "source_refs"}
-                or not isinstance(issue["criterion"], str) or issue["criterion"] not in failed):
+                or not isinstance(issue["criterion"], str) or issue["criterion"] not in CRITERIA):
             raise ReviewError("Review issues contradict criterion outcomes")
         _text(issue["explanation"], SCHEMA["properties"]["issues"]["items"]["properties"]["explanation"]["maxLength"])
         references(issue["source_refs"])
+        if issue["criterion"] not in failed:
+            if result["verdict"] == "approve":
+                raise ReviewError("Review approval cannot contain issues")
+            reason = issue["explanation"]
+            if len(reason) > CHECK["properties"]["reason"]["maxLength"]:
+                reason = "See the recorded issue for this criterion."
+            result["criteria"][issue["criterion"]].update(
+                outcome="fail", source_refs=list(issue["source_refs"]), reason=reason)
+            failed.add(issue["criterion"])
         issues.add(issue["criterion"])
     if issues != failed:
         raise ReviewError("Review must explain every failed criterion")
@@ -313,6 +328,12 @@ def validate_review(result: dict, packet: dict) -> dict:
 def decision_record_matches(record, result, *, candidate, prepared, policy_hash):
     """Require the recorded app stage and exact context behind a cached decision."""
     if not isinstance(record, dict) or not isinstance(record.get("reviews"), list) or not record["reviews"]:
+        return False
+    try:
+        if (not isinstance(record.get("input_row"), dict)
+                or candidate_policy.item_fingerprint(record["input_row"]) != prepared["binding"]["item"]):
+            return False
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
         return False
     final = record["reviews"][-1]
     if not isinstance(final, dict) or any(final.get(key) != value for key, value in (

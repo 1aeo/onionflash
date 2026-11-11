@@ -110,6 +110,12 @@ def _patch_file(path: Path) -> dict:
     return result
 
 
+def _retired_alert_source_ids(config: dict) -> set[str]:
+    """Identify configured legacy alert sources that cannot enter news analysis."""
+    return {source["id"] for source in config["sources"]
+            if source.get("alert_format") in {"consensus", "censorship"}}
+
+
 def _operator_command(args, config: dict, store: Store) -> dict:
     """Dispatch one operator action with its required hash and reason."""
     if args.command == "story":
@@ -135,7 +141,8 @@ def _operator_command(args, config: dict, store: Store) -> dict:
         return rejection.show_item(store, args.item)
     options = {"expected_hash": args.expect_hash, "reason": args.reason}
     if args.action == "retry":
-        return rejection.retry_item(store, args.item, llm=config["llm"], reconsider_ignored=args.reconsider_ignored, **options)
+        return rejection.retry_item(store, args.item, llm=config["llm"], reconsider_ignored=args.reconsider_ignored,
+                                    retired_source_ids=_retired_alert_source_ids(config), **options)
     return rejection.dismiss_item(store, args.item, **options)
 
 
@@ -227,8 +234,7 @@ def run(config: dict, store: Store) -> dict:
                               "error": f"Unexpected {type(exc).__name__} at {Path(frame.filename).name}:{frame.lineno}"}
     run_deadline = started + budget
     endpoint_failures = 0
-    retired_alerts = {source["id"] for source in config["sources"]
-                      if source.get("alert_format") in {"consensus", "censorship"}}
+    retired_alerts = _retired_alert_source_ids(config)
     with Analyzer(config, deadline=run_deadline) as analyzer, Reviewer(config, deadline=run_deadline) as reviewer:
         for row in store.pending(config["llm"]["max_items_per_run"], now_iso()):
             if time.monotonic() >= run_deadline:

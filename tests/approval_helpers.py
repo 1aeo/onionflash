@@ -53,7 +53,7 @@ def approve(store, prepared, candidate=None, *, policy="test-policy", result=Non
              "coverage_hash": prepared["coverage_hash"], "policy_hash": policy, "result": result}
     changes = {key: candidate[key] for key in review.EDITABLE if candidate[key] != prepared["candidate"][key]}
     initial = review.validate_review(verdict("revise", repair=changes), prepared["packet"]) if changes else approved_result(prepared["packet"])
-    audit = {"candidate": candidate, "packet": prepared["packet"], "coverage": prepared["coverage"],
+    audit = {"input_row": prepared["row"], "candidate": candidate, "packet": prepared["packet"], "coverage": prepared["coverage"],
              "reviews": [{**stage, "stage": "review", "candidate_hash": prepared["candidate_hash"], "result": initial},
                          {**stage, "stage": "verification"}],
              "outcome": "skipped" if result.get("verdict") == "skip" else "approved"}

@@ -349,7 +349,7 @@ def test_dismissed_failed_pending_revision_only_requeues_on_source_change(store)
 
 @pytest.mark.parametrize("action", ["retry", "dismiss"])
 @pytest.mark.parametrize("change", ["status='published'", "attempts=attempts+1", "rejections=rejections+1",
-                                    "last_error=NULL", "next_attempt_at=NULL"])
+                                    "last_error=NULL", "next_attempt_at=NULL", "source_id='retired-alerts'"])
 def test_concurrent_pending_queue_change_is_not_overwritten(store, monkeypatch, action, change):
     """A stale operator action must preserve concurrent queue updates without an audit."""
     _, row = failed_pending(store)
@@ -380,7 +380,7 @@ def test_ignored_reconsideration_is_explicit_audited_and_one_item_only(store):
         rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DEFAULTS["llm"], DATE)
     assert actions(store) == []
     result = rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DEFAULTS["llm"], DATE,
-                                  reconsider_ignored=True)
+                                  reconsider_ignored=True, retired_source_ids={"retired-alerts"})
     assert result["status"] == "pending" and store.stories() == []
     current = dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone())
     assert current["attempts"] == current["rejections"] == 0
@@ -493,6 +493,47 @@ def reviewed_skip(store):
                    if json.loads(saved["review_record_json"]).get("input_row", {}).get("id") == row["id"])
     assert not store.db.execute("SELECT 1 FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
     return row, receipt, checker.calls[0][0]
+
+
+@pytest.mark.parametrize("status", ["ignored", "rejected", "pending"])
+def test_retry_refuses_configured_retired_sources_without_mutating_saved_state(store, status):
+    """Reject retired retries before queue changes, audit creation or evidence deletion."""
+    row, _, _ = reviewed_skip(store)
+    with store.db:
+        store.db.execute("UPDATE items SET status=?,attempts=1,last_error='Earlier failure' WHERE id=?",
+                         (status, row["id"]))
+    before = sorted(store.db.iterdump())
+    with pytest.raises(ValueError, match="Retired alert sources cannot be retried"):
+        rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DEFAULTS["llm"], DATE,
+                             reconsider_ignored=status == "ignored", retired_source_ids={row["source_id"]})
+    assert sorted(store.db.iterdump()) == before
+    assert actions(store) == []
+
+
+@pytest.mark.parametrize("alert_format", ["consensus", "censorship"])
+def test_cli_refuses_retired_alert_reconsideration_before_queue_or_audit_changes(store, tmp_path, monkeypatch, capsys, alert_format):
+    """Apply configured retirement to operator retries without invoking a model."""
+    from onionflash import cli
+    row, _, _ = reviewed_skip(store)
+    path = tmp_path / "config.toml"
+    path.write_text(f'''[storage]
+database="queue.sqlite3"
+output_dir="public"
+[[sources]]
+id="test"
+url="https://example.org/feed.xml"
+kind="feed"
+authority="telemetry"
+alert_format="{alert_format}"
+''')
+    monkeypatch.setattr(cli.Analyzer, "analyze", lambda *_args: pytest.fail("Retry must not call a model"))
+    before = sorted(store.db.iterdump())
+    assert cli.main(["rejected", "retry", "--config", str(path), "--item", row["id"],
+                     "--expect-hash", row["content_hash"], "--reason", "Reviewed selection", "--reconsider-ignored"]) == 2
+    output = capsys.readouterr()
+    assert output.out == "" and "Retired alert sources cannot be retried" in output.err
+    assert sorted(store.db.iterdump()) == before
+    assert actions(store) == []
 
 
 def test_explicit_reconsideration_gets_fresh_decision_and_preserves_unrelated_approvals(store):

@@ -11,7 +11,7 @@ from .util import digest, normalize_evidence as _plain
 from .comments import analysis_content
 from .schema import CATEGORIES, PRIORITIES, CONFIDENCES, STATES, PRODUCTS
 
-PROMPT_VERSION = "onionflash-11"
+PROMPT_VERSION = "onionflash-12"
 MIN_EVIDENCE_CHARS = 8
 MAX_EVIDENCE_CHOICES = 128
 SCHEMA = {
@@ -60,6 +60,8 @@ Classify only the supplied event: a generic bugfix is not a security fix without
 source support for a vulnerability or security classification. A merged capability
 is feature/protocol news with state=merged, not a release. Reserve release labels
 for observed version tags or explicit release announcements.
+If issue labels and the report body disagree on severity, either attribute both
+ratings or omit severity. Do not choose one silently or invent a combined rating.
 
 In replies, distinguish the author's own contribution from quoted history. Do not
 present a repeated parent message or old announcement as a new event. Measurements need their own
@@ -76,6 +78,10 @@ security-patch step does not prove there were patches or that they shipped. An o
 post-release checklist does not negate an explicit release announcement. A merged
 change (kind=gitlab_mr) is merged, not released or deployed. A tag is only tagged
 until an announcement establishes release status.
+When merge metadata says merged, describe the completed change rather than another
+proposal. Pre-merge scheduling comments describe earlier plans, not current status.
+A fix present only in a proposed patch series does not establish a merged or
+generally available fix; preserve that limited scope.
 
 Write a factual headline and 1-3 concise sentences. Brief sources
 can have brief summaries; never add filler to reach a word count. Preserve who did

@@ -89,6 +89,61 @@ def test_approval_is_not_rewritten_or_reclassified(monkeypatch):
     assert response["verdict"] == "approve" and public == before
 
 
+@pytest.mark.parametrize("action", ["revise", "hold", "skip"])
+@pytest.mark.parametrize("long_reason", [False, True])
+def test_refusal_issues_conservatively_override_pass_checks_without_mutating_input(action, long_reason):
+    """A stated problem may downgrade a refusal's check, never authorize publication."""
+    criterion = "news_value" if action == "skip" else "technical_details"
+    response = verdict(action, criterion=criterion, repair={"tags": ["release"]} if action == "revise" else None)
+    response["criteria"][criterion]["outcome"] = "pass"
+    issue = response["issues"][0]
+    issue["source_refs"] = ["S1:P1"]
+    issue["explanation"] = "Security classification is unsupported." if not long_reason else "Unsupported classification. " * 8
+    original = copy.deepcopy(response)
+    normalized = review.validate_review(response, packet())
+    check = normalized["criteria"][criterion]
+    assert normalized["verdict"] == action and check["outcome"] == "fail"
+    assert check["source_refs"] == issue["source_refs"]
+    assert 0 < len(check["reason"]) <= review.CHECK["properties"]["reason"]["maxLength"]
+    if not long_reason:
+        assert check["reason"] == issue["explanation"]
+    if action == "revise":
+        assert normalized["repair"] == {"tags": ["release"]}
+    assert response == original
+    normalized["issues"][0]["source_refs"].clear()
+    normalized["criteria"][criterion]["source_refs"].clear()
+    assert response == original
+
+
+@pytest.mark.parametrize("problem", ["approve", "bad-reference", "unexplained-failure", "unknown-criterion"])
+def test_issue_reconciliation_preserves_fail_closed_review_rules(problem):
+    """Contradictory critiques cannot bypass approval, reference or completeness checks."""
+    response = verdict("revise", criterion="technical_details", repair={"tags": ["release"]})
+    response["criteria"]["technical_details"]["outcome"] = "pass"
+    if problem == "approve":
+        response.update(verdict="approve", repair=None)
+    elif problem == "bad-reference":
+        response["issues"][0]["source_refs"] = ["S9:P99"]
+    elif problem == "unexplained-failure":
+        response["criteria"]["source_support"]["outcome"] = "fail"
+    else:
+        response["issues"][0]["criterion"] = "invented"
+    original = copy.deepcopy(response)
+    with pytest.raises(review.ReviewError):
+        review.validate_review(response, packet())
+    assert response == original
+
+
+def test_issue_reconciliation_never_upgrades_existing_failed_or_insufficient_checks():
+    """Existing refusal reasons retain their outcomes and evidence during normalization."""
+    for outcome in ("fail", "insufficient"):
+        response = verdict("hold", criterion="technical_details")
+        response["criteria"]["technical_details"]["outcome"] = outcome
+        prior = copy.deepcopy(response["criteria"]["technical_details"])
+        normalized = review.validate_review(response, packet())
+        assert normalized["criteria"]["technical_details"] == prior
+
+
 def test_repairs_can_clear_but_cannot_generate_an_impact_paragraph(monkeypatch):
     """Model repairs may remove legacy commentary without creating new advice."""
     public = candidate(why_it_matters="Existing commentary")

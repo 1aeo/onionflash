@@ -86,9 +86,10 @@ and no historical items are reset automatically. The normal writer and review
 pipeline decides whether to publish it and may ignore it again.
 
 Reconsideration does not reactivate retired alert sources. An item whose configured
-source still uses `alert_format = "consensus"` or `"censorship"` is ignored by the
-normal run before drafting, including after an explicit retry. Use this option
-for editorial reconsideration of supported news sources.
+source still uses `alert_format = "consensus"` or `"censorship"` cannot be retried:
+the CLI refuses it before changing queue state, audit records or saved evidence.
+Existing pending alerts are still ignored by the normal run before drafting.
+Use reconsideration for supported news sources.
 
 ## Dismiss one failed revision
 

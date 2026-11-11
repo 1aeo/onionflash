@@ -146,13 +146,15 @@ def _request(item_id, expected_hash, reason, observed):
     return reason.strip(), format_utc(parse_utc(observed or now_iso()))
 
 
-def _checked(db, item_id, expected_hash, *, reconsider_ignored=False):
+def _checked(db, item_id, expected_hash, *, reconsider_ignored=False, retired_source_ids=()):
     """Require the inspected source revision and an explicitly eligible queue state."""
     row = db.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
     if row is None:
         raise ValueError("Source item was not found")
     if row["content_hash"] != expected_hash:
         raise ValueError("Source content changed; inspect the current item before acting")
+    if row["source_id"] in retired_source_ids:
+        raise ValueError("Retired alert sources cannot be retried")
     failed_pending = (row["status"] == "pending" and type(row["attempts"]) is int
                       and row["attempts"] > 0 and isinstance(row["last_error"], str)
                       and bool(row["last_error"].strip()))
@@ -180,14 +182,15 @@ def _retry_key(row, llm):
         raise ValueError("Stored source item is not ready for analysis; restore or recollect it first") from None
 
 
-def _act(store, item_id, expected_hash, reason, action, llm, observed, *, reconsider_ignored=False):
+def _act(store, item_id, expected_hash, reason, action, llm, observed, *, reconsider_ignored=False, retired_source_ids=()):
     """Apply one guarded queue action and preserve its audit in the same transaction."""
     if type(reconsider_ignored) is not bool or (reconsider_ignored and action != "retry"):
         raise ValueError("Reconsidering ignored items is an explicit retry option")
     reason, stamp = _request(item_id, expected_hash, reason, observed)
     db = store.db
     with db:
-        row = _checked(db, item_id, expected_hash, reconsider_ignored=reconsider_ignored)
+        row = _checked(db, item_id, expected_hash, reconsider_ignored=reconsider_ignored,
+                       retired_source_ids=retired_source_ids)
         key = _retry_key(row, llm) if action == "retry" else None
         previous_analysis = db.execute("""SELECT * FROM analyses WHERE cache_key=?
             AND (source_item_id IS NULL OR source_item_id=?)
@@ -200,9 +203,9 @@ def _act(store, item_id, expected_hash, reason, action, llm, observed, *, recons
         update = ("status='pending',attempts=0,rejections=0,next_attempt_at=NULL,last_error=NULL"
                   if action == "retry" else "status='dismissed',next_attempt_at=NULL")
         changed = db.execute(f"""UPDATE items SET {update}
-            WHERE id=? AND content_hash=? AND payload=? AND status=? AND attempts=?
+            WHERE id=? AND source_id=? AND content_hash=? AND payload=? AND status=? AND attempts=?
             AND rejections=? AND last_error IS ? AND next_attempt_at IS ?""",
-            (item_id, expected_hash, row["payload"], row["status"], row["attempts"],
+            (item_id, row["source_id"], expected_hash, row["payload"], row["status"], row["attempts"],
              row["rejections"], row["last_error"], row["next_attempt_at"])).rowcount
         if changed != 1:
             raise ValueError("Source item changed during the action; inspect it again")
@@ -223,9 +226,11 @@ def _act(store, item_id, expected_hash, reason, action, llm, observed, *, recons
             "status": "pending" if action == "retry" else "dismissed", "action_id": event.lastrowid}
 
 
-def retry_item(store, item_id, expected_hash, reason, llm, observed=None, *, reconsider_ignored=False) -> dict:
-    """Retry one reviewed revision and retain its superseded analysis for audit."""
-    return _act(store, item_id, expected_hash, reason, "retry", llm, observed, reconsider_ignored=reconsider_ignored)
+def retry_item(store, item_id, expected_hash, reason, llm, observed=None, *, reconsider_ignored=False,
+               retired_source_ids=()) -> dict:
+    """Retry one reviewed revision unless its configured source is retired."""
+    return _act(store, item_id, expected_hash, reason, "retry", llm, observed,
+                reconsider_ignored=reconsider_ignored, retired_source_ids=retired_source_ids)
 
 
 def dismiss_item(store, item_id, expected_hash, reason, observed=None) -> dict:
