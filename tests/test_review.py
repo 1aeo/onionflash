@@ -83,10 +83,41 @@ def test_malformed_or_ambiguous_approval_is_rejected(monkeypatch, bad):
 
 
 def test_approval_is_not_rewritten_or_reclassified(monkeypatch):
-    public = candidate(confidence="suspected", state="developing", why_it_matters="")
+    public = candidate(confidence="suspected", state="developing", category="security", tags=["security"], why_it_matters="")
     before = copy.deepcopy(public)
     response = reviewer(monkeypatch, completion(verdict())).review(public, packet())
     assert response["verdict"] == "approve" and public == before
+
+
+@pytest.mark.parametrize("state", ["released", "tagged"])
+@pytest.mark.parametrize("verification", [False, True])
+def test_release_metadata_allows_announced_and_tagged_states(monkeypatch, state, verification):
+    """Coherent release metadata preserves the model's approval at either stage."""
+    result = reviewer(monkeypatch, completion(verdict())).review(candidate(state=state), packet(), verification=verification)
+    assert result["verdict"] == "approve"
+
+
+@pytest.mark.parametrize("category,tags", [("release", ["feature"]), ("feature", ["release"]), ("release", ["release"])])
+@pytest.mark.parametrize("verification", [False, True])
+def test_release_labels_cannot_approve_a_merged_change(monkeypatch, category, tags, verification):
+    """A model approval cannot override contradictory publication metadata."""
+    public = candidate(state="merged", category=category, tags=tags)
+    before = copy.deepcopy(public)
+    raw = verdict()
+    result = reviewer(monkeypatch, completion(raw)).review(public, packet(), verification=verification)
+    assert result["verdict"] == "hold" and result["repair"] is None
+    assert result["criteria"]["status"]["outcome"] == "fail"
+    assert result["issues"] == [{"criterion": "status", "source_refs": [],
+                                 "explanation": "Release labels require a released or tagged state."}]
+    assert all(result["criteria"][key] == raw["criteria"][key] for key in review.CRITERIA if key != "status")
+    assert review.validate_review(result, packet()) == result and public == before
+
+
+def test_inconsistent_release_metadata_does_not_prevent_editorial_skip(monkeypatch):
+    """Non-news can still be skipped without repairing metadata that will not publish."""
+    result = reviewer(monkeypatch, completion(verdict("skip", criterion="news_value"))).review(
+        candidate(state="merged"), packet())
+    assert result["verdict"] == "skip"
 
 
 @pytest.mark.parametrize("action", ["revise", "hold", "skip"])

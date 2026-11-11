@@ -10,7 +10,7 @@ from .candidate import SEMANTIC_FIELDS as EDITABLE
 from .render import _prepare_story
 from .util import digest
 
-REVIEW_VERSION = "onionflash-review-7"
+REVIEW_VERSION = "onionflash-review-9"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details", "news_value", "new_information")
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
@@ -143,9 +143,10 @@ The application has already chosen the publication action:
   do not demand a separate association or reject it for being a followup.
   Skip only when the candidate adds no material facts to that prior account.
 - When prior_story is null, this candidate would be a NEW article. If recent
-  coverage describes the same concrete event and the source adds a material
-  lifecycle change, hold with new_information insufficient for operator association.
-  If it merely repeats covered facts, skip. Distinct events can still be news.
+  coverage describes the same event, require a material new development such as
+  a completed fix, merge, resolution or release. Such a supported followup can be
+  a concise standalone article; do not invent an association or overwrite another
+  story. If it merely repeats covered facts, skip. Distinct events can still be news.
 A shared authority name or topic alone does not establish the same event; a
 different release version is a distinct release event.
 Compare lifecycle states explicitly: prior coverage requesting a change does not
@@ -175,7 +176,7 @@ and at least one failed or insufficient editorial criterion. Prefer skip for non
 or duplicate coverage even when the draft also contains factual defects; do not spend
 repairs polishing an item that should not publish. Explain every failed criterion.
 For important new material whose support is insufficient for a defensible account,
-or whose known followup needs operator association, use hold with repair null.
+use hold with repair null.
 If all factual and editorial criteria pass, approve.
 A proposed repair is NOT approval: another fresh review must verify the exact result.
 An initial approval also requires a separate fresh verification before publication.
@@ -325,6 +326,12 @@ def validate_review(result: dict, packet: dict) -> dict:
     return _validate(result, _packet_refs(packet))
 
 
+def release_labels_match_state(candidate: dict) -> bool:
+    """Release labels require a tagged or released state for automatic publication."""
+    return (candidate["state"] in {"released", "tagged"}
+            or (candidate["category"] != "release" and "release" not in candidate["tags"]))
+
+
 def decision_record_matches(record, result, *, candidate, prepared, policy_hash):
     """Require the recorded app stage and exact context behind a cached decision."""
     if not isinstance(record, dict) or not isinstance(record.get("reviews"), list) or not record["reviews"]:
@@ -341,7 +348,8 @@ def decision_record_matches(record, result, *, candidate, prepared, policy_hash)
             ("coverage_hash", prepared["coverage_hash"]), ("policy_hash", policy_hash))):
         return False
     if result["verdict"] == "approve":
-        if final.get("stage") != "verification" or len(record["reviews"]) != 2:
+        if (not release_labels_match_state(candidate)
+                or final.get("stage") != "verification" or len(record["reviews"]) != 2):
             return False
         first = record["reviews"][0]
         if not isinstance(first, dict) or any(first.get(key) != value for key, value in (
@@ -388,4 +396,11 @@ class Reviewer(CompletionClient):
             payload["coverage_background"] = coverage
         result = self.complete(VERIFY_PROMPT if verification else SYSTEM_PROMPT,
                                payload, schema, "onionflash_review")
-        return _validate(result, refs, wire=True)
+        result = _validate(result, refs, wire=True)
+        if result["verdict"] == "approve" and not release_labels_match_state(candidate_public):
+            reason = "Release labels require a released or tagged state."
+            result.update(verdict="hold", repair=None,
+                          criteria={**result["criteria"], "status": {
+                              "outcome": "fail", "source_refs": [], "reason": reason}},
+                          issues=[{"criterion": "status", "source_refs": [], "explanation": reason}])
+        return result

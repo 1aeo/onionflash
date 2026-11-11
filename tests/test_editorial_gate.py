@@ -232,7 +232,7 @@ def test_reconciled_critique_still_requires_fresh_verification(context, final):
     critique = verdict("revise", criterion="technical_details", repair={"tags": ["release"]})
     critique["criteria"]["technical_details"]["outcome"] = "pass"
     checker = Reviewer(critique, verdict(final))
-    draft = analysis(category="release", tags=["release", "security"], why_it_matters="")
+    draft = analysis(category="release", tags=["release", "security"], state="released", why_it_matters="")
     result = run(cfg, store, row, Writer(draft), checker)
     assert result["review_calls"] == 2 and [call[2] for call in checker.calls] == [False, True]
     assert checker.calls[1][0]["tags"] == ["release"]
@@ -255,6 +255,39 @@ def test_store_refuses_an_approval_receipt_without_final_verification(context):
     with pytest.raises(ReviewRequired, match="final verification"):
         store.commit_candidate(prepared, prepared["candidate"], "first-pass-only", LATER, **receipt)
     assert store.stories() == [] and store.pending_count() == 1
+
+
+@pytest.mark.parametrize("category,tags", [("release", ["feature"]), ("feature", ["release"]), ("release", ["release"])])
+def test_complete_approval_receipt_cannot_publish_inconsistent_release_metadata(context, category, tags):
+    """Even a complete matching proof cannot publish mutually inconsistent labels."""
+    _, store = context
+    row = pending(store)
+    prepared = store.prepare_candidate(row, analysis(state="merged", category=category, tags=tags), LATER)
+    receipt = approve(store, prepared)
+    with pytest.raises(ReviewRequired, match="final verification or skip record"):
+        store.commit_candidate(prepared, prepared["candidate"], "inconsistent-labels", LATER, **receipt)
+    assert store.stories() == [] and store.pending_count() == 1
+    # The same metadata does not prevent an explicit non-publication decision.
+    receipt = approve(store, prepared, result=review.validate_review(skipped(), prepared["packet"]))
+    assert store.skip_candidate(prepared, prepared["candidate"], "skip-inconsistent", LATER, **receipt)["status"] == "ignored"
+
+
+def test_cached_inconsistent_release_approval_is_invalidated_and_held(context, monkeypatch):
+    """A cached approval and a second model approval cannot override enum coherence."""
+    from test_analyze import FakeLLM, completion
+    cfg, store = context
+    cfg["llm"]["base_url"] = "https://llm.example/v1"
+    monkeypatch.setenv(cfg["llm"]["api_key_env"], "unit-test-secret")
+    row = pending(store)
+    draft = analysis(state="merged", category="feature", tags=["release"])
+    prepared = store.prepare_candidate(row, draft, LATER, review_settings=cfg["review"])
+    receipt = approve(store, prepared, policy=review.policy_hash(cfg))
+    with review.Reviewer(cfg) as checker:
+        checker.client = FakeLLM(completion(verdict()))
+        result = run(cfg, store, row, Writer(draft), checker)
+    assert result["status"] == "held" and result["review_calls"] == 1 and not result["cache_hit"]
+    assert not store.db.execute("SELECT 1 FROM review_approvals WHERE key=?", (receipt["approval_key"],)).fetchone()
+    assert store.stories() == []
 
 
 def test_incomplete_cached_verification_is_replaced_by_fresh_review_not_a_stale_loop(context, monkeypatch):

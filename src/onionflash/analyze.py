@@ -11,7 +11,7 @@ from .util import digest, normalize_evidence as _plain
 from .comments import analysis_content
 from .schema import CATEGORIES, PRIORITIES, CONFIDENCES, STATES, PRODUCTS
 
-PROMPT_VERSION = "onionflash-12"
+PROMPT_VERSION = "onionflash-13"
 MIN_EVIDENCE_CHARS = 8
 MAX_EVIDENCE_CHOICES = 128
 SCHEMA = {
@@ -82,6 +82,8 @@ When merge metadata says merged, describe the completed change rather than anoth
 proposal. Pre-merge scheduling comments describe earlier plans, not current status.
 A fix present only in a proposed patch series does not establish a merged or
 generally available fix; preserve that limited scope.
+Use developing for observations, discussions and unresolved reports. Reserve merged
+for an explicitly completed code merge, not a measurement report mentioning software.
 
 Write a factual headline and 1-3 concise sentences. Brief sources
 can have brief summaries; never add filler to reach a word count. Preserve who did

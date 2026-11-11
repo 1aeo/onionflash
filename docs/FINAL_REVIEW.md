@@ -47,6 +47,9 @@ separate impact paragraph. An explicitly sourced consequence or requested action
 may appear in the summary with its audience, scope and prerequisites preserved.
 Historical impact text remains readable. A review repair may clear it, but cannot
 create or rewrite an impact paragraph; operator corrections remain separate.
+Automatic approvals also require consistent metadata: a `release` category or
+tag needs state `released` or `tagged`. An inconsistent approval is held, including
+when loading a cached decision. This check does not infer facts from source text.
 
 The model must not invent impact or advice to make a weak source seem important.
 An open checklist cannot negate an explicit release announcement, and checked
@@ -56,8 +59,9 @@ mitigation bypass.
 
 Existing issue/release identities allow meaningful updates to the same article.
 Semantic similarity alone never merges unrelated events. A potentially important
-follow-up that cannot safely update the right existing article is held for
-editorial handling, rather than published as another incident headline.
+follow-up with no established article match can be a concise standalone story
+when it adds a material, supported development. It does not change another
+article's identity or overwrite a protected correction.
 
 ## Decisions and calls
 

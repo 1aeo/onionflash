@@ -1550,6 +1550,49 @@
       "coverage": [
         "news_value"
       ]
+    },
+    {
+      "id": "unmapped-material-followup",
+      "packet": "issue-update",
+      "candidate": {
+        "id": "e25ff6e85114314bfb5a745c",
+        "title": "Protocol-parser crash fix merged",
+        "summary": "A maintainer reports that the fix for a crash caused by malformed relay protocol tokens is now merged. No release containing the fix has been announced.",
+        "why_it_matters": "",
+        "category": "security",
+        "tags": [
+          "security"
+        ],
+        "state": "merged",
+        "confidence": "reported"
+      },
+      "expected": "approve",
+      "coverage": [
+        "new_information",
+        "status"
+      ],
+      "coverage_set": "related-issue"
+    },
+    {
+      "id": "unmapped-unchanged-followup",
+      "packet": "unchanged-issue",
+      "candidate": {
+        "id": "f88586387ecbf55c5a2cdb56",
+        "title": "Protocol-parser crash reported",
+        "summary": "A report describes a crash caused by malformed relay protocol tokens. A fix is proposed.",
+        "why_it_matters": "",
+        "category": "security",
+        "tags": [
+          "security"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      },
+      "expected": "skip",
+      "coverage": [
+        "new_information"
+      ],
+      "coverage_set": "related-issue"
     }
   ],
   "coverage_sets": {
@@ -1617,6 +1660,31 @@
           "state": "developing",
           "updated_at": "2026-11-09T12:00:00Z",
           "summary_truncated": false
+        }
+      ],
+      "truncated": false
+    },
+    "related-issue": {
+      "prior_story": null,
+      "recent": [
+        {
+          "id": "1d0b897c21b1d07101efff97",
+          "title": "Protocol-parser crash reported",
+          "summary": "A report describes a crash caused by malformed relay protocol tokens. A fix is proposed.",
+          "why_it_matters": "",
+          "category": "security",
+          "priority": "normal",
+          "confidence": "reported",
+          "state": "developing",
+          "products": [
+            "tor"
+          ],
+          "tags": [
+            "security"
+          ],
+          "published_at": "2026-11-08T12:00:00Z",
+          "updated_at": "2026-11-08T12:00:00Z",
+          "added_at": "2026-11-08T12:00:00Z"
         }
       ],
       "truncated": false
