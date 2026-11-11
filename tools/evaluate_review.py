@@ -48,7 +48,9 @@ def expand(corpus: dict) -> list[dict]:
                  **case["candidate"]}
         cases.append({**case, "candidate": _prepare_story(story, editorial=story.get("editorial")),
                       "packet": {"sources": sources, "missing_sources": packet.get("missing_sources", []),
-                                 "truncated": packet.get("truncated", False)}})
+                                 "truncated": packet.get("truncated", False)},
+                      "existing_coverage": corpus.get("coverage_sets", {}).get(case.get("coverage_set"),
+                          {"prior_story": None, "recent": [], "truncated": False})})
     return cases
 
 
@@ -58,7 +60,9 @@ def kept_unsupported(case: dict, story: dict) -> list[str]:
     return [phrase for phrase in case.get("unsupported", []) if phrase.casefold() in text]
 
 
-def evaluate(config, cases, output, *, rounds=1, verify_repairs=False, deadline=None):
+def evaluate(config, cases, output, *, rounds=1, verify_repairs=True, deadline=None):
+    if not verify_repairs:
+        raise ValueError("Final verification is mandatory")
     output = Path(output).resolve()
     public = Path(config["storage"]["output_dir"]).resolve()
     if output == public or public in output.parents:
@@ -69,14 +73,14 @@ def evaluate(config, cases, output, *, rounds=1, verify_repairs=False, deadline=
     for case in cases:
         # A negative case without the wording its repair must remove would score any
         # verified repair as a correct refusal.
-        if (case["id"] in identities or case["expected"] not in {"approve", "not_approve"}
+        if (case["id"] in identities or case["expected"] not in {"approve", "not_approve", "skip"}
                 or (verify_repairs and case["expected"] == "not_approve" and not case.get("unsupported"))):
             raise ValueError("Invalid or duplicate evaluation case")
         identities.add(case["id"])
     output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     totals = {"cases": 0, "matched": 0, "false_approvals": 0, "positive_rejections": 0,
-              "errors": 0, "repairs_verified": 0, "repairs_held": 0, "incomplete": False}
+              "errors": 0, "editorial_misses": 0, "repairs_verified": 0, "repairs_held": 0, "repairs_skipped": 0, "incomplete": False}
     identity = policy_hash(config)
     with os.fdopen(descriptor, "w", encoding="utf-8") as report, EvaluationReviewer(config, deadline=deadline) as reviewer:
         for iteration in range(1, rounds + 1):
@@ -86,26 +90,36 @@ def evaluate(config, cases, output, *, rounds=1, verify_repairs=False, deadline=
                     break
                 started = time.monotonic()
                 record = {"case": case["id"], "round": iteration, "expected": case["expected"],
-                          "policy_hash": identity, "candidate": case["candidate"], "packet": case["packet"]}
+                          "policy_hash": identity, "candidate": case["candidate"], "packet": case["packet"],
+                          "existing_coverage": case.get("existing_coverage")}
                 totals["cases"] += 1
                 try:
-                    result = reviewer.review(case["candidate"], case["packet"])
+                    result = reviewer.review(case["candidate"], case["packet"], coverage=case.get("existing_coverage"))
                     record["result"] = result
-                    approved = result["verdict"] == "approve"
-                    if verify_repairs and result["verdict"] == "revise":
-                        repaired = apply_repair(case["candidate"], result["repair"])
-                        verified = reviewer.review(repaired, case["packet"], verification=True)
-                        record.update(repaired=repaired, verification=verified,
-                                      kept_unsupported=kept_unsupported(case, repaired))
-                        totals["repairs_verified" if verified["verdict"] == "approve" else "repairs_held"] += 1
-                        # The gate publishes a verified repair. That approves a positive case, and a
-                        # negative one only if the repair kept its flagged wording.
-                        approved = verified["verdict"] == "approve" and (
-                            case["expected"] == "approve" or bool(record["kept_unsupported"]))
-                    matched = approved == (case["expected"] == "approve")
+                    final_verdict = result["verdict"]
+                    published = final_verdict == "approve"
+                    unsafe = published and case["expected"] != "approve"
+                    if result["verdict"] in {"approve", "revise"}:
+                        final_candidate = (apply_repair(case["candidate"], result["repair"])
+                                           if result["verdict"] == "revise" else case["candidate"])
+                        verified = reviewer.review(final_candidate, case["packet"],
+                                                   coverage=case.get("existing_coverage"), verification=True)
+                        record.update(verification=verified, kept_unsupported=kept_unsupported(case, final_candidate))
+                        if result["verdict"] == "revise":
+                            record["repaired"] = final_candidate
+                            totals[{"approve": "repairs_verified", "skip": "repairs_skipped"}.get(verified["verdict"], "repairs_held")] += 1
+                        final_verdict = verified["verdict"]
+                        published = final_verdict == "approve"
+                        unsafe = published and (case["expected"] == "skip" or
+                            (case["expected"] == "not_approve" and bool(record["kept_unsupported"])))
+                    matched = (published if case["expected"] == "approve" else
+                               final_verdict == "skip" if case["expected"] == "skip" else not unsafe)
+                    record["final_verdict"] = final_verdict
+                    record["published_candidate"] = record.get("repaired", case["candidate"]) if published else None
                     totals["matched"] += matched
-                    totals["false_approvals"] += approved and case["expected"] == "not_approve"
-                    totals["positive_rejections"] += not approved and case["expected"] == "approve"
+                    totals["false_approvals"] += unsafe
+                    totals["positive_rejections"] += not published and case["expected"] == "approve"
+                    totals["editorial_misses"] += final_verdict != "skip" and case["expected"] == "skip"
                     record["matched"] = matched
                 except (AnalysisError, ValueError, TypeError, KeyError) as exc:
                     totals["errors"] += 1
@@ -140,7 +154,8 @@ def main(argv=None):
     parser.add_argument("--case-id", action="append", default=[])
     parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--max-seconds", type=int, default=900)
-    parser.add_argument("--verify-repairs", action="store_true")
+    parser.add_argument("--verify-repairs", action="store_true", default=True,
+                        help="Compatibility option; final verification always runs")
     args = parser.parse_args(argv)
     os.umask(0o077)
     if not 1 <= args.max_seconds <= 7200 or args.cases.stat().st_size > 2097152:
@@ -154,7 +169,7 @@ def main(argv=None):
         cases = [case for case in cases if case["id"] in selected]
     result = evaluate(config, cases, args.output, rounds=args.rounds,
                       verify_repairs=args.verify_repairs, deadline=time.monotonic() + args.max_seconds)
-    return int(bool(result["false_approvals"] or result["positive_rejections"] or result["errors"] or result["incomplete"]))
+    return int(bool(result["false_approvals"] or result["positive_rejections"] or result["editorial_misses"] or result["errors"] or result["incomplete"]))
 
 
 if __name__ == "__main__":

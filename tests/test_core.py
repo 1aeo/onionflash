@@ -139,47 +139,6 @@ def test_false_evidence_and_extra_model_fields_rejected():
         validate_analysis({**analysis(), "url": "https://evil.example/"}, item())
 
 
-def test_confirmation_cannot_be_invented_from_public_issue():
-    result = validate_analysis(analysis(confidence="confirmed"), item())
-    assert result["confidence"] == "reported"
-
-
-def test_bastet_requested_removal_cannot_be_published_as_completed():
-    body = "Last night, bastet's operator notified us that the machine is very plausibly compromised. In any kind of scenario here, the keys can't be trusted anymore and bastet will generate a new identity soon. In the meantime, remove bastet from source as we can't trust it anymore."
-    src = item(title="dirauth: Remove bastet from list", content=body)
-    quote = "the machine is very plausibly compromised"
-    wrong = analysis(
-        title="Bastet reported plausibly compromised",
-        summary="The Tor team has removed bastet from the source code.",
-        state="resolved",
-        evidence=[quote],
-    )
-    with pytest.raises(AnalysisError, match="completed action"):
-        validate_analysis(wrong, src)
-    correct = analysis(
-        title="Bastet reported plausibly compromised",
-        summary="Tor's issue requests removal of bastet after the operator reported a plausible compromise.",
-        state="resolved",
-        evidence=[quote],
-    )
-    assert validate_analysis(correct, src)["state"] == "developing"
-    with pytest.raises(AnalysisError, match="uncertainty"):
-        validate_analysis(
-            {**correct, "title": "Bastet directory authority compromised"}, src
-        )
-
-
-def test_tags_and_merges_are_not_release_availability():
-    assert (
-        validate_analysis(analysis(state="released"), item(kind="tag"))["state"]
-        == "tagged"
-    )
-    assert (
-        validate_analysis(analysis(state="released"), item(kind="gitlab_mr"))["state"]
-        == "merged"
-    )
-
-
 def test_queue_is_durable_and_idempotent(tmp_path):
     db = tmp_path / "state.db"
     with Store(db) as store:

@@ -35,7 +35,7 @@ def scripted(reply):
             return self
         def __exit__(self, *args):
             pass
-        def review(self, candidate, packet, *, verification=False):
+        def review(self, candidate, packet, *, coverage=None, verification=False):
             return reply(verification)
     return Reviewer
 
@@ -47,7 +47,7 @@ def test_controlled_corpus_is_blinded_and_covers_rubric():
     assert set(CRITERIA) <= {criterion for c in cases for criterion in c["coverage"]}
     assert any(c["expected"] == "approve" and "operational_advice" in c["coverage"] for c in cases)
     for case in cases:
-        payload = {"candidate": case["candidate"], "packet": case["packet"]}
+        payload = {"candidate": case["candidate"], "packet": case["packet"], "existing_coverage": case["existing_coverage"]}
         assert case["id"] not in json.dumps(payload)
         assert _packet_refs(case["packet"])
         # A negative case flags wording that it contains and its approved twins do not.
@@ -114,3 +114,54 @@ def test_repair_verification_refuses_a_negative_case_without_its_unsupported_wor
     case = dict(next(c for c in corpus() if c["id"] == "bastet-original"), unsupported=[])
     with pytest.raises(ValueError, match="Invalid or duplicate evaluation case"):
         module.evaluate(config, [case], tmp_path / "report.jsonl", verify_repairs=True)
+
+
+def test_editorial_skip_requires_skip_and_never_counts_repaired_publication_as_success(tmp_path, monkeypatch):
+    module = evaluator()
+    config = copy.deepcopy(DEFAULTS)
+    config["storage"]["output_dir"] = str(tmp_path / "public")
+    case = next(c for c in corpus() if c["expected"] == "skip")
+    for outcome, misses, false in (("skip", 0, 0), ("hold", 1, 0), ("approve", 1, 1)):
+        monkeypatch.setattr(module, "EvaluationReviewer", scripted(lambda verification: {"verdict": outcome}))
+        result = module.evaluate(config, [case], tmp_path / (outcome + ".jsonl"))
+        assert result["editorial_misses"] == misses
+        assert result["false_approvals"] == false
+    monkeypatch.setattr(module, "EvaluationReviewer", scripted(
+        lambda verification: {"verdict": "approve"} if verification else
+        {"verdict": "revise", "repair": {"why_it_matters": "A supported but redundant statement."}}))
+    result = module.evaluate(config, [case], tmp_path / "repaired.jsonl", verify_repairs=True)
+    assert result["false_approvals"] == result["editorial_misses"] == 1
+
+
+def test_coverage_background_is_passed_to_both_reviews_and_saved_privately(tmp_path, monkeypatch):
+    module = evaluator()
+    config = copy.deepcopy(DEFAULTS)
+    config["storage"]["output_dir"] = str(tmp_path / "public")
+    case = next(c for c in corpus() if c.get("existing_coverage", {}).get("recent"))
+    seen = []
+    class Inspector(scripted(lambda verification: {"verdict": "skip"})):
+        def review(self, candidate, packet, *, coverage=None, verification=False):
+            seen.append(coverage)
+            return ({"verdict": "skip"} if verification else
+                    {"verdict": "revise", "repair": {"why_it_matters": "A source-supported statement."}})
+    monkeypatch.setattr(module, "EvaluationReviewer", Inspector)
+    output = tmp_path / "coverage.jsonl"
+    result = module.evaluate(config, [case], output, verify_repairs=True)
+    assert result["repairs_skipped"] == 1 and result["repairs_held"] == 0
+    assert seen == [case["existing_coverage"], case["existing_coverage"]]
+    assert json.loads(output.read_text().splitlines()[0])["existing_coverage"] == case["existing_coverage"]
+
+
+def test_first_approval_is_not_publication_without_final_verification(tmp_path, monkeypatch):
+    module = evaluator()
+    config = copy.deepcopy(DEFAULTS)
+    config["storage"]["output_dir"] = str(tmp_path / "public")
+    case = next(c for c in corpus() if c["expected"] == "approve")
+    monkeypatch.setattr(module, "EvaluationReviewer", scripted(
+        lambda verification: {"verdict": "hold"} if verification else {"verdict": "approve"}))
+    result = module.evaluate(config, [case], tmp_path / "final-hold.jsonl")
+    assert result["positive_rejections"] == 1 and result["matched"] == 0
+    record = json.loads((tmp_path / "final-hold.jsonl").read_text().splitlines()[0])
+    assert record["published_candidate"] is None and record["final_verdict"] == "hold"
+    with pytest.raises(ValueError, match="mandatory"):
+        module.evaluate(config, [case], tmp_path / "bypass.jsonl", verify_repairs=False)
