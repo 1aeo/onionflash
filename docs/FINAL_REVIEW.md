@@ -109,10 +109,13 @@ inspect failures. See [operator controls](REJECTED_ANALYSES.md) and
 
 ## Configuration and evaluation
 
-Review model, timeouts and input/output bounds remain in `[review]` in the
-[example configuration](../config.example.toml). Requests also obey the shared
-run deadline. The coverage background is bounded separately; truncation is
-explicit and never proves the absence of older coverage.
+The reviewer uses the `[llm]` endpoint, fallbacks, credential environment,
+network policy and request timeout, so no additional service is needed.
+`review.model` selects a different model; empty uses `llm.model`. The packet
+bounds, the reply length and the single repair are fixed, so the model endpoint
+needs enough context for a full packet. Requests also obey the shared run
+deadline. The coverage background is bounded separately; truncation is explicit
+and never proves the absence of older coverage.
 
 The controlled evaluation does not collect, open the application database or
 publish. It exercises both review rounds, records their outputs privately, and

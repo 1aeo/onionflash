@@ -9,7 +9,7 @@ import pytest
 
 from approval_helpers import approve, verdict
 from onionflash import editorial, rejection, review, review_gate
-from onionflash.analyze import AnalysisError, tag_notice
+from onionflash.analyze import AnalysisError, cache_key, tag_notice
 from onionflash.store import Store
 from onionflash.util import digest
 from test_core import DATE, analysis, config, item
@@ -91,9 +91,9 @@ def test_approved_exact_candidate_commits_and_keeps_private_complete_audit(conte
     assert result == {"status": "published", "writer_calls": 1, "review_calls": 2, "cache_hit": False}
     assert job(store) is None
     assert store.stories()[0]["summary"] == checker.calls[0][0]["summary"]
-    saved = store.db.execute("SELECT review_record FROM analyses").fetchone()[0]
-    audit = json.loads(saved)
-    assert audit["writer"]["result"] == analysis()
+    saved = store.db.execute("SELECT result,review_record FROM analyses").fetchone()
+    audit = json.loads(saved[1])
+    assert json.loads(saved[0]) == analysis() and audit["writer"] == {"key": cache_key(row, cfg["llm"])}
     assert audit["prepared"]["packet"]["sources"]
     assert [r["stage"] for r in audit["reviews"]] == ["review", "verification"] and audit["outcome"] == "approved"
 
@@ -158,14 +158,6 @@ def test_second_nonapproval_holds_once_and_never_rewrites_again(context, second)
     assert job(store)["stage"] == "held"
     audit = json.loads(store.db.execute("SELECT review_record FROM analyses").fetchone()[0])
     assert audit["outcome"] == "held" and len(audit["reviews"]) == 2
-
-
-def test_zero_repairs_holds_after_one_review(context):
-    cfg, store = context
-    cfg["review"]["max_repairs"] = 0
-    row = pending(store)
-    result = run(cfg, store, row, Writer(), Reviewer(verdict("revise", repair={"why_it_matters": ""})))
-    assert result["status"] == "held" and result["review_calls"] == 1
 
 
 @pytest.mark.parametrize("repair", [None, {"title": analysis()["title"]}, {"title": ""}],
@@ -323,7 +315,7 @@ def test_cache_cannot_treat_an_approve_boolean_as_all_required_checks(context):
 
 def test_cache_pruning_retains_active_approval_jobs(context, monkeypatch):
     cfg, store = context
-    cfg["review"]["max_cache_entries"] = 1
+    monkeypatch.setattr(review_gate, "MAX_APPROVALS", 1)
     row = pending(store)
     monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("crash")))
     with pytest.raises(RuntimeError):
@@ -339,10 +331,9 @@ def test_cache_pruning_retains_active_approval_jobs(context, monkeypatch):
     assert job(store)["stage"] == "approved"
 
 
-def test_status_reads_stage_counts_without_creating_tables_or_exposing_audit(context):
+def test_status_reads_stage_counts_without_exposing_audit(context):
     cfg, store = context
     assert review_gate.status(store) == {"stages": {}, "approval_cache_entries": 0}
-    assert not store.db.execute("SELECT 1 FROM sqlite_master WHERE name='review_jobs'").fetchone()
     row = pending(store)
     with pytest.raises(AnalysisError):
         run(cfg, store, row, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
@@ -355,10 +346,10 @@ def test_operator_retry_preserves_held_audit_and_reuses_the_completed_draft(cont
     cfg, store = context
     row = pending(store)
     assert run(cfg, store, row, Writer(), Reviewer(verdict("hold")))["status"] == "held"
-    rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed new validation policy", cfg["llm"], LATER)
-    previous = json.loads(store.db.execute("SELECT superseded_analysis_json FROM rejection_actions").fetchone()[0])
-    audit = json.loads(previous["review_record"])
-    assert audit["outcome"] == "held" and audit["reviews"][0]["result"]["verdict"] == "hold"
+    rejection.retry_item(store, row["id"], row["content_hash"], "The review prompt was revised", LATER)
+    audit = json.loads(store.db.execute("SELECT review_record FROM analyses WHERE cache_key=?",
+                                        (cache_key(row, cfg["llm"]),)).fetchone()[0])
+    assert audit["outcome"] == "held" and audit["reviews"][0]["result"]["verdict"] == "hold"  # retry keeps it
     assert job(store)["stage"] == "drafted"
     retry = store.pending(1, LATER)[0]
     writer = Writer()
@@ -375,6 +366,16 @@ def test_a_source_that_reverts_to_a_held_revision_is_held_again_without_a_review
     checker = Reviewer(verdict())
     assert run(cfg, store, store.pending(1, LATER)[0], Writer(), checker)["status"] == "held"
     assert checker.calls == []
+
+
+def test_ignored_draft_leaves_the_queue_without_review(context):
+    cfg, store = context
+    row = pending(store)
+    result = run(cfg, store, row, Writer(analysis(publish=False)), Reviewer())
+    assert result == {"status": "ignored", "writer_calls": 1, "review_calls": 0, "cache_hit": False}
+    assert store.db.execute("SELECT status FROM items").fetchone()[0] == "ignored"
+    assert job(store) is None and store.pending_count() == 0 and store.stories() == []
+    assert json.loads(store.db.execute("SELECT result FROM analyses").fetchone()[0]) == analysis(publish=False)
 
 
 def test_ignored_writer_result_cannot_overwrite_a_concurrent_source_update(context):
@@ -446,8 +447,9 @@ def test_rejected_show_still_prints_the_item_when_its_review_record_is_damaged(c
 def test_rejected_show_without_a_current_job_stays_read_only(context):
     _, store = context
     row = pending(store)
+    before = list(store.db.iterdump())
     assert rejection.show_item(store, row["id"])["final_review"] is None
-    assert not store.db.execute("SELECT 1 FROM sqlite_master WHERE name='review_jobs'").fetchone()
+    assert list(store.db.iterdump()) == before
 
 
 @pytest.mark.parametrize("change", ["source", "candidate", "policy"])
@@ -475,10 +477,11 @@ def test_superseded_verification_preserves_its_exact_old_source_and_stage(contex
     checker = Reviewer(verdict("revise", repair={"why_it_matters": ""}), verdict())
     assert run(cfg, store, row, Writer(analysis(why_it_matters=wrong)), checker)["status"] == "published"
     assert job(store) is None
-    records = [json.loads(r[0]) for r in store.db.execute("SELECT review_record FROM analyses WHERE review_record IS NOT NULL")]
-    preserved = next(r for r in records if r.get("outcome") == "superseded")
+    records = [(json.loads(r[0]), json.loads(r[1])) for r in store.db.execute(
+        "SELECT review_record,result FROM analyses WHERE review_record IS NOT NULL")]
+    preserved, draft = next(record for record in records if record[0].get("outcome") == "superseded")
     assert preserved["stage"] == "verify"
-    assert preserved["writer"]["result"]["why_it_matters"] == wrong
+    assert draft["why_it_matters"] == wrong
     assert preserved["candidate"]["why_it_matters"] == ""
     assert preserved["reviews"][0]["result"]["verdict"] == "revise"
     assert preserved["source_envelope"] == envelope
@@ -543,7 +546,6 @@ def test_approval_receipt_and_job_pin_roll_back_together_if_job_save_fails(conte
     """Persist the receipt and its unfinished-job pin atomically."""
     cfg, store = context
     row = pending(store)
-    review_gate.initialize(store)
     store.db.execute("""CREATE TRIGGER fail_approved_job BEFORE INSERT ON review_jobs
         WHEN NEW.stage='approved' BEGIN SELECT RAISE(ABORT,'job save unavailable'); END""")
     store.db.commit()
@@ -560,7 +562,7 @@ def test_approval_receipt_and_job_pin_roll_back_together_if_job_save_fails(conte
 
 def test_resuming_approved_job_never_temporarily_unpins_its_receipt(context, monkeypatch):
     cfg, store = context
-    cfg["review"]["max_cache_entries"] = 1
+    monkeypatch.setattr(review_gate, "MAX_APPROVALS", 1)
     row = pending(store)
     commit = store.commit_candidate
     monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("crash before commit")))

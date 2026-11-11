@@ -56,21 +56,7 @@ DEFAULTS = {
         "user_agent": "OnionFlash (+https://github.com/1aeo/onionflash)",
     },
     "monitoring": {},
-    "comments": {
-        "enabled": False,
-        "run_budget_seconds": 30,
-        "max_issues_per_run": 12,
-        "max_issues_per_source": 4,
-        "max_comments": 12,
-        "comment_chars": 2000,
-        "total_chars": 8000,
-        "interval_seconds": 1800,
-        "candidate_days": 14,
-        "cache_days": 30,
-        "max_cache_entries": 512,
-        "failure_backoff_base_seconds": 300,
-        "failure_backoff_cap_seconds": 21600,
-    },
+    "comments": {"enabled": False},
     "llm": {
         "base_url": "",
         "fallback_base_urls": [],
@@ -89,54 +75,21 @@ DEFAULTS = {
         "enable_thinking": False,
         "send_chat_template_kwargs": True,
     },
-    "review": {
-        "model": "",
-        "timeout_seconds": 90,
-        "connect_timeout_seconds": 10,
-        "total_timeout_seconds": 120,
-        "max_output_tokens": 2200,
-        "max_source_chars": 24000,
-        "max_sources": 8,
-        "max_passages": 64,
-        "passage_chars": 1800,
-        "max_repairs": 1,
-        "max_cache_entries": 2000,
-    },
+    "review": {"model": ""},
     "sources": [],
 }
 
-# Ranges for the numbers an operator sets, so an accidental zero cannot disable a
-# timeout or turn a retry loop into a busy loop. A name's range applies in every
-# section that uses it; max_pages and max_items_per_source also bound a source's
-# own max_pages and max_items.
+# Ranges for the numbers an operator sets in llm, storage and site, so an accidental
+# zero cannot disable a timeout or turn a retry loop into a busy loop. max_pages and
+# max_items_per_source bound a source's own max_pages and max_items.
 BOUNDS = {
     "timeout_seconds": (1, 600),
-    "connect_timeout_seconds": (1, 120),
-    "total_timeout_seconds": (1, 600),
-    "max_output_tokens": (128, 8192),
-    "max_source_chars": (1000, 100000),
-    "max_sources": (1, 16),
-    "max_passages": (1, 256),
-    "passage_chars": (100, 4000),
-    "max_repairs": (0, 1),
     "max_pages": (1, 100),
     "page_size": (1, 100),
     "max_items_per_source": (1, 10000),
     "max_items_per_run": (1, 1000),
     "render_batch_size": (1, 1000),
     "feed_size": (0, 100000),
-    "run_budget_seconds": (30, 3600),
-    "failure_backoff_base_seconds": (1, 3600),
-    "failure_backoff_cap_seconds": (1, 604800),
-    "max_issues_per_run": (1, 100),
-    "max_issues_per_source": (1, 20),
-    "max_comments": (1, 100),
-    "comment_chars": (100, 10000),
-    "total_chars": (1000, 40000),
-    "interval_seconds": (30, 604800),
-    "candidate_days": (1, 365),
-    "cache_days": (1, 365),
-    "max_cache_entries": (1, 10000),
 }
 
 
@@ -156,7 +109,11 @@ RETIRED = {
     "storage": {"max_stories"},
     "http": {"requests_per_minute"},
     "llm": {"retry_attempts", "max_input_chars"},
-    "comments": {"max_pages", "page_size"},
+    "comments": {"max_pages", "page_size", "run_budget_seconds", "max_issues_per_run", "max_issues_per_source",
+                 "max_comments", "comment_chars", "total_chars", "interval_seconds", "candidate_days", "cache_days",
+                 "max_cache_entries", "failure_backoff_base_seconds", "failure_backoff_cap_seconds"},
+    "review": {"timeout_seconds", "connect_timeout_seconds", "total_timeout_seconds", "max_output_tokens",
+               "max_source_chars", "max_sources", "max_passages", "passage_chars", "max_repairs", "max_cache_entries"},
     "collection": {"healthy_poll_tolerance_seconds", "tag_priority_score", "max_xml_depth", "max_xml_elements",
                    "reconcile_seconds"},
     "monitoring": {
@@ -201,7 +158,7 @@ def load_config(path: str | Path) -> dict:
                     f"Unknown {section} settings: {', '.join(sorted(unknown))}"
                 )
             config[section].update(values)
-    for section in ("http", "collection", "llm", "storage", "site", "comments", "review"):
+    for section in ("llm", "storage", "site"):
         for key, value in config[section].items():
             if key in BOUNDS:
                 low, high = BOUNDS[key]
@@ -217,8 +174,6 @@ def load_config(path: str | Path) -> dict:
                     raise ValueError(f"{section}.{key} must be an integer")
     if not isinstance(config["comments"]["enabled"], bool):
         raise ValueError("comments.enabled must be a boolean")
-    if config["comments"]["failure_backoff_cap_seconds"] < config["comments"]["failure_backoff_base_seconds"]:
-        raise ValueError("Comments backoff cap must be at least its base")
     base_url = _expand(config["site"]["base_url"])
     parsed_site = urlsplit(base_url)
     if (
@@ -296,10 +251,6 @@ def load_config(path: str | Path) -> dict:
     if not isinstance(review["model"], str) or len(review["model"]) > 200 or any(ord(c) < 32 for c in review["model"]):
         raise ValueError("review.model must be a short model identifier, or empty to inherit llm.model")
     review["model"] = review["model"].strip()
-    if review["total_timeout_seconds"] < review["connect_timeout_seconds"]:
-        raise ValueError("review.total_timeout_seconds must cover its connection timeout")
-    if review["passage_chars"] > review["max_source_chars"]:
-        raise ValueError("review.passage_chars must fit within max_source_chars")
     sources = config["sources"]
     if not isinstance(sources, list) or not sources or len(sources) > 100:
         raise ValueError("Configure between 1 and 100 sources")
@@ -379,11 +330,13 @@ def load_config(path: str | Path) -> dict:
             if website.query or website.fragment or not website.path.strip("/"):
                 raise ValueError("Timeline website_url must be a clean repository URL")
         source["fallback_urls"] = [canonical_url(u) for u in source["fallback_urls"]]
-        if any(key in source for key in ("gitlab_project", "comments_graphql_url", "comments_enabled")):
+        # comments_graphql_url and comments_enabled are retired source keys that still load.
+        # An old comments_enabled = false keeps the source out, as leaving out gitlab_project does.
+        if source.get("comments_enabled") is False:
+            source.pop("gitlab_project", None)
+        if "gitlab_project" in source:
             if source["kind"] != "gitlab_issue":
                 raise ValueError("Comment configuration requires a GitLab issue source")
-            if not isinstance(source.get("comments_enabled", True), bool):
-                raise ValueError("comments_enabled must be a boolean")
             from .comments import CommentError, _identity
             try:
                 _identity(source)

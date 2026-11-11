@@ -804,15 +804,15 @@ def test_a_longer_llm_timeout_extends_the_fixed_attempt_total():
 def test_only_operator_settings_are_configurable_and_the_rest_are_ignored(tmp_path, caplog):
     path = tmp_path / "config.toml"
     path.write_text('[collection]\nlookback_days = 3\n[http]\nretry_attempts = 7\n'
-                    '[llm]\nmax_items_per_run = 20\nmax_input_chars = 5000\n[comments]\nmax_pages = 2\npage_size = 20\n'
+                    '[llm]\nmax_items_per_run = 20\nmax_input_chars = 5000\n[comments]\nmax_pages = 2\ninterval_seconds = 900\n'
                     '[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
     with caplog.at_level("WARNING", logger="onionflash.config"):
         config = load_config(path)
     assert config["llm"]["max_items_per_run"] == 20  # an operator setting
     assert config["collection"]["lookback_days"] == DEFAULTS["collection"]["lookback_days"]
     assert config["http"]["retry_attempts"] == DEFAULTS["http"]["retry_attempts"]
-    assert "max_input_chars" not in config["llm"] and "max_pages" not in config["comments"]
-    for key in ("collection.lookback_days", "http.retry_attempts", "llm.max_input_chars", "comments.max_pages", "comments.page_size"):
+    assert "max_input_chars" not in config["llm"] and config["comments"] == {"enabled": False}
+    for key in ("collection.lookback_days", "http.retry_attempts", "llm.max_input_chars", "comments.max_pages", "comments.interval_seconds"):
         assert f"Ignoring setting {key}" in caplog.text
     path.write_text('[http]\nnot_a_setting = 1\n[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
     with pytest.raises(ValueError, match="Unknown http settings"):

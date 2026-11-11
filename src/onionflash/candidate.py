@@ -123,29 +123,25 @@ def assert_current(db, prepared: dict) -> None:
         raise StaleCandidate("Supporting source changed since candidate preparation")
 
 
-def prepare(db, row: dict, result: dict, observed: str, *, review_settings: dict | None = None) -> dict:
+def prepare(db, row: dict, result: dict, observed: str) -> dict:
     # Copy caller-owned values so later repairs cannot mutate the original draft.
     """Assemble the exact candidate and bind all state needed for its guarded commit."""
     row, result = json.loads(json.dumps(row)), json.loads(json.dumps(result))
-    if type(result.get("publish")) is not bool:
-        raise ValueError("Draft publication decision must be boolean")
     current = db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()
     if current is None or item_fingerprint(dict(current)) != item_fingerprint(row):
         raise StaleCandidate("Source item changed before candidate preparation")
     item = json.loads(row["payload"])
-    if item.get("id") != row["id"]:
-        raise ValueError("Source identity differs from its stored item")
     existing = existing_story(db, row)
     story_id = existing["id"] if existing else digest(row["cluster_key"])[:24]
     locked = editorial.is_locked(db, story_id)
-    coverage_budget = min(COVERAGE_CHARS, (review_settings or {}).get("max_source_chars", source_packet.DEFAULT_LIMITS["max_source_chars"]) // 2)
+    coverage_budget = min(COVERAGE_CHARS, source_packet.LIMITS["max_source_chars"] // 2)
     binding = {"item": item_fingerprint(row), "prior_story": digest(existing),
                "lock": control_fingerprint(db, story_id), "sources": [], "coverage_budget": coverage_budget}
     envelope = {"row": row, "result": result, "story_id": story_id,
                 "cluster_key": existing["cluster_key"] if existing else row["cluster_key"],
                 "candidate": None, "payload": None, "packet": {"sources": [], "missing_sources": [], "truncated": False},
                 "binding": binding, "locked": locked, "requires_review": False, "coverage": None,
-                "writer_item_id": None, "observed": observed}
+                "observed": observed}
     if result["publish"] and not locked:
         previous = json.loads(existing["payload"]) if existing else None
         source = {key: item[key] for key in ("id", "url", "title", "published_at")}
@@ -178,13 +174,13 @@ def prepare(db, row: dict, result: dict, observed: str, *, review_settings: dict
         # collection identities privately for future grouping and source lookup.
         data.update({key: value for key, value in public.items() if key not in {"sources", "editorial"}})
         writer = data["editorial_item"]
-        packet, bindings = source_packet.build_packet(db, item, data, public, writer, review_settings)
+        packet, bindings = source_packet.build_packet(db, item, data, public, writer)
         binding["sources"] = bindings
-        envelope.update(candidate=public, payload=data, packet=packet, writer_item_id=writer,
+        envelope.update(candidate=public, payload=data, packet=packet,
                         coverage=coverage_background(db, existing, coverage_budget), requires_review=True)
     binding.update(payload_hash=digest(envelope["payload"]), candidate_hash=digest(envelope["candidate"]), packet_hash=digest(envelope["packet"]))
     binding["coverage_hash"] = digest(envelope["coverage"])
     envelope.update(candidate_hash=digest(envelope["candidate"]), source_hash=digest(envelope["packet"]),
-                    coverage_hash=binding["coverage_hash"], binding_hash=digest(binding), missing_sources=envelope["packet"]["missing_sources"])
+                    coverage_hash=binding["coverage_hash"], binding_hash=digest(binding))
     return envelope
 

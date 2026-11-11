@@ -18,7 +18,7 @@ from .analyze import AnalysisError, Analyzer
 from .review import Reviewer
 from .review_gate import process_item, status as review_status
 from .collect import CollectionError, collect_source
-from .comments import enrich_comments, merge_cached_comments, status as comments_status
+from .comments import RUN_BUDGET_SECONDS as COMMENTS_BUDGET, enrich_comments, merge_cached_comments, status as comments_status
 from .config import load_config
 from .store import Store, source_due
 from .transport import HttpClient
@@ -141,7 +141,7 @@ def _operator_command(args, config: dict, store: Store) -> dict:
         return rejection.show_item(store, args.item)
     options = {"expected_hash": args.expect_hash, "reason": args.reason}
     if args.action == "retry":
-        return rejection.retry_item(store, args.item, llm=config["llm"], reconsider_ignored=args.reconsider_ignored,
+        return rejection.retry_item(store, args.item, reconsider_ignored=args.reconsider_ignored,
                                     retired_source_ids=_retired_alert_source_ids(config), **options)
     return rejection.dismiss_item(store, args.item, **options)
 
@@ -167,16 +167,13 @@ def run(config: dict, store: Store) -> dict:
     comments_enabled = bool(config.get("comments", {}).get("enabled"))
     # Comments share collection time, preserving the existing analysis reserve.
     # Keep at least half the collection window available for primary sources.
-    comments_budget = min(config["comments"]["run_budget_seconds"], collection_window / 2) if comments_enabled else 0
+    comments_budget = min(COMMENTS_BUDGET, collection_window / 2) if comments_enabled else 0
     collection_deadline = started + collection_window - comments_budget
-    has_comment_cache = comments_enabled or bool(store.db.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='comment_cache'"
-    ).fetchone())
 
     def record_items(source, items):
         received = now_iso()
-        if has_comment_cache:
-            items = (merge_cached_comments(store, item, source, received if comments_enabled else None) for item in items)
+        if comments_enabled:  # Once they are turned off, stored notes no longer reach new revisions.
+            items = (merge_cached_comments(store, item, source, received) for item in items)
         report["items_changed"] += sum(store.ingest(item, received) for item in items)
         return received
 
@@ -312,7 +309,6 @@ def main(argv: list[str] | None = None) -> int:
                         "sources": sum(s["enabled"] for s in config["sources"]),
                         "model": config["llm"]["model"],
                         "review_model": config["review"]["model"] or config["llm"]["model"],
-                        "review_max_repairs": config["review"]["max_repairs"],
                         "comments_enabled": config["comments"]["enabled"],
                         "llm_endpoint_configured": bool(config["llm"]["base_url"]),
                         "llm_credential_present": bool(

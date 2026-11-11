@@ -8,7 +8,8 @@ from .comments import analysis_context
 from .util import canonical_url, digest
 
 
-DEFAULT_LIMITS = {"max_sources": 8, "max_source_chars": 24000, "max_passages": 64, "passage_chars": 1800}
+# The review packet's fixed bounds.
+LIMITS = {"max_sources": 8, "max_source_chars": 24000, "max_passages": 64, "passage_chars": 1800}
 SOURCE_FIELDS = ("id", "source_id", "url", "title", "content", "source_content", "kind", "authority", "product",
                  "published_at", "updated_at", "labels", "upstream_state", "public_comments")
 
@@ -124,13 +125,12 @@ def _shares(needs, floors, budget):
     return shares
 
 
-def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str | None, settings: dict | None):
-    limits = {key: (settings or {}).get(key, value) for key, value in DEFAULT_LIMITS.items()}
+def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str | None):
     missing, bindings, units, truncated = [], {}, [], False
     required_ids = {incoming["id"], writer_id}
     # Legacy grouped stories may predate writer provenance. Their complete
     # collected source set can still support a fresh review of the final prose;
-    # every source then becomes required, with the same configured bounds.
+    # every source then becomes required, within the same bounds.
     require_all = writer_id is None
     # Required sources come first, so the max_sources cap below drops optional links before them.
     references = sorted(payload["sources"], key=lambda source: (
@@ -174,7 +174,7 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
         # description window; then the rest of the description. A share too small
         # for the whole source cuts description text before any note.
         description, _ = analysis_context(item)
-        size = limits["passage_chars"]
+        size = LIMITS["passage_chars"]
         view = _passages(item["title"], size) + [
             passage for note in item.get("public_comments", [])
             for passage in _passages(note["body"], size, author=note["author"], created_at=note["created_at"], url=note["url"])
@@ -183,7 +183,7 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
                       view if writer_id and item.get("id") == writer_id else []))
     if writer_id and not any(ref.get("source_item_id", ref.get("id")) == writer_id for ref in references):
         missing.append("retained-writer-source-unavailable")
-    cap = min(limits["max_sources"], limits["max_passages"] // 2, limits["max_source_chars"] // 2)
+    cap = min(LIMITS["max_sources"], LIMITS["max_passages"] // 2, LIMITS["max_source_chars"] // 2)
     for unit, _, required, *_ in units[cap:]:
         if required:
             missing.append(unit["url"])
@@ -193,9 +193,9 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
     # room the others leave. They share passages, then characters, each smallest need
     # first, so a source with many short notes keeps them while longer ones fill the
     # characters.
-    counts = _shares([len(unit[1]) for unit in units], [len(unit[4]) for unit in units], limits["max_passages"])
+    counts = _shares([len(unit[1]) for unit in units], [len(unit[4]) for unit in units], LIMITS["max_passages"])
     chars = _shares([sum(len(passage["text"]) for passage in unit[1][:count]) for unit, count in zip(units, counts)],
-                    [sum(len(passage["text"]) for passage in unit[4]) for unit in units], limits["max_source_chars"])
+                    [sum(len(passage["text"]) for passage in unit[4]) for unit in units], LIMITS["max_source_chars"])
     sources = []
     for index, (unit, evidence, _, source_bindings, _) in enumerate(units):
         for binding in source_bindings:

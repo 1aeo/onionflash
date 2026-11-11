@@ -204,24 +204,22 @@ class ReviewError(AnalysisError):
     """An unusable review reply counts against the item, like an invalid draft."""
 
 
-def _settings(config: dict) -> dict:
-    review = config["review"]
-    llm = {**config["llm"], **{key: review[key] for key in (
-        "timeout_seconds", "connect_timeout_seconds", "total_timeout_seconds", "max_output_tokens")}}
-    llm["model"] = review.get("model") or config["llm"]["model"]
-    return llm
+OUTPUT_TOKENS = 2200  # room for every criterion and a repair
+
+
+def _llm(config: dict) -> dict:
+    """The writer's endpoint and transport policy, timeout included, with the review model."""
+    return {**config["llm"], "model": config["review"]["model"] or config["llm"]["model"], "max_output_tokens": OUTPUT_TOKENS}
 
 
 def policy_hash(config: dict) -> str:
-    """Bind review rules, model identity and context bounds to reusable decisions."""
-    llm = _settings(config)
+    """The prompt, schema, model identity and coverage bounds; source_hash binds the packet and its bounds."""
+    llm = _llm(config)
     identity = {key: llm[key] for key in ("model", "base_url", "fallback_base_urls", "max_output_tokens",
                                          "enable_thinking", "send_chat_template_kwargs")}
-    bounds = {key: config["review"][key] for key in (
-        "max_source_chars", "max_sources", "max_passages", "passage_chars", "max_repairs")}
-    bounds.update(coverage_rows=candidate_policy.COVERAGE_ROWS, coverage_chars=candidate_policy.COVERAGE_CHARS,
-                  coverage_summary_chars=candidate_policy.COVERAGE_SUMMARY_CHARS)
-    return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, SCHEMA, identity, bounds])
+    coverage = {"coverage_rows": candidate_policy.COVERAGE_ROWS, "coverage_chars": candidate_policy.COVERAGE_CHARS,
+                "coverage_summary_chars": candidate_policy.COVERAGE_SUMMARY_CHARS}
+    return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, SCHEMA, identity, coverage])
 
 
 def _text(value, maximum: int, *, empty: bool = False) -> None:
@@ -374,11 +372,7 @@ def decision_record_matches(record, result, *, candidate, prepared, policy_hash)
 
 class Reviewer(CompletionClient):
     def __init__(self, config: dict, deadline: float | None = None):
-        self.settings = config["review"]
-        super().__init__({**config, "llm": _settings(config)}, deadline=deadline)
-        # Unlike the writer's fixed default total, this is an operator-selected
-        # cap. A longer read timeout must not silently increase the review budget.
-        self.http_settings["total_timeout_seconds"] = self.settings["total_timeout_seconds"]
+        super().__init__({**config, "llm": _llm(config)}, deadline=deadline)
 
     def review(self, candidate_public: dict, packet: dict, *, coverage: dict | None = None, verification: bool = False) -> dict:
         """Review one exact candidate without carrying forward earlier model replies."""

@@ -55,7 +55,7 @@ XML feeds alone allow the browser XML viewer's inline styling and `data:` icons,
 and keep the generic XML type so browsers show them instead of downloading them.
 Scripts remain blocked, and HTML pages retain their stricter stylesheet policy.
 
-The first run collects up to the configured lookback window and analyzes a
+The first run collects up to the fixed lookback window and analyzes a
 bounded number of items. More items remain queued for subsequent runs. An empty
 first page can mean the LLM is not configured or the queue has not yielded a
 publishable story yet; `onionflash status --config config.toml` explains queue
@@ -86,15 +86,14 @@ The API key is read only from the `ONIONFLASH_LLM_API_KEY` environment variable.
 | --- | --- |
 | `site` | Title, description, canonical URL, repository link, page/feed sizes |
 | `storage` | Private SQLite path, owned public output directory and bounded article-render batch size |
-| `comments` | Optional anonymous GitLab discussion enrichment, polling/backoff, per-run/text limits and bounded watch-cache size |
+| `comments` | Optional anonymous GitLab discussion enrichment (`enabled`) |
 | `llm` | Base URL and fallback URLs, model, private-network allowlist (`allowed_networks`, `allow_http`), request timeout, items per run, chat-template flag |
-| `review` | Reviewer model override, request/token/source bounds, one-repair limit and approval-cache size |
+| `review` | Reviewer model override |
 | `sources` | Stream ID, display name, public website URL, kind, collection URL, fallback URLs, product, authority, optional interval/page/item overrides |
 
-Collection, HTTP and writer model limits (lookback, budgets, retries, response sizes,
-backoff) are fixed defaults in `onionflash/config.py`; a file that still sets them
-loads, with each one logged as ignored. The separate final-review settings are
-operator-configurable in `[review]`.
+Collection, HTTP, model, comment and final-review limits (lookback, budgets,
+retries, response sizes, backoff, source-packet bounds) are fixed in code; a file
+that still sets one loads, with each one logged as ignored.
 
 Public sources must use HTTPS. Private inference endpoints require explicit
 `llm.allowed_networks` CIDRs and `llm.allow_http = true` when using HTTP. Prefer
@@ -140,8 +139,7 @@ longer configured, including as a fallback.
 Set `[comments].enabled = true` to enrich relevant GitLab issues with public
 discussion. Each participating `gitlab_issue` source needs its exact
 `gitlab_project`, such as `tpo/core/tor`; the example already identifies the Tor
-projects. `comments_graphql_url` optionally overrides the same-origin GraphQL
-endpoint, and `comments_enabled = false` excludes an individual source.
+projects. Leave out `gitlab_project` to keep a source out.
 
 No GitLab account, token or browser session is used. The collector verifies the
 project identity and public visibility, the issue's non-confidential status,
@@ -150,10 +148,10 @@ new comment content. Comment authors and dates stay explicit. Final review recei
 the bounded verified discussion independently of the quotes selected by the writer,
 so an uncited corrective comment is still available to the reviewer.
 
-Comments default to a 30-minute per-issue interval. Per-run limits rotate across
+Comments use a fixed 30-minute per-issue interval. Per-run limits rotate across
 projects and previously published issues, so this is bounded follow-up coverage,
 not an exhaustive discussion mirror. The phase shares collection time and keeps
-the configured analysis reserve; primary sources retain at least half the
+the fixed analysis reserve; primary sources retain at least half the
 collection window. `onionflash status` reports comment scheduling and failures.
 See [source coverage](docs/SOURCE_COVERAGE.md#anonymous-public-gitlab-discussion-updates).
 
@@ -208,8 +206,8 @@ See [editorial commands and recovery](docs/EDITORIAL.md).
 attempt count and current content hash. `rejected show --item ITEM_ID` includes
 the saved source. Explicit `retry` and `dismiss` actions require that hash and a
 private operator reason; neither action invokes the model or publishes anything.
-A dismissed item stays dismissed while its content is unchanged. Substantive new
-source content can queue it again. See [rejected-analysis commands](docs/REJECTED_ANALYSES.md).
+A dismissed item stays dismissed while its content is unchanged, unless an operator
+retries it. Substantive new source content can queue it again. See [rejected-analysis commands](docs/REJECTED_ANALYSES.md).
 
 Each command returns a compact JSON result. Invalid configuration or a build
 failure returns nonzero. A partial source outage or queued analysis is reported

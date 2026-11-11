@@ -1,13 +1,16 @@
+import contextlib
 import json
 import socket
 import time
+from types import SimpleNamespace
 from unittest import mock
 
 import httpx
 import pytest
 
-from onionflash import cli
-from onionflash.comments import (INPUT_CHARS, NOTE_WINDOW, CommentError, _compose, _source_key, analysis_context,
+from approval_helpers import ApprovingReviewer
+from onionflash import cli, comments
+from onionflash.comments import (INPUT_CHARS, NOTE_WINDOW, CommentError, _compose, _identity, _source_key, analysis_context,
                                 enrich_comments, fetch_comments, merge_cached_comments, status)
 from onionflash.config import DEFAULTS, load_config
 from onionflash.store import Store
@@ -50,15 +53,17 @@ def response(data):
     return Response(200, json.dumps(data).encode(), {}, ENDPOINT)
 
 
-def settings(**kw):
-    return {**DEFAULTS["comments"], **kw}
-
-
-def comments_config(tmp_path, **kw):
+def comments_config(tmp_path):
     cfg = config(tmp_path)
     cfg["sources"] = [issue_source()]
-    cfg["comments"] = settings(enabled=True, **kw)
+    cfg["comments"] = {"enabled": True}
     return cfg
+
+
+def limits(monkeypatch, **values):
+    """Shrink fixed comment limits, such as MAX_ISSUES_PER_RUN, for one test."""
+    for name, value in values.items():
+        monkeypatch.setattr(comments, name, value)
 
 
 def enrich(cfg, store, observed, client, **kw):
@@ -98,9 +103,9 @@ class Issues:
         return response(data)
 
 
-def two_projects(tmp_path, **kw):
+def two_projects(tmp_path):
     """Comment settings and a store with two new issues in each of two projects."""
-    cfg = comments_config(tmp_path, **kw)
+    cfg = comments_config(tmp_path)
     cfg["sources"].append(source(id="arti-issues", kind="gitlab_issue", gitlab_project="tpo/core/arti",
                                  url=ORIGIN + "/api/v4/projects/647/issues"))
     store = Store(cfg["storage"]["database"])
@@ -113,7 +118,7 @@ def two_projects(tmp_path, **kw):
 @pytest.mark.parametrize("kind", ["Note", "DiscussionNote"])
 def test_supported_public_note_types_preserve_provenance(kind):
     ident = f"gid://gitlab/{kind}/123"
-    notes = fetch_comments(FakeClient([response(payload([note("123", id=ident)]))]), issue_source(), issue(), settings())
+    notes = fetch_comments(FakeClient([response(payload([note("123", id=ident)]))]), issue_source(), issue())
     assert len(notes) == 1 and notes[0]["id"] == ident
     assert notes[0]["url"] == URL + "#note_123"
 
@@ -123,7 +128,7 @@ def test_supported_public_note_types_preserve_provenance(kind):
                                   "gid://gitlab/DiscussionNote/١٢٣", "gid://gitlab/Note/123\n"])
 def test_unknown_or_malformed_note_gid_types_are_rejected(ident):
     with pytest.raises(CommentError, match="identity"):
-        fetch_comments(FakeClient([response(payload([note("123", id=ident)]))]), issue_source(), issue(), settings())
+        fetch_comments(FakeClient([response(payload([note("123", id=ident)]))]), issue_source(), issue())
 
 
 @pytest.mark.parametrize("location", [ENDPOINT + "/redirected", "https://other.example/api/graphql"])
@@ -152,7 +157,7 @@ def test_owned_anonymous_client_refuses_redirect_before_following(tmp_path, monk
 @pytest.mark.parametrize("visibility", [None, "private", "internal", "PUBLIC", False])
 def test_unknown_or_nonpublic_project_fails_closed(visibility):
     with pytest.raises(CommentError, match="Public project"):
-        fetch_comments(FakeClient([response(payload(visibility=visibility))]), issue_source(), issue(), settings())
+        fetch_comments(FakeClient([response(payload(visibility=visibility))]), issue_source(), issue())
 
 
 @pytest.mark.parametrize("confidential", [None, True, 0, "false"])
@@ -160,13 +165,13 @@ def test_confidential_flag_must_be_exact_false(confidential):
     data = payload()
     data["data"]["project"]["issue"]["confidential"] = confidential
     with pytest.raises(CommentError, match="Public issue"):
-        fetch_comments(FakeClient([response(data)]), issue_source(), issue(), settings())
+        fetch_comments(FakeClient([response(data)]), issue_source(), issue())
 
 
 @pytest.mark.parametrize("change", [{"fullPath": "other/project"}, {"id": "gid://gitlab/Project/99"}, {"webUrl": "https://evil.example/tpo/core/tor"}])
 def test_wrong_project_identity_is_rejected(change):
     with pytest.raises(CommentError):
-        fetch_comments(FakeClient([response(payload(**change))]), issue_source(), issue(), settings())
+        fetch_comments(FakeClient([response(payload(**change))]), issue_source(), issue())
 
 
 def test_internal_and_system_notes_never_cross_boundary(tmp_path):
@@ -200,13 +205,13 @@ def test_unknown_note_visibility_does_not_create_a_partial_snapshot(tmp_path, fl
 def test_one_request_reads_the_newest_note_window():
     older, newer = note("1", createdAt="2026-11-08T11:00:00Z"), note("2", body="A later public report.")
     client = FakeClient([response(payload([older, newer])), FetchError("HTTP 503")])
-    notes = fetch_comments(client, issue_source(), issue(), settings())
+    notes = fetch_comments(client, issue_source(), issue())
     assert [n["id"] for n in notes] == ["gid://gitlab/Note/2", "gid://gitlab/Note/1"]  # newest first
     [(method, endpoint, request)] = client.calls
     assert (method, endpoint) == ("POST", ENDPOINT)
     assert request["json_body"]["variables"] == {"project": PROJECT, "iid": "41473", "size": NOTE_WINDOW}
     with pytest.raises(FetchError):
-        fetch_comments(client, issue_source(), issue(), settings())
+        fetch_comments(client, issue_source(), issue())
 
 
 @pytest.mark.parametrize("mutate", [
@@ -220,7 +225,7 @@ def test_malformed_and_partial_graphql_responses_fail_closed(mutate):
     data = payload()
     mutate(data)
     with pytest.raises((CommentError, ValueError)) as error:
-        fetch_comments(FakeClient([response(data)]), issue_source(), issue(), settings())
+        fetch_comments(FakeClient([response(data)]), issue_source(), issue())
     assert "SECRET" not in str(error.value)
 
 
@@ -232,14 +237,15 @@ def test_anonymous_transport_never_reuses_set_cookie_or_auth():
     resolver = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", 443))]
     with HttpClient(DEFAULTS["http"], transport=httpx.MockTransport(handler), resolver=resolver) as client:
         for _ in range(2):
-            fetch_comments(client, issue_source(), issue(), settings())
+            fetch_comments(client, issue_source(), issue())
     assert len(requests) == 2
     for request in requests:
         assert not any(key in request.headers for key in ["cookie", "authorization", "private-token"])
 
 
-def test_cache_backoff_edits_deletion_and_refresh(tmp_path):
-    cfg = comments_config(tmp_path, interval_seconds=30)
+def test_cache_backoff_edits_deletion_and_refresh(tmp_path, monkeypatch):
+    limits(monkeypatch, INTERVAL_SECONDS=30)
+    cfg = comments_config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         store.ingest(issue(), DATE)
         assert enrich(cfg, store, DATE, FakeClient([response(payload())]))["changed"] == 1
@@ -265,15 +271,15 @@ def test_cache_backoff_edits_deletion_and_refresh(tmp_path):
         assert store.db.execute("SELECT failures FROM comment_sources").fetchone()[0] == 2
 
 
-def test_old_published_issues_rotate_with_bounded_cache(tmp_path):
-    cfg = comments_config(tmp_path, max_issues_per_run=1, max_issues_per_source=1, max_cache_entries=1)
+def test_old_published_issues_rotate(tmp_path, monkeypatch):
+    limits(monkeypatch, MAX_ISSUES_PER_RUN=1, MAX_ISSUES_PER_SOURCE=1)
+    cfg = comments_config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         published_issues(store, 41473, 41474)
         client = Issues()
         enrich(cfg, store, DATE, client)
         enrich(cfg, store, DATE, client)
         assert sorted(iid for _, iid in client.seen) == ["41473", "41474"]
-        assert store.db.execute("SELECT COUNT(*) FROM comment_cache").fetchone()[0] == 1
 
 
 @pytest.mark.parametrize("status_value", ["pending", "ignored", "rejected", "dismissed"])
@@ -302,32 +308,53 @@ def test_rest_activity_requests_a_first_check_of_an_ignored_issue(tmp_path):
             store.db.execute("UPDATE items SET status='ignored'")
         assert enrich(cfg, store, DATE, FakeClient([]))["checked"] == 0  # only pending issues are new
         later = after(600, DATE)
-        merge_cached_comments(store, issue(), issue_source(comments_enabled=False), later)  # an excluded source
+        merge_cached_comments(store, issue(), {**issue_source(), "gitlab_project": ""}, later)  # a source left out
         assert enrich(cfg, store, later, FakeClient([]))["checked"] == 0
         assert not store.ingest(merge_cached_comments(store, issue(), issue_source(), later), later)
         assert enrich(cfg, store, later, FakeClient([response(payload())]))["changed"] == 1
 
 
-def test_collection_requests_comment_checks_only_while_comments_are_enabled(tmp_path, monkeypatch):
+def test_runs_keep_verified_notes_until_comments_are_turned_off(tmp_path, monkeypatch):
+    """A REST re-poll keeps the snapshot; turned off, notes leave new revisions; back on, activity requests a check."""
     cfg = comments_config(tmp_path)
-    client = FakeClient([response(payload())])
+    cfg["collection"]["source_budget_seconds"] = 600  # so the shared collection window bounds the source
+    clock, rest, deadlines = [DATE], [issue()], []
+
+    def collect(client, *args):
+        deadlines.append(client.deadline)
+        return {"items": [dict(rest[0])]}
+
+    client = FakeClient([response(payload()), response(payload())])
+    monkeypatch.setattr(cli, "now_iso", lambda: clock[0])
+    monkeypatch.setattr(cli.time, "monotonic", lambda: 100.0)
     monkeypatch.setattr(cli, "source_due", lambda *args: True)
-    monkeypatch.setattr(cli, "collect_source", lambda *args: {"items": [issue(updated_at=after(600, DATE))]})
+    monkeypatch.setattr(cli, "collect_source", collect)
     monkeypatch.setattr(cli, "enrich_comments", lambda *args, **kw: enrich(*args, client, **kw))
+    monkeypatch.setattr(cli, "Analyzer", lambda *args, **kw: contextlib.nullcontext(SimpleNamespace(analyze=lambda item: analysis())))
+    monkeypatch.setattr(cli, "Reviewer", ApprovingReviewer)
     monkeypatch.setattr(cli, "build", lambda *args: {})
     with Store(cfg["storage"]["database"]) as store:
-        store.ingest(issue(), DATE)
-        with store.db:
-            store.db.execute("UPDATE items SET status='ignored'")
-        enrich(cfg, store, DATE, FakeClient([]))  # nothing to check yet
-        cfg["comments"]["enabled"] = False
-        cli.run(cfg, store)
-        assert status(store)["watched_issues"] == 0
-        cfg["comments"]["enabled"] = True
-        assert cli.run(cfg, store)["comments"]["changed"] == 1
+        def run(minutes, enabled=True):
+            clock[0], cfg["comments"]["enabled"] = after(60 * minutes, DATE), enabled
+            return cli.run(cfg, store)
+
+        def saved():
+            return json.loads(store.db.execute("SELECT payload FROM items").fetchone()[0])
+
+        assert run(0)["analyzed"] == 1 and len(saved()["public_comments"]) == 1
+        repeated = run(5)  # the notes are not due again yet
+        assert repeated["items_changed"] == repeated["analyzed"] == store.pending_count() == 0
+        assert len(saved()["public_comments"]) == 1
+        rest[0] = issue(content="The issue description was edited.", updated_at=after(600, DATE))
+        run(10, enabled=False)
+        assert "public_comments" not in saved() and note()["body"] not in json.dumps(saved())
+        assert store.db.execute("SELECT next_fetch_at FROM comment_cache").fetchone()[0] == after(1800, DATE)
+        assert run(15)["comments"]["changed"] == 1
+    # 100 + 120 - 30: the comment phase's time comes out of the collection window only while it runs.
+    assert deadlines == [190.0, 190.0, 220.0, 190.0]
 
 
-def test_requested_checks_go_first_pending_ones_before_others(tmp_path):
+def test_requested_checks_go_first_pending_ones_before_others(tmp_path, monkeypatch):
     cfg = comments_config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         urls = {iid: URL.replace("41473", iid) for iid in ["1", "2", "3", "4"]}
@@ -341,7 +368,7 @@ def test_requested_checks_go_first_pending_ones_before_others(tmp_path):
         # REST activity on ignored 2, ignored 4 and pending 3; an overlapping page then repeats 2.
         for iid, updated, seen in [("2", 600, 600), ("4", 900, 900), ("3", 1200, 1200), ("2", 600, 1500)]:
             merge_cached_comments(store, issue(url=urls[iid], updated_at=after(updated, DATE)), issue_source(), after(seen, DATE))
-        cfg["comments"]["max_issues_per_source"] = 1
+        limits(monkeypatch, MAX_ISSUES_PER_SOURCE=1)
         for _ in range(4):  # the published issue's timer is overdue as well
             assert enrich(cfg, store, after(3600, DATE), client)["checked"] == 1
         assert [iid for _, iid in client.seen[4:]] == ["3", "2", "4", "1"]
@@ -368,16 +395,17 @@ def test_writer_sees_fetched_notes_verbatim_beside_a_long_description():
     bodies = [(f"Note {n} reports a detail" + "." * 2000)[:2000] for n in range(4)]
     authors = ["operator", "maintainer"] * 2
     raw = [note(str(n), body=bodies[n], author={"username": authors[n]}, createdAt=f"2026-11-08T1{n}:00:00Z") for n in range(4)]
-    notes = fetch_comments(FakeClient([response(payload(raw))]), issue_source(), issue(), settings())
+    notes = fetch_comments(FakeClient([response(payload(raw))]), issue_source(), issue())
     enriched = _compose(issue(content="Long description. " * 3000), notes, DATE, source_key="k")
     description, seen = analysis_context(enriched)
     assert seen == [{"author": authors[n], "created_at": f"2026-11-08T1{n}:00:00Z", "body": bodies[n]} for n in (3, 2, 1, 0)]
     assert description == enriched["content"][:INPUT_CHARS - 8000]
 
 
-def test_note_limits_apply_before_any_persistence():
+def test_note_limits_apply_before_any_persistence(monkeypatch):
+    limits(monkeypatch, MAX_COMMENTS=3, COMMENT_CHARS=200, TOTAL_CHARS=450)
     notes = fetch_comments(FakeClient([response(payload([note(str(i), body="a" * 1000) for i in range(8)]))]),
-                           issue_source(), issue(), settings(max_comments=3, comment_chars=200, total_chars=450))
+                           issue_source(), issue())
     assert len(notes) == 3 and sum(len(n["body"]) for n in notes) == 450
 
 
@@ -392,8 +420,9 @@ def test_notes_are_dated_against_the_response_not_the_phase_start(tmp_path):
         assert [n["id"] for n in saved["public_comments"]] == ["gid://gitlab/Note/1"]
 
 
-def test_a_reaction_that_moves_only_a_note_update_time_does_not_requeue(tmp_path):
-    cfg = comments_config(tmp_path, interval_seconds=30)
+def test_a_reaction_that_moves_only_a_note_update_time_does_not_requeue(tmp_path, monkeypatch):
+    limits(monkeypatch, INTERVAL_SECONDS=30)
+    cfg = comments_config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         store.ingest(issue(), DATE)
         enrich(cfg, store, DATE, FakeClient([response(payload())]))
@@ -406,7 +435,7 @@ def test_a_reaction_that_moves_only_a_note_update_time_does_not_requeue(tmp_path
         assert tuple(store.db.execute(f"SELECT {columns} FROM items").fetchone()) == before
 
 
-def test_rows_written_by_earlier_releases_read_as_before_and_change_format_once(tmp_path):
+def test_rows_written_by_earlier_releases_read_as_before_and_change_format_once(tmp_path, monkeypatch):
     """Earlier releases kept the description in source_content, wrote note text into content and hashed only content."""
     def stored(store, value):
         store.ingest(value, DATE)
@@ -421,7 +450,8 @@ def test_rows_written_by_earlier_releases_read_as_before_and_change_format_once(
                 "author": "operator", "created_at": DATE, "updated_at": DATE, "body": note()["body"]}
     composed = (description + "\n\nPublic issue comments (untrusted attributed reports, not independent verification):\n"
                 f"@operator — {DATE} (edited {DATE})\n{old_note['url']}\n{old_note['body']}")
-    cfg = comments_config(tmp_path, interval_seconds=30)
+    limits(monkeypatch, INTERVAL_SECONDS=30)
+    cfg = comments_config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         row = stored(store, issue(content=composed, source_content=description, public_comments=[old_note], **snapshot))
         # The writer and review read the description and the note list, never the composed comment text.
@@ -445,7 +475,6 @@ def test_status_is_read_only_and_contains_only_scheduling_metadata(tmp_path):
     cfg = comments_config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         assert status(store) == {"watched_issues": 0, "sources": []}
-        assert not store.db.execute("SELECT name FROM sqlite_master WHERE name='comment_cache'").fetchone()
         store.ingest(issue(), DATE)
         enrich(cfg, store, DATE, FakeClient([response(payload())]))
         other = issue(url=URL.replace("41473", "41474"))
@@ -460,8 +489,9 @@ def test_status_is_read_only_and_contains_only_scheduling_metadata(tmp_path):
 @pytest.mark.parametrize("answer", [response(payload(visibility="private")),
                                     response({**payload(), "errors": [{"message": "unavailable"}]})],
                          ids=["private", "errors"])
-def test_project_failure_preserves_only_previously_verified_context(tmp_path, answer):
-    cfg = comments_config(tmp_path, interval_seconds=30)
+def test_project_failure_preserves_only_previously_verified_context(tmp_path, monkeypatch, answer):
+    limits(monkeypatch, INTERVAL_SECONDS=30)
+    cfg = comments_config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         store.ingest(issue(), DATE)
         enrich(cfg, store, DATE, FakeClient([response(payload())]))
@@ -477,8 +507,9 @@ def test_project_failure_preserves_only_previously_verified_context(tmp_path, an
 
 
 @pytest.mark.parametrize("status_value", ["published", "dismissed"])
-def test_outage_and_recovery_do_not_requeue_or_oscillate_unchanged_comments(tmp_path, status_value):
-    cfg = comments_config(tmp_path, interval_seconds=30)
+def test_outage_and_recovery_do_not_requeue_or_oscillate_unchanged_comments(tmp_path, monkeypatch, status_value):
+    limits(monkeypatch, INTERVAL_SECONDS=30)
+    cfg = comments_config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         original = issue()
         store.ingest(original, DATE)
@@ -509,7 +540,7 @@ def test_verified_snapshot_survives_scheduling_cache_eviction_but_not_identity_c
             store.db.execute("DELETE FROM comment_cache")
         retained = merge_cached_comments(store, issue(), issue_source())
         assert len(retained["public_comments"]) == 1 and retained["comments_checked_at"] == DATE
-        assert merge_cached_comments(store, issue(), issue_source(comments_graphql_url=ORIGIN + "/other-api")) == issue()
+        assert merge_cached_comments(store, issue(), {**issue_source(), "url": ORIGIN + "/api/v4/projects/tpo%2Fcore%2Ftor/issues"}) == issue()
         with store.db:
             old = json.loads(store.db.execute("SELECT payload FROM items").fetchone()[0])
             old.pop("comments_source_key")
@@ -517,19 +548,11 @@ def test_verified_snapshot_survives_scheduling_cache_eviction_but_not_identity_c
         assert merge_cached_comments(store, issue(), issue_source()) == issue()
 
 
-def test_merge_does_not_create_scheduling_tables(tmp_path):
-    cfg = comments_config(tmp_path)
-    with Store(cfg["storage"]["database"]) as store:
-        store.ingest(issue(), DATE)
-        assert merge_cached_comments(store, issue(), issue_source(), DATE) == issue()  # comments enabled, tables not yet
-        assert not store.db.execute("SELECT 1 FROM sqlite_master WHERE name='comment_cache'").fetchone()
-
-
 @pytest.mark.parametrize("bad_payload", ["broken JSON", '{"kind":"gitlab_issue","title":"Cold item"}',
                                         '{"kind":"gitlab_issue","title":"Missing URL","content":"body"}',
                                         json.dumps(issue(content="invalid\ud800text"))])
 def test_bad_local_history_does_not_back_off_other_issues(tmp_path, bad_payload):
-    cfg = comments_config(tmp_path, max_issues_per_source=4)
+    cfg = comments_config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         first = published_issues(store, 41473, 41474)[0]
         with store.db:
@@ -541,8 +564,9 @@ def test_bad_local_history_does_not_back_off_other_issues(tmp_path, bad_payload)
         assert store.db.execute("SELECT failures,next_fetch_at FROM comment_sources").fetchone()[:] == (0, None)
 
 
-def test_history_cursor_does_not_advance_past_an_unattempted_tail(tmp_path):
-    cfg = comments_config(tmp_path, max_issues_per_run=1, max_issues_per_source=4)
+def test_history_cursor_does_not_advance_past_an_unattempted_tail(tmp_path, monkeypatch):
+    limits(monkeypatch, MAX_ISSUES_PER_RUN=1)
+    cfg = comments_config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         client = Issues()
         for row in published_issues(store, 41473, 41474, 41475):
@@ -551,8 +575,9 @@ def test_history_cursor_does_not_advance_past_an_unattempted_tail(tmp_path):
         assert len(set(client.seen)) == 3
 
 
-def test_history_and_recent_issues_share_a_single_slot_over_multiple_runs(tmp_path):
-    cfg = comments_config(tmp_path, max_issues_per_run=1, max_issues_per_source=1)
+def test_history_and_recent_issues_share_a_single_slot_over_multiple_runs(tmp_path, monkeypatch):
+    limits(monkeypatch, MAX_ISSUES_PER_RUN=1, MAX_ISSUES_PER_SOURCE=1)
+    cfg = comments_config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         published_issues(store, 41473, 41474, 41475, 41476)  # more history than runs, so turns must alternate
         client = Issues()
@@ -565,8 +590,9 @@ def test_history_and_recent_issues_share_a_single_slot_over_multiple_runs(tmp_pa
         assert sum(int(iid) >= 42000 for _, iid in client.seen) == 2
 
 
-def test_a_requested_check_takes_no_rotation_turn(tmp_path):
-    cfg = comments_config(tmp_path, max_issues_per_run=1, max_issues_per_source=1)
+def test_a_requested_check_takes_no_rotation_turn(tmp_path, monkeypatch):
+    limits(monkeypatch, MAX_ISSUES_PER_RUN=1, MAX_ISSUES_PER_SOURCE=1)
+    cfg = comments_config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         urls = {iid: URL.replace("41473", iid) for iid in ["1", "2", "3", "4"]}
         for url in urls.values():
@@ -583,8 +609,9 @@ def test_a_requested_check_takes_no_rotation_turn(tmp_path):
         assert fetched[0] in {"1", "4"} and fetched[1:] == ["2", "3"]
 
 
-def test_success_on_another_issue_does_not_reset_item_failure_backoff(tmp_path):
-    cfg = comments_config(tmp_path, max_issues_per_run=1, max_issues_per_source=1, interval_seconds=3600)
+def test_success_on_another_issue_does_not_reset_item_failure_backoff(tmp_path, monkeypatch):
+    limits(monkeypatch, MAX_ISSUES_PER_RUN=1, MAX_ISSUES_PER_SOURCE=1, INTERVAL_SECONDS=3600)
+    cfg = comments_config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         rows = published_issues(store, 41473, 41474)
         failed_id = rows[0]["id"]
@@ -634,8 +661,9 @@ def test_an_outage_costs_one_request_per_project(tmp_path):
         assert [s["failures"] for s in status(store)["sources"]] == [1, 1]
 
 
-def test_projects_take_turns_and_removed_projects_leave_status(tmp_path):
-    cfg, store = two_projects(tmp_path, max_issues_per_run=1)
+def test_projects_take_turns_and_removed_projects_leave_status(tmp_path, monkeypatch):
+    limits(monkeypatch, MAX_ISSUES_PER_RUN=1)
+    cfg, store = two_projects(tmp_path)
     with store:
         client = Issues()
         for _ in range(3):
@@ -670,16 +698,21 @@ def test_spent_deadline_stops_before_any_request(tmp_path):
 def test_an_issue_outside_its_project_is_never_requested():
     client = FakeClient([])
     with pytest.raises(CommentError):
-        fetch_comments(client, issue_source(), issue(url=URL.replace("tpo/core/tor", "other/project")), settings())
+        fetch_comments(client, issue_source(), issue(url=URL.replace("tpo/core/tor", "other/project")))
     assert not client.calls
 
 
-def test_comment_config_requires_explicit_clean_identity(tmp_path):
-    text = '[comments]\nenabled=true\n[[sources]]\nid="x"\nkind="gitlab_issue"\nurl="https://gitlab.torproject.org/api/v4/projects/426/issues"\ngitlab_project="tpo/core/tor"\n'
+def test_comment_config_requires_a_clean_identity_and_retired_source_keys_still_load(tmp_path):
+    text = '[comments]\nenabled=true\n[[sources]]\nid="x"\nkind="gitlab_issue"\nurl="https://gitlab.torproject.org/api/v4/projects/426/issues"\n'
     path = tmp_path / "config.toml"
-    path.write_text(text)
-    assert load_config(path)["comments"]["enabled"]
-    for endpoint in ['https://evil.example/api/graphql', ENDPOINT + '?private_token=secret']:
-        path.write_text(text + f'comments_graphql_url="{endpoint}"\n')
-        with pytest.raises(ValueError, match="anonymous"):
-            load_config(path)
+    path.write_text(text + 'gitlab_project="tpo"\n')
+    with pytest.raises(ValueError, match="anonymous"):
+        load_config(path)
+    # The GraphQL endpoint is always the origin's own; an old comments_enabled = false still leaves a source out.
+    for extra, participates in [('comments_graphql_url="https://evil.example/api/graphql"\n', True),
+                                ("comments_enabled=true\n", True), ("comments_enabled=false\n", False)]:
+        path.write_text(text + 'gitlab_project="tpo/core/tor"\n' + extra)
+        cfg = load_config(path)
+        assert cfg["comments"]["enabled"] and ("gitlab_project" in cfg["sources"][0]) == participates
+        if participates:
+            assert _identity(cfg["sources"][0])[2] == ENDPOINT

@@ -102,6 +102,42 @@ class Store:
                 published_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS comment_cache (
+                item_id TEXT PRIMARY KEY, source_key TEXT NOT NULL, checked_at TEXT NOT NULL,
+                next_fetch_at TEXT NOT NULL, failures INTEGER NOT NULL DEFAULT 0, error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS comment_cache_checked ON comment_cache(checked_at);
+            CREATE TABLE IF NOT EXISTS comment_sources (
+                source_id TEXT PRIMARY KEY, source_key TEXT NOT NULL, failures INTEGER NOT NULL DEFAULT 0,
+                next_fetch_at TEXT, error TEXT, rotation_cursor TEXT NOT NULL DEFAULT '',
+                recent_first INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS comment_history_rotation ON items(source_id,id) WHERE story_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS comment_recent_pending ON items(source_id,priority_score DESC,last_seen DESC,id) WHERE status='pending';
+            CREATE TABLE IF NOT EXISTS review_jobs (
+                item_id TEXT PRIMARY KEY, writer_key TEXT NOT NULL,
+                policy_hash TEXT NOT NULL, stage TEXT NOT NULL,
+                draft_json TEXT, envelope_json TEXT, record_json TEXT NOT NULL,
+                approval_key TEXT, prepared_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS review_approvals (
+                key TEXT PRIMARY KEY, candidate_hash TEXT NOT NULL,
+                source_hash TEXT NOT NULL, policy_hash TEXT NOT NULL,
+                binding_hash TEXT NOT NULL, result_json TEXT NOT NULL,
+                review_record_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                last_used_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS review_approvals_used ON review_approvals(last_used_at,key);
+            CREATE TABLE IF NOT EXISTS rejection_actions (
+                action_id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT NOT NULL,
+                content_hash TEXT NOT NULL, action TEXT NOT NULL CHECK(action IN ('retry','dismiss')),
+                reason TEXT NOT NULL, created_at TEXT NOT NULL,
+                before_status TEXT NOT NULL, before_attempts INTEGER NOT NULL,
+                before_rejections INTEGER NOT NULL, before_error TEXT, before_next_attempt_at TEXT,
+                -- No longer written; earlier releases still read and write them after a code rollback.
+                superseded_analysis_key TEXT, superseded_analysis_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS rejection_actions_item ON rejection_actions(item_id,action_id);
             DROP TABLE IF EXISTS monitoring_observations;
             DROP TABLE IF EXISTS monitoring_counters;
             DROP TABLE IF EXISTS monitoring_groups;
@@ -298,12 +334,8 @@ class Store:
             VALUES(?,?,?,?,?,?)""", (cache_key, result_json, observed, row["payload"], row["id"], record_json))
         return cache_key
 
-    def prepare_candidate(self, row: dict, result: dict, observed: str, *, review_settings: dict | None = None) -> dict:
-        return candidate.prepare(self.db, row, result, observed, review_settings=review_settings)
-
-    def _clear_review_job(self, item_id: str) -> None:
-        if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='review_jobs' AND type='table'").fetchone():
-            self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (item_id,))
+    def prepare_candidate(self, row: dict, result: dict, observed: str) -> dict:
+        return candidate.prepare(self.db, row, result, observed)
 
     def commit_candidate(self, prepared: dict, approved_candidate: dict | None, cache_key: str, observed: str, *,
                          approval_key: str | None = None, policy_hash: str | None = None,
@@ -340,9 +372,9 @@ class Store:
                 normalized = render._prepare_story(approved_candidate, editorial=original.get("editorial"))
                 if normalized != approved_candidate:
                     raise ReviewRequired("The approved candidate must already be normalized")
-                if prepared["missing_sources"]:
+                if prepared["packet"]["missing_sources"]:
                     raise ReviewRequired("Required source material is unavailable")
-                if not approval_key or not policy_hash or not self.db.execute("SELECT 1 FROM sqlite_master WHERE name='review_approvals'").fetchone():
+                if not approval_key or not policy_hash:
                     raise ReviewRequired("Exact final candidate needs a recorded review decision")
                 receipt = self.db.execute("SELECT * FROM review_approvals WHERE key=?", (approval_key,)).fetchone()
                 if receipt is None or any(receipt[key] != expected for key, expected in (
@@ -364,9 +396,6 @@ class Store:
                     payload.update({key: approved_candidate[key] for key in candidate.SEMANTIC_FIELDS})
                     if existing is None:  # Date publication, not the first draft.
                         payload["added_at"] = observed
-            if review_record is None and self.db.execute("SELECT 1 FROM sqlite_master WHERE name='review_jobs'").fetchone():
-                job = self.db.execute("SELECT record_json FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
-                review_record = json.loads(job[0]) if job else None
             analysis_key = self.record_analysis(row, result, cache_key, observed, review_record=review_record)
             if payload is not None:
                 if payload.get("editorial_item") == row["id"]:
@@ -382,7 +411,7 @@ class Store:
             mapped_id = story_id if published else row.get("story_id")
             self.db.execute("UPDATE items SET status=?,story_id=?,next_attempt_at=NULL,last_error=NULL WHERE id=?",
                             ("published" if published else "ignored", mapped_id, row["id"]))
-            self._clear_review_job(row["id"])
+            self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
         return {"story_id": mapped_id, "status": "locked" if locked and published else "published" if published else "ignored"}
 
     def skip_candidate(self, prepared: dict, reviewed_candidate: dict, cache_key: str, observed: str, *,
@@ -391,13 +420,6 @@ class Store:
         return self.commit_candidate(prepared, reviewed_candidate, cache_key, observed,
                                      approval_key=approval_key, policy_hash=policy_hash,
                                      review_record=review_record, decision="skip")
-
-    def finish(self, row: dict, result: dict, cache_key: str, observed: str) -> None:
-        """Only ignored drafts and locked operator decisions bypass review."""
-        prepared = self.prepare_candidate(row, result, observed)
-        if prepared["requires_review"]:
-            raise ReviewRequired("Automatic publication requires the final review gate")
-        self.commit_candidate(prepared, prepared["candidate"], cache_key, observed)
 
     def stories(self, limit: int = -1) -> list[dict]:
         """Stored stories, newest activity first (all of them by default)."""

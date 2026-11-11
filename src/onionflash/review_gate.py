@@ -12,46 +12,24 @@ import json
 from .analyze import AnalysisError, cache_key
 from .util import digest, now_iso
 
+MAX_APPROVALS = 2000  # cached approvals kept besides those unfinished jobs pin
+
 
 def _json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
 
 
-def initialize(store):
-    store.db.executescript("""
-        CREATE TABLE IF NOT EXISTS review_jobs (
-            item_id TEXT PRIMARY KEY, writer_key TEXT NOT NULL,
-            policy_hash TEXT NOT NULL, stage TEXT NOT NULL,
-            draft_json TEXT, envelope_json TEXT, record_json TEXT NOT NULL,
-            approval_key TEXT, prepared_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS review_approvals (
-            key TEXT PRIMARY KEY, candidate_hash TEXT NOT NULL,
-            source_hash TEXT NOT NULL, policy_hash TEXT NOT NULL,
-            binding_hash TEXT NOT NULL, result_json TEXT NOT NULL,
-            review_record_json TEXT NOT NULL, created_at TEXT NOT NULL,
-            last_used_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS review_approvals_used ON review_approvals(last_used_at,key);
-    """)
-
-
 def status(store):
-    """Read compact stage/cache counts without creating tables or loading bodies."""
-    tables = {row[0] for row in store.db.execute("""SELECT name FROM sqlite_master
-        WHERE type='table' AND name IN ('review_jobs','review_approvals')""")}
-    stages = dict(store.db.execute("SELECT stage,COUNT(*) FROM review_jobs GROUP BY stage")) if "review_jobs" in tables else {}
-    approvals = store.db.execute("SELECT COUNT(*) FROM review_approvals").fetchone()[0] if "review_approvals" in tables else 0
-    return {"stages": stages, "approval_cache_entries": approvals}
+    """Read compact stage/cache counts without loading bodies."""
+    return {"stages": dict(store.db.execute("SELECT stage,COUNT(*) FROM review_jobs GROUP BY stage")),
+            "approval_cache_entries": store.db.execute("SELECT COUNT(*) FROM review_approvals").fetchone()[0]}
 
 
 def reset_review_work(store, item_id):
     """Explicit operator retry starts a new review, retaining its completed draft.
 
-    The caller owns the transaction and preserves the superseded review audit.
+    The caller owns the transaction; the replaced job is archived here.
     """
-    if not store.db.execute("SELECT 1 FROM sqlite_master WHERE name='review_jobs'").fetchone():
-        return
     row = store.db.execute("SELECT * FROM review_jobs WHERE item_id=?", (item_id,)).fetchone()
     if row is None:
         return
@@ -68,8 +46,6 @@ def discard_review_decisions(store, item_id):
     Completed decisions outlive their jobs. Removing them makes an identical
     candidate receive a fresh review, including after an interrupted retry.
     """
-    if not store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_approvals'").fetchone():
-        return
     expired = []
     for saved in store.db.execute("SELECT key,review_record_json FROM review_approvals"):
         try:
@@ -177,11 +153,9 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
     from .store import ReviewRequired, StaleCandidate
 
     observed = observed or now_iso()
-    settings = config["review"]
     policy = review.policy_hash(config)
     writer_key = cache_key(row, config["llm"])
     report = {"status": "pending", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
-    initialize(store)
     if not _current(store, row):
         return {**report, "status": "stale"}
     job = store.db.execute("SELECT * FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
@@ -200,19 +174,17 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             return {**report, "status": "deferred"}
         report["writer_calls"] += json.loads(row["payload"])["kind"] != "tag"
         draft = writer.analyze(json.loads(row["payload"]))
-        record["writer"] = {"key": writer_key, "result": draft}
+        record["writer"] = {"key": writer_key}  # The draft itself is saved in the job, then in analyses.
         _save(store, row["id"], writer_key, policy, "drafted", draft, None, record, observed, prepared_at=prepared_at,
               supersede=superseded_input, reason="source or writer input changed")
     if not draft["publish"]:
-        try:
-            store.finish(row, draft, writer_key, observed)
-        except (StaleCandidate, ReviewRequired):
+        try:  # The commit records the draft and deletes the job.
+            store.commit_candidate(store.prepare_candidate(row, draft, observed), None, writer_key, observed)
+        except StaleCandidate:
             return {**report, "status": "stale"}
-        with store.db:
-            store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
         return {**report, "status": "ignored"}
     try:
-        prepared = store.prepare_candidate(row, draft, prepared_at, review_settings=settings)
+        prepared = store.prepare_candidate(row, draft, prepared_at)
         old = json.loads(job["envelope_json"]) if job is not None and job["envelope_json"] else None
         same = old is not None and job["policy_hash"] == policy and _identity(old) == _identity(prepared)
         stage = job["stage"] if same else "review"
@@ -228,7 +200,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             record["outcome"] = "locked"
             store.commit_candidate(prepared, prepared["candidate"], writer_key, now_iso(), review_record=record)
             return {**report, "status": record["outcome"]}
-        if prepared.get("missing_sources"):
+        if prepared["packet"]["missing_sources"]:
             _hold(store, row, prepared, draft, writer_key, record, observed, "required source material is unavailable")
             return {**report, "status": "held"}
         if stage == "held":
@@ -294,7 +266,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                       prepared_at=prepared_at, approval_key=key, approval_receipt=receipt)
                 committed = _commit_decision(store, prepared, candidate, writer_key, policy, record, key, verdict["verdict"])
                 return {**report, "status": committed["status"]}
-            if verdict["verdict"] == "hold" or verification or settings["max_repairs"] == 0:
+            if verdict["verdict"] == "hold" or verification:  # one repair at most, and only a verified one
                 reason = "verification did not approve the repair" if verification else "review did not approve the candidate"
                 _hold(store, row, prepared, draft, writer_key, record, observed, reason)
                 return {**report, "status": "held"}
@@ -309,4 +281,4 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
     except (StaleCandidate, ReviewRequired):
         return {**report, "status": "stale"}
     finally:
-        _prune(store, settings["max_cache_entries"])
+        _prune(store, MAX_APPROVALS)

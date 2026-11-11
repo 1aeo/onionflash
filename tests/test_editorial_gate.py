@@ -87,9 +87,11 @@ def test_routine_tag_has_local_draft_but_requires_editorial_review(context):
         assert writer.client is None
     assert result["status"] == "ignored" and result["writer_calls"] == 0 and result["review_calls"] == 1
     assert store.stories() == []
+    row = pending(store, item(kind="tag", title="another-tag", url="https://example.org/another-tag"))
+    prepared = store.prepare_candidate(row, tag_notice(json.loads(row["payload"])), LATER)
+    assert prepared["requires_review"]
     with pytest.raises(ReviewRequired):
-        row = pending(store, item(kind="tag", title="another-tag", url="https://example.org/another-tag"))
-        store.finish(row, tag_notice(json.loads(row["payload"])), "not-reviewed", LATER)
+        store.commit_candidate(prepared, prepared["candidate"], "not-reviewed", LATER)
 
 
 def test_editorial_skip_may_include_factual_defects_without_requesting_a_pointless_repair(context):
@@ -155,7 +157,7 @@ def test_coverage_is_bounded_but_keeps_exact_prior_visible_text(context):
     for number in range(40):
         add_coverage(store, f"background-{number:02d}", summary="Background detail. " * 80)
     row = pending(store, {**original, "content": original["content"] + " A current change.", "updated_at": LATER})
-    prepared = store.prepare_candidate(row, analysis(), LATER, review_settings=cfg["review"])
+    prepared = store.prepare_candidate(row, analysis(), LATER)
     background = prepared["coverage"]
     assert background["prior_story"]["id"] == prior_id
     assert background["prior_story"]["summary"] == previous["summary"]
@@ -280,7 +282,7 @@ def test_cached_inconsistent_release_approval_is_invalidated_and_held(context, m
     monkeypatch.setenv(cfg["llm"]["api_key_env"], "unit-test-secret")
     row = pending(store)
     draft = analysis(state="merged", category="feature", tags=["release"])
-    prepared = store.prepare_candidate(row, draft, LATER, review_settings=cfg["review"])
+    prepared = store.prepare_candidate(row, draft, LATER)
     receipt = approve(store, prepared, policy=review.policy_hash(cfg))
     with review.Reviewer(cfg) as checker:
         checker.client = FakeLLM(completion(verdict()))
@@ -398,7 +400,7 @@ def test_unidentified_skip_receipt_cannot_bypass_explicit_reconsideration(contex
         alter_receipt_input(proof, change)
         store.db.execute("UPDATE review_approvals SET review_record_json=? WHERE key=?",
                          (json.dumps(proof), saved["key"]))
-    rejection.retry_item(store, row["id"], row["content_hash"], "Reconsider the inspected item", cfg["llm"], LATER,
+    rejection.retry_item(store, row["id"], row["content_hash"], "Reconsider the inspected item", LATER,
                          reconsider_ignored=True)
     # Invalidation deliberately cannot infer ownership from the damaged record.
     assert store.db.execute("SELECT 1 FROM review_approvals WHERE key=?", (saved["key"],)).fetchone()

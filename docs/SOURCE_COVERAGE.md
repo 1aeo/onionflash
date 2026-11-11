@@ -34,13 +34,12 @@ connection returns the newest notes with `last`; it does not support a `sort`
 argument. [GitLab documents anonymous query access, null authorization responses,
 and the `/api/graphql` endpoint](https://docs.gitlab.com/api/graphql/).
 
-Set `[comments].enabled = true` to opt in. Each participating issue source must
-also declare its exact `gitlab_project`; `comments_enabled = false` excludes one
-source. `comments_graphql_url` can replace the default clean same-origin endpoint.
-No password, personal token, authorization header, or session cookie is accepted
-by this adapter. It creates a fresh public HTTP client; the transport discards
-cookies between requests and applies its normal DNS checks, timeout, retries,
-response-size bound and run deadline.
+Set `[comments].enabled = true` to opt in. Only issue sources that declare their
+exact `gitlab_project` participate, and each is read through its own origin's
+`/api/graphql`. No password, personal token, authorization header, or session
+cookie is accepted by this adapter. It creates a fresh public HTTP client; the
+transport discards cookies between requests and applies its normal DNS checks,
+timeout, retries, response-size bound and run deadline.
 
 The response must explicitly match the configured project path, numeric project
 ID (when configured in the REST URL), project URL and public visibility. The
@@ -53,7 +52,7 @@ creation dates and exact note URLs, and remain untrusted reports rather than
 confirmation of the underlying claim. Notes created after the response arrived
 are excluded; a malformed creation date fails closed.
 
-The default limit is 12 issues per run, four per source, the newest 40 notes read
+The fixed limits are 12 issues per run, four per source, the newest 40 notes read
 in one request (system notes count toward that window), 12 retained comments per
 issue, 2,000 characters per comment and 8,000 comment characters per issue. The
 newest bounded window is refreshed after 30 minutes; old notes outside that window
@@ -78,15 +77,17 @@ History cursors advance only for attempted rows. Old published issues remain
 eligible when their description and publication date do not change. Indexed,
 bounded candidate queries avoid making a request for every historical story.
 Project order also rotates under the shared budget. Scheduling metadata expires
-after 30 days and is capped at 512 entries; note count/text is bounded in each
-ordinary item snapshot. Verified source identity/time live with that snapshot,
-so scheduling-cache eviction or an outage cannot strip it or requeue unchanged
-content. Malformed or cold local records are skipped without marking the whole
-provider unavailable. Cache state never contains unfiltered note responses.
+after 30 days; note count/text is bounded in each ordinary item snapshot.
+Verified source identity/time live with that snapshot, so expired scheduling
+metadata or an outage cannot strip it or requeue unchanged content. Malformed or
+cold local records are skipped without marking the whole provider unavailable.
+Cache state never contains unfiltered note responses.
 
 `content` keeps the issue description and `public_comments` the sanitized
 attributed notes. Fresh REST descriptions retain eligible cached notes, while
-stale descriptions cannot roll the item backwards. A new, edited or deleted note
+stale descriptions cannot roll the item backwards. Once comments are turned off,
+or a source loses its `gitlab_project`, an issue's next REST revision is stored
+and analyzed without its notes. A new, edited or deleted note
 requeues analysis under the original issue identity without changing the issue's
 source publication or update timestamp; a reaction that only moves a note's update
 time requeues nothing. The writer sees the stored notes verbatim, newest first, as
@@ -114,7 +115,7 @@ The November 10 repository check found 804 rows, including the October 28 Tor
 The HTTP response-size limit bounds the table; retries and backoff also apply.
 Conditional HTTP requests avoid parsing unchanged snapshots.
 
-Rows qualify through the configured event-date lookback (14 days by default):
+Rows qualify through the fixed 14-day event-date lookback:
 a recent start or explicit end can qualify, and the date that qualified a row
 dates its item. An old `ongoing` row or a recent repository commit cannot qualify
 a row. Every row's dates must parse, but other fields of historical rows are read

@@ -44,7 +44,7 @@ def test_writer_and_reviewer_see_attributed_notes_that_text_cannot_forge(tmp_pat
     with Store(tmp_path / "state.db") as store:
         store.ingest(payload, DATE)
         row = store.pending(1, DATE)[0]
-        prepared = store.prepare_candidate(row, result, DATE, review_settings=config["review"])
+        prepared = store.prepare_candidate(row, result, DATE)
         with ControlledReviewer(config) as checker:
             assert checker.review(prepared["candidate"], prepared["packet"])["verdict"] == "approve"
     written = json.loads(requests[0]["messages"][1]["content"])

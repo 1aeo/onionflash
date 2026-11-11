@@ -8,7 +8,6 @@ tests script their reviewer replies with `verdict`.
 import json
 
 from onionflash import review, review_gate
-from onionflash.config import DEFAULTS
 from onionflash.util import digest
 
 
@@ -57,7 +56,6 @@ def approve(store, prepared, candidate=None, *, policy="test-policy", result=Non
              "reviews": [{**stage, "stage": "review", "candidate_hash": prepared["candidate_hash"], "result": initial},
                          {**stage, "stage": "verification"}],
              "outcome": "skipped" if result.get("verdict") == "skip" else "approved"}
-    review_gate.initialize(store)
     with store.db:
         store.db.execute("""INSERT OR REPLACE INTO review_approvals (key,candidate_hash,source_hash,policy_hash,
             binding_hash,result_json,review_record_json,created_at,last_used_at) VALUES(?,?,?,?,?,?,?,?,?)""",
@@ -67,8 +65,6 @@ def approve(store, prepared, candidate=None, *, policy="test-policy", result=Non
 
 
 def finish_reviewed(store, row, result, key, observed):
-    if not result["publish"]:
-        return store.finish(row, result, key, observed)
-    prepared = store.prepare_candidate(row, result, observed, review_settings=DEFAULTS["review"])
+    prepared = store.prepare_candidate(row, result, observed)
     receipt = approve(store, prepared) if prepared["requires_review"] else {}
     return store.commit_candidate(prepared, prepared["candidate"], key, observed, **receipt)

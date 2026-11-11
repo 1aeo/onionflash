@@ -325,15 +325,17 @@ def test_duplicate_verdict_and_truncated_review_are_never_approved(monkeypatch):
     assert not caught.value.retryable
 
 
-def test_review_reuses_endpoint_fallback_and_effective_timeout_policy(monkeypatch):
+def test_review_reuses_endpoint_fallback_and_the_writer_timeout(monkeypatch):
     cfg = config()
-    cfg["llm"]["fallback_base_urls"] = ["https://fallback.example/v1"]
-    cfg["review"].update(model="review-model", timeout_seconds=180)
+    cfg["llm"].update(fallback_base_urls=["https://fallback.example/v1"], timeout_seconds=180)
+    cfg["review"]["model"] = "review-model"
     checker = reviewer(monkeypatch, FetchError("unavailable", status=503), completion(verdict()), settings=cfg)
     assert checker.review(candidate(), packet())["verdict"] == "approve"
     assert [url for url, _ in checker.client.requests] == ["https://llm.example/v1/chat/completions", "https://fallback.example/v1/chat/completions"]
     assert checker.client.requests[-1][1]["model"] == "review-model"
-    assert checker.http_settings["total_timeout_seconds"] == 120
+    assert checker.client.requests[-1][1]["max_tokens"] == review.OUTPUT_TOKENS
+    # An operator's longer llm.timeout_seconds reaches review too, and the attempt total covers it.
+    assert (checker.http_settings["timeout_seconds"], checker.http_settings["total_timeout_seconds"]) == (180, 190)
     assert checker.http_settings["retry_attempts"] == 1
 
 
@@ -346,13 +348,13 @@ def test_review_client_receives_shared_absolute_deadline(monkeypatch):
         assert fake.deadline == 123.5
 
 
-def test_policy_hash_binds_effective_model_endpoint_sources_but_not_credentials(monkeypatch):
+def test_policy_hash_binds_effective_model_and_endpoint_but_not_credentials(monkeypatch):
     cfg = config()
     initial = review.policy_hash(cfg)
     monkeypatch.setenv("ONIONFLASH_LLM_API_KEY", "a-different-secret")
     assert review.policy_hash(cfg) == initial
     for section, key, value in [("llm", "model", "another-model"), ("llm", "base_url", "https://other.example/v1"),
-                                ("review", "max_source_chars", 12000), ("review", "model", "review-only")]:
+                                ("llm", "fallback_base_urls", ["https://fallback.example/v1"]), ("review", "model", "review-only")]:
         changed = copy.deepcopy(cfg)
         changed[section][key] = value
         assert review.policy_hash(changed) != initial
