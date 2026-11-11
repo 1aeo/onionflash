@@ -938,13 +938,11 @@ def test_a_long_plain_text_title_keeps_its_brackets_in_the_content():
     assert "Use Vec<u8>" in item_["content"]
 
 
-def test_future_dates_are_clamped_to_the_poll_except_for_alert_parsers():
+def test_future_dates_are_clamped_to_the_poll():
     from onionflash.collect import _item
     later = "2062-01-01T00:00:00Z"
     item_ = _item(source(), "https://example.org/1", "t", "", later, later, observed=DATE)
     assert (item_["published_at"], item_["updated_at"]) == (DATE, DATE)
-    alert = _item(source(alert_format="consensus"), "https://example.org/2", "t", "", later, later, observed=DATE)
-    assert alert["published_at"] == later
 
 
 def test_rss_guid_that_is_not_a_permalink_is_never_a_citation():

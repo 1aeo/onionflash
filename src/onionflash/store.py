@@ -9,7 +9,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .util import after, backoff_seconds, digest, item_cluster, item_identity
-from . import candidate, editorial, monitoring, render
+from . import candidate, editorial, render
 from .candidate import ReviewRequired, StaleCandidate
 
 
@@ -100,8 +100,10 @@ class Store:
                 published_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            DROP TABLE IF EXISTS monitoring_observations;
+            DROP TABLE IF EXISTS monitoring_counters;
+            DROP TABLE IF EXISTS monitoring_groups;
         """)
-        monitoring.initialize(self.db)
         editorial.initialize(self.db)
         analysis_columns = {row[1] for row in self.db.execute("PRAGMA table_info(analyses)")}
         for name, kind in (("source_payload", "TEXT"), ("source_item_id", "TEXT"), ("input_chars", "INTEGER"), ("review_record", "TEXT")):
@@ -414,9 +416,6 @@ class Store:
                 (limit,),
             )
         ]
-
-    def ingest_alerts(self, source: dict, items: list[dict], observed: str) -> dict:
-        return monitoring.ingest(self.db, source, items, observed)
 
     def health(
         self, sources: list[dict], stale_seconds: int, observed: str

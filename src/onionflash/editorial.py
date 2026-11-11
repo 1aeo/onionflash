@@ -1,8 +1,7 @@
 """Trusted local corrections, retractions and their durable revision record.
 
 Only this module grants a connection-local write permit, and only within an
-operator transaction. The database guard also protects against monitoring's
-direct story updates. Public history contains accepted public snapshots only.
+operator transaction. The database guard also protects direct story updates. Public history contains accepted public snapshots only.
 """
 
 from __future__ import annotations

@@ -340,19 +340,14 @@ def load_config(path: str | Path) -> dict:
         source.setdefault("authority", "community")
         source.setdefault("enabled", True)
         source.setdefault("interval_seconds", 300)
-        source.setdefault("alert_format", "")
-        source.setdefault("monitor_id", source["id"])
-        if source["alert_format"] == "censorship":
-            # Retired: those alerts could never publish. An old file still loads.
-            logging.getLogger(__name__).warning(
-                "Ignoring source %s: anti-censorship alerts are no longer collected; it can be deleted", source["id"])
-            source["enabled"] = False
-        elif not isinstance(source["alert_format"], str) or source["alert_format"] not in {"", "consensus"}:
+        alert_format = source.get("alert_format", "")
+        if not isinstance(alert_format, str) or alert_format not in {"", "consensus", "censorship"}:
             raise ValueError("Unsupported alert format")
-        if not isinstance(source["monitor_id"], str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", source["monitor_id"]):
-            raise ValueError("Invalid monitor identity")
-        if source["alert_format"] and (source["kind"] != "feed" or source["authority"] != "telemetry"):
-            raise ValueError("Alert parsers require a feed classified as telemetry")
+        if alert_format:
+            # Preserve old source entries without reclassifying them as news.
+            logging.getLogger(__name__).warning(
+                "Ignoring source %s: monitoring alert collection is retired; remove this source", source["id"])
+            source["enabled"] = False
         if source["kind"] not in {"feed", "tag", "gitlab_issue", "gitlab_mr", "metrics_timeline"}:
             raise ValueError("Unsupported source kind")
         if source["authority"] not in {

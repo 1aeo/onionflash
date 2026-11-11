@@ -162,14 +162,7 @@ open-ended events into new incidents. Citations point to the exact commit and
 table line. Ambiguous recent rows are skipped with a source warning. See
 [timeline coverage and identity rules](docs/SOURCE_COVERAGE.md#tor-metrics-timeline).
 
-### Automated monitoring alerts
-
-Consensus-health notifications remain private. The deterministic parser groups
-them into candidates for source-backed context; repeated warnings alone do not
-create headlines or enter the model queue. `onionflash status` exposes current
-private candidates. Ordinary incident reports and release announcements retain
-their existing publication path. See [monitoring qualification, inspection and
-episode rules](docs/MONITORING.md).
+For older source files, see [retired source compatibility](docs/SOURCE_COVERAGE.md#retired-monitoring-sources).
 
 ## Commands
 
@@ -272,8 +265,7 @@ queue. See [final review, configuration and evaluation](docs/FINAL_REVIEW.md).
   supplied source. The excerpts stay private; public citations are created from
   collected URLs, never model-proposed URLs. Source text is treated as untrusted
   data.
-- Reports and suspected compromises retain explicit uncertainty. Raw monitoring
-  follows the separate [private-candidate policy](docs/MONITORING.md). GitLab issue
+- Reports and suspected compromises retain explicit uncertainty. GitLab issue
   hosting alone does not establish confirmation. Tags
   are marked `tagged`; merges are marked `merged`. A later tag cannot downgrade an
   already announced release.

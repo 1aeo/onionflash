@@ -242,15 +242,3 @@ url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torpr
 product = "network"
 authority = "community"
 enabled = true
-
-[[sources]]
-id = "consensus-health-alerts"
-name = "Tor Project Consensus Health Monitoring Mailing List"
-website_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/"
-url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/feed/"
-kind = "feed"
-authority = "telemetry"
-product = "network"
-alert_format = "consensus"
-# Mirrors of this monitor must use the same identity.
-monitor_id = "tor-doctor"
