@@ -59,9 +59,10 @@ def _item(
     title_html: bool = True,
     observed: str | None = None,
 ) -> dict:
-    if observed and not source.get("alert_format"):
+    """Normalize one collected record and clamp future timestamps to observation time."""
+    if observed:
         # A future date (a typo or a scheduled event) must not pin a story to the
-        # top or block later corrections. Alert parsers judge future dates themselves.
+        # top or block later corrections.
         # All three are format_utc strings, so string order is time order.
         published, updated = min(published, observed), min(updated, observed)
     return {
@@ -162,10 +163,6 @@ def _feed(
     items = []
     identities, conflicts, skipped = {}, set(), 0
     for entry in feed.entries:
-        if source.get("alert_format") and not (entry.get("published_parsed") or entry.get("updated_parsed")):
-            # A poll's clock must never manufacture a new monitoring observation.
-            skipped += 1
-            continue
         published = _entry_time(
             entry, "published", _entry_time(entry, "updated", started)
         )

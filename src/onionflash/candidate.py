@@ -10,6 +10,49 @@ from .util import canonical_url, digest, format_utc, normalize_evidence, parse_u
 
 # Writer fields a review may repair; their order is part of the review policy hash.
 SEMANTIC_FIELDS = ("title", "summary", "why_it_matters", "category", "priority", "confidence", "state", "products", "tags")
+COVERAGE_ROWS = 32
+COVERAGE_CHARS = 12000
+COVERAGE_SUMMARY_CHARS = 200
+
+
+def coverage_background(db, prior: dict | None, budget: int) -> dict:
+    """Bounded committed coverage for editorial comparison, never source evidence."""
+    def public_text(row):
+        """Normalize public coverage fields and reject mismatched stored identities."""
+        public = render._prepare_story(json.loads(row["payload"]))
+        if public["id"] != row["id"]:
+            raise ValueError("Coverage identity differs from its stored story")
+        return {key: public[key] for key in ("id", *SEMANTIC_FIELDS, "published_at", "updated_at", "added_at")}
+
+    previous = public_text(prior) if prior else None
+    result = {"prior_story": previous, "recent": [], "truncated": False}
+    prior_size = len(json.dumps(result, ensure_ascii=False))
+    if prior_size > COVERAGE_CHARS:
+        raise ValueError("Prior coverage exceeds bounded public text limits")
+    # Preserve the prior story's exact visible text even when the optional
+    # recent-history allowance is small. Public field limits bound that text.
+    budget = max(min(budget, COVERAGE_CHARS), prior_size)
+    rows = db.execute("""SELECT s.id,s.payload,COALESCE(e.retracted,0) AS retracted
+        FROM stories s LEFT JOIN editorial_controls e ON e.story_id=s.id
+        ORDER BY s.rowid DESC LIMIT ?""", (COVERAGE_ROWS,)).fetchall()
+    result["truncated"] = len(rows) == COVERAGE_ROWS
+    for row in rows:
+        if row["retracted"] or (prior and row["id"] == prior["id"]):
+            continue
+        try:
+            current = public_text(row)
+        except (ValueError, TypeError, KeyError, AttributeError, UnicodeError):
+            result["truncated"] = True
+            continue
+        compact = {key: current[key] for key in ("id", "title", "summary", "category", "state", "updated_at")}
+        compact["summary"] = compact["summary"][:COVERAGE_SUMMARY_CHARS]
+        compact["summary_truncated"] = len(current["summary"]) > COVERAGE_SUMMARY_CHARS
+        result["truncated"] |= compact["summary_truncated"]
+        if len(result["recent"]) + bool(previous) >= COVERAGE_ROWS or len(json.dumps({**result, "recent": [*result["recent"], compact]}, ensure_ascii=False)) > budget:
+            result["truncated"] = True
+            break
+        result["recent"].append(compact)
+    return result
 
 
 class ReviewRequired(ValueError):
@@ -73,6 +116,7 @@ def control_fingerprint(db, story_id: str) -> str:
 
 
 def assert_current(db, prepared: dict) -> None:
+    """Refuse a decision if its input, coverage, sources or editorial state changed."""
     binding, row = prepared["binding"], prepared["row"]
     current = db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()
     if current is None or item_fingerprint(dict(current)) != binding["item"] or item_fingerprint(row) != binding["item"]:
@@ -81,29 +125,16 @@ def assert_current(db, prepared: dict) -> None:
         raise StaleCandidate("Published story changed since candidate preparation")
     if control_fingerprint(db, prepared["story_id"]) != binding["lock"]:
         raise StaleCandidate("Editorial decision changed since candidate preparation")
+    if prepared["coverage"] is not None and digest(coverage_background(
+            db, existing_story(db, row), binding["coverage_budget"])) != binding["coverage_hash"]:
+        raise StaleCandidate("Existing coverage changed since final review")
     if any(not source_packet.binding_current(db, source) for source in binding["sources"]):
         raise StaleCandidate("Supporting source changed since candidate preparation")
 
 
-def wholly_deterministic(db, row: dict, payload: dict, public: dict) -> bool:
-    if payload.get("editorial_kind") != "tag":
-        return False
-    from .analyze import tag_notice
-    writer = payload.get("editorial_item")
-    item = json.loads(row["payload"])
-    writer_item = item if writer == item["id"] else None
-    if writer_item is None:
-        writer_source = next((source for source in payload["sources"] if source.get("id") == writer), None)
-        loaded = source_packet._load(db, writer, writer_source["url"], payload.get("editorial_analysis_key")) if writer_source else None
-        writer_item = loaded[0] if loaded else None
-    if writer_item is None or writer_item.get("kind") != "tag":
-        return False
-    literal = tag_notice(writer_item)
-    return all(public[key] == literal[key] for key in SEMANTIC_FIELDS)
-
-
 def prepare(db, row: dict, result: dict, observed: str, *, input_chars: int | None = None, review_settings: dict | None = None) -> dict:
     # Copy caller-owned values so later repairs cannot mutate the original draft.
+    """Assemble the exact candidate and bind all state needed for its guarded commit."""
     row, result = json.loads(json.dumps(row)), json.loads(json.dumps(result))
     if type(result.get("publish")) is not bool:
         raise ValueError("Draft publication decision must be boolean")
@@ -116,12 +147,13 @@ def prepare(db, row: dict, result: dict, observed: str, *, input_chars: int | No
     existing = existing_story(db, row)
     story_id = existing["id"] if existing else digest(row["cluster_key"])[:24]
     locked = editorial.is_locked(db, story_id)
+    coverage_budget = min(COVERAGE_CHARS, (review_settings or {}).get("max_source_chars", source_packet.DEFAULT_LIMITS["max_source_chars"]) // 2)
     binding = {"item": item_fingerprint(row), "prior_story": digest(existing),
-               "lock": control_fingerprint(db, story_id), "sources": []}
+               "lock": control_fingerprint(db, story_id), "sources": [], "coverage_budget": coverage_budget}
     envelope = {"row": row, "result": result, "input_chars": input_chars, "story_id": story_id,
                 "cluster_key": existing["cluster_key"] if existing else row["cluster_key"],
                 "candidate": None, "payload": None, "packet": {"sources": [], "missing_sources": [], "truncated": False},
-                "binding": binding, "locked": locked, "requires_review": False, "wholly_deterministic": False,
+                "binding": binding, "locked": locked, "requires_review": False, "coverage": None,
                 "writer_item_id": None, "observed": observed}
     if result["publish"] and not locked:
         previous = json.loads(existing["payload"]) if existing else None
@@ -161,12 +193,12 @@ def prepare(db, row: dict, result: dict, observed: str, *, input_chars: int | No
         data["updated_at"] = public["updated_at"] = max([data["updated_at"], *note_updates.values()])
         if writer in note_updates:
             data["editorial_updated_at"] = max(data["editorial_updated_at"], note_updates[writer])
-        deterministic = wholly_deterministic(db, row, data, public)
         binding["sources"] = bindings
         envelope.update(candidate=public, payload=data, packet=packet, writer_item_id=writer,
-                        wholly_deterministic=deterministic, requires_review=not deterministic)
+                        coverage=coverage_background(db, existing, coverage_budget), requires_review=True)
     binding.update(payload_hash=digest(envelope["payload"]), candidate_hash=digest(envelope["candidate"]), packet_hash=digest(envelope["packet"]))
+    binding["coverage_hash"] = digest(envelope["coverage"])
     envelope.update(candidate_hash=digest(envelope["candidate"]), source_hash=digest(envelope["packet"]),
-                    binding_hash=digest(binding), missing_sources=envelope["packet"]["missing_sources"])
+                    coverage_hash=binding["coverage_hash"], binding_hash=digest(binding), missing_sources=envelope["packet"]["missing_sources"])
     return envelope
 

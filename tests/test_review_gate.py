@@ -30,10 +30,18 @@ class Writer:
 class Reviewer:
     """Returns validated verdicts, as review.Reviewer does."""
     def __init__(self, *responses):
-        self.responses, self.calls = list(responses), []
+        """Script reviewer responses, adding final approval only for approval shorthand."""
+        self.responses, self.calls, self.coverages = list(responses), [], []
+        # A shorthand approval includes an independent final approval. Empty
+        # and failure scripts remain strict, so unexpected calls still fail.
+        if len(responses) == 1 and (callable(responses[0]) or
+                isinstance(responses[0], dict) and responses[0].get("verdict") == "approve"):
+            self.responses.append(verdict())
 
-    def review(self, candidate, packet, *, verification=False):
+    def review(self, candidate, packet, *, coverage=None, verification=False):
+        """Capture exact review inputs and validate or raise the next scripted response."""
         self.calls.append((copy.deepcopy(candidate), copy.deepcopy(packet), verification))
+        self.coverages.append(copy.deepcopy(coverage))
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -75,18 +83,19 @@ def seed_legacy(store, incoming=None, result=None):
 
 
 def test_approved_exact_candidate_commits_and_keeps_private_complete_audit(context):
+    """Publish reviewed text and retain both stages with their evidence privately."""
     cfg, store = context
     row = pending(store)
     writer, checker = Writer(), Reviewer(verdict())
     result = run(cfg, store, row, writer, checker)
-    assert result == {"status": "published", "writer_calls": 1, "review_calls": 1, "cache_hit": False}
+    assert result == {"status": "published", "writer_calls": 1, "review_calls": 2, "cache_hit": False}
     assert job(store) is None
     assert store.stories()[0]["summary"] == checker.calls[0][0]["summary"]
     saved = store.db.execute("SELECT review_record FROM analyses").fetchone()[0]
     audit = json.loads(saved)
     assert audit["writer"]["result"] == analysis()
     assert audit["prepared"]["packet"]["sources"]
-    assert len(audit["reviews"]) == 1 and audit["outcome"] == "approved"
+    assert [r["stage"] for r in audit["reviews"]] == ["review", "verification"] and audit["outcome"] == "approved"
 
 
 def test_a_new_story_is_dated_when_the_review_commits_not_when_the_item_started(context, monkeypatch):
@@ -100,6 +109,7 @@ def test_a_new_story_is_dated_when_the_review_commits_not_when_the_item_started(
 
 @pytest.mark.parametrize("failure", [AnalysisError("timeout", retryable=True), {}])
 def test_review_timeout_or_malformed_verdict_resumes_without_regenerating_writer(context, failure):
+    """Resume the unfinished review while retaining its already completed writer draft."""
     cfg, store = context
     row = pending(store)
     writer, checker = Writer(), Reviewer(failure)
@@ -114,7 +124,7 @@ def test_review_timeout_or_malformed_verdict_resumes_without_regenerating_writer
     next_writer, next_checker = Writer(), Reviewer(verdict())
     result = run(cfg, store, row, next_writer, next_checker)
     assert result["status"] == "published" and result["writer_calls"] == 0
-    assert next_writer.calls == [] and len(next_checker.calls) == 1
+    assert next_writer.calls == [] and len(next_checker.calls) == 2
 
 
 def test_repair_requires_fresh_verification_and_resumes_that_exact_stage(context):
@@ -209,13 +219,14 @@ def test_source_change_during_review_fails_commit_cas(context):
 
 
 def test_policy_change_reuses_writer_but_requires_a_new_review(context):
+    """Invalidate review approval on policy change without discarding the source draft."""
     cfg, store = context
     row = pending(store)
     with pytest.raises(AnalysisError):
         run(cfg, store, row, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
     cfg["review"]["model"] = "different-review-model"
     result = run(cfg, store, row, Writer(), Reviewer(verdict()))
-    assert result["writer_calls"] == 0 and result["review_calls"] == 1 and not result["cache_hit"]
+    assert result["writer_calls"] == 0 and result["review_calls"] == 2 and not result["cache_hit"]
 
 
 def test_final_merge_reviews_retained_old_bad_text_and_commits_only_the_verified_repair(context):
@@ -251,7 +262,8 @@ def test_human_lock_during_review_invalidates_approval_and_preserves_operator_te
     assert second["status"] == "locked" and second["writer_calls"] == second["review_calls"] == 0
 
 
-def test_tag_exemption_depends_on_final_candidate_not_incoming_kind(context):
+def test_tag_update_still_reviews_the_existing_prose_it_retains(context):
+    """Review inherited prose even when a locally drafted tag triggers the candidate."""
     cfg, store = context
     original = item(title="Tor 0.4.9.16 released", kind="feed", content="Tor 0.4.9.16 was released with an announced change.")
     seed_legacy(store, original, analysis(title="Tor release announcement"))
@@ -259,16 +271,20 @@ def test_tag_exemption_depends_on_final_candidate_not_incoming_kind(context):
     row = pending(store, tag)
     checker = Reviewer(verdict())
     result = run(cfg, store, row, Writer(tag_notice(tag)), checker)
-    assert result["review_calls"] == 1 and checker.calls[0][0]["title"] == "Tor release announcement"
+    assert result["review_calls"] == 2 and checker.calls[0][0]["title"] == "Tor release announcement"
 
 
-def test_fully_deterministic_tag_can_finish_with_network_disabled(context):
+def test_tag_draft_requires_final_review_and_waits_when_network_is_disabled(context):
+    """Defer an unreviewed tag until both publication reviews can run."""
     cfg, store = context
     tag = item(title="tor-0.4.9.16", kind="tag", content="")
     row = pending(store, tag)
     checker = Reviewer()
     result = run(cfg, store, row, Writer(tag_notice(tag)), checker, allow_network=False)
-    assert result["status"] == "deterministic" and checker.calls == []
+    assert result["status"] == "deferred" and checker.calls == []
+    assert result["writer_calls"] == 0 and store.stories() == []
+    reviewed = run(cfg, store, row, Writer(tag_notice(tag)), Reviewer(verdict()))
+    assert reviewed["status"] == "published" and reviewed["writer_calls"] == 0 and reviewed["review_calls"] == 2
 
 
 def test_network_disabled_defers_new_network_work_without_failure(context):
@@ -293,7 +309,8 @@ def test_missing_retained_source_holds_without_a_review_call(context):
     assert result["status"] == "held" and result["review_calls"] == 0
 
 
-def test_cache_cannot_treat_an_approve_boolean_as_seven_passing_checks(context):
+def test_cache_cannot_treat_an_approve_boolean_as_all_required_checks(context):
+    """Reject an incomplete cached verdict instead of trusting its approval label."""
     cfg, store = context
     row = pending(store)
     with pytest.raises(AnalysisError):
@@ -301,7 +318,7 @@ def test_cache_cannot_treat_an_approve_boolean_as_seven_passing_checks(context):
     saved = job(store)
     approve(store, json.loads(saved["envelope_json"]), policy=saved["policy_hash"], result={"verdict": "approve"})
     result = run(cfg, store, row, Writer(), Reviewer(verdict()))
-    assert result["review_calls"] == 1 and not result["cache_hit"]
+    assert result["review_calls"] == 2 and not result["cache_hit"]
 
 
 def test_cache_pruning_retains_active_approval_jobs(context, monkeypatch):
@@ -523,6 +540,7 @@ def test_hold_final_update_guard_rolls_back_an_in_transaction_source_change(cont
 
 
 def test_approval_receipt_and_job_pin_roll_back_together_if_job_save_fails(context):
+    """Persist the receipt and its unfinished-job pin atomically."""
     cfg, store = context
     row = pending(store)
     review_gate.initialize(store)
@@ -532,7 +550,7 @@ def test_approval_receipt_and_job_pin_roll_back_together_if_job_save_fails(conte
     with pytest.raises(sqlite3.IntegrityError, match="job save unavailable"):
         run(cfg, store, row, Writer(), Reviewer(verdict()))
     assert store.db.execute("SELECT COUNT(*) FROM review_approvals").fetchone()[0] == 0
-    assert job(store)["stage"] == "review" and job(store)["approval_key"] is None
+    assert job(store)["stage"] == "verify" and job(store)["approval_key"] is None
     assert len(store.stories()) == 0
     store.db.execute("DROP TRIGGER fail_approved_job")
     store.db.commit()
@@ -599,6 +617,7 @@ def test_run_report_counts_held_stale_and_cached_reviews(context, monkeypatch):
 
 
 def test_unusable_replies_and_drafts_take_strikes_and_the_run_still_builds(context, monkeypatch):
+    """Isolate invalid model output so other queued work and the site build continue."""
     from onionflash import cli
     cfg, store = context
     cfg["sources"] = []
@@ -609,7 +628,8 @@ def test_unusable_replies_and_drafts_take_strikes_and_the_run_still_builds(conte
             return analysis(title="\uffff") if incoming["url"].endswith("/draft") else analysis()
 
     class Replies:
-        def review(self, candidate, packet, *, verification=False):
+        def review(self, candidate, packet, *, coverage=None, verification=False):
+            """Return malformed replies only for the designated failure fixtures."""
             return review.validate_review({} if "/reply" in packet["sources"][0]["url"] else verdict(), packet)
 
     built = []

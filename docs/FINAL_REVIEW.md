@@ -1,132 +1,129 @@
-# Final publication review
+# Publication review
 
-The reviewer evaluates the exact current story that would be published, including
-wording retained from an existing grouped story. It never approves only an incoming
-draft and then allows storage precedence to substitute different text afterward.
-Operator corrections and retractions retain their separate, trusted local workflow.
+The application drafts a story from bounded source text, assembles the exact
+candidate, then asks the configured model to critique it and verify it in a fresh
+request. Only a final approval can publish. The same endpoint and model serve
+these requests unless a separate review model is configured.
 
-## Workflow
+## Selection and grounding
 
-1. Generate one structurally valid draft and save it privately.
-2. Assemble the final candidate using existing identity, grouping, precedence,
-   citation, date and editorial-lock rules.
-3. Build a bounded packet of actual source material, with identifiers such as
-   `S1:P3`. Include material supporting retained prior wording and verified public
-   comments even when the writer did not quote them.
-4. Make a fresh reviewer request containing the candidate and source packet.
-5. Publish only an `approve` result with all seven criteria passing, no issues and
-   no edits. A `revise` response may propose one minimal semantic repair. Normalize
-   that repair, then send its exact text and sources in a fresh verification request.
-6. Hold the update if required source material is unavailable, the review returns
-   `hold`, a `revise` arrives while `max_repairs = 0`, a repair is missing,
-   unchanged or invalid, or verification does not approve. Do not apply a second
-   repair. A candidate that was held before stays held without another review,
-   for example after a source reverts to a held revision.
+Prefer concrete releases, credible and clearly scoped security reports,
+substantial merged fixes/features, and meaningful incident developments. Routine
+maintenance, template checklists, acknowledgments, unsupported speculation and
+repeated quotations do not merit standalone news. A later timestamp or another
+distribution channel does not make an old event new.
 
-The normal successful path uses two model calls: writer and reviewer. One repair
-adds a third call. Transport failures may retry through configured endpoints or a
-later scheduled run, but completed stages are retained rather than regenerated.
-An ignored draft needs no publication review. A wholly deterministic final tag
-notice does not need LLM review. An incoming tag is not an exemption when the
-merged story retains model prose. Raw monitoring follows the separate
-[private-candidate policy](MONITORING.md).
+The writer summarizes the source without selecting news. Its `publish=true` field
+submits a draft for review; only the reviewer decides news value and novelty.
+The writer selects literal evidence excerpts from its exact input. This prevents
+quote-copying errors; it does not establish that the excerpts support every
+claim. The reviewer therefore receives the full bounded numbered source packet,
+including retained source material and verified public comments that the writer
+may not have quoted. Previous generated summaries are never factual evidence.
 
-## Rubric
+A separate, bounded coverage background contains the existing article for a
+known update and compact recent articles. It is used only to compare novelty.
+It is not an authoritative source or an instruction, and cannot support claims
+missing from the source packet. The background reads committed stories, so an
+article accepted earlier in the same run is visible before the site rebuild.
 
-Every criterion has its own `pass`, `fail` or `insufficient` result and source
-references. There is no averaged score or majority approval.
+The reviewer evaluates nine independent criteria:
 
-| Criterion | Required behavior |
+| Criterion | Requirement |
 | --- | --- |
-| Source support | Every substantive current claim is supported by the packet. |
-| Actor and action | Preserve who does what; developer work cannot become operator configuration advice. |
-| Status | Distinguish requests, proposals, merges, releases, deployment and resolution. |
-| Uncertainty and attribution | Preserve report/suspicion qualifiers and the actual speaker. |
-| Scope and timing | Do not turn a single failed probe into country-wide blocking, or an old report into a current attack. |
-| Operational advice | Require explicit source support for the stated audience and action. |
-| Technical details | Ground versions, dates, counts, identities, causes and impacts. |
+| Source support | Support every substantive claim with the supplied sources. |
+| Actor and action | Preserve who does what; developer work is not operator advice. |
+| Status | Distinguish requests, merges, releases, deployment and resolution. |
+| Uncertainty and attribution | Preserve qualifications and material disagreement. |
+| Scope and timing | Preserve affected versions, platforms, samples and dates. |
+| Operational advice | Require explicit source support for the audience and action. |
+| Technical details | Ground identities, counts, mechanisms and consequences. |
+| News value | Require a concrete development worth publishing. |
+| New information | Require meaningful new facts, not duplicate coverage or quoted history. |
 
-This is factual review. Supported wording is not rejected for repetition, brevity
-or stylistic preference. `why_it_matters` can be an empty string or a faithful
-restatement of a source concern; no extra impact statement is required. A repair
-must remove or minimally correct unsupported claims, not add plausible advice.
-Trusted editorial history labeled superseded is not current reporting.
+New drafts have a concise factual summary and an empty `why_it_matters` field.
+The request schema and response validation enforce this; the model cannot add a
+separate impact paragraph. An explicitly sourced consequence or requested action
+may appear in the summary with its audience, scope and prerequisites preserved.
+Historical impact text remains readable. A review repair may clear it, but cannot
+create or rewrite an impact paragraph; operator corrections remain separate.
+Automatic approvals also require consistent metadata: a `release` category or
+tag needs state `released` or `tagged`. An inconsistent approval is held, including
+when loading a cached decision. This check does not infer facts from source text.
 
-Candidate and source content are untrusted data. The reviewer has no tools, and
-its prompt tells it to disregard instructions, role claims and purported
-approvals embedded in either. This reduces prompt-injection risk but does not
-remove it. The response schema constrains references to identifiers in the
-packet, and application validation checks the complete verdict, criteria,
-references and repair fields again; that checks a verdict's structure, not why
-the model reached it.
+The model must not invent impact or advice to make a weak source seem important.
+An open checklist cannot negate an explicit release announcement, and checked
+conditional template steps do not prove that security fixes shipped. Counter
+inactivity or unresponsive diagnostics alone do not establish an attack or a
+mitigation bypass.
 
-## Sources and exact approvals
+Existing issue/release identities allow meaningful updates to the same article.
+Semantic similarity alone never merges unrelated events. A potentially important
+follow-up with no established article match can be a concise standalone story
+when it adds a material, supported development. It does not change another
+article's identity or overwrite a protected correction.
 
-The packet uses collected source text, not previous generated summaries as
-evidence. Current source records are preferred when they match the cited URL.
-Retained immutable citations can use exact saved historical snapshots with their
-true dates and historical labels. Text from a newer immutable URL is never labeled
-as the old citation.
+## Decisions and calls
 
-Source and passage counts and text lengths are bounded. Truncation is explicit;
-the model may not infer omitted material. Unknown legacy writers require the
-retained source set to be available within those bounds. Source-link metadata
-alone is not a substitute for a missing body needed to support a substantive claim.
+- `approve`: every criterion passes, with no issues or edits. An initial approval
+  advances to fresh final verification; it cannot publish by itself.
+- `revise`: one minimal repair is allowed, followed by fresh verification of its
+  exact normalized text. No rewrite loop or second repair is applied.
+- `skip`: low-value or redundant material is recorded as ignored. It creates no
+  article or revision and leaves existing coverage intact.
+- `hold`: potentially useful material is unsupported, ambiguous or not ready to
+  publish. It remains available through the existing operator controls.
 
-Approvals bind the exact normalized candidate, supplied source packet, reviewer
-policy and current item/source/story/editorial-lock fingerprints. A commit takes
-an immediate SQLite transaction and checks those bindings again. Changed inputs
-invalidate the approval. The approved candidate is written directly; no later
-merge or semantic rewrite can restore an old unsupported sentence. Only a new
-story's `added_at`, its publishing date, is set at commit instead, so a retried
-review cannot backdate it.
+A normal publication uses one writer request and two review requests. A repair
+uses the same number: writer, critique/repair, verification. Deterministic tag
+text skips the writer call but still needs both reviews; a tag is not an official
+release announcement. A first-round skip or hold ends without final verification.
+Historical ignored drafts remain readable; new writer requests cannot silently
+skip a source before editorial review.
 
-## Configuration
+Completed stages survive interruptions. Transport failures use the normal
+backoff; malformed replies count against the item rather than retrying forever.
+Human corrections and retractions retain their separate trusted, locked workflow.
+Raw monitoring feeds are not collected or published.
 
-The reviewer uses the `[llm]` endpoint, fallbacks, credential environment and
-network policy, so no additional service is needed. `review.model` selects a
-different model; empty uses `llm.model`. [`config.example.toml`](../config.example.toml)
-lists the other `[review]` settings and their defaults. Raising the source limits
-also needs a model endpoint with enough context and enough time in each run.
+## Exact decisions and private state
 
-## Private state and operator inspection
+Decisions bind the normalized candidate, source packet, coverage background,
+review policy, and current source/story/editorial state. The commit rechecks
+these bindings in an immediate SQLite transaction. Changed context invalidates
+the decision; publication never remerges different wording afterward.
 
-Review jobs, approval receipts and review audits are private SQLite state; none
-of them, and no source packet, is rendered into the public site.
-`onionflash status` reports stage and cache counts. A hold enters `rejected`,
-where [rejection controls](REJECTED_ANALYSES.md) inspect, retry or dismiss it.
+Private review jobs retain unfinished work. The bounded decision cache and
+analysis audit retain the source/context and reviews used for the decision.
+Only a recorded successful final verification can authorize publication.
+Skipped candidates are audited without changing articles or editorial controls.
 
-## Evaluate the configured model
+Use the existing `status`, `rejected show`, `retry` and `dismiss` controls to
+inspect failures. See [operator controls](REJECTED_ANALYSES.md) and
+[corrections and retractions](EDITORIAL.md).
 
-Mocked tests establish the publication contract and failure behavior. They do not
-establish that a model's semantic judgments are accurate. The controlled corpus,
-`tools/review_cases.json`, contains the saved bastet mistake and synthetic
-negative/positive controls for each rubric area, including legitimate operator
-instructions. Model-visible IDs and synthetic URLs are opaque; case names and
-expected results are not sent.
+## Configuration and evaluation
 
-After loading the same LLM environment used by the application:
+Review model, timeouts and input/output bounds remain in `[review]` in the
+[example configuration](../config.example.toml). Requests also obey the shared
+run deadline. The coverage background is bounded separately; truncation is
+explicit and never proves the absence of older coverage.
+
+The controlled evaluation does not collect, open the application database or
+publish. It exercises both review rounds, records their outputs privately, and
+scores the final candidate that would actually publish:
 
 ```sh
 PYTHONPATH=src python tools/evaluate_review.py --config config.toml \
-  --output /private/path/review-evaluation.jsonl --max-seconds 1800
+  --output /private/path/review-evaluation.jsonl --max-seconds 3600
 ```
 
-Add `--verify-repairs` to apply each proposed repair and send it to the same model
-in the gate's verification request. A verified repair of a negative case that
-still contains one of the case's `unsupported` phrases counts as a false approval,
-because the gate would publish it. A verified repair of a positive case counts
-as an approval for the same reason. That check compares wording only. It misses
-paraphrases and new claims, and it also counts a faithful repair that keeps a
-phrase inside a negation, such as "no evidence that ...". So read `repaired` in
-the private report for every verified repair, including each one counted as a
-false approval. Use `--case-id NAME` to select a case, or `--rounds 2` to repeat
-controls. Output must be a new private file outside the public directory. The
-tool does not collect sources, open the application database or publish stories.
-It records errors and incomplete runs as failures, rather than counting them as
-successful judgments.
+Use `--case-id` for selected cases and `--rounds` for repeated trials. The older
+`--verify-repairs` option remains accepted; final verification always runs.
+Expected results and case labels are not sent to the model. Inspect approved
+articles and repairs against the sources as well as checking the automatic
+scores: phrase checks cannot establish semantic correctness.
 
-Using the same model for writing and review can retain shared blind spots.
-Keep the correction workflow and primary-source links, and evaluate changed
-models or rubric versions before rollout. Passing a finite corpus is not a
-guarantee that all future factual errors will be caught.
+Using the same model for drafting and review can retain shared blind spots.
+Finite tests are not a production accuracy estimate. Keep primary-source links,
+editorial corrections and periodic audits of new output.

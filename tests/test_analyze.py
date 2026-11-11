@@ -44,64 +44,6 @@ def analyzer(monkeypatch, *responses, fallbacks=()):
     return result
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-def test_a_qualifier_inside_the_flagged_claim_does_not_excuse_it():
-    from onionflash.analyze import _kept_claim
-    claim = "Operators may need to rotate keys."
-    draft = {"title": "t", "summary": claim, "why_it_matters": "w"}
-    copied = {**draft, "title": "New title"}
-    attributed = {**draft, "summary": "According to the report, operators may need to rotate keys."}
-    assert _kept_claim([claim], [draft], copied) == claim
-    assert _kept_claim([claim], [draft], attributed) == claim  # the claim's own "may" is not a hedge
-    hedged = {**draft, "summary": "It is unclear whether operators may need to rotate keys."}
-    assert _kept_claim([claim], [draft], hedged) is None
-
-
-def test_a_short_flagged_statement_removed_once_may_not_come_back():
-    from onionflash.analyze import _kept_claim
-    draft = {"title": "t", "summary": "The issue reports a crash. No fix.", "why_it_matters": "w"}
-    first = {**draft, "summary": "The issue reports a crash."}
-    assert _kept_claim(["No fix."], [draft], first) is None
-    assert _kept_claim(["No fix."], [draft, first], draft) == "No fix."
-    hedged = {**draft, "summary": "The issue reports a crash. It is unclear whether there is no fix."}
-    assert _kept_claim(["No fix."], [draft, first], hedged) is None
-    # Whole words only: "confirmed" inside "unconfirmed" is not the flagged word.
-    assert _kept_claim(["confirmed compromise"], [draft], {**draft, "summary": "An unconfirmed compromise."}) is None
-
-
-def test_a_qualifier_must_belong_to_the_claims_own_clause():
-    from onionflash.analyze import _kept_claim
-    claim = "Operators must update their configurations to exclude the node."
-    draft = {"title": "t", "summary": claim, "why_it_matters": "w"}
-    elsewhere = {**draft, "summary": "It is unclear whether the node is compromised, but operators must "
-                                      "update their configurations to exclude the node."}
-    assert _kept_claim([claim], [draft], elsewhere) == claim
-    after = {**draft, "summary": "The report says operators must update their configurations to exclude "
-                                  "the node is unconfirmed."}
-    assert _kept_claim([claim.rstrip(".")], [draft], after) is None
-
-
-def test_a_short_flagged_statement_left_unchanged_is_kept():
-    from onionflash.analyze import _kept_claim
-    draft = {"title": "t", "summary": "The patch is merged. Safe.", "why_it_matters": "w"}
-    assert _kept_claim(["Safe."], [draft], {**draft, "title": "New title"}) == "Safe."
-
-
-
-
-
-
 def test_non_finite_numbers_are_invalid_model_json():
     from onionflash.analyze import _json_object
     for text in ('{"publish": false, "priority": NaN}', '{"publish": false, "x": 1e999}'):
@@ -109,14 +51,41 @@ def test_non_finite_numbers_are_invalid_model_json():
             _json_object(text)
 
 
-def test_ignore_decision_makes_one_call_and_skips_field_checks(monkeypatch):
+def test_historical_ignore_decisions_remain_readable():
     ignore = analysis(publish=False, title="x" * 150, evidence=["not in the source at all"])
+    assert validate_analysis(ignore, item()) == ignore
+
+
+def test_historical_impact_text_remains_readable():
+    saved = analysis(why_it_matters="The report concerns directory authority trust.")
+    assert validate_analysis(saved, item()) == saved
+
+
+def test_writer_cannot_silently_skip_a_source_before_editorial_review(monkeypatch):
+    ignore = analysis(publish=False, title="", summary="", why_it_matters="", evidence=[], products=[], tags=[])
     llm = analyzer(monkeypatch, completion(ignore))
-    assert llm.analyze(item())["publish"] is False
+    with pytest.raises(AnalysisError, match="draft for publication review") as caught:
+        llm.analyze(item())
+    assert not caught.value.retryable
     assert len(llm.client.requests) == 1
 
 
+@pytest.mark.parametrize("use_fallback", [False, True])
+def test_writer_rejects_separate_impact_text_even_when_endpoint_ignores_schema(monkeypatch, use_fallback):
+    """Reject impact text from either endpoint without another validation retry."""
+    responses = [FetchError("network request failed", retryable=True)] if use_fallback else []
+    responses.append(completion(analysis(why_it_matters="Operators must update to prevent consensus generation issues.")))
+    llm = analyzer(monkeypatch, *responses, fallbacks=["https://fallback.example/v1"])
+    with pytest.raises(AnalysisError, match="leave why_it_matters empty") as caught:
+        llm.analyze(item())
+    assert not caught.value.retryable
+    assert len(llm.client.requests) == 1 + use_fallback
+    assert all(request[1]["response_format"]["json_schema"]["schema"]["properties"]["why_it_matters"]["enum"] == [""]
+               for request in llm.client.requests)
+
+
 def test_endpoint_failures_are_retryable_and_validation_is_not_resent(monkeypatch):
+    """Retry transport failures while keeping malformed content failures item-local."""
     llm = analyzer(monkeypatch, FetchError("HTTP 401", status=401))
     with pytest.raises(AnalysisError, match="HTTP 401") as caught:
         llm.analyze(item())
@@ -127,7 +96,7 @@ def test_endpoint_failures_are_retryable_and_validation_is_not_resent(monkeypatc
         llm.analyze(item())
     assert not caught.value.retryable and len(llm.client.requests) == 1
     llm = analyzer(monkeypatch, FetchError("network request failed", retryable=True),
-                   completion(analysis()), fallbacks=["https://fallback.example/v1"])
+                   completion(analysis(why_it_matters="")), fallbacks=["https://fallback.example/v1"])
     assert llm.analyze(item())["title"] == analysis()["title"]
     assert [url for url, _ in llm.client.requests][0].startswith("https://llm.example")
 
@@ -147,7 +116,7 @@ def test_truncated_and_malformed_completions(monkeypatch):
 def test_draft_text_that_publishing_would_drop_is_a_strike_before_review(noncharacter):
     # Rendering removes U+FFFE and U+FFFF, so this headline would publish empty.
     with pytest.raises(AnalysisError, match="Invalid model title") as caught:
-        validate_analysis(analysis(title=f" {noncharacter} "), item(), editorial=False)
+        validate_analysis(analysis(title=f" {noncharacter} "), item())
     assert not caught.value.retryable
 
 
@@ -166,7 +135,7 @@ def test_evidence_matching_ignores_typography_and_case_but_not_emptiness():
     ('The `sample_metric` counter remains unchanged.', 'The `sample_metric` counter remains unchanged.'),
 ])
 def test_literal_evidence_preserves_source_formatting(body, quote):
-    result = validate_analysis(analysis(evidence=[quote]), item(content=body), editorial=False)
+    result = validate_analysis(analysis(evidence=[quote]), item(content=body))
     assert result["evidence"] == [quote]
 
 
@@ -179,25 +148,27 @@ def test_literal_evidence_preserves_source_formatting(body, quote):
 ])
 def test_model_reformatting_or_changed_words_are_still_not_literal_evidence(body, quote):
     with pytest.raises(AnalysisError, match="not an exact excerpt"):
-        validate_analysis(analysis(evidence=[quote]), item(content=body), editorial=False)
+        validate_analysis(analysis(evidence=[quote]), item(content=body))
 
 
 def test_evidence_diagnostics_distinguish_short_quotes_from_absent_quotes():
     with pytest.raises(AnalysisError, match="quote 1 is shorter"):
-        validate_analysis(analysis(evidence=["ACK"]), item(content="The reply was ACK."), editorial=False)
+        validate_analysis(analysis(evidence=["ACK"]), item(content="The reply was ACK."))
     with pytest.raises(AnalysisError, match="quote 2 is not an exact excerpt"):
         validate_analysis(analysis(evidence=["The reply was", "An invented quotation"]),
-                          item(content="The reply was acknowledged."), editorial=False)
+                          item(content="The reply was acknowledged."))
     tag = item(kind="tag", title="v1")
     assert validate_analysis(tag_notice(tag), tag)["evidence"] == ["v1"]
 
 
-def test_writer_request_advertises_the_existing_evidence_length_floor(monkeypatch):
-    llm = analyzer(monkeypatch, completion(analysis()))
+def test_writer_request_requires_a_draft_and_the_existing_evidence_length_floor(monkeypatch):
+    llm = analyzer(monkeypatch, completion(analysis(why_it_matters="")))
     llm.analyze(item())
     request = llm.client.requests[0][1]
-    rule = request["response_format"]["json_schema"]["schema"]["properties"]["evidence"]["items"]
-    assert rule["minLength"] == MIN_EVIDENCE_CHARS
+    fields = request["response_format"]["json_schema"]["schema"]["properties"]
+    assert fields["publish"]["enum"] == [True]
+    assert fields["why_it_matters"]["enum"] == [""]
+    assert fields["evidence"]["items"]["minLength"] == MIN_EVIDENCE_CHARS
 
 
 def test_evidence_enum_is_derived_from_the_exact_supplied_context():
@@ -209,11 +180,12 @@ def test_evidence_enum_is_derived_from_the_exact_supplied_context():
 
 
 def test_writer_excerpt_options_retain_later_supplied_comments(monkeypatch):
+    """Keep literal comment evidence within the same context sent to the writer."""
     source = item(content="Original description", source_content="Original description", public_comments=[{
         "id": "gid://gitlab/DiscussionNote/1", "url": "https://example.org/issue#note_1", "author": "operator",
         "created_at": DATE, "updated_at": DATE, "body": 'The later **clarification** retains "quoted text".',
     }])
-    llm = analyzer(monkeypatch, completion(analysis(evidence=["Original description"])))
+    llm = analyzer(monkeypatch, completion(analysis(why_it_matters="", evidence=["Original description"])))
     llm.analyze(source)
     request = llm.client.requests[0][1]
     supplied = json.loads(request["messages"][1]["content"])
@@ -259,15 +231,6 @@ def test_evidence_grammar_is_bounded_across_a_full_many_line_input():
     assert all(choice == "Source title" or choice in content for choice in choices)
     assert any("row-07" in choice for choice in choices)
     assert sum(map(len, choices)) <= MAX_EVIDENCE_CHOICES * 500
-
-
-def test_hedged_issue_wording_is_not_a_completed_action():
-    source = item(title="Remove bastet", content="Bastet should be removed from the authority list.")
-    for summary in ["The issue asks that bastet be removed.", "Bastet has not been removed yet.",
-                    "The key has not been rotated."]:
-        validate_analysis(analysis(summary=summary, evidence=["Bastet should be removed"]), source)
-    with pytest.raises(AnalysisError, match="completed action"):
-        validate_analysis(analysis(summary="Tor has removed bastet.", evidence=["Bastet should be removed"]), source)
 
 
 def test_items_are_rejected_after_three_failures_and_requeued_when_content_changes(tmp_path):
@@ -321,7 +284,7 @@ def test_one_failing_item_does_not_stop_the_run_but_two_endpoint_failures_do(tmp
 
 def test_writer_produces_one_draft_without_premerge_grounding(monkeypatch):
     claim = "Operators must update their configurations to exclude the node."
-    draft = analysis(why_it_matters=claim, confidence="confirmed", state="released")
+    draft = analysis(summary=claim, why_it_matters="", confidence="confirmed", state="released")
     llm = analyzer(monkeypatch, completion(draft))
     assert llm.analyze(item()) == draft
     assert len(llm.client.requests) == 1

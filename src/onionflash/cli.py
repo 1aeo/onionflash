@@ -19,7 +19,6 @@ from .review import Reviewer
 from .review_gate import process_item, status as review_status
 from .collect import CollectionError, collect_source
 from .comments import enrich_comments, merge_cached_comments, status as comments_status
-from .monitoring import candidates as monitoring_candidates
 from .config import load_config
 from .store import Store, source_due
 from .transport import HttpClient
@@ -50,6 +49,7 @@ def build(config: dict, store: Store, *, force: bool = False) -> dict:
 
 
 def _operator_parsers(commands) -> None:
+    """Register explicit inspection and guarded editorial or retry commands."""
     story = commands.add_parser("story", help="Inspect, correct, or retract a published story")
     actions = story.add_subparsers(dest="action", required=True)
     for name in ("show", "history", "correct", "retract", "restore", "unlock"):
@@ -81,6 +81,8 @@ def _operator_parsers(commands) -> None:
         if name in {"retry", "dismiss"}:
             action.add_argument("--expect-hash", required=True, help="Current content_hash returned by rejected show")
             action.add_argument("--reason", required=True, help="Private operator reason for this action")
+        if name == "retry":
+            action.add_argument("--reconsider-ignored", action="store_true", help="Explicitly reconsider one inspected ignored item")
 
 
 def _patch_file(path: Path) -> dict:
@@ -108,7 +110,14 @@ def _patch_file(path: Path) -> dict:
     return result
 
 
+def _retired_alert_source_ids(config: dict) -> set[str]:
+    """Identify configured legacy alert sources that cannot enter news analysis."""
+    return {source["id"] for source in config["sources"]
+            if source.get("alert_format") in {"consensus", "censorship"}}
+
+
 def _operator_command(args, config: dict, store: Store) -> dict:
+    """Dispatch one operator action with its required hash and reason."""
     if args.command == "story":
         from . import editorial
 
@@ -132,11 +141,13 @@ def _operator_command(args, config: dict, store: Store) -> dict:
         return rejection.show_item(store, args.item)
     options = {"expected_hash": args.expect_hash, "reason": args.reason}
     if args.action == "retry":
-        return rejection.retry_item(store, args.item, llm=config["llm"], **options)
+        return rejection.retry_item(store, args.item, llm=config["llm"], reconsider_ignored=args.reconsider_ignored,
+                                    retired_source_ids=_retired_alert_source_ids(config), **options)
     return rejection.dismiss_item(store, args.item, **options)
 
 
 def run(config: dict, store: Store) -> dict:
+    """Collect and review pending items within one deadline, then build the site."""
     observed = now_iso()
     report = {
         "sources_ok": 0,
@@ -164,9 +175,6 @@ def run(config: dict, store: Store) -> dict:
 
     def record_items(source, items):
         received = now_iso()
-        if source.get("alert_format"):
-            report.setdefault("alerts", {})[source["id"]] = store.ingest_alerts(source, items, received)
-            return received
         if has_comment_cache:
             items = (merge_cached_comments(store, item, source, received if comments_enabled else None) for item in items)
         report["items_changed"] += sum(store.ingest(item, received) for item in items)
@@ -226,11 +234,19 @@ def run(config: dict, store: Store) -> dict:
                               "error": f"Unexpected {type(exc).__name__} at {Path(frame.filename).name}:{frame.lineno}"}
     run_deadline = started + budget
     endpoint_failures = 0
+    retired_alerts = _retired_alert_source_ids(config)
     with Analyzer(config, deadline=run_deadline) as analyzer, Reviewer(config, deadline=run_deadline) as reviewer:
         for row in store.pending(config["llm"]["max_items_per_run"], now_iso()):
             if time.monotonic() >= run_deadline:
                 report["budget_reached"] = True
                 break
+            if row["source_id"] in retired_alerts:
+                # Old manually queued alerts must not become ordinary news.
+                with store.db:
+                    store.db.execute("""UPDATE items SET status='ignored',next_attempt_at=NULL,last_error=NULL
+                        WHERE id=? AND source_id=? AND content_hash=? AND payload=? AND status='pending'""",
+                        (row["id"], row["source_id"], row["content_hash"], row["payload"]))
+                continue
             try:
                 result = process_item(config, store, row, analyzer, reviewer, now_iso(),
                                       allow_network=endpoint_failures < 2)
@@ -317,7 +333,6 @@ def main(argv: list[str] | None = None) -> int:
                     else int(store.get_meta("published_stories")),
                     "comments": {"enabled": config["comments"]["enabled"], **comments_status(store)},
                     "final_review": review_status(store),
-                    "monitoring_candidates": monitoring_candidates(store.db, now_iso()),
                     "sources": store.health(
                         config["sources"], config["collection"]["stale_after_seconds"], now_iso()
                     ),

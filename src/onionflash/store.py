@@ -9,7 +9,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .util import after, backoff_seconds, digest, item_cluster, item_identity
-from . import candidate, editorial, monitoring, render
+from . import candidate, editorial, render
 from .candidate import ReviewRequired, StaleCandidate
 
 
@@ -68,6 +68,7 @@ def item_priority(item: dict) -> int:
 
 class Store:
     def __init__(self, path: str | Path):
+        """Open persistent state and apply idempotent schema maintenance before use."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if path.is_symlink():
@@ -100,8 +101,10 @@ class Store:
                 published_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            DROP TABLE IF EXISTS monitoring_observations;
+            DROP TABLE IF EXISTS monitoring_counters;
+            DROP TABLE IF EXISTS monitoring_groups;
         """)
-        monitoring.initialize(self.db)
         editorial.initialize(self.db)
         analysis_columns = {row[1] for row in self.db.execute("PRAGMA table_info(analyses)")}
         for name, kind in (("source_payload", "TEXT"), ("source_item_id", "TEXT"), ("input_chars", "INTEGER"), ("review_record", "TEXT")):
@@ -312,8 +315,10 @@ class Store:
 
     def commit_candidate(self, prepared: dict, approved_candidate: dict | None, cache_key: str, observed: str, *,
                          approval_key: str | None = None, policy_hash: str | None = None,
-                         review_record: dict | None = None) -> dict:
-        """Publish the approved bytes after CAS checks, without merging again."""
+                         review_record: dict | None = None, decision: str = "approve") -> dict:
+        """Apply an exact reviewed publication/skip decision after all CAS checks."""
+        if decision not in {"approve", "skip"}:
+            raise ValueError("Unsupported final review decision")
         if self.db.in_transaction:
             raise ValueError("Candidate commit requires a fresh transaction")
         self.db.execute("BEGIN IMMEDIATE")
@@ -323,6 +328,7 @@ class Store:
             if (digest(binding) != prepared["binding_hash"] or digest(prepared["packet"]) != prepared["source_hash"]
                     or digest(prepared["candidate"]) != prepared["candidate_hash"]
                     or binding["candidate_hash"] != prepared["candidate_hash"] or binding["packet_hash"] != prepared["source_hash"]
+                    or digest(prepared["coverage"]) != prepared["coverage_hash"] or binding["coverage_hash"] != prepared["coverage_hash"]
                     or digest(prepared["payload"]) != binding["payload_hash"]):
                 raise StaleCandidate("Prepared candidate or evidence changed after assembly")
             row, result = prepared["row"], prepared["result"]
@@ -330,6 +336,8 @@ class Store:
             story_id = existing["id"] if existing else digest(row["cluster_key"])[:24]
             cluster = existing["cluster_key"] if existing else row["cluster_key"]
             locked = editorial.is_locked(self.db, story_id)
+            if decision == "skip" and (not result["publish"] or locked):
+                raise ReviewRequired("Editorial skip requires an unlocked reviewed candidate")
             payload = None
             if result["publish"] and not locked:
                 original = prepared["candidate"]
@@ -340,29 +348,30 @@ class Store:
                 normalized = render._prepare_story(approved_candidate, editorial=original.get("editorial"))
                 if normalized != approved_candidate:
                     raise ReviewRequired("The approved candidate must already be normalized")
-                payload = json.loads(json.dumps(prepared["payload"]))
-                if not candidate.wholly_deterministic(self.db, row, payload, approved_candidate):
-                    if prepared["missing_sources"]:
-                        raise ReviewRequired("Required source material is unavailable")
-                    if not approval_key or not policy_hash or not self.db.execute("SELECT 1 FROM sqlite_master WHERE name='review_approvals'").fetchone():
-                        raise ReviewRequired("Exact final candidate needs a recorded review approval")
-                    receipt = self.db.execute("SELECT * FROM review_approvals WHERE key=?", (approval_key,)).fetchone()
-                    if receipt is None or any(receipt[key] != expected for key, expected in (
-                            ("candidate_hash", digest(approved_candidate)), ("source_hash", prepared["source_hash"]),
-                            ("policy_hash", policy_hash), ("binding_hash", prepared["binding_hash"]))):
-                        raise ReviewRequired("Review approval does not match this candidate and its sources")
-                    from .review import validate_review
-                    verdict = validate_review(json.loads(receipt["result_json"]), prepared["packet"])
-                    if verdict["verdict"] != "approve":
-                        raise ReviewRequired("Final review did not approve publication")
-                    if review_record is None:
-                        review_record = json.loads(receipt["review_record_json"])
-                    self.db.execute("UPDATE review_approvals SET last_used_at=? WHERE key=?", (observed, approval_key))
-                elif approved_candidate != original:
-                    raise ReviewRequired("A deterministic notice cannot accept an unreviewed repair")
-                payload.update({key: approved_candidate[key] for key in candidate.SEMANTIC_FIELDS})
-                if existing is None:  # Date a new story when it is published, not when it was first drafted.
-                    payload["added_at"] = observed
+                if prepared["missing_sources"]:
+                    raise ReviewRequired("Required source material is unavailable")
+                if not approval_key or not policy_hash or not self.db.execute("SELECT 1 FROM sqlite_master WHERE name='review_approvals'").fetchone():
+                    raise ReviewRequired("Exact final candidate needs a recorded review decision")
+                receipt = self.db.execute("SELECT * FROM review_approvals WHERE key=?", (approval_key,)).fetchone()
+                if receipt is None or any(receipt[key] != expected for key, expected in (
+                        ("candidate_hash", digest(approved_candidate)), ("source_hash", prepared["source_hash"]),
+                        ("policy_hash", policy_hash), ("binding_hash", prepared["binding_hash"]))):
+                    raise ReviewRequired("Review decision does not match this candidate and its context")
+                from .review import decision_record_matches, validate_review
+                verdict = validate_review(json.loads(receipt["result_json"]), prepared["packet"])
+                if verdict["verdict"] != decision:
+                    raise ReviewRequired("Final review did not authorize this decision")
+                proof = json.loads(receipt["review_record_json"])
+                if not decision_record_matches(proof, verdict, candidate=approved_candidate, prepared=prepared, policy_hash=policy_hash):
+                    raise ReviewRequired("Review decision requires a matching final verification or skip record")
+                if review_record is None:
+                    review_record = proof
+                self.db.execute("UPDATE review_approvals SET last_used_at=? WHERE key=?", (observed, approval_key))
+                if decision == "approve":
+                    payload = json.loads(json.dumps(prepared["payload"]))
+                    payload.update({key: approved_candidate[key] for key in candidate.SEMANTIC_FIELDS})
+                    if existing is None:  # Date publication, not the first draft.
+                        payload["added_at"] = observed
             if review_record is None and self.db.execute("SELECT 1 FROM sqlite_master WHERE name='review_jobs'").fetchone():
                 job = self.db.execute("SELECT record_json FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
                 review_record = json.loads(job[0]) if job else None
@@ -378,14 +387,22 @@ class Store:
                     raise StaleCandidate("Story became editorially protected before publication")
             elif locked and result["publish"]:
                 editorial.record_held(self.db, story_id, observed)
-            mapped_id = story_id if result["publish"] else row.get("story_id")
+            published = result["publish"] and decision == "approve"
+            mapped_id = story_id if published else row.get("story_id")
             self.db.execute("UPDATE items SET status=?,story_id=?,next_attempt_at=NULL,last_error=NULL WHERE id=?",
-                            ("published" if result["publish"] else "ignored", mapped_id, row["id"]))
+                            ("published" if published else "ignored", mapped_id, row["id"]))
             self._clear_review_job(row["id"])
-        return {"story_id": mapped_id, "status": "locked" if locked and result["publish"] else "published" if result["publish"] else "ignored"}
+        return {"story_id": mapped_id, "status": "locked" if locked and published else "published" if published else "ignored"}
+
+    def skip_candidate(self, prepared: dict, reviewed_candidate: dict, cache_key: str, observed: str, *,
+                       approval_key: str, policy_hash: str, review_record: dict | None = None) -> dict:
+        """Audit an editorial skip without changing any published story or lock."""
+        return self.commit_candidate(prepared, reviewed_candidate, cache_key, observed,
+                                     approval_key=approval_key, policy_hash=policy_hash,
+                                     review_record=review_record, decision="skip")
 
     def finish(self, row: dict, result: dict, cache_key: str, observed: str, *, input_chars: int | None = None) -> None:
-        """Only ignored, locked or wholly deterministic notices bypass review."""
+        """Only ignored drafts and locked operator decisions bypass review."""
         prepared = self.prepare_candidate(row, result, observed, input_chars=input_chars)
         if prepared["requires_review"]:
             raise ReviewRequired("Automatic publication requires the final review gate")
@@ -400,9 +417,6 @@ class Store:
                 (limit,),
             )
         ]
-
-    def ingest_alerts(self, source: dict, items: list[dict], observed: str) -> dict:
-        return monitoring.ingest(self.db, source, items, observed)
 
     def health(
         self, sources: list[dict], stale_seconds: int, observed: str
