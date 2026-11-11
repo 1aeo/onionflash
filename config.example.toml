@@ -1,0 +1,256 @@
+# Copy to config.toml. Paths are relative to this configuration file.
+# Credentials stay in environment variables, never in tracked configuration.
+[site]
+title = "Onion Flash"
+description = "Important Tor news, distilled."
+base_url = "https://1aeo.com/onionflash/"
+repository_url = "https://github.com/1aeo/onionflash"
+page_size = 100
+# Zero includes all published history; a positive value is an optional feed limit.
+feed_size = 0
+
+[storage]
+database = "state/onionflash.sqlite3"
+output_dir = "build/public"
+# Article work per run, never a published-history retention limit.
+render_batch_size = 250
+
+# Optional anonymous public issue discussions. Existing installations remain disabled
+# until explicitly enabled. Only issue sources with gitlab_project participate.
+[comments]
+enabled = false
+run_budget_seconds = 30
+max_issues_per_run = 12
+max_issues_per_source = 4
+max_pages = 2
+page_size = 20
+max_comments = 12
+comment_chars = 2000
+total_chars = 8000
+interval_seconds = 1800
+candidate_days = 14
+cache_days = 30
+max_cache_entries = 512
+failure_backoff_base_seconds = 300
+failure_backoff_cap_seconds = 21600
+
+[llm]
+# Supply a base URL ending in /v1, or set a literal endpoint here. The API key is
+# read from the ONIONFLASH_LLM_API_KEY environment variable.
+base_url = "${ONIONFLASH_LLM_BASE_URL}"
+fallback_base_urls = []
+model = "qwen3.8-27b"
+# For a private LAN endpoint, explicitly set allow_http=true (if necessary)
+# and allowed_networks to the exact server IPs as /32 or /128 CIDRs.
+allow_http = false
+allowed_networks = []
+timeout_seconds = 120
+max_items_per_run = 12
+# vLLM understands this optional extension. Set false for providers that do not.
+send_chat_template_kwargs = true
+
+# Every automatic model-written publication needs an approval of its exact final
+# candidate and bounded source packet. These review-specific limits are tunable.
+# The endpoint, credentials and network policy are inherited from [llm].
+[review]
+model = ""                     # Empty uses llm.model.
+timeout_seconds = 90
+connect_timeout_seconds = 10
+total_timeout_seconds = 120
+max_output_tokens = 2200
+max_source_chars = 24000
+max_sources = 8
+max_passages = 64
+passage_chars = 1800
+max_repairs = 1                 # 0 holds any revision request; 1 allows one repair.
+max_cache_entries = 2000
+
+# Source kind is feed, tag, gitlab_issue, gitlab_mr, or metrics_timeline.
+# Fallbacks must offer the same logical stream; they are tried in order.
+# Optional source overrides: enabled, interval_seconds, max_pages, max_items.
+# GitLab issue comments: gitlab_project verifies exact public project identity;
+# comments_enabled=false opts out. comments_graphql_url may override the clean
+# same-origin /api/graphql URL. No cookies, passwords or tokens are supported.
+# website_url links to the public source page; url is the collection endpoint.
+# authority describes the stream, not proof that every claim is correct.
+[[sources]]
+id = "tor-tags"
+name = "Tor Project GitLab Tags for Tor"
+website_url = "https://gitlab.torproject.org/tpo/core/tor/-/tags"
+kind = "tag"
+url = "https://gitlab.torproject.org/tpo/core/tor/-/tags?format=atom"
+fallback_urls = []
+product = "tor"
+authority = "official"
+
+[[sources]]
+id = "arti-tags"
+name = "Tor Project GitLab Tags for Arti"
+website_url = "https://gitlab.torproject.org/tpo/core/arti/-/tags"
+kind = "tag"
+url = "https://gitlab.torproject.org/tpo/core/arti/-/tags?format=atom"
+fallback_urls = []
+product = "arti"
+authority = "official"
+
+[[sources]]
+id = "tor-relays"
+name = "Tor Project Relay Operators Mailing List"
+website_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/"
+url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/feed/"
+fallback_urls = ["https://forum.torproject.org/c/mailing-lists/tor-relays/25.rss"]
+product = "network"
+authority = "community"
+
+[[sources]]
+id = "tor-announce"
+name = "Tor Project Announcements Mailing List"
+website_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-announce@lists.torproject.org/"
+url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-announce@lists.torproject.org/feed/"
+product = "network"
+authority = "official"
+
+[[sources]]
+id = "network-health-list"
+name = "Tor Project Network Health Mailing List"
+website_url = "https://lists.torproject.org/mailman3/hyperkitty/list/network-health@lists.torproject.org/"
+url = "https://lists.torproject.org/mailman3/hyperkitty/list/network-health@lists.torproject.org/feed/"
+product = "network"
+authority = "community"
+
+[[sources]]
+id = "tor-status"
+name = "Tor Project Infrastructure Status"
+website_url = "https://torprojectstatus.org/"
+url = "https://torprojectstatus.org/index.xml"
+product = "network"
+authority = "official"
+
+[[sources]]
+id = "tor-blog"
+name = "Tor Project Blog"
+website_url = "https://blog.torproject.org/"
+url = "https://blog.torproject.org/feed.xml"
+product = "network"
+authority = "official"
+
+[[sources]]
+id = "tor-issues"
+gitlab_project = "tpo/core/tor"
+name = "Tor Project GitLab Issues for Tor"
+website_url = "https://gitlab.torproject.org/tpo/core/tor/-/issues?state=all"
+kind = "gitlab_issue"
+url = "https://gitlab.torproject.org/api/v4/projects/426/issues"
+product = "tor"
+authority = "development"
+
+[[sources]]
+id = "tor-merges"
+name = "Tor Project GitLab Merged Changes for Tor"
+website_url = "https://gitlab.torproject.org/tpo/core/tor/-/merge_requests?state=merged"
+kind = "gitlab_mr"
+url = "https://gitlab.torproject.org/api/v4/projects/426/merge_requests"
+product = "tor"
+authority = "development"
+
+[[sources]]
+id = "arti-issues"
+gitlab_project = "tpo/core/arti"
+name = "Tor Project GitLab Issues for Arti"
+website_url = "https://gitlab.torproject.org/tpo/core/arti/-/issues?state=all"
+kind = "gitlab_issue"
+url = "https://gitlab.torproject.org/api/v4/projects/647/issues"
+product = "arti"
+authority = "development"
+
+[[sources]]
+id = "arti-merges"
+name = "Tor Project GitLab Merged Changes for Arti"
+website_url = "https://gitlab.torproject.org/tpo/core/arti/-/merge_requests?state=merged"
+kind = "gitlab_mr"
+url = "https://gitlab.torproject.org/api/v4/projects/647/merge_requests"
+product = "arti"
+authority = "development"
+
+[[sources]]
+id = "network-analysis"
+gitlab_project = "tpo/network-health/analysis"
+name = "Tor Project GitLab Issues for Network Health Analysis"
+website_url = "https://gitlab.torproject.org/tpo/network-health/analysis/-/issues?state=all"
+kind = "gitlab_issue"
+url = "https://gitlab.torproject.org/api/v4/projects/1407/issues"
+product = "network"
+authority = "development"
+
+[[sources]]
+id = "network-team"
+gitlab_project = "tpo/network-health/team"
+name = "Tor Project GitLab Issues for Network Health Team"
+website_url = "https://gitlab.torproject.org/tpo/network-health/team/-/issues?state=all"
+kind = "gitlab_issue"
+url = "https://gitlab.torproject.org/api/v4/projects/591/issues"
+product = "network"
+authority = "development"
+
+[[sources]]
+id = "spec-merges"
+name = "Tor Project GitLab Merged Changes for Tor Specifications"
+website_url = "https://gitlab.torproject.org/tpo/core/torspec/-/merge_requests?state=merged"
+kind = "gitlab_mr"
+url = "https://gitlab.torproject.org/api/v4/projects/543/merge_requests"
+product = "torspec"
+authority = "development"
+
+[[sources]]
+id = "tor-browser-security"
+gitlab_project = "tpo/applications/tor-browser"
+name = "Tor Project GitLab Security Issues for Tor Browser"
+website_url = "https://gitlab.torproject.org/tpo/applications/tor-browser/-/issues?state=all&label_name%5B%5D=Security"
+kind = "gitlab_issue"
+url = "https://gitlab.torproject.org/api/v4/projects/472/issues?labels=Security"
+product = "tor-browser"
+authority = "development"
+
+[[sources]]
+id = "anti-censorship-team"
+gitlab_project = "tpo/anti-censorship/team"
+name = "Tor Project GitLab Issues for Anti-Censorship Team"
+website_url = "https://gitlab.torproject.org/tpo/anti-censorship/team/-/issues?state=all"
+kind = "gitlab_issue"
+url = "https://gitlab.torproject.org/api/v4/projects/549/issues"
+product = "network"
+authority = "development"
+
+[[sources]]
+id = "tor-metrics-news"
+name = "Tor Project Metrics Timeline Repository"
+website_url = "https://gitlab.torproject.org/tpo/network-health/metrics/timeline"
+kind = "metrics_timeline"
+url = "https://gitlab.torproject.org/api/v4/projects/644/repository/files/README.md?ref=master"
+fallback_urls = []
+product = "network"
+# Curated context may include unknown causes and historical event ranges.
+authority = "telemetry"
+interval_seconds = 3600
+
+# Development discussion adds proposal and protocol-change context.
+[[sources]]
+id = "tor-dev"
+name = "Tor Project Development Mailing List"
+website_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/"
+url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/feed/"
+product = "network"
+authority = "community"
+enabled = true
+
+[[sources]]
+id = "consensus-health-alerts"
+name = "Tor Project Consensus Health Monitoring Mailing List"
+website_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/"
+url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/feed/"
+kind = "feed"
+authority = "telemetry"
+product = "network"
+alert_format = "consensus"
+# Mirrors of this monitor must use the same identity.
+monitor_id = "tor-doctor"

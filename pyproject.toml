@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "onionflash"
+dynamic = ["version"]
+description = "A small, source-linked Tor news collector and static publisher."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "1aeo" }]
+dependencies = ["httpx>=0.28.1,<0.29", "httpcore>=1.0.9,<1.1", "feedparser>=6.0.11,<7"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+onionflash = "onionflash.cli:main"
+
+[project.urls]
+Repository = "https://github.com/1aeo/onionflash"
+Deployment = "https://github.com/1aeo/onionflash-deploy"
+
+[tool.setuptools.dynamic]
+version = { attr = "onionflash.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+onionflash = ["assets/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
