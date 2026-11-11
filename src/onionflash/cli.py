@@ -49,6 +49,7 @@ def build(config: dict, store: Store, *, force: bool = False) -> dict:
 
 
 def _operator_parsers(commands) -> None:
+    """Register explicit inspection and guarded editorial or retry commands."""
     story = commands.add_parser("story", help="Inspect, correct, or retract a published story")
     actions = story.add_subparsers(dest="action", required=True)
     for name in ("show", "history", "correct", "retract", "restore", "unlock"):
@@ -110,6 +111,7 @@ def _patch_file(path: Path) -> dict:
 
 
 def _operator_command(args, config: dict, store: Store) -> dict:
+    """Dispatch one operator action with its required hash and reason."""
     if args.command == "story":
         from . import editorial
 
@@ -138,6 +140,7 @@ def _operator_command(args, config: dict, store: Store) -> dict:
 
 
 def run(config: dict, store: Store) -> dict:
+    """Collect and review pending items within one deadline, then build the site."""
     observed = now_iso()
     report = {
         "sources_ok": 0,

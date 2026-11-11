@@ -41,11 +41,18 @@ The reviewer evaluates nine independent criteria:
 | News value | Require a concrete development worth publishing. |
 | New information | Require meaningful new facts, not duplicate coverage or quoted history. |
 
-Empty `why_it_matters` is valid. The model must not invent impact or advice to
-make a weak source seem important. An open checklist cannot negate an explicit
-release announcement, and checked conditional template steps do not prove that
-security fixes shipped. Counter inactivity or unresponsive diagnostics alone do
-not establish an attack or a mitigation bypass.
+New drafts have a concise factual summary and an empty `why_it_matters` field.
+The request schema and response validation enforce this; the model cannot add a
+separate impact paragraph. An explicitly sourced consequence or requested action
+may appear in the summary with its audience, scope and prerequisites preserved.
+Historical impact text remains readable. A review repair may clear it, but cannot
+create or rewrite an impact paragraph; operator corrections remain separate.
+
+The model must not invent impact or advice to make a weak source seem important.
+An open checklist cannot negate an explicit release announcement, and checked
+conditional template steps do not prove that security fixes shipped. Counter
+inactivity or unresponsive diagnostics alone do not establish an attack or a
+mitigation bypass.
 
 Existing issue/release identities allow meaningful updates to the same article.
 Semantic similarity alone never merges unrelated events. A potentially important

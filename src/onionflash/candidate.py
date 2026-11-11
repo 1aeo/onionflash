@@ -18,6 +18,7 @@ COVERAGE_SUMMARY_CHARS = 200
 def coverage_background(db, prior: dict | None, budget: int) -> dict:
     """Bounded committed coverage for editorial comparison, never source evidence."""
     def public_text(row):
+        """Normalize public coverage fields and reject mismatched stored identities."""
         public = render._prepare_story(json.loads(row["payload"]))
         if public["id"] != row["id"]:
             raise ValueError("Coverage identity differs from its stored story")
@@ -115,6 +116,7 @@ def control_fingerprint(db, story_id: str) -> str:
 
 
 def assert_current(db, prepared: dict) -> None:
+    """Refuse a decision if its input, coverage, sources or editorial state changed."""
     binding, row = prepared["binding"], prepared["row"]
     current = db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()
     if current is None or item_fingerprint(dict(current)) != binding["item"] or item_fingerprint(row) != binding["item"]:
@@ -132,6 +134,7 @@ def assert_current(db, prepared: dict) -> None:
 
 def prepare(db, row: dict, result: dict, observed: str, *, input_chars: int | None = None, review_settings: dict | None = None) -> dict:
     # Copy caller-owned values so later repairs cannot mutate the original draft.
+    """Assemble the exact candidate and bind all state needed for its guarded commit."""
     row, result = json.loads(json.dumps(row)), json.loads(json.dumps(result))
     if type(result.get("publish")) is not bool:
         raise ValueError("Draft publication decision must be boolean")

@@ -30,6 +30,7 @@ class Writer:
 class Reviewer:
     """Returns validated verdicts, as review.Reviewer does."""
     def __init__(self, *responses):
+        """Script reviewer responses, adding final approval only for approval shorthand."""
         self.responses, self.calls, self.coverages = list(responses), [], []
         # A shorthand approval includes an independent final approval. Empty
         # and failure scripts remain strict, so unexpected calls still fail.
@@ -38,6 +39,7 @@ class Reviewer:
             self.responses.append(verdict())
 
     def review(self, candidate, packet, *, coverage=None, verification=False):
+        """Capture exact review inputs and validate or raise the next scripted response."""
         self.calls.append((copy.deepcopy(candidate), copy.deepcopy(packet), verification))
         self.coverages.append(copy.deepcopy(coverage))
         response = self.responses.pop(0)
@@ -81,6 +83,7 @@ def seed_legacy(store, incoming=None, result=None):
 
 
 def test_approved_exact_candidate_commits_and_keeps_private_complete_audit(context):
+    """Publish reviewed text and retain both stages with their evidence privately."""
     cfg, store = context
     row = pending(store)
     writer, checker = Writer(), Reviewer(verdict())
@@ -106,6 +109,7 @@ def test_a_new_story_is_dated_when_the_review_commits_not_when_the_item_started(
 
 @pytest.mark.parametrize("failure", [AnalysisError("timeout", retryable=True), {}])
 def test_review_timeout_or_malformed_verdict_resumes_without_regenerating_writer(context, failure):
+    """Resume the unfinished review while retaining its already completed writer draft."""
     cfg, store = context
     row = pending(store)
     writer, checker = Writer(), Reviewer(failure)
@@ -215,6 +219,7 @@ def test_source_change_during_review_fails_commit_cas(context):
 
 
 def test_policy_change_reuses_writer_but_requires_a_new_review(context):
+    """Invalidate review approval on policy change without discarding the source draft."""
     cfg, store = context
     row = pending(store)
     with pytest.raises(AnalysisError):
@@ -258,6 +263,7 @@ def test_human_lock_during_review_invalidates_approval_and_preserves_operator_te
 
 
 def test_tag_update_still_reviews_the_existing_prose_it_retains(context):
+    """Review inherited prose even when a locally drafted tag triggers the candidate."""
     cfg, store = context
     original = item(title="Tor 0.4.9.16 released", kind="feed", content="Tor 0.4.9.16 was released with an announced change.")
     seed_legacy(store, original, analysis(title="Tor release announcement"))
@@ -269,6 +275,7 @@ def test_tag_update_still_reviews_the_existing_prose_it_retains(context):
 
 
 def test_tag_draft_requires_final_review_and_waits_when_network_is_disabled(context):
+    """Defer an unreviewed tag until both publication reviews can run."""
     cfg, store = context
     tag = item(title="tor-0.4.9.16", kind="tag", content="")
     row = pending(store, tag)
@@ -303,6 +310,7 @@ def test_missing_retained_source_holds_without_a_review_call(context):
 
 
 def test_cache_cannot_treat_an_approve_boolean_as_all_required_checks(context):
+    """Reject an incomplete cached verdict instead of trusting its approval label."""
     cfg, store = context
     row = pending(store)
     with pytest.raises(AnalysisError):
@@ -532,6 +540,7 @@ def test_hold_final_update_guard_rolls_back_an_in_transaction_source_change(cont
 
 
 def test_approval_receipt_and_job_pin_roll_back_together_if_job_save_fails(context):
+    """Persist the receipt and its unfinished-job pin atomically."""
     cfg, store = context
     row = pending(store)
     review_gate.initialize(store)
@@ -608,6 +617,7 @@ def test_run_report_counts_held_stale_and_cached_reviews(context, monkeypatch):
 
 
 def test_unusable_replies_and_drafts_take_strikes_and_the_run_still_builds(context, monkeypatch):
+    """Isolate invalid model output so other queued work and the site build continue."""
     from onionflash import cli
     cfg, store = context
     cfg["sources"] = []
@@ -619,6 +629,7 @@ def test_unusable_replies_and_drafts_take_strikes_and_the_run_still_builds(conte
 
     class Replies:
         def review(self, candidate, packet, *, coverage=None, verification=False):
+            """Return malformed replies only for the designated failure fixtures."""
             return review.validate_review({} if "/reply" in packet["sources"][0]["url"] else verdict(), packet)
 
     built = []

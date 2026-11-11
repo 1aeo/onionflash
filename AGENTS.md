@@ -2,6 +2,13 @@
 
 These rules apply to every change, whether a person or a coding agent makes it.
 
+## Releases
+
+Agent-run GitHub operations use `1aeo` and its public noreply commit identity.
+Open a pull request, address all review feedback, and wait for the automated code
+review of the latest commit to finish with no new findings. Merge the reviewed
+change before deploying it. Never deploy unmerged work.
+
 ## Public text
 
 This repository is public, and GitHub keeps every revision of PR and issue text.

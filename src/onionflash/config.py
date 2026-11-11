@@ -178,6 +178,7 @@ def _expand(value: str) -> str:
 
 
 def load_config(path: str | Path) -> dict:
+    """Merge defaults, validate operator choices and safely accept retired settings."""
     path = Path(path).expanduser().resolve(strict=True)
     with path.open("rb") as stream:
         raw = tomllib.load(stream)

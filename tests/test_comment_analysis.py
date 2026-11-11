@@ -12,6 +12,7 @@ from test_core import DATE, analysis, item
 
 
 def test_long_description_keeps_comment_evidence_in_draft_and_final_review(tmp_path, monkeypatch):
+    """Preserve corrective comments through both bounded drafting and review inputs."""
     config = copy.deepcopy(DEFAULTS)
     config["llm"].update(base_url="https://example.org/v1", api_key_env="TEST_COMMENT_KEY", max_input_chars=1200)
     monkeypatch.setenv("TEST_COMMENT_KEY", "private-test-key")
@@ -22,8 +23,8 @@ def test_long_description_keeps_comment_evidence_in_draft_and_final_review(tmp_p
     payload = item(content="Original issue context. " * 1000)
     payload.update(source_content=payload["content"], public_comments=[note])
     draft = analysis(title="Maintainer reports a proposed fix",
-                     summary="A public comment describes a proposed fix for the reported issue.",
-                     why_it_matters=note["body"], evidence=[note["body"]])
+                     summary="A public comment describes a proposed fix for the reported issue. " + note["body"],
+                     why_it_matters="", evidence=[note["body"]])
     requests = []
 
     class ControlledAnalyzer(Analyzer):

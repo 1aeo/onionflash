@@ -55,12 +55,18 @@ def expand(corpus: dict) -> list[dict]:
 
 
 def kept_unsupported(case: dict, story: dict) -> list[str]:
-    """The case's flagged unsupported phrases that the story's text still contains."""
+    """Find flagged wording or classifications still present in a proposed publication."""
     text = "\n".join(story[key] for key in ("title", "summary", "why_it_matters")).casefold()
-    return [phrase for phrase in case.get("unsupported", []) if phrase.casefold() in text]
+    kept = [phrase for phrase in case.get("unsupported", []) if phrase.casefold() in text]
+    for field, forbidden in case.get("forbidden_classifications", {}).items():
+        values = story.get(field, [])
+        values = values if isinstance(values, list) else [values]
+        kept.extend(f"{field}:{value}" for value in forbidden if value in values)
+    return kept
 
 
 def evaluate(config, cases, output, *, rounds=1, verify_repairs=True, deadline=None):
+    """Score final reviewed candidates and save bounded evaluation evidence privately."""
     if not verify_repairs:
         raise ValueError("Final verification is mandatory")
     output = Path(output).resolve()
@@ -147,6 +153,7 @@ def evaluate(config, cases, output, *, rounds=1, verify_repairs=True, deadline=N
 
 
 def main(argv=None):
+    """Validate evaluation options and return failure for incomplete or incorrect runs."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--cases", type=Path, default=Path(__file__).resolve().with_name("review_cases.json"))

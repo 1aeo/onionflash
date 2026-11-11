@@ -68,6 +68,7 @@ def item_priority(item: dict) -> int:
 
 class Store:
     def __init__(self, path: str | Path):
+        """Open persistent state and apply idempotent schema maintenance before use."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if path.is_symlink():

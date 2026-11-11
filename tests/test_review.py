@@ -89,7 +89,21 @@ def test_approval_is_not_rewritten_or_reclassified(monkeypatch):
     assert response["verdict"] == "approve" and public == before
 
 
+def test_repairs_can_clear_but_cannot_generate_an_impact_paragraph(monkeypatch):
+    """Model repairs may remove legacy commentary without creating new advice."""
+    public = candidate(why_it_matters="Existing commentary")
+    assert review.apply_repair(public, {"why_it_matters": ""})["why_it_matters"] == ""
+    with pytest.raises(review.ReviewError):
+        review.apply_repair(public, {"why_it_matters": "Operators must upgrade immediately."})
+    checker = reviewer(monkeypatch, completion(verdict()))
+    checker.review(public, packet())
+    schema = checker.client.requests[0][1]["response_format"]["json_schema"]["schema"]
+    field = schema["properties"]["repair"]["anyOf"][1]["properties"]["why_it_matters"]
+    assert field["anyOf"][0]["enum"] == [""] and field["anyOf"][1] == {"type": "null"}
+
+
 def test_editorial_coverage_is_background_and_never_an_evidence_reference(monkeypatch):
+    """Keep coverage separate from the packet IDs allowed as factual evidence."""
     public = candidate()
     background = {"prior_story": None, "recent": [{"id": "B1", "title": "Earlier coverage"}], "truncated": False}
     checker = reviewer(monkeypatch, completion(verdict()), completion(verdict()))
@@ -111,6 +125,7 @@ def test_editorial_coverage_is_background_and_never_an_evidence_reference(monkey
 @pytest.mark.parametrize("criterion", ["news_value", "new_information"])
 @pytest.mark.parametrize("outcome", ["fail", "insufficient"])
 def test_editorial_skip_requires_a_recorded_editorial_failure(criterion, outcome):
+    """Require a failed selection criterion before accepting a skip verdict."""
     response = verdict("skip", criterion=criterion)
     response["criteria"][criterion]["outcome"] = outcome
     result = review.validate_review(response, packet())
@@ -152,6 +167,7 @@ def test_all_nine_criteria_are_required_for_approval(criterion):
 
 
 def test_fresh_verification_can_skip_a_duplicate_without_proposing_a_repair(monkeypatch):
+    """Permit final duplicate rejection while forbidding an accompanying rewrite."""
     response = verdict("skip", criterion="new_information")
     checker = reviewer(monkeypatch, completion(response))
     result = checker.review(candidate(), packet(), coverage={"prior_story": candidate(), "recent": [], "truncated": False}, verification=True)

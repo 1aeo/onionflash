@@ -147,6 +147,7 @@ def _request(item_id, expected_hash, reason, observed):
 
 
 def _checked(db, item_id, expected_hash, *, reconsider_ignored=False):
+    """Require the inspected source revision and an explicitly eligible queue state."""
     row = db.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
     if row is None:
         raise ValueError("Source item was not found")
@@ -180,6 +181,7 @@ def _retry_key(row, llm):
 
 
 def _act(store, item_id, expected_hash, reason, action, llm, observed, *, reconsider_ignored=False):
+    """Apply one guarded queue action and preserve its audit in the same transaction."""
     if type(reconsider_ignored) is not bool or (reconsider_ignored and action != "retry"):
         raise ValueError("Reconsidering ignored items is an explicit retry option")
     reason, stamp = _request(item_id, expected_hash, reason, observed)
@@ -187,7 +189,10 @@ def _act(store, item_id, expected_hash, reason, action, llm, observed, *, recons
     with db:
         row = _checked(db, item_id, expected_hash, reconsider_ignored=reconsider_ignored)
         key = _retry_key(row, llm) if action == "retry" else None
-        previous_analysis = db.execute("SELECT * FROM analyses WHERE cache_key=?", (key,)).fetchone() if key else None
+        previous_analysis = db.execute("""SELECT * FROM analyses WHERE cache_key=?
+            AND (source_item_id IS NULL OR source_item_id=?)
+            AND (source_payload IS NULL OR source_payload=?)""",
+            (key, item_id, row["payload"])).fetchone() if key else None
         snapshot = json.dumps(dict(previous_analysis), ensure_ascii=False, allow_nan=False) if previous_analysis else None
         if snapshot is not None:
             snapshot.encode("utf-8")
@@ -210,7 +215,9 @@ def _act(store, item_id, expected_hash, reason, action, llm, observed, *, recons
         if previous_analysis:
             db.execute("DELETE FROM analyses WHERE cache_key=?", (key,))
         if action == "retry":
-            from .review_gate import reset_review_work
+            from .review_gate import discard_review_decisions, reset_review_work
+            if row["status"] == "ignored":
+                discard_review_decisions(store, item_id)
             reset_review_work(store, item_id)
     return {"item_id": item_id, "content_hash": expected_hash, "action": action,
             "status": "pending" if action == "retry" else "dismissed", "action_id": event.lastrowid}

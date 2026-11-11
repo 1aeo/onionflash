@@ -11,7 +11,7 @@ from .util import digest, normalize_evidence as _plain
 from .comments import analysis_content
 from .schema import CATEGORIES, PRIORITIES, CONFIDENCES, STATES, PRODUCTS
 
-PROMPT_VERSION = "onionflash-10"
+PROMPT_VERSION = "onionflash-11"
 MIN_EVIDENCE_CHARS = 8
 MAX_EVIDENCE_CHOICES = 128
 SCHEMA = {
@@ -56,6 +56,10 @@ authorize publication. Do not invent significance, findings or an impact stateme
 to make weak material seem important. Preserve prerequisites, reported severity,
 platform scope and whether a capability is opt-in or incomplete. A routine release
 is normal priority, not a critical incident.
+Classify only the supplied event: a generic bugfix is not a security fix without
+source support for a vulnerability or security classification. A merged capability
+is feature/protocol news with state=merged, not a release. Reserve release labels
+for observed version tags or explicit release announcements.
 
 In replies, distinguish the author's own contribution from quoted history. Do not
 present a repeated parent message or old announcement as a new event. Measurements need their own
@@ -84,8 +88,9 @@ Preserve the source's inspection date for claims about versions or the main bran
 Do not invent versions, CVEs, identities, consequences, fixes or operator guidance.
 A developer changing source code is not an operator changing configuration.
 
-Add why_it_matters only when the source explicitly states a useful consequence or
-operator action; otherwise leave it empty. Empty is the default, not a deficiency.
+Set why_it_matters to an empty string. Do not write a separate impact paragraph.
+An explicitly stated consequence or requested action may appear in the summary,
+with its actual audience, scope and prerequisites preserved.
 Do not infer generic benefits to stability, reliability, security or privacy from
 the existence of a fix, or urgency from an editorial label. No caveats, filler, inferred
 privacy impacts or extra advice. Source-host location alone does not establish
@@ -305,6 +310,7 @@ class Analyzer(CompletionClient):
     """Produce one structurally valid draft; final publication review is separate."""
 
     def analyze(self, item: dict) -> dict:
+        """Return a bounded draft with literal evidence, never a publication decision."""
         if item["kind"] == "tag":
             return tag_notice(item)
         bounded = {key: item.get(key) for key in (
@@ -315,6 +321,8 @@ class Analyzer(CompletionClient):
                                    source)
         if not result["publish"]:
             raise AnalysisError("Writer must return a draft for publication review")
+        if result["why_it_matters"]:
+            raise AnalysisError("Writer must leave why_it_matters empty")
         return result
 
 
@@ -355,5 +363,6 @@ def _writer_schema(bounded: dict) -> dict:
                     for index in range(MAX_EVIDENCE_CHOICES)]
     schema = copy.deepcopy(SCHEMA)
     schema["properties"]["publish"]["enum"] = [True]
+    schema["properties"]["why_it_matters"]["enum"] = [""]
     schema["properties"]["evidence"]["items"]["enum"] = excerpts
     return schema

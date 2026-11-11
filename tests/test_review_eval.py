@@ -41,6 +41,7 @@ def scripted(reply):
 
 
 def test_controlled_corpus_is_blinded_and_covers_rubric():
+    """Keep evaluation labels out of model input and cover every review criterion."""
     kept = evaluator().kept_unsupported
     cases = corpus()
     assert len({c["id"] for c in cases}) == len(cases)
@@ -52,7 +53,9 @@ def test_controlled_corpus_is_blinded_and_covers_rubric():
         assert _packet_refs(case["packet"])
         # A negative case flags wording that it contains and its approved twins do not.
         assert bool(case.get("unsupported")) == (case["expected"] == "not_approve")
-        assert kept(case, case["candidate"]) == case.get("unsupported", [])
+        flagged = kept(case, case["candidate"])
+        assert set(case.get("unsupported", [])) <= set(flagged)
+        assert bool(flagged) == (case["expected"] == "not_approve")
         assert not any(kept(case, twin["candidate"]) for twin in cases
                        if twin["expected"] == "approve" and twin["packet"] == case["packet"])
         # Nor does the smallest faithful repair of "the source confirms that X": "... does not confirm that X".
@@ -117,6 +120,7 @@ def test_repair_verification_refuses_a_negative_case_without_its_unsupported_wor
 
 
 def test_editorial_skip_requires_skip_and_never_counts_repaired_publication_as_success(tmp_path, monkeypatch):
+    """Count publication of a negative editorial case as a failure even after repair."""
     module = evaluator()
     config = copy.deepcopy(DEFAULTS)
     config["storage"]["output_dir"] = str(tmp_path / "public")
@@ -128,12 +132,13 @@ def test_editorial_skip_requires_skip_and_never_counts_repaired_publication_as_s
         assert result["false_approvals"] == false
     monkeypatch.setattr(module, "EvaluationReviewer", scripted(
         lambda verification: {"verdict": "approve"} if verification else
-        {"verdict": "revise", "repair": {"why_it_matters": "A supported but redundant statement."}}))
+        {"verdict": "revise", "repair": {"summary": "A supported but redundant statement."}}))
     result = module.evaluate(config, [case], tmp_path / "repaired.jsonl", verify_repairs=True)
     assert result["false_approvals"] == result["editorial_misses"] == 1
 
 
 def test_coverage_background_is_passed_to_both_reviews_and_saved_privately(tmp_path, monkeypatch):
+    """Keep both stages and the private report bound to the same coverage context."""
     module = evaluator()
     config = copy.deepcopy(DEFAULTS)
     config["storage"]["output_dir"] = str(tmp_path / "public")
@@ -141,9 +146,10 @@ def test_coverage_background_is_passed_to_both_reviews_and_saved_privately(tmp_p
     seen = []
     class Inspector(scripted(lambda verification: {"verdict": "skip"})):
         def review(self, candidate, packet, *, coverage=None, verification=False):
+            """Capture each background and simulate a repair followed by a final skip."""
             seen.append(coverage)
             return ({"verdict": "skip"} if verification else
-                    {"verdict": "revise", "repair": {"why_it_matters": "A source-supported statement."}})
+                    {"verdict": "revise", "repair": {"summary": "A source-supported statement."}})
     monkeypatch.setattr(module, "EvaluationReviewer", Inspector)
     output = tmp_path / "coverage.jsonl"
     result = module.evaluate(config, [case], output, verify_repairs=True)
@@ -153,6 +159,7 @@ def test_coverage_background_is_passed_to_both_reviews_and_saved_privately(tmp_p
 
 
 def test_first_approval_is_not_publication_without_final_verification(tmp_path, monkeypatch):
+    """Score the final refusal instead of treating initial approval as publication."""
     module = evaluator()
     config = copy.deepcopy(DEFAULTS)
     config["storage"]["output_dir"] = str(tmp_path / "public")
@@ -165,3 +172,13 @@ def test_first_approval_is_not_publication_without_final_verification(tmp_path, 
     assert record["published_candidate"] is None and record["final_verdict"] == "hold"
     with pytest.raises(ValueError, match="mandatory"):
         module.evaluate(config, [case], tmp_path / "bypass.jsonl", verify_repairs=False)
+
+
+def test_evaluation_detects_unsupported_labels_after_text_is_repaired():
+    """Removing a headline claim cannot hide its surviving misleading classification."""
+    module = evaluator()
+    case = next(c for c in corpus() if c["id"] == "bugfix-is-not-security-fix")
+    repaired = {**case["candidate"], "title": "Browser update", "summary": "An Android bugfix was released."}
+    assert module.kept_unsupported(case, repaired) == ["tags:security"]
+    repaired["tags"] = ["release"]
+    assert module.kept_unsupported(case, repaired) == []

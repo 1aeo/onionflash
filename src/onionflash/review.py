@@ -10,13 +10,14 @@ from .candidate import SEMANTIC_FIELDS as EDITABLE
 from .render import _prepare_story
 from .util import digest
 
-REVIEW_VERSION = "onionflash-review-5"
+REVIEW_VERSION = "onionflash-review-6"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details", "news_value", "new_information")
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
 FIELDS = {key: copy.deepcopy(DRAFT_SCHEMA["properties"][key]) for key in EDITABLE}
 for field, length in (("title", 180), ("summary", 1600), ("why_it_matters", 800)):
     FIELDS[field]["maxLength"] = length
+FIELDS["why_it_matters"]["enum"] = [""]
 REFS = {"type": "array", "items": {"type": "string", "maxLength": 32}, "maxItems": 12}
 CHECK = {"type": "object", "additionalProperties": False, "properties": {
     "outcome": {"type": "string", "enum": ["pass", "fail", "insufficient"]},
@@ -64,6 +65,11 @@ be more elegant. A supported why_it_matters may repeat its own summary; an empty
 why_it_matters is valid. This differs from repeating an already-covered event.
 Category and priority are editorial labels: flag them only when they materially
 misrepresent the evidence, not because a source did not use the exact label.
+Labels still make claims: a generic bugfix or dependency update is not evidence
+of a security fix. A security label needs a described vulnerability or explicit
+security classification in the source. Use release for a version tag or announced
+release, not an implementation merely merged into development; classify a merged
+capability as feature/protocol as appropriate while retaining state=merged.
 Reported and suspected are both acceptable for attributed unconfirmed claims when
 the current wording preserves uncertainty. Do not demand stronger certainty.
 
@@ -92,6 +98,12 @@ valid; remove unsupported impact and filler rather than inventing importance.
 The existence of a fix does not itself support generic benefits to network stability,
 reliability, security or privacy. An editorial label does not establish extra urgency.
 Remove such an inferred impact sentence unless the packet explicitly supports it.
+An emergency release, an available fix or a description of benefits is NOT an
+instruction that an operator must or should act. Approval of operator advice needs
+a passage explicitly directing that actor to take that action. In this criterion's
+reason quote the instruction briefly, or say no instruction is present. Never use
+'supported by the emergency nature', presumed best practice or implied necessity
+as evidence. Remove unrequested advice even when it seems sensible.
 If there is no operator instruction, this criterion passes. A faithful restatement
 of an explicit source concern or requested software change passes; repeating it
 does not create an operator instruction. For example, source 'remove X from source'
@@ -110,6 +122,12 @@ newsworthy. An empty why_it_matters remains valid. Routine CI, data-refresh/test
 minor chores, generic discussion,
 praise and unsupported expectations do not merit standalone news. A genuine upstream
 version tag can be newsworthy as an observed tag, without claiming a release shipped.
+Open feature requests, design ideas and exploratory implementation benchmarks are
+not news merely because they propose a security or performance benefit. Skip them
+until there is a concrete adoption/merge, or a distinct credible vulnerability
+disclosure or observed incident. Do not mistake a proposed improvement for a newly
+established defect. A genuine vulnerability report can still be news while its fix
+is only proposed; distinguish the disclosure from speculative development work.
 new_information: compare the actual candidate with the supplied existing coverage.
 Compare the concrete event and facts, not matching product or version keywords.
 A newly reported security issue affecting an already-released version can be new
@@ -125,6 +143,9 @@ item but prior_story is absent, mark new_information insufficient and hold for
 operator association rather than create another headline. Mere duplicates still
 skip. A shared authority name or topic alone is not an association; an important
 distinct event or a different release version may justify a new story.
+Compare lifecycle states explicitly: prior coverage requesting a change does not
+already cover a later merge completing it. Source metadata marking a merge complete
+is material new information even if the description still discusses planned work.
 
 For each criterion return outcome pass, fail or insufficient, a concise reason,
 and source_refs containing only IDs from the packet (S1 for source metadata,
@@ -142,6 +163,8 @@ Do not expand a repair with impacts, mechanisms, technical details or advice abs
 from the source packet. Add only supplied facts needed to correct the specific
 problem. A draft that buries important new measured facts behind quoted old news
 may be revised to focus on those facts; trivial asides are not novelty.
+New stories use only a concise summary. Do not add or rewrite a why_it_matters
+paragraph: leave a supported historical paragraph unchanged, or clear it with "".
 For low-value or merely duplicate candidates, verdict skip with repair null
 and at least one failed or insufficient editorial criterion. Prefer skip for non-news
 or duplicate coverage even when the draft also contains factual defects; do not spend
@@ -153,7 +176,15 @@ A proposed repair is NOT approval: another fresh review must verify the exact re
 An initial approval also requires a separate fresh verification before publication.
 Return only the requested JSON object, without Markdown or additional prose.
 """
-VERIFY_PROMPT = SYSTEM_PROMPT + """
+VERIFY_PROMPT = """You are performing an adversarial evidence audit, not endorsing a draft.
+Try to falsify each claim and label by locating its exact support in the packet.
+Do not supply a missing premise from common sense or technical expectations.
+In particular, distinguish a useful/emergency fix from an explicit instruction
+to operators; a bugfix from a security fix; and merged code from a released version.
+Check the headline and classification arrays as carefully as the summary.
+Any unsupported claim must prevent approval, even if the rest is accurate.
+
+""" + SYSTEM_PROMPT + """
 This is the final verification request. Evaluate the supplied candidate independently
 against the packet and coverage background; it may contain mistakes from an earlier
 edit. You may only approve, hold or skip. Never propose another repair, request another
@@ -174,6 +205,7 @@ def _settings(config: dict) -> dict:
 
 
 def policy_hash(config: dict) -> str:
+    """Bind review rules, model identity and context bounds to reusable decisions."""
     llm = _settings(config)
     identity = {key: llm[key] for key in ("model", "base_url", "fallback_base_urls", "max_output_tokens",
                                          "enable_thinking", "send_chat_template_kwargs")}
@@ -222,6 +254,7 @@ def apply_repair(candidate: dict, repair: dict) -> dict:
 
 
 def _validate(result: dict, refs: set[str], *, wire: bool = False) -> dict:
+    """Require consistent verdicts, complete criteria and valid packet references."""
     if (not isinstance(result, dict) or set(result) != set(SCHEMA["properties"])
             or result["verdict"] not in ("approve", "revise", "hold", "skip")
             or not isinstance(result["criteria"], dict) or set(result["criteria"]) != set(CRITERIA)
@@ -317,6 +350,7 @@ class Reviewer(CompletionClient):
         self.http_settings["total_timeout_seconds"] = self.settings["total_timeout_seconds"]
 
     def review(self, candidate_public: dict, packet: dict, *, coverage: dict | None = None, verification: bool = False) -> dict:
+        """Review one exact candidate without carrying forward earlier model replies."""
         refs = _packet_refs(packet)
         schema = copy.deepcopy(SCHEMA)
         if refs:

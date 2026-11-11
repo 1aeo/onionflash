@@ -228,8 +228,9 @@ while taking their upload snapshot.
 
 ## Reliability and editorial behavior
 
-The writer drafts a faithful source account; the reviewer decides whether it adds
-worthwhile news. Automatic stories need a source-grounded critique and fresh final
+New stories use a concise factual summary without a separate generated impact
+paragraph. The reviewer decides whether the account adds worthwhile news.
+Automatic stories need a source-grounded critique and fresh final
 verification of the exact candidate. Routine and duplicate items are skipped;
 unsupported important claims are held. See
 [selection, final review and evaluation](docs/FINAL_REVIEW.md).

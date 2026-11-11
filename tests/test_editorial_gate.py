@@ -30,6 +30,7 @@ def skipped(criterion="new_information"):
 
 
 def test_editorial_skip_is_audited_and_does_not_change_existing_article_or_controls(context):
+    """Record the skip while preserving the existing article and editorial controls."""
     cfg, store = context
     original, story_id = seed_legacy(store)
     row = pending(store, {**original, "content": original["content"] + " A routine acknowledgment.", "updated_at": LATER})
@@ -47,6 +48,7 @@ def test_editorial_skip_is_audited_and_does_not_change_existing_article_or_contr
 
 
 def test_second_item_sees_coverage_committed_in_the_same_cycle_before_build(context):
+    """Expose newly accepted coverage to later items without waiting for rendering."""
     cfg, store = context
     first = pending(store)
     assert run(cfg, store, first, Writer(), Reviewer(verdict()))["status"] == "published"
@@ -61,6 +63,7 @@ def test_second_item_sees_coverage_committed_in_the_same_cycle_before_build(cont
 
 
 def test_material_known_issue_followup_updates_same_article_after_review(context):
+    """Keep the established story identity when a reviewed follow-up adds information."""
     cfg, store = context
     original, story_id = seed_legacy(store)
     before = store.stories()[0]
@@ -75,6 +78,7 @@ def test_material_known_issue_followup_updates_same_article_after_review(context
 
 
 def test_routine_tag_has_local_draft_but_requires_editorial_review(context):
+    """Require a news-value decision even when drafting the tag needs no model call."""
     cfg, store = context
     tag = item(kind="tag", title="data-refresh", content="A routine data snapshot tag.")
     row = pending(store, tag)
@@ -89,6 +93,7 @@ def test_routine_tag_has_local_draft_but_requires_editorial_review(context):
 
 
 def test_editorial_skip_may_include_factual_defects_without_requesting_a_pointless_repair(context):
+    """Allow non-news to be discarded without repairing claims that cannot publish."""
     cfg, store = context
     row = pending(store)
     response = skipped("news_value")
@@ -100,9 +105,11 @@ def test_editorial_skip_may_include_factual_defects_without_requesting_a_pointle
 
 @pytest.mark.parametrize("decision", ["approve", "skip"])
 def test_coverage_change_during_review_invalidates_publication_and_skip(context, decision):
+    """Invalidate both publication and skip decisions made against stale coverage."""
     cfg, store = context
     row = pending(store)
     def changed_coverage():
+        """Simulate another committed article arriving while the model is reviewing."""
         add_coverage(store)
         return verdict() if decision == "approve" else skipped()
     result = run(cfg, store, row, Writer(), Reviewer(changed_coverage))
@@ -115,6 +122,7 @@ def test_coverage_change_during_review_invalidates_publication_and_skip(context,
 
 
 def test_completed_skip_resumes_from_bound_receipt_without_a_model_call(context, monkeypatch):
+    """Commit an interrupted skip from its exact durable receipt without reanalysis."""
     cfg, store = context
     row = pending(store)
     commit = store.skip_candidate
@@ -129,6 +137,7 @@ def test_completed_skip_resumes_from_bound_receipt_without_a_model_call(context,
 
 
 def test_skip_requires_a_valid_recorded_skip_and_cannot_apply_approve_receipt(context):
+    """Prevent a publication receipt from authorizing a different editorial decision."""
     _, store = context
     row = pending(store)
     prepared = store.prepare_candidate(row, analysis(), LATER)
@@ -139,6 +148,7 @@ def test_skip_requires_a_valid_recorded_skip_and_cannot_apply_approve_receipt(co
 
 
 def test_coverage_is_bounded_but_keeps_exact_prior_visible_text(context):
+    """Bound recent context while preserving the known prior article without truncation."""
     cfg, store = context
     original, prior_id = seed_legacy(store, result=analysis(summary="Prior text. " * 100, why_it_matters="Prior consequence. " * 25))
     previous = store.stories()[0]
@@ -157,6 +167,7 @@ def test_coverage_is_bounded_but_keeps_exact_prior_visible_text(context):
 
 
 def test_recent_query_does_not_scan_unbounded_history_to_replace_retracted_rows(context):
+    """Keep the database scan bounded even when all recent stories are retracted."""
     _, store = context
     for number in range(40):
         add_coverage(store, f"background-{number:02d}")
@@ -170,6 +181,7 @@ def test_recent_query_does_not_scan_unbounded_history_to_replace_retracted_rows(
 
 
 def test_corrupted_prepared_background_cannot_be_committed(context):
+    """Reject changed background bytes even when the original receipt still exists."""
     _, store = context
     add_coverage(store)
     row = pending(store)
@@ -183,6 +195,7 @@ def test_corrupted_prepared_background_cannot_be_committed(context):
 
 @pytest.mark.parametrize("final", ["hold", "skip"])
 def test_initial_approval_cannot_publish_when_fresh_verification_refuses(context, final):
+    """Make the final verdict authoritative when the first review approved the draft."""
     cfg, store = context
     row = pending(store)
     response = skipped() if final == "skip" else verdict("hold")
@@ -196,6 +209,7 @@ def test_initial_approval_cannot_publish_when_fresh_verification_refuses(context
 
 
 def test_initial_approval_resumes_only_final_verification_after_interruption(context):
+    """Resume the uncompleted verification without repeating the draft or critique."""
     cfg, store = context
     row = pending(store)
     checker = Reviewer(verdict(), AnalysisError("verification unavailable", retryable=True))
@@ -211,6 +225,7 @@ def test_initial_approval_resumes_only_final_verification_after_interruption(con
 
 
 def test_store_refuses_an_approval_receipt_without_final_verification(context):
+    """Enforce fresh verification at the store boundary as well as in the worker."""
     _, store = context
     row = pending(store)
     prepared = store.prepare_candidate(row, analysis(), LATER)
@@ -225,6 +240,7 @@ def test_store_refuses_an_approval_receipt_without_final_verification(context):
 
 
 def test_incomplete_cached_verification_is_replaced_by_fresh_review_not_a_stale_loop(context, monkeypatch):
+    """Recover from an incomplete receipt by replacing its review history."""
     cfg, store = context
     row = pending(store)
     commit = store.commit_candidate
@@ -245,6 +261,7 @@ def test_incomplete_cached_verification_is_replaced_by_fresh_review_not_a_stale_
 
 @pytest.mark.parametrize("damaged", ["missing", "verdict", "binding"])
 def test_store_requires_a_complete_matching_initial_review_as_well_as_final_approval(context, damaged):
+    """Require both review stages to prove the exact source and candidate transition."""
     _, store = context
     row = pending(store)
     prepared = store.prepare_candidate(row, analysis(), LATER)

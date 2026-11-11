@@ -59,6 +59,7 @@ def _item(
     title_html: bool = True,
     observed: str | None = None,
 ) -> dict:
+    """Normalize one collected record and clamp future timestamps to observation time."""
     if observed:
         # A future date (a typo or a scheduled event) must not pin a story to the
         # top or block later corrections.

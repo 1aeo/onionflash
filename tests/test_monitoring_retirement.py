@@ -37,6 +37,7 @@ monitor_id="old-monitor"
 
 @pytest.mark.parametrize("alert_format", ["consensus", "censorship"])
 def test_retired_source_is_disabled_before_fetch_and_old_queue_never_reaches_model(tmp_path, monkeypatch, caplog, capsys, alert_format):
+    """Prevent legacy alert configuration and queued rows from becoming ordinary news."""
     path = legacy_config(tmp_path, alert_format)
     cfg = load_config(path)
     assert cfg["monitoring"] == {}
@@ -93,6 +94,7 @@ def test_unknown_alert_format_is_rejected_instead_of_becoming_news(tmp_path):
 
 @pytest.mark.parametrize("action", ["correct", "retract"])
 def test_retiring_private_tables_preserves_legacy_articles_and_editorial_history(tmp_path, monkeypatch, action):
+    """Remove obsolete private tables without changing published or corrected history."""
     cfg = settings(tmp_path)
     value = story(1, confidence="observed-anomaly", state="developing", category="directory-authority")
     with Store(cfg["storage"]["database"]) as store:

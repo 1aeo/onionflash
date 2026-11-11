@@ -62,6 +62,26 @@ def reset_review_work(store, item_id):
         record_json=?,approval_key=NULL,updated_at=? WHERE item_id=?""", (_json(record), now_iso(), item_id))
 
 
+def discard_review_decisions(store, item_id):
+    """Invalidate one reconsidered item's receipts in the operator transaction.
+
+    Completed decisions outlive their jobs. Removing them makes an identical
+    candidate receive a fresh review, including after an interrupted retry.
+    """
+    if not store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_approvals'").fetchone():
+        return
+    expired = []
+    for saved in store.db.execute("SELECT key,review_record_json FROM review_approvals"):
+        try:
+            record = json.loads(saved["review_record_json"])
+            matches = record.get("input_row", {}).get("id") == item_id
+        except (ValueError, TypeError, AttributeError, RecursionError):
+            continue  # An unreadable receipt cannot authorize a cached decision.
+        if matches:
+            expired.append((saved["key"],))
+    store.db.executemany("DELETE FROM review_approvals WHERE key=?", expired)
+
+
 def _archive_job(store, job, observed, reason):
     """Retain an invalidated stage and its original source, in the caller's txn."""
     record = json.loads(job["record_json"])
@@ -114,6 +134,7 @@ def _prune(store, maximum):
 
 
 def _commit_decision(store, prepared, candidate, writer_key, policy, record, key, verdict):
+    """Send a reviewed publication or skip through the matching guarded store action."""
     commit = store.skip_candidate if verdict == "skip" else store.commit_candidate
     return commit(prepared, candidate, writer_key, now_iso(), approval_key=key,
                   policy_hash=policy, review_record=record)

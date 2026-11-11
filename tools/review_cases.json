@@ -516,6 +516,73 @@
           ]
         }
       ]
+    },
+    "emergency-without-advice": {
+      "sources": [
+        {
+          "url": "https://example.invalid/events/4c9f8",
+          "title": "Version 1.2.6 released",
+          "kind": "feed",
+          "authority": "official",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "Version 1.2.6 is an emergency release affecting only directory authorities. It fixes protocol-version requirements that caused older clients to exit."
+          ]
+        }
+      ]
+    },
+    "platform-bugfix": {
+      "sources": [
+        {
+          "url": "https://example.invalid/events/4c9f8",
+          "title": "Browser 9.2.1 Android release",
+          "kind": "feed",
+          "authority": "official",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "Browser 9.2.1 is an Android-only release fixing platform-specific breakage caused by a zlib update."
+          ]
+        }
+      ]
+    },
+    "merged-capability": {
+      "sources": [
+        {
+          "url": "https://example.invalid/events/4c9f8",
+          "title": "Initial exit proxying",
+          "kind": "gitlab_mr",
+          "authority": "official",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "merged",
+          "passages": [
+            "This merged change introduces opt-in exit traffic proxying. It is incomplete and has not been released."
+          ]
+        }
+      ]
+    },
+    "exploratory-proposal": {
+      "sources": [
+        {
+          "url": "https://example.invalid/events/9d3e6",
+          "title": "Proposed persistent replay store",
+          "kind": "gitlab_issue",
+          "authority": "community",
+          "product": "arti",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "We could keep replay entries on disk to reduce memory use. Initial benchmarks compare possible database backends. This is a design idea; there is no implemented or adopted change and no new vulnerability disclosure or observed incident."
+          ]
+        }
+      ]
     }
   },
   "cases": [
@@ -1371,6 +1438,117 @@
       "unsupported": [
         "critical to maintain network stability",
         "prevent widespread service disruption"
+      ]
+    },
+    {
+      "id": "emergency-is-not-operator-advice",
+      "packet": "emergency-without-advice",
+      "candidate": {
+        "id": "a138b47619b102cd3b719874",
+        "title": "Version 1.2.6 emergency release fixes older-client exits",
+        "summary": "Version 1.2.6 fixes protocol-version requirements that caused older clients to exit. Directory authorities must update to prevent consensus generation issues.",
+        "why_it_matters": "",
+        "category": "release",
+        "tags": [
+          "release"
+        ],
+        "state": "released",
+        "confidence": "confirmed"
+      },
+      "expected": "not_approve",
+      "coverage": [
+        "operational_advice",
+        "technical_details"
+      ],
+      "unsupported": [
+        "must update",
+        "consensus generation issues"
+      ]
+    },
+    {
+      "id": "bugfix-is-not-security-fix",
+      "packet": "platform-bugfix",
+      "candidate": {
+        "id": "e63749c2d15629684cd475bd",
+        "title": "Browser 9.2.1 security release for Android",
+        "summary": "Browser 9.2.1 is an Android-only security release fixing platform-specific breakage caused by a zlib update.",
+        "why_it_matters": "",
+        "category": "release",
+        "tags": [
+          "release",
+          "security"
+        ],
+        "state": "released",
+        "confidence": "confirmed"
+      },
+      "expected": "not_approve",
+      "coverage": [
+        "source_support",
+        "technical_details"
+      ],
+      "unsupported": [
+        "security release"
+      ],
+      "forbidden_classifications": {
+        "tags": [
+          "security"
+        ]
+      }
+    },
+    {
+      "id": "merged-is-not-release",
+      "packet": "merged-capability",
+      "candidate": {
+        "id": "7c93bc05246e1012b3c8c5f4",
+        "title": "Opt-in exit proxying released",
+        "summary": "An initial implementation of opt-in exit proxying was merged. It remains incomplete and has not been released.",
+        "why_it_matters": "",
+        "category": "release",
+        "tags": [
+          "release",
+          "feature"
+        ],
+        "state": "merged",
+        "confidence": "reported"
+      },
+      "expected": "not_approve",
+      "coverage": [
+        "status",
+        "technical_details"
+      ],
+      "unsupported": [
+        "proxying released"
+      ],
+      "forbidden_classifications": {
+        "tags": [
+          "release"
+        ],
+        "category": [
+          "release"
+        ],
+        "state": [
+          "released"
+        ]
+      }
+    },
+    {
+      "id": "exploratory-proposal-is-not-news",
+      "packet": "exploratory-proposal",
+      "candidate": {
+        "id": "2532ad7cc8d87b7d475f729c",
+        "title": "Persistent replay store proposed to reduce memory use",
+        "summary": "A developer proposes keeping replay entries on disk and shares initial database benchmarks. The idea has not been implemented or adopted.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      },
+      "expected": "skip",
+      "coverage": [
+        "news_value"
       ]
     }
   ],

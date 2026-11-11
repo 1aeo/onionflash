@@ -79,9 +79,16 @@ It does not permit published, dismissed, new pending or reset pending items.
 Repeating the command immediately after a successful retry is refused. The
 existing hash, readable-source and queue-state checks still apply, and the
 private audit records the prior ignored state, reason and superseded analysis.
+Saved review decisions for that item are invalidated, so even an identical draft
+receives a fresh editorial decision. Unrelated cached decisions are preserved.
 Only the selected item is queued; no source content or timestamps are invented,
 and no historical items are reset automatically. The normal writer and review
 pipeline decides whether to publish it and may ignore it again.
+
+Reconsideration does not reactivate retired alert sources. An item whose configured
+source still uses `alert_format = "consensus"` or `"censorship"` is ignored by the
+normal run before drafting, including after an explicit retry. Use this option
+for editorial reconsideration of supported news sources.
 
 ## Dismiss one failed revision
 

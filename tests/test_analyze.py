@@ -56,6 +56,11 @@ def test_historical_ignore_decisions_remain_readable():
     assert validate_analysis(ignore, item()) == ignore
 
 
+def test_historical_impact_text_remains_readable():
+    saved = analysis(why_it_matters="The report concerns directory authority trust.")
+    assert validate_analysis(saved, item()) == saved
+
+
 def test_writer_cannot_silently_skip_a_source_before_editorial_review(monkeypatch):
     ignore = analysis(publish=False, title="", summary="", why_it_matters="", evidence=[], products=[], tags=[])
     llm = analyzer(monkeypatch, completion(ignore))
@@ -65,7 +70,22 @@ def test_writer_cannot_silently_skip_a_source_before_editorial_review(monkeypatc
     assert len(llm.client.requests) == 1
 
 
+@pytest.mark.parametrize("use_fallback", [False, True])
+def test_writer_rejects_separate_impact_text_even_when_endpoint_ignores_schema(monkeypatch, use_fallback):
+    """Reject impact text from either endpoint without another validation retry."""
+    responses = [FetchError("network request failed", retryable=True)] if use_fallback else []
+    responses.append(completion(analysis(why_it_matters="Operators must update to prevent consensus generation issues.")))
+    llm = analyzer(monkeypatch, *responses, fallbacks=["https://fallback.example/v1"])
+    with pytest.raises(AnalysisError, match="leave why_it_matters empty") as caught:
+        llm.analyze(item())
+    assert not caught.value.retryable
+    assert len(llm.client.requests) == 1 + use_fallback
+    assert all(request[1]["response_format"]["json_schema"]["schema"]["properties"]["why_it_matters"]["enum"] == [""]
+               for request in llm.client.requests)
+
+
 def test_endpoint_failures_are_retryable_and_validation_is_not_resent(monkeypatch):
+    """Retry transport failures while keeping malformed content failures item-local."""
     llm = analyzer(monkeypatch, FetchError("HTTP 401", status=401))
     with pytest.raises(AnalysisError, match="HTTP 401") as caught:
         llm.analyze(item())
@@ -76,7 +96,7 @@ def test_endpoint_failures_are_retryable_and_validation_is_not_resent(monkeypatc
         llm.analyze(item())
     assert not caught.value.retryable and len(llm.client.requests) == 1
     llm = analyzer(monkeypatch, FetchError("network request failed", retryable=True),
-                   completion(analysis()), fallbacks=["https://fallback.example/v1"])
+                   completion(analysis(why_it_matters="")), fallbacks=["https://fallback.example/v1"])
     assert llm.analyze(item())["title"] == analysis()["title"]
     assert [url for url, _ in llm.client.requests][0].startswith("https://llm.example")
 
@@ -142,11 +162,12 @@ def test_evidence_diagnostics_distinguish_short_quotes_from_absent_quotes():
 
 
 def test_writer_request_requires_a_draft_and_the_existing_evidence_length_floor(monkeypatch):
-    llm = analyzer(monkeypatch, completion(analysis()))
+    llm = analyzer(monkeypatch, completion(analysis(why_it_matters="")))
     llm.analyze(item())
     request = llm.client.requests[0][1]
     fields = request["response_format"]["json_schema"]["schema"]["properties"]
     assert fields["publish"]["enum"] == [True]
+    assert fields["why_it_matters"]["enum"] == [""]
     assert fields["evidence"]["items"]["minLength"] == MIN_EVIDENCE_CHARS
 
 
@@ -159,11 +180,12 @@ def test_evidence_enum_is_derived_from_the_exact_supplied_context():
 
 
 def test_writer_excerpt_options_retain_later_supplied_comments(monkeypatch):
+    """Keep literal comment evidence within the same context sent to the writer."""
     source = item(content="Original description", source_content="Original description", public_comments=[{
         "id": "gid://gitlab/DiscussionNote/1", "url": "https://example.org/issue#note_1", "author": "operator",
         "created_at": DATE, "updated_at": DATE, "body": 'The later **clarification** retains "quoted text".',
     }])
-    llm = analyzer(monkeypatch, completion(analysis(evidence=["Original description"])))
+    llm = analyzer(monkeypatch, completion(analysis(why_it_matters="", evidence=["Original description"])))
     llm.analyze(source)
     request = llm.client.requests[0][1]
     supplied = json.loads(request["messages"][1]["content"])
@@ -262,7 +284,7 @@ def test_one_failing_item_does_not_stop_the_run_but_two_endpoint_failures_do(tmp
 
 def test_writer_produces_one_draft_without_premerge_grounding(monkeypatch):
     claim = "Operators must update their configurations to exclude the node."
-    draft = analysis(why_it_matters=claim, confidence="confirmed", state="released")
+    draft = analysis(summary=claim, why_it_matters="", confidence="confirmed", state="released")
     llm = analyzer(monkeypatch, completion(draft))
     assert llm.analyze(item()) == draft
     assert len(llm.client.requests) == 1
