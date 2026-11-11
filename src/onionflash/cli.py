@@ -67,7 +67,7 @@ def _operator_parsers(commands) -> None:
         if name == "restore":
             action.add_argument("--revision", required=True, type=int, help="Revision to restore and lock")
 
-    rejected = commands.add_parser("rejected", help="Inspect and explicitly retry or dismiss rejected analyses")
+    rejected = commands.add_parser("rejected", help="Inspect and explicitly retry or dismiss failed analyses")
     actions = rejected.add_subparsers(dest="action", required=True)
     for name in ("list", "show", "retry", "dismiss"):
         action = actions.add_parser(name)
