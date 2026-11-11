@@ -195,6 +195,26 @@ def test_completed_decision_resumes_after_crash_without_any_model_call(context, 
     assert not store.db.execute("SELECT 1 FROM review_approvals").fetchone()
 
 
+@pytest.mark.parametrize("receipt", ["damaged", "missing"])
+def test_a_recorded_decision_without_a_usable_receipt_reviews_the_draft_again(context, monkeypatch, receipt):
+    """The repaired text is not reviewed as a first draft, so it cannot be repaired a second time."""
+    cfg, store = context
+    row = pending(store)
+    commit = store.commit_candidate
+    monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash before commit")))
+    first = Reviewer(verdict("revise", repair={"why_it_matters": ""}), verdict())
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        run(cfg, store, row, Writer(analysis(why_it_matters="Operators must edit their relay configuration.")), first)
+    monkeypatch.setattr(store, "commit_candidate", commit)
+    with store.db:
+        store.db.execute("UPDATE review_approvals SET review_record_json='{'" if receipt == "damaged" else "DELETE FROM review_approvals")
+    checker = Reviewer(verdict())
+    assert run(cfg, store, row, Writer(), checker)["status"] == "published"
+    assert [call[0] for call in checker.calls] == [first.calls[0][0]] * 2
+    audit = json.loads(store.db.execute("SELECT review_record FROM analyses").fetchone()[0])
+    assert [entry["stage"] for entry in audit["reviews"]] == ["review", "verification"]
+
+
 def test_changed_source_invalidates_staged_draft_and_prior_approval(context, monkeypatch):
     cfg, store = context
     row = pending(store)
@@ -311,14 +331,15 @@ def test_missing_retained_source_holds_without_a_review_call(context):
     assert store.db.execute("SELECT status FROM items WHERE id=?", (original["id"],)).fetchone()[0] == "published"
 
 
-def test_cache_cannot_treat_an_approve_boolean_as_all_required_checks(context):
-    """Reject an incomplete cached verdict instead of trusting its approval label."""
+@pytest.mark.parametrize("cached", [{"verdict": "approve"}, verdict("hold")], ids=["incomplete-approval", "hold"])
+def test_cache_reviews_again_unless_the_receipt_is_a_complete_decision(context, cached):
+    """Neither an incomplete approval nor a cached hold can stand in for a fresh review."""
     cfg, store = context
     row = pending(store)
     with pytest.raises(AnalysisError):
         run(cfg, store, row, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
     saved = job(store)
-    approve(store, json.loads(saved["envelope_json"]), policy=saved["policy_hash"], result={"verdict": "approve"})
+    approve(store, json.loads(saved["envelope_json"]), policy=saved["policy_hash"], result=cached)
     result = run(cfg, store, row, Writer(), Reviewer(verdict()))
     assert result["review_calls"] == 2 and not result["cache_hit"]
 
@@ -368,7 +389,8 @@ def test_operator_retry_preserves_held_audit_and_reuses_the_completed_draft(cont
     assert writer.calls == []
     final = json.loads(store.db.execute("SELECT review_record FROM analyses ORDER BY rowid DESC").fetchone()[0])
     assert final["outcome"] == "approved" and final["writer"] == {"key": cache_key(row, cfg["llm"])}
-    assert rejection.show_item(store, row["id"])["final_review"]["latest_review"]["verdict"] == "approve"
+    shown = rejection.show_item(store, row["id"])["final_review"]
+    assert shown["latest_review"]["verdict"] == "approve" and shown["source_packet"]["sources"] and shown["coverage"] is not None
 
 
 def test_a_source_that_reverts_to_a_held_revision_is_held_again_without_a_review(context):
@@ -524,21 +546,41 @@ def test_a_database_error_during_analysis_is_not_an_item_strike(context, monkeyp
     assert tuple(store.db.execute("SELECT status,rejections FROM items").fetchone()) == ("pending", 0)
 
 
-def test_run_report_counts_review_outcomes_and_model_calls(context, monkeypatch):
+def test_run_report_counts_review_outcomes(context, monkeypatch):
     from onionflash import cli
     cfg, store = context
     cfg["sources"] = []
-    outcomes = iter([("held", False, 1, 2), ("stale", False, 0, 1), ("published", True, 0, 0),
-                     ("ignored", False, 1, 1), ("ignored", True, 0, 0)])
-    monkeypatch.setattr(cli, "process_item", lambda *args, **kwargs: dict(zip(
-        ("status", "cache_hit", "writer_calls", "review_calls"), next(outcomes))))
+    outcomes = iter([("held", False), ("stale", False), ("published", True), ("ignored", False), ("ignored", True)])
+    monkeypatch.setattr(cli, "process_item", lambda *args, **kwargs: dict(zip(("status", "cache_hit"), next(outcomes))))
     monkeypatch.setattr(cli, "build", lambda *args: {})
     for name in ("one", "two", "three", "four", "five"):
         store.ingest(item(url="https://example.org/" + name), DATE)
     report = cli.run(cfg, store)
     counts = [report[key] for key in ("analyzed", "analysis_failed", "review_held", "review_stale",
-                                      "review_cache_hits", "review_skipped", "model_calls")]
-    assert counts == [4, 1, 1, 1, 2, 2, 6]
+                                      "review_cache_hits", "review_skipped")]
+    assert counts == [4, 1, 1, 1, 2, 2]
+
+
+def test_run_report_counts_the_model_requests_of_items_that_fail(context, monkeypatch):
+    from onionflash import cli
+    from onionflash.analyze import CompletionClient
+    cfg, store = context
+    cfg["sources"] = []
+    cfg["llm"]["base_url"] = "https://llm.example/v1"
+    monkeypatch.setenv(cfg["llm"]["api_key_env"], "test-key")
+
+    def complete(client, request, key):
+        if request["response_format"]["json_schema"]["name"] == "onionflash_news":
+            return analysis(why_it_matters="")
+        raise AnalysisError("LLM request failed", retryable=True)
+
+    monkeypatch.setattr(CompletionClient, "_complete", complete)
+    monkeypatch.setattr(cli, "build", lambda *args: {})
+    for name in ("one", "two"):
+        store.ingest(item(url="https://example.org/" + name), DATE)
+    report = cli.run(cfg, store)
+    # Each item's writer request and failed review request count.
+    assert (report["analysis_failed"], report["model_calls"]) == (2, 4)
 
 
 def test_unusable_replies_and_drafts_take_strikes_and_the_run_still_builds(context, monkeypatch):
@@ -548,11 +590,13 @@ def test_unusable_replies_and_drafts_take_strikes_and_the_run_still_builds(conte
     cfg["sources"] = []
 
     class Drafts:
+        calls = 0
         def analyze(self, incoming):
             # Publishing drops U+FFFF, so this draft cannot form a public story.
             return analysis(title="\uffff") if incoming["url"].endswith("/draft") else analysis()
 
     class Replies:
+        calls = 0
         def review(self, candidate, packet, *, coverage=None, verification=False):
             """Return malformed replies only for the designated failure fixtures."""
             return review.validate_review({} if "/reply" in packet["sources"][0]["url"] else verdict(), packet)

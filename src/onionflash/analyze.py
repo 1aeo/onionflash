@@ -238,6 +238,7 @@ class CompletionClient:
             "retry_attempts": 1,
         }
         self.client: HttpClient | None = None
+        self.calls = 0  # requests sent, for the run report
 
     def __enter__(self) -> CompletionClient:
         return self
@@ -272,6 +273,7 @@ class CompletionClient:
         }
         if self.llm["send_chat_template_kwargs"]:
             request["chat_template_kwargs"] = {"enable_thinking": self.llm["enable_thinking"]}
+        self.calls += 1
         return self._complete(request, key)
 
     def _complete(self, request: dict, key: str) -> dict:

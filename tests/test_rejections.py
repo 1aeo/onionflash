@@ -458,7 +458,8 @@ def test_a_skip_is_listed_with_its_reason_and_shows_its_decision_and_coverage(st
     finish_reviewed(store, first, analysis(), cache_key(first, DEFAULTS["llm"]), DATE)
     row, _ = reviewed_skip(store)
     listed = rejection.list_items(store, status="ignored")["items"]
-    assert [(entry["id"], entry["rejection_reason"]) for entry in listed] == [(row["id"], "Final review skipped: new_information")]
+    assert [(entry["id"], entry["story_id"], entry["rejection_reason"]) for entry in listed] == [
+        (row["id"], None, "Final review skipped: new_information")]  # a skip maps the item to no story
     shown = rejection.show_item(store, row["id"])["final_review"]
     assert shown["stage"] == "finished" and shown["latest_review"]["criteria"]["new_information"]["outcome"] == "insufficient"
     assert [entry["id"] for entry in shown["coverage"]["recent"]] == [store.stories()[0]["id"]]
@@ -478,3 +479,15 @@ def test_explicit_reconsideration_gets_a_fresh_decision(store):
     assert result["status"] == "published" and not result["cache_hit"]
     assert result["review_calls"] == 2 and checker.calls[0][0] == candidate
     assert [call[2] for call in checker.calls] == [False, True]
+
+
+def test_show_prints_a_skip_that_repeats_the_first_decision_after_a_hold(store):
+    """An exact repeat of an earlier audit row is saved again once another decision came between them."""
+    from onionflash import review_gate
+    from test_review_gate import Reviewer, Writer, verdict
+    row, _ = reviewed_skip(store)
+    rejection.retry_item(store, row["id"], row["content_hash"], "Reconsider this editorial decision", DATE)
+    assert review_gate.process_item(DEFAULTS, store, store.pending(1, DATE)[0], Writer(), Reviewer(verdict("hold")), DATE)["status"] == "held"
+    rejection.retry_item(store, row["id"], row["content_hash"], "Retry the held item", DATE)
+    reviewed_skip(store)  # the first skip again, with an identical record
+    assert rejection.show_item(store, row["id"])["final_review"]["latest_review"]["verdict"] == "skip"

@@ -33,7 +33,8 @@ for items a review skipped; a skip's reason names the criteria that did not pass
 final review's stage, current candidate, numbered source packet (for checking
 references such as `S1:P3`), coverage background and latest per-criterion
 verdict. They come from the item's review job or, once a commit has finished the
-current revision, from the decision that commit recorded, with stage `finished`.
+current revision, from the decision that commit recorded, with stage `finished`,
+until the deployment's private evidence retention archives that record.
 That verdict's `candidate_hash` names the text it evaluated; during `verify`, the
 candidate shown is the unchanged draft or its one repair. The output is private
 operator data. `show` also accepts an explicit pending or ignored item ID;

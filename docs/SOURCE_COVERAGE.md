@@ -88,9 +88,9 @@ while unambiguous rows continue. They are never silently merged.
 Repository revision time orders corrections separately from event dates.
 Unchanged row content is not reanalyzed when another row changes. Timeline
 context can update its own story, but cannot replace a richer existing news
-summary merely because the repository was edited later. A grouped item that
-adds no new information is skipped; the release story keeps its text and
-existing citations.
+summary merely because the repository was edited later. A row that
+release-version clustering groups with an existing release story is skipped if
+it adds no new information; the story keeps its text and existing citations.
 
 ## Important sources that need more handling first
 
@@ -112,9 +112,9 @@ is a deployment configuration choice; see the deployment repository's guide.
 
 ## Retired monitoring sources
 
-A source entry that sets `alert_format` loads disabled, with a warning; remove
-it. The unused `monitor_id` key and the retired `[monitoring]` settings are
-accepted and ignored. Old databases keep the unused monitoring tables; nothing
-reads or writes them. Automated notice lists, such as tor-consensus-health and
-metrics-alerts, report checker or collector state rather than network news; do
-not add them as news feeds.
+A source entry with a non-empty `alert_format` loads disabled, with a warning;
+remove it. The unused `monitor_id` key and the retired `[monitoring]` settings
+are accepted and ignored. Opening a database leaves any unused monitoring tables
+in place; nothing reads or writes them. Automated notice lists, such as
+tor-consensus-health and metrics-alerts, report checker or collector state
+rather than network news; do not add them as news feeds.

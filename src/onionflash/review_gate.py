@@ -4,6 +4,8 @@ The existing item queue owns scheduling and backoff. These private tables keep
 one unfinished job per item, overwritten when its inputs change or an operator
 retries the item, and the receipt of its recorded decision until that decision
 commits; they are not a cache of writer responses for arbitrary future items.
+Every job record keeps the item row as input_row, which this release never
+reads, because earlier releases read it after a code rollback.
 """
 
 from __future__ import annotations
@@ -34,7 +36,8 @@ def reset_review_work(store, item_id):
     row = store.db.execute("SELECT writer_key FROM review_jobs WHERE item_id=?", (item_id,)).fetchone()
     if row is None:
         return
-    record = {"schema_version": 1, "writer": {"key": row["writer_key"]}, "reviews": []}
+    item = dict(store.db.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone())
+    record = {"schema_version": 1, "writer": {"key": row["writer_key"]}, "input_row": item, "reviews": []}
     store.db.execute("""UPDATE review_jobs SET stage='drafted',envelope_json=NULL,
         record_json=?,approval_key=NULL,updated_at=? WHERE item_id=?""", (_json(record), now_iso(), item_id))
 
@@ -89,7 +92,7 @@ def _hold(store, row, draft, writer_key, record, observed, reason):
 
 
 def process_item(config, store, row, writer, reviewer, observed=None, *, allow_network=True):
-    """Resume writer → exact-candidate review → optional verification → commit.
+    """Resume writer → exact-candidate review → verification of an approval or repair → commit.
 
     Transport errors leave the current stage durable and raise a retryable
     AnalysisError for the existing queue's backoff. An unusable reply keeps the
@@ -111,7 +114,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         prepared_at = job["prepared_at"]
     else:
         job, draft = None, None
-        record = {"schema_version": 1, "writer": None, "reviews": []}
+        record = {"schema_version": 1, "writer": None, "input_row": row, "reviews": []}
         prepared_at = observed
     if draft is None:
         if not allow_network and json.loads(row["payload"])["kind"] != "tag":
@@ -125,10 +128,9 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         old = json.loads(job["envelope_json"]) if job is not None and job["envelope_json"] else None
         same = old is not None and job["policy_hash"] == policy and _identity(old) == _identity(prepared)
         stage = job["stage"] if same else "review"
-        if not same:
-            # input_row is unused; earlier releases read it after a code rollback.
-            record = {"schema_version": 1, "writer": record["writer"], "input_row": row, "reviews": [], "policy_hash": policy,
-                      "prepared": {key: prepared[key] for key in ("candidate", "packet", "coverage", "candidate_hash", "source_hash", "coverage_hash", "binding_hash")}}
+        fresh = {"schema_version": 1, "writer": record["writer"], "input_row": row, "reviews": [], "policy_hash": policy,
+                 "prepared": {key: prepared[key] for key in ("candidate", "packet", "coverage", "candidate_hash", "source_hash", "coverage_hash", "binding_hash")}}
+        record = record if same else fresh
         candidate = record.get("candidate", prepared["candidate"])
         _save(store, row["id"], writer_key, policy, stage, draft, prepared, record, observed, prepared_at=prepared_at,
               approval_key=job["approval_key"] if same else None)
@@ -165,6 +167,8 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                 return report
             with store.db:
                 store.db.execute("DELETE FROM review_approvals WHERE key=?", (key,))
+        if stage in {"approved", "skipped"}:  # without a usable receipt, review the writer's draft again
+            stage, candidate, record = "review", prepared["candidate"], fresh
         while True:
             verification = stage == "verify"
             if not allow_network:

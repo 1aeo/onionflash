@@ -321,9 +321,11 @@ class Store:
         result_json = json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False)
         record_json = json.dumps(review_record, ensure_ascii=False, sort_keys=True, allow_nan=False) if review_record is not None else None
         values = (result_json, row["payload"], row["id"], record_json)
-        previous = self.db.execute("SELECT result,source_payload,source_item_id,review_record FROM analyses WHERE cache_key=?", (cache_key,)).fetchone()
+        previous = self.db.execute("""SELECT result,source_payload,source_item_id,review_record,
+            rowid=(SELECT MAX(rowid) FROM analyses WHERE source_item_id=?) FROM analyses WHERE cache_key=?""",
+            (row["id"], cache_key)).fetchone()
         if previous is not None:
-            if tuple(previous) == values:
+            if tuple(previous) == (*values, 1):  # an exact repeat of the item's newest record
                 return cache_key
             cache_key = digest(["analysis-audit", cache_key, values, observed])
         self.db.execute("""INSERT OR IGNORE INTO analyses

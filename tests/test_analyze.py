@@ -257,6 +257,7 @@ def test_one_failing_item_does_not_stop_the_run_but_two_endpoint_failures_do(tmp
     calls = []
 
     class FlakyAnalyzer:
+        calls = 0
         def __init__(self, *args, **kwargs):
             pass
         def __enter__(self):

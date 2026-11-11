@@ -481,6 +481,8 @@ def test_a_failing_source_is_deferred_and_does_not_starve_queued_analysis(
     cfg = config(tmp_path)
 
     class DummyContext:
+        calls = 0
+
         def __init__(self, *args, **kwargs):
             pass
 

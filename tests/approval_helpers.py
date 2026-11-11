@@ -30,6 +30,8 @@ def approved_result(packet):
 
 class ApprovingReviewer:
     """Use only where an existing CLI test supplies an equally synthetic writer."""
+    calls = 0
+
     def __init__(self, *args, **kwargs):
         pass
 

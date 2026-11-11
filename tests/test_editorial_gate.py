@@ -170,6 +170,25 @@ def test_interrupted_verification_restarts_the_critique_when_coverage_changes(co
     assert [call[2] for call in resumed.calls] == [False, True]
 
 
+@pytest.mark.parametrize("change", ["coverage", "policy"])
+def test_recorded_decision_is_not_reused_after_its_context_changes(context, monkeypatch, change):
+    """A decision recorded before a crash is reviewed again once its coverage or policy changes."""
+    cfg, store = context
+    row = pending(store)
+    commit = store.commit_candidate
+    monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash before commit")))
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        run(cfg, store, row, Writer(), Reviewer(verdict()))
+    monkeypatch.setattr(store, "commit_candidate", commit)
+    if change == "coverage":
+        add_coverage(store)
+    else:
+        cfg["review"]["model"] = "different-review-model"
+    checker = Reviewer(verdict())
+    assert run(cfg, store, row, Writer(), checker)["status"] == "published"
+    assert [call[2] for call in checker.calls] == [False, True]
+
+
 @pytest.mark.parametrize("final", ["approve", "hold"])
 def test_reconciled_critique_still_requires_fresh_verification(context, final):
     """Repairing a contradictory critique never substitutes for final approval."""

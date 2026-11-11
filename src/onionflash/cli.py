@@ -59,7 +59,7 @@ def _operator_parsers(commands) -> None:
         if name == "restore":
             action.add_argument("--revision", required=True, type=int, help="Revision to restore and lock")
 
-    rejected = commands.add_parser("rejected", help="Inspect and explicitly retry or dismiss failed analyses")
+    rejected = commands.add_parser("rejected", help="Inspect and explicitly retry or dismiss failed analyses, or retry an ignored item")
     actions = rejected.add_subparsers(dest="action", required=True)
     for name in ("list", "show", "retry", "dismiss"):
         action = actions.add_parser(name)
@@ -195,7 +195,6 @@ def run(config: dict, store: Store) -> dict:
                 if result["status"] not in {"stale", "deferred"}:
                     report["analyzed"] += 1
                 report["review_cache_hits"] += bool(result["cache_hit"])
-                report["model_calls"] += result["writer_calls"] + result["review_calls"]
                 if result["status"] == "held":
                     report["review_held"] += 1
                     report["analysis_failed"] += 1
@@ -222,6 +221,7 @@ def run(config: dict, store: Store) -> dict:
                 store.defer(row["id"], f"Unexpected {type(exc).__name__} at {Path(frame.filename).name}:{frame.lineno}",
                             config["llm"], now_iso(), terminal=True)
                 report["analysis_failed"] += 1
+        report["model_calls"] = analyzer.calls + reviewer.calls
     report["pending_analysis"] = store.pending_count()
     report["rejected_analysis"] = store.rejected_count()
     report["final_review"] = review_status(store)

@@ -133,6 +133,7 @@ def _pipeline_config(tmp_path):
 
 def _prepare_run(monkeypatch, analyze):
     class FakeAnalyzer:
+        calls = 0
         def __init__(self, *args, **kwargs):
             pass
         def __enter__(self):
