@@ -66,10 +66,9 @@ def approve(store, prepared, candidate=None, *, policy="test-policy", result=Non
     return {"approval_key": key, "policy_hash": policy}
 
 
-def finish_reviewed(store, row, result, key, observed, *, input_chars=None):
+def finish_reviewed(store, row, result, key, observed):
     if not result["publish"]:
-        return store.finish(row, result, key, observed, input_chars=input_chars)
-    prepared = store.prepare_candidate(row, result, observed, input_chars=input_chars,
-                                       review_settings=DEFAULTS["review"])
+        return store.finish(row, result, key, observed)
+    prepared = store.prepare_candidate(row, result, observed, review_settings=DEFAULTS["review"])
     receipt = approve(store, prepared) if prepared["requires_review"] else {}
     return store.commit_candidate(prepared, prepared["candidate"], key, observed, **receipt)

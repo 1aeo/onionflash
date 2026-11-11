@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .util import after, backoff_seconds, digest, item_cluster, item_identity
 from . import candidate, editorial, render
+from .comments import analysis_context
 from .candidate import ReviewRequired, StaleCandidate
 
 
@@ -107,7 +108,7 @@ class Store:
         """)
         editorial.initialize(self.db)
         analysis_columns = {row[1] for row in self.db.execute("PRAGMA table_info(analyses)")}
-        for name, kind in (("source_payload", "TEXT"), ("source_item_id", "TEXT"), ("input_chars", "INTEGER"), ("review_record", "TEXT")):
+        for name, kind in (("source_payload", "TEXT"), ("source_item_id", "TEXT"), ("review_record", "TEXT")):
             if name not in analysis_columns:
                 self.db.execute(f"ALTER TABLE analyses ADD COLUMN {name} {kind}")
         self.db.execute("CREATE INDEX IF NOT EXISTS analyses_source_snapshot ON analyses(source_item_id,created_at DESC,cache_key DESC)")
@@ -204,20 +205,12 @@ class Store:
     def ingest(self, item: dict, observed: str) -> bool:
         item_id = digest(item_identity(item))[:24]
         item["id"] = item_id
-        content_hash = digest(
-            {
-                k: item.get(k)
-                for k in (
-                    "title",
-                    "content",
-                    "kind",
-                    "product",
-                    "labels",
-                    "authority",
-                    "upstream_state",
-                )
-            }
-        )
+        fields = {k: item.get(k) for k in ("title", "content", "kind", "product", "labels", "authority", "upstream_state")}
+        if item.get("public_comments"):
+            # Notes as the writer sees them, so a reaction that moves only a note's
+            # update time, or a verification time, never requeues an item.
+            fields["public_comments"] = analysis_context(item)[1]
+        content_hash = digest(fields)
         cluster = item_cluster(item)
         row = self.db.execute(
             "SELECT content_hash,payload FROM items WHERE id=?", (item_id,)
@@ -290,24 +283,23 @@ class Store:
         return self.db.execute("SELECT COUNT(*) FROM items WHERE status='rejected'").fetchone()[0]
 
     def record_analysis(self, row: dict, result: dict, cache_key: str, observed: str, *,
-                        input_chars: int | None = None, review_record: dict | None = None) -> str:
+                        review_record: dict | None = None) -> str:
         """Append immutable private evidence; the caller owns the transaction."""
         result_json = json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False)
         record_json = json.dumps(review_record, ensure_ascii=False, sort_keys=True, allow_nan=False) if review_record is not None else None
-        values = (result_json, row["payload"], row["id"], input_chars, record_json)
-        previous = self.db.execute("SELECT result,source_payload,source_item_id,input_chars,review_record FROM analyses WHERE cache_key=?", (cache_key,)).fetchone()
+        values = (result_json, row["payload"], row["id"], record_json)
+        previous = self.db.execute("SELECT result,source_payload,source_item_id,review_record FROM analyses WHERE cache_key=?", (cache_key,)).fetchone()
         if previous is not None:
             if tuple(previous) == values:
                 return cache_key
             cache_key = digest(["analysis-audit", cache_key, values, observed])
         self.db.execute("""INSERT OR IGNORE INTO analyses
-            (cache_key,result,created_at,source_payload,source_item_id,input_chars,review_record)
-            VALUES(?,?,?,?,?,?,?)""", (cache_key, result_json, observed, row["payload"], row["id"], input_chars, record_json))
+            (cache_key,result,created_at,source_payload,source_item_id,review_record)
+            VALUES(?,?,?,?,?,?)""", (cache_key, result_json, observed, row["payload"], row["id"], record_json))
         return cache_key
 
-    def prepare_candidate(self, row: dict, result: dict, observed: str, *, input_chars: int | None = None,
-                          review_settings: dict | None = None) -> dict:
-        return candidate.prepare(self.db, row, result, observed, input_chars=input_chars, review_settings=review_settings)
+    def prepare_candidate(self, row: dict, result: dict, observed: str, *, review_settings: dict | None = None) -> dict:
+        return candidate.prepare(self.db, row, result, observed, review_settings=review_settings)
 
     def _clear_review_job(self, item_id: str) -> None:
         if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='review_jobs' AND type='table'").fetchone():
@@ -375,8 +367,7 @@ class Store:
             if review_record is None and self.db.execute("SELECT 1 FROM sqlite_master WHERE name='review_jobs'").fetchone():
                 job = self.db.execute("SELECT record_json FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
                 review_record = json.loads(job[0]) if job else None
-            analysis_key = self.record_analysis(row, result, cache_key, observed,
-                                                input_chars=prepared["input_chars"], review_record=review_record)
+            analysis_key = self.record_analysis(row, result, cache_key, observed, review_record=review_record)
             if payload is not None:
                 if payload.get("editorial_item") == row["id"]:
                     payload["editorial_analysis_key"] = analysis_key
@@ -386,7 +377,7 @@ class Store:
                 if changed.rowcount != 1:
                     raise StaleCandidate("Story became editorially protected before publication")
             elif locked and result["publish"]:
-                editorial.record_held(self.db, story_id, observed)
+                editorial.record_held(self.db, story_id)
             published = result["publish"] and decision == "approve"
             mapped_id = story_id if published else row.get("story_id")
             self.db.execute("UPDATE items SET status=?,story_id=?,next_attempt_at=NULL,last_error=NULL WHERE id=?",
@@ -401,9 +392,9 @@ class Store:
                                      approval_key=approval_key, policy_hash=policy_hash,
                                      review_record=review_record, decision="skip")
 
-    def finish(self, row: dict, result: dict, cache_key: str, observed: str, *, input_chars: int | None = None) -> None:
+    def finish(self, row: dict, result: dict, cache_key: str, observed: str) -> None:
         """Only ignored drafts and locked operator decisions bypass review."""
-        prepared = self.prepare_candidate(row, result, observed, input_chars=input_chars)
+        prepared = self.prepare_candidate(row, result, observed)
         if prepared["requires_review"]:
             raise ReviewRequired("Automatic publication requires the final review gate")
         self.commit_candidate(prepared, prepared["candidate"], cache_key, observed)

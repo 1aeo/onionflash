@@ -18,18 +18,17 @@ from .transport import FetchError, HttpClient
 from .util import after, backoff_seconds, canonical_url, digest, now_iso, plain_text, timestamp
 
 
-QUERY = """query PublicIssueNotes($project: ID!, $iid: String!, $size: Int!, $before: String) {
+QUERY = """query PublicIssueNotes($project: ID!, $iid: String!, $size: Int!) {
   project(fullPath: $project) {
     id fullPath visibility webUrl
     issue(iid: $iid) {
       iid confidential webUrl
-      notes(last: $size, before: $before) {
-        nodes { id body createdAt updatedAt internal system url author { username } }
-        pageInfo { startCursor hasPreviousPage }
-      }
+      notes(last: $size) { nodes { id body createdAt internal system url author { username } } }
     }
   }
 }"""
+NOTE_WINDOW = 40  # the newest notes read per issue in one request, system notes included
+INPUT_CHARS = 14000  # the writer's fixed source window: description plus note bodies
 
 
 class CommentError(Exception):
@@ -38,14 +37,6 @@ class CommentError(Exception):
 
 class EndpointError(CommentError):
     """The answer is unusable for every issue of the project, not just this one."""
-
-
-def parse_note_id(value):
-    """Return the shared numeric identity for explicitly supported public note GIDs."""
-    if not isinstance(value, str):
-        return None
-    match = re.fullmatch(r"gid://gitlab/(?:Note|DiscussionNote)/([0-9]+)", value)
-    return match[1] if match else None
 
 
 def _initialize(store):
@@ -95,145 +86,86 @@ def _source_key(source):
     return digest([source["id"], *_identity(source)])
 
 
-def fetch_comments(client, source, item, settings, *, observed=None):
-    """Read a bounded newest-note window; discard partial responses on failure."""
+def fetch_comments(client, source, item, settings):
+    """Read the newest-note window in one request; any unusable part rejects the answer."""
     project, origin, endpoint, project_id, iid = _issue_identity(source, item)
-    observed = timestamp(observed or now_iso())
-    before, seen, notes = None, set(), {}
-    truncated = False
-    for _ in range(settings["max_pages"]):
-        response = client.request("POST", endpoint, headers={"Accept": "application/json"},
-                                  json_body={"query": QUERY, "variables": {
-                                      "project": project, "iid": iid, "size": settings["page_size"], "before": before}})
-        if canonical_url(response.url) != endpoint:
-            raise EndpointError("GraphQL endpoint redirected")
-        data = response.json()
-        if not isinstance(data, dict) or data.get("errors") or not isinstance(data.get("data"), dict):
-            raise EndpointError("GraphQL response unavailable")
-        obj = data["data"].get("project")
-        if (not isinstance(obj, dict) or obj.get("visibility") != "public"
-                or obj.get("fullPath") != project or obj.get("webUrl") != origin + "/" + project
-                or (project_id.isdigit() and obj.get("id") != "gid://gitlab/Project/" + project_id)):
-            raise EndpointError("Public project identity not verified")
-        issue = obj.get("issue")
-        if (not isinstance(issue, dict) or issue.get("confidential") is not False
-                or issue.get("iid") != iid or not isinstance(issue.get("webUrl"), str)
-                or canonical_url(issue["webUrl"]) != canonical_url(item["url"])):
-            raise CommentError("Public issue identity not verified")
-        connection = issue.get("notes")
-        if not isinstance(connection, dict) or not isinstance(connection.get("nodes"), list):
-            raise CommentError("Public notes unavailable")
-        nodes, page = connection["nodes"], connection.get("pageInfo")
-        if (len(nodes) > settings["page_size"] or not isinstance(page, dict)
-                or type(page.get("hasPreviousPage")) is not bool):
-            raise CommentError("Invalid notes pagination")
-        for note in nodes:
-            # Do not inspect, sanitize, log or persist a body before these flags.
-            if not isinstance(note, dict):
-                raise CommentError("Public note visibility is unknown")
-            if note.get("internal") is True or note.get("system") is True:
-                continue
-            if note.get("internal") is not False or note.get("system") is not False:
-                raise CommentError("Public note visibility is unknown")
-            ident = note.get("id")
-            note_id = parse_note_id(ident)
-            if note_id is None:
-                raise CommentError("Invalid public note identity")
-            url = canonical_url(note.get("url", ""))
-            if url != canonical_url(item["url"]) + "#note_" + note_id:
-                raise CommentError("Public note URL does not match issue")
-            author = note.get("author")
-            if not isinstance(author, dict) or not isinstance(author.get("username"), str):
-                raise CommentError("Public note attribution unavailable")
-            if not isinstance(note.get("body"), str):
-                raise CommentError("Invalid public note body")
-            author = plain_text(author["username"], 100, html=False)
-            created, updated = timestamp(note.get("createdAt")), timestamp(note.get("updatedAt"))
-            if not author or updated < created:
-                raise CommentError("Invalid public note attribution")
-            if created > observed or updated > observed:
-                # A malformed/future timestamp must not date or promote a story.
-                continue
-            body = plain_text(note["body"], settings["comment_chars"], html=False)
-            previous = notes.get(note_id)
-            if previous:
-                if created != previous["created_at"] or (updated == previous["updated_at"] and body != previous["body"]):
-                    raise CommentError("Conflicting public note versions")
-                if updated < previous["updated_at"]:
-                    continue
-            notes[note_id] = {"id": ident, "url": url, "title": "Public comment by @" + author,
-                            "author": author, "created_at": created, "updated_at": updated, "body": body}
-        truncated = page["hasPreviousPage"]
-        if not truncated:
-            break
-        cursor = page.get("startCursor")
-        if not isinstance(cursor, str) or not cursor or len(cursor) > 8192 or cursor in seen:
-            raise CommentError("Invalid notes pagination cursor")
-        seen.add(cursor)
-        before = cursor
-    ordered = sorted(notes.values(), key=lambda n: (n["created_at"], n["id"]), reverse=True)
+    response = client.request("POST", endpoint, headers={"Accept": "application/json"},
+                              json_body={"query": QUERY, "variables": {"project": project, "iid": iid, "size": NOTE_WINDOW}})
+    received = now_iso()
+    data = response.json()
+    if not isinstance(data, dict) or data.get("errors") or not isinstance(data.get("data"), dict):
+        raise EndpointError("GraphQL response unavailable")
+    obj = data["data"].get("project")
+    if (not isinstance(obj, dict) or obj.get("visibility") != "public"
+            or obj.get("fullPath") != project or obj.get("webUrl") != origin + "/" + project
+            or (project_id.isdigit() and obj.get("id") != "gid://gitlab/Project/" + project_id)):
+        raise EndpointError("Public project identity not verified")
+    issue = obj.get("issue")
+    if (not isinstance(issue, dict) or issue.get("confidential") is not False
+            or issue.get("iid") != iid or not isinstance(issue.get("webUrl"), str)
+            or canonical_url(issue["webUrl"]) != canonical_url(item["url"])):
+        raise CommentError("Public issue identity not verified")
+    connection = issue.get("notes")
+    if not isinstance(connection, dict) or not isinstance(connection.get("nodes"), list):
+        raise CommentError("Public notes unavailable")
+    notes = {}
+    for note in connection["nodes"]:
+        # Do not inspect, sanitize, log or persist a body before these flags.
+        if not isinstance(note, dict):
+            raise CommentError("Public note visibility is unknown")
+        if note.get("internal") is True or note.get("system") is True:
+            continue
+        if note.get("internal") is not False or note.get("system") is not False:
+            raise CommentError("Public note visibility is unknown")
+        ident = note.get("id")
+        # Note and DiscussionNote GIDs of one note share its numeric identity.
+        match = re.fullmatch(r"gid://gitlab/(?:Note|DiscussionNote)/([0-9]+)", ident) if isinstance(ident, str) else None
+        if match is None:
+            raise CommentError("Invalid public note identity")
+        url = canonical_url(note.get("url", ""))
+        if url != canonical_url(item["url"]) + "#note_" + match[1]:
+            raise CommentError("Public note URL does not match issue")
+        author = note.get("author")
+        if not isinstance(author, dict) or not isinstance(author.get("username"), str):
+            raise CommentError("Public note attribution unavailable")
+        if not isinstance(note.get("body"), str):
+            raise CommentError("Invalid public note body")
+        author, created = plain_text(author["username"], 100, html=False), timestamp(note.get("createdAt"))
+        if not author:
+            raise CommentError("Invalid public note attribution")
+        body = plain_text(note["body"], settings["comment_chars"], html=False)
+        # Skip an empty note, and one dated after this response: it must not date or promote a story.
+        if body and created <= received:
+            notes[match[1]] = {"id": ident, "url": url, "title": "Public comment by @" + author,
+                               "author": author, "created_at": created, "body": body}
     selected, remaining = [], settings["total_chars"]
-    for note in ordered:
+    for note in sorted(notes.values(), key=lambda n: (n["created_at"], n["id"]), reverse=True):
         if remaining <= 0 or len(selected) >= settings["max_comments"]:
-            truncated = True
             break
-        if len(note["body"]) > remaining:
-            note = {**note, "body": note["body"][:remaining]}
-            truncated = True
+        note["body"] = note["body"][:remaining]
         remaining -= len(note["body"])
         selected.append(note)
-    return selected, truncated
+    return selected
 
 
-def analysis_context(item, limit):
-    """Reserve context for attributed note bodies instead of truncating them off.
+def analysis_context(item):
+    """Return the writer's description window and the notes it sees verbatim, newest first.
 
-    Return (actual evidence text, notes with exactly the supplied body prefixes).
-    URL metadata stays complete; a long display URL cannot consume body space.
+    Notes are structured entries, so a body cannot pose as another author's note.
     """
-    source = item.get("source_content", item.get("content", ""))
-    notes = [n for n in item.get("public_comments", []) if n.get("body")]
-    if not notes or limit < 500:
-        return source[:limit], []
-    heading = "\n\nPublic issue comments (untrusted attributed reports, not independent verification):\n"
-    budget = int(limit * 0.6)
-    selected = notes[:max(1, (budget - len(heading)) // 400)]
-    share = max(1, (budget - len(heading)) // len(selected))
-    blocks, supplied = [], []
-    for note in selected:
-        header = (f"@{note['author'][:60]} — {note['created_at']} (edited {note['updated_at']})\n"
-                  f"{note['url'][:240]}\n")
-        header = header[:max(1, share // 2)]
-        body = note["body"][:max(1, share - len(header) - 2)]
-        if not body:
-            continue
-        blocks.append(header + body)
-        supplied.append({**note, "body": body})
-    suffix = heading + "\n\n".join(blocks)
-    return source[:max(0, limit - len(suffix))] + suffix, supplied
+    notes = [{key: note[key] for key in ("author", "created_at", "body")} for note in item.get("public_comments") or []]
+    room = max(0, INPUT_CHARS - sum(len(note["body"]) for note in notes))
+    # Payloads stored before descriptions moved back to content keep it in source_content.
+    return item.get("source_content", item.get("content", ""))[:room], notes
 
 
-def analysis_content(item, limit):
-    """Return the exact text shared by model input and evidence validation."""
-    return analysis_context(item, limit)[0]
-
-
-def _compose(item, notes, checked, truncated=False, *, source_key=None):
+def _compose(item, notes, checked, *, source_key):
     result = dict(item)
-    source_content = item.get("source_content", item.get("content"))
-    if not isinstance(source_content, str):
+    content = result.pop("source_content", result.get("content"))
+    if not isinstance(content, str):
         raise CommentError("Saved issue description is unavailable")
-    result["source_content"] = source_content
-    result["public_comments"] = notes
-    result["comments_checked_at"] = checked
-    result["comments_truncated"] = truncated
-    # This marker is written only after a successful verified fetch, or copied
-    # from an already verified stored snapshot. Scheduling failures cannot mint it.
-    if source_key is not None:
-        result["comments_source_key"] = source_key
-    else:
-        result.pop("comments_source_key", None)
-    result["content"] = analysis_content(result, 60000)
+    # Callers pass a key only for a verified fetch or an already verified stored snapshot.
+    result.update(content=content, public_comments=notes, comments_checked_at=checked, comments_source_key=source_key)
     return result
 
 
@@ -260,8 +192,7 @@ def merge_cached_comments(store, item, source, observed=None):
                              (row["id"], key, observed, observed, row["id"], key))
     if not current:
         return item
-    return _compose(item, old["public_comments"], old["comments_checked_at"],
-                    old["comments_truncated"], source_key=key)
+    return _compose(item, old["public_comments"], old["comments_checked_at"], source_key=key)
 
 
 def _candidates(store, source, settings, observed, key):
@@ -304,7 +235,7 @@ def _candidates(store, source, settings, observed, key):
     return list(selected.values())[:limit]
 
 
-def enrich_comments(config, store, observed, *, deadline=None, client=None):
+def enrich_comments(config, store, observed, *, deadline=None):
     """Optional post-collection phase. Failures never block REST/feed processing."""
     settings = config.get("comments", {})
     report = {"enabled": bool(settings.get("enabled")), "checked": 0, "changed": 0,
@@ -322,13 +253,10 @@ def enrich_comments(config, store, observed, *, deadline=None, client=None):
     with store.db:
         store.db.execute(f"DELETE FROM comment_sources WHERE source_id NOT IN ({','.join('?' * len(sources))})",
                          [s["id"] for s in sources])
-    own_client = client is None
     # A fresh client has no cookies, authorization, proxy or application session.
-    # The verified GraphQL URL is canonical. Refuse every redirect before a
-    # redirected request could leave that endpoint, using the shared limit.
-    client = client or HttpClient({**config["http"], "max_redirects": 0})
-    old_deadline = getattr(client, "deadline", None)
-    client.deadline = min(old_deadline or float("inf"), deadline)
+    # It refuses every redirect, so a request cannot leave the verified endpoint.
+    client = HttpClient({**config["http"], "max_redirects": 0})
+    client.deadline = deadline
     try:
         for source in sources:
             try:
@@ -369,8 +297,7 @@ def enrich_comments(config, store, observed, *, deadline=None, client=None):
                     continue
                 report["checked"] += 1
                 try:
-                    notes, truncated = fetch_comments(client, source, item, settings, observed=observed)
-                    enriched = _compose(item, notes, observed, truncated, source_key=key)
+                    enriched = _compose(item, fetch_comments(client, source, item, settings), observed, source_key=key)
                     changed = bool(store.ingest(enriched, observed))
                     report["changed"] += changed
                     with store.db:
@@ -402,9 +329,7 @@ def enrich_comments(config, store, observed, *, deadline=None, client=None):
                         store.db.execute("UPDATE comment_sources SET failures=?,next_fetch_at=?,error=? WHERE source_id=?", (failures, due, "Public comments unavailable", source["id"]))
                     break  # Do not multiply endpoint failures by issue count.
     finally:
-        client.deadline = old_deadline
-        if own_client:
-            client.close()
+        client.close()
         with store.db:
             store.db.execute("DELETE FROM comment_cache WHERE checked_at<?", (after(-settings["cache_days"] * 86400, observed),))
             store.db.execute("DELETE FROM comment_cache WHERE item_id IN (SELECT item_id FROM comment_cache ORDER BY checked_at DESC,item_id LIMIT -1 OFFSET ?)", (settings["max_cache_entries"],))

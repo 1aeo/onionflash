@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 
 from . import editorial, render, source_packet
-from .util import canonical_url, digest, format_utc, normalize_evidence, parse_utc
+from .comments import analysis_context
+from .util import digest, normalize_evidence
 
 
 # Writer fields a review may repair; their order is part of the review policy hash.
@@ -67,34 +68,24 @@ def _rank(kind: str, confidence: str, updated_at: str) -> tuple:
     return ({"tag": 0, "metrics_timeline": 1}.get(kind, 2), confidence == "confirmed", updated_at)
 
 
-def _comment_sources(item: dict, result: dict, input_chars: int | None, observed: str) -> list[dict]:
-    if type(input_chars) is not int or input_chars <= 0 or not item.get("public_comments"):
+def _comment_sources(item: dict, result: dict) -> list[dict]:
+    """Cite the earliest note stating each quote that the title and description do not.
+
+    Only a verified fetch writes notes, so their fields need no checks here.
+    """
+    if not item.get("public_comments"):
         return []
-    from .comments import analysis_context, parse_note_id
-    try:
-        _, supplied = analysis_context(item, input_chars)
-    except (ValueError, TypeError, KeyError, AttributeError):
-        return []
-    evidence = [normalize_evidence(quote) for quote in result.get("evidence", []) if isinstance(quote, str)]
-    evidence = [quote for quote in evidence if len(quote) >= 8]
+    description, _ = analysis_context(item)
+    described = normalize_evidence(item["title"] + "\n" + description)
+    quotes = {normalize_evidence(quote) for quote in result["evidence"]}
+    quotes = {quote for quote in quotes if len(quote) >= 8 and quote not in described}
     sources = []
-    for note in supplied:
-        try:
-            identifier = parse_note_id(note["id"])
-            url = canonical_url(note["url"])
-            if identifier is None or url != canonical_url(item["url"]).split("#", 1)[0] + "#note_" + identifier:
-                continue
-            body = normalize_evidence(note["body"])
-            if not any(quote in body for quote in evidence):
-                continue
-            created = format_utc(parse_utc(note["created_at"]))
-            updated = format_utc(parse_utc(note["updated_at"]))
-            if not created <= updated <= observed:
-                continue
-            sources.append({"id": item["id"] + ":" + note["id"], "source_item_id": item["id"],
-                            "url": url, "title": note["title"], "published_at": created, "updated_at": updated})
-        except (KeyError, TypeError, ValueError, UnicodeError):
-            continue
+    for note in sorted(item["public_comments"], key=lambda note: note["created_at"]):
+        found = {quote for quote in quotes if quote in normalize_evidence(note["body"])}
+        if found:
+            quotes -= found
+            sources.append({"id": item["id"] + ":" + note["id"], "source_item_id": item["id"], "url": note["url"],
+                            "title": note["title"], "published_at": note["created_at"]})
     return sources
 
 
@@ -132,7 +123,7 @@ def assert_current(db, prepared: dict) -> None:
         raise StaleCandidate("Supporting source changed since candidate preparation")
 
 
-def prepare(db, row: dict, result: dict, observed: str, *, input_chars: int | None = None, review_settings: dict | None = None) -> dict:
+def prepare(db, row: dict, result: dict, observed: str, *, review_settings: dict | None = None) -> dict:
     # Copy caller-owned values so later repairs cannot mutate the original draft.
     """Assemble the exact candidate and bind all state needed for its guarded commit."""
     row, result = json.loads(json.dumps(row)), json.loads(json.dumps(result))
@@ -150,7 +141,7 @@ def prepare(db, row: dict, result: dict, observed: str, *, input_chars: int | No
     coverage_budget = min(COVERAGE_CHARS, (review_settings or {}).get("max_source_chars", source_packet.DEFAULT_LIMITS["max_source_chars"]) // 2)
     binding = {"item": item_fingerprint(row), "prior_story": digest(existing),
                "lock": control_fingerprint(db, story_id), "sources": [], "coverage_budget": coverage_budget}
-    envelope = {"row": row, "result": result, "input_chars": input_chars, "story_id": story_id,
+    envelope = {"row": row, "result": result, "story_id": story_id,
                 "cluster_key": existing["cluster_key"] if existing else row["cluster_key"],
                 "candidate": None, "payload": None, "packet": {"sources": [], "missing_sources": [], "truncated": False},
                 "binding": binding, "locked": locked, "requires_review": False, "coverage": None,
@@ -158,8 +149,9 @@ def prepare(db, row: dict, result: dict, observed: str, *, input_chars: int | No
     if result["publish"] and not locked:
         previous = json.loads(existing["payload"]) if existing else None
         source = {key: item[key] for key in ("id", "url", "title", "published_at")}
-        comments = _comment_sources(item, result, input_chars, observed)
-        effective_updated = max([item["updated_at"], *(source["updated_at"] for source in comments)])
+        # Only a newly cited note moves the story's date, to the time it was written.
+        comments = _comment_sources(item, result)
+        effective_updated = max([item["updated_at"], *(source["published_at"] for source in comments)])
         source_map = {source["url"]: source for source in (previous or {}).get("sources", [])
                       if source.get("id") != item["id"] and source.get("source_item_id") != item["id"]}
         source_map[source["url"]] = source
@@ -186,13 +178,7 @@ def prepare(db, row: dict, result: dict, observed: str, *, input_chars: int | No
         # collection identities privately for future grouping and source lookup.
         data.update({key: value for key, value in public.items() if key not in {"sources", "editorial"}})
         writer = data["editorial_item"]
-        packet, bindings, note_updates = source_packet.build_packet(db, item, data, public, writer, review_settings)
-        # Final review can repair a draft using a corrective note the writer did
-        # not quote. Date the exact candidate from the verified note material
-        # actually supplied to that review, never collection/poll timestamps.
-        data["updated_at"] = public["updated_at"] = max([data["updated_at"], *note_updates.values()])
-        if writer in note_updates:
-            data["editorial_updated_at"] = max(data["editorial_updated_at"], note_updates[writer])
+        packet, bindings = source_packet.build_packet(db, item, data, public, writer, review_settings)
         binding["sources"] = bindings
         envelope.update(candidate=public, payload=data, packet=packet, writer_item_id=writer,
                         coverage=coverage_background(db, existing, coverage_budget), requires_review=True)

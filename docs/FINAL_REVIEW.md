@@ -19,7 +19,12 @@ The writer selects literal evidence excerpts from its exact input. This prevents
 quote-copying errors; it does not establish that the excerpts support every
 claim. The reviewer therefore receives the full bounded numbered source packet,
 including retained source material and verified public comments that the writer
-may not have quoted. Previous generated summaries are never factual evidence.
+may not have quoted. The source the story's prose came from gets at least the text
+its writer saw. The other sources share the remaining passages, then characters,
+smallest need first, and leave it the room they do not need. A source's comments
+come before its description, so a long description is cut first. Comment passages
+name their author, so comment text cannot pose as another comment. Previous
+generated summaries are never factual evidence.
 
 A separate, bounded coverage background contains the existing article for a
 known update and compact recent articles. It is used only to compare novelty.

@@ -61,8 +61,6 @@ DEFAULTS = {
         "run_budget_seconds": 30,
         "max_issues_per_run": 12,
         "max_issues_per_source": 4,
-        "max_pages": 2,
-        "page_size": 20,
         "max_comments": 12,
         "comment_chars": 2000,
         "total_chars": 8000,
@@ -85,7 +83,6 @@ DEFAULTS = {
         "total_timeout_seconds": 180,
         "max_response_bytes": 65536,
         "max_output_tokens": 1200,
-        "max_input_chars": 14000,
         "max_items_per_run": 12,
         "retry_base_seconds": 300,
         "retry_cap_seconds": 21600,
@@ -158,7 +155,8 @@ OPERATOR_SETTINGS = {
 RETIRED = {
     "storage": {"max_stories"},
     "http": {"requests_per_minute"},
-    "llm": {"retry_attempts"},
+    "llm": {"retry_attempts", "max_input_chars"},
+    "comments": {"max_pages", "page_size"},
     "collection": {"healthy_poll_tolerance_seconds", "tag_priority_score", "max_xml_depth", "max_xml_elements",
                    "reconcile_seconds"},
     "monitoring": {

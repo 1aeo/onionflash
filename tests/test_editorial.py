@@ -12,7 +12,7 @@ import pytest
 
 from onionflash import editorial, render
 from onionflash.cli import build
-from onionflash.comments import _compose, analysis_context
+from onionflash.comments import _compose
 from onionflash.store import Store, backup_database
 from onionflash.util import after
 from test_core import DATE, analysis, config, item
@@ -297,78 +297,63 @@ def test_model_or_raw_story_cannot_forge_editorial_notice(seeded):
     assert "editorial" not in current_files(cfg, story_id)["json"]
 
 
-def note_item(body="The report’s old keys remain untrusted.", **changes):
-    url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41473"
-    note = {"id": "gid://gitlab/Note/123", "url": url + "#note_123", "title": "Public comment by @operator",
-            "author": "operator", "created_at": EDIT, "updated_at": EDIT, "body": body, **changes}
-    return _compose(item(url=url), [note], LATER)
+URL = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41473"
 
 
-@pytest.mark.parametrize("budget,evidence,cited", [(4000, "the report's OLD keys remain untrusted", True),
-    (None, "The report’s old keys remain untrusted", False), (499, "The report’s old keys remain untrusted", False),
-    (4000, "The operator reported a plausible compromise", False), (4000, "keys", False)])
-@pytest.mark.parametrize("note_kind", ["Note", "DiscussionNote"])
-def test_writer_quotes_select_citations_while_supplied_review_notes_date_story(tmp_path, budget, evidence, cited, note_kind):
+def note(ident, created, body):
+    return {"id": f"gid://gitlab/Note/{ident}", "url": f"{URL}#note_{ident}", "title": f"Public comment by @user{ident}",
+            "author": f"user{ident}", "created_at": created, "body": body}
+
+
+def note_item(body="The report’s old keys remain untrusted."):
+    return _compose(item(url=URL), [note(123, EDIT, body)], LATER, source_key="k")
+
+
+@pytest.mark.parametrize("evidence,cited", [("the report's OLD keys remain untrusted", True),
+    ("The operator reported a plausible compromise", False), ("keys", False)])
+def test_only_cited_notes_add_citations_and_date_the_story(tmp_path, evidence, cited):
     cfg = config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
-        incoming = note_item(id=f"gid://gitlab/{note_kind}/123")
-        store.ingest(incoming, LATER)
-        row = store.pending(1, LATER)[0]
-        finish_reviewed(store, row, analysis(evidence=[evidence]), "note", LATER, input_chars=budget)
+        store.ingest(note_item(), LATER)
+        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=[evidence]), "note", LATER)
         story = store.stories()[0]
         assert len(story["sources"]) == (2 if cited else 1)
-        assert story["updated_at"] == EDIT  # Final review sees the verified note even when the draft did not cite it.
-        assert story["editorial_updated_at"] == story["updated_at"]
+        # A cited note dates the story by when it was written; a note review only saw does not.
+        assert story["updated_at"] == story["editorial_updated_at"] == (EDIT if cited else DATE)
         assert story["published_at"] == DATE and story["added_at"] == LATER
         assert json.loads(store.db.execute("SELECT payload FROM items").fetchone()[0])["updated_at"] == DATE
-        saved = store.db.execute("SELECT input_chars FROM analyses WHERE cache_key='note'").fetchone()
-        assert saved[0] == budget
 
 
-def test_unknown_note_type_cannot_supply_story_citations_or_update_time(tmp_path):
+def test_a_quote_cites_only_its_earliest_note_and_never_a_reply_repeating_the_description(tmp_path):
     cfg = config(tmp_path)
+    notes = [note(3, LATER, "> The report’s old keys remain untrusted. Agreed."),
+             note(2, LATER, "+1, the operator reported a plausible compromise."),
+             note(1, EDIT, "The report’s old keys remain untrusted.")]
     with Store(cfg["storage"]["database"]) as store:
-        store.ingest(note_item(id="gid://gitlab/OtherNote/123"), LATER)
-        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=["The report’s old keys remain untrusted"]),
-                     "unknown-note", LATER, input_chars=4000)
+        store.ingest(_compose(item(url=URL), notes, LATER, source_key="k"), LATER)
+        evidence = ["The report’s old keys remain untrusted", "the operator reported a plausible compromise"]
+        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=evidence), "replies", LATER)
         story = store.stories()[0]
-        assert len(story["sources"]) == 1 and story["updated_at"] == DATE
+        assert [source["url"] for source in story["sources"]] == [URL, URL + "#note_1"]
+        assert story["updated_at"] == EDIT
 
 
-def test_unseen_note_tail_or_mismatched_url_cannot_be_cited(tmp_path):
-    cfg = config(tmp_path)
-    with Store(cfg["storage"]["database"]) as store:
-        incoming = note_item(body="Visible prefix. " * 1000 + "Only in unseen tail.")
-        text, notes = analysis_context(incoming, 500)
-        assert "Only in unseen tail." not in text
-        store.ingest(incoming, LATER)
-        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=["Only in unseen tail."]), "tail", LATER, input_chars=500)
-        assert len(store.stories()[0]["sources"]) == 1
-        incoming = note_item(url="https://evil.example/#note_123")
-        store.ingest(incoming, LATER)
-        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=["The report’s old keys remain untrusted"]), "wrong-url", LATER, input_chars=4000)
-        assert len(store.stories()[0]["sources"]) == 1
-
-
-def test_note_only_edits_advance_story_time_and_removed_citations_are_refreshed(tmp_path):
+def test_note_edits_keep_the_story_date_and_removed_citations_are_refreshed(tmp_path):
     cfg = config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         incoming = note_item()
         evidence = ["The report’s old keys remain untrusted"]
         store.ingest(incoming, EDIT)
-        finish_reviewed(store, store.pending(1, EDIT)[0], analysis(evidence=evidence), "first", EDIT, input_chars=4000)
+        finish_reviewed(store, store.pending(1, EDIT)[0], analysis(evidence=evidence), "first", EDIT)
         first = copy.deepcopy(store.stories()[0])
-        incoming["public_comments"][0].update(body="The report’s old keys remain untrusted. Added a detail.", updated_at=LATER)
-        incoming = _compose(incoming, incoming["public_comments"], LATER)
-        store.ingest(incoming, LATER)
-        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=evidence), "edit", LATER, input_chars=4000)
+        assert first["updated_at"] == EDIT and len(first["sources"]) == 2
+        incoming["public_comments"][0]["body"] = "The report’s old keys remain untrusted. Added a detail."
+        assert store.ingest(_compose(incoming, incoming["public_comments"], LATER, source_key="k"), LATER)
+        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=evidence), "edit", LATER)
         current = store.stories()[0]
-        assert current["updated_at"] == LATER
+        assert current["updated_at"] == EDIT  # an edit is not a newer note
         assert current["added_at"] == first["added_at"] and current["published_at"] == first["published_at"]
         assert len(current["sources"]) == 2
-        incoming["public_comments"] = []
-        incoming = _compose(incoming, [], LATER)
-        store.ingest(incoming, LATER)
-        finish_reviewed(store, store.pending(1, LATER)[0], analysis(), "removed", LATER, input_chars=4000)
-        assert len(store.stories()[0]["sources"]) == 1
-        assert store.stories()[0]["updated_at"] == LATER
+        store.ingest(_compose(incoming, [], LATER, source_key="k"), LATER)
+        finish_reviewed(store, store.pending(1, LATER)[0], analysis(), "removed", LATER)
+        assert len(store.stories()[0]["sources"]) == 1 and store.stories()[0]["updated_at"] == EDIT

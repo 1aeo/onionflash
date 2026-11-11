@@ -90,9 +90,7 @@ def _archive_job(store, job, observed, reason):
     draft = json.loads(job["draft_json"]) if job["draft_json"] is not None else {}
     audit = {**record, "outcome": "superseded", "stage": job["stage"],
              "superseded_reason": reason, "superseded_at": observed, "source_envelope": envelope}
-    input_chars = envelope.get("input_chars") if envelope else (record.get("writer") or {}).get("input_chars")
-    store.record_analysis(source_row, draft, job["writer_key"], observed,
-                          input_chars=input_chars, review_record=audit)
+    store.record_analysis(source_row, draft, job["writer_key"], observed, review_record=audit)
 
 
 def _save(store, item_id, writer_key, policy_hash, stage, draft, prepared, record, observed,
@@ -154,8 +152,7 @@ def _hold(store, row, prepared, draft, writer_key, record, observed, reason):
     with store.db:
         from .candidate import assert_current
         assert_current(store.db, prepared)
-        store.record_analysis(row, draft, writer_key, observed,
-                              input_chars=prepared.get("input_chars"), review_record=record)
+        store.record_analysis(row, draft, writer_key, observed, review_record=record)
         changed = store.db.execute("""UPDATE items SET status='rejected',attempts=attempts+1,
             rejections=MAX(rejections,3),next_attempt_at=NULL,last_error=?
             WHERE id=? AND content_hash=? AND payload=? AND status='pending'""",
@@ -203,20 +200,19 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             return {**report, "status": "deferred"}
         report["writer_calls"] += json.loads(row["payload"])["kind"] != "tag"
         draft = writer.analyze(json.loads(row["payload"]))
-        record["writer"] = {"key": writer_key, "result": draft, "input_chars": config["llm"]["max_input_chars"]}
+        record["writer"] = {"key": writer_key, "result": draft}
         _save(store, row["id"], writer_key, policy, "drafted", draft, None, record, observed, prepared_at=prepared_at,
               supersede=superseded_input, reason="source or writer input changed")
     if not draft["publish"]:
         try:
-            store.finish(row, draft, writer_key, observed, input_chars=config["llm"]["max_input_chars"])
+            store.finish(row, draft, writer_key, observed)
         except (StaleCandidate, ReviewRequired):
             return {**report, "status": "stale"}
         with store.db:
             store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
         return {**report, "status": "ignored"}
     try:
-        prepared = store.prepare_candidate(row, draft, prepared_at,
-                                           input_chars=config["llm"]["max_input_chars"], review_settings=settings)
+        prepared = store.prepare_candidate(row, draft, prepared_at, review_settings=settings)
         old = json.loads(job["envelope_json"]) if job is not None and job["envelope_json"] else None
         same = old is not None and job["policy_hash"] == policy and _identity(old) == _identity(prepared)
         stage = job["stage"] if same else "review"

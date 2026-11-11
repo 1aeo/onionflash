@@ -29,7 +29,7 @@ def initialize(db) -> None:
             story_id TEXT PRIMARY KEY, revision INTEGER NOT NULL,
             locked INTEGER NOT NULL, retracted INTEGER NOT NULL,
             notice_action TEXT NOT NULL, notice_reason TEXT NOT NULL, notice_at TEXT NOT NULL,
-            held_updates INTEGER NOT NULL DEFAULT 0, last_held_at TEXT
+            held_updates INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS editorial_revisions (
             story_id TEXT NOT NULL, revision INTEGER NOT NULL,
@@ -164,8 +164,8 @@ def is_locked(db, story_id: str) -> bool:
     return bool(db.execute("SELECT 1 FROM editorial_controls WHERE story_id=? AND locked=1", (story_id,)).fetchone())
 
 
-def record_held(db, story_id: str, observed: str) -> None:
-    db.execute("UPDATE editorial_controls SET held_updates=held_updates+1,last_held_at=? WHERE story_id=?", (observed, story_id))
+def record_held(db, story_id: str) -> None:
+    db.execute("UPDATE editorial_controls SET held_updates=held_updates+1 WHERE story_id=?", (story_id,))
 
 
 def public_metadata(db, story_id: str) -> dict | None:

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from onionflash import cli
+from onionflash.comments import _compose
 from onionflash.config import load_config
 from onionflash.store import Store
 from onionflash.util import item_cluster
@@ -114,7 +115,9 @@ def test_patch_file_rejects_ambiguous_or_unbounded_input(tmp_path, body):
 
 def test_comments_do_not_split_identical_issue_grouping():
     original = item(content="Identical original issue description. " * 10)
-    first = {**original, "source_content": original["content"], "content": original["content"] + "\nFirst discussion"}
-    second = {**original, "url": "https://example.org/other-project/1", "source_content": original["content"],
-              "content": original["content"] + "\nDifferent discussion"}
+    note = {"id": "gid://gitlab/Note/1", "url": original["url"] + "#note_1", "title": "Public comment by @a",
+            "author": "a", "created_at": DATE, "body": "First discussion"}
+    first = _compose(original, [note], DATE, source_key="k")
+    second = _compose({**original, "url": "https://example.org/other-project/1"}, [{**note, "body": "Other discussion"}],
+                      DATE, source_key="k")
     assert item_cluster(first) == item_cluster(second) == item_cluster(original)

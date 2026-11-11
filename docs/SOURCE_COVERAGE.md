@@ -30,7 +30,7 @@ GraphQL discussion adapter below reads verified public notes without authenticat
 Reviewed November 10, 2026 against the configured Tor, Arti, Network Health
 Analysis, Network Health Team, Tor Browser, and Anti-Censorship Team projects.
 Anonymous GraphQL requests succeeded for all six projects. The live issue-note
-connection supports `last`/`before` pagination; it does not support a `sort`
+connection returns the newest notes with `last`; it does not support a `sort`
 argument. [GitLab documents anonymous query access, null authorization responses,
 and the `/api/graphql` endpoint](https://docs.gitlab.com/api/graphql/).
 
@@ -42,23 +42,23 @@ by this adapter. It creates a fresh public HTTP client; the transport discards
 cookies between requests and applies its normal DNS checks, timeout, retries,
 response-size bound and run deadline.
 
-Every page must explicitly match the configured project path, numeric project
+The response must explicitly match the configured project path, numeric project
 ID (when configured in the REST URL), project URL and public visibility. The
 issue identity must match and `confidential` must be exactly false. Only notes
 whose `internal` and `system` flags are both exactly false are eligible. Missing,
 null or mismatched visibility/identity is rejected; unknown note flags reject
 the snapshot before their bodies are processed. Raw responses and upstream error strings
 are never saved or logged. Notes are attributed to their authors, retain their
-own creation/edit dates and exact note URLs, and remain untrusted reports rather
-than confirmation of the underlying claim. Notes dated after the observation
-time are excluded; malformed or reversed creation/edit dates fail closed.
+creation dates and exact note URLs, and remain untrusted reports rather than
+confirmation of the underlying claim. Notes created after the response arrived
+are excluded; a malformed creation date fails closed.
 
-The default limit is 12 issues per run, four per source, two pages of 20 notes,
-12 retained comments per issue, 2,000 characters per comment and 8,000 comment
-characters per issue. The newest bounded window is refreshed after 30 minutes;
-old notes outside that window can be omitted. The `comments_truncated` field
-makes this limit explicit. Replacing a snapshot handles note edits and deletions
-within the inspected window. An unavailable or unverifiable response is not a
+The default limit is 12 issues per run, four per source, the newest 40 notes read
+in one request (system notes count toward that window), 12 retained comments per
+issue, 2,000 characters per comment and 8,000 comment characters per issue. The
+newest bounded window is refreshed after 30 minutes; old notes outside that window
+can be omitted. Replacing a snapshot handles note edits and deletions within the
+inspected window. An unavailable or unverifiable response is not a
 new snapshot: it preserves the last verified public evidence and its original
 verification time, applies bounded backoff, and leaves normal collection
 running. An unusable answer about one issue backs off only that issue; transport,
@@ -84,13 +84,17 @@ so scheduling-cache eviction or an outage cannot strip it or requeue unchanged
 content. Malformed or cold local records are skipped without marking the whole
 provider unavailable. Cache state never contains unfiltered note responses.
 
-`source_content` preserves the original issue description and source identity;
-`public_comments` records the sanitized attributed notes. Fresh REST descriptions
-retain eligible cached notes, while stale descriptions cannot roll the item
-backwards. Comment changes requeue analysis under the original issue identity;
-they never advance its source publication or update timestamp. Analyzer context
-reserves room for attributed comment bodies even with a long description. A
-separate `comments_checked_at` is observation metadata, not the event date.
+`content` keeps the issue description and `public_comments` the sanitized
+attributed notes. Fresh REST descriptions retain eligible cached notes, while
+stale descriptions cannot roll the item backwards. A new, edited or deleted note
+requeues analysis under the original issue identity without changing the issue's
+source publication or update timestamp; a reaction that only moves a note's update
+time requeues nothing. The writer sees the stored notes verbatim, newest first, as
+entries that carry their authors and creation dates, and the description fills the
+rest of its fixed input window. A story cites the earliest note stating a quote that
+the title and description do not, and only such a newly cited note moves the
+story's date, to the time the note was written. A separate `comments_checked_at` is
+observation metadata, not the event date.
 
 ### Tor Metrics timeline
 

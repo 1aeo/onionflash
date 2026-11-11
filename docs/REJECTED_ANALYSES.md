@@ -57,7 +57,7 @@ automatically using normal backoff; a malformed reply resumes it too, but counts
 toward the three failures. A retry never treats a proposed repair as approval.
 
 If an analysis record already exists for the
-current source/model/prompt/input-window key, retry preserves its complete prior value in the
+current source/model/prompt key, retry preserves its complete prior value in the
 private action audit as `superseded_analysis_key` and `superseded_analysis_json`,
 including its structured held-review audit, then removes that record so the new attempt can save its own analysis. Other
 analysis records and already accepted stories are unchanged.

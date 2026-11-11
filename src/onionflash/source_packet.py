@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 
-from .util import canonical_url, digest, format_utc, parse_utc
+from .comments import analysis_context
+from .util import canonical_url, digest
 
 
 DEFAULT_LIMITS = {"max_sources": 8, "max_source_chars": 24000, "max_passages": 64, "passage_chars": 1800}
@@ -104,32 +105,43 @@ def binding_current(db, binding: dict) -> bool:
     return item is not None and source_fingerprint(item) == binding["hash"]
 
 
+def _passages(text, size, **note):
+    """Split text into passages of at most size characters; a note's passages name it."""
+    return [{**note, "text": text[start:start + size]} for start in range(0, len(text), size) if text[start:start + size].strip()]
+
+
+def _shares(needs, floors, budget):
+    """Split budget smallest need first, so a source that needs less leaves the rest to the
+    others. A source with a floor goes first, gets at least it and takes what the others
+    leave; every source keeps two."""
+    shares, order = [0] * len(needs), sorted(range(len(needs)), key=lambda index: (not floors[index], needs[index]))
+    for rank, index in enumerate(order):
+        later = len(needs) - rank - 1
+        shares[index] = min(needs[index], max(budget // (later + 1), min(floors[index], budget - 2 * later)))
+        budget -= shares[index]
+    if order and floors[order[0]]:
+        shares[order[0]] += min(needs[order[0]] - shares[order[0]], budget)
+    return shares
+
+
 def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str | None, settings: dict | None):
     limits = {key: (settings or {}).get(key, value) for key, value in DEFAULT_LIMITS.items()}
-    if any(type(value) is not int or value < 1 for value in limits.values()):
-        raise ValueError("Review source limits must be positive integers")
     missing, bindings, units, truncated = [], {}, [], False
     required_ids = {incoming["id"], writer_id}
     # Legacy grouped stories may predate writer provenance. Their complete
     # collected source set can still support a fresh review of the final prose;
     # every source then becomes required, with the same configured bounds.
     require_all = writer_id is None
-    # Incoming evidence and the retained prose writer come first, so old optional
-    # citation links cannot consume their context allowance.
-    references = list(payload["sources"])
-    references.sort(key=lambda source: (source.get("source_item_id", source.get("id")) not in required_ids,
-                                        source.get("source_item_id", source.get("id")) != writer_id,
-                                        source["url"]))
+    # Required sources come first, so the max_sources cap below drops optional links before them.
+    references = sorted(payload["sources"], key=lambda source: (
+        source.get("source_item_id", source.get("id")) not in required_ids,
+        source.get("source_item_id", source.get("id")) != writer_id, source["url"]))
     public_urls = {source["url"] for source in public["sources"]}
-    seen = set()
     for source in references:
         source_id = source.get("source_item_id", source.get("id"))
         required = require_all or source_id in required_ids
         if not required and source["url"] not in public_urls:
             continue
-        if source["url"] in seen:
-            continue
-        seen.add(source["url"])
         if source_id == incoming["id"]:
             loaded = (incoming, [{"table": "items", "key": incoming["id"], "hash": source_fingerprint(incoming)}], "current", None)
         else:
@@ -147,68 +159,55 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
         if captured:
             unit["captured_at"] = captured
         if source.get("source_item_id"):
-            note = next((note for note in item.get("public_comments", []) if note.get("url") == source["url"]), None)
-            if note is None or not isinstance(note.get("body"), str) or not note["body"].strip():
+            # A cited note is supplied with the text of its parent issue.
+            if not any(note["url"] == source["url"] for note in item.get("public_comments", [])):
                 truncated = True
                 if required:
                     missing.append(source["url"])
-                continue
-            # All available verified notes are supplied under their parent
-            # source, independently of which quotes the writer selected.
             continue
         if not isinstance(body, str) or not (body.strip() or item["title"].strip()):
             truncated = True
             if required:
                 missing.append(source["url"])
             continue
-        # Metadata is bounded separately from evidence passages.
-        truncated |= any(isinstance(value, str) and key != "url" and len(value) > 500 for key, value in unit.items())
-        unit = {key: value[:500] if isinstance(value, str) and key != "url" else value for key, value in unit.items()}
-        units.append((unit, item, required, source_bindings))
+        # First the text a writer sees for this item: its title, every note and its
+        # description window; then the rest of the description. A share too small
+        # for the whole source cuts description text before any note.
+        description, _ = analysis_context(item)
+        size = limits["passage_chars"]
+        view = _passages(item["title"], size) + [
+            passage for note in item.get("public_comments", [])
+            for passage in _passages(note["body"], size, author=note["author"], created_at=note["created_at"], url=note["url"])
+        ] + _passages(description, size)
+        units.append((unit, view + _passages(body[len(description):], size), required, source_bindings,
+                      view if writer_id and item.get("id") == writer_id else []))
     if writer_id and not any(ref.get("source_item_id", ref.get("id")) == writer_id for ref in references):
         missing.append("retained-writer-source-unavailable")
     cap = min(limits["max_sources"], limits["max_passages"] // 2, limits["max_source_chars"] // 2)
-    for unit, item, required, _ in units[cap:]:
+    for unit, _, required, *_ in units[cap:]:
         if required:
             missing.append(unit["url"])
     truncated |= len(units) > cap
     units = units[:cap]
-    sources, note_updates, remaining_chars, remaining_passages = [], {}, limits["max_source_chars"], limits["max_passages"]
-    for index, (unit, item, required, source_bindings) in enumerate(units):
+    # The source that wrote the story keeps at least the text its writer saw, and the
+    # room the others leave. They share passages, then characters, each smallest need
+    # first, so a source with many short notes keeps them while longer ones fill the
+    # characters.
+    counts = _shares([len(unit[1]) for unit in units], [len(unit[4]) for unit in units], limits["max_passages"])
+    chars = _shares([sum(len(passage["text"]) for passage in unit[1][:count]) for unit, count in zip(units, counts)],
+                    [sum(len(passage["text"]) for passage in unit[4]) for unit in units], limits["max_source_chars"])
+    sources = []
+    for index, (unit, evidence, _, source_bindings, _) in enumerate(units):
         for binding in source_bindings:
             bindings[(binding["table"], binding["key"])] = binding
+        passages, left = [], chars[index]
+        for passage in evidence[:counts[index]]:
+            if left <= 0:
+                break
+            passages.append({**passage, "text": passage["text"][:left]})
+            left -= len(passages[-1]["text"])
+        truncated |= passages != evidence
         source_id = f"S{index + 1}"
-        allowance = remaining_chars // (len(units) - index)
-        passage_allowance = remaining_passages // (len(units) - index)
-        title = unit["title"][:min(limits["passage_chars"], max(1, allowance // 4))]
-        passages = [{"id": source_id + ":P1", "text": title}] if title.strip() else []
-        available = min(allowance - len(title), (passage_allowance - 1) * limits["passage_chars"])
-        from .comments import analysis_context
-        body = item.get("source_content", item.get("content"))
-        bounded, notes = analysis_context(item, available)
-        from .comments import parse_note_id
-        for note in notes:
-            try:
-                identifier = parse_note_id(note["id"])
-                created, updated = format_utc(parse_utc(note["created_at"])), format_utc(parse_utc(note["updated_at"]))
-                if (identifier is not None and created <= updated and canonical_url(note["url"]) ==
-                        canonical_url(item["url"]).split("#", 1)[0] + "#note_" + identifier):
-                    key = item.get("id") or unit["url"]
-                    note_updates[key] = max(note_updates.get(key, updated), updated)
-            except (KeyError, TypeError, ValueError):
-                continue
-        supplied_description = len(bounded) if not notes else len(bounded.split("\n\nPublic issue comments", 1)[0])
-        all_notes = [note for note in item.get("public_comments", []) if note.get("body")]
-        truncated |= (supplied_description < len(body) or len(notes) < len(all_notes)
-                      or any(len(note["body"]) < len(original["body"]) for note, original in zip(notes, all_notes)))
-        for offset in range(0, len(bounded), limits["passage_chars"]):
-            text = bounded[offset:offset + limits["passage_chars"]]
-            if text.strip():
-                passages.append({"id": f"{source_id}:P{len(passages) + 1}", "text": text})
-        if body and not bounded and required:
-            missing.append(unit["url"])
-        truncated |= len(title) < len(unit["title"])
-        remaining_chars -= sum(len(p["text"]) for p in passages)
-        remaining_passages -= len(passages)
-        sources.append({"id": source_id, **unit, "passages": passages})
-    return {"sources": sources, "missing_sources": list(dict.fromkeys(missing)), "truncated": truncated}, list(bindings.values()), note_updates
+        sources.append({"id": source_id, **unit, "passages": [
+            {"id": f"{source_id}:P{number}", **passage} for number, passage in enumerate(passages, 1)]})
+    return {"sources": sources, "missing_sources": list(dict.fromkeys(missing)), "truncated": truncated}, list(bindings.values())

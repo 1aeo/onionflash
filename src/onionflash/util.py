@@ -214,10 +214,7 @@ def item_cluster(item: dict) -> str:
             and re.search(r"\b" + _PRODUCT_NAMES[product] + r"[- ](?:version\s+)?$", title[: match.start()])
         ):
             return f"release:{product}:{match.group(1)}"
-    # Related issues can have different discussions. Comments enrich analysis,
-    # but must not split an existing identical-description incident grouping.
-    original = item.get("source_content") if item.get("kind") == "gitlab_issue" else None
-    body = re.sub(r"\s+", " ", original if isinstance(original, str) else item["content"]).strip().lower()
+    body = re.sub(r"\s+", " ", item["content"]).strip().lower()
     if len(body) >= 180 and item.get("kind") in {"gitlab_issue", "gitlab_mr"}:
         clean_title = re.sub(r"\s+", " ", title).strip()
         clean_title = re.sub(
