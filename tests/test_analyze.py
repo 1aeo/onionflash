@@ -51,10 +51,17 @@ def test_non_finite_numbers_are_invalid_model_json():
             _json_object(text)
 
 
-def test_ignore_decision_makes_one_call_and_skips_field_checks(monkeypatch):
+def test_historical_ignore_decisions_remain_readable():
     ignore = analysis(publish=False, title="x" * 150, evidence=["not in the source at all"])
+    assert validate_analysis(ignore, item()) == ignore
+
+
+def test_writer_cannot_silently_skip_a_source_before_editorial_review(monkeypatch):
+    ignore = analysis(publish=False, title="", summary="", why_it_matters="", evidence=[], products=[], tags=[])
     llm = analyzer(monkeypatch, completion(ignore))
-    assert llm.analyze(item())["publish"] is False
+    with pytest.raises(AnalysisError, match="draft for publication review") as caught:
+        llm.analyze(item())
+    assert not caught.value.retryable
     assert len(llm.client.requests) == 1
 
 
@@ -134,12 +141,13 @@ def test_evidence_diagnostics_distinguish_short_quotes_from_absent_quotes():
     assert validate_analysis(tag_notice(tag), tag)["evidence"] == ["v1"]
 
 
-def test_writer_request_advertises_the_existing_evidence_length_floor(monkeypatch):
+def test_writer_request_requires_a_draft_and_the_existing_evidence_length_floor(monkeypatch):
     llm = analyzer(monkeypatch, completion(analysis()))
     llm.analyze(item())
     request = llm.client.requests[0][1]
-    rule = request["response_format"]["json_schema"]["schema"]["properties"]["evidence"]["items"]
-    assert rule["minLength"] == MIN_EVIDENCE_CHARS
+    fields = request["response_format"]["json_schema"]["schema"]["properties"]
+    assert fields["publish"]["enum"] == [True]
+    assert fields["evidence"]["items"]["minLength"] == MIN_EVIDENCE_CHARS
 
 
 def test_evidence_enum_is_derived_from_the_exact_supplied_context():

@@ -228,9 +228,11 @@ while taking their upload snapshot.
 
 ## Reliability and editorial behavior
 
-Automatic model-written stories publish only after a separate model call approves
-the exact final story against numbered source passages; a hold enters the rejected
-queue. See [final review, configuration and evaluation](docs/FINAL_REVIEW.md).
+The writer drafts a faithful source account; the reviewer decides whether it adds
+worthwhile news. Automatic stories need a source-grounded critique and fresh final
+verification of the exact candidate. Routine and duplicate items are skipped;
+unsupported important claims are held. See
+[selection, final review and evaluation](docs/FINAL_REVIEW.md).
 
 - Public HTTP and private inference share the same transport helper. It validates
   addresses at TCP connection time, pins connections to vetted IPs while retaining
@@ -256,8 +258,8 @@ queue. See [final review, configuration and evaluation](docs/FINAL_REVIEW.md).
   an audit, not a general runtime analysis cache. The application makes one model
   request at a time, within the existing run budget, and preserves the analysis
   time reserve.
-- Explicit `kind = "tag"` streams produce attributed tag notices without an LLM
-  request. These notices remain `tagged`, have a fixed queue-priority
+- Explicit `kind = "tag"` streams produce attributed drafts locally, then use the
+  same publication reviews. These notices remain `tagged`, have a fixed queue-priority
   floor, and cannot replace a richer announcement already grouped with that
   version. Repeated identical model labels are normalized rather than retried;
   invalid labels and unsupported evidence are still rejected.

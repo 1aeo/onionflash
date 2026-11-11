@@ -80,6 +80,8 @@ def _operator_parsers(commands) -> None:
         if name in {"retry", "dismiss"}:
             action.add_argument("--expect-hash", required=True, help="Current content_hash returned by rejected show")
             action.add_argument("--reason", required=True, help="Private operator reason for this action")
+        if name == "retry":
+            action.add_argument("--reconsider-ignored", action="store_true", help="Explicitly reconsider one inspected ignored item")
 
 
 def _patch_file(path: Path) -> dict:
@@ -131,7 +133,7 @@ def _operator_command(args, config: dict, store: Store) -> dict:
         return rejection.show_item(store, args.item)
     options = {"expected_hash": args.expect_hash, "reason": args.reason}
     if args.action == "retry":
-        return rejection.retry_item(store, args.item, llm=config["llm"], **options)
+        return rejection.retry_item(store, args.item, llm=config["llm"], reconsider_ignored=args.reconsider_ignored, **options)
     return rejection.dismiss_item(store, args.item, **options)
 
 

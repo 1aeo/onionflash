@@ -161,11 +161,10 @@ publication are documented in the deployment repository.
    latency reporting. Keep source timestamps distinct from observation and
    publication time. Accuracy and preserved articles take priority over latency analytics.
 
-Tag publication and scheduler jitter are addressed in this update rather than
-left as roadmap items. Tags receive deterministic attributed notices without
-inference and remain `tagged` until an actual release announcement supplies that
-context. Harmless duplicate model labels are normalized; invalid labels and
-unsupported evidence remain rejected.
+Tag drafts are deterministic and remain `tagged` until an actual release
+announcement supplies that context. They still need the
+[editorial and factual publication reviews](FINAL_REVIEW.md). Harmless duplicate
+model labels are normalized; invalid labels and unsupported evidence are rejected.
 
 Personal push/email alerts remain intentionally deferred. Storage-bucket isolation
 is a deployment configuration choice; see the deployment repository's guide.

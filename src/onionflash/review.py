@@ -10,7 +10,7 @@ from .candidate import SEMANTIC_FIELDS as EDITABLE
 from .render import _prepare_story
 from .util import digest
 
-REVIEW_VERSION = "onionflash-review-4"
+REVIEW_VERSION = "onionflash-review-5"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details", "news_value", "new_information")
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
@@ -89,6 +89,9 @@ operational_advice: instructions, necessity or urgency for operators require exp
 source support for that actor and action. Do not invent configuration edits, upgrades,
 workarounds, key changes, commands or required mitigations. Empty why_it_matters is
 valid; remove unsupported impact and filler rather than inventing importance.
+The existence of a fix does not itself support generic benefits to network stability,
+reliability, security or privacy. An editorial label does not establish extra urgency.
+Remove such an inferred impact sentence unless the packet explicitly supports it.
 If there is no operator instruction, this criterion passes. A faithful restatement
 of an explicit source concern or requested software change passes; repeating it
 does not create an operator instruction. For example, source 'remove X from source'

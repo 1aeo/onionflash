@@ -13,6 +13,8 @@ maintenance, template checklists, acknowledgments, unsupported speculation and
 repeated quotations do not merit standalone news. A later timestamp or another
 distribution channel does not make an old event new.
 
+The writer summarizes the source without selecting news. Its `publish=true` field
+submits a draft for review; only the reviewer decides news value and novelty.
 The writer selects literal evidence excerpts from its exact input. This prevents
 quote-copying errors; it does not establish that the excerpts support every
 claim. The reviewer therefore receives the full bounded numbered source packet,
@@ -64,8 +66,9 @@ editorial handling, rather than published as another incident headline.
 A normal publication uses one writer request and two review requests. A repair
 uses the same number: writer, critique/repair, verification. Deterministic tag
 text skips the writer call but still needs both reviews; a tag is not an official
-release announcement. An ignored draft needs no review, and a first-round skip
-or hold ends without final verification.
+release announcement. A first-round skip or hold ends without final verification.
+Historical ignored drafts remain readable; new writer requests cannot silently
+skip a source before editorial review.
 
 Completed stages survive interruptions. Transport failures use the normal
 backoff; malformed replies count against the item rather than retrying forever.

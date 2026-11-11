@@ -11,8 +11,9 @@ publish a story, retract a story or unlock an editorial correction.
 Retry and dismiss also accept a `pending` item that has already failed: its
 attempt count must be positive and its saved error must be nonblank. This lets
 an operator act on a reviewed failure without waiting for terminal rejection.
-New or reset pending items, and published, ignored or already dismissed items,
-cannot be retried or dismissed through these controls.
+New or reset pending items, and published or already dismissed items, cannot be
+retried or dismissed through these controls. Ignored items require the explicit
+reconsideration option described below; ordinary retry and dismiss refuse them.
 
 ## Inspect
 
@@ -32,8 +33,8 @@ a final-review job exists, its stage, current candidate, numbered source packet
 (for checking references such as `S1:P3`) and latest per-criterion verdict. That
 verdict's `candidate_hash` names the text it evaluated; during `verify`, the
 candidate shown is a repair that has not been verified yet. The output is private
-operator data. `show` also accepts an explicit pending item ID; inspect its
-attempt count and saved error before deciding whether to intervene.
+operator data. `show` also accepts an explicit pending or ignored item ID;
+inspect the saved source and decision before deciding whether to intervene.
 
 ## Retry one failed revision
 
@@ -60,6 +61,27 @@ current source/model/prompt/input-window key, retry preserves its complete prior
 private action audit as `superseded_analysis_key` and `superseded_analysis_json`,
 including its structured held-review audit, then removes that record so the new attempt can save its own analysis. Other
 analysis records and already accepted stories are unchanged.
+
+## Reconsider one ignored item
+
+When inspection identifies worthwhile news previously ignored by the selection
+policy, explicitly queue that saved revision for another decision:
+
+```sh
+onionflash rejected show --config config.toml --item ITEM_ID
+onionflash rejected retry --config config.toml --item ITEM_ID \
+  --reconsider-ignored --expect-hash CURRENT_CONTENT_HASH \
+  --reason "Reviewed the saved source after a selection-policy correction"
+```
+
+The flag applies only to retry and permits `ignored` as an additional state.
+It does not permit published, dismissed, new pending or reset pending items.
+Repeating the command immediately after a successful retry is refused. The
+existing hash, readable-source and queue-state checks still apply, and the
+private audit records the prior ignored state, reason and superseded analysis.
+Only the selected item is queued; no source content or timestamps are invented,
+and no historical items are reset automatically. The normal writer and review
+pipeline decides whether to publish it and may ignore it again.
 
 ## Dismiss one failed revision
 

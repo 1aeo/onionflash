@@ -36,6 +36,15 @@ def failed_pending(store, *, terminal=False):
     return source, dict(store.db.execute("SELECT * FROM items WHERE id=?", (source["id"],)).fetchone())
 
 
+def ignored(store, number=0):
+    source = item(url=f"https://example.org/ignored/{number}")
+    store.ingest(source, DATE)
+    row = store.pending(1, DATE)[0]
+    result = analysis(publish=False, title="", summary="", why_it_matters="", products=[], tags=[], evidence=[])
+    finish_reviewed(store, row, result, cache_key(row, DEFAULTS["llm"]), DATE)
+    return source, dict(store.db.execute("SELECT * FROM items WHERE id=?", (source["id"],)).fetchone())
+
+
 def analysis_result(store, key):
     """Inspect the stored analysis audit directly; runtime analysis has no cache."""
     row = store.db.execute("SELECT result FROM analyses WHERE cache_key=?", (key,)).fetchone()
@@ -345,8 +354,8 @@ def test_concurrent_pending_queue_change_is_not_overwritten(store, monkeypatch, 
     _, row = failed_pending(store)
     original = rejection._checked
     database = store.db.execute("PRAGMA database_list").fetchone()[2]
-    def changed_after_read(db, item_id, expected_hash):
-        captured = original(db, item_id, expected_hash)
+    def changed_after_read(db, item_id, expected_hash, **kwargs):
+        captured = original(db, item_id, expected_hash, **kwargs)
         with sqlite3.connect(database) as other:
             other.execute(f"UPDATE items SET {change} WHERE id=?", (item_id,))
         return captured
@@ -359,3 +368,110 @@ def test_concurrent_pending_queue_change_is_not_overwritten(store, monkeypatch, 
     current = dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone())
     assert current["content_hash"] == row["content_hash"] and current["payload"] == row["payload"]
     assert current["status"] != "dismissed" and actions(store) == []
+
+
+def test_ignored_reconsideration_is_explicit_audited_and_one_item_only(store):
+    _, row = ignored(store)
+    _, other = ignored(store, 1)
+    key = cache_key(row, DEFAULTS["llm"])
+    with pytest.raises(ValueError, match="reconsider-ignored"):
+        rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DEFAULTS["llm"], DATE)
+    assert actions(store) == []
+    result = rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DEFAULTS["llm"], DATE,
+                                  reconsider_ignored=True)
+    assert result["status"] == "pending" and store.stories() == []
+    current = dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone())
+    assert current["attempts"] == current["rejections"] == 0
+    assert current["last_error"] is None and current["next_attempt_at"] is None
+    for field in ("payload", "content_hash", "source_id", "url", "first_seen", "last_seen", "story_id"):
+        assert current[field] == row[field]
+    assert dict(store.db.execute("SELECT * FROM items WHERE id=?", (other["id"],)).fetchone()) == other
+    audit = actions(store)[0]
+    assert audit["before_status"] == "ignored" and audit["action"] == "retry"
+    assert audit["reason"] == "Reviewed selection"
+    saved = json.loads(audit["superseded_analysis_json"])
+    assert json.loads(saved["result"])["publish"] is False and saved["source_payload"] == row["payload"]
+    assert audit["superseded_analysis_key"] == key and analysis_result(store, key) is None
+    with pytest.raises(ValueError, match="previously failed pending"):
+        rejection.retry_item(store, row["id"], row["content_hash"], "Duplicate retry", DEFAULTS["llm"], DATE,
+                              reconsider_ignored=True)
+    assert len(actions(store)) == 1
+
+
+@pytest.mark.parametrize("status", ["pending", "published", "dismissed"])
+def test_reconsider_flag_does_not_allow_new_pending_or_other_completed_states(store, status):
+    _, row = ignored(store)
+    with store.db:
+        store.db.execute("UPDATE items SET status=? WHERE id=?", (status, row["id"]))
+    with pytest.raises(ValueError, match="previously failed pending"):
+        rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DEFAULTS["llm"], DATE,
+                              reconsider_ignored=True)
+    assert store.db.execute("SELECT status FROM items WHERE id=?", (row["id"],)).fetchone()[0] == status
+    assert actions(store) == []
+
+
+@pytest.mark.parametrize("problem", ["stale", "cold", "reason", "audit"])
+def test_ignored_reconsideration_retains_existing_guards_and_transactional_audit(store, problem):
+    _, row = ignored(store)
+    expected, reason = row["content_hash"], "Reviewed selection"
+    if problem == "stale":
+        expected = "f" * 64
+    elif problem == "cold":
+        payload = json.loads(row["payload"])
+        payload.pop("content")
+        with store.db:
+            store.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps(payload), row["id"]))
+    elif problem == "reason":
+        reason = ""
+    else:
+        with store.db:
+            rejection._initialize(store.db)
+            store.db.execute("CREATE TRIGGER fail_audit BEFORE INSERT ON rejection_actions BEGIN SELECT RAISE(ABORT,'unavailable'); END")
+    before = dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone())
+    previous = analysis_result(store, cache_key(row, DEFAULTS["llm"]))
+    with pytest.raises((ValueError, sqlite3.IntegrityError)):
+        rejection.retry_item(store, row["id"], expected, reason, DEFAULTS["llm"], DATE, reconsider_ignored=True)
+    assert dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()) == before
+    assert analysis_result(store, cache_key(row, DEFAULTS["llm"])) == previous
+    assert actions(store) == []
+
+
+def test_ignored_reconsideration_rechecks_concurrent_state(store, monkeypatch):
+    _, row = ignored(store)
+    original = rejection._checked
+    database = store.db.execute("PRAGMA database_list").fetchone()[2]
+    def changed_after_read(db, item_id, expected_hash, **kwargs):
+        captured = original(db, item_id, expected_hash, **kwargs)
+        with sqlite3.connect(database) as other:
+            other.execute("UPDATE items SET status='published' WHERE id=?", (item_id,))
+        return captured
+    monkeypatch.setattr(rejection, "_checked", changed_after_read)
+    with pytest.raises(ValueError, match="changed during"):
+        rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DEFAULTS["llm"], DATE,
+                              reconsider_ignored=True)
+    assert store.db.execute("SELECT status FROM items WHERE id=?", (row["id"],)).fetchone()[0] == "published"
+    assert actions(store) == []
+
+
+def test_cli_reconsider_flag_is_available_only_on_retry(store, tmp_path, monkeypatch, capsys):
+    from onionflash import cli
+    _, row = ignored(store)
+    path = tmp_path / "config.toml"
+    path.write_text('''[storage]
+database="queue.sqlite3"
+output_dir="public"
+[[sources]]
+id="test"
+url="https://example.org/feed.xml"
+''')
+    monkeypatch.setattr(cli.Analyzer, "analyze", lambda *_args: pytest.fail("Retry must not call a model"))
+    options = ["--config", str(path), "--item", row["id"], "--expect-hash", row["content_hash"], "--reason", "Reviewed selection"]
+    assert cli.main(["rejected", "retry", *options]) == 2
+    assert "reconsider-ignored" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as rejected_flag:
+        cli.main(["rejected", "dismiss", *options, "--reconsider-ignored"])
+    assert rejected_flag.value.code == 2
+    capsys.readouterr()
+    assert cli.main(["rejected", "retry", *options, "--reconsider-ignored"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "pending"
+    assert actions(store)[0]["before_status"] == "ignored"

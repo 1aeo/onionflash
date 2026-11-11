@@ -484,6 +484,38 @@
           ]
         }
       ]
+    },
+    "new-version-tag": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/d1275b453cf50694035810c0",
+          "title": "tor-1.2.5",
+          "kind": "tag",
+          "authority": "official",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "The upstream tag feed lists tor-1.2.5. No release announcement is supplied."
+          ]
+        }
+      ]
+    },
+    "tag-of-covered-release": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/15b25034af05ec8925091056",
+          "title": "tor-1.2.3",
+          "kind": "tag",
+          "authority": "official",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "The upstream tag feed lists tor-1.2.3. No release announcement is supplied."
+          ]
+        }
+      ]
     }
   },
   "cases": [
@@ -1269,6 +1301,76 @@
       "coverage_set": "untrusted-background",
       "unsupported": [
         "is confirmed compromised"
+      ]
+    },
+    {
+      "id": "new-version-tag",
+      "packet": "new-version-tag",
+      "candidate": {
+        "id": "d1275b453cf50694035810c0",
+        "title": "Tor tag observed: tor-1.2.5",
+        "summary": "The upstream feed lists the tag “tor-1.2.5”. This notice records the upstream tag entry linked below.",
+        "why_it_matters": "",
+        "category": "release",
+        "state": "tagged",
+        "confidence": "reported",
+        "tags": [
+          "release"
+        ]
+      },
+      "expected": "approve",
+      "coverage": [
+        "news_value",
+        "new_information",
+        "status"
+      ]
+    },
+    {
+      "id": "tag-of-covered-release",
+      "packet": "tag-of-covered-release",
+      "candidate": {
+        "id": "15b25034af05ec8925091056",
+        "title": "Tor tag observed: tor-1.2.3",
+        "summary": "The upstream feed lists the tag “tor-1.2.3”. This notice records the upstream tag entry linked below.",
+        "why_it_matters": "",
+        "category": "release",
+        "state": "tagged",
+        "confidence": "reported",
+        "tags": [
+          "release"
+        ]
+      },
+      "expected": "skip",
+      "coverage": [
+        "news_value",
+        "new_information",
+        "status"
+      ],
+      "coverage_set": "release-covered"
+    },
+    {
+      "id": "inferred-release-benefits",
+      "packet": "empty-impact-release",
+      "candidate": {
+        "id": "5701d2155a82f85345752a36",
+        "title": "Tor 1.2.4 released",
+        "summary": "The Tor Project announced stable release 1.2.4 and made its release files available.",
+        "why_it_matters": "This release is critical to maintain network stability and prevent widespread service disruption.",
+        "category": "release",
+        "tags": [
+          "release"
+        ],
+        "state": "released",
+        "confidence": "confirmed"
+      },
+      "expected": "not_approve",
+      "coverage": [
+        "source_support",
+        "operational_advice"
+      ],
+      "unsupported": [
+        "critical to maintain network stability",
+        "prevent widespread service disruption"
       ]
     }
   ],
