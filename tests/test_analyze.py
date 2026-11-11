@@ -8,7 +8,7 @@ import json
 
 import pytest
 
-from onionflash.analyze import AnalysisError, Analyzer, MIN_EVIDENCE_CHARS, _writer_schema, tag_notice, validate_analysis
+from onionflash.analyze import AnalysisError, Analyzer, MAX_EVIDENCE_CHOICES, MIN_EVIDENCE_CHARS, _writer_schema, tag_notice, validate_analysis
 from onionflash.config import DEFAULTS
 from onionflash.store import Store
 from onionflash.transport import FetchError, Response
@@ -248,6 +248,17 @@ def test_no_qualifying_literal_excerpt_fails_closed_without_a_request(monkeypatc
 def test_casefold_expansion_cannot_create_an_impossible_enum_choice(text):
     with pytest.raises(AnalysisError, match="no qualifying literal evidence"):
         _writer_schema({"title": text, "content": ""})
+
+
+def test_evidence_grammar_is_bounded_across_a_full_many_line_input():
+    content = "".join(f"row-{index:04d}\n" for index in range(1550)) + "Final comment"
+    assert len(content) <= DEFAULTS["llm"]["max_input_chars"]
+    choices = _writer_schema({"title": "Source title", "content": content})["properties"]["evidence"]["items"]["enum"]
+    assert len(choices) == MAX_EVIDENCE_CHOICES
+    assert choices[0] == "Source title" and choices[-1] == "Final comment"
+    assert all(choice == "Source title" or choice in content for choice in choices)
+    assert any("row-07" in choice for choice in choices)
+    assert sum(map(len, choices)) <= MAX_EVIDENCE_CHOICES * 500
 
 
 def test_hedged_issue_wording_is_not_a_completed_action():

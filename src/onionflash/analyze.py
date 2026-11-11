@@ -14,6 +14,7 @@ from .schema import CATEGORIES, PRIORITIES, CONFIDENCES, STATES, PRODUCTS
 
 PROMPT_VERSION = "onionflash-8-draft"
 MIN_EVIDENCE_CHARS = 8
+MAX_EVIDENCE_CHOICES = 128
 SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -101,8 +102,7 @@ Copy punctuation and formatting literally: keep Markdown **emphasis** and
 `code` delimiters, and any > prefixes inside a quoted email excerpt. Do not remove
 formatting, substitute single quotes for double quotes, paraphrase, insert ellipses,
 or stitch together separate source spans. JSON-escape double quotes instead of changing
-them. Prefer a shorter excerpt within one source line when a longer one crosses email
-quotation prefixes. Do not generate URLs or claim any additional source.
+them. Do not generate URLs or claim any additional source.
 Return only the requested JSON object, with no Markdown or prose around it.
 """
 
@@ -469,6 +469,11 @@ def _writer_schema(bounded: dict) -> dict:
     excerpts = list(dict.fromkeys(excerpts))
     if not excerpts:
         raise AnalysisError("Source has no qualifying literal evidence excerpt")
+    if len(excerpts) > MAX_EVIDENCE_CHOICES:
+        # Bound grammar size while retaining options throughout the input,
+        # including the first title and the last supplied comment.
+        excerpts = [excerpts[index * (len(excerpts) - 1) // (MAX_EVIDENCE_CHOICES - 1)]
+                    for index in range(MAX_EVIDENCE_CHOICES)]
     schema = copy.deepcopy(SCHEMA)
     schema["properties"]["evidence"]["items"]["enum"] = excerpts
     return schema
