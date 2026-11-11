@@ -92,3 +92,12 @@ def test_verified_repair_that_keeps_flagged_wording_is_a_false_approval(tmp_path
         result = module.evaluate(config, selected, output, verify_repairs=True)
         assert (result["repairs_verified"], result["false_approvals"], result["matched"]) == (1, false_approvals, 1 - false_approvals)
         assert json.loads(output.read_text().splitlines()[0])["kept_unsupported"] == kept
+
+
+def test_repair_verification_refuses_a_negative_case_without_its_unsupported_wording(tmp_path):
+    module = evaluator()
+    config = copy.deepcopy(DEFAULTS)
+    config["storage"]["output_dir"] = str(tmp_path / "public")
+    case = dict(next(c for c in corpus() if c["id"] == "bastet-original"), unsupported=[])
+    with pytest.raises(ValueError, match="Invalid or duplicate evaluation case"):
+        module.evaluate(config, [case], tmp_path / "report.jsonl", verify_repairs=True)

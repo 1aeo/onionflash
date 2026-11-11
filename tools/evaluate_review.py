@@ -67,7 +67,10 @@ def evaluate(config, cases, output, *, rounds=1, verify_repairs=False, deadline=
         raise ValueError("Use 1–3 rounds and 1–100 cases")
     identities = set()
     for case in cases:
-        if case["id"] in identities or case["expected"] not in {"approve", "not_approve"}:
+        # A negative case without the wording its repair must remove would score any
+        # verified repair as a correct refusal.
+        if (case["id"] in identities or case["expected"] not in {"approve", "not_approve"}
+                or (verify_repairs and case["expected"] == "not_approve" and not case.get("unsupported"))):
             raise ValueError("Invalid or duplicate evaluation case")
         identities.add(case["id"])
     output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
