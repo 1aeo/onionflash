@@ -3,6 +3,7 @@
 Only sanitized, explicitly public non-system notes cross the response boundary.
 The bounded cache holds scheduling metadata, never raw GraphQL responses. Existing
 published issues rotate through a bounded query, independently of REST lookback.
+REST activity on an issue of any status requests a check.
 """
 
 from __future__ import annotations
@@ -33,6 +34,10 @@ QUERY = """query PublicIssueNotes($project: ID!, $iid: String!, $size: Int!, $be
 
 class CommentError(Exception):
     """Messages are fixed strings; never include upstream bodies or error text."""
+
+
+class EndpointError(CommentError):
+    """The answer is unusable for every issue of the project, not just this one."""
 
 
 def parse_note_id(value):
@@ -105,15 +110,15 @@ def fetch_comments(client, source, item, settings, *, observed=None):
                                   json_body={"query": QUERY, "variables": {
                                       "project": project, "iid": iid, "size": settings["page_size"], "before": before}})
         if canonical_url(response.url) != endpoint:
-            raise CommentError("GraphQL endpoint redirected")
+            raise EndpointError("GraphQL endpoint redirected")
         data = response.json()
         if not isinstance(data, dict) or data.get("errors") or not isinstance(data.get("data"), dict):
-            raise CommentError("GraphQL response unavailable")
+            raise EndpointError("GraphQL response unavailable")
         obj = data["data"].get("project")
         if (not isinstance(obj, dict) or obj.get("visibility") != "public"
                 or obj.get("fullPath") != project or obj.get("webUrl") != origin + "/" + project
                 or (project_id.isdigit() and obj.get("id") != "gid://gitlab/Project/" + project_id)):
-            raise CommentError("Public project identity not verified")
+            raise EndpointError("Public project identity not verified")
         issue = obj.get("issue")
         if (not isinstance(issue, dict) or issue.get("confidential") is not False
                 or issue.get("iid") != iid or not isinstance(issue.get("webUrl"), str)
@@ -236,37 +241,38 @@ def _compose(item, notes, checked, truncated=False, *, source_key=None):
     return result
 
 
-def merge_cached_comments(store, item, source=None):
-    """Keep a verified bounded snapshot while REST refreshes the description."""
-    if item.get("kind") != "gitlab_issue" or source is None or not source.get("gitlab_project"):
+def merge_cached_comments(store, item, source, observed=None):
+    """Keep the verified snapshot on a REST refresh; Store.ingest rejects stale revisions.
+
+    GitLab updates an issue when a note is added, but the kept snapshot leaves the
+    content hash unchanged. So while comments are enabled (observed is set), REST
+    activity after the last check, or an issue without a snapshot, requests a
+    check whatever the issue's status.
+    """
+    if item.get("kind") != "gitlab_issue" or not source.get("gitlab_project"):
         return item
-    try:
-        key = _source_key(source)
-        _issue_identity(source, item)
-    except (CommentError, ValueError):
-        return item
-    row = store.db.execute("SELECT payload FROM items WHERE url=?", (item["url"],)).fetchone()
+    row = store.db.execute("SELECT id,payload FROM items WHERE url=?", (item["url"],)).fetchone()
     if row is None:
         return item
-    try:
-        old = json.loads(row["payload"])
-        if (not isinstance(old, dict) or old.get("comments_source_key") != key
-                or not isinstance(old.get("public_comments"), list)):
-            return item
-        checked = timestamp(old.get("comments_checked_at"))
-        # Never make an older REST response appear current by combining it with
-        # newer notes. A retained snapshot is historical, not freshly verified.
-        if item["updated_at"] < old["updated_at"]:
-            return _compose(old, old["public_comments"], checked,
-                            old.get("comments_truncated", False), source_key=key)
-        return _compose(item, old["public_comments"], checked,
-                        old.get("comments_truncated", False), source_key=key)
-    except (CommentError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
+    old, key = json.loads(row["payload"]), _source_key(source)
+    current = old.get("comments_source_key") == key
+    if (observed and source.get("comments_enabled", True) and (not current or item["updated_at"] > old["comments_checked_at"])
+            and store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='comment_cache'").fetchone()):
+        with store.db:  # next_fetch_at=checked_at marks a request; an unserved request keeps its place, a failing issue its backoff.
+            store.db.execute("INSERT OR REPLACE INTO comment_cache SELECT ?,?,?,?,0,NULL WHERE NOT EXISTS(SELECT 1 FROM comment_cache"
+                             " WHERE item_id=? AND source_key=? AND (failures>0 OR next_fetch_at<=checked_at))",
+                             (row["id"], key, observed, observed, row["id"], key))
+    if not current:
         return item
+    return _compose(item, old["public_comments"], old["comments_checked_at"],
+                    old["comments_truncated"], source_key=key)
 
 
 def _candidates(store, source, settings, observed, key):
-    """Half recent candidates, half rotating published history, without a network scan."""
+    """Requested checks, then half recent candidates, half rotating published history.
+
+    No network scan. A locked story's issues wait for unlock.
+    """
     limit = settings["max_issues_per_source"]
     state = store.db.execute("SELECT * FROM comment_sources WHERE source_id=?", (source["id"],)).fetchone()
     if state and state["source_key"] == key and state["next_fetch_at"] and state["next_fetch_at"] > observed:
@@ -277,8 +283,16 @@ def _candidates(store, source, settings, observed, key):
     cursor = state["rotation_cursor"] if state and state["source_key"] == key else ""
     recent_first = bool(state["recent_first"]) if state and state["source_key"] == key else False
     due = "(c.item_id IS NULL OR c.source_key<>? OR c.next_fetch_at<=?)"
-    select = "SELECT i.* FROM items i LEFT JOIN comment_cache c ON c.item_id=i.id WHERE i.source_id=? AND " + due
+    unlocked = " AND NOT EXISTS(SELECT 1 FROM editorial_controls e WHERE e.story_id=i.story_id AND e.locked=1)"
+    select = "SELECT i.* FROM items i LEFT JOIN comment_cache c ON c.item_id=i.id WHERE i.source_id=? AND " + due + unlocked
     args = (source["id"], key, observed)
+    # Whatever the status: requests from merge_cached_comments (next_fetch_at<=checked_at), and retries
+    # of failed checks of issues without a story, which the rotation below retries only while recent
+    # and pending. CROSS JOIN keeps the bounded cache as the outer loop.
+    requested = store.db.execute(
+        "SELECT i.* FROM comment_cache c CROSS JOIN items i ON i.id=c.item_id WHERE c.next_fetch_at<=? AND i.source_id=?"
+        " AND (c.next_fetch_at<=c.checked_at OR (c.failures>0 AND i.story_id IS NULL))" + unlocked +
+        " ORDER BY i.status<>'pending',c.next_fetch_at,i.id LIMIT ?", (observed, source["id"], limit)).fetchall()
     recent = store.db.execute(select + " AND i.status='pending' AND i.last_seen>=? ORDER BY i.priority_score DESC,i.last_seen DESC,i.id LIMIT ?",
                              (*args, after(-settings["candidate_days"] * 86400, observed), limit)).fetchall()
     published = store.db.execute(select + " AND i.story_id IS NOT NULL AND i.id>? ORDER BY i.id LIMIT ?", (*args, cursor, limit)).fetchall()
@@ -287,15 +301,11 @@ def _candidates(store, source, settings, observed, key):
     groups = ([(row, False) for row in recent], [(row, True) for row in published])
     if not recent_first:
         groups = groups[::-1]
-    selected = {}
+    selected = {row["id"]: {**dict(row), "_comments_history": None} for row in requested}
     for pair in zip_longest(*groups):
-        for entry in pair:
-            if entry is not None:
-                row, historical = entry
-                selected.setdefault(row["id"], {**dict(row), "_comments_history": historical})
-                if len(selected) >= limit:
-                    return list(selected.values())
-    return list(selected.values())
+        for row, historical in filter(None, pair):
+            selected.setdefault(row["id"], {**dict(row), "_comments_history": historical})
+    return list(selected.values())[:limit]
 
 
 def enrich_comments(config, store, observed, *, deadline=None, client=None):
@@ -314,12 +324,8 @@ def enrich_comments(config, store, observed, *, deadline=None, client=None):
     last_source = store.get_meta("comments_source_cursor") or ""
     sources.sort(key=lambda s: (s["id"] <= last_source, s["id"]))
     with store.db:
-        active = [s["id"] for s in sources]
-        if active:
-            placeholders = ",".join("?" for _ in active)
-            store.db.execute(f"DELETE FROM comment_sources WHERE source_id NOT IN ({placeholders})", active)
-        else:
-            store.db.execute("DELETE FROM comment_sources")
+        store.db.execute(f"DELETE FROM comment_sources WHERE source_id NOT IN ({','.join('?' * len(sources))})",
+                         [s["id"] for s in sources])
     own_client = client is None
     # A fresh client has no cookies, authorization, proxy or application session.
     # The verified GraphQL URL is canonical. Refuse every redirect before a
@@ -344,7 +350,7 @@ def enrich_comments(config, store, observed, *, deadline=None, client=None):
                     if row["_comments_history"]:
                         store.db.execute("UPDATE comment_sources SET rotation_cursor=?,recent_first=1 WHERE source_id=?",
                                          (row["id"], source["id"]))
-                    else:
+                    elif row["_comments_history"] is not None:  # a requested check takes no rotation turn
                         store.db.execute("UPDATE comment_sources SET recent_first=0 WHERE source_id=?", (source["id"],))
                 try:
                     if not isinstance(row["payload"], str) or len(row["payload"]) > 1048576:
@@ -380,7 +386,7 @@ def enrich_comments(config, store, observed, *, deadline=None, client=None):
                         store.db.execute("INSERT OR REPLACE INTO comment_cache VALUES(?,?,?,?,0,NULL)",
                                          (row["id"], key, observed, after(settings["interval_seconds"], observed)))
                         store.db.execute("UPDATE comment_sources SET failures=0,next_fetch_at=NULL,error=NULL WHERE source_id=?", (source["id"],))
-                except (CommentError, FetchError, ValueError, TypeError, KeyError):
+                except (CommentError, FetchError, ValueError, TypeError, KeyError) as exc:
                     # No response or an unverifiable response is not evidence
                     # that old public notes disappeared. Keep the prior verified
                     # snapshot and its original verification time unchanged.
@@ -388,11 +394,15 @@ def enrich_comments(config, store, observed, *, deadline=None, client=None):
                     state = store.db.execute("SELECT failures FROM comment_sources WHERE source_id=?", (source["id"],)).fetchone()
                     failures = (state[0] if state else 0) + 1
                     due = after(backoff_seconds(failures, settings["failure_backoff_base_seconds"], settings["failure_backoff_cap_seconds"]), observed)
-                    cached = store.db.execute("SELECT failures FROM comment_cache WHERE item_id=? AND source_key=?", (row["id"], key)).fetchone()
-                    item_failures = (cached[0] if cached else 0) + 1
+                    # Keeping checked_at lets cache_days end retries of an issue that never verifies.
+                    cached = store.db.execute("SELECT failures,checked_at FROM comment_cache WHERE item_id=? AND source_key=?",
+                                              (row["id"], key)).fetchone() or (0, observed)
+                    item_failures = cached[0] + 1
                     item_due = after(backoff_seconds(item_failures, settings["failure_backoff_base_seconds"], settings["failure_backoff_cap_seconds"]), observed)
                     with store.db:
-                        store.db.execute("INSERT OR REPLACE INTO comment_cache VALUES(?,?,?,?,?,?)", (row["id"], key, observed, item_due, item_failures, "Public comments unavailable"))
+                        store.db.execute("INSERT OR REPLACE INTO comment_cache VALUES(?,?,?,?,?,?)", (row["id"], key, cached[1], item_due, item_failures, "Public comments unavailable"))
+                        if not isinstance(exc, (FetchError, EndpointError)):
+                            continue  # The verified project answered; only this issue backs off.
                         store.db.execute("UPDATE comment_sources SET failures=?,next_fetch_at=?,error=? WHERE source_id=?", (failures, due, "Public comments unavailable", source["id"]))
                     break  # Do not multiply endpoint failures by issue count.
     finally:
@@ -411,8 +421,9 @@ def status(store):
         "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('comment_sources','comment_cache')")}
     if tables != {"comment_sources", "comment_cache"}:
         return {"watched_issues": 0, "sources": []}
+    # A requested check (next_fetch_at<=checked_at) has not run yet.
     rows = store.db.execute("""SELECT s.source_id AS id,s.failures,s.error,s.next_fetch_at,
-        COUNT(c.item_id) AS cached_issues,MAX(c.checked_at) AS last_checked_at
+        COUNT(c.item_id) AS cached_issues,MAX(CASE WHEN c.next_fetch_at>c.checked_at THEN c.checked_at END) AS last_checked_at
         FROM comment_sources s LEFT JOIN comment_cache c ON c.source_key=s.source_key
         GROUP BY s.source_id ORDER BY s.source_id""").fetchall()
     return {"watched_issues": store.db.execute("SELECT COUNT(*) FROM comment_cache").fetchone()[0],
