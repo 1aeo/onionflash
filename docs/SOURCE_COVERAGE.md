@@ -16,7 +16,6 @@ protocol changes. The additional configured streams are:
 | [Anti-Censorship team issues](https://gitlab.torproject.org/api/v4/projects/549/issues) | `anti-censorship-team`, enabled | Human investigations of blocking and bridge/transport availability, including unlabeled reports. |
 | [Tor Metrics Timeline repository](https://gitlab.torproject.org/tpo/network-health/metrics/timeline) | `tor-metrics-news`, enabled | Curated event rows from the maintained README; validated repository snapshots replace the stale Atom feed. |
 | [Tor Project Development Mailing List](https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/) | `tor-dev`, enabled | Proposal and protocol-change discussions; the normal importance and evidence checks filter routine messages. |
-| [Consensus-health monitoring](https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/) | `consensus-health-alerts`, enabled | [Private monitoring candidates](MONITORING.md) for source-backed context; raw warnings do not create standalone news. |
 
 Browser release announcements were already present in Tor Blog and tor-announce.
 The Browser issue stream is deliberately filtered; it does not replace those
@@ -139,7 +138,6 @@ clustering still adds corroborating citations to existing release stories.
 
 | Source | Reason for keeping it outside automatic news publication for now |
 | --- | --- |
-| [Metrics alerts](https://lists.torproject.org/mailman3/hyperkitty/list/metrics-alerts@lists.torproject.org/feed/) | Collector failures need to remain distinct from network failures. |
 | [TPA infrastructure issues](https://gitlab.torproject.org/tpo/tpa/team) | Useful incidents mixed with substantial routine administration; add if infrastructure coverage is desired. |
 | [Tor Browser tags](https://gitlab.torproject.org/tpo/applications/tor-browser/-/tags?format=atom) | Mixes Browser/base-browser and stable/alpha/build tags; needs explicit product/version filtering. |
 
@@ -159,10 +157,7 @@ publication are documented in the deployment repository.
 
 1. **Broader discussion coverage.** Merge-request discussions and older comments
    beyond the bounded newest-note window remain outside the anonymous issue adapter.
-2. **Independent monitoring corroboration.** Anti-censorship probe alerts are
-   not collected: publishing them would need evidence from functioning independent
-   monitoring locations or controls, which the current feed lacks.
-3. **Long-term measurement.** Dedicated per-revision timing records would support
+2. **Long-term measurement.** Dedicated per-revision timing records would support
    latency reporting. Keep source timestamps distinct from observation and
    publication time. Accuracy and preserved articles take priority over latency analytics.
 
@@ -174,3 +169,17 @@ unsupported evidence remain rejected.
 
 Personal push/email alerts remain intentionally deferred. Storage-bucket isolation
 is a deployment configuration choice; see the deployment repository's guide.
+
+## Retired monitoring sources
+
+Automated monitoring collection and private candidate tracking have been removed.
+Old source entries with `alert_format = "consensus"` or `"censorship"` still load,
+but are disabled with a warning before collection. Any saved pending items from
+those configured sources are ignored when the queue reaches them; they do not
+fall back to news analysis. Remove these source entries from updated configurations.
+The unused `monitor_id` key and retired `[monitoring]` settings remain accepted.
+
+The obsolete private observation and group tables are removed when the database
+opens. Published stories, their permanent URLs and editorial history remain
+intact; retirement does not silently delete or retract them. Source-backed
+incident reports and release announcements continue through ordinary collection.
