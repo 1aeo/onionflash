@@ -140,9 +140,9 @@ def prepare(db, row: dict, result: dict, observed: str) -> dict:
     envelope = {"row": row, "result": result, "story_id": story_id,
                 "cluster_key": existing["cluster_key"] if existing else row["cluster_key"],
                 "candidate": None, "payload": None, "packet": {"sources": [], "missing_sources": [], "truncated": False},
-                "binding": binding, "locked": locked, "requires_review": False, "coverage": None,
+                "binding": binding, "locked": locked, "coverage": None,
                 "observed": observed}
-    if result["publish"] and not locked:
+    if not locked:
         previous = json.loads(existing["payload"]) if existing else None
         source = {key: item[key] for key in ("id", "url", "title", "published_at")}
         # Only a newly cited note moves the story's date, to the time it was written.
@@ -177,7 +177,7 @@ def prepare(db, row: dict, result: dict, observed: str) -> dict:
         packet, bindings = source_packet.build_packet(db, item, data, public, writer)
         binding["sources"] = bindings
         envelope.update(candidate=public, payload=data, packet=packet,
-                        coverage=coverage_background(db, existing, coverage_budget), requires_review=True)
+                        coverage=coverage_background(db, existing, coverage_budget))
     binding.update(payload_hash=digest(envelope["payload"]), candidate_hash=digest(envelope["candidate"]), packet_hash=digest(envelope["packet"]))
     binding["coverage_hash"] = digest(envelope["coverage"])
     envelope.update(candidate_hash=digest(envelope["candidate"]), source_hash=digest(envelope["packet"]),

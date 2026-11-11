@@ -40,8 +40,7 @@ def ignored(store, number=0):
     source = item(url=f"https://example.org/ignored/{number}")
     store.ingest(source, DATE)
     row = store.pending(1, DATE)[0]
-    result = analysis(publish=False, title="", summary="", why_it_matters="", products=[], tags=[], evidence=[])
-    finish_reviewed(store, row, result, cache_key(row, DEFAULTS["llm"]), DATE)
+    finish_reviewed(store, row, analysis(), cache_key(row, DEFAULTS["llm"]), DATE, decision="skip")
     return source, dict(store.db.execute("SELECT * FROM items WHERE id=?", (source["id"],)).fetchone())
 
 
@@ -349,7 +348,7 @@ def test_new_or_completed_items_cannot_be_acted_on(store, action, status, attemp
     assert actions(store) == []
 
 
-def test_pending_retry_archives_review_attempt_and_reuses_draft(store):
+def test_pending_retry_restarts_review_and_reuses_draft(store):
     from onionflash import review_gate
     from test_review_gate import Writer, Reviewer, verdict
     source = item()
@@ -362,8 +361,6 @@ def test_pending_retry_archives_review_attempt_and_reuses_draft(store):
     rejection.retry_item(store, row["id"], row["content_hash"], "Review policy repaired", DATE)
     job = store.db.execute("SELECT stage,record_json FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
     assert job["stage"] == "drafted" and json.loads(job["record_json"])["reviews"] == []
-    archived = json.loads(store.db.execute("SELECT review_record FROM analyses WHERE source_item_id=?", (row["id"],)).fetchone()[0])
-    assert archived["outcome"] == "superseded" and archived["stage"] == "review"
     writer = Writer()
     result = review_gate.process_item(DEFAULTS, store, store.pending(1, DATE)[0], writer, Reviewer(verdict()), DATE)
     assert result["status"] == "published" and writer.calls == []
@@ -433,7 +430,7 @@ def test_ignored_reconsideration_is_explicit_audited_and_one_item_only(store):
     assert audit["reason"] == "Reviewed selection"
     # The ignored decision's analysis record stays where it is; retry adds no copy of it.
     assert audit["superseded_analysis_key"] is None and audit["superseded_analysis_json"] is None
-    assert analysis_result(store, key)["publish"] is False
+    assert analysis_result(store, key) == analysis()
     with pytest.raises(ValueError, match="previously failed pending"):
         rejection.retry_item(store, row["id"], row["content_hash"], "Duplicate retry", DATE,
                               reconsider_ignored=True)

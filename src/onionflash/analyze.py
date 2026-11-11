@@ -140,7 +140,7 @@ def _json_object(text: str) -> dict:
         result = json.loads(text, object_pairs_hook=unique)
         # Stored analyses must be standard UTF-8 JSON: reject unpaired surrogate
         # escapes and non-finite numbers (NaN, Infinity, 1e999) before a malformed
-        # model response reaches the queue, even in an ignore decision.
+        # model response reaches the queue.
         json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8")
     except (ValueError, TypeError, RecursionError) as exc:
         raise AnalysisError("Model returned invalid JSON") from exc
@@ -154,17 +154,11 @@ def validate_analysis(result: dict, item: dict) -> dict:
     fields = SCHEMA["properties"]
     if not isinstance(result, dict) or set(result) != set(fields):
         raise AnalysisError("Model response fields do not match schema")
-    if type(result["publish"]) is not bool:
-        raise AnalysisError("Model publish field is not boolean")
-    if not result["publish"]:
-        # An ignore decision publishes nothing, so its other fields are irrelevant.
-        return result
+    if result["publish"] is not True:
+        raise AnalysisError("Writer must return a draft for publication review")
     for key, rule in fields.items():
         value = result[key]
-        if rule["type"] == "boolean":
-            if type(value) is not bool:
-                raise AnalysisError("Model publish field is not boolean")
-        elif rule["type"] == "string":
+        if rule["type"] == "string":
             allowed = rule.get("enum")
             valid = isinstance(value, str) and (
                 value in allowed if allowed is not None else (
@@ -189,20 +183,15 @@ def validate_analysis(result: dict, item: dict) -> dict:
             elif any(not isinstance(v, str) or len(v) > member["maxLength"] for v in value):
                 raise AnalysisError(f"Invalid model {key}")
     evidence = result["evidence"]
-    minimum = 1 if item["kind"] == "tag" else MIN_EVIDENCE_CHARS
     context = _plain(item["title"] + "\n" + item["content"])
     for index, quote in enumerate(evidence, 1):
         normalized = _plain(quote)
-        if len(normalized) < minimum:
-            raise AnalysisError(f"Model evidence quote {index} is shorter than {minimum} normalized characters")
+        if len(normalized) < MIN_EVIDENCE_CHARS:
+            raise AnalysisError(f"Model evidence quote {index} is shorter than {MIN_EVIDENCE_CHARS} normalized characters")
         if normalized not in context:
             raise AnalysisError(f"Model evidence quote {index} is not an exact excerpt of supplied title or content")
-    if result["publish"]:
-        if (
-            not all(result[k] for k in ("title", "summary"))
-            or not evidence
-        ):
-            raise AnalysisError("Published story needs text and source evidence")
+    if not all(result[k] for k in ("title", "summary")) or not evidence:
+        raise AnalysisError("Published story needs text and source evidence")
     return result
 
 
@@ -333,8 +322,6 @@ class Analyzer(CompletionClient):
         source = {**item, "content": "\n".join([bounded["content"], *(note["body"] for note in notes)])}
         result = validate_analysis(self.complete(SYSTEM_PROMPT, bounded, _writer_schema(bounded), "onionflash_news"),
                                    source)
-        if not result["publish"]:
-            raise AnalysisError("Writer must return a draft for publication review")
         if result["why_it_matters"]:
             raise AnalysisError("Writer must leave why_it_matters empty")
         return result

@@ -1,8 +1,9 @@
 """Durable stages for reviewing the exact candidate before its guarded commit.
 
-The existing item queue owns scheduling and backoff. These private tables retain
-one unfinished job per item and a bounded cache of exact review approvals; they
-are not a cache of writer responses for arbitrary future items.
+The existing item queue owns scheduling and backoff. These private tables keep
+one unfinished job per item, overwritten when its inputs change or an operator
+retries the item, and a bounded cache of exact review approvals; they are not a
+cache of writer responses for arbitrary future items.
 """
 
 from __future__ import annotations
@@ -28,14 +29,12 @@ def status(store):
 def reset_review_work(store, item_id):
     """Explicit operator retry starts a new review, retaining its completed draft.
 
-    The caller owns the transaction; the replaced job is archived here.
+    The caller owns the transaction.
     """
-    row = store.db.execute("SELECT * FROM review_jobs WHERE item_id=?", (item_id,)).fetchone()
+    row = store.db.execute("SELECT writer_key FROM review_jobs WHERE item_id=?", (item_id,)).fetchone()
     if row is None:
         return
-    _archive_job(store, row, now_iso(), "explicit operator retry")
-    old = json.loads(row["record_json"])
-    record = {"schema_version": 1, "writer": old.get("writer"), "input_row": old["input_row"], "reviews": []}
+    record = {"schema_version": 1, "writer": {"key": row["writer_key"]}, "reviews": []}
     store.db.execute("""UPDATE review_jobs SET stage='drafted',envelope_json=NULL,
         record_json=?,approval_key=NULL,updated_at=? WHERE item_id=?""", (_json(record), now_iso(), item_id))
 
@@ -58,22 +57,9 @@ def discard_review_decisions(store, item_id):
     store.db.executemany("DELETE FROM review_approvals WHERE key=?", expired)
 
 
-def _archive_job(store, job, observed, reason):
-    """Retain an invalidated stage and its original source, in the caller's txn."""
-    record = json.loads(job["record_json"])
-    envelope = json.loads(job["envelope_json"]) if job["envelope_json"] is not None else None
-    source_row = envelope["row"] if envelope is not None else record["input_row"]
-    draft = json.loads(job["draft_json"]) if job["draft_json"] is not None else {}
-    audit = {**record, "outcome": "superseded", "stage": job["stage"],
-             "superseded_reason": reason, "superseded_at": observed, "source_envelope": envelope}
-    store.record_analysis(source_row, draft, job["writer_key"], observed, review_record=audit)
-
-
 def _save(store, item_id, writer_key, policy_hash, stage, draft, prepared, record, observed,
-          *, prepared_at, approval_key=None, supersede=None, reason=None, approval_receipt=None):
+          *, prepared_at, approval_key=None, approval_receipt=None):
     with store.db:
-        if supersede is not None:
-            _archive_job(store, supersede, observed, reason)
         if approval_receipt is not None:
             # Receipt and the unfinished job's pin become durable together.
             store.db.execute("""INSERT OR REPLACE INTO review_approvals
@@ -159,15 +145,13 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
     if not _current(store, row):
         return {**report, "status": "stale"}
     job = store.db.execute("SELECT * FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
-    superseded_input = None
     if job is not None and job["writer_key"] == writer_key:
         draft = json.loads(job["draft_json"]) if job["draft_json"] is not None else None
         record = json.loads(job["record_json"])
         prepared_at = job["prepared_at"]
     else:
-        superseded_input = job
         job, draft = None, None
-        record = {"schema_version": 1, "writer": None, "input_row": row, "reviews": []}
+        record = {"schema_version": 1, "writer": None, "reviews": []}
         prepared_at = observed
     if draft is None:
         if not allow_network and json.loads(row["payload"])["kind"] != "tag":
@@ -175,26 +159,17 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         report["writer_calls"] += json.loads(row["payload"])["kind"] != "tag"
         draft = writer.analyze(json.loads(row["payload"]))
         record["writer"] = {"key": writer_key}  # The draft itself is saved in the job, then in analyses.
-        _save(store, row["id"], writer_key, policy, "drafted", draft, None, record, observed, prepared_at=prepared_at,
-              supersede=superseded_input, reason="source or writer input changed")
-    if not draft["publish"]:
-        try:  # The commit records the draft and deletes the job.
-            store.commit_candidate(store.prepare_candidate(row, draft, observed), None, writer_key, observed)
-        except StaleCandidate:
-            return {**report, "status": "stale"}
-        return {**report, "status": "ignored"}
+        _save(store, row["id"], writer_key, policy, "drafted", draft, None, record, observed, prepared_at=prepared_at)
     try:
         prepared = store.prepare_candidate(row, draft, prepared_at)
         old = json.loads(job["envelope_json"]) if job is not None and job["envelope_json"] else None
         same = old is not None and job["policy_hash"] == policy and _identity(old) == _identity(prepared)
         stage = job["stage"] if same else "review"
-        superseded_context = job if job is not None and not same and (old is not None or job["policy_hash"] != policy) else None
         if not same:
             record = {"schema_version": 1, "writer": record["writer"], "input_row": row, "reviews": [], "policy_hash": policy,
                       "prepared": {key: prepared[key] for key in ("candidate", "packet", "coverage", "candidate_hash", "source_hash", "coverage_hash", "binding_hash")}}
         candidate = record.get("candidate", prepared["candidate"])
         _save(store, row["id"], writer_key, policy, stage, draft, prepared, record, observed, prepared_at=prepared_at,
-              supersede=superseded_context, reason="candidate context or review policy changed",
               approval_key=job["approval_key"] if same else None)
         if prepared.get("locked"):
             record["outcome"] = "locked"
@@ -234,12 +209,11 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             with store.db:
                 store.db.execute("DELETE FROM review_approvals WHERE key=?", (key,))
             if stage in {"approved", "skipped"}:
-                invalidated = store.db.execute("SELECT * FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
                 record = {"schema_version": 1, "writer": record["writer"], "input_row": row,
                           "reviews": [], "policy_hash": policy, "prepared": record["prepared"]}
                 candidate, stage = prepared["candidate"], "review"
                 _save(store, row["id"], writer_key, policy, stage, draft, prepared, record, observed,
-                      prepared_at=prepared_at, supersede=invalidated, reason="invalid cached review decision")
+                      prepared_at=prepared_at)
         while True:
             verification = stage == "verify"
             if not allow_network:

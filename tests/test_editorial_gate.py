@@ -89,7 +89,6 @@ def test_routine_tag_has_local_draft_but_requires_editorial_review(context):
     assert store.stories() == []
     row = pending(store, item(kind="tag", title="another-tag", url="https://example.org/another-tag"))
     prepared = store.prepare_candidate(row, tag_notice(json.loads(row["payload"])), LATER)
-    assert prepared["requires_review"]
     with pytest.raises(ReviewRequired):
         store.commit_candidate(prepared, prepared["candidate"], "not-reviewed", LATER)
 
@@ -210,8 +209,8 @@ def test_initial_approval_cannot_publish_when_fresh_verification_refuses(context
     assert store.stories() == []
 
 
-def test_initial_approval_resumes_only_final_verification_after_interruption(context):
-    """Resume the uncompleted verification without repeating the draft or critique."""
+def test_interrupted_verification_restarts_the_critique_when_coverage_changes(context):
+    """A story published in the meantime restarts the critique without repeating the draft."""
     cfg, store = context
     row = pending(store)
     checker = Reviewer(verdict(), AnalysisError("verification unavailable", retryable=True))
@@ -220,10 +219,11 @@ def test_initial_approval_resumes_only_final_verification_after_interruption(con
     assert job(store)["stage"] == "verify"
     assert store.db.execute("SELECT COUNT(*) FROM review_approvals").fetchone()[0] == 0
     assert store.stories() == []
+    add_coverage(store)
     resumed = Reviewer(verdict())
     result = run(cfg, store, row, Writer(), resumed)
-    assert result["status"] == "published" and result["writer_calls"] == 0 and result["review_calls"] == 1
-    assert [call[2] for call in resumed.calls] == [True]
+    assert result["status"] == "published" and result["writer_calls"] == 0 and result["review_calls"] == 2
+    assert [call[2] for call in resumed.calls] == [False, True]
 
 
 @pytest.mark.parametrize("final", ["approve", "hold"])

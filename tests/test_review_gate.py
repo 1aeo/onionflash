@@ -215,7 +215,7 @@ def test_policy_change_reuses_writer_but_requires_a_new_review(context):
     cfg, store = context
     row = pending(store)
     with pytest.raises(AnalysisError):
-        run(cfg, store, row, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
+        run(cfg, store, row, Writer(), Reviewer(verdict(), AnalysisError("timeout", retryable=True)))
     cfg["review"]["model"] = "different-review-model"
     result = run(cfg, store, row, Writer(), Reviewer(verdict()))
     assert result["writer_calls"] == 0 and result["review_calls"] == 2 and not result["cache_hit"]
@@ -355,6 +355,8 @@ def test_operator_retry_preserves_held_audit_and_reuses_the_completed_draft(cont
     writer = Writer()
     assert run(cfg, store, retry, writer, Reviewer(verdict()))["status"] == "published"
     assert writer.calls == []
+    final = json.loads(store.db.execute("SELECT review_record FROM analyses ORDER BY rowid DESC").fetchone()[0])
+    assert final["outcome"] == "approved" and final["writer"] == {"key": cache_key(row, cfg["llm"])}
 
 
 def test_a_source_that_reverts_to_a_held_revision_is_held_again_without_a_review(context):
@@ -366,28 +368,6 @@ def test_a_source_that_reverts_to_a_held_revision_is_held_again_without_a_review
     checker = Reviewer(verdict())
     assert run(cfg, store, store.pending(1, LATER)[0], Writer(), checker)["status"] == "held"
     assert checker.calls == []
-
-
-def test_ignored_draft_leaves_the_queue_without_review(context):
-    cfg, store = context
-    row = pending(store)
-    result = run(cfg, store, row, Writer(analysis(publish=False)), Reviewer())
-    assert result == {"status": "ignored", "writer_calls": 1, "review_calls": 0, "cache_hit": False}
-    assert store.db.execute("SELECT status FROM items").fetchone()[0] == "ignored"
-    assert job(store) is None and store.pending_count() == 0 and store.stories() == []
-    assert json.loads(store.db.execute("SELECT result FROM analyses").fetchone()[0]) == analysis(publish=False)
-
-
-def test_ignored_writer_result_cannot_overwrite_a_concurrent_source_update(context):
-    cfg, store = context
-    row = pending(store)
-    class ChangingWriter:
-        def analyze(self, _item):
-            store.ingest(item(content="Changed source while writer was running.", updated_at=LATER), LATER)
-            return analysis(publish=False)
-    result = run(cfg, store, row, ChangingWriter(), Reviewer())
-    assert result["status"] == "stale" and store.pending_count() == 1
-    assert store.db.execute("SELECT COUNT(*) FROM analyses").fetchone()[0] == 0
 
 
 def test_rejected_show_explains_structured_hold_with_the_actual_candidate_and_passages(context, monkeypatch):
@@ -434,7 +414,7 @@ def test_rejected_show_reads_a_reused_approval_after_an_interrupted_commit(conte
 
 
 @pytest.mark.parametrize("kind", [*DAMAGE, "review-not-an-object", "review-without-result"])
-def test_rejected_show_still_prints_the_item_when_its_review_record_is_damaged(context, kind):
+def test_rejected_show_and_retry_survive_a_damaged_review_record(context, kind):
     cfg, store = context
     row = pending(store)
     assert run(cfg, store, row, Writer(), Reviewer(verdict("hold")))["status"] == "held"
@@ -446,6 +426,8 @@ def test_rejected_show_still_prints_the_item_when_its_review_record_is_damaged(c
     shown = rejection.show_item(store, row["id"])
     assert shown["final_review"] == {"stage": "held", "error": "Saved review record cannot be read"}
     assert shown["saved_item"] is not None
+    rejection.retry_item(store, row["id"], row["content_hash"], "Retry after inspection", LATER)
+    assert job(store)["stage"] == "drafted"
 
 
 def test_rejected_show_without_a_current_job_stays_read_only(context):
@@ -454,61 +436,6 @@ def test_rejected_show_without_a_current_job_stays_read_only(context):
     before = list(store.db.iterdump())
     assert rejection.show_item(store, row["id"])["final_review"] is None
     assert list(store.db.iterdump()) == before
-
-
-@pytest.mark.parametrize("change", ["source", "candidate", "policy"])
-def test_superseded_verification_preserves_its_exact_old_source_and_stage(context, change):
-    cfg, store = context
-    row = pending(store)
-    wrong = "Superseded instruction: operators must edit their configuration."
-    with pytest.raises(AnalysisError):
-        run(cfg, store, row, Writer(analysis(why_it_matters=wrong)),
-            Reviewer(verdict("revise", repair={"why_it_matters": ""}), AnalysisError("timeout", retryable=True)))
-    old = job(store)
-    envelope = json.loads(old["envelope_json"])
-    assert old["stage"] == "verify"
-    if change == "source":
-        store.ingest(item(content="A different source revision after the paused verification.", updated_at=LATER), LATER)
-        row = store.pending(1, LATER)[0]
-    elif change == "policy":
-        cfg["review"]["model"] = "a-new-review-policy-model"
-    else:
-        data = copy.deepcopy(envelope["payload"])
-        data["updated_at"] = "2026-11-09T12:00:00Z"
-        with store.db:
-            store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (data["id"], envelope["cluster_key"],
-                             json.dumps(data), data["published_at"], data["updated_at"]))
-    checker = Reviewer(verdict("revise", repair={"why_it_matters": ""}), verdict())
-    assert run(cfg, store, row, Writer(analysis(why_it_matters=wrong)), checker)["status"] == "published"
-    assert job(store) is None
-    records = [(json.loads(r[0]), json.loads(r[1])) for r in store.db.execute(
-        "SELECT review_record,result FROM analyses WHERE review_record IS NOT NULL")]
-    preserved, draft = next(record for record in records if record[0].get("outcome") == "superseded")
-    assert preserved["stage"] == "verify"
-    assert draft["why_it_matters"] == wrong
-    assert preserved["candidate"]["why_it_matters"] == ""
-    assert preserved["reviews"][0]["result"]["verdict"] == "revise"
-    assert preserved["source_envelope"] == envelope
-    assert preserved["source_envelope"]["row"]["payload"] == old_source_payload(old)
-
-
-def old_source_payload(saved):
-    return json.loads(saved["envelope_json"])["row"]["payload"]
-
-
-def test_reset_of_pending_review_preserves_the_stage_before_reusing_draft(context):
-    cfg, store = context
-    row = pending(store)
-    with pytest.raises(AnalysisError):
-        run(cfg, store, row, Writer(), Reviewer(verdict("revise", repair={"why_it_matters": ""}),
-                                               AnalysisError("timeout", retryable=True)))
-    before = job(store)
-    with store.db:
-        review_gate.reset_review_work(store, row["id"])
-    audit = json.loads(store.db.execute("SELECT review_record FROM analyses").fetchone()[0])
-    assert audit["stage"] == "verify" and audit["superseded_reason"] == "explicit operator retry"
-    assert audit["source_envelope"]["row"]["payload"] == old_source_payload(before)
-    assert job(store)["stage"] == "drafted" and job(store)["draft_json"] == before["draft_json"]
 
 
 def test_hold_takes_write_lock_before_checks_and_blocks_a_concurrent_revision(context, monkeypatch):

@@ -360,10 +360,10 @@ class Store:
             story_id = existing["id"] if existing else digest(row["cluster_key"])[:24]
             cluster = existing["cluster_key"] if existing else row["cluster_key"]
             locked = editorial.is_locked(self.db, story_id)
-            if decision == "skip" and (not result["publish"] or locked):
+            if decision == "skip" and locked:
                 raise ReviewRequired("Editorial skip requires an unlocked reviewed candidate")
             payload = None
-            if result["publish"] and not locked:
+            if not locked:
                 original = prepared["candidate"]
                 if not isinstance(approved_candidate, dict) or set(approved_candidate) != set(original):
                     raise ReviewRequired("Approval must identify the complete public candidate")
@@ -403,9 +403,9 @@ class Store:
                 self.db.execute("""INSERT INTO stories(id,cluster_key,payload,published_at,updated_at)
                     VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at""",
                     (story_id, cluster, json.dumps(payload, ensure_ascii=False, allow_nan=False), payload["published_at"], payload["updated_at"]))
-            elif locked and result["publish"]:
+            elif locked:
                 editorial.record_held(self.db, story_id)
-            published = result["publish"] and decision == "approve"
+            published = decision == "approve"
             mapped_id = story_id if published else row.get("story_id")
             self.db.execute("UPDATE items SET status=?,story_id=?,next_attempt_at=NULL,last_error=NULL WHERE id=?",
                             ("published" if published else "ignored", mapped_id, row["id"]))

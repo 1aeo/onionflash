@@ -8,7 +8,7 @@ import json
 
 import pytest
 
-from onionflash.analyze import AnalysisError, Analyzer, MAX_EVIDENCE_CHOICES, MIN_EVIDENCE_CHARS, _writer_schema, tag_notice, validate_analysis
+from onionflash.analyze import AnalysisError, Analyzer, MAX_EVIDENCE_CHOICES, MIN_EVIDENCE_CHARS, _writer_schema, validate_analysis
 from onionflash.comments import INPUT_CHARS
 from onionflash.config import DEFAULTS
 from onionflash.store import Store
@@ -50,11 +50,6 @@ def test_non_finite_numbers_are_invalid_model_json():
     for text in ('{"publish": false, "priority": NaN}', '{"publish": false, "x": 1e999}'):
         with pytest.raises(AnalysisError, match="invalid JSON"):
             _json_object(text)
-
-
-def test_historical_ignore_decisions_remain_readable():
-    ignore = analysis(publish=False, title="x" * 150, evidence=["not in the source at all"])
-    assert validate_analysis(ignore, item()) == ignore
 
 
 def test_historical_impact_text_remains_readable():
@@ -158,8 +153,8 @@ def test_evidence_diagnostics_distinguish_short_quotes_from_absent_quotes():
     with pytest.raises(AnalysisError, match="quote 2 is not an exact excerpt"):
         validate_analysis(analysis(evidence=["The reply was", "An invented quotation"]),
                           item(content="The reply was acknowledged."))
-    tag = item(kind="tag", title="v1")
-    assert validate_analysis(tag_notice(tag), tag)["evidence"] == ["v1"]
+    with pytest.raises(AnalysisError, match="needs text and source evidence"):
+        validate_analysis(analysis(evidence=[]), item())
 
 
 def test_writer_request_requires_a_draft_and_the_existing_evidence_length_floor(monkeypatch):

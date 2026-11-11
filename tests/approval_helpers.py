@@ -64,7 +64,8 @@ def approve(store, prepared, candidate=None, *, policy="test-policy", result=Non
     return {"approval_key": key, "policy_hash": policy}
 
 
-def finish_reviewed(store, row, result, key, observed):
+def finish_reviewed(store, row, result, key, observed, *, decision="approve"):
     prepared = store.prepare_candidate(row, result, observed)
-    receipt = approve(store, prepared) if prepared["requires_review"] else {}
-    return store.commit_candidate(prepared, prepared["candidate"], key, observed, **receipt)
+    reply = verdict("skip", criterion="news_value") if decision == "skip" else None
+    receipt = {} if prepared["locked"] else approve(store, prepared, result=reply)
+    return store.commit_candidate(prepared, prepared["candidate"], key, observed, decision=decision, **receipt)

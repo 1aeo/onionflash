@@ -34,7 +34,7 @@ def test_prepare_is_read_only_and_an_unreviewed_commit_is_refused(tmp_path):
         before = store.db.total_changes
         prepared = store.prepare_candidate(row, analysis(), DATE)
         assert store.db.total_changes == before
-        assert store.stories() == [] and prepared["requires_review"]
+        assert store.stories() == []
         assert prepared["candidate"] == render._prepare_story(prepared["payload"])
         with pytest.raises(ReviewRequired):
             store.commit_candidate(prepared, prepared["candidate"], "unreviewed", DATE)
@@ -294,7 +294,6 @@ def test_legacy_multi_source_prose_requires_all_evidence_not_guessed_writer(tmp_
         prepared = store.prepare_candidate(row, analysis(), LATER)
         assert prepared["payload"]["editorial_item"] is None
         assert prepared["candidate"]["summary"] == old["summary"]
-        assert prepared["requires_review"]
         if missing_body:
             assert first["url"] in prepared["packet"]["missing_sources"]
             with pytest.raises(ReviewRequired):
@@ -336,7 +335,6 @@ def test_stable_timeline_identity_cannot_label_new_commit_bytes_with_old_citatio
         store.ingest(tag, LATER)
         row = dict(store.db.execute("SELECT * FROM items WHERE id=?", (tag["id"],)).fetchone())
         prepared = store.prepare_candidate(row, tag_notice(json.loads(row["payload"])), LATER)
-        assert prepared["requires_review"]
         assert old_url in {source["url"] for source in prepared["candidate"]["sources"]}
         assert new_url not in {source["url"] for source in prepared["candidate"]["sources"]}
         packet_text = "".join(p["text"] for source in prepared["packet"]["sources"] for p in source["passages"])
@@ -374,7 +372,6 @@ def test_title_only_source_is_reviewable_but_compacted_snapshot_is_missing(tmp_p
         draft = analysis(title=source["title"], summary="The release feed announces Tor 0.4.9.16.",
                          why_it_matters="", category="release", tags=["release"], state="released", evidence=[source["title"]])
         prepared = store.prepare_candidate(row, draft, DATE)
-        assert prepared["requires_review"]
         if body is None:
             assert prepared["packet"]["missing_sources"] == [source["url"]]
             assert prepared["packet"]["sources"] == []
