@@ -25,7 +25,8 @@ def initialize(db) -> None:
             story_id TEXT PRIMARY KEY, revision INTEGER NOT NULL,
             locked INTEGER NOT NULL, retracted INTEGER NOT NULL,
             notice_action TEXT NOT NULL, notice_reason TEXT NOT NULL, notice_at TEXT NOT NULL,
-            held_updates INTEGER NOT NULL DEFAULT 0
+            held_updates INTEGER NOT NULL DEFAULT 0,
+            last_held_at TEXT  -- unused; earlier releases write it after a code rollback
         );
         CREATE TABLE IF NOT EXISTS editorial_revisions (
             story_id TEXT NOT NULL, revision INTEGER NOT NULL,

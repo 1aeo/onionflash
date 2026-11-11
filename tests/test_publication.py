@@ -83,7 +83,7 @@ def test_history_beyond_one_catalog_batch_is_permanent_and_feeds_carry_the_newes
         assert (output / "news" / story(100)["id"] / "story.json").is_file()
         def guids(path):
             return [guid.text for guid in ET.parse(output / path).iter("guid")]
-        assert len(guids("feed.xml")) == len(guids("tags/release.xml")) == publication.FEED_ITEMS
+        assert len(guids("feed.xml")) == len(guids("tags/release.xml")) == 100
         assert [item["id"] for item in json.loads((output / "feed.json").read_text())["items"]] == guids("feed.xml")
         assert not [guid for guid in guids("feed.xml") if story(0)["id"] in guid]
         assert story(0)["id"] in guids("tags/security.xml")[0]  # each topic feed has its own newest stories
@@ -110,7 +110,7 @@ def test_history_beyond_one_catalog_batch_is_permanent_and_feeds_carry_the_newes
         store.db.execute("DELETE FROM stories WHERE id=?", (story(0)["id"],)); store.db.commit()
         build(cfg, store)
         assert (output / "news" / story(0)["id"] / "index.html").is_file()
-        assert len(guids("feed.xml")) == publication.FEED_ITEMS
+        assert len(guids("feed.xml")) == 100
 
 
 def test_once_every_feed_is_full_each_keeps_exactly_its_newest_stories(tmp_path, monkeypatch):

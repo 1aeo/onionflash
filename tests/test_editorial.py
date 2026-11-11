@@ -55,6 +55,15 @@ def current_files(cfg, story_id):
             "json": json.loads((root / "news" / story_id / "story.json").read_text())}
 
 
+def test_databases_this_release_creates_still_accept_earlier_held_update_writes(tmp_path):
+    # An earlier release, after a code rollback, records a held update in last_held_at.
+    with Store(tmp_path / "db.sqlite3") as store:
+        store.db.execute("""INSERT INTO editorial_controls(story_id,revision,locked,retracted,notice_action,
+            notice_reason,notice_at) VALUES('s',1,1,0,'correct','r','t')""")
+        store.db.execute("UPDATE editorial_controls SET held_updates=held_updates+1,last_held_at='t2' WHERE story_id='s'")
+        assert store.db.execute("SELECT last_held_at FROM editorial_controls").fetchone()[0] == "t2"
+
+
 def test_correction_preserves_identity_dates_and_keeps_superseded_text_off_feeds(seeded):
     cfg, store, story_id = seeded
     before = editorial.show(store.db, story_id)

@@ -24,10 +24,23 @@ def _identifier(value: str) -> str:
     return value
 
 
+# The payload is read as bytes, so a value that is not even UTF-8 reaches _payload instead of failing the query.
+_COLUMNS = "id,content_hash,source_id,status,attempts,rejections,next_attempt_at,story_id,url,last_error,CAST(payload AS BLOB) AS payload"
+
+
+def _payload(row):
+    """The saved item, or None when its JSON is damaged, so one bad row cannot hide the others."""
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _summary(row):
     result = {key: row[key] for key in ("id", "content_hash", "source_id", "status", "attempts", "rejections", "next_attempt_at", "story_id")}
     # The CLI escapes printed text, so stored values are shown as the app wrote them.
-    result.update(source_url=row["url"], rejection_reason=row["last_error"], title=json.loads(row["payload"])["title"])
+    result.update(source_url=row["url"], rejection_reason=row["last_error"], title=(_payload(row) or {}).get("title"))
     return result
 
 
@@ -38,7 +51,7 @@ def list_items(store, *, status="rejected", limit=50, after=None) -> dict:
     if type(limit) is not int or not 1 <= limit <= MAX_LIMIT:
         raise ValueError(f"List limit must be between 1 and {MAX_LIMIT}")
     cursor = "" if after is None else _identifier(after)
-    rows = store.db.execute("SELECT * FROM items WHERE status=? AND id>? ORDER BY id LIMIT ?",
+    rows = store.db.execute(f"SELECT {_COLUMNS} FROM items WHERE status=? AND id>? ORDER BY id LIMIT ?",
                             (status, cursor, limit + 1)).fetchall()
     shown = rows[:limit]
     return {"items": [_summary(row) for row in shown],
@@ -47,11 +60,11 @@ def list_items(store, *, status="rejected", limit=50, after=None) -> dict:
 
 def show_item(store, item_id) -> dict:
     """Inspect saved source and structured final review, never raw provider output."""
-    row = store.db.execute("SELECT * FROM items WHERE id=?", (_identifier(item_id),)).fetchone()
+    row = store.db.execute(f"SELECT {_COLUMNS} FROM items WHERE id=?", (_identifier(item_id),)).fetchone()
     if row is None:
         raise ValueError("Source item was not found")
     result = _summary(row)
-    result["saved_item"] = json.loads(row["payload"])
+    result["saved_item"] = _payload(row)
     result["final_review"] = _final_review(store, item_id)
     result["actions"] = [dict(action) for action in store.db.execute(
         """SELECT action_id,action,content_hash,reason,created_at,before_status,before_attempts,before_rejections

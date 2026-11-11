@@ -55,6 +55,18 @@ def actions(store):
     return [dict(row) for row in store.db.execute("SELECT * FROM rejection_actions ORDER BY action_id")]
 
 
+@pytest.mark.parametrize("damage", ["'{'", "'[1]'", "CAST(x'7b22ff22' AS TEXT)"])
+def test_a_damaged_saved_item_stays_listable_and_inspectable(store, damage):
+    _, row = rejected(store, 0)
+    _, intact = rejected(store, 1)
+    store.db.execute(f"UPDATE items SET payload={damage} WHERE id=?", (row["id"],))
+    store.db.commit()
+    listed = {entry["id"]: entry["title"] for entry in rejection.list_items(store)["items"]}
+    assert listed == {row["id"]: None, intact["id"]: json.loads(intact["payload"])["title"]}
+    shown = rejection.show_item(store, row["id"])
+    assert shown["saved_item"] is None and shown["content_hash"] == row["content_hash"]
+
+
 def test_list_excludes_transient_failures_and_is_bounded_with_stable_pagination(store):
     transient = item(url="https://example.org/transient")
     store.ingest(transient, DATE)

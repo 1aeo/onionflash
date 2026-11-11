@@ -170,13 +170,8 @@ while taking their upload snapshot.
 ### Editorial controls
 
 `onionflash story show|history|correct|retract|restore|unlock` corrects or
-retracts a published story. Its reason is **public**; the story keeps its URL and
-stays locked against automation until an explicit `unlock`.
-`onionflash rejected list|show|retry|dismiss` handles failed analyses, and with
-`retry --reconsider-ignored` an ignored item, with a private reason. Every change
-needs the current hash that `show` reports. None of these commands calls the
-model or publishes anything: after a story change, build, and the next deployment
-publishes it. See
+retracts a published story; `onionflash rejected list|show|retry|dismiss`
+handles failed analyses and, with `retry --reconsider-ignored`, an ignored item. See
 [editorial commands and recovery](docs/EDITORIAL.md) and
 [rejected-analysis commands](docs/REJECTED_ANALYSES.md).
 
