@@ -12,13 +12,13 @@ from onionflash.config import DEFAULTS
 from onionflash.util import digest
 
 
-def approved_result(candidate, packet):
+def approved_result(packet):
     refs = [packet["sources"][0]["id"]] if packet["sources"] else []
     result = {"verdict": "approve", "criteria": {
         name: {"outcome": "pass", "source_refs": refs,
                "reason": "Explicit synthetic approval for this isolated test fixture."}
         for name in review.CRITERIA}, "issues": [], "repair": None}
-    return review.validate_review(result, candidate, packet, verification=True)
+    return review.validate_review(result, packet)
 
 
 class ApprovingReviewer:
@@ -33,7 +33,7 @@ class ApprovingReviewer:
         pass
 
     def review(self, candidate, packet, *, verification=False):
-        return approved_result(candidate, packet)
+        return approved_result(packet)
 
 
 def finish_reviewed(store, row, result, key, observed, *, input_chars=None):
@@ -44,7 +44,7 @@ def finish_reviewed(store, row, result, key, observed, *, input_chars=None):
     receipt, audit = {}, None
     if prepared["requires_review"]:
         review_gate.initialize(store)
-        approval = approved_result(prepared["candidate"], prepared["packet"])
+        approval = approved_result(prepared["packet"])
         policy = review.policy_hash(DEFAULTS)
         approval_key = digest(["synthetic-fixture-approval", prepared["candidate_hash"],
                                prepared["source_hash"], policy, prepared["binding_hash"]])

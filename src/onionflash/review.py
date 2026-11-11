@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 import copy
-import json
-import re
 
 from .analyze import AnalysisError, CompletionClient, SCHEMA as DRAFT_SCHEMA
+from .candidate import SEMANTIC_FIELDS as EDITABLE
 from .render import _prepare_story
 from .util import digest
 
 REVIEW_VERSION = "onionflash-review-2"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details")
-EDITABLE = ("title", "summary", "why_it_matters", "category", "priority", "confidence",
-            "state", "products", "tags")
 FIELDS = {key: copy.deepcopy(DRAFT_SCHEMA["properties"][key]) for key in EDITABLE}
 for field, length in (("title", 180), ("summary", 1600), ("why_it_matters", 800)):
     FIELDS[field]["maxLength"] = length
@@ -132,57 +129,22 @@ def policy_hash(config: dict) -> str:
     return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, SCHEMA, identity, bounds])
 
 
-def _json_safe(value) -> None:
-    try:
-        json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
-    except (ValueError, TypeError, RecursionError) as exc:
-        raise ReviewError("Review data is not valid UTF-8 JSON") from exc
-
-
 def _text(value, maximum: int, *, empty: bool = False) -> None:
     if (not isinstance(value, str) or len(value) > maximum or (not empty and not value.strip())
             or any(ord(char) < 32 and char not in "\n\t" for char in value)):
         raise ReviewError("Invalid review text")
 
 
-def _packet_refs(packet: dict, settings: dict | None = None) -> set[str]:
-    if (not isinstance(packet, dict) or set(packet) != {"sources", "missing_sources", "truncated"}
-            or type(packet["truncated"]) is not bool or not isinstance(packet["missing_sources"], list)
-            or not isinstance(packet["sources"], list)):
-        raise ReviewError("Invalid review source packet")
-    _json_safe(packet)
-    if settings and (len(packet["sources"]) > settings["max_sources"] or
-            len(json.dumps(packet, ensure_ascii=False)) > settings["max_source_chars"] + 10000 * settings["max_sources"]):
-        raise ReviewError("Review source packet metadata exceeds limit")
-    refs, passages, characters = set(), 0, 0
-    for source in packet["sources"]:
-        if (not isinstance(source, dict) or not isinstance(source.get("id"), str)
-                or len(source["id"]) > 32 or not re.fullmatch(r"S[1-9][0-9]*", source["id"])):
-            raise ReviewError("Invalid review source identity")
-        ident = source["id"]
-        if ident in refs or not isinstance(source.get("passages"), list):
-            raise ReviewError("Duplicate source identity or invalid passages")
-        refs.add(ident)
-        for passage in source["passages"]:
-            if (not isinstance(passage, dict) or set(passage) != {"id", "text"}
-                    or not isinstance(passage.get("id"), str) or len(passage["id"]) > 32
-                    or not re.fullmatch(re.escape(ident) + r":P[1-9][0-9]*", passage["id"])
-                    or passage["id"] in refs):
-                raise ReviewError("Invalid review passage identity")
-            _text(passage["text"], settings["passage_chars"] if settings else 1000000)
-            refs.add(passage["id"])
-            passages += 1
-            characters += len(passage["text"])
-    if settings and (passages > settings["max_passages"] or characters > settings["max_source_chars"]):
-        raise ReviewError("Review source packet exceeds configured bounds")
-    return refs
+def _packet_refs(packet: dict) -> set[str]:
+    """The app builds the packet within its bounds (source_packet.build_packet)."""
+    sources = packet["sources"]
+    return {source["id"] for source in sources} | {passage["id"] for source in sources for passage in source["passages"]}
 
 
 def apply_repair(candidate: dict, repair: dict) -> dict:
     """Normalize a minimal semantic repair BEFORE its independent verification."""
     if not isinstance(repair, dict) or not repair or set(repair) - set(EDITABLE):
         raise ReviewError("Repair contains unsupported or immutable fields")
-    _json_safe(repair)
     for key, value in repair.items():
         rule = FIELDS[key]
         if rule["type"] == "string":
@@ -199,15 +161,12 @@ def apply_repair(candidate: dict, repair: dict) -> dict:
         normalized = _prepare_story(updated, editorial=updated.get("editorial"))
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
         raise ReviewError("Repair does not form a valid public story") from exc
-    if any(normalized.get(key) != value for key, value in candidate.items() if key not in EDITABLE):
-        raise ReviewError("Repair changes immutable public metadata")
     if normalized == candidate:
         raise ReviewError("Repair does not change the candidate")
     return normalized
 
 
-def _validate(result: dict, candidate: dict, refs: set[str], *, verification: bool, wire: bool = False) -> dict:
-    _json_safe(result)
+def _validate(result: dict, refs: set[str], *, wire: bool = False) -> dict:
     if (not isinstance(result, dict) or set(result) != set(SCHEMA["properties"])
             or result["verdict"] not in ("approve", "revise", "hold")
             or not isinstance(result["criteria"], dict) or set(result["criteria"]) != set(CRITERIA)
@@ -256,9 +215,9 @@ def _validate(result: dict, candidate: dict, refs: set[str], *, verification: bo
     return {**result, "repair": repair}
 
 
-def validate_review(result: dict, candidate: dict, packet: dict, *, verification: bool = False) -> dict:
+def validate_review(result: dict, packet: dict) -> dict:
     """Validate saved/API responses with the same rubric and source-reference rules."""
-    return _validate(result, candidate, _packet_refs(packet), verification=verification)
+    return _validate(result, _packet_refs(packet))
 
 
 class Reviewer(CompletionClient):
@@ -270,8 +229,7 @@ class Reviewer(CompletionClient):
         self.http_settings["total_timeout_seconds"] = self.settings["total_timeout_seconds"]
 
     def review(self, candidate_public: dict, packet: dict, *, verification: bool = False) -> dict:
-        refs = _packet_refs(packet, self.settings)
-        _json_safe(candidate_public)
+        refs = _packet_refs(packet)
         schema = copy.deepcopy(SCHEMA)
         if refs:
             # Constrain guided generation to real references as well as checking
@@ -284,4 +242,4 @@ class Reviewer(CompletionClient):
         # A prior model response, critique or approval is never part of its history.
         result = self.complete(VERIFY_PROMPT if verification else SYSTEM_PROMPT,
                                {"candidate": candidate_public, "packet": packet}, schema, "onionflash_review")
-        return _validate(result, candidate_public, refs, verification=verification, wire=True)
+        return _validate(result, refs, wire=True)

@@ -35,7 +35,7 @@ def test_long_description_keeps_comment_evidence_in_draft_and_final_review(tmp_p
         def _complete(self, request, key):
             requests.append(request)
             data = json.loads(request["messages"][1]["content"])
-            return approved_result(data["candidate"], data["packet"])
+            return approved_result(data["packet"])
 
     with ControlledAnalyzer(config) as analyzer:
         result = analyzer.analyze(payload)
@@ -111,15 +111,18 @@ def test_comments_use_collection_window_without_spending_analysis_reserve(tmp_pa
 
     class NoAnalysis:
         def __init__(self, config, deadline=None):
-            captured["analysis"] = deadline
+            captured[type(self).__name__] = deadline
         def __enter__(self):
             return self
         def __exit__(self, *args):
             pass
 
+    class NoReview(NoAnalysis):
+        pass
+
     monkeypatch.setattr(cli, "enrich_comments", comments)
     monkeypatch.setattr(cli, "Analyzer", NoAnalysis)
-    monkeypatch.setattr(cli, "Reviewer", ApprovingReviewer)
+    monkeypatch.setattr(cli, "Reviewer", NoReview)
     with Store(tmp_path / "state.db") as store:
         cli.run(config, store)
-    assert captured == {"comments": 220.0, "analysis": 340.0}
+    assert captured == {"comments": 220.0, "NoAnalysis": 340.0, "NoReview": 340.0}

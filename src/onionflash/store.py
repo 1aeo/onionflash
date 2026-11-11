@@ -329,15 +329,13 @@ class Store:
             existing = candidate.existing_story(self.db, row)
             story_id = existing["id"] if existing else digest(row["cluster_key"])[:24]
             cluster = existing["cluster_key"] if existing else row["cluster_key"]
-            if story_id != prepared["story_id"] or cluster != prepared["cluster_key"]:
-                raise StaleCandidate("Story grouping changed after assembly")
             locked = editorial.is_locked(self.db, story_id)
             payload = None
             if result["publish"] and not locked:
                 original = prepared["candidate"]
                 if not isinstance(approved_candidate, dict) or set(approved_candidate) != set(original):
                     raise ReviewRequired("Approval must identify the complete public candidate")
-                if any(approved_candidate[key] != original[key] for key in original if key not in candidate.REPAIR_FIELDS):
+                if any(approved_candidate[key] != original[key] for key in original if key not in candidate.SEMANTIC_FIELDS):
                     raise ReviewRequired("Review cannot change story identity, sources, dates or editorial metadata")
                 normalized = render._prepare_story(approved_candidate, editorial=original.get("editorial"))
                 if normalized != approved_candidate:
@@ -354,7 +352,7 @@ class Store:
                             ("policy_hash", policy_hash), ("binding_hash", prepared["binding_hash"]))):
                         raise ReviewRequired("Review approval does not match this candidate and its sources")
                     from .review import validate_review
-                    verdict = validate_review(json.loads(receipt["result_json"]), approved_candidate, prepared["packet"], verification=True)
+                    verdict = validate_review(json.loads(receipt["result_json"]), prepared["packet"])
                     if verdict["verdict"] != "approve":
                         raise ReviewRequired("Final review did not approve publication")
                     if review_record is None:

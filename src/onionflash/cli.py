@@ -232,7 +232,7 @@ def run(config: dict, store: Store) -> dict:
                 break
             try:
                 result = process_item(config, store, row, analyzer, reviewer, now_iso(),
-                                      deadline=run_deadline, allow_network=endpoint_failures < 2)
+                                      allow_network=endpoint_failures < 2)
                 if result["status"] not in {"stale", "deferred"}:
                     report["analyzed"] += 1
                 report["review_cache_hits"] += bool(result["cache_hit"])
