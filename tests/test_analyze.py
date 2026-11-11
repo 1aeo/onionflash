@@ -8,7 +8,7 @@ import json
 
 import pytest
 
-from onionflash.analyze import AnalysisError, Analyzer, validate_analysis
+from onionflash.analyze import AnalysisError, Analyzer, MIN_EVIDENCE_CHARS, _writer_schema, tag_notice, validate_analysis
 from onionflash.config import DEFAULTS
 from onionflash.store import Store
 from onionflash.transport import FetchError, Response
@@ -158,6 +158,96 @@ def test_evidence_matching_ignores_typography_and_case_but_not_emptiness():
     for quote in [" " * 8, "release", "not a quote from the source"]:
         with pytest.raises(AnalysisError, match="evidence"):
             validate_analysis(analysis(evidence=[quote]), source)
+
+
+@pytest.mark.parametrize("body,quote", [
+    ('The result is **available** under "policy beta".', 'The result is **available** under "policy beta".'),
+    ('> An earlier report spans\n> two quoted source lines.', 'An earlier report spans\n> two quoted source lines.'),
+    ('The `sample_metric` counter remains unchanged.', 'The `sample_metric` counter remains unchanged.'),
+])
+def test_literal_evidence_preserves_source_formatting(body, quote):
+    result = validate_analysis(analysis(evidence=[quote]), item(content=body), editorial=False)
+    assert result["evidence"] == [quote]
+
+
+@pytest.mark.parametrize("body,quote", [
+    ('The result is **available** under the policy.', 'The result is available under the policy.'),
+    ('The result uses "policy beta".', "The result uses 'policy beta'."),
+    ('> An earlier report spans\n> two quoted source lines.', 'An earlier report spans two quoted source lines.'),
+    ('The `sample_metric` counter remains unchanged.', 'The sample_metric counter remains unchanged.'),
+    ('The old keys are not trusted.', 'The old keys are trusted.'),
+])
+def test_model_reformatting_or_changed_words_are_still_not_literal_evidence(body, quote):
+    with pytest.raises(AnalysisError, match="not an exact excerpt"):
+        validate_analysis(analysis(evidence=[quote]), item(content=body), editorial=False)
+
+
+def test_evidence_diagnostics_distinguish_short_quotes_from_absent_quotes():
+    with pytest.raises(AnalysisError, match="quote 1 is shorter"):
+        validate_analysis(analysis(evidence=["ACK"]), item(content="The reply was ACK."), editorial=False)
+    with pytest.raises(AnalysisError, match="quote 2 is not an exact excerpt"):
+        validate_analysis(analysis(evidence=["The reply was", "An invented quotation"]),
+                          item(content="The reply was acknowledged."), editorial=False)
+    tag = item(kind="tag", title="v1")
+    assert validate_analysis(tag_notice(tag), tag)["evidence"] == ["v1"]
+
+
+def test_writer_request_advertises_the_existing_evidence_length_floor(monkeypatch):
+    llm = analyzer(monkeypatch, completion(analysis()))
+    llm.analyze(item())
+    request = llm.client.requests[0][1]
+    rule = request["response_format"]["json_schema"]["schema"]["properties"]["evidence"]["items"]
+    assert rule["minLength"] == MIN_EVIDENCE_CHARS
+
+
+def test_evidence_enum_is_derived_from_the_exact_supplied_context():
+    supplied = {"title": "An example source", "content": '> A quoted **status** uses "policy alpha".\nA second literal line.'}
+    choices = _writer_schema(supplied)["properties"]["evidence"]["items"]["enum"]
+    assert '> A quoted **status** uses "policy alpha".' in choices
+    assert all(choice in supplied["title"] or choice in supplied["content"] for choice in choices)
+    assert all(MIN_EVIDENCE_CHARS <= len(choice) <= 500 for choice in choices)
+
+
+def test_writer_excerpt_options_retain_later_supplied_comments(monkeypatch):
+    source = item(content="Original description", source_content="Original description", public_comments=[{
+        "id": "gid://gitlab/DiscussionNote/1", "url": "https://example.org/issue#note_1", "author": "operator",
+        "created_at": DATE, "updated_at": DATE, "body": 'The later **clarification** retains "quoted text".',
+    }])
+    llm = analyzer(monkeypatch, completion(analysis(evidence=["Original description"])))
+    llm.analyze(source)
+    request = llm.client.requests[0][1]
+    supplied = json.loads(request["messages"][1]["content"])
+    choices = request["response_format"]["json_schema"]["schema"]["properties"]["evidence"]["items"]["enum"]
+    assert 'The later **clarification** retains "quoted text".' in choices
+    assert all(choice in supplied["title"] or choice in supplied["content"] for choice in choices)
+
+
+def test_oversized_literal_lines_have_bounded_choices_including_their_tail():
+    line = "x" * 1500 + "END"
+    choices = _writer_schema({"title": "A source title", "content": line})["properties"]["evidence"]["items"]["enum"]
+    assert all(len(choice) <= 500 for choice in choices)
+    assert any(choice.endswith("END") for choice in choices)
+    assert all(choice in line or choice == "A source title" for choice in choices)
+
+
+def test_adjacent_short_lines_remain_a_literal_evidence_option():
+    supplied = {"title": "Ack", "content": "one\ntwo\nthree\nend"}
+    choices = _writer_schema(supplied)["properties"]["evidence"]["items"]["enum"]
+    assert choices and any(choice.endswith("end") for choice in choices)
+    assert all(choice in supplied["content"] for choice in choices)
+
+
+def test_no_qualifying_literal_excerpt_fails_closed_without_a_request(monkeypatch):
+    llm = analyzer(monkeypatch)
+    with pytest.raises(AnalysisError, match="no qualifying literal evidence"):
+        llm.analyze(item(title="Ack", content="OK"))
+    assert llm.client.requests == []
+
+
+@pytest.mark.parametrize("text", ["Straße!", "ßßßß", "ﬃﬃﬃ"])
+def test_casefold_expansion_cannot_create_an_impossible_enum_choice(text):
+    with pytest.raises(AnalysisError, match="no qualifying literal evidence"):
+        _writer_schema({"title": text, "content": ""})
 
 
 def test_hedged_issue_wording_is_not_a_completed_action():
