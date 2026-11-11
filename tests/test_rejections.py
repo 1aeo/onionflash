@@ -12,7 +12,7 @@ from onionflash.analyze import AnalysisError, cache_key
 from onionflash.config import DEFAULTS
 from onionflash.store import Store
 from onionflash.util import after
-from test_core import DATE, analysis, item
+from test_core import DAMAGE, DATE, analysis, damaged, item
 
 
 @pytest.fixture
@@ -55,16 +55,38 @@ def actions(store):
     return [dict(row) for row in store.db.execute("SELECT * FROM rejection_actions ORDER BY action_id")]
 
 
-@pytest.mark.parametrize("damage", ["'{'", "'[1]'", "CAST(x'7b22ff22' AS TEXT)"])
-def test_a_damaged_saved_item_stays_listable_and_inspectable(store, damage):
+def damage(store, row, kind):
+    store.db.execute("UPDATE items SET payload=CAST(? AS TEXT) WHERE id=?", (damaged(row["payload"], kind), row["id"]))
+    store.db.commit()
+
+
+@pytest.mark.parametrize("kind", DAMAGE)
+def test_a_damaged_saved_item_stays_listable_and_inspectable(store, kind):
     _, row = rejected(store, 0)
     _, intact = rejected(store, 1)
-    store.db.execute(f"UPDATE items SET payload={damage} WHERE id=?", (row["id"],))
-    store.db.commit()
+    damage(store, row, kind)
     listed = {entry["id"]: entry["title"] for entry in rejection.list_items(store)["items"]}
     assert listed == {row["id"]: None, intact["id"]: json.loads(intact["payload"])["title"]}
     shown = rejection.show_item(store, row["id"])
     assert shown["saved_item"] is None and shown["content_hash"] == row["content_hash"]
+
+
+@pytest.mark.parametrize("kind", DAMAGE)
+def test_a_damaged_saved_item_can_be_dismissed_but_not_retried(store, kind):
+    _, row = rejected(store)
+    damage(store, row, kind)
+    with pytest.raises(ValueError, match="restore or recollect it first"):
+        rejection.retry_item(store, row["id"], row["content_hash"], "try again")
+    assert rejection.dismiss_item(store, row["id"], row["content_hash"], "damaged copy")["status"] == "dismissed"
+
+
+@pytest.mark.parametrize("title", [[1], {"a": 1}, 5, True])
+def test_only_text_is_listed_as_a_title(store, title):
+    """A saved title of another type never reaches the printed list, which could not print one nested deeply enough."""
+    _, row = rejected(store)
+    store.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps({**json.loads(row["payload"]), "title": title}), row["id"]))
+    store.db.commit()
+    assert rejection.list_items(store)["items"][0]["title"] is None
 
 
 def test_list_excludes_transient_failures_and_is_bounded_with_stable_pagination(store):
@@ -207,10 +229,11 @@ def test_retry_and_dismiss_do_not_mutate_an_existing_story_or_editorial_state(st
     assert rejection.show_item(store, source["id"])["story_id"] == original_story_id
 
 
-def test_retry_refuses_missing_source_body_but_dismiss_still_works(store):
+@pytest.mark.parametrize("field", ["content", "url", "updated_at"])
+def test_retry_refuses_an_incomplete_saved_item_but_dismiss_still_works(store, field):
     _, row = rejected(store)
     payload = json.loads(row["payload"])
-    payload.pop("content")
+    payload.pop(field)
     with store.db:
         store.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps(payload), row["id"]))
     with pytest.raises(ValueError, match="restore or recollect"):
@@ -363,7 +386,10 @@ def test_dismissed_failed_pending_revision_only_requeues_on_source_change(store)
 
 @pytest.mark.parametrize("action", ["retry", "dismiss"])
 @pytest.mark.parametrize("change", ["status='published'", "attempts=attempts+1", "rejections=rejections+1",
-                                    "last_error=NULL", "next_attempt_at=NULL", "source_id='retired-alerts'"])
+                                    "last_error=NULL", "next_attempt_at=NULL", "source_id='retired-alerts'",
+                                    # Comment refreshes rewrite only the payload, so the swap compares its exact bytes.
+                                    "payload='{\"other\": 1}'", "payload=replace(payload, 'title', 'título')",
+                                    "payload=CAST(x'7b22ff22' AS TEXT)"])
 def test_concurrent_pending_queue_change_is_not_overwritten(store, monkeypatch, action, change):
     """A stale operator action must preserve concurrent queue updates without an audit."""
     _, row = failed_pending(store)
@@ -380,8 +406,8 @@ def test_concurrent_pending_queue_change_is_not_overwritten(store, monkeypatch, 
             rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed", DATE)
         else:
             rejection.dismiss_item(store, row["id"], row["content_hash"], "Reviewed", DATE)
-    current = dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone())
-    assert current["content_hash"] == row["content_hash"] and current["payload"] == row["payload"]
+    current = store.db.execute("SELECT content_hash,status FROM items WHERE id=?", (row["id"],)).fetchone()
+    assert current["content_hash"] == row["content_hash"]
     assert current["status"] != "dismissed" and actions(store) == []
 
 

@@ -69,6 +69,19 @@ def analysis(**kw):
     }
 
 
+DAMAGE = ["invalid-json", "non-object", "invalid-utf8", "deep", "surrogate", "bom", "utf-16"]
+
+
+def damaged(document, kind):
+    """Bytes the app never saves for a JSON document: broken JSON, a non-object, bytes that are not
+    UTF-8, nesting past the parser's limit, or the document with a lone surrogate added, a BOM
+    prepended, or encoded as UTF-16."""
+    if kind == "surrogate":
+        return json.dumps({**json.loads(document), "\ud800": ""}, ensure_ascii=False).encode("utf-8", "surrogatepass")
+    return {"invalid-json": b"{", "non-object": b"[1]", "invalid-utf8": b'{"\xff"', "deep": b"[" * 100000,
+            "bom": b"\xef\xbb\xbf" + document.encode(), "utf-16": document.encode("utf-16")}[kind]
+
+
 def config(tmp_path):
     result = copy.deepcopy(DEFAULTS)
     result["storage"]["database"] = str(tmp_path / "state.sqlite3")

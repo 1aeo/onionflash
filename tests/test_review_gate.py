@@ -12,7 +12,7 @@ from onionflash import editorial, rejection, review, review_gate
 from onionflash.analyze import AnalysisError, cache_key, tag_notice
 from onionflash.store import Store
 from onionflash.util import digest
-from test_core import DATE, analysis, config, item
+from test_core import DAMAGE, DATE, analysis, config, damaged, item
 
 
 LATER = "2026-11-10T12:00:00Z"
@@ -433,12 +433,16 @@ def test_rejected_show_reads_a_reused_approval_after_an_interrupted_commit(conte
     assert shown["stage"] == "approved" and shown["latest_review"]["verdict"] == "approve"
 
 
-def test_rejected_show_still_prints_the_item_when_its_review_record_is_damaged(context):
+@pytest.mark.parametrize("kind", [*DAMAGE, "review-not-an-object", "review-without-result"])
+def test_rejected_show_still_prints_the_item_when_its_review_record_is_damaged(context, kind):
     cfg, store = context
     row = pending(store)
     assert run(cfg, store, row, Writer(), Reviewer(verdict("hold")))["status"] == "held"
+    # Besides the damaged() kinds, a record can be a valid object of the wrong shape.
+    shapes = {"review-not-an-object": b'{"reviews": [1]}', "review-without-result": b'{"reviews": [{"stage": "held"}]}'}
     with store.db:
-        store.db.execute("UPDATE review_jobs SET record_json='{' WHERE item_id=?", (row["id"],))
+        value = shapes.get(kind) or damaged(job(store)["record_json"], kind)
+        store.db.execute("UPDATE review_jobs SET record_json=CAST(? AS TEXT) WHERE item_id=?", (value, row["id"]))
     shown = rejection.show_item(store, row["id"])
     assert shown["final_review"] == {"stage": "held", "error": "Saved review record cannot be read"}
     assert shown["saved_item"] is not None

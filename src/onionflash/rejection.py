@@ -24,23 +24,29 @@ def _identifier(value: str) -> str:
     return value
 
 
-# The payload is read as bytes, so a value that is not even UTF-8 reaches _payload instead of failing the query.
+# The payload is read as bytes, so a value that is not even UTF-8 reaches _object instead of failing the query.
 _COLUMNS = "id,content_hash,source_id,status,attempts,rejections,next_attempt_at,story_id,url,last_error,CAST(payload AS BLOB) AS payload"
 
 
-def _payload(row):
-    """The saved item, or None when its JSON is damaged, so one bad row cannot hide the others."""
+def _object(value):
+    """A saved JSON object read as bytes, or None when it is damaged, so one bad row cannot hide
+    the others. Decoding is strict UTF-8, as when the pipeline reads the row, not json.loads'
+    lenient bytes mode."""
     try:
-        payload = json.loads(row["payload"])
-    except (TypeError, ValueError):
+        value = json.loads(str(value, "utf-8"))
+    except (ValueError, RecursionError):
         return None
-    return payload if isinstance(payload, dict) else None
+    return value if isinstance(value, dict) else None
+
+
+def _text(value):
+    return value if isinstance(value, str) else None
 
 
 def _summary(row):
     result = {key: row[key] for key in ("id", "content_hash", "source_id", "status", "attempts", "rejections", "next_attempt_at", "story_id")}
     # The CLI escapes printed text, so stored values are shown as the app wrote them.
-    result.update(source_url=row["url"], rejection_reason=row["last_error"], title=(_payload(row) or {}).get("title"))
+    result.update(source_url=row["url"], rejection_reason=row["last_error"], title=_text((_object(row["payload"]) or {}).get("title")))
     return result
 
 
@@ -64,7 +70,7 @@ def show_item(store, item_id) -> dict:
     if row is None:
         raise ValueError("Source item was not found")
     result = _summary(row)
-    result["saved_item"] = _payload(row)
+    result["saved_item"] = _object(row["payload"])
     result["final_review"] = _final_review(store, item_id)
     result["actions"] = [dict(action) for action in store.db.execute(
         """SELECT action_id,action,content_hash,reason,created_at,before_status,before_attempts,before_rejections
@@ -74,11 +80,12 @@ def show_item(store, item_id) -> dict:
 
 def _final_review(store, item_id):
     """The current job's stage, candidate, source packet and latest verdict, as saved."""
-    row = store.db.execute("SELECT stage,record_json FROM review_jobs WHERE item_id=?", (item_id,)).fetchone()
+    row = store.db.execute("SELECT stage,CAST(record_json AS BLOB) AS record_json FROM review_jobs WHERE item_id=?",
+                           (item_id,)).fetchone()
     if row is None:
         return None
+    record = _object(row["record_json"])
     try:
-        record = json.loads(row["record_json"])
         prepared = record.get("prepared", {})
         reviews = record.get("reviews") or record.get("approval", {}).get("reviews", [])
         latest = reviews[-1] if reviews else None
@@ -86,7 +93,7 @@ def _final_review(store, item_id):
                 "source_packet": prepared.get("packet"),
                 "latest_review": latest and {**latest["result"], "phase": latest["stage"],
                                              "candidate_hash": latest["candidate_hash"]}}
-    except (ValueError, TypeError, KeyError, AttributeError):
+    except (TypeError, KeyError, AttributeError):
         # A damaged record must not hide the item and its actions.
         return {"stage": row["stage"], "error": "Saved review record cannot be read"}
 
@@ -100,7 +107,7 @@ def _request(item_id, expected_hash, reason, observed):
 
 def _checked(db, item_id, expected_hash, *, statuses, retired_source_ids=()):
     """Require the inspected source revision and a queue state the action applies to."""
-    row = db.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+    row = db.execute(f"SELECT {_COLUMNS} FROM items WHERE id=?", (item_id,)).fetchone()
     if row is None:
         raise ValueError("Source item was not found")
     if row["content_hash"] != expected_hash:
@@ -118,8 +125,8 @@ def _checked(db, item_id, expected_hash, *, statuses, retired_source_ids=()):
 
 def _ready(row):
     """Refuse to queue a structurally unreadable/cold item for model analysis."""
+    payload = _object(row["payload"]) or {}
     try:
-        payload = json.loads(row["payload"])
         if payload.get("id") != row["id"]:
             raise ValueError
         for key in ("title", "content", "kind"):
@@ -130,7 +137,7 @@ def _ready(row):
         canonical_url(payload["url"])
         parse_utc(payload["published_at"])
         parse_utc(payload["updated_at"])
-    except (ValueError, TypeError, KeyError, AttributeError):
+    except (ValueError, KeyError):
         raise ValueError("Stored source item is not ready for analysis; restore or recollect it first") from None
 
 
@@ -151,7 +158,7 @@ def _act(store, item_id, expected_hash, reason, action, observed, *, reconsider_
         update = ("status='pending',attempts=0,rejections=0,next_attempt_at=NULL,last_error=NULL"
                   if action == "retry" else "status='dismissed',next_attempt_at=NULL")
         changed = db.execute(f"""UPDATE items SET {update}
-            WHERE id=? AND source_id=? AND content_hash=? AND payload=? AND status=? AND attempts=?
+            WHERE id=? AND source_id=? AND content_hash=? AND CAST(payload AS BLOB)=? AND status=? AND attempts=?
             AND rejections=? AND last_error IS ? AND next_attempt_at IS ?""",
             (item_id, row["source_id"], expected_hash, row["payload"], row["status"], row["attempts"],
              row["rejections"], row["last_error"], row["next_attempt_at"])).rowcount
