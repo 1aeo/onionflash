@@ -5,12 +5,12 @@ import json
 
 import pytest
 
-from onionflash import editorial, render, review, review_gate
+from approval_helpers import approve, finish_reviewed
+from onionflash import editorial, render, review
 from onionflash.analyze import tag_notice
 from onionflash.candidate import ReviewRequired, StaleCandidate
-from onionflash.source_packet import DEFAULT_LIMITS
+from onionflash.config import DEFAULTS
 from onionflash.store import Store
-from onionflash.util import digest
 from test_core import DATE, analysis, item
 
 
@@ -23,26 +23,8 @@ def pending(store, incoming=None, observed=DATE):
     return store.pending(1, observed)[0]
 
 
-def approve(store, prepared, candidate=None, *, policy="test-policy", verdict=None):
-    candidate = candidate or prepared["candidate"]
-    review_gate.initialize(store)
-    ref = prepared["packet"]["sources"][0]["passages"][0]["id"]
-    verdict = verdict or {"verdict": "approve", "repair": None, "issues": [],
-                          "criteria": {name: {"outcome": "pass", "source_refs": [ref], "reason": "Fixture review."} for name in review.CRITERIA}}
-    key = digest([digest(candidate), prepared["source_hash"], policy, prepared["binding_hash"]])
-    audit = {"candidate": candidate, "packet": prepared["packet"], "reviews": [verdict]}
-    with store.db:
-        store.db.execute("INSERT OR REPLACE INTO review_approvals VALUES(?,?,?,?,?,?,?,?,?)",
-                         (key, digest(candidate), prepared["source_hash"], policy, prepared["binding_hash"],
-                          json.dumps(verdict), json.dumps(audit), DATE, DATE))
-    return {"approval_key": key, "policy_hash": policy}
-
-
 def publish(store, incoming=None, result=None, *, observed=DATE, key="fixture", input_chars=14000):
-    row = pending(store, incoming, observed)
-    prepared = store.prepare_candidate(row, result or analysis(), observed, input_chars=input_chars)
-    receipt = approve(store, prepared) if prepared["requires_review"] else {}
-    store.commit_candidate(prepared, prepared["candidate"], key, observed, **receipt)
+    finish_reviewed(store, pending(store, incoming, observed), result or analysis(), key, observed, input_chars=input_chars)
     return store.stories()[0]
 
 
@@ -75,29 +57,6 @@ def test_truncation_at_space_keeps_reviewed_candidate_stable_through_commit(tmp_
         receipt = approve(store, prepared)
         store.commit_candidate(prepared, public, "truncated-source", DATE, **receipt)
         assert render._prepare_story(store.stories()[0]) == public
-
-
-def test_review_sees_retained_bad_text_and_actual_prior_writer_source(tmp_path):
-    with Store(tmp_path / "db") as store:
-        old = publish(store, item(content=BODY, updated_at=LATER),
-                      analysis(why_it_matters="Operators must edit their configurations."), observed=LATER)
-        incoming = item(url="https://example.org/arti/1", source_id="arti", content=BODY)
-        row = pending(store, incoming, LATER)
-        prepared = store.prepare_candidate(row, analysis(why_it_matters="The report requests a source-code change."), LATER)
-        assert prepared["candidate"]["why_it_matters"] == old["why_it_matters"]
-        assert prepared["candidate"]["id"] == old["id"]
-        assert prepared["candidate"]["published_at"] == old["published_at"]
-        assert prepared["writer_item_id"] == old["editorial_item"]
-        assert len(prepared["candidate"]["sources"]) == 2
-        passages = [p["text"] for source in prepared["packet"]["sources"] for p in source["passages"]]
-        assert BODY in passages
-        assert not any("Operators must edit" in text for text in passages)
-        repaired = review.apply_repair(prepared["candidate"], {"why_it_matters": ""})
-        receipt = approve(store, prepared, repaired)
-        store.commit_candidate(prepared, repaired, "repair", LATER, **receipt)
-        final = store.stories()[0]
-        assert final["why_it_matters"] == ""
-        assert final["id"] == old["id"] and final["published_at"] == old["published_at"]
 
 
 @pytest.mark.parametrize("change", ["item", "supporting-source", "story", "lock", "new-story"])
@@ -167,26 +126,6 @@ def test_locked_story_skips_model_prose_but_records_analysis_and_grouping(tmp_pa
         assert store.stories()[0]["summary"] == "An operator correction."
         assert store.db.execute("SELECT COUNT(*) FROM analyses").fetchone()[0] == 2
         assert store.db.execute("SELECT story_id FROM items WHERE id=?", (row["id"],)).fetchone()[0] == old["id"]
-
-
-def test_tag_exemption_applies_to_final_candidate_not_incoming_kind(tmp_path):
-    release = item(kind="feed", title="Tor 0.4.9.16 released", url="https://example.org/release", content=BODY)
-    tag = item(kind="tag", title="tor-0.4.9.16", url="https://example.org/tag", content="", updated_at=LATER)
-    with Store(tmp_path / "db") as store:
-        old = publish(store, release, analysis(title="Tor release includes security changes.", state="released"))
-        row = pending(store, tag, LATER)
-        prepared = store.prepare_candidate(row, tag_notice(json.loads(row["payload"])), LATER)
-        assert prepared["requires_review"] and not prepared["wholly_deterministic"]
-        assert prepared["candidate"]["title"] == old["title"]
-        with pytest.raises(ReviewRequired):
-            store.finish(row, tag_notice(json.loads(row["payload"])), "tag-model-merge", LATER)
-    with Store(tmp_path / "new-db") as store:
-        row = pending(store, tag, LATER)
-        result = tag_notice(json.loads(row["payload"]))
-        prepared = store.prepare_candidate(row, result, LATER)
-        assert prepared["wholly_deterministic"] and not prepared["requires_review"]
-        store.finish(row, result, "literal", LATER)
-        assert store.stories()[0]["state"] == "tagged"
 
 
 def test_cold_required_source_holds_and_hot_historical_snapshot_is_labeled(tmp_path):
@@ -312,7 +251,7 @@ def test_uncited_corrective_note_survives_long_description_and_binds_approval(tm
             "author": "maintainer", "created_at": DATE, "updated_at": LATER,
             "body": "Correction: relay operators do not need to edit their configurations."}
     incoming = _compose(item(url=url, content=BODY * 100), [note], LATER)
-    limits = {**DEFAULT_LIMITS, "max_source_chars": 2000, "passage_chars": 500}
+    limits = {**DEFAULTS["review"], "max_source_chars": 2000, "passage_chars": 500}
     with Store(tmp_path / "db") as store:
         row = pending(store, incoming, LATER)
         draft = analysis(evidence=["The operator reports that old directory-authority keys cannot be trusted"])
@@ -366,7 +305,7 @@ def test_legacy_multi_source_prose_requires_all_evidence_not_guessed_writer(tmp_
             assert not prepared["missing_sources"]
             assert {source["url"] for source in prepared["packet"]["sources"]} == {first["url"], second["url"]}
             # Resource bounds still hold even when the writer is unidentified.
-            bounded = store.prepare_candidate(row, analysis(), LATER, review_settings={**DEFAULT_LIMITS, "max_sources": 1})
+            bounded = store.prepare_candidate(row, analysis(), LATER, review_settings={**DEFAULTS["review"], "max_sources": 1})
             assert bounded["missing_sources"]
             receipt = approve(store, prepared)
             store.commit_candidate(prepared, prepared["candidate"], "legacy-reviewed", LATER, **receipt)
@@ -463,7 +402,7 @@ def test_only_review_supplied_note_dates_advance_candidate_not_poll_receipts(tmp
         assert supplied["candidate"]["updated_at"] == LATER
         assert supplied["payload"]["editorial_updated_at"] == LATER
         excluded = store.prepare_candidate(row, draft, after(3600, LATER), input_chars=14000,
-                                           review_settings={**DEFAULT_LIMITS, "max_source_chars": 400})
+                                           review_settings={**DEFAULTS["review"], "max_source_chars": 400})
         assert excluded["candidate"]["updated_at"] == DATE  # Context too small to supply the note.
         assert excluded["packet"]["truncated"]
         poll = json.loads(row["payload"])

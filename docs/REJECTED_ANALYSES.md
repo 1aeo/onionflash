@@ -3,9 +3,8 @@
 Transient failures, such as an unavailable LLM endpoint, remain pending and use
 the normal exponential backoff. Three terminal writer or final-review
 content/validation failures, or unexpected processing errors, move an item to
-`rejected`. A semantic final-review hold rejects the candidate immediately,
-including an unusable repair or one that does not pass its fresh verification;
-automation does not keep rewriting that source revision.
+`rejected`. A [final-review](FINAL_REVIEW.md) hold rejects the candidate
+immediately; automation does not keep rewriting that source revision.
 
 These local CLI commands act on one item at a time. They do not call the LLM,
 publish a story, retract a story or unlock an editorial correction.
@@ -23,26 +22,12 @@ attempt count and rejection count. It excludes transient pending failures and
 returns a `next_cursor` for bounded ID-based pagination. Limits are 1–200 items.
 Use `--status dismissed` to inspect dismissed revisions.
 
-`show` explicitly includes the saved source item and up to 20 recent operator
-actions. When a current final-review job exists, `final_review` also shows:
-
-- Its stage and exact candidate text, including a repair waiting for verification.
-- The latest structured verdict, each criterion's outcome and reason, and the
-  issues identified by the reviewer.
-- The bounded numbered source packet, so references such as `S1:P3` can be checked
-  against the actual supplied passage.
-
-`latest_review.phase` distinguishes the first review from verification. Its
-`candidate_hash` identifies the text that verdict evaluated; during `verify`,
-the current candidate may be the repair that has not yet received approval.
-No job is shown after successful publication clears it; its completed audit
-remains in private analysis records.
-
-This is a read-only private inspection command. Source text, review findings and
-operator reasons are not published by it. It does not dump raw provider errors,
-credential fields or superseded analysis JSON. Each saved source/review record is
-bounded to 1 MiB; malformed or oversized records produce an inspection error
-field rather than a source dump.
+`show` prints the saved source item, up to 20 recent operator actions and, while
+a final-review job exists, its stage, current candidate, numbered source packet
+(for checking references such as `S1:P3`) and latest per-criterion verdict. That
+verdict's `candidate_hash` names the text it evaluated; during `verify`, the
+candidate shown is a repair that has not been verified yet. The output is private
+operator data.
 
 ## Retry one rejected revision
 

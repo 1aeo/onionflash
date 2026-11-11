@@ -93,7 +93,7 @@ def test_optional_comment_failure_does_not_stop_saved_analysis(tmp_path, monkeyp
         report = cli.run(config, store)
         assert report["comments"]["failed"] == 1
         assert "RAW PRIVATE" not in json.dumps(report)
-        assert report["analyzed"] == 1 and store.story_count() == 1
+        assert report["analyzed"] == 1 and len(store.stories()) == 1
 
 
 def test_comments_use_collection_window_without_spending_analysis_reserve(tmp_path, monkeypatch):
