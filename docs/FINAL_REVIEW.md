@@ -27,8 +27,9 @@ The normal successful path uses two model calls: writer and reviewer. One repair
 adds a third call. Transport failures may retry through configured endpoints or a
 later scheduled run, but completed stages are retained rather than regenerated.
 An ignored draft needs no publication review. A wholly deterministic final tag
-notice and the existing deterministic monitoring notices do not need LLM review.
-An incoming tag is not an exemption when the merged story retains model prose.
+notice does not need LLM review. An incoming tag is not an exemption when the
+merged story retains model prose. Raw monitoring follows the separate
+[private-candidate policy](MONITORING.md).
 
 ## Rubric
 
