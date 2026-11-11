@@ -1,4 +1,4 @@
-"""Small, private operator controls for terminally rejected source items.
+"""Small, private operator controls for rejected or previously failed source items.
 
 The CLI must hold the application run lock for retry/dismiss. These actions do
 not call a model, publish a story, or change editorial correction state.
@@ -152,8 +152,11 @@ def _checked(db, item_id, expected_hash):
         raise ValueError("Source item was not found")
     if row["content_hash"] != expected_hash:
         raise ValueError("Source content changed; inspect the current item before acting")
-    if row["status"] != "rejected":
-        raise ValueError("Only a terminally rejected item can be retried or dismissed")
+    failed_pending = (row["status"] == "pending" and type(row["attempts"]) is int
+                      and row["attempts"] > 0 and isinstance(row["last_error"], str)
+                      and bool(row["last_error"].strip()))
+    if row["status"] != "rejected" and not failed_pending:
+        raise ValueError("Only a terminally rejected or previously failed pending item can be retried or dismissed")
     return dict(row)
 
 
@@ -187,15 +190,13 @@ def _act(store, item_id, expected_hash, reason, action, llm, observed):
         if snapshot is not None:
             snapshot.encode("utf-8")
         _initialize(db)
-        if action == "retry":
-            changed = db.execute("""UPDATE items SET status='pending',attempts=0,rejections=0,
-                next_attempt_at=NULL,last_error=NULL
-                WHERE id=? AND content_hash=? AND payload=? AND status='rejected'""",
-                (item_id, expected_hash, row["payload"])).rowcount
-        else:
-            changed = db.execute("""UPDATE items SET status='dismissed',next_attempt_at=NULL
-                WHERE id=? AND content_hash=? AND payload=? AND status='rejected'""",
-                (item_id, expected_hash, row["payload"])).rowcount
+        update = ("status='pending',attempts=0,rejections=0,next_attempt_at=NULL,last_error=NULL"
+                  if action == "retry" else "status='dismissed',next_attempt_at=NULL")
+        changed = db.execute(f"""UPDATE items SET {update}
+            WHERE id=? AND content_hash=? AND payload=? AND status=? AND attempts=?
+            AND rejections=? AND last_error IS ? AND next_attempt_at IS ?""",
+            (item_id, expected_hash, row["payload"], row["status"], row["attempts"],
+             row["rejections"], row["last_error"], row["next_attempt_at"])).rowcount
         if changed != 1:
             raise ValueError("Source item changed during the action; inspect it again")
         event = db.execute("""INSERT INTO rejection_actions
@@ -214,7 +215,7 @@ def _act(store, item_id, expected_hash, reason, action, llm, observed):
 
 
 def retry_item(store, item_id, expected_hash, reason, llm, observed=None) -> dict:
-    """Queue one rejected revision and retain its superseded analysis for audit."""
+    """Retry one failed revision and retain its superseded analysis for audit."""
     return _act(store, item_id, expected_hash, reason, "retry", llm, observed)
 
 

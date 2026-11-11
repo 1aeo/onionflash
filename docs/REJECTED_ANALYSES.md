@@ -8,6 +8,11 @@ immediately; automation does not keep rewriting that source revision.
 
 These local CLI commands act on one item at a time. They do not call the LLM,
 publish a story, retract a story or unlock an editorial correction.
+Retry and dismiss also accept a `pending` item that has already failed: its
+attempt count must be positive and its saved error must be nonblank. This lets
+an operator act on a reviewed failure without waiting for terminal rejection.
+New or reset pending items, and published, ignored or already dismissed items,
+cannot be retried or dismissed through these controls.
 
 ## Inspect
 
@@ -27,17 +32,18 @@ a final-review job exists, its stage, current candidate, numbered source packet
 (for checking references such as `S1:P3`) and latest per-criterion verdict. That
 verdict's `candidate_hash` names the text it evaluated; during `verify`, the
 candidate shown is a repair that has not been verified yet. The output is private
-operator data.
+operator data. `show` also accepts an explicit pending item ID; inspect its
+attempt count and saved error before deciding whether to intervene.
 
-## Retry one rejected revision
+## Retry one failed revision
 
 ```sh
 onionflash rejected retry --config config.toml --item ITEM_ID \
   --expect-hash CURRENT_CONTENT_HASH --reason "The grounding rule was fixed"
 ```
 
-Copy `CURRENT_CONTENT_HASH` from the inspected item. A changed hash or a status
-other than `rejected` stops the action. Retry resets the attempt/rejection counts
+Copy `CURRENT_CONTENT_HASH` from the inspected item. A changed hash or an
+ineligible queue state stops the action. Retry resets the attempt/rejection counts
 and cooldown, then queues the item for the normal analysis pipeline. It does not
 bypass validation or approve a publication. A missing or unreadable source body
 must be restored or recollected before retrying.
@@ -55,7 +61,7 @@ private action audit as `superseded_analysis_key` and `superseded_analysis_json`
 including its structured held-review audit, then removes that record so the new attempt can save its own analysis. Other
 analysis records and already accepted stories are unchanged.
 
-## Dismiss one rejected revision
+## Dismiss one failed revision
 
 ```sh
 onionflash rejected dismiss --config config.toml --item ITEM_ID \
@@ -72,7 +78,8 @@ decision about that source revision, not a permanent ban on future reporting.
 Both actions require a reason of 1–1,000 characters. Repeating an already-applied
 action returns a state error without resetting the queue or adding another audit
 record. Mutations run under the application's existing run lock and apply an
-additional content-hash/state guard in SQLite. A failed audit write rolls back
+additional content-hash, payload and queue-state guard in SQLite, including the
+observed counters, error and cooldown. A failed audit write rolls back
 the queue and analysis-record changes.
 
 The private `rejection_actions` table records each reason, source-version hash,
