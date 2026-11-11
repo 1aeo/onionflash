@@ -171,14 +171,15 @@ def test_unusable_repair_holds_after_one_call_for_operator_inspection(context, r
     assert rejection.show_item(store, row["id"])["final_review"]["latest_review"]["verdict"] == "revise"
 
 
-def test_completed_approval_resumes_after_crash_without_any_model_call(context, monkeypatch):
+@pytest.mark.parametrize("decision", ["approve", "skip"])
+def test_completed_decision_resumes_after_crash_without_any_model_call(context, monkeypatch, decision):
     cfg, store = context
     row = pending(store)
     commit = store.commit_candidate
     monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash before commit")))
     with pytest.raises(RuntimeError, match="simulated crash"):
-        run(cfg, store, row, Writer(), Reviewer(verdict()))
-    assert job(store)["stage"] == "approved" and len(store.stories()) == 0
+        run(cfg, store, row, Writer(), Reviewer(verdict(decision, criterion="news_value")))
+    assert job(store)["stage"] == ("approved" if decision == "approve" else "skipped") and len(store.stories()) == 0
     store.defer(row["id"], "Unexpected RuntimeError", cfg["llm"], LATER, terminal=True)  # as the run loop does
     row = dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone())
     monkeypatch.setattr(store, "commit_candidate", commit)
@@ -188,8 +189,9 @@ def test_completed_approval_resumes_after_crash_without_any_model_call(context, 
     assert run(cfg, store, other, Writer(), Reviewer(verdict("skip", criterion="news_value")))["status"] == "ignored"
     writer, checker = Writer(), Reviewer()
     result = run(cfg, store, row, writer, checker, allow_network=False)
-    assert result["status"] == "published" and result["cache_hit"]
+    assert result["status"] == ("published" if decision == "approve" else "ignored") and result["cache_hit"]
     assert writer.calls == checker.calls == [] and job(store) is None
+    assert len(store.stories()) == (1 if decision == "approve" else 0)
     assert not store.db.execute("SELECT 1 FROM review_approvals").fetchone()
 
 
@@ -250,15 +252,16 @@ def test_human_lock_during_review_preserves_operator_text(context):
 
 
 def test_tag_update_still_reviews_the_existing_prose_it_retains(context):
-    """Review inherited prose even when a locally drafted tag triggers the candidate."""
+    """Review and repair inherited prose even when a locally drafted tag triggers the candidate."""
     cfg, store = context
     original = item(title="Tor 0.4.9.16 released", kind="feed", content="Tor 0.4.9.16 was released with an announced change.")
-    seed_legacy(store, original, analysis(title="Tor release announcement"))
+    seed_legacy(store, original, analysis(title="Tor release announcement", state="tagged"))
     tag = item(url="https://example.org/tags/tor-0.4.9.16", title="tor-0.4.9.16", kind="tag", content="")
     row = pending(store, tag)
-    checker = Reviewer(verdict())
+    checker = Reviewer(verdict("revise", repair={"title": "Tor 0.4.9.16 release announcement"}), verdict())
     result = run(cfg, store, row, Writer(tag_notice(tag)), checker)
     assert result["review_calls"] == 2 and checker.calls[0][0]["title"] == "Tor release announcement"
+    assert result["status"] == "published" and store.stories()[0]["title"] == "Tor 0.4.9.16 release announcement"
 
 
 def test_tag_draft_requires_final_review_and_waits_when_network_is_disabled(context):
@@ -272,6 +275,17 @@ def test_tag_draft_requires_final_review_and_waits_when_network_is_disabled(cont
     assert result["writer_calls"] == 0 and store.stories() == []
     reviewed = run(cfg, store, row, Writer(tag_notice(tag)), Reviewer(verdict()))
     assert reviewed["status"] == "published" and reviewed["writer_calls"] == 0 and reviewed["review_calls"] == 2
+
+
+def test_tag_notice_stays_literal_when_review_proposes_a_repair(context):
+    """Hold a tag notice that review would edit, even when verification would approve the edit."""
+    cfg, store = context
+    tag = item(title="tor-0.4.9.16", kind="tag", content="")
+    row = pending(store, tag)
+    checker = Reviewer(verdict("revise", repair={"title": "Tor 0.4.9.16 released", "state": "released"}), verdict())
+    result = run(cfg, store, row, Writer(tag_notice(tag)), checker)
+    assert result["status"] == "held" and result["review_calls"] == 1 and store.stories() == []
+    assert store.db.execute("SELECT last_error FROM items").fetchone()[0] == "Final review held: review proposed editing a literal tag notice"
 
 
 def test_network_disabled_defers_new_network_work_without_failure(context):
@@ -342,6 +356,7 @@ def test_operator_retry_preserves_held_audit_and_reuses_the_completed_draft(cont
     cfg, store = context
     row = pending(store)
     assert run(cfg, store, row, Writer(), Reviewer(verdict("hold")))["status"] == "held"
+    assert store.db.execute("SELECT last_error FROM items").fetchone()[0] == "Final review held: review did not approve the candidate"
     rejection.retry_item(store, row["id"], row["content_hash"], "The review prompt was revised", LATER)
     audit = json.loads(store.db.execute("SELECT review_record FROM analyses WHERE cache_key=?",
                                         (cache_key(row, cfg["llm"]),)).fetchone()[0])

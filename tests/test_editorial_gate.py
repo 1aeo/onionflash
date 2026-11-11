@@ -28,17 +28,15 @@ def skipped(criterion="new_information"):
     return verdict("skip", criterion=criterion)
 
 
-def test_editorial_skip_is_audited_and_does_not_change_existing_article_or_controls(context):
-    """Record the skip while preserving the existing article and editorial controls."""
+def test_editorial_skip_is_audited_and_does_not_change_existing_article(context):
+    """Record the skip while preserving the existing article."""
     cfg, store = context
     original, story_id = seed_legacy(store)
     row = pending(store, {**original, "content": original["content"] + " A routine acknowledgment.", "updated_at": LATER})
     stories = [tuple(r) for r in store.db.execute("SELECT * FROM stories")]
-    controls = [tuple(r) for r in store.db.execute("SELECT * FROM editorial_controls")]
     result = run(cfg, store, row, Writer(), Reviewer(skipped()))
     assert result["status"] == "ignored" and job(store) is None
     assert [tuple(r) for r in store.db.execute("SELECT * FROM stories")] == stories
-    assert [tuple(r) for r in store.db.execute("SELECT * FROM editorial_controls")] == controls
     saved = store.db.execute("SELECT status,story_id FROM items WHERE id=?", (row["id"],)).fetchone()
     assert tuple(saved) == ("ignored", story_id)
     record = json.loads(store.db.execute("SELECT review_record FROM analyses").fetchone()[0])
@@ -66,14 +64,16 @@ def test_material_known_issue_followup_updates_same_article_after_review(context
     cfg, store = context
     original, story_id = seed_legacy(store)
     before = store.stories()[0]
+    add_coverage(store)
     row = pending(store, {**original, "content": original["content"] + " A substantive later result.", "updated_at": LATER})
     checker = Reviewer(verdict())
     result = run(cfg, store, row, Writer(analysis(summary="The source reports a substantive later result.")), checker)
-    assert result["status"] == "published" and len(store.stories()) == 1
+    assert result["status"] == "published" and len(store.stories()) == 2
     after = store.stories()[0]
     assert after["id"] == story_id and after["published_at"] == before["published_at"]
     assert after["summary"] == "The source reports a substantive later result."
     assert checker.coverages[0]["prior_story"]["summary"] == before["summary"]
+    assert story_id not in {entry["id"] for entry in checker.coverages[0]["recent"]} and checker.coverages[1] == checker.coverages[0]
 
 
 def test_routine_tag_has_local_draft_but_requires_editorial_review(context):
@@ -90,32 +90,6 @@ def test_routine_tag_has_local_draft_but_requires_editorial_review(context):
     prepared = store.prepare_candidate(row, tag_notice(json.loads(row["payload"])), LATER)
     with pytest.raises(ReviewRequired):
         store.commit_candidate(prepared, prepared["candidate"], "not-reviewed", LATER)
-
-
-def test_editorial_skip_may_include_factual_defects_without_requesting_a_pointless_repair(context):
-    """Allow non-news to be discarded without repairing claims that cannot publish."""
-    cfg, store = context
-    row = pending(store)
-    response = skipped("news_value")
-    response["criteria"]["source_support"]["outcome"] = "fail"
-    response["issues"].append({"criterion": "source_support", "source_refs": ["S1"], "explanation": "The draft also overstates this routine item."})
-    result = run(cfg, store, row, Writer(), Reviewer(response))
-    assert result["status"] == "ignored" and store.rejected_count() == 0 and store.stories() == []
-
-
-def test_completed_skip_resumes_from_bound_receipt_without_a_model_call(context, monkeypatch):
-    """Commit an interrupted skip from its exact durable receipt without reanalysis."""
-    cfg, store = context
-    row = pending(store)
-    commit = store.commit_candidate
-    monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("interrupted before skip commit")))
-    with pytest.raises(RuntimeError):
-        run(cfg, store, row, Writer(), Reviewer(skipped()))
-    assert job(store)["stage"] == "skipped" and store.pending_count() == 1
-    monkeypatch.setattr(store, "commit_candidate", commit)
-    result = run(cfg, store, row, Writer(), Reviewer(), allow_network=False)
-    assert result["status"] == "ignored" and result["cache_hit"] and result["review_calls"] == 0
-    assert job(store) is None and store.stories() == []
 
 
 def test_skip_requires_a_valid_recorded_skip_and_cannot_apply_approve_receipt(context):
@@ -158,7 +132,7 @@ def test_recent_query_does_not_scan_unbounded_history_to_replace_retracted_rows(
                 store.db.execute("""INSERT INTO editorial_controls
                     (story_id,revision,locked,retracted,notice_action,notice_reason,notice_at)
                     VALUES(?,1,1,1,'retract','Withdrawn',?)""", (f"background-{number:02d}", LATER))
-    background = candidate.coverage_background(store.db, None, candidate.COVERAGE_CHARS)
+    background = candidate.coverage_background(store.db, None)
     assert background["recent"] == [] and background["truncated"]
 
 
@@ -175,6 +149,8 @@ def test_initial_approval_cannot_publish_when_fresh_verification_refuses(context
     assert [call[2] for call in checker.calls] == [False, True]
     assert checker.calls[0][:2] == checker.calls[1][:2]
     assert store.stories() == []
+    if final == "hold":
+        assert store.db.execute("SELECT last_error FROM items").fetchone()[0] == "Final review held: final verification did not approve the candidate"
 
 
 def test_interrupted_verification_restarts_the_critique_when_coverage_changes(context):

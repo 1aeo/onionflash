@@ -193,8 +193,11 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                                                    policy_hash=policy, review_record=record, decision=verdict["verdict"])
                 return {**report, "status": committed["status"]}
             if verdict["verdict"] == "hold" or verification:  # one repair at most, and only a verified one
-                reason = "verification did not approve the repair" if verification else "review did not approve the candidate"
+                reason = "final verification did not approve the candidate" if verification else "review did not approve the candidate"
                 _hold(store, row, draft, writer_key, record, observed, reason)
+                return {**report, "status": "held"}
+            if prepared["payload"]["editorial_kind"] == "tag":
+                _hold(store, row, draft, writer_key, record, observed, "review proposed editing a literal tag notice")
                 return {**report, "status": "held"}
             try:
                 candidate = review.apply_repair(candidate, verdict["repair"])

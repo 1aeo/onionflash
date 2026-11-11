@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 
 from .analyze import AnalysisError, CompletionClient, SCHEMA as DRAFT_SCHEMA
-from . import candidate as candidate_policy
 from .candidate import SEMANTIC_FIELDS as EDITABLE
 from .render import _prepare_story
 from .util import digest
@@ -213,13 +212,11 @@ def _llm(config: dict) -> dict:
 
 
 def policy_hash(config: dict) -> str:
-    """The prompt, schema, model identity and coverage bounds; source_hash binds the packet and its bounds."""
+    """The prompt, schema and model identity; the source and binding hashes bind the packet and coverage."""
     llm = _llm(config)
     identity = {key: llm[key] for key in ("model", "base_url", "fallback_base_urls", "max_output_tokens",
                                          "enable_thinking", "send_chat_template_kwargs")}
-    coverage = {"coverage_rows": candidate_policy.COVERAGE_ROWS, "coverage_chars": candidate_policy.COVERAGE_CHARS,
-                "coverage_summary_chars": candidate_policy.COVERAGE_SUMMARY_CHARS}
-    return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, SCHEMA, identity, coverage])
+    return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, SCHEMA, identity])
 
 
 def _text(value, maximum: int, *, empty: bool = False) -> None:

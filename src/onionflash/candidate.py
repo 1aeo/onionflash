@@ -16,7 +16,7 @@ COVERAGE_CHARS = 12000
 COVERAGE_SUMMARY_CHARS = 200
 
 
-def coverage_background(db, prior: dict | None, budget: int) -> dict:
+def coverage_background(db, prior: dict | None) -> dict:
     """Bounded committed coverage for editorial comparison, never source evidence."""
     def public_text(row):
         """Normalize public coverage fields and reject mismatched stored identities."""
@@ -27,12 +27,6 @@ def coverage_background(db, prior: dict | None, budget: int) -> dict:
 
     previous = public_text(prior) if prior else None
     result = {"prior_story": previous, "recent": [], "truncated": False}
-    prior_size = len(json.dumps(result, ensure_ascii=False))
-    if prior_size > COVERAGE_CHARS:
-        raise ValueError("Prior coverage exceeds bounded public text limits")
-    # Preserve the prior story's exact visible text even when the optional
-    # recent-history allowance is small. Public field limits bound that text.
-    budget = max(min(budget, COVERAGE_CHARS), prior_size)
     rows = db.execute("""SELECT s.id,s.payload,COALESCE(e.retracted,0) AS retracted
         FROM stories s LEFT JOIN editorial_controls e ON e.story_id=s.id
         ORDER BY s.rowid DESC LIMIT ?""", (COVERAGE_ROWS,)).fetchall()
@@ -49,7 +43,7 @@ def coverage_background(db, prior: dict | None, budget: int) -> dict:
         compact["summary"] = compact["summary"][:COVERAGE_SUMMARY_CHARS]
         compact["summary_truncated"] = len(current["summary"]) > COVERAGE_SUMMARY_CHARS
         result["truncated"] |= compact["summary_truncated"]
-        if len(result["recent"]) + bool(previous) >= COVERAGE_ROWS or len(json.dumps({**result, "recent": [*result["recent"], compact]}, ensure_ascii=False)) > budget:
+        if len(result["recent"]) + bool(previous) >= COVERAGE_ROWS or len(json.dumps({**result, "recent": [*result["recent"], compact]}, ensure_ascii=False)) > COVERAGE_CHARS:
             result["truncated"] = True
             break
         result["recent"].append(compact)
@@ -117,9 +111,8 @@ def prepare(db, row: dict, result: dict, observed: str) -> dict:
     existing = existing_story(db, row)
     story_id = existing["id"] if existing else digest(row["cluster_key"])[:24]
     locked = editorial.is_locked(db, story_id)
-    coverage_budget = min(COVERAGE_CHARS, source_packet.LIMITS["max_source_chars"] // 2)
     binding = {"item": item_fingerprint(row), "prior_story": digest(existing),
-               "lock": control_fingerprint(db, story_id), "sources": [], "coverage_budget": coverage_budget}
+               "lock": control_fingerprint(db, story_id), "sources": []}
     envelope = {"row": row, "result": result, "story_id": story_id,
                 "cluster_key": existing["cluster_key"] if existing else row["cluster_key"],
                 "candidate": None, "payload": None, "packet": {"sources": [], "missing_sources": [], "truncated": False},
@@ -160,7 +153,7 @@ def prepare(db, row: dict, result: dict, observed: str) -> dict:
         packet, bindings = source_packet.build_packet(db, item, data, public, writer)
         binding["sources"] = bindings
         envelope.update(candidate=public, payload=data, packet=packet,
-                        coverage=coverage_background(db, existing, coverage_budget))
+                        coverage=coverage_background(db, existing))
     binding.update(payload_hash=digest(envelope["payload"]), candidate_hash=digest(envelope["candidate"]), packet_hash=digest(envelope["packet"]))
     binding["coverage_hash"] = digest(envelope["coverage"])
     envelope.update(candidate_hash=digest(envelope["candidate"]), source_hash=digest(envelope["packet"]),
