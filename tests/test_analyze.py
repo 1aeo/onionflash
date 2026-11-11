@@ -8,7 +8,8 @@ import json
 
 import pytest
 
-from onionflash.analyze import AnalysisError, Analyzer, MAX_EVIDENCE_CHOICES, MIN_EVIDENCE_CHARS, _writer_schema, validate_analysis
+from onionflash.analyze import (AnalysisError, Analyzer, MAX_EVIDENCE_CHOICES, MIN_EVIDENCE_CHARS, SCHEMA, _writer_schema,
+                                validate_analysis)
 from onionflash.comments import INPUT_CHARS
 from onionflash.config import DEFAULTS
 from onionflash.store import Store
@@ -165,6 +166,8 @@ def test_writer_request_requires_a_draft_and_the_existing_evidence_length_floor(
     assert fields["publish"]["enum"] == [True]
     assert fields["why_it_matters"]["enum"] == [""]
     assert fields["evidence"]["items"]["minLength"] == MIN_EVIDENCE_CHARS
+    assert fields["title"]["minLength"] == fields["summary"]["minLength"] == fields["evidence"]["minItems"] == 1
+    assert "minLength" not in SCHEMA["properties"]["title"] | SCHEMA["properties"]["summary"]  # review repairs copy these rules
 
 
 def test_evidence_enum_is_derived_from_the_exact_supplied_context():

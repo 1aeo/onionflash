@@ -367,4 +367,6 @@ def _writer_schema(bounded: dict) -> dict:
     schema["properties"]["publish"]["enum"] = [True]
     schema["properties"]["why_it_matters"]["enum"] = [""]
     schema["properties"]["evidence"]["items"]["enum"] = excerpts
+    schema["properties"]["title"]["minLength"] = schema["properties"]["summary"]["minLength"] = 1
+    schema["properties"]["evidence"]["minItems"] = 1
     return schema
