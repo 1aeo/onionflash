@@ -268,6 +268,24 @@ def test_a_snapshot_an_older_release_accepted_and_this_one_rejects_cannot_stop_b
         assert (output / f"news/{story(2)['id']}/index.html").is_file()
 
 
+def test_topic_backfill_after_an_upgrade_skips_a_snapshot_this_release_rejects(tmp_path, monkeypatch):
+    cfg = settings(tmp_path)
+    with Store(cfg["storage"]["database"]) as store:
+        put(store.db, story(1))
+        with monkeypatch.context() as older:  # an older release accepted plain-HTTP sources
+            older.setattr(render, "_public_url", lambda url: url)
+            put(store.db, story(2, sources=[{"url": "http://example.org/report", "title": "Report"}]))
+            build(cfg, store)
+        monkeypatch.setattr(publication, "publication_year", lambda: 2030)  # this release rebuilds
+        with store.db:  # as after an upgrade from a release without topic tables
+            store.db.execute("DELETE FROM public_story_topics")
+            store.db.execute("DELETE FROM metadata WHERE key='publication_topics'")
+        build(cfg, store)
+        assert meta(store.db, "publication_topics") == "1"
+        topics = {row[0] for row in store.db.execute("SELECT DISTINCT story_id FROM public_story_topics")}
+        assert topics == {story(1)["id"]}
+
+
 def test_interrupted_index_work_resumes_and_generation_advances_once(tmp_path, monkeypatch):
     cfg = settings(tmp_path)
     with Store(cfg["storage"]["database"]) as store:

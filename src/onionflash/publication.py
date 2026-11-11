@@ -293,14 +293,16 @@ def _story_topics(db, story: dict) -> set[str]:
 def _backfill_topics(db) -> None:
     if _meta(db, "publication_topics") == "1":
         return
-    cursor = ""
+    cursor, current = "", _meta(db, "publication_template")
     while True:
         rows = db.execute("SELECT * FROM public_catalog WHERE story_id>? ORDER BY story_id LIMIT 100", (cursor,)).fetchall()
         if not rows:
             break
         with db:
             for row in rows:
-                _story_topics(db, _public_story(row))
+                # Like the views, leave out a snapshot this release rejects.
+                if (story := _public_story(row, current)) is not None:
+                    _story_topics(db, story)
         cursor = rows[-1]["story_id"]
     with db:
         _set_meta(db, "publication_topics", "1")
