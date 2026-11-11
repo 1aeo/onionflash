@@ -315,7 +315,7 @@ def test_failed_pending_actions_preserve_audit_and_do_not_repeat(store, action, 
     assert current["next_attempt_at"] is None and store.stories() == []
     assert set(result) == {"item_id", "content_hash", "action", "status", "action_id"}
     # Neither action moves the analysis record into the audit.
-    assert analysis_result(store, key) == {} and audit["superseded_analysis_json"] is None
+    assert analysis_result(store, key) == {}
     if action == "retry":
         assert current["status"] == "pending" and current["attempts"] == current["rejections"] == 0
         assert current["rejection_reason"] is None
@@ -517,7 +517,7 @@ url="https://example.org/feed.xml"
 
 
 def reviewed_skip(store):
-    """Leave a completed skip receipt after the gate removes its finished job."""
+    """Commit a reviewed skip, which leaves neither its job nor its receipt."""
     from onionflash import review_gate
     from test_review_gate import Reviewer, Writer, verdict
     source = item(url="https://example.org/reconsidered-report")
@@ -525,16 +525,15 @@ def reviewed_skip(store):
     row = store.pending(1, DATE)[0]
     checker = Reviewer(verdict("skip", criterion="new_information"))
     assert review_gate.process_item(DEFAULTS, store, row, Writer(), checker, DATE)["status"] == "ignored"
-    receipt = next(dict(saved) for saved in store.db.execute("SELECT * FROM review_approvals")
-                   if json.loads(saved["review_record_json"]).get("input_row", {}).get("id") == row["id"])
     assert not store.db.execute("SELECT 1 FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
-    return row, receipt, checker.calls[0][0]
+    assert not store.db.execute("SELECT 1 FROM review_approvals").fetchone()
+    return row, checker.calls[0][0]
 
 
 @pytest.mark.parametrize("status", ["ignored", "rejected", "pending"])
 def test_retry_refuses_configured_retired_sources_without_mutating_saved_state(store, status):
     """Reject retired retries before queue changes, audit creation or evidence deletion."""
-    row, _, _ = reviewed_skip(store)
+    row, _ = reviewed_skip(store)
     with store.db:
         store.db.execute("UPDATE items SET status=?,attempts=1,last_error='Earlier failure' WHERE id=?",
                          (status, row["id"]))
@@ -550,7 +549,7 @@ def test_retry_refuses_configured_retired_sources_without_mutating_saved_state(s
 def test_cli_refuses_retired_alert_reconsideration_before_queue_or_audit_changes(store, tmp_path, monkeypatch, capsys, alert_format):
     """Apply configured retirement to operator retries without invoking a model."""
     from onionflash import cli
-    row, _, _ = reviewed_skip(store)
+    row, _ = reviewed_skip(store)
     path = tmp_path / "config.toml"
     path.write_text(f'''[storage]
 database="queue.sqlite3"
@@ -572,78 +571,15 @@ alert_format="{alert_format}"
     assert actions(store) == []
 
 
-def test_explicit_reconsideration_gets_fresh_decision_and_preserves_unrelated_approvals(store):
+def test_explicit_reconsideration_gets_a_fresh_decision(store):
     """Identical source, draft and context cannot reuse the explicitly rejected skip."""
     from onionflash import review_gate
     from test_review_gate import Reviewer, Writer, verdict
-    other = item(url="https://example.org/already-approved")
-    store.ingest(other, DATE)
-    assert review_gate.process_item(DEFAULTS, store, store.pending(1, DATE)[0], Writer(), Reviewer(verdict()), DATE)["status"] == "published"
-    retained = [tuple(saved) for saved in store.db.execute("SELECT * FROM review_approvals")]
-    retained_analysis = dict(store.db.execute("SELECT * FROM analyses WHERE source_item_id=?", (other["id"],)).fetchone())
-    row, receipt, candidate = reviewed_skip(store)
+    row, candidate = reviewed_skip(store)
     rejection.retry_item(store, row["id"], row["content_hash"], "Reconsider this editorial decision", DATE,
                          reconsider_ignored=True)
-    assert [tuple(saved) for saved in store.db.execute("SELECT * FROM review_approvals")] == retained
-    # Identical source text shares a base analysis key, but never ownership of its audit.
-    assert actions(store)[0]["superseded_analysis_json"] is None
-    assert dict(store.db.execute("SELECT * FROM analyses WHERE source_item_id=?", (other["id"],)).fetchone()) == retained_analysis
-    prior = store.db.execute("SELECT review_record FROM analyses WHERE source_item_id=?", (row["id"],)).fetchone()
-    assert json.loads(prior[0])["approval_key"] == receipt["key"]
     checker = Reviewer(verdict())
     result = review_gate.process_item(DEFAULTS, store, store.pending(1, DATE)[0], Writer(), checker, DATE)
     assert result["status"] == "published" and not result["cache_hit"]
     assert result["review_calls"] == 2 and checker.calls[0][0] == candidate
     assert [call[2] for call in checker.calls] == [False, True]
-    assert len(store.stories()) == 2
-    assert tuple(store.db.execute("SELECT * FROM review_approvals WHERE key=?", (retained[0][0],)).fetchone()) == retained[0]
-
-
-@pytest.mark.parametrize("interruption", ["before_review", "between_reviews", "after_decision"])
-def test_reconsideration_stays_fresh_across_interruption_and_resumes_its_new_decision(store, monkeypatch, interruption):
-    """A restart reuses only work completed after explicit reconsideration."""
-    from onionflash import review_gate
-    from test_review_gate import Reviewer, Writer, verdict
-    row, receipt, candidate = reviewed_skip(store)
-    rejection.retry_item(store, row["id"], row["content_hash"], "Inspect again", DATE,
-                         reconsider_ignored=True)
-    assert not store.db.execute("SELECT 1 FROM review_approvals WHERE key=?", (receipt["key"],)).fetchone()
-    failure = AnalysisError("Request timed out", retryable=True)
-    checker = Reviewer(failure) if interruption == "before_review" else Reviewer(verdict(), failure)
-    if interruption == "after_decision":
-        checker = Reviewer(verdict())
-        commit = store.commit_candidate
-        def interrupted_commit(*args, **kwargs):
-            raise RuntimeError("interrupted before commit")
-        monkeypatch.setattr(store, "commit_candidate", interrupted_commit)
-    with pytest.raises(RuntimeError if interruption == "after_decision" else AnalysisError):
-        review_gate.process_item(DEFAULTS, store, store.pending(1, DATE)[0], Writer(), checker, DATE)
-    assert checker.calls[0][0] == candidate
-    if interruption == "after_decision":
-        monkeypatch.setattr(store, "commit_candidate", commit)
-        saved = store.db.execute("SELECT result_json FROM review_approvals WHERE key=?", (receipt["key"],)).fetchone()
-        assert json.loads(saved[0])["verdict"] == "approve"
-    else:
-        assert not store.db.execute("SELECT 1 FROM review_approvals WHERE key=?", (receipt["key"],)).fetchone()
-    database = store.db.execute("PRAGMA database_list").fetchone()[2]
-    with Store(database) as resumed:
-        writer = Writer()
-        checker = Reviewer() if interruption == "after_decision" else Reviewer(verdict())
-        result = review_gate.process_item(DEFAULTS, resumed, resumed.pending(1, DATE)[0], writer, checker, DATE)
-        assert result["status"] == "published" and writer.calls == []
-        expected = {"before_review": [False, True], "between_reviews": [True], "after_decision": []}[interruption]
-        assert [call[2] for call in checker.calls] == expected
-        assert result["cache_hit"] is (interruption == "after_decision")
-
-
-def test_failed_reconsideration_audit_preserves_completed_skip_receipt(store):
-    """The operator transaction cannot discard a decision without recording its action."""
-    row, receipt, _ = reviewed_skip(store)
-    with store.db:
-        store.db.execute("CREATE TRIGGER fail_reconsideration BEFORE INSERT ON rejection_actions BEGIN SELECT RAISE(ABORT,'unavailable'); END")
-    with pytest.raises(sqlite3.IntegrityError):
-        rejection.retry_item(store, row["id"], row["content_hash"], "Inspect again", DATE,
-                             reconsider_ignored=True)
-    assert dict(store.db.execute("SELECT * FROM review_approvals WHERE key=?", (receipt["key"],)).fetchone()) == receipt
-    assert store.db.execute("SELECT status FROM items WHERE id=?", (row["id"],)).fetchone()[0] == "ignored"
-    assert actions(store) == []

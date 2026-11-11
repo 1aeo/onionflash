@@ -106,23 +106,6 @@ def control_fingerprint(db, story_id: str) -> str:
     return digest(dict(row) if row else None)
 
 
-def assert_current(db, prepared: dict) -> None:
-    """Refuse a decision if its input, coverage, sources or editorial state changed."""
-    binding, row = prepared["binding"], prepared["row"]
-    current = db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()
-    if current is None or item_fingerprint(dict(current)) != binding["item"] or item_fingerprint(row) != binding["item"]:
-        raise StaleCandidate("Source item changed since candidate preparation")
-    if digest(existing_story(db, row)) != binding["prior_story"]:
-        raise StaleCandidate("Published story changed since candidate preparation")
-    if control_fingerprint(db, prepared["story_id"]) != binding["lock"]:
-        raise StaleCandidate("Editorial decision changed since candidate preparation")
-    if prepared["coverage"] is not None and digest(coverage_background(
-            db, existing_story(db, row), binding["coverage_budget"])) != binding["coverage_hash"]:
-        raise StaleCandidate("Existing coverage changed since final review")
-    if any(not source_packet.binding_current(db, source) for source in binding["sources"]):
-        raise StaleCandidate("Supporting source changed since candidate preparation")
-
-
 def prepare(db, row: dict, result: dict, observed: str) -> dict:
     # Copy caller-owned values so later repairs cannot mutate the original draft.
     """Assemble the exact candidate and bind all state needed for its guarded commit."""

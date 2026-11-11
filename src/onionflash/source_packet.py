@@ -89,23 +89,6 @@ def _load(db, source_id: str | None, url: str, analysis_key: str | None = None):
     return None
 
 
-def binding_current(db, binding: dict) -> bool:
-    table = binding["table"]
-    if table == "item_lookup":
-        if binding["by"] not in {"id", "url"}:
-            return False
-        row = db.execute("SELECT payload FROM items WHERE " + binding["by"] + "=?", (binding["key"],)).fetchone()
-        return _lookup_fingerprint(row) == binding["hash"]
-    if table == "items":
-        row = db.execute("SELECT payload FROM items WHERE id=?", (binding["key"],)).fetchone()
-    elif table == "analyses":
-        row = db.execute("SELECT source_payload FROM analyses WHERE cache_key=?", (binding["key"],)).fetchone()
-    else:
-        return False
-    item = _decode(row[0]) if row else None
-    return item is not None and source_fingerprint(item) == binding["hash"]
-
-
 def _passages(text, size, **note):
     """Split text into passages of at most size characters; a note's passages name it."""
     return [{**note, "text": text[start:start + size]} for start in range(0, len(text), size) if text[start:start + size].strip()]

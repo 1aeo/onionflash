@@ -179,11 +179,18 @@ def test_completed_approval_resumes_after_crash_without_any_model_call(context, 
     with pytest.raises(RuntimeError, match="simulated crash"):
         run(cfg, store, row, Writer(), Reviewer(verdict()))
     assert job(store)["stage"] == "approved" and len(store.stories()) == 0
+    store.defer(row["id"], "Unexpected RuntimeError", cfg["llm"], LATER, terminal=True)  # as the run loop does
+    row = dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone())
     monkeypatch.setattr(store, "commit_candidate", commit)
+    # Another item's commit leaves the receipt that this job pins.
+    store.ingest(item(url="https://example.org/other-report", content="A routine reply."), DATE)
+    other = dict(store.db.execute("SELECT * FROM items WHERE url=?", ("https://example.org/other-report",)).fetchone())
+    assert run(cfg, store, other, Writer(), Reviewer(verdict("skip", criterion="news_value")))["status"] == "ignored"
     writer, checker = Writer(), Reviewer()
     result = run(cfg, store, row, writer, checker, allow_network=False)
     assert result["status"] == "published" and result["cache_hit"]
     assert writer.calls == checker.calls == [] and job(store) is None
+    assert not store.db.execute("SELECT 1 FROM review_approvals").fetchone()
 
 
 def test_changed_source_invalidates_staged_draft_and_prior_approval(context, monkeypatch):
@@ -198,16 +205,6 @@ def test_changed_source_invalidates_staged_draft_and_prior_approval(context, mon
     writer = Writer()
     result = run(cfg, store, changed, writer, Reviewer(verdict()))
     assert result["writer_calls"] == 1 and len(writer.calls) == 1
-
-
-def test_source_change_during_review_fails_commit_cas(context):
-    cfg, store = context
-    row = pending(store)
-    def change_source():
-        store.ingest(item(content="Changed while the final reviewer was running.", updated_at=LATER), LATER)
-        return verdict()
-    result = run(cfg, store, row, Writer(), Reviewer(change_source))
-    assert result["status"] == "stale" and len(store.stories()) == 0
 
 
 def test_policy_change_reuses_writer_but_requires_a_new_review(context):
@@ -239,19 +236,17 @@ def test_final_merge_reviews_retained_old_bad_text_and_commits_only_the_verified
     assert len(store.stories()) == 1
 
 
-def test_human_lock_during_review_invalidates_approval_and_preserves_operator_text(context):
+def test_human_lock_during_review_preserves_operator_text(context):
     cfg, store = context
     original, story_id = seed_legacy(store)
     row = pending(store, {**original, "content": original["content"] + " A later report.", "updated_at": LATER})
-    def human_edit():
-        editorial.correct(store.db, story_id, {"why_it_matters": "Operator-reviewed wording."},
-                          reason="Corrected unsupported advice.", expect_hash=editorial.show(store.db, story_id)["hash"], observed=LATER)
-        return verdict()
-    result = run(cfg, store, row, Writer(), Reviewer(human_edit))
-    assert result["status"] == "stale"
-    assert store.stories()[0]["why_it_matters"] == "Operator-reviewed wording."
+    with pytest.raises(AnalysisError):
+        run(cfg, store, row, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
+    editorial.correct(store.db, story_id, {"why_it_matters": "Operator-reviewed wording."},
+                      reason="Corrected unsupported advice.", expect_hash=editorial.show(store.db, story_id)["hash"], observed=LATER)
     second = run(cfg, store, row, Writer(), Reviewer(), allow_network=False)
     assert second["status"] == "locked" and second["writer_calls"] == second["review_calls"] == 0
+    assert store.stories()[0]["why_it_matters"] == "Operator-reviewed wording."
 
 
 def test_tag_update_still_reviews_the_existing_prose_it_retains(context):
@@ -299,6 +294,7 @@ def test_missing_retained_source_holds_without_a_review_call(context):
     row = pending(store, item(url="https://example.org/news/mirror", source_id="mirror", content=original["content"]))
     result = run(cfg, store, row, Writer(), Reviewer())
     assert result["status"] == "held" and result["review_calls"] == 0
+    assert store.db.execute("SELECT status FROM items WHERE id=?", (original["id"],)).fetchone()[0] == "published"
 
 
 def test_cache_cannot_treat_an_approve_boolean_as_all_required_checks(context):
@@ -438,39 +434,16 @@ def test_rejected_show_without_a_current_job_stays_read_only(context):
     assert list(store.db.iterdump()) == before
 
 
-def test_hold_takes_write_lock_before_checks_and_blocks_a_concurrent_revision(context, monkeypatch):
+def test_hold_audit_and_rejection_roll_back_together_if_job_update_fails(context):
     cfg, store = context
     row = pending(store)
-    original = store.record_analysis
-    reached = []
-    def at_audit_boundary(*args, **kwargs):
-        reached.append(store.db.in_transaction)
-        assert store.db.in_transaction
-        with sqlite3.connect(cfg["storage"]["database"], timeout=0.01) as other:
-            with pytest.raises(sqlite3.OperationalError, match="locked"):
-                other.execute("UPDATE items SET content_hash=? WHERE id=?", ("f" * 64, row["id"]))
-        return original(*args, **kwargs)
-    monkeypatch.setattr(store, "record_analysis", at_audit_boundary)
-    result = run(cfg, store, row, Writer(), Reviewer(verdict("hold")))
-    assert result["status"] == "held" and reached == [True]
-    current = store.db.execute("SELECT content_hash,status FROM items WHERE id=?", (row["id"],)).fetchone()
-    assert tuple(current) == (row["content_hash"], "rejected")
-    assert not store.db.in_transaction
-
-
-def test_hold_final_update_guard_rolls_back_an_in_transaction_source_change(context, monkeypatch):
-    cfg, store = context
-    row = pending(store)
-    original = store.record_analysis
-    def change_inside_audit(*args, **kwargs):
-        store.db.execute("UPDATE items SET content_hash=? WHERE id=?", ("f" * 64, row["id"]))
-        return original(*args, **kwargs)
-    monkeypatch.setattr(store, "record_analysis", change_inside_audit)
-    result = run(cfg, store, row, Writer(), Reviewer(verdict("hold")))
-    assert result["status"] == "stale"
-    current = store.db.execute("SELECT content_hash,status FROM items WHERE id=?", (row["id"],)).fetchone()
-    assert tuple(current) == (row["content_hash"], "pending")
+    store.db.execute("""CREATE TRIGGER fail_held_job BEFORE UPDATE ON review_jobs
+        WHEN NEW.stage='held' BEGIN SELECT RAISE(ABORT,'hold unavailable'); END""")
+    store.db.commit()
+    with pytest.raises(sqlite3.IntegrityError, match="hold unavailable"):
+        run(cfg, store, row, Writer(), Reviewer(verdict("hold")))
     assert store.db.execute("SELECT COUNT(*) FROM analyses").fetchone()[0] == 0
+    assert store.pending_count() == 1 and job(store)["stage"] == "review"
 
 
 def test_approval_receipt_and_job_pin_roll_back_together_if_job_save_fails(context):

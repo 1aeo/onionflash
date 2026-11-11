@@ -170,9 +170,7 @@ def _act(store, item_id, expected_hash, reason, action, observed, *, reconsider_
             (item_id, expected_hash, action, reason, stamp, row["status"], row["attempts"],
              row["rejections"], row["last_error"], row["next_attempt_at"]))
         if action == "retry":
-            from .review_gate import discard_review_decisions, reset_review_work
-            if row["status"] == "ignored":
-                discard_review_decisions(store, item_id)
+            from .review_gate import reset_review_work
             reset_review_work(store, item_id)
     return {"item_id": item_id, "content_hash": expected_hash, "action": action,
             "status": "pending" if action == "retry" else "dismissed", "action_id": event.lastrowid}
