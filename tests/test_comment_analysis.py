@@ -68,6 +68,7 @@ def test_optional_comment_failure_does_not_stop_saved_analysis(tmp_path, monkeyp
     monkeypatch.setattr(cli, "enrich_comments", broken_comments)
 
     class SavedAnalyzer:
+        calls = 0
         def __init__(self, *args, **kwargs):
             pass
         def __enter__(self):
@@ -101,6 +102,7 @@ def test_comments_use_collection_window_without_spending_analysis_reserve(tmp_pa
         return {"enabled": True, "checked": 0, "changed": 0, "failed": 0, "skipped": 0, "budget_reached": False}
 
     class NoAnalysis:
+        calls = 0
         def __init__(self, config, deadline=None):
             captured[type(self).__name__] = deadline
         def __enter__(self):

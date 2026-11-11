@@ -1,8 +1,11 @@
 """Durable stages for reviewing the exact candidate before its guarded commit.
 
-The existing item queue owns scheduling and backoff. These private tables retain
-one unfinished job per item and a bounded cache of exact review approvals; they
-are not a cache of writer responses for arbitrary future items.
+The existing item queue owns scheduling and backoff. These private tables keep
+one unfinished job per item, overwritten when its inputs change or an operator
+retries the item, and the receipt of its recorded decision until that decision
+commits; they are not a cache of writer responses for arbitrary future items.
+Every job record keeps the item row as input_row, which this release never
+reads, because earlier releases read it after a code rollback.
 """
 
 from __future__ import annotations
@@ -28,52 +31,20 @@ def status(store):
 def reset_review_work(store, item_id):
     """Explicit operator retry starts a new review, retaining its completed draft.
 
-    The caller owns the transaction; the replaced job is archived here.
+    The caller owns the transaction.
     """
-    row = store.db.execute("SELECT * FROM review_jobs WHERE item_id=?", (item_id,)).fetchone()
+    row = store.db.execute("SELECT writer_key FROM review_jobs WHERE item_id=?", (item_id,)).fetchone()
     if row is None:
         return
-    _archive_job(store, row, now_iso(), "explicit operator retry")
-    old = json.loads(row["record_json"])
-    record = {"schema_version": 1, "writer": old.get("writer"), "input_row": old["input_row"], "reviews": []}
+    item = dict(store.db.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone())
+    record = {"schema_version": 1, "writer": {"key": row["writer_key"]}, "input_row": item, "reviews": []}
     store.db.execute("""UPDATE review_jobs SET stage='drafted',envelope_json=NULL,
         record_json=?,approval_key=NULL,updated_at=? WHERE item_id=?""", (_json(record), now_iso(), item_id))
 
 
-def discard_review_decisions(store, item_id):
-    """Invalidate one reconsidered item's receipts in the operator transaction.
-
-    Completed decisions outlive their jobs. Removing them makes an identical
-    candidate receive a fresh review, including after an interrupted retry.
-    """
-    expired = []
-    for saved in store.db.execute("SELECT key,review_record_json FROM review_approvals"):
-        try:
-            record = json.loads(saved["review_record_json"])
-            matches = record.get("input_row", {}).get("id") == item_id
-        except (ValueError, TypeError, AttributeError, RecursionError):
-            continue  # An unreadable receipt cannot authorize a cached decision.
-        if matches:
-            expired.append((saved["key"],))
-    store.db.executemany("DELETE FROM review_approvals WHERE key=?", expired)
-
-
-def _archive_job(store, job, observed, reason):
-    """Retain an invalidated stage and its original source, in the caller's txn."""
-    record = json.loads(job["record_json"])
-    envelope = json.loads(job["envelope_json"]) if job["envelope_json"] is not None else None
-    source_row = envelope["row"] if envelope is not None else record["input_row"]
-    draft = json.loads(job["draft_json"]) if job["draft_json"] is not None else {}
-    audit = {**record, "outcome": "superseded", "stage": job["stage"],
-             "superseded_reason": reason, "superseded_at": observed, "source_envelope": envelope}
-    store.record_analysis(source_row, draft, job["writer_key"], observed, review_record=audit)
-
-
 def _save(store, item_id, writer_key, policy_hash, stage, draft, prepared, record, observed,
-          *, prepared_at, approval_key=None, supersede=None, reason=None, approval_receipt=None):
+          *, prepared_at, approval_key=None, approval_receipt=None):
     with store.db:
-        if supersede is not None:
-            _archive_job(store, supersede, observed, reason)
         if approval_receipt is not None:
             # Receipt and the unfinished job's pin become durable together.
             store.db.execute("""INSERT OR REPLACE INTO review_approvals
@@ -107,41 +78,21 @@ def _prune(store, maximum):
         """, (maximum,))
 
 
-def _commit_decision(store, prepared, candidate, writer_key, policy, record, key, verdict):
-    """Send a reviewed publication or skip through the matching guarded store action."""
-    commit = store.skip_candidate if verdict == "skip" else store.commit_candidate
-    return commit(prepared, candidate, writer_key, now_iso(), approval_key=key,
-                  policy_hash=policy, review_record=record)
-
-
-def _current(store, row):
-    current = store.db.execute("SELECT content_hash,payload,status FROM items WHERE id=?", (row["id"],)).fetchone()
-    return (current is not None and current["content_hash"] == row["content_hash"]
-            and current["payload"] == row["payload"] and current["status"] == "pending")
-
-
-def _hold(store, row, prepared, draft, writer_key, record, observed, reason):
+def _hold(store, row, draft, writer_key, record, observed, reason):
     """One semantic hold is terminal; only source change/operator retry requeues."""
     record["outcome"] = "held"
     record["hold_reason"] = reason
-    store.db.execute("BEGIN IMMEDIATE")
     with store.db:
-        from .candidate import assert_current
-        assert_current(store.db, prepared)
         store.record_analysis(row, draft, writer_key, observed, review_record=record)
-        changed = store.db.execute("""UPDATE items SET status='rejected',attempts=attempts+1,
-            rejections=MAX(rejections,3),next_attempt_at=NULL,last_error=?
-            WHERE id=? AND content_hash=? AND payload=? AND status='pending'""",
-            ("Final review held: " + reason, row["id"], row["content_hash"], row["payload"]))
-        if changed.rowcount != 1:
-            from .store import StaleCandidate
-            raise StaleCandidate("Source item changed before review hold")
+        store.db.execute("""UPDATE items SET status='rejected',attempts=attempts+1,
+            rejections=MAX(rejections,3),next_attempt_at=NULL,last_error=? WHERE id=?""",
+            ("Final review held: " + reason, row["id"]))
         store.db.execute("""UPDATE review_jobs SET stage='held',record_json=?,approval_key=NULL,
             updated_at=? WHERE item_id=?""", (_json(record), observed, row["id"]))
 
 
 def process_item(config, store, row, writer, reviewer, observed=None, *, allow_network=True):
-    """Resume writer → exact-candidate review → optional verification → CAS commit.
+    """Resume writer → exact-candidate review → verification of an approval or repair → commit.
 
     Transport errors leave the current stage durable and raise a retryable
     AnalysisError for the existing queue's backoff. An unusable reply keeps the
@@ -150,22 +101,18 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
     immediately; it never starts an endless rewrite loop.
     """
     from . import review
-    from .store import ReviewRequired, StaleCandidate
+    from .candidate import ReviewRequired, StaleCandidate
 
     observed = observed or now_iso()
     policy = review.policy_hash(config)
     writer_key = cache_key(row, config["llm"])
     report = {"status": "pending", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
-    if not _current(store, row):
-        return {**report, "status": "stale"}
     job = store.db.execute("SELECT * FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
-    superseded_input = None
     if job is not None and job["writer_key"] == writer_key:
         draft = json.loads(job["draft_json"]) if job["draft_json"] is not None else None
         record = json.loads(job["record_json"])
         prepared_at = job["prepared_at"]
     else:
-        superseded_input = job
         job, draft = None, None
         record = {"schema_version": 1, "writer": None, "input_row": row, "reviews": []}
         prepared_at = observed
@@ -175,38 +122,29 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         report["writer_calls"] += json.loads(row["payload"])["kind"] != "tag"
         draft = writer.analyze(json.loads(row["payload"]))
         record["writer"] = {"key": writer_key}  # The draft itself is saved in the job, then in analyses.
-        _save(store, row["id"], writer_key, policy, "drafted", draft, None, record, observed, prepared_at=prepared_at,
-              supersede=superseded_input, reason="source or writer input changed")
-    if not draft["publish"]:
-        try:  # The commit records the draft and deletes the job.
-            store.commit_candidate(store.prepare_candidate(row, draft, observed), None, writer_key, observed)
-        except StaleCandidate:
-            return {**report, "status": "stale"}
-        return {**report, "status": "ignored"}
+        _save(store, row["id"], writer_key, policy, "drafted", draft, None, record, observed, prepared_at=prepared_at)
     try:
         prepared = store.prepare_candidate(row, draft, prepared_at)
         old = json.loads(job["envelope_json"]) if job is not None and job["envelope_json"] else None
         same = old is not None and job["policy_hash"] == policy and _identity(old) == _identity(prepared)
         stage = job["stage"] if same else "review"
-        superseded_context = job if job is not None and not same and (old is not None or job["policy_hash"] != policy) else None
-        if not same:
-            record = {"schema_version": 1, "writer": record["writer"], "input_row": row, "reviews": [], "policy_hash": policy,
-                      "prepared": {key: prepared[key] for key in ("candidate", "packet", "coverage", "candidate_hash", "source_hash", "coverage_hash", "binding_hash")}}
+        fresh = {"schema_version": 1, "writer": record["writer"], "input_row": row, "reviews": [], "policy_hash": policy,
+                 "prepared": {key: prepared[key] for key in ("candidate", "packet", "coverage", "candidate_hash", "source_hash", "coverage_hash", "binding_hash")}}
+        record = record if same else fresh
         candidate = record.get("candidate", prepared["candidate"])
         _save(store, row["id"], writer_key, policy, stage, draft, prepared, record, observed, prepared_at=prepared_at,
-              supersede=superseded_context, reason="candidate context or review policy changed",
               approval_key=job["approval_key"] if same else None)
         if prepared.get("locked"):
             record["outcome"] = "locked"
             store.commit_candidate(prepared, prepared["candidate"], writer_key, now_iso(), review_record=record)
             return {**report, "status": record["outcome"]}
         if prepared["packet"]["missing_sources"]:
-            _hold(store, row, prepared, draft, writer_key, record, observed, "required source material is unavailable")
+            _hold(store, row, draft, writer_key, record, observed, "required source material is unavailable")
             return {**report, "status": "held"}
         if stage == "held":
             # The same candidate held before: a source reverted to a held revision,
             # or an item was requeued without reset_review_work. Do not review it again.
-            _hold(store, row, prepared, draft, writer_key, record, observed, "operator review is required")
+            _hold(store, row, draft, writer_key, record, observed, "operator review is required")
             return {**report, "status": "held"}
         key = _approval_key(candidate, prepared, policy)
         cached = store.db.execute("SELECT * FROM review_approvals WHERE key=?", (key,)).fetchone()
@@ -214,10 +152,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             try:
                 verdict = review.validate_review(json.loads(cached["result_json"]), prepared["packet"])
                 proof = json.loads(cached["review_record_json"])
-                valid = (verdict["verdict"] in {"approve", "skip"} and cached["candidate_hash"] == digest(candidate)
-                         and cached["source_hash"] == prepared["source_hash"] and cached["policy_hash"] == policy
-                         and cached["binding_hash"] == prepared["binding_hash"]
-                         and review.decision_record_matches(proof, verdict, candidate=candidate, prepared=prepared, policy_hash=policy))
+                valid = verdict["verdict"] in {"approve", "skip"}
             except (AnalysisError, ValueError, TypeError, KeyError):
                 valid = False
             if valid:
@@ -226,20 +161,14 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                 record["outcome"] = "skipped" if verdict["verdict"] == "skip" else "approved"
                 _save(store, row["id"], writer_key, policy, record["outcome"], draft, prepared, record, observed,
                       prepared_at=prepared_at, approval_key=key)
-                with store.db:
-                    store.db.execute("UPDATE review_approvals SET last_used_at=? WHERE key=?", (observed, key))
-                committed = _commit_decision(store, prepared, candidate, writer_key, policy, record, key, verdict["verdict"])
+                committed = store.commit_candidate(prepared, candidate, writer_key, now_iso(), approval_key=key,
+                                                   policy_hash=policy, review_record=record, decision=verdict["verdict"])
                 report.update(status=committed["status"], cache_hit=True)
                 return report
             with store.db:
                 store.db.execute("DELETE FROM review_approvals WHERE key=?", (key,))
-            if stage in {"approved", "skipped"}:
-                invalidated = store.db.execute("SELECT * FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
-                record = {"schema_version": 1, "writer": record["writer"], "input_row": row,
-                          "reviews": [], "policy_hash": policy, "prepared": record["prepared"]}
-                candidate, stage = prepared["candidate"], "review"
-                _save(store, row["id"], writer_key, policy, stage, draft, prepared, record, observed,
-                      prepared_at=prepared_at, supersede=invalidated, reason="invalid cached review decision")
+        if stage in {"approved", "skipped"}:  # without a usable receipt, review the writer's draft again
+            stage, candidate, record = "review", prepared["candidate"], fresh
         while True:
             verification = stage == "verify"
             if not allow_network:
@@ -264,16 +193,20 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                            _json(verdict), _json(record), observed, observed)
                 _save(store, row["id"], writer_key, policy, record["outcome"], draft, prepared, record, observed,
                       prepared_at=prepared_at, approval_key=key, approval_receipt=receipt)
-                committed = _commit_decision(store, prepared, candidate, writer_key, policy, record, key, verdict["verdict"])
+                committed = store.commit_candidate(prepared, candidate, writer_key, now_iso(), approval_key=key,
+                                                   policy_hash=policy, review_record=record, decision=verdict["verdict"])
                 return {**report, "status": committed["status"]}
             if verdict["verdict"] == "hold" or verification:  # one repair at most, and only a verified one
-                reason = "verification did not approve the repair" if verification else "review did not approve the candidate"
-                _hold(store, row, prepared, draft, writer_key, record, observed, reason)
+                reason = "final verification did not approve the candidate" if verification else "review did not approve the candidate"
+                _hold(store, row, draft, writer_key, record, observed, reason)
+                return {**report, "status": "held"}
+            if prepared["payload"]["editorial_kind"] == "tag":
+                _hold(store, row, draft, writer_key, record, observed, "review proposed editing a literal tag notice")
                 return {**report, "status": "held"}
             try:
                 candidate = review.apply_repair(candidate, verdict["repair"])
             except review.ReviewError:
-                _hold(store, row, prepared, draft, writer_key, record, observed, "review proposed an unusable repair")
+                _hold(store, row, draft, writer_key, record, observed, "review proposed an unusable repair")
                 return {**report, "status": "held"}
             stage = "verify"
             record["candidate"] = candidate

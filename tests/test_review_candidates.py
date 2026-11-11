@@ -1,6 +1,5 @@
 """The exact merged public candidate, its evidence and the commit boundary."""
 
-import copy
 import json
 
 import pytest
@@ -8,7 +7,7 @@ import pytest
 from approval_helpers import approve, finish_reviewed
 from onionflash import editorial, render, review, source_packet
 from onionflash.analyze import tag_notice
-from onionflash.candidate import ReviewRequired, StaleCandidate
+from onionflash.candidate import ReviewRequired
 from onionflash.comments import INPUT_CHARS, _compose
 from onionflash.store import Store
 from test_core import DATE, analysis, item
@@ -34,7 +33,7 @@ def test_prepare_is_read_only_and_an_unreviewed_commit_is_refused(tmp_path):
         before = store.db.total_changes
         prepared = store.prepare_candidate(row, analysis(), DATE)
         assert store.db.total_changes == before
-        assert store.stories() == [] and prepared["requires_review"]
+        assert store.stories() == []
         assert prepared["candidate"] == render._prepare_story(prepared["payload"])
         with pytest.raises(ReviewRequired):
             store.commit_candidate(prepared, prepared["candidate"], "unreviewed", DATE)
@@ -55,40 +54,6 @@ def test_truncation_at_space_keeps_reviewed_candidate_stable_through_commit(tmp_
         receipt = approve(store, prepared)
         store.commit_candidate(prepared, public, "truncated-source", DATE, **receipt)
         assert render._prepare_story(store.stories()[0]) == public
-
-
-@pytest.mark.parametrize("change", ["item", "supporting-source", "story", "lock", "new-story"])
-def test_stale_approval_never_writes_or_remerges(tmp_path, change):
-    with Store(tmp_path / "db") as store:
-        old = publish(store) if change != "new-story" else None
-        incoming = item(url="https://example.org/second", source_id="second", content=BODY, updated_at=LATER)
-        row = pending(store, incoming, LATER)
-        prepared = store.prepare_candidate(row, analysis(), LATER)
-        receipt = approve(store, prepared)
-        if change == "item":
-            incoming["content"] += " Corrected evidence."
-            store.ingest(incoming, LATER)
-        elif change == "supporting-source":
-            original = json.loads(store.db.execute("SELECT payload FROM items WHERE id=?", (old["editorial_item"],)).fetchone()[0])
-            original["content"] += " A later source correction."
-            original["updated_at"] = LATER
-            store.ingest(original, LATER)
-        elif change == "story":
-            with store.db:
-                store.db.execute("UPDATE stories SET updated_at=? WHERE id=?", (LATER, old["id"]))
-        elif change == "lock":
-            current = editorial.show(store.db, old["id"])
-            editorial.correct(store.db, old["id"], {"summary": "Operator-reviewed source text."},
-                              reason="Correction", expect_hash=current["hash"], observed=LATER)
-        else:
-            value = prepared["payload"]
-            with store.db:
-                store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (value["id"], prepared["cluster_key"], json.dumps(value), value["published_at"], value["updated_at"]))
-        before = [dict(row) for row in store.db.execute("SELECT * FROM stories")]
-        with pytest.raises(StaleCandidate):
-            store.commit_candidate(prepared, prepared["candidate"], "stale", LATER, **receipt)
-        assert [dict(row) for row in store.db.execute("SELECT * FROM stories")] == before
-        assert not store.db.in_transaction
 
 
 def test_poll_only_metadata_does_not_invalidate_approval(tmp_path):
@@ -138,11 +103,8 @@ def test_cold_required_source_holds_and_hot_historical_snapshot_is_labeled(tmp_p
         assert not prepared["packet"]["missing_sources"]
         historical = next(source for source in prepared["packet"]["sources"] if source["snapshot"] == "historical-analysis")
         assert historical["published_at"] == DATE and historical["updated_at"] == LATER
-        receipt = approve(store, prepared)
         with store.db:
             store.db.execute("DELETE FROM analyses WHERE source_item_id=?", (old["editorial_item"],))
-        with pytest.raises(StaleCandidate):
-            store.commit_candidate(prepared, prepared["candidate"], "evicted", LATER, **receipt)
         missing = store.prepare_candidate(row, analysis(), LATER)
         assert missing["packet"]["missing_sources"]
         with pytest.raises(ReviewRequired):
@@ -204,7 +166,7 @@ def test_review_audits_append_instead_of_losing_retried_decisions(tmp_path):
         assert [json.loads(row[0])["verdict"] for row in store.db.execute("SELECT review_record FROM analyses ORDER BY created_at")] == ["hold", "approve"]
 
 
-def test_comment_evidence_has_real_author_dates_and_invalidates_stale_approval(tmp_path):
+def test_comment_evidence_has_real_author_dates(tmp_path):
     url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41473"
     note = {"id": "gid://gitlab/Note/42", "url": url + "#note_42", "title": "Public comment by @maintainer",
             "author": "maintainer", "created_at": LATER, "body": "The proposed source-code fix still needs review."}
@@ -218,28 +180,6 @@ def test_comment_evidence_has_real_author_dates_and_invalidates_stale_approval(t
             {"id": "S1:P2", "author": "maintainer", "created_at": LATER, "url": note["url"], "text": note["body"]}]
         assert prepared["candidate"]["updated_at"] == LATER  # the cited note's creation time
         assert prepared["candidate"]["published_at"] == DATE
-        receipt = approve(store, prepared)
-        altered = json.loads(row["payload"])
-        altered["public_comments"][0]["body"] = "The earlier comment has been withdrawn."
-        with store.db:
-            store.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps(altered), row["id"]))
-        with pytest.raises(StaleCandidate):
-            store.commit_candidate(prepared, prepared["candidate"], "comment-race", LATER, **receipt)
-
-
-def test_raw_payload_or_packet_mutation_cannot_reuse_an_approval(tmp_path):
-    with Store(tmp_path / "db") as store:
-        prepared = store.prepare_candidate(pending(store), analysis(), DATE)
-        receipt = approve(store, prepared)
-        altered = copy.deepcopy(prepared)
-        altered["payload"]["editorial_kind"] = "tag"
-        with pytest.raises(StaleCandidate):
-            store.commit_candidate(altered, altered["candidate"], "provenance-tamper", DATE, **receipt)
-        altered = copy.deepcopy(prepared)
-        altered["packet"]["sources"][0]["passages"][0]["text"] = "Replacement source text."
-        with pytest.raises(StaleCandidate):
-            store.commit_candidate(altered, altered["candidate"], "packet-tamper", DATE, **receipt)
-        assert not store.stories()
 
 
 def test_uncited_corrective_note_survives_long_description_and_binds_approval(tmp_path):
@@ -261,15 +201,12 @@ def test_uncited_corrective_note_survives_long_description_and_binds_approval(tm
         assert prepared["packet"]["truncated"]
         assert prepared["candidate"]["updated_at"] == DATE  # a note review only saw does not date the story
         assert prepared["candidate"]["published_at"] == DATE
-        receipt = approve(store, prepared)
         incoming["public_comments"][0]["body"] += " The change is not released yet."
         incoming = _compose(incoming, incoming["public_comments"], LATER, source_key="k")
         store.ingest(incoming, LATER)
         refreshed_row = store.pending(1, LATER)[0]
         refreshed = store.prepare_candidate(refreshed_row, draft, LATER)
         assert refreshed["source_hash"] != prepared["source_hash"]
-        with pytest.raises(StaleCandidate):
-            store.commit_candidate(prepared, prepared["candidate"], "uncited-change", LATER, **receipt)
 
 
 @pytest.mark.parametrize("missing_body", [False, True])
@@ -294,7 +231,6 @@ def test_legacy_multi_source_prose_requires_all_evidence_not_guessed_writer(tmp_
         prepared = store.prepare_candidate(row, analysis(), LATER)
         assert prepared["payload"]["editorial_item"] is None
         assert prepared["candidate"]["summary"] == old["summary"]
-        assert prepared["requires_review"]
         if missing_body:
             assert first["url"] in prepared["packet"]["missing_sources"]
             with pytest.raises(ReviewRequired):
@@ -336,7 +272,6 @@ def test_stable_timeline_identity_cannot_label_new_commit_bytes_with_old_citatio
         store.ingest(tag, LATER)
         row = dict(store.db.execute("SELECT * FROM items WHERE id=?", (tag["id"],)).fetchone())
         prepared = store.prepare_candidate(row, tag_notice(json.loads(row["payload"])), LATER)
-        assert prepared["requires_review"]
         assert old_url in {source["url"] for source in prepared["candidate"]["sources"]}
         assert new_url not in {source["url"] for source in prepared["candidate"]["sources"]}
         packet_text = "".join(p["text"] for source in prepared["packet"]["sources"] for p in source["passages"])
@@ -351,12 +286,11 @@ def test_stable_timeline_identity_cannot_label_new_commit_bytes_with_old_citatio
             assert source["snapshot"] == "historical-analysis"
             assert source["updated_at"] == DATE
             assert "original timeline" in packet_text
-            receipt = approve(store, prepared)
-            # Even an exact historical packet remains bound to the current
-            # source state that selected it, so a later update invalidates it.
+            # Even an exact historical packet stays bound to the current source state
+            # that selected it, so a later update changes the binding but not the packet.
             store.ingest({**moved, "content": "A further timeline correction.", "updated_at": "2026-11-10T12:00:00Z"}, "2026-11-10T12:00:00Z")
-            with pytest.raises(StaleCandidate):
-                store.commit_candidate(prepared, prepared["candidate"], "source-moved-again", LATER, **receipt)
+            again = store.prepare_candidate(row, tag_notice(json.loads(row["payload"])), LATER)
+            assert again["source_hash"] == prepared["source_hash"] and again["binding_hash"] != prepared["binding_hash"]
         assert store.stories()[0]["summary"] == old["summary"]
 
 
@@ -374,7 +308,6 @@ def test_title_only_source_is_reviewable_but_compacted_snapshot_is_missing(tmp_p
         draft = analysis(title=source["title"], summary="The release feed announces Tor 0.4.9.16.",
                          why_it_matters="", category="release", tags=["release"], state="released", evidence=[source["title"]])
         prepared = store.prepare_candidate(row, draft, DATE)
-        assert prepared["requires_review"]
         if body is None:
             assert prepared["packet"]["missing_sources"] == [source["url"]]
             assert prepared["packet"]["sources"] == []

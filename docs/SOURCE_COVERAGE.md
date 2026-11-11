@@ -88,8 +88,9 @@ while unambiguous rows continue. They are never silently merged.
 Repository revision time orders corrections separately from event dates.
 Unchanged row content is not reanalyzed when another row changes. Timeline
 context can update its own story, but cannot replace a richer existing news
-summary merely because the repository was edited later. Release-version
-clustering still adds corroborating citations to existing release stories.
+summary merely because the repository was edited later. A row that
+release-version clustering groups with an existing release story is skipped if
+it adds no new information; the story keeps its text and existing citations.
 
 ## Important sources that need more handling first
 
@@ -111,14 +112,9 @@ is a deployment configuration choice; see the deployment repository's guide.
 
 ## Retired monitoring sources
 
-Automated monitoring collection and private candidate tracking have been removed.
-Old source entries with `alert_format = "consensus"` or `"censorship"` still load,
-but are disabled with a warning before collection. Any saved pending items from
-those configured sources are ignored when the queue reaches them; they do not
-fall back to news analysis. Remove these source entries from updated configurations.
-The unused `monitor_id` key and retired `[monitoring]` settings remain accepted.
-
-The obsolete private observation and group tables are removed when the database
-opens. Published stories, their permanent URLs and editorial history remain
-intact; retirement does not silently delete or retract them. Source-backed
-incident reports and release announcements continue through ordinary collection.
+A source entry with a non-empty `alert_format` loads disabled, with a warning;
+remove it. The unused `monitor_id` key and the retired `[monitoring]` settings
+are accepted and ignored. Opening a database leaves any unused monitoring tables
+in place; nothing reads or writes them. Automated notice lists, such as
+tor-consensus-health and metrics-alerts, report checker or collector state
+rather than network news; do not add them as news feeds.

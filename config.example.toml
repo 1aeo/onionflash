@@ -31,9 +31,9 @@ max_items_per_run = 12
 # vLLM understands this optional extension. Set false for providers that do not.
 send_chat_template_kwargs = true
 
-# Every automatic model-written publication needs an approval of its exact final
-# candidate and bounded source packet. The endpoint, credentials, network policy
-# and timeout are inherited from [llm].
+# Every automatic publication, tag notices included, needs a final approval of its
+# exact candidate, bounded source packet and coverage background. The endpoint,
+# credentials, network policy and timeout are inherited from [llm].
 [review]
 model = ""                     # Empty uses llm.model.
 

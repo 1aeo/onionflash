@@ -4,10 +4,11 @@ These rules apply to every change, whether a person or a coding agent makes it.
 
 ## Releases
 
-Agent-run GitHub operations use `1aeo` and its public noreply commit identity.
-Open a pull request, address all review feedback, and wait for the automated code
-review of the latest commit to finish with no new findings. Merge the reviewed
-change before deploying it. Never deploy unmerged work.
+Commit with your own correct name and email address. Open a pull request,
+address all review feedback, and wait for the automated code review of the
+latest commit to finish with no new findings. Squash-merge the reviewed change,
+with a commit message that names no branch, before deploying it. Never deploy
+unmerged work.
 
 ## Public text
 
@@ -32,9 +33,7 @@ A setting exists only for a real operator choice: for example the site's
 identity, paths and page sizes, the sources, and the model endpoint, model,
 network allowlist, timeout and items per run (see `OPERATOR_SETTINGS` and
 `config.example.toml`). Other budgets, limits, timeouts, retries, batch and cache
-sizes belong in code as constants. Some sections, such as `[comments]` and
-`[review]`, still expose such values; add no more, and remove one only together
-with the code that reads it.
+sizes belong in code as constants.
 
 When a section setting is removed, add its key to `RETIRED` so existing files
 keep loading. A section that loses its last setting stays in `DEFAULTS` as an

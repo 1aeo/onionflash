@@ -12,9 +12,8 @@ Retry and dismiss also accept a `pending` item that has already failed: its
 attempt count must be positive and its saved error must be nonblank. This lets
 an operator act on a reviewed failure without waiting for terminal rejection.
 New or reset pending items and published items cannot be retried or dismissed
-through these controls. A dismissed item can be retried, which reverses the
-dismissal, but not dismissed again. Ignored items require the explicit
-reconsideration option described below; ordinary retry and dismiss refuse them.
+through these controls. A dismissed or ignored item can be retried, which
+reverses the dismissal or reconsiders the item, but neither can be dismissed.
 
 ## Inspect
 
@@ -27,13 +26,17 @@ onionflash rejected show --config config.toml --item ITEM_ID
 `list` includes the item ID, title, source URL, content hash, rejection reason,
 attempt count and rejection count. It excludes transient pending failures and
 returns a `next_cursor` for bounded ID-based pagination. Limits are 1–200 items.
-Use `--status dismissed` to inspect dismissed revisions.
+Use `--status dismissed` to inspect dismissed revisions, or `--status ignored`
+for items a review skipped; a skip's reason names the criteria that did not pass.
 
-`show` prints the saved source item, up to 20 recent operator actions and, while
-a final-review job exists, its stage, current candidate, numbered source packet
-(for checking references such as `S1:P3`) and latest per-criterion verdict. That
-verdict's `candidate_hash` names the text it evaluated; during `verify`, the
-candidate shown is a repair that has not been verified yet. The output is private
+`show` prints the saved source item, up to 20 recent operator actions and the
+final review's stage, current candidate, numbered source packet (for checking
+references such as `S1:P3`), coverage background and latest per-criterion
+verdict. They come from the item's review job or, once a commit has finished the
+current revision, from the decision that commit recorded, with stage `finished`,
+until the deployment's private evidence retention archives that record.
+That verdict's `candidate_hash` names the text it evaluated; during `verify`, the
+candidate shown is the unchanged draft or its one repair. The output is private
 operator data. `show` also accepts an explicit pending or ignored item ID;
 inspect the saved source and decision before deciding whether to intervene.
 
@@ -47,8 +50,9 @@ onionflash rejected retry --config config.toml --item ITEM_ID \
 Copy `CURRENT_CONTENT_HASH` from the inspected item. A changed hash or an
 ineligible queue state stops the action. Retry resets the attempt/rejection counts
 and cooldown, then queues the item for the normal analysis pipeline. It does not
-bypass validation or approve a publication. A missing or unreadable source body
-must be restored or recollected before retrying.
+bypass validation or approve a publication. An item whose saved source is
+incomplete or unreadable cannot be retried; this includes old ignored items whose
+source body the deployment's private evidence retention removed.
 
 The next scheduled run resumes the item. A completed writer draft in its current
 review job is retained; the writer runs again only if its source or writer-input
@@ -57,40 +61,22 @@ candidate and source packet. An unchanged reviewer model and review policy
 normally return the same verdict, so retry a held item after its source material,
 `review.model` or the application's review policy changed. Review timeouts and
 endpoint failures resume the unfinished review/verification stage automatically
-using normal backoff; a malformed reply resumes it too, but counts toward the
-three failures. A retry never treats a proposed repair as approval.
+using normal backoff, unless a story published in the meantime changed the
+coverage background, which restarts the critique; a malformed reply resumes it
+too, but counts toward the three failures. A retry never treats a proposed
+repair as approval.
 
 Retry does not change or delete private analysis records: a held review stays
 there, and the new attempt adds its own record. Accepted stories are unchanged.
 
 ## Reconsider one ignored item
 
-When inspection identifies worthwhile news previously ignored by the selection
-policy, explicitly queue that saved revision for another decision:
-
-```sh
-onionflash rejected show --config config.toml --item ITEM_ID
-onionflash rejected retry --config config.toml --item ITEM_ID \
-  --reconsider-ignored --expect-hash CURRENT_CONTENT_HASH \
-  --reason "Reviewed the saved source after a selection-policy correction"
-```
-
-The flag applies only to retry and permits `ignored` as an additional state.
-It does not permit published, new pending or reset pending items. Repeating the
-command immediately after a successful retry is refused. The existing hash,
-readable-source and queue-state checks still apply, and the private audit records
-the prior ignored state and the reason.
-Saved review decisions for that item are invalidated, so even an identical draft
-receives a fresh editorial decision. Unrelated cached decisions are preserved.
-Only the selected item is queued; no source content or timestamps are invented,
-and no historical items are reset automatically. The normal writer and review
-pipeline decides whether to publish it and may ignore it again.
-
-Reconsideration does not reactivate retired alert sources. An item whose configured
-source still uses `alert_format = "consensus"` or `"censorship"` cannot be retried:
-the CLI refuses it before changing queue state, audit records or saved evidence.
-Existing pending alerts are still ignored by the normal run before drafting.
-Use reconsideration for supported news sources.
+When inspection shows that a review skipped worthwhile news, retry the item as
+above. The writer and review requests run again; with unchanged sources, models
+and review policy they normally return the same decision, and the item may be
+ignored again. The new review compares the item with the newest stories at
+retry time, which may no longer include a story that the earlier decision
+compared it with, so check that decision's coverage in `show` first.
 
 ## Dismiss one failed revision
 

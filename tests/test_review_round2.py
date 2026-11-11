@@ -108,9 +108,6 @@ def test_array_duplicates_and_evidence_whitespace_preserve_existing_policy():
     accepted = validate_analysis(analysis(products=["tor", "tor"], tags=["security", "security"], evidence=[quote]), item())
     assert accepted["products"] == ["tor"] and accepted["tags"] == ["security"]
     assert accepted["evidence"] == [quote]
-    unpublished = validate_analysis(analysis(publish=False, title="", summary="", why_it_matters="", evidence=[], confidence="confirmed", state="released", products=["tor", "tor"]), item(kind="tag"))
-    # Ignore decisions publish nothing, so their other fields are returned untouched.
-    assert unpublished["state"] == "released" and unpublished["confidence"] == "confirmed"
 
 
 def test_source_failure_updates_status_and_watermark_in_one_statement(tmp_path):
@@ -136,6 +133,7 @@ def _pipeline_config(tmp_path):
 
 def _prepare_run(monkeypatch, analyze):
     class FakeAnalyzer:
+        calls = 0
         def __init__(self, *args, **kwargs):
             pass
         def __enter__(self):
@@ -177,12 +175,12 @@ def test_two_endpoint_failures_leave_the_remaining_rows_untouched(tmp_path, monk
     assert skipped["next_attempt_at"] is None
 
 
-@pytest.mark.parametrize("publish", [True, False])
-def test_defer_does_not_change_completed_item_metadata(tmp_path, publish):
+@pytest.mark.parametrize("decision", ["approve", "skip"])
+def test_defer_does_not_change_completed_item_metadata(tmp_path, decision):
     with Store(tmp_path / "state.db") as store:
         store.ingest(item(), DATE)
         row = store.pending(1, DATE)[0]
-        finish_reviewed(store, row, analysis(publish=publish), "cache", DATE)
+        finish_reviewed(store, row, analysis(), "cache", DATE, decision=decision)
         before = dict(store.db.execute("SELECT * FROM items").fetchone())
         store.defer(row["id"], "Late timeout", DEFAULTS["llm"], DATE)
         assert dict(store.db.execute("SELECT * FROM items").fetchone()) == before

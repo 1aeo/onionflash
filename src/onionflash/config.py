@@ -289,10 +289,7 @@ def load_config(path: str | Path) -> dict:
         source.setdefault("authority", "community")
         source.setdefault("enabled", True)
         source.setdefault("interval_seconds", 300)
-        alert_format = source.get("alert_format", "")
-        if not isinstance(alert_format, str) or alert_format not in {"", "consensus", "censorship"}:
-            raise ValueError("Unsupported alert format")
-        if alert_format:
+        if source.get("alert_format"):
             # Preserve old source entries without reclassifying them as news.
             logging.getLogger(__name__).warning(
                 "Ignoring source %s: monitoring alert collection is retired; remove this source", source["id"])

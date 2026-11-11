@@ -69,7 +69,7 @@ def test_malformed_or_ambiguous_approval_is_rejected(monkeypatch, bad):
     elif bad == "changed-text":
         response["repair"] = {key: None for key in review.EDITABLE}
     elif bad == "missing-criterion":
-        del response["criteria"]["technical_details"]
+        del response["criteria"]["new_information"]
     elif bad == "missing-refs":
         response["criteria"]["source_support"]["source_refs"] = []
     elif bad == "score":
@@ -242,23 +242,10 @@ def test_skip_cannot_repair_text_or_omit_its_issues():
 
 @pytest.mark.parametrize("criterion", ["news_value", "new_information"])
 def test_all_nine_criteria_are_required_for_approval(criterion):
-    response = verdict()
-    del response["criteria"][criterion]
-    with pytest.raises(review.ReviewError, match="fields do not match"):
-        review.validate_review(response, packet())
     response = verdict("skip", criterion=criterion)
     response["verdict"] = "approve"
     with pytest.raises(review.ReviewError, match="all criteria"):
         review.validate_review(response, packet())
-
-
-def test_fresh_verification_can_skip_a_duplicate_without_proposing_a_repair(monkeypatch):
-    """Permit final duplicate rejection while forbidding an accompanying rewrite."""
-    response = verdict("skip", criterion="new_information")
-    checker = reviewer(monkeypatch, completion(response))
-    result = checker.review(candidate(), packet(), coverage={"prior_story": candidate(), "recent": [], "truncated": False}, verification=True)
-    assert result["verdict"] == "skip" and result["repair"] is None
-    assert checker.client.requests[0][1]["messages"][0]["content"] == review.VERIFY_PROMPT
 
 
 def test_repairs_cannot_modify_immutable_or_private_fields():
@@ -358,11 +345,3 @@ def test_policy_hash_binds_effective_model_and_endpoint_but_not_credentials(monk
         changed = copy.deepcopy(cfg)
         changed[section][key] = value
         assert review.policy_hash(changed) != initial
-
-
-@pytest.mark.parametrize("name", ["COVERAGE_ROWS", "COVERAGE_CHARS", "COVERAGE_SUMMARY_CHARS"])
-def test_policy_hash_binds_coverage_limits(monkeypatch, name):
-    cfg = config()
-    initial = review.policy_hash(cfg)
-    monkeypatch.setattr(review.candidate_policy, name, getattr(review.candidate_policy, name) + 1)
-    assert review.policy_hash(cfg) != initial

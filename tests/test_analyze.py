@@ -8,7 +8,8 @@ import json
 
 import pytest
 
-from onionflash.analyze import AnalysisError, Analyzer, MAX_EVIDENCE_CHOICES, MIN_EVIDENCE_CHARS, _writer_schema, tag_notice, validate_analysis
+from onionflash.analyze import (AnalysisError, Analyzer, MAX_EVIDENCE_CHOICES, MIN_EVIDENCE_CHARS, SCHEMA, _writer_schema,
+                                validate_analysis)
 from onionflash.comments import INPUT_CHARS
 from onionflash.config import DEFAULTS
 from onionflash.store import Store
@@ -52,11 +53,6 @@ def test_non_finite_numbers_are_invalid_model_json():
             _json_object(text)
 
 
-def test_historical_ignore_decisions_remain_readable():
-    ignore = analysis(publish=False, title="x" * 150, evidence=["not in the source at all"])
-    assert validate_analysis(ignore, item()) == ignore
-
-
 def test_historical_impact_text_remains_readable():
     saved = analysis(why_it_matters="The report concerns directory authority trust.")
     assert validate_analysis(saved, item()) == saved
@@ -80,9 +76,19 @@ def test_writer_rejects_separate_impact_text_even_when_endpoint_ignores_schema(m
     with pytest.raises(AnalysisError, match="leave why_it_matters empty") as caught:
         llm.analyze(item())
     assert not caught.value.retryable
-    assert len(llm.client.requests) == 1 + use_fallback
+    assert len(llm.client.requests) == llm.calls == 1 + use_fallback  # the run report counts each endpoint request
     assert all(request[1]["response_format"]["json_schema"]["schema"]["properties"]["why_it_matters"]["enum"] == [""]
                for request in llm.client.requests)
+
+
+@pytest.mark.parametrize("sent", [0, 1])
+def test_endpoint_attempts_refused_at_the_deadline_are_not_counted(monkeypatch, sent):
+    from onionflash.transport import DeadlineReached
+    responses = [FetchError("network request failed", retryable=True)] * sent + [DeadlineReached()] * (3 - sent)
+    llm = analyzer(monkeypatch, *responses, fallbacks=["https://fallback.example/v1", "https://third.example/v1"])
+    with pytest.raises(AnalysisError, match="LLM request failed") as caught:
+        llm.analyze(item())
+    assert caught.value.retryable and llm.calls == sent and len(llm.client.requests) == sent + 1
 
 
 def test_endpoint_failures_are_retryable_and_validation_is_not_resent(monkeypatch):
@@ -158,8 +164,8 @@ def test_evidence_diagnostics_distinguish_short_quotes_from_absent_quotes():
     with pytest.raises(AnalysisError, match="quote 2 is not an exact excerpt"):
         validate_analysis(analysis(evidence=["The reply was", "An invented quotation"]),
                           item(content="The reply was acknowledged."))
-    tag = item(kind="tag", title="v1")
-    assert validate_analysis(tag_notice(tag), tag)["evidence"] == ["v1"]
+    with pytest.raises(AnalysisError, match="needs text and source evidence"):
+        validate_analysis(analysis(evidence=[]), item())
 
 
 def test_writer_request_requires_a_draft_and_the_existing_evidence_length_floor(monkeypatch):
@@ -170,6 +176,8 @@ def test_writer_request_requires_a_draft_and_the_existing_evidence_length_floor(
     assert fields["publish"]["enum"] == [True]
     assert fields["why_it_matters"]["enum"] == [""]
     assert fields["evidence"]["items"]["minLength"] == MIN_EVIDENCE_CHARS
+    assert fields["title"]["minLength"] == fields["summary"]["minLength"] == fields["evidence"]["minItems"] == 1
+    assert "minLength" not in SCHEMA["properties"]["title"] | SCHEMA["properties"]["summary"]  # review repairs copy these rules
 
 
 def test_evidence_enum_is_derived_from_the_exact_supplied_context():
@@ -259,6 +267,7 @@ def test_one_failing_item_does_not_stop_the_run_but_two_endpoint_failures_do(tmp
     calls = []
 
     class FlakyAnalyzer:
+        calls = 0
         def __init__(self, *args, **kwargs):
             pass
         def __enter__(self):

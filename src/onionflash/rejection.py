@@ -1,4 +1,4 @@
-"""Private operator controls for failed, dismissed or explicitly reconsidered source items.
+"""Private operator controls for failed, dismissed or ignored source items.
 
 The CLI must hold the application run lock for retry/dismiss. These actions do
 not call a model, publish a story, or change editorial correction state.
@@ -52,8 +52,8 @@ def _summary(row):
 
 def list_items(store, *, status="rejected", limit=50, after=None) -> dict:
     """Bounded, stable ID pagination; transient pending failures are excluded."""
-    if not isinstance(status, str) or status not in {"rejected", "dismissed"}:
-        raise ValueError("List status must be rejected or dismissed")
+    if not isinstance(status, str) or status not in {"rejected", "dismissed", "ignored"}:
+        raise ValueError("List status must be rejected, dismissed or ignored")
     if type(limit) is not int or not 1 <= limit <= MAX_LIMIT:
         raise ValueError(f"List limit must be between 1 and {MAX_LIMIT}")
     cursor = "" if after is None else _identifier(after)
@@ -79,10 +79,14 @@ def show_item(store, item_id) -> dict:
 
 
 def _final_review(store, item_id):
-    """The current job's stage, candidate, source packet and latest verdict, as saved."""
+    """The current job or, once a commit finished the current revision, the decision that commit recorded, if any
+    (stage "finished"): its candidate, source packet, coverage and latest verdict, as saved."""
+    # Only a commit sets these statuses, and it writes the item's newest audit row.
     row = store.db.execute("SELECT stage,CAST(record_json AS BLOB) AS record_json FROM review_jobs WHERE item_id=?",
-                           (item_id,)).fetchone()
-    if row is None:
+                           (item_id,)).fetchone() or store.db.execute(
+        """SELECT 'finished' AS stage,CAST(review_record AS BLOB) AS record_json FROM analyses WHERE source_item_id=?1
+        AND (SELECT status FROM items WHERE id=?1) IN ('ignored','published') ORDER BY rowid DESC LIMIT 1""", (item_id,)).fetchone()
+    if row is None or row["record_json"] is None:
         return None
     record = _object(row["record_json"])
     try:
@@ -90,7 +94,7 @@ def _final_review(store, item_id):
         reviews = record.get("reviews") or record.get("approval", {}).get("reviews", [])
         latest = reviews[-1] if reviews else None
         return {"stage": row["stage"], "candidate": record.get("candidate", prepared.get("candidate")),
-                "source_packet": prepared.get("packet"),
+                "source_packet": prepared.get("packet"), "coverage": prepared.get("coverage"),
                 "latest_review": latest and {**latest["result"], "phase": latest["stage"],
                                              "candidate_hash": latest["candidate_hash"]}}
     except (TypeError, KeyError, AttributeError):
@@ -105,21 +109,19 @@ def _request(item_id, expected_hash, reason, observed):
     return editorial._text(reason, "operator reason", 1000), format_utc(parse_utc(observed or now_iso()))
 
 
-def _checked(db, item_id, expected_hash, *, statuses, retired_source_ids=()):
+def _checked(db, item_id, expected_hash, *, statuses):
     """Require the inspected source revision and a queue state the action applies to."""
     row = db.execute(f"SELECT {_COLUMNS} FROM items WHERE id=?", (item_id,)).fetchone()
     if row is None:
         raise ValueError("Source item was not found")
     if row["content_hash"] != expected_hash:
         raise ValueError("Source content changed; inspect the current item before acting")
-    if row["source_id"] in retired_source_ids:
-        raise ValueError("Retired alert sources cannot be retried")
     failed_pending = (row["status"] == "pending" and type(row["attempts"]) is int
                       and row["attempts"] > 0 and isinstance(row["last_error"], str)
                       and bool(row["last_error"].strip()))
     if row["status"] not in statuses and not failed_pending:
         raise ValueError("Only a terminally rejected or previously failed pending item can be retried or dismissed, "
-                         "or a dismissed one retried; ignored items require retry --reconsider-ignored")
+                         "or a dismissed or ignored one retried")
     return dict(row)
 
 
@@ -138,29 +140,26 @@ def _ready(row):
         parse_utc(payload["published_at"])
         parse_utc(payload["updated_at"])
     except (ValueError, KeyError):
-        raise ValueError("Stored source item is not ready for analysis; restore or recollect it first") from None
+        raise ValueError("Stored source item is incomplete or unreadable and cannot be retried") from None
 
 
-def _act(store, item_id, expected_hash, reason, action, observed, *, reconsider_ignored=False, retired_source_ids=()):
+def _act(store, item_id, expected_hash, reason, action, observed):
     """Apply one guarded queue action and record its audit in the same transaction."""
-    if type(reconsider_ignored) is not bool or (reconsider_ignored and action != "retry"):
-        raise ValueError("Reconsidering ignored items is an explicit retry option")
     reason, stamp = _request(item_id, expected_hash, reason, observed)
     db = store.db
     with db:
-        # Retry also undoes a dismissal, and reconsiders an ignored item only on explicit request;
+        # Retry also undoes a dismissal or reconsiders an ignored item;
         # dismissing applies only to a rejected or previously failed revision.
-        statuses = ({"rejected", "dismissed", *(["ignored"] if reconsider_ignored else [])}
-                    if action == "retry" else {"rejected"})
-        row = _checked(db, item_id, expected_hash, statuses=statuses, retired_source_ids=retired_source_ids)
+        statuses = {"rejected", "dismissed", "ignored"} if action == "retry" else {"rejected"}
+        row = _checked(db, item_id, expected_hash, statuses=statuses)
         if action == "retry":
             _ready(row)
         update = ("status='pending',attempts=0,rejections=0,next_attempt_at=NULL,last_error=NULL"
                   if action == "retry" else "status='dismissed',next_attempt_at=NULL")
         changed = db.execute(f"""UPDATE items SET {update}
-            WHERE id=? AND source_id=? AND content_hash=? AND CAST(payload AS BLOB)=? AND status=? AND attempts=?
+            WHERE id=? AND content_hash=? AND CAST(payload AS BLOB)=? AND status=? AND attempts=?
             AND rejections=? AND last_error IS ? AND next_attempt_at IS ?""",
-            (item_id, row["source_id"], expected_hash, row["payload"], row["status"], row["attempts"],
+            (item_id, expected_hash, row["payload"], row["status"], row["attempts"],
              row["rejections"], row["last_error"], row["next_attempt_at"])).rowcount
         if changed != 1:
             raise ValueError("Source item changed during the action; inspect it again")
@@ -170,19 +169,15 @@ def _act(store, item_id, expected_hash, reason, action, observed, *, reconsider_
             (item_id, expected_hash, action, reason, stamp, row["status"], row["attempts"],
              row["rejections"], row["last_error"], row["next_attempt_at"]))
         if action == "retry":
-            from .review_gate import discard_review_decisions, reset_review_work
-            if row["status"] == "ignored":
-                discard_review_decisions(store, item_id)
+            from .review_gate import reset_review_work
             reset_review_work(store, item_id)
     return {"item_id": item_id, "content_hash": expected_hash, "action": action,
             "status": "pending" if action == "retry" else "dismissed", "action_id": event.lastrowid}
 
 
-def retry_item(store, item_id, expected_hash, reason, observed=None, *, reconsider_ignored=False,
-               retired_source_ids=()) -> dict:
-    """Queue one failed or dismissed revision again, unless its configured source is retired."""
-    return _act(store, item_id, expected_hash, reason, "retry", observed,
-                reconsider_ignored=reconsider_ignored, retired_source_ids=retired_source_ids)
+def retry_item(store, item_id, expected_hash, reason, observed=None) -> dict:
+    """Queue one failed, dismissed or ignored revision again."""
+    return _act(store, item_id, expected_hash, reason, "retry", observed)
 
 
 def dismiss_item(store, item_id, expected_hash, reason, observed=None) -> dict:

@@ -330,7 +330,7 @@ def test_runs_keep_verified_notes_until_comments_are_turned_off(tmp_path, monkey
     monkeypatch.setattr(cli, "source_due", lambda *args: True)
     monkeypatch.setattr(cli, "collect_source", collect)
     monkeypatch.setattr(cli, "enrich_comments", lambda *args, **kw: enrich(*args, client, **kw))
-    monkeypatch.setattr(cli, "Analyzer", lambda *args, **kw: contextlib.nullcontext(SimpleNamespace(analyze=lambda item: analysis())))
+    monkeypatch.setattr(cli, "Analyzer", lambda *args, **kw: contextlib.nullcontext(SimpleNamespace(analyze=lambda item: analysis(), calls=0)))
     monkeypatch.setattr(cli, "Reviewer", ApprovingReviewer)
     monkeypatch.setattr(cli, "build", lambda *args: {})
     with Store(cfg["storage"]["database"]) as store:

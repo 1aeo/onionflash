@@ -59,13 +59,13 @@ def _operator_parsers(commands) -> None:
         if name == "restore":
             action.add_argument("--revision", required=True, type=int, help="Revision to restore and lock")
 
-    rejected = commands.add_parser("rejected", help="Inspect and explicitly retry or dismiss failed analyses")
+    rejected = commands.add_parser("rejected", help="Inspect and explicitly retry or dismiss failed analyses, or retry an ignored item")
     actions = rejected.add_subparsers(dest="action", required=True)
     for name in ("list", "show", "retry", "dismiss"):
         action = actions.add_parser(name)
         action.add_argument("--config", required=True, type=Path)
         if name == "list":
-            action.add_argument("--status", choices=("rejected", "dismissed"), default="rejected")
+            action.add_argument("--status", choices=("rejected", "dismissed", "ignored"), default="rejected")
             action.add_argument("--limit", type=int, default=50)
             action.add_argument("--after", help="Continuation cursor returned by the previous list")
         else:
@@ -73,17 +73,9 @@ def _operator_parsers(commands) -> None:
         if name in {"retry", "dismiss"}:
             action.add_argument("--expect-hash", required=True, help="Current content_hash returned by rejected show")
             action.add_argument("--reason", required=True, help="Private operator reason for this action")
-        if name == "retry":
-            action.add_argument("--reconsider-ignored", action="store_true", help="Explicitly reconsider one inspected ignored item")
 
 
-def _retired_alert_source_ids(config: dict) -> set[str]:
-    """Identify configured legacy alert sources that cannot enter news analysis."""
-    return {source["id"] for source in config["sources"]
-            if source.get("alert_format") in {"consensus", "censorship"}}
-
-
-def _operator_command(args, config: dict, store: Store) -> dict:
+def _operator_command(args, store: Store) -> dict:
     """Dispatch one operator action with its required hash and reason."""
     if args.command == "story":
         if args.action == "show":
@@ -102,11 +94,7 @@ def _operator_command(args, config: dict, store: Store) -> dict:
         return rejection.list_items(store, status=args.status, limit=args.limit, after=args.after)
     if args.action == "show":
         return rejection.show_item(store, args.item)
-    options = {"expected_hash": args.expect_hash, "reason": args.reason}
-    if args.action == "retry":
-        return rejection.retry_item(store, args.item, reconsider_ignored=args.reconsider_ignored,
-                                    retired_source_ids=_retired_alert_source_ids(config), **options)
-    return rejection.dismiss_item(store, args.item, **options)
+    return getattr(rejection, args.action + "_item")(store, args.item, args.expect_hash, args.reason)
 
 
 def run(config: dict, store: Store) -> dict:
@@ -121,8 +109,10 @@ def run(config: dict, store: Store) -> dict:
         "budget_reached": False,
         "entries_skipped": 0,
         "review_held": 0,
+        "review_skipped": 0,
         "review_cache_hits": 0,
         "review_stale": 0,
+        "model_calls": 0,
     }
     started = time.monotonic()
     budget = config["collection"]["run_budget_seconds"]
@@ -194,19 +184,11 @@ def run(config: dict, store: Store) -> dict:
                               "error": f"Unexpected {type(exc).__name__} at {Path(frame.filename).name}:{frame.lineno}"}
     run_deadline = started + budget
     endpoint_failures = 0
-    retired_alerts = _retired_alert_source_ids(config)
     with Analyzer(config, deadline=run_deadline) as analyzer, Reviewer(config, deadline=run_deadline) as reviewer:
         for row in store.pending(config["llm"]["max_items_per_run"], now_iso()):
             if time.monotonic() >= run_deadline:
                 report["budget_reached"] = True
                 break
-            if row["source_id"] in retired_alerts:
-                # Old manually queued alerts must not become ordinary news.
-                with store.db:
-                    store.db.execute("""UPDATE items SET status='ignored',next_attempt_at=NULL,last_error=NULL
-                        WHERE id=? AND source_id=? AND content_hash=? AND payload=? AND status='pending'""",
-                        (row["id"], row["source_id"], row["content_hash"], row["payload"]))
-                continue
             try:
                 result = process_item(config, store, row, analyzer, reviewer, now_iso(),
                                       allow_network=endpoint_failures < 2)
@@ -218,6 +200,8 @@ def run(config: dict, store: Store) -> dict:
                     report["analysis_failed"] += 1
                 elif result["status"] == "stale":
                     report["review_stale"] += 1
+                elif result["status"] == "ignored":
+                    report["review_skipped"] += 1
             except AnalysisError as exc:
                 # A request cut off by the run deadline is retryable: the item backs off.
                 store.defer(row["id"], str(exc), config["llm"], now_iso(), terminal=not exc.retryable)
@@ -225,8 +209,8 @@ def run(config: dict, store: Store) -> dict:
                 if exc.retryable:
                     # After a second endpoint failure, skip further network
                     # analysis; one failing item alone does not stop the run.
-                    # Deterministic notices and completed cached approvals can
-                    # still finish; unfinished network stages resume next run.
+                    # Completed cached decisions can still finish; unfinished
+                    # stages, tag reviews included, resume next run.
                     endpoint_failures += 1
             except sqlite3.Error:
                 raise  # a database problem is not the item's fault and must not be a strike
@@ -237,6 +221,7 @@ def run(config: dict, store: Store) -> dict:
                 store.defer(row["id"], f"Unexpected {type(exc).__name__} at {Path(frame.filename).name}:{frame.lineno}",
                             config["llm"], now_iso(), terminal=True)
                 report["analysis_failed"] += 1
+        report["model_calls"] = analyzer.calls + reviewer.calls
     report["pending_analysis"] = store.pending_count()
     report["rejected_analysis"] = store.rejected_count()
     report["final_review"] = review_status(store)
@@ -302,7 +287,7 @@ def main(argv: list[str] | None = None) -> int:
             with Store(config["storage"]["database"]) as store:
                 # Explicit source inspection can contain arbitrary Unicode. JSON
                 # escapes keep terminal control/bidi characters visibly inert.
-                print(json.dumps(_operator_command(args, config, store), ensure_ascii=True))
+                print(json.dumps(_operator_command(args, store), ensure_ascii=True))
             return 0
         with run_lock(config["storage"]["database"]) as acquired:
             if not acquired:
@@ -312,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0 if args.command == "run" else 75
             with Store(config["storage"]["database"]) as store:
                 if operator:
-                    result = _operator_command(args, config, store)
+                    result = _operator_command(args, store)
                 elif args.command == "run":
                     result = run(config, store)
                 else:

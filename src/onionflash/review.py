@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 
 from .analyze import AnalysisError, CompletionClient, SCHEMA as DRAFT_SCHEMA
-from . import candidate as candidate_policy
 from .candidate import SEMANTIC_FIELDS as EDITABLE
 from .render import _prepare_story
 from .util import digest
@@ -213,13 +212,11 @@ def _llm(config: dict) -> dict:
 
 
 def policy_hash(config: dict) -> str:
-    """The prompt, schema, model identity and coverage bounds; source_hash binds the packet and its bounds."""
+    """The prompt, schema and model identity; the source and binding hashes bind the packet and coverage."""
     llm = _llm(config)
     identity = {key: llm[key] for key in ("model", "base_url", "fallback_base_urls", "max_output_tokens",
                                          "enable_thinking", "send_chat_template_kwargs")}
-    coverage = {"coverage_rows": candidate_policy.COVERAGE_ROWS, "coverage_chars": candidate_policy.COVERAGE_CHARS,
-                "coverage_summary_chars": candidate_policy.COVERAGE_SUMMARY_CHARS}
-    return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, SCHEMA, identity, coverage])
+    return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, SCHEMA, identity])
 
 
 def _text(value, maximum: int, *, empty: bool = False) -> None:
@@ -330,44 +327,6 @@ def release_labels_match_state(candidate: dict) -> bool:
     """Release labels require a tagged or released state for automatic publication."""
     return (candidate["state"] in {"released", "tagged"}
             or (candidate["category"] != "release" and "release" not in candidate["tags"]))
-
-
-def decision_record_matches(record, result, *, candidate, prepared, policy_hash):
-    """Require the recorded app stage and exact context behind a cached decision."""
-    if not isinstance(record, dict) or not isinstance(record.get("reviews"), list) or not record["reviews"]:
-        return False
-    try:
-        if (not isinstance(record.get("input_row"), dict)
-                or candidate_policy.item_fingerprint(record["input_row"]) != prepared["binding"]["item"]):
-            return False
-    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
-        return False
-    final = record["reviews"][-1]
-    if not isinstance(final, dict) or any(final.get(key) != value for key, value in (
-            ("result", result), ("candidate_hash", digest(candidate)), ("source_hash", prepared["source_hash"]),
-            ("coverage_hash", prepared["coverage_hash"]), ("policy_hash", policy_hash))):
-        return False
-    if result["verdict"] == "approve":
-        if (not release_labels_match_state(candidate)
-                or final.get("stage") != "verification" or len(record["reviews"]) != 2):
-            return False
-        first = record["reviews"][0]
-        if not isinstance(first, dict) or any(first.get(key) != value for key, value in (
-                ("stage", "review"), ("candidate_hash", prepared["candidate_hash"]),
-                ("source_hash", prepared["source_hash"]), ("coverage_hash", prepared["coverage_hash"]), ("policy_hash", policy_hash))):
-            return False
-        try:
-            initial = validate_review(first["result"], prepared["packet"])
-            if initial["verdict"] == "approve":
-                expected = prepared["candidate"]
-            elif initial["verdict"] == "revise":
-                expected = apply_repair(prepared["candidate"], initial["repair"])
-            else:
-                return False
-            return expected == candidate
-        except (AnalysisError, ValueError, TypeError, KeyError):
-            return False
-    return result["verdict"] == "skip" and final.get("stage") in {"review", "verification"}
 
 
 class Reviewer(CompletionClient):

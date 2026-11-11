@@ -11,7 +11,7 @@ from pathlib import Path
 from .util import after, backoff_seconds, digest, item_cluster, item_identity
 from . import candidate, editorial, render
 from .comments import analysis_context
-from .candidate import ReviewRequired, StaleCandidate
+from .candidate import ReviewRequired
 
 
 def backup_database(source: str | Path, destination: str | Path) -> None:
@@ -138,9 +138,6 @@ class Store:
                 superseded_analysis_key TEXT, superseded_analysis_json TEXT
             );
             CREATE INDEX IF NOT EXISTS rejection_actions_item ON rejection_actions(item_id,action_id);
-            DROP TABLE IF EXISTS monitoring_observations;
-            DROP TABLE IF EXISTS monitoring_counters;
-            DROP TABLE IF EXISTS monitoring_groups;
         """)
         editorial.initialize(self.db)
         analysis_columns = {row[1] for row in self.db.execute("PRAGMA table_info(analyses)")}
@@ -324,9 +321,11 @@ class Store:
         result_json = json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False)
         record_json = json.dumps(review_record, ensure_ascii=False, sort_keys=True, allow_nan=False) if review_record is not None else None
         values = (result_json, row["payload"], row["id"], record_json)
-        previous = self.db.execute("SELECT result,source_payload,source_item_id,review_record FROM analyses WHERE cache_key=?", (cache_key,)).fetchone()
+        previous = self.db.execute("""SELECT result,source_payload,source_item_id,review_record,
+            rowid=(SELECT MAX(rowid) FROM analyses WHERE source_item_id=?) FROM analyses WHERE cache_key=?""",
+            (row["id"], cache_key)).fetchone()
         if previous is not None:
-            if tuple(previous) == values:
+            if tuple(previous) == (*values, 1):  # an exact repeat of the item's newest record
                 return cache_key
             cache_key = digest(["analysis-audit", cache_key, values, observed])
         self.db.execute("""INSERT OR IGNORE INTO analyses
@@ -340,30 +339,14 @@ class Store:
     def commit_candidate(self, prepared: dict, approved_candidate: dict | None, cache_key: str, observed: str, *,
                          approval_key: str | None = None, policy_hash: str | None = None,
                          review_record: dict | None = None, decision: str = "approve") -> dict:
-        """Apply an exact reviewed publication/skip decision after all CAS checks."""
-        if decision not in {"approve", "skip"}:
-            raise ValueError("Unsupported final review decision")
+        """Apply an exact reviewed publication or skip decision and delete its receipt."""
         if self.db.in_transaction:
             raise ValueError("Candidate commit requires a fresh transaction")
         self.db.execute("BEGIN IMMEDIATE")
         with self.db:
-            candidate.assert_current(self.db, prepared)
-            binding = prepared["binding"]
-            if (digest(binding) != prepared["binding_hash"] or digest(prepared["packet"]) != prepared["source_hash"]
-                    or digest(prepared["candidate"]) != prepared["candidate_hash"]
-                    or binding["candidate_hash"] != prepared["candidate_hash"] or binding["packet_hash"] != prepared["source_hash"]
-                    or digest(prepared["coverage"]) != prepared["coverage_hash"] or binding["coverage_hash"] != prepared["coverage_hash"]
-                    or digest(prepared["payload"]) != binding["payload_hash"]):
-                raise StaleCandidate("Prepared candidate or evidence changed after assembly")
-            row, result = prepared["row"], prepared["result"]
-            existing = candidate.existing_story(self.db, row)
-            story_id = existing["id"] if existing else digest(row["cluster_key"])[:24]
-            cluster = existing["cluster_key"] if existing else row["cluster_key"]
-            locked = editorial.is_locked(self.db, story_id)
-            if decision == "skip" and (not result["publish"] or locked):
-                raise ReviewRequired("Editorial skip requires an unlocked reviewed candidate")
-            payload = None
-            if result["publish"] and not locked:
+            row, result, story_id, locked = prepared["row"], prepared["result"], prepared["story_id"], prepared["locked"]
+            payload = skipped = None
+            if not locked:
                 original = prepared["candidate"]
                 if not isinstance(approved_candidate, dict) or set(approved_candidate) != set(original):
                     raise ReviewRequired("Approval must identify the complete public candidate")
@@ -374,50 +357,41 @@ class Store:
                     raise ReviewRequired("The approved candidate must already be normalized")
                 if prepared["packet"]["missing_sources"]:
                     raise ReviewRequired("Required source material is unavailable")
-                if not approval_key or not policy_hash:
-                    raise ReviewRequired("Exact final candidate needs a recorded review decision")
                 receipt = self.db.execute("SELECT * FROM review_approvals WHERE key=?", (approval_key,)).fetchone()
                 if receipt is None or any(receipt[key] != expected for key, expected in (
                         ("candidate_hash", digest(approved_candidate)), ("source_hash", prepared["source_hash"]),
                         ("policy_hash", policy_hash), ("binding_hash", prepared["binding_hash"]))):
                     raise ReviewRequired("Review decision does not match this candidate and its context")
-                from .review import decision_record_matches, validate_review
+                from .review import validate_review
                 verdict = validate_review(json.loads(receipt["result_json"]), prepared["packet"])
                 if verdict["verdict"] != decision:
                     raise ReviewRequired("Final review did not authorize this decision")
-                proof = json.loads(receipt["review_record_json"])
-                if not decision_record_matches(proof, verdict, candidate=approved_candidate, prepared=prepared, policy_hash=policy_hash):
-                    raise ReviewRequired("Review decision requires a matching final verification or skip record")
                 if review_record is None:
-                    review_record = proof
-                self.db.execute("UPDATE review_approvals SET last_used_at=? WHERE key=?", (observed, approval_key))
+                    review_record = json.loads(receipt["review_record_json"])
+                self.db.execute("DELETE FROM review_approvals WHERE key=?", (approval_key,))
                 if decision == "approve":
                     payload = json.loads(json.dumps(prepared["payload"]))
                     payload.update({key: approved_candidate[key] for key in candidate.SEMANTIC_FIELDS})
-                    if existing is None:  # Date publication, not the first draft.
+                    if candidate.existing_story(self.db, row) is None:  # Date publication, not the first draft.
                         payload["added_at"] = observed
+                else:
+                    skipped = ("Final review skipped: " + ", ".join(
+                        name for name, check in verdict["criteria"].items() if check["outcome"] != "pass"))[:160]
             analysis_key = self.record_analysis(row, result, cache_key, observed, review_record=review_record)
             if payload is not None:
                 if payload.get("editorial_item") == row["id"]:
                     payload["editorial_analysis_key"] = analysis_key
                 self.db.execute("""INSERT INTO stories(id,cluster_key,payload,published_at,updated_at)
                     VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at""",
-                    (story_id, cluster, json.dumps(payload, ensure_ascii=False, allow_nan=False), payload["published_at"], payload["updated_at"]))
-            elif locked and result["publish"]:
+                    (story_id, prepared["cluster_key"], json.dumps(payload, ensure_ascii=False, allow_nan=False), payload["published_at"], payload["updated_at"]))
+            elif locked:
                 editorial.record_held(self.db, story_id)
-            published = result["publish"] and decision == "approve"
+            published = decision == "approve"
             mapped_id = story_id if published else row.get("story_id")
-            self.db.execute("UPDATE items SET status=?,story_id=?,next_attempt_at=NULL,last_error=NULL WHERE id=?",
-                            ("published" if published else "ignored", mapped_id, row["id"]))
+            self.db.execute("UPDATE items SET status=?,story_id=?,next_attempt_at=NULL,last_error=? WHERE id=?",
+                            ("published" if published else "ignored", mapped_id, skipped, row["id"]))
             self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
         return {"story_id": mapped_id, "status": "locked" if locked and published else "published" if published else "ignored"}
-
-    def skip_candidate(self, prepared: dict, reviewed_candidate: dict, cache_key: str, observed: str, *,
-                       approval_key: str, policy_hash: str, review_record: dict | None = None) -> dict:
-        """Audit an editorial skip without changing any published story or lock."""
-        return self.commit_candidate(prepared, reviewed_candidate, cache_key, observed,
-                                     approval_key=approval_key, policy_hash=policy_hash,
-                                     review_record=review_record, decision="skip")
 
     def stories(self, limit: int = -1) -> list[dict]:
         """Stored stories, newest activity first (all of them by default)."""

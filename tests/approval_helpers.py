@@ -30,6 +30,8 @@ def approved_result(packet):
 
 class ApprovingReviewer:
     """Use only where an existing CLI test supplies an equally synthetic writer."""
+    calls = 0
+
     def __init__(self, *args, **kwargs):
         pass
 
@@ -48,13 +50,9 @@ def approve(store, prepared, candidate=None, *, policy="test-policy", result=Non
     candidate = candidate or prepared["candidate"]
     result = result or approved_result(prepared["packet"])
     key = review_gate._approval_key(candidate, prepared, policy)
-    stage = {"candidate_hash": digest(candidate), "source_hash": prepared["source_hash"],
+    stage = {"stage": "verification", "candidate_hash": digest(candidate), "source_hash": prepared["source_hash"],
              "coverage_hash": prepared["coverage_hash"], "policy_hash": policy, "result": result}
-    changes = {key: candidate[key] for key in review.EDITABLE if candidate[key] != prepared["candidate"][key]}
-    initial = review.validate_review(verdict("revise", repair=changes), prepared["packet"]) if changes else approved_result(prepared["packet"])
-    audit = {"input_row": prepared["row"], "candidate": candidate, "packet": prepared["packet"], "coverage": prepared["coverage"],
-             "reviews": [{**stage, "stage": "review", "candidate_hash": prepared["candidate_hash"], "result": initial},
-                         {**stage, "stage": "verification"}],
+    audit = {"candidate": candidate, "packet": prepared["packet"], "coverage": prepared["coverage"], "reviews": [stage],
              "outcome": "skipped" if result.get("verdict") == "skip" else "approved"}
     with store.db:
         store.db.execute("""INSERT OR REPLACE INTO review_approvals (key,candidate_hash,source_hash,policy_hash,
@@ -64,7 +62,8 @@ def approve(store, prepared, candidate=None, *, policy="test-policy", result=Non
     return {"approval_key": key, "policy_hash": policy}
 
 
-def finish_reviewed(store, row, result, key, observed):
+def finish_reviewed(store, row, result, key, observed, *, decision="approve"):
     prepared = store.prepare_candidate(row, result, observed)
-    receipt = approve(store, prepared) if prepared["requires_review"] else {}
-    return store.commit_candidate(prepared, prepared["candidate"], key, observed, **receipt)
+    reply = verdict("skip", criterion="news_value") if decision == "skip" else None
+    receipt = {} if prepared["locked"] else approve(store, prepared, result=reply)
+    return store.commit_candidate(prepared, prepared["candidate"], key, observed, decision=decision, **receipt)
