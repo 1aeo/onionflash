@@ -22,6 +22,7 @@ from . import editorial, render
 from .util import digest, now_iso
 
 
+FEED_ITEMS = 100  # the newest stories in each feed; pages and story.json keep the whole history
 _ARTICLE = r"news/[A-Za-z0-9_-]{1,64}/(?:index\.html|story\.json)"
 _TOPIC = "(?:" + "|".join(re.escape(topic) for topic in render.CATEGORIES) + ")"
 _PATH = re.compile(r"(?:" + _ARTICLE + r"|page/[1-9][0-9]*/index\.html|topics/" + _TOPIC
@@ -276,8 +277,8 @@ def _backfill_topics(db) -> None:
         _set_meta(db, "publication_topics", "1")
 
 
-def _feeds(artifacts: Artifacts, db, site: dict, base: str, limit: int) -> None:
-    # Fan out one bounded catalog pass instead of rereading it for every topic.
+def _feeds(artifacts: Artifacts, db, site: dict, base: str) -> None:
+    # Fan out one catalog pass, which stops once every feed is full, instead of rereading it per topic.
     with ExitStack() as stack:
         writers = {category: stack.enter_context(artifacts.stream(
             "feed.xml" if category is None else f"tags/{category}.xml",
@@ -288,7 +289,7 @@ def _feeds(artifacts: Artifacts, db, site: dict, base: str, limit: int) -> None:
         for story in _accepted(db, order="updated_at"):
             xml = None
             for category, writer in writers.items():
-                if (category and category not in story["tags"]) or (limit and counts[category] >= limit):
+                if (category and category not in story["tags"]) or counts[category] >= FEED_ITEMS:
                     continue
                 if not counts[category]:
                     path = "feed.xml" if category is None else f"tags/{category}.xml"
@@ -301,6 +302,8 @@ def _feeds(artifacts: Artifacts, db, site: dict, base: str, limit: int) -> None:
                         json_writer.write(b",\n")
                     json_writer.write(json.dumps(render._json_feed_item(story, base), ensure_ascii=False).encode("utf-8"))
                 counts[category] += 1
+            if min(counts.values()) >= FEED_ITEMS:
+                break
         for category, writer in writers.items():
             if not counts[category]:
                 path = "feed.xml" if category is None else f"tags/{category}.xml"
@@ -412,7 +415,7 @@ def build(config: dict, store, *, force: bool = False) -> dict:
             _set_meta(db, "publication_template", identity)
             _set_meta(db, "publication_rebuild_active", identity)
     artifacts = Artifacts(db, output, observed)
-    limit = config["storage"].get("render_batch_size", 250)
+    limit = config["storage"]["render_batch_size"]
     candidates = db.execute("""SELECT public_render_queue.story_id AS id,stories.payload FROM public_render_queue
         LEFT JOIN stories ON stories.id=public_render_queue.story_id
         WHERE public_render_queue.last_error IS NULL ORDER BY public_render_queue.rowid LIMIT ?""", (limit,)).fetchall()
@@ -493,7 +496,7 @@ def build(config: dict, store, *, force: bool = False) -> dict:
             for topic in render.CATEGORIES:
                 stats = db.execute("SELECT COUNT(*),MAX(updated_at) FROM public_story_topics WHERE topic=?", (topic,)).fetchone()
                 _listing(artifacts, site, base, [], count=stats[0], latest=stats[1], refresh=True, topic=topic)
-            _feeds(artifacts, db, site, base, site["feed_size"])
+            _feeds(artifacts, db, site, base)
         _set_meta(db, "publication_views", views)
         ready = _migration_ready(artifacts, identity, pending)
         if ready:

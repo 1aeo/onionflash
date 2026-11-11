@@ -54,36 +54,6 @@ def _label(value: str) -> str:
     return value.replace("-", " ").capitalize()
 
 
-def _editorial(value: dict | None) -> dict | None:
-    """Validate metadata supplied by the operator ledger, never source output."""
-    if value is None:
-        return None
-    if not isinstance(value, dict) or set(value) != {"status", "revision", "action", "reason", "at", "history", "history_total"}:
-        raise ValueError("Invalid editorial metadata")
-    if value["status"] not in {"corrected", "retracted"} or value["action"] not in {"correct", "retract", "restore"}:
-        raise ValueError("Invalid editorial state")
-    if type(value["revision"]) is not int or value["revision"] < 1 or type(value["history_total"]) is not int or value["history_total"] != value["revision"]:
-        raise ValueError("Invalid editorial revision")
-    if not isinstance(value["history"], list) or len(value["history"]) > 20:
-        raise ValueError("Invalid editorial history")
-    result = {**value, "reason": _text(value["reason"], 1000), "at": _iso(_date(value["at"])), "history": []}
-    if not result["reason"]:
-        raise ValueError("Editorial reason is required")
-    for entry in value["history"]:
-        if not isinstance(entry, dict) or set(entry) - {"revision", "action", "reason", "created_at", "superseded"}:
-            raise ValueError("Invalid editorial history entry")
-        if type(entry.get("revision")) is not int or not 1 <= entry["revision"] <= result["revision"] or entry.get("action") not in {"correct", "retract", "restore", "unlock"}:
-            raise ValueError("Invalid editorial history action")
-        clean = {"revision": entry["revision"], "action": entry["action"], "reason": _text(entry.get("reason"), 1000), "created_at": _iso(_date(entry.get("created_at")))}
-        if "superseded" in entry:
-            previous = entry["superseded"]
-            if not isinstance(previous, dict) or set(previous) != {"title", "summary", "why_it_matters"}:
-                raise ValueError("Invalid superseded public text")
-            clean["superseded"] = {key: _text(previous[key], limit) for key, limit in (("title", 180), ("summary", 1600), ("why_it_matters", 800))}
-        result["history"].append(clean)
-    return result
-
-
 def _prepare_story(story: dict, *, editorial: dict | None = None) -> dict:
     story_id = story.get("id", "")
     if not isinstance(story_id, str) or not ID_PATTERN.fullmatch(story_id):
@@ -123,9 +93,8 @@ def _prepare_story(story: dict, *, editorial: dict | None = None) -> dict:
         # When Onion Flash first published the story; older records fall back to the source date.
         "added_at": _iso(_date(story.get("added_at") or story.get("published_at"))),
     }
-    notice = _editorial(editorial)
-    if notice is not None:
-        public["editorial"] = notice
+    if editorial:  # built only from the operator ledger, never from source or model output
+        public["editorial"] = editorial
     return public
 
 
@@ -199,9 +168,10 @@ def _editorial_history(story: dict) -> str:
             old_text = ('<details class="superseded-text"><summary>Superseded public text — not current reporting</summary>'
                         f'<h3>{_escape(previous["title"])}</h3><p>{_escape(previous["summary"])}</p>'
                         + (f'<p><strong>Previous context:</strong> {_escape(previous["why_it_matters"])}</p>' if previous["why_it_matters"] else "") + '</details>')
-        rows.append(f'<li><strong>Revision {entry["revision"]}: {labels[entry["action"]]}</strong> · {_time(entry["created_at"], full=True)}<p>{_escape(entry["reason"])}</p>{old_text}</li>')
-    older = f'<p>Showing the latest {len(rows)} of {notice["history_total"]} changes. Earlier revision records are retained by the publisher.</p>' if notice["history_total"] > len(rows) else ""
-    return f'<details class="editorial-history" data-nosnippet><summary>Editorial history ({notice["history_total"]})</summary><ol>{"".join(rows)}</ol>{older}</details>'
+        rows.append(f'<li><strong>Revision {int(entry["revision"])}: {labels[entry["action"]]}</strong> · {_time(entry["created_at"], full=True)}<p>{_escape(entry["reason"])}</p>{old_text}</li>')
+    total = int(notice["revision"])
+    older = f'<p>Showing the latest {len(rows)} of {total} changes. Earlier revision records are retained by the publisher.</p>' if total > len(rows) else ""
+    return f'<details class="editorial-history" data-nosnippet><summary>Editorial history ({total})</summary><ol>{"".join(rows)}</ol>{older}</details>'
 
 
 def _health_details(health: list[dict]) -> str:

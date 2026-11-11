@@ -1,9 +1,13 @@
 # Corrections, retractions and revision history
 
-These commands are for a trusted operator on the collector host. They use the
-configured SQLite database and the same process lock as collection. They do not
-call the model or publish the site. Run the normal build and deployment after
-reviewing the receipt. A scheduled build can also pick up the queued change.
+These commands are for a trusted operator on the collector host and use the
+configured SQLite database. `show` and `history` take no lock, so they also work
+while collection or a build runs. `correct`, `retract`, `restore` and `unlock`
+take the same nonblocking process lock as collection: while a run or build holds
+it, they print `{"status": "already-running"}`, exit 75 and change nothing. No
+command calls the model or publishes the site. Run the normal build and
+deployment after reviewing the receipt. A scheduled build can also pick up the
+queued change.
 
 Every change requires a reason and the hash of the version you reviewed. Reasons
 are **public**: write a concise explanation for readers, without credentials,
@@ -56,6 +60,10 @@ unlock.
 
 ## Retract, restore or resume automation
 
+A later analysis that declines to publish never removes a published story, which
+may have other sources, and a false claim that passed validation is not a
+[rejected analysis](REJECTED_ANALYSES.md) to retry: correct or retract the story.
+
 Retraction replaces current reporting with a clearly labeled tombstone at the
 same URL. The homepage, RSS and JSON Feed show the retraction and its reason.
 While the story is retracted, its pages and feeds publish none of its earlier
@@ -72,18 +80,17 @@ onionflash story retract --config config.toml --story STORY_ID \
   --expect-hash REVIEWED_HASH --reason 'The source withdrew this report.'
 ```
 
-Inspect private revision history in bounded pages:
+Inspect the private revision history, newest first:
 
 ```sh
-onionflash story history --config config.toml --story STORY_ID --limit 20
-onionflash story history --config config.toml --story STORY_ID --limit 20 --before 21
+onionflash story history --config config.toml --story STORY_ID
 ```
 
-Use the returned `next_before` cursor for the next page. Each private revision
-keeps the previous stored record, previous accepted public snapshot if one
-existed, resulting text, reason, action time and before/after hashes. Revision
-zero refers to the accepted public text before the first operator action; other
-numbers refer to the text recorded by that operator revision.
+Each private revision keeps the previous stored record, previous accepted public
+snapshot if one existed, resulting text, reason, action time and before/after
+hashes. Revision zero refers to the accepted public text before the first
+operator action; other numbers refer to the text recorded by that operator
+revision.
 
 Restore a reviewed earlier revision using a fresh current hash:
 
@@ -119,25 +126,22 @@ omits until it is restored. Homepage and feed summaries contain the current
 account and notice, never the obsolete full text. Canonical article JSON includes
 the same public notice/history as its article.
 
-All revisions remain in the private SQLite ledger; the history command reads it
-in pages of at most 100. Raw collected sources, unaccepted drafts, model evidence
-and private editorial metadata do not enter public history. If a stored draft is
-invalid, a valid last-published snapshot can be used for a correction, while the
-invalid original record remains private for investigation.
+All revisions remain in the private SQLite ledger, and the history command prints
+all of them. Raw collected sources, unaccepted drafts, model evidence and private
+editorial metadata do not enter public history. If a stored draft is invalid, a
+valid last-published snapshot can be used for a correction, while the invalid
+original record remains private for investigation.
 
 Back up the SQLite database with the normal deployment backup workflow. It
 contains the complete operator ledger and last-good public snapshots, allowing
 `build --force` to recover the article pages without model calls. Corrections
 have no application-imposed history expiry.
 
-After the editorial schema is installed, **database writers must use the current
-application version**. SQLite guards use a connection-local permission function
-which current `Store` connections register. Raw or older writers cannot silently
-overwrite protected stories. Read-only inspection and SQLite backups still work.
-The permission is granted only inside an operator transaction, reset before
-commit and rolled back on failure; there is no durable bypass flag. Rolling back
-Cloudflare frontend files is independent of the collector database version.
+Locks are enforced where automation writes stories, not by SQLite. Raw SQLite
+writes and collector releases without editorial controls ignore them, so after
+running such a release, check each corrected or retracted story with `story show`.
+SQLite inspection and backups work with any version, and rolling back Cloudflare
+frontend files is independent of the collector database version.
 
 Public source/model output cannot supply the correction metadata. Notices are
-constructed from the operator ledger, validated at the publication boundary and
-HTML-escaped like the rest of the article.
+built only from the operator ledger and HTML-escaped like the rest of the article.

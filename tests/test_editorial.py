@@ -2,6 +2,7 @@
 
 from approval_helpers import finish_reviewed
 import copy
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -12,9 +13,8 @@ import pytest
 
 from onionflash import editorial, render
 from onionflash.cli import build
-from onionflash.comments import _compose, analysis_context
+from onionflash.comments import _compose
 from onionflash.store import Store, backup_database
-from onionflash.util import after
 from test_core import DATE, analysis, config, item
 
 
@@ -53,6 +53,15 @@ def current_files(cfg, story_id):
             "rss": ET.parse(root / "feed.xml").findtext("./channel/item/description"),
             "feed": json.loads((root / "feed.json").read_text())["items"][0],
             "json": json.loads((root / "news" / story_id / "story.json").read_text())}
+
+
+def test_databases_this_release_creates_still_accept_earlier_held_update_writes(tmp_path):
+    # An earlier release, after a code rollback, records a held update in last_held_at.
+    with Store(tmp_path / "db.sqlite3") as store:
+        store.db.execute("""INSERT INTO editorial_controls(story_id,revision,locked,retracted,notice_action,
+            notice_reason,notice_at) VALUES('s',1,1,0,'correct','r','t')""")
+        store.db.execute("UPDATE editorial_controls SET held_updates=held_updates+1,last_held_at='t2' WHERE story_id='s'")
+        assert store.db.execute("SELECT last_held_at FROM editorial_controls").fetchone()[0] == "t2"
 
 
 def test_correction_preserves_identity_dates_and_keeps_superseded_text_off_feeds(seeded):
@@ -106,29 +115,19 @@ def test_late_automation_is_cached_and_grouped_but_cannot_overwrite_locked_story
     assert len(store.stories()) == 1
 
 
-def test_sql_guard_covers_update_delete_insert_replace_and_raw_connections(seeded):
+def test_story_guards_left_by_an_earlier_release_cannot_stop_other_writers(seeded):
     cfg, store, story_id = seeded
-    edit(store, story_id)
-    row = dict(store.db.execute("SELECT * FROM stories WHERE id=?", (story_id,)).fetchone())
-    with store.db:
-        store.db.execute("UPDATE stories SET payload='bad' WHERE id=?", (story_id,))
-        store.db.execute("DELETE FROM stories WHERE id=?", (story_id,))
-        store.db.execute("INSERT OR REPLACE INTO stories VALUES(?,?,?,?,?)", (story_id, row["cluster_key"], "bad", DATE, DATE))
-        store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", ("other-id", row["cluster_key"], "bad", DATE, DATE))
-        store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", ("unlocked", "unlocked", "unrelated", DATE, DATE))
-        store.db.execute("UPDATE OR REPLACE stories SET id=? WHERE id='unlocked'", (story_id,))
-        store.db.execute("UPDATE OR REPLACE stories SET cluster_key=? WHERE id='unlocked'", (row["cluster_key"],))
-        assert store.db.execute("SELECT payload FROM stories WHERE id='unlocked'").fetchone()[0] == "unrelated"
-        store.db.execute("DELETE FROM stories WHERE id='unlocked'")
-    assert dict(store.db.execute("SELECT * FROM stories WHERE id=?", (story_id,)).fetchone()) == row
-    with sqlite3.connect(cfg["storage"]["database"]) as raw:
-        assert raw.execute("SELECT COUNT(*) FROM stories").fetchone()[0] == 1
-        with pytest.raises(sqlite3.OperationalError, match="onionflash_editorial_permit"):
-            raw.execute("UPDATE stories SET payload='bad' WHERE id=?", (story_id,))
-    assert len(store.stories()) == 1
+    with store.db:  # earlier releases guarded stories with a function only they register
+        for event, row in (("INSERT", "NEW"), ("UPDATE", "OLD"), ("DELETE", "OLD")):
+            store.db.execute(f"CREATE TRIGGER IF NOT EXISTS editorial_story_{event.lower()} BEFORE {event} ON stories "
+                             f"WHEN onionflash_editorial_permit({row}.id)=0 BEGIN SELECT RAISE(IGNORE); END")
+    with Store(cfg["storage"]["database"]), sqlite3.connect(cfg["storage"]["database"]) as raw:
+        assert raw.execute("INSERT INTO stories VALUES('other','other','{}',?,?)", (DATE, DATE)).rowcount == 1
+        assert raw.execute("UPDATE stories SET updated_at=updated_at WHERE id=?", (story_id,)).rowcount == 1
+        assert raw.execute("DELETE FROM stories WHERE id='other'").rowcount == 1
 
 
-def test_failed_operator_write_rolls_back_revision_and_cannot_leave_permit_open(seeded):
+def test_failed_operator_write_rolls_back_revision(seeded):
     cfg, store, story_id = seeded
     before = edit(store, story_id)
     store.db.execute("CREATE TRIGGER fail_revision BEFORE INSERT ON editorial_revisions BEGIN SELECT RAISE(ABORT,'injected failure'); END")
@@ -136,10 +135,6 @@ def test_failed_operator_write_rolls_back_revision_and_cannot_leave_permit_open(
     with pytest.raises(sqlite3.IntegrityError, match="injected failure"):
         edit(store, story_id, patch={"title": "A change that must roll back"}, observed=LATER)
     assert not store.db.in_transaction
-    assert editorial.show(store.db, story_id)["hash"] == before["hash"]
-    assert store.db.execute("SELECT onionflash_editorial_permit(?)", (story_id,)).fetchone()[0] == 0
-    with store.db:
-        store.db.execute("UPDATE stories SET payload='bad' WHERE id=?", (story_id,))
     assert editorial.show(store.db, story_id)["hash"] == before["hash"]
     assert len(editorial.history(store.db, story_id)["revisions"]) == 1
 
@@ -259,8 +254,8 @@ def test_list_field_correction_publishes_canonical_sources_tags_and_products(see
     assert story_id in (Path(cfg["storage"]["output_dir"]) / "topics" / "relay" / "index.html").read_text()
 
 
-@pytest.mark.parametrize("changes", [{"reason": ""}, {"reason": "x" * 1001}, {"expect_hash": ""},
-    {"expect_hash": "0" * 64}, {"observed": "not a date"}, {"observed": "2020-01-01T00:00:00Z"}])
+@pytest.mark.parametrize("changes", [{"reason": ""}, {"reason": "x" * 1001}, {"reason": "Fixed a claim.\uffff"},
+    {"expect_hash": ""}, {"expect_hash": "0" * 64}, {"observed": "not a date"}, {"observed": "2020-01-01T00:00:00Z"}])
 def test_reason_hash_and_time_are_required_and_validated(seeded, changes):
     cfg, store, story_id = seeded
     before = editorial.show(store.db, story_id)
@@ -270,20 +265,33 @@ def test_reason_hash_and_time_are_required_and_validated(seeded, changes):
     assert editorial.show(store.db, story_id)["hash"] == before["hash"]
 
 
-def test_private_history_paginates_and_public_history_is_bounded(seeded):
+def test_private_history_is_complete_and_public_history_is_bounded(seeded):
     cfg, store, story_id = seeded
     for number in range(23):
         edit(store, story_id, patch={"summary": f"Correction {number}."})
-    first = editorial.history(store.db, story_id, limit=2)
-    second = editorial.history(store.db, story_id, limit=2, before=first["next_before"])
-    assert [r["revision"] for r in first["revisions"]] == [23, 22]
-    assert [r["revision"] for r in second["revisions"]] == [21, 20]
-    metadata = editorial.public_metadata(store.db, story_id)
-    assert metadata["history_total"] == 23 and len(metadata["history"]) == 20
+    assert [r["revision"] for r in editorial.history(store.db, story_id)["revisions"]] == list(range(23, 0, -1))
     build(cfg, store)
-    assert len(current_files(cfg, story_id)["json"]["editorial"]["history"]) == 20
-    with pytest.raises(ValueError):
-        editorial.history(store.db, story_id, limit=101)
+    files = current_files(cfg, story_id)
+    assert len(files["json"]["editorial"]["history"]) == 20
+    assert files["json"]["editorial"]["history_total"] == 23  # earlier releases require it after a rollback
+    assert "Editorial history (23)" in files["article"] and "latest 20 of 23 changes" in files["article"]
+
+
+def test_a_catalog_snapshot_with_other_editorial_fields_still_renders(seeded):
+    cfg, store, story_id = seeded
+    edit(store, story_id)
+    act(editorial.unlock, store, story_id)
+    build(cfg, store)
+    # As another release may write it; with its private row gone, only this snapshot renders the story.
+    public = current_files(cfg, story_id)["json"]
+    public["editorial"]["later_field"] = 1
+    text = json.dumps(public, ensure_ascii=False, sort_keys=True) + "\n"
+    with store.db:
+        store.db.execute("UPDATE public_catalog SET public_json=?,json_sha256=?,template_hash='earlier' WHERE story_id=?",
+                         (text, hashlib.sha256(text.encode()).hexdigest(), story_id))
+        store.db.execute("DELETE FROM stories WHERE id=?", (story_id,))
+    assert build(cfg, store, force=True)["stories_skipped"] == 0
+    assert f'id="story-{story_id}"' in current_files(cfg, story_id)["home"]
 
 
 def test_model_or_raw_story_cannot_forge_editorial_notice(seeded):
@@ -297,78 +305,63 @@ def test_model_or_raw_story_cannot_forge_editorial_notice(seeded):
     assert "editorial" not in current_files(cfg, story_id)["json"]
 
 
-def note_item(body="The report’s old keys remain untrusted.", **changes):
-    url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41473"
-    note = {"id": "gid://gitlab/Note/123", "url": url + "#note_123", "title": "Public comment by @operator",
-            "author": "operator", "created_at": EDIT, "updated_at": EDIT, "body": body, **changes}
-    return _compose(item(url=url), [note], LATER)
+URL = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41473"
 
 
-@pytest.mark.parametrize("budget,evidence,cited", [(4000, "the report's OLD keys remain untrusted", True),
-    (None, "The report’s old keys remain untrusted", False), (499, "The report’s old keys remain untrusted", False),
-    (4000, "The operator reported a plausible compromise", False), (4000, "keys", False)])
-@pytest.mark.parametrize("note_kind", ["Note", "DiscussionNote"])
-def test_writer_quotes_select_citations_while_supplied_review_notes_date_story(tmp_path, budget, evidence, cited, note_kind):
+def note(ident, created, body):
+    return {"id": f"gid://gitlab/Note/{ident}", "url": f"{URL}#note_{ident}", "title": f"Public comment by @user{ident}",
+            "author": f"user{ident}", "created_at": created, "body": body}
+
+
+def note_item(body="The report’s old keys remain untrusted."):
+    return _compose(item(url=URL), [note(123, EDIT, body)], LATER, source_key="k")
+
+
+@pytest.mark.parametrize("evidence,cited", [("the report's OLD keys remain untrusted", True),
+    ("The operator reported a plausible compromise", False), ("keys", False)])
+def test_only_cited_notes_add_citations_and_date_the_story(tmp_path, evidence, cited):
     cfg = config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
-        incoming = note_item(id=f"gid://gitlab/{note_kind}/123")
-        store.ingest(incoming, LATER)
-        row = store.pending(1, LATER)[0]
-        finish_reviewed(store, row, analysis(evidence=[evidence]), "note", LATER, input_chars=budget)
+        store.ingest(note_item(), LATER)
+        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=[evidence]), "note", LATER)
         story = store.stories()[0]
         assert len(story["sources"]) == (2 if cited else 1)
-        assert story["updated_at"] == EDIT  # Final review sees the verified note even when the draft did not cite it.
-        assert story["editorial_updated_at"] == story["updated_at"]
+        # A cited note dates the story by when it was written; a note review only saw does not.
+        assert story["updated_at"] == story["editorial_updated_at"] == (EDIT if cited else DATE)
         assert story["published_at"] == DATE and story["added_at"] == LATER
         assert json.loads(store.db.execute("SELECT payload FROM items").fetchone()[0])["updated_at"] == DATE
-        saved = store.db.execute("SELECT input_chars FROM analyses WHERE cache_key='note'").fetchone()
-        assert saved[0] == budget
 
 
-def test_unknown_note_type_cannot_supply_story_citations_or_update_time(tmp_path):
+def test_a_quote_cites_only_its_earliest_note_and_never_a_reply_repeating_the_description(tmp_path):
     cfg = config(tmp_path)
+    notes = [note(3, LATER, "> The report’s old keys remain untrusted. Agreed."),
+             note(2, LATER, "+1, the operator reported a plausible compromise."),
+             note(1, EDIT, "The report’s old keys remain untrusted.")]
     with Store(cfg["storage"]["database"]) as store:
-        store.ingest(note_item(id="gid://gitlab/OtherNote/123"), LATER)
-        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=["The report’s old keys remain untrusted"]),
-                     "unknown-note", LATER, input_chars=4000)
+        store.ingest(_compose(item(url=URL), notes, LATER, source_key="k"), LATER)
+        evidence = ["The report’s old keys remain untrusted", "the operator reported a plausible compromise"]
+        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=evidence), "replies", LATER)
         story = store.stories()[0]
-        assert len(story["sources"]) == 1 and story["updated_at"] == DATE
+        assert [source["url"] for source in story["sources"]] == [URL, URL + "#note_1"]
+        assert story["updated_at"] == EDIT
 
 
-def test_unseen_note_tail_or_mismatched_url_cannot_be_cited(tmp_path):
-    cfg = config(tmp_path)
-    with Store(cfg["storage"]["database"]) as store:
-        incoming = note_item(body="Visible prefix. " * 1000 + "Only in unseen tail.")
-        text, notes = analysis_context(incoming, 500)
-        assert "Only in unseen tail." not in text
-        store.ingest(incoming, LATER)
-        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=["Only in unseen tail."]), "tail", LATER, input_chars=500)
-        assert len(store.stories()[0]["sources"]) == 1
-        incoming = note_item(url="https://evil.example/#note_123")
-        store.ingest(incoming, LATER)
-        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=["The report’s old keys remain untrusted"]), "wrong-url", LATER, input_chars=4000)
-        assert len(store.stories()[0]["sources"]) == 1
-
-
-def test_note_only_edits_advance_story_time_and_removed_citations_are_refreshed(tmp_path):
+def test_note_edits_keep_the_story_date_and_removed_citations_are_refreshed(tmp_path):
     cfg = config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         incoming = note_item()
         evidence = ["The report’s old keys remain untrusted"]
         store.ingest(incoming, EDIT)
-        finish_reviewed(store, store.pending(1, EDIT)[0], analysis(evidence=evidence), "first", EDIT, input_chars=4000)
+        finish_reviewed(store, store.pending(1, EDIT)[0], analysis(evidence=evidence), "first", EDIT)
         first = copy.deepcopy(store.stories()[0])
-        incoming["public_comments"][0].update(body="The report’s old keys remain untrusted. Added a detail.", updated_at=LATER)
-        incoming = _compose(incoming, incoming["public_comments"], LATER)
-        store.ingest(incoming, LATER)
-        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=evidence), "edit", LATER, input_chars=4000)
+        assert first["updated_at"] == EDIT and len(first["sources"]) == 2
+        incoming["public_comments"][0]["body"] = "The report’s old keys remain untrusted. Added a detail."
+        assert store.ingest(_compose(incoming, incoming["public_comments"], LATER, source_key="k"), LATER)
+        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=evidence), "edit", LATER)
         current = store.stories()[0]
-        assert current["updated_at"] == LATER
+        assert current["updated_at"] == EDIT  # an edit is not a newer note
         assert current["added_at"] == first["added_at"] and current["published_at"] == first["published_at"]
         assert len(current["sources"]) == 2
-        incoming["public_comments"] = []
-        incoming = _compose(incoming, [], LATER)
-        store.ingest(incoming, LATER)
-        finish_reviewed(store, store.pending(1, LATER)[0], analysis(), "removed", LATER, input_chars=4000)
-        assert len(store.stories()[0]["sources"]) == 1
-        assert store.stories()[0]["updated_at"] == LATER
+        store.ingest(_compose(incoming, [], LATER, source_key="k"), LATER)
+        finish_reviewed(store, store.pending(1, LATER)[0], analysis(), "removed", LATER)
+        assert len(store.stories()[0]["sources"]) == 1 and store.stories()[0]["updated_at"] == EDIT

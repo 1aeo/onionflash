@@ -30,67 +30,24 @@ GraphQL discussion adapter below reads verified public notes without authenticat
 Reviewed November 10, 2026 against the configured Tor, Arti, Network Health
 Analysis, Network Health Team, Tor Browser, and Anti-Censorship Team projects.
 Anonymous GraphQL requests succeeded for all six projects. The live issue-note
-connection supports `last`/`before` pagination; it does not support a `sort`
+connection returns the newest notes with `last`; it does not support a `sort`
 argument. [GitLab documents anonymous query access, null authorization responses,
 and the `/api/graphql` endpoint](https://docs.gitlab.com/api/graphql/).
 
-Set `[comments].enabled = true` to opt in. Each participating issue source must
-also declare its exact `gitlab_project`; `comments_enabled = false` excludes one
-source. `comments_graphql_url` can replace the default clean same-origin endpoint.
-No password, personal token, authorization header, or session cookie is accepted
-by this adapter. It creates a fresh public HTTP client; the transport discards
-cookies between requests and applies its normal DNS checks, timeout, retries,
-response-size bound and run deadline.
-
-Every page must explicitly match the configured project path, numeric project
-ID (when configured in the REST URL), project URL and public visibility. The
-issue identity must match and `confidential` must be exactly false. Only notes
-whose `internal` and `system` flags are both exactly false are eligible. Missing,
-null or mismatched visibility/identity is rejected; unknown note flags reject
-the snapshot before their bodies are processed. Raw responses and upstream error strings
-are never saved or logged. Notes are attributed to their authors, retain their
-own creation/edit dates and exact note URLs, and remain untrusted reports rather
-than confirmation of the underlying claim. Notes dated after the observation
-time are excluded; malformed or reversed creation/edit dates fail closed.
-
-The default limit is 12 issues per run, four per source, two pages of 20 notes,
-12 retained comments per issue, 2,000 characters per comment and 8,000 comment
-characters per issue. The newest bounded window is refreshed after 30 minutes;
-old notes outside that window can be omitted. The `comments_truncated` field
-makes this limit explicit. Replacing a snapshot handles note edits and deletions
-within the inspected window. An unavailable or unverifiable response is not a
-new snapshot: it preserves the last verified public evidence and its original
-verification time, applies bounded backoff, and leaves normal collection
-running. An unusable answer about one issue backs off only that issue; transport,
-redirect, response and project identity failures back off its source. A verified
-public snapshot with no eligible notes can remove previous note enrichment; a
-transport failure cannot masquerade as that deletion.
-
-GitLab updates an issue when a note is added, so the REST scan returns it even
-when nothing else changed. Activity after an issue's last check, or on an issue
-without a snapshot, requests a check whatever the issue's status, and changed
-notes queue a new revision for analysis. Requested checks go first, pending
-issues first, then in the order first requested. A failed check of an issue
-without a story is retried the same way until its scheduling metadata expires.
-Recent pending issues and a rotating selection of issues already tied to
-published stories alternate under the shared budget, including single-slot runs.
-History cursors advance only for attempted rows. Old published issues remain
-eligible when their description and publication date do not change. Indexed,
-bounded candidate queries avoid making a request for every historical story.
-Project order also rotates under the shared budget. Scheduling metadata expires
-after 30 days and is capped at 512 entries; note count/text is bounded in each
-ordinary item snapshot. Verified source identity/time live with that snapshot,
-so scheduling-cache eviction or an outage cannot strip it or requeue unchanged
-content. Malformed or cold local records are skipped without marking the whole
-provider unavailable. Cache state never contains unfiltered note responses.
-
-`source_content` preserves the original issue description and source identity;
-`public_comments` records the sanitized attributed notes. Fresh REST descriptions
-retain eligible cached notes, while stale descriptions cannot roll the item
-backwards. Comment changes requeue analysis under the original issue identity;
-they never advance its source publication or update timestamp. Analyzer context
-reserves room for attributed comment bodies even with a long description. A
-separate `comments_checked_at` is observation metadata, not the event date.
+Set `[comments].enabled = true` to opt in. Only issue sources that declare their
+exact `gitlab_project` take part, each read through its own origin's
+`/api/graphql`, and the adapter accepts no password, token, authorization header
+or session cookie. A response must match the configured project and its public
+visibility, the issue must match and be non-confidential, and only notes whose
+`internal` and `system` flags are both false are kept. Raw responses and upstream
+error text are never saved or logged. Each check reads an issue's newest notes in
+one bounded request; checks repeat after 30 minutes and share fixed per-run
+limits, so older notes can be missing. A failed or unverifiable check keeps the
+last verified notes. Notes stay attributed, untrusted reports with their authors,
+creation dates and exact URLs. A new, edited or deleted note queues the issue for
+analysis again, and only a newly cited note moves the story's date, to the time
+the note was written. Once comments are turned off, or a source loses its
+`gitlab_project`, an issue's next revision is analyzed without its notes.
 
 ### Tor Metrics timeline
 
@@ -110,7 +67,7 @@ The November 10 repository check found 804 rows, including the October 28 Tor
 The HTTP response-size limit bounds the table; retries and backoff also apply.
 Conditional HTTP requests avoid parsing unchanged snapshots.
 
-Rows qualify through the configured event-date lookback (14 days by default):
+Rows qualify through the fixed 14-day event-date lookback:
 a recent start or explicit end can qualify, and the date that qualified a row
 dates its item. An old `ongoing` row or a recent repository commit cannot qualify
 a row. Every row's dates must parse, but other fields of historical rows are read
@@ -141,30 +98,13 @@ clustering still adds corroborating citations to existing release stories.
 | [TPA infrastructure issues](https://gitlab.torproject.org/tpo/tpa/team) | Useful incidents mixed with substantial routine administration; add if infrastructure coverage is desired. |
 | [Tor Browser tags](https://gitlab.torproject.org/tpo/applications/tor-browser/-/tags?format=atom) | Mixes Browser/base-browser and stable/alpha/build tags; needs explicit product/version filtering. |
 
-## Operator controls and remaining work
-
-Durable [corrections, retractions and revision history](EDITORIAL.md) protect
-operator decisions from later automation. A later `publish=false` result does
-not automatically delete a previously published story, which may have multiple
-sources. The [rejected-analysis CLI](REJECTED_ANALYSES.md) provides explicit
-inspection, retry and dismissal without bypassing validation. These workflows
-serve different purposes: a false claim that passed validation needs a story
-correction, not a rejected-item retry.
-
-[Permanent publication](PERMANENT_HISTORY.md) retains every article URL and
-paginates the full history. Optional private-evidence retention and Spaces
-publication are documented in the deployment repository.
+## Remaining work
 
 1. **Broader discussion coverage.** Merge-request discussions and older comments
    beyond the bounded newest-note window remain outside the anonymous issue adapter.
 2. **Long-term measurement.** Dedicated per-revision timing records would support
    latency reporting. Keep source timestamps distinct from observation and
    publication time. Accuracy and preserved articles take priority over latency analytics.
-
-Tag drafts are deterministic and remain `tagged` until an actual release
-announcement supplies that context. They still need the
-[editorial and factual publication reviews](FINAL_REVIEW.md). Harmless duplicate
-model labels are normalized; invalid labels and unsupported evidence are rejected.
 
 Personal push/email alerts remain intentionally deferred. Storage-bucket isolation
 is a deployment configuration choice; see the deployment repository's guide.

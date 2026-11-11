@@ -7,12 +7,12 @@ import sqlite3
 
 import pytest
 
-from onionflash import rejection
+from onionflash import editorial, rejection
 from onionflash.analyze import AnalysisError, cache_key
 from onionflash.config import DEFAULTS
 from onionflash.store import Store
 from onionflash.util import after
-from test_core import DATE, analysis, item
+from test_core import DAMAGE, DATE, analysis, damaged, item
 
 
 @pytest.fixture
@@ -52,9 +52,41 @@ def analysis_result(store, key):
 
 
 def actions(store):
-    if not store.db.execute("SELECT 1 FROM sqlite_master WHERE name='rejection_actions'").fetchone():
-        return []
     return [dict(row) for row in store.db.execute("SELECT * FROM rejection_actions ORDER BY action_id")]
+
+
+def damage(store, row, kind):
+    store.db.execute("UPDATE items SET payload=CAST(? AS TEXT) WHERE id=?", (damaged(row["payload"], kind), row["id"]))
+    store.db.commit()
+
+
+@pytest.mark.parametrize("kind", DAMAGE)
+def test_a_damaged_saved_item_stays_listable_and_inspectable(store, kind):
+    _, row = rejected(store, 0)
+    _, intact = rejected(store, 1)
+    damage(store, row, kind)
+    listed = {entry["id"]: entry["title"] for entry in rejection.list_items(store)["items"]}
+    assert listed == {row["id"]: None, intact["id"]: json.loads(intact["payload"])["title"]}
+    shown = rejection.show_item(store, row["id"])
+    assert shown["saved_item"] is None and shown["content_hash"] == row["content_hash"]
+
+
+@pytest.mark.parametrize("kind", DAMAGE)
+def test_a_damaged_saved_item_can_be_dismissed_but_not_retried(store, kind):
+    _, row = rejected(store)
+    damage(store, row, kind)
+    with pytest.raises(ValueError, match="restore or recollect it first"):
+        rejection.retry_item(store, row["id"], row["content_hash"], "try again")
+    assert rejection.dismiss_item(store, row["id"], row["content_hash"], "damaged copy")["status"] == "dismissed"
+
+
+@pytest.mark.parametrize("title", [[1], {"a": 1}, 5, True])
+def test_only_text_is_listed_as_a_title(store, title):
+    """A saved title of another type never reaches the printed list, which could not print one nested deeply enough."""
+    _, row = rejected(store)
+    store.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps({**json.loads(row["payload"]), "title": title}), row["id"]))
+    store.db.commit()
+    assert rejection.list_items(store)["items"][0]["title"] is None
 
 
 def test_list_excludes_transient_failures_and_is_bounded_with_stable_pagination(store):
@@ -81,47 +113,49 @@ def test_list_excludes_transient_failures_and_is_bounded_with_stable_pagination(
     assert pending["attempts"] == 5 and pending["rejections"] == 0
 
 
-def test_show_is_explicit_source_inspection_and_handles_malformed_payload(store):
+def test_show_is_explicit_source_inspection(store):
     source, row = rejected(store)
     shown = rejection.show_item(store, source["id"])
     assert shown["saved_item"]["content"] == source["content"]
     assert shown["content_hash"] == row["content_hash"]
     assert shown["actions"] == []
-    with store.db:
-        store.db.execute("UPDATE items SET payload='broken JSON' WHERE id=?", (source["id"],))
-    assert rejection.show_item(store, source["id"])["saved_item"] is None
-    assert rejection.list_items(store)["items"][0]["saved_item_error"]
 
 
-def test_retry_supersedes_only_current_analysis_and_saves_evidence_privately(store, capsys):
+def test_retry_queues_the_revision_and_leaves_analysis_records_unchanged(store, capsys):
     source, row = rejected(store)
     key = cache_key(row, DEFAULTS["llm"])
-    previous_result = analysis()
-    with store.db:
-        store.db.execute("INSERT INTO analyses(cache_key,result,created_at,source_payload,source_item_id) VALUES(?,?,?,?,?)",
-                         (key, json.dumps(previous_result), DATE, row["payload"], row["id"]))
-        store.db.execute("INSERT INTO analyses(cache_key,result,created_at) VALUES('other','{}',?)", (DATE,))
-    result = rejection.retry_item(store, row["id"], row["content_hash"], "Grounding rule was repaired", DEFAULTS["llm"], DATE)
+    with store.db:  # a record under the same key, from an identical revision or another item with the same content
+        store.record_analysis(row, analysis(), key, DATE)
+    before = [tuple(record) for record in store.db.execute("SELECT * FROM analyses")]
+    result = rejection.retry_item(store, row["id"], row["content_hash"], "Grounding rule was repaired", DATE)
     queued = store.pending(10, DATE)
     assert len(queued) == 1
     assert (queued[0]["status"], queued[0]["attempts"], queued[0]["rejections"], queued[0]["next_attempt_at"], queued[0]["last_error"]) == ("pending", 0, 0, None, None)
-    assert analysis_result(store, key) is None and analysis_result(store, "other") == {}
+    assert [tuple(record) for record in store.db.execute("SELECT * FROM analyses")] == before
     assert store.stories() == []  # Retrying is not publishing.
     audit = actions(store)[0]
-    assert audit["superseded_analysis_key"] == key
-    snapshot = json.loads(audit["superseded_analysis_json"])
-    assert json.loads(snapshot["result"]) == previous_result
-    assert snapshot["source_payload"] == row["payload"]
-    assert audit["before_attempts"] == 3 and audit["before_rejections"] == 3
+    assert (audit["before_status"], audit["before_attempts"], audit["before_rejections"]) == ("rejected", 3, 3)
     assert audit["reason"] == "Grounding rule was repaired"
-    assert "content" not in result and "reason" not in result and "superseded_analysis_json" not in result
-    assert "superseded_analysis_json" not in rejection.show_item(store, row["id"])["actions"][0]
+    assert "content" not in result and "reason" not in result
     assert capsys.readouterr().out == ""
     finish_reviewed(store, queued[0], analysis(summary="A supported account after retry."), key, after(60, DATE))
     assert store.pending_count() == 0
-    assert store.stories()[0]["summary"] == "A supported account after retry."
-    assert analysis_result(store, key)["summary"] == "A supported account after retry."
+    story = store.stories()[0]
+    assert story["summary"] == "A supported account after retry."
+    assert analysis_result(store, key) == analysis()  # the earlier record stays; the new attempt adds its own
+    assert analysis_result(store, story["editorial_analysis_key"])["summary"] == "A supported account after retry."
     assert len(actions(store)) == 1
+
+
+def test_retry_undoes_a_mistaken_dismissal(store):
+    _, row = rejected(store)
+    rejection.dismiss_item(store, row["id"], row["content_hash"], "Dismissed by mistake", DATE)
+    assert rejection.retry_item(store, row["id"], row["content_hash"], "A real report", DATE)["status"] == "pending"
+    assert store.pending_count() == 1
+    for operation in (rejection.retry_item, rejection.dismiss_item):  # neither applies to the queued revision
+        with pytest.raises(ValueError, match="terminally rejected"):
+            operation(store, row["id"], row["content_hash"], "Again", DATE)
+    assert [(audit["action"], audit["before_status"]) for audit in actions(store)] == [("dismiss", "rejected"), ("retry", "dismissed")]
 
 
 def test_dismissal_stops_unchanged_and_timestamp_only_replays_but_new_content_requeues(store):
@@ -151,11 +185,10 @@ def test_dismissal_stops_unchanged_and_timestamp_only_replays_but_new_content_re
 @pytest.mark.parametrize("action", ["retry", "dismiss"])
 def test_repeated_action_is_not_applied_twice(store, action):
     _, row = rejected(store)
-    operation = (lambda: rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed", DEFAULTS["llm"], DATE)) if action == "retry" else (
-        lambda: rejection.dismiss_item(store, row["id"], row["content_hash"], "Reviewed", DATE))
-    operation()
+    operation = getattr(rejection, action + "_item")
+    operation(store, row["id"], row["content_hash"], "Reviewed", DATE)
     with pytest.raises(ValueError, match="terminally rejected"):
-        operation()
+        operation(store, row["id"], row["content_hash"], "Reviewed", DATE)
     assert len(actions(store)) == 1
 
 
@@ -167,83 +200,87 @@ def test_stale_hash_and_new_pending_actions_are_rejected_without_audit(store):
         rejection.dismiss_item(store, row["id"], row["content_hash"], "Old view", DATE)
     current = rejection.show_item(store, row["id"])
     with pytest.raises(ValueError, match="terminally rejected"):
-        rejection.retry_item(store, row["id"], current["content_hash"], "New source revision", DEFAULTS["llm"], DATE)
+        rejection.retry_item(store, row["id"], current["content_hash"], "New source revision", DATE)
     assert actions(store) == []
 
 
 @pytest.mark.parametrize("failures", [1, 3])
-def test_retry_and_dismiss_do_not_mutate_an_existing_story_or_editorial_state(store, failures):
+@pytest.mark.parametrize("locked", [False, True])
+def test_retry_and_dismiss_do_not_mutate_an_existing_story_or_editorial_state(store, failures, locked):
     source = item()
     store.ingest(source, DATE)
     first = store.pending(1, DATE)[0]
     finish_reviewed(store, first, analysis(), cache_key(first, DEFAULTS["llm"]), DATE)
     original_story_id = store.stories()[0]["id"]
+    if locked:  # an operator correction locks the story
+        editorial.correct(store.db, original_story_id, {"why_it_matters": "Operator-corrected text."}, reason="Operator correction",
+                          expect_hash=editorial.show(store.db, original_story_id)["hash"], observed=DATE)
     changed = {**source, "content": source["content"] + " A disputed later revision.", "updated_at": after(60, DATE)}
     store.ingest(changed, after(60, DATE))
     for _ in range(failures):
         store.defer(source["id"], "Unsupported later claim", DEFAULTS["llm"], DATE, terminal=True)
-    before = [tuple(row) for row in store.db.execute("SELECT * FROM stories")]
-    with store.db:
-        store.db.execute("CREATE TABLE operator_override_fixture(story_id TEXT,value TEXT)")
-        store.db.execute("INSERT INTO operator_override_fixture VALUES('story','must remain locked')")
+    before = editorial.show(store.db, original_story_id)  # its hash covers the story row, revision, lock and retraction
     current = rejection.show_item(store, source["id"])
-    rejection.retry_item(store, source["id"], current["content_hash"], "Check repaired reviewer", DEFAULTS["llm"], DATE)
+    rejection.retry_item(store, source["id"], current["content_hash"], "Check repaired reviewer", DATE)
     for _ in range(failures):
         store.defer(source["id"], "Still unsupported", DEFAULTS["llm"], DATE, terminal=True)
     rejection.dismiss_item(store, source["id"], current["content_hash"], "Keep the earlier accepted account", DATE)
-    assert [tuple(row) for row in store.db.execute("SELECT * FROM stories")] == before
-    assert store.db.execute("SELECT value FROM operator_override_fixture").fetchone()[0] == "must remain locked"
+    assert editorial.show(store.db, original_story_id) == before and before["locked"] == locked
     assert rejection.show_item(store, source["id"])["story_id"] == original_story_id
 
 
-def test_retry_refuses_missing_source_body_but_dismiss_still_works(store):
+@pytest.mark.parametrize("field", ["content", "url", "updated_at"])
+def test_retry_refuses_an_incomplete_saved_item_but_dismiss_still_works(store, field):
     _, row = rejected(store)
     payload = json.loads(row["payload"])
-    payload.pop("content")
+    payload.pop(field)
     with store.db:
         store.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps(payload), row["id"]))
     with pytest.raises(ValueError, match="restore or recollect"):
-        rejection.retry_item(store, row["id"], row["content_hash"], "Try again", DEFAULTS["llm"], DATE)
+        rejection.retry_item(store, row["id"], row["content_hash"], "Try again", DATE)
     assert actions(store) == []
     rejection.dismiss_item(store, row["id"], row["content_hash"], "No usable stored body", DATE)
     assert rejection.show_item(store, row["id"])["status"] == "dismissed"
 
 
 @pytest.mark.parametrize("pending", [False, True])
-def test_failed_audit_insert_rolls_back_queue_and_analysis_changes(store, pending):
+def test_failed_audit_insert_rolls_back_the_action(store, pending):
     _, row = failed_pending(store) if pending else rejected(store)
-    key = cache_key(row, DEFAULTS["llm"])
     with store.db:
-        store.db.execute("INSERT INTO analyses(cache_key,result,created_at) VALUES(?,?,?)", (key, '{}', DATE))
-        rejection._initialize(store.db)
         store.db.execute("""CREATE TRIGGER fail_rejection_audit BEFORE INSERT ON rejection_actions
                          BEGIN SELECT RAISE(ABORT,'audit unavailable'); END""")
     with pytest.raises(sqlite3.IntegrityError):
-        rejection.retry_item(store, row["id"], row["content_hash"], "Retry", DEFAULTS["llm"], DATE)
-    assert rejection.show_item(store, row["id"])["status"] == row["status"]
-    assert analysis_result(store, key) == {} and actions(store) == []
+        rejection.retry_item(store, row["id"], row["content_hash"], "Retry", DATE)
+    assert rejection.show_item(store, row["id"])["status"] == row["status"] and actions(store) == []
+
+
+def test_an_earlier_release_can_still_use_the_audit_table(store):
+    """After a code rollback, an earlier release writes and reads two columns this one no longer uses."""
+    _, row = rejected(store)
+    with store.db:
+        store.db.execute("""INSERT INTO rejection_actions(item_id,content_hash,action,reason,created_at,before_status,
+            before_attempts,before_rejections,before_error,before_next_attempt_at,superseded_analysis_key,superseded_analysis_json)
+            VALUES(?,?,'dismiss','Reviewed',?,'rejected',3,3,NULL,NULL,NULL,NULL)""", (row["id"], row["content_hash"], DATE))
+    assert store.db.execute("SELECT superseded_analysis_key FROM rejection_actions").fetchone()[0] is None
+    assert rejection.show_item(store, row["id"])["actions"][0]["reason"] == "Reviewed"
 
 
 def test_content_changed_during_retry_does_not_get_overwritten(store, monkeypatch):
     _, row = rejected(store)
-    key = cache_key(row, DEFAULTS["llm"])
-    with store.db:
-        store.db.execute("INSERT INTO analyses(cache_key,result,created_at) VALUES(?,?,?)", (key, '{}', DATE))
-    original_key = rejection._retry_key
+    ready = rejection._ready
     database = store.db.execute("PRAGMA database_list").fetchone()[2]
 
-    def concurrent_change(current, llm):
-        result = original_key(current, llm)
+    def concurrent_change(current):
+        ready(current)
         with sqlite3.connect(database) as writer:
             writer.execute("UPDATE items SET content_hash=? WHERE id=?", ("f" * 64, row["id"]))
-        return result
 
-    monkeypatch.setattr(rejection, "_retry_key", concurrent_change)
+    monkeypatch.setattr(rejection, "_ready", concurrent_change)
     with pytest.raises(ValueError, match="changed during"):
-        rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed", DEFAULTS["llm"], DATE)
+        rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed", DATE)
     current = rejection.show_item(store, row["id"])
     assert current["status"] == "rejected" and current["content_hash"] == "f" * 64
-    assert analysis_result(store, key) == {} and actions(store) == []
+    assert actions(store) == []
 
 
 @pytest.mark.parametrize("reason", ["", "   ", "x" * 1001, "bad\x1bvalue", "bad\ud800value"])
@@ -268,7 +305,7 @@ def test_failed_pending_actions_preserve_audit_and_do_not_repeat(store, action, 
     key = cache_key(row, DEFAULTS["llm"])
     with store.db:
         store.db.execute("INSERT INTO analyses(cache_key,result,created_at) VALUES(?,?,?)", (key, '{}', DATE))
-    operation = (lambda: rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed failure", DEFAULTS["llm"], DATE)) if action == "retry" else (
+    operation = (lambda: rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed failure", DATE)) if action == "retry" else (
         lambda: rejection.dismiss_item(store, row["id"], row["content_hash"], "Redundant source revision", DATE))
     result = operation()
     current = rejection.show_item(store, row["id"])
@@ -278,12 +315,13 @@ def test_failed_pending_actions_preserve_audit_and_do_not_repeat(store, action, 
     assert audit["before_next_attempt_at"] == row["next_attempt_at"]
     assert current["next_attempt_at"] is None and store.stories() == []
     assert set(result) == {"item_id", "content_hash", "action", "status", "action_id"}
+    # Neither action moves the analysis record into the audit.
+    assert analysis_result(store, key) == {} and audit["superseded_analysis_json"] is None
     if action == "retry":
         assert current["status"] == "pending" and current["attempts"] == current["rejections"] == 0
-        assert current["rejection_reason"] == "" and analysis_result(store, key) is None
-        assert json.loads(audit["superseded_analysis_json"])["result"] == '{}'
+        assert current["rejection_reason"] is None
     else:
-        assert current["status"] == "dismissed" and analysis_result(store, key) == {}
+        assert current["status"] == "dismissed"
         assert not store.ingest(copy.deepcopy(source), after(60, DATE))
         assert not store.ingest({**source, "updated_at": after(120, DATE)}, after(120, DATE))
         assert store.pending_count() == 0
@@ -292,12 +330,11 @@ def test_failed_pending_actions_preserve_audit_and_do_not_repeat(store, action, 
     assert len(actions(store)) == 1
 
 
-@pytest.mark.parametrize("action", ["retry", "dismiss"])
-@pytest.mark.parametrize("status,attempts,error", [
+@pytest.mark.parametrize("action,status,attempts,error", [(action, *case) for action in ("retry", "dismiss") for case in [
     ("pending", 0, None), ("pending", 0, "old error"), ("pending", 1, None),
     ("pending", 1, "  \t"), ("pending", -1, "old error"),
     ("published", 2, "old error"), ("ignored", 2, "old error"), ("dismissed", 2, "old error"),
-])
+] if (action, case[0]) != ("retry", "dismissed")])  # retry undoes a dismissal
 def test_new_or_completed_items_cannot_be_acted_on(store, action, status, attempts, error):
     _, row = failed_pending(store)
     with store.db:
@@ -305,7 +342,7 @@ def test_new_or_completed_items_cannot_be_acted_on(store, action, status, attemp
     before = dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone())
     with pytest.raises(ValueError, match="previously failed pending"):
         if action == "retry":
-            rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed", DEFAULTS["llm"], DATE)
+            rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed", DATE)
         else:
             rejection.dismiss_item(store, row["id"], row["content_hash"], "Reviewed", DATE)
     assert dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()) == before
@@ -322,7 +359,7 @@ def test_pending_retry_archives_review_attempt_and_reuses_draft(store):
         review_gate.process_item(DEFAULTS, store, row, Writer(),
                                  Reviewer(AnalysisError("Request timed out", retryable=True)), DATE)
     store.defer(row["id"], "Final review request failed", DEFAULTS["llm"], DATE)
-    rejection.retry_item(store, row["id"], row["content_hash"], "Review policy repaired", DEFAULTS["llm"], DATE)
+    rejection.retry_item(store, row["id"], row["content_hash"], "Review policy repaired", DATE)
     job = store.db.execute("SELECT stage,record_json FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
     assert job["stage"] == "drafted" and json.loads(job["record_json"])["reviews"] == []
     archived = json.loads(store.db.execute("SELECT review_record FROM analyses WHERE source_item_id=?", (row["id"],)).fetchone()[0])
@@ -349,7 +386,10 @@ def test_dismissed_failed_pending_revision_only_requeues_on_source_change(store)
 
 @pytest.mark.parametrize("action", ["retry", "dismiss"])
 @pytest.mark.parametrize("change", ["status='published'", "attempts=attempts+1", "rejections=rejections+1",
-                                    "last_error=NULL", "next_attempt_at=NULL", "source_id='retired-alerts'"])
+                                    "last_error=NULL", "next_attempt_at=NULL", "source_id='retired-alerts'",
+                                    # Comment refreshes rewrite only the payload, so the swap compares its exact bytes.
+                                    "payload='{\"other\": 1}'", "payload=replace(payload, 'title', 'título')",
+                                    "payload=CAST(x'7b22ff22' AS TEXT)"])
 def test_concurrent_pending_queue_change_is_not_overwritten(store, monkeypatch, action, change):
     """A stale operator action must preserve concurrent queue updates without an audit."""
     _, row = failed_pending(store)
@@ -363,11 +403,11 @@ def test_concurrent_pending_queue_change_is_not_overwritten(store, monkeypatch, 
     monkeypatch.setattr(rejection, "_checked", changed_after_read)
     with pytest.raises(ValueError, match="changed during"):
         if action == "retry":
-            rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed", DEFAULTS["llm"], DATE)
+            rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed", DATE)
         else:
             rejection.dismiss_item(store, row["id"], row["content_hash"], "Reviewed", DATE)
-    current = dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone())
-    assert current["content_hash"] == row["content_hash"] and current["payload"] == row["payload"]
+    current = store.db.execute("SELECT content_hash,status FROM items WHERE id=?", (row["id"],)).fetchone()
+    assert current["content_hash"] == row["content_hash"]
     assert current["status"] != "dismissed" and actions(store) == []
 
 
@@ -377,9 +417,9 @@ def test_ignored_reconsideration_is_explicit_audited_and_one_item_only(store):
     _, other = ignored(store, 1)
     key = cache_key(row, DEFAULTS["llm"])
     with pytest.raises(ValueError, match="reconsider-ignored"):
-        rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DEFAULTS["llm"], DATE)
+        rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DATE)
     assert actions(store) == []
-    result = rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DEFAULTS["llm"], DATE,
+    result = rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DATE,
                                   reconsider_ignored=True, retired_source_ids={"retired-alerts"})
     assert result["status"] == "pending" and store.stories() == []
     current = dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone())
@@ -391,22 +431,22 @@ def test_ignored_reconsideration_is_explicit_audited_and_one_item_only(store):
     audit = actions(store)[0]
     assert audit["before_status"] == "ignored" and audit["action"] == "retry"
     assert audit["reason"] == "Reviewed selection"
-    saved = json.loads(audit["superseded_analysis_json"])
-    assert json.loads(saved["result"])["publish"] is False and saved["source_payload"] == row["payload"]
-    assert audit["superseded_analysis_key"] == key and analysis_result(store, key) is None
+    # The ignored decision's analysis record stays where it is; retry adds no copy of it.
+    assert audit["superseded_analysis_key"] is None and audit["superseded_analysis_json"] is None
+    assert analysis_result(store, key)["publish"] is False
     with pytest.raises(ValueError, match="previously failed pending"):
-        rejection.retry_item(store, row["id"], row["content_hash"], "Duplicate retry", DEFAULTS["llm"], DATE,
+        rejection.retry_item(store, row["id"], row["content_hash"], "Duplicate retry", DATE,
                               reconsider_ignored=True)
     assert len(actions(store)) == 1
 
 
-@pytest.mark.parametrize("status", ["pending", "published", "dismissed"])
+@pytest.mark.parametrize("status", ["pending", "published"])  # a dismissed revision can always be retried
 def test_reconsider_flag_does_not_allow_new_pending_or_other_completed_states(store, status):
     _, row = ignored(store)
     with store.db:
         store.db.execute("UPDATE items SET status=? WHERE id=?", (status, row["id"]))
     with pytest.raises(ValueError, match="previously failed pending"):
-        rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DEFAULTS["llm"], DATE,
+        rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DATE,
                               reconsider_ignored=True)
     assert store.db.execute("SELECT status FROM items WHERE id=?", (row["id"],)).fetchone()[0] == status
     assert actions(store) == []
@@ -428,12 +468,11 @@ def test_ignored_reconsideration_retains_existing_guards_and_transactional_audit
         reason = ""
     else:
         with store.db:
-            rejection._initialize(store.db)
             store.db.execute("CREATE TRIGGER fail_audit BEFORE INSERT ON rejection_actions BEGIN SELECT RAISE(ABORT,'unavailable'); END")
     before = dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone())
     previous = analysis_result(store, cache_key(row, DEFAULTS["llm"]))
     with pytest.raises((ValueError, sqlite3.IntegrityError)):
-        rejection.retry_item(store, row["id"], expected, reason, DEFAULTS["llm"], DATE, reconsider_ignored=True)
+        rejection.retry_item(store, row["id"], expected, reason, DATE, reconsider_ignored=True)
     assert dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()) == before
     assert analysis_result(store, cache_key(row, DEFAULTS["llm"])) == previous
     assert actions(store) == []
@@ -450,7 +489,7 @@ def test_ignored_reconsideration_rechecks_concurrent_state(store, monkeypatch):
         return captured
     monkeypatch.setattr(rejection, "_checked", changed_after_read)
     with pytest.raises(ValueError, match="changed during"):
-        rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DEFAULTS["llm"], DATE,
+        rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DATE,
                               reconsider_ignored=True)
     assert store.db.execute("SELECT status FROM items WHERE id=?", (row["id"],)).fetchone()[0] == "published"
     assert actions(store) == []
@@ -504,7 +543,7 @@ def test_retry_refuses_configured_retired_sources_without_mutating_saved_state(s
                          (status, row["id"]))
     before = sorted(store.db.iterdump())
     with pytest.raises(ValueError, match="Retired alert sources cannot be retried"):
-        rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DEFAULTS["llm"], DATE,
+        rejection.retry_item(store, row["id"], row["content_hash"], "Reviewed selection", DATE,
                              reconsider_ignored=status == "ignored", retired_source_ids={row["source_id"]})
     assert sorted(store.db.iterdump()) == before
     assert actions(store) == []
@@ -546,7 +585,7 @@ def test_explicit_reconsideration_gets_fresh_decision_and_preserves_unrelated_ap
     retained = [tuple(saved) for saved in store.db.execute("SELECT * FROM review_approvals")]
     retained_analysis = dict(store.db.execute("SELECT * FROM analyses WHERE source_item_id=?", (other["id"],)).fetchone())
     row, receipt, candidate = reviewed_skip(store)
-    rejection.retry_item(store, row["id"], row["content_hash"], "Reconsider this editorial decision", DEFAULTS["llm"], DATE,
+    rejection.retry_item(store, row["id"], row["content_hash"], "Reconsider this editorial decision", DATE,
                          reconsider_ignored=True)
     assert [tuple(saved) for saved in store.db.execute("SELECT * FROM review_approvals")] == retained
     # Identical source text shares a base analysis key, but never ownership of its audit.
@@ -569,7 +608,7 @@ def test_reconsideration_stays_fresh_across_interruption_and_resumes_its_new_dec
     from onionflash import review_gate
     from test_review_gate import Reviewer, Writer, verdict
     row, receipt, candidate = reviewed_skip(store)
-    rejection.retry_item(store, row["id"], row["content_hash"], "Inspect again", DEFAULTS["llm"], DATE,
+    rejection.retry_item(store, row["id"], row["content_hash"], "Inspect again", DATE,
                          reconsider_ignored=True)
     assert not store.db.execute("SELECT 1 FROM review_approvals WHERE key=?", (receipt["key"],)).fetchone()
     failure = AnalysisError("Request timed out", retryable=True)
@@ -604,10 +643,9 @@ def test_failed_reconsideration_audit_preserves_completed_skip_receipt(store):
     """The operator transaction cannot discard a decision without recording its action."""
     row, receipt, _ = reviewed_skip(store)
     with store.db:
-        rejection._initialize(store.db)
         store.db.execute("CREATE TRIGGER fail_reconsideration BEFORE INSERT ON rejection_actions BEGIN SELECT RAISE(ABORT,'unavailable'); END")
     with pytest.raises(sqlite3.IntegrityError):
-        rejection.retry_item(store, row["id"], row["content_hash"], "Inspect again", DEFAULTS["llm"], DATE,
+        rejection.retry_item(store, row["id"], row["content_hash"], "Inspect again", DATE,
                              reconsider_ignored=True)
     assert dict(store.db.execute("SELECT * FROM review_approvals WHERE key=?", (receipt["key"],)).fetchone()) == receipt
     assert store.db.execute("SELECT status FROM items WHERE id=?", (row["id"],)).fetchone()[0] == "ignored"

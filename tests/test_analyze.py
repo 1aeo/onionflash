@@ -9,6 +9,7 @@ import json
 import pytest
 
 from onionflash.analyze import AnalysisError, Analyzer, MAX_EVIDENCE_CHOICES, MIN_EVIDENCE_CHARS, _writer_schema, tag_notice, validate_analysis
+from onionflash.comments import INPUT_CHARS
 from onionflash.config import DEFAULTS
 from onionflash.store import Store
 from onionflash.transport import FetchError, Response
@@ -181,17 +182,19 @@ def test_evidence_enum_is_derived_from_the_exact_supplied_context():
 
 def test_writer_excerpt_options_retain_later_supplied_comments(monkeypatch):
     """Keep literal comment evidence within the same context sent to the writer."""
-    source = item(content="Original description", source_content="Original description", public_comments=[{
-        "id": "gid://gitlab/DiscussionNote/1", "url": "https://example.org/issue#note_1", "author": "operator",
-        "created_at": DATE, "updated_at": DATE, "body": 'The later **clarification** retains "quoted text".',
+    body = 'The later **clarification** retains "quoted text".'
+    source = item(content="Original description", public_comments=[{
+        "id": "gid://gitlab/DiscussionNote/1", "url": "https://example.org/issue#note_1",
+        "title": "Public comment by @operator", "author": "operator", "created_at": DATE, "body": body,
     }])
-    llm = analyzer(monkeypatch, completion(analysis(why_it_matters="", evidence=["Original description"])))
-    llm.analyze(source)
+    llm = analyzer(monkeypatch, completion(analysis(why_it_matters="", evidence=[body])))
+    assert llm.analyze(source)["evidence"] == [body]  # a note body the writer saw is literal evidence
     request = llm.client.requests[0][1]
     supplied = json.loads(request["messages"][1]["content"])
     choices = request["response_format"]["json_schema"]["schema"]["properties"]["evidence"]["items"]["enum"]
-    assert 'The later **clarification** retains "quoted text".' in choices
-    assert all(choice in supplied["title"] or choice in supplied["content"] for choice in choices)
+    assert body in choices
+    texts = [supplied["title"], supplied["content"], *(note["body"] for note in supplied["public_comments"])]
+    assert all(any(choice in text for text in texts) for choice in choices)
 
 
 def test_oversized_literal_lines_have_bounded_choices_including_their_tail():
@@ -224,7 +227,7 @@ def test_casefold_expansion_cannot_create_an_impossible_enum_choice(text):
 
 def test_evidence_grammar_is_bounded_across_a_full_many_line_input():
     content = "".join(f"row-{index:04d}\n" for index in range(1550)) + "Final comment"
-    assert len(content) <= DEFAULTS["llm"]["max_input_chars"]
+    assert len(content) <= INPUT_CHARS
     choices = _writer_schema({"title": "Source title", "content": content})["properties"]["evidence"]["items"]["enum"]
     assert len(choices) == MAX_EVIDENCE_CHOICES
     assert choices[0] == "Source title" and choices[-1] == "Final comment"

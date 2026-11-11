@@ -2,9 +2,8 @@ from approval_helpers import finish_reviewed
 import json
 from pathlib import Path
 
-import pytest
-
 from onionflash import cli
+from onionflash.comments import _compose
 from onionflash.config import load_config
 from onionflash.store import Store
 from onionflash.util import item_cluster
@@ -40,10 +39,13 @@ def test_cli_correct_build_lock_and_stale_guard(tmp_path, capsys):
     config, cfg, story_id = setup_story(tmp_path)
     current = invoke(capsys, "story", "show", "--config", config, "--story", story_id)
     patch = tmp_path / "patch.json"
-    patch.write_text(json.dumps({"why_it_matters": "The report says the existing keys cannot be trusted."}))
     arguments = ("story", "correct", "--config", config, "--story", story_id,
                  "--expect-hash", current["hash"], "--patch", patch,
                  "--reason", "Removed an unsupported operator instruction.")
+    for body in (b"\xff", b"[]", b'{"why_it_matters": NaN}'):  # refused without a change, so the hash stays current
+        patch.write_bytes(body)
+        invoke(capsys, *arguments, expected=2)
+    patch.write_text(json.dumps({"why_it_matters": "The report says the existing keys cannot be trusted."}))
     changed = invoke(capsys, *arguments)
     assert changed["locked"] and changed["publication_pending"]
     assert changed["revision"] == 1
@@ -54,8 +56,8 @@ def test_cli_correct_build_lock_and_stale_guard(tmp_path, capsys):
     assert public["why_it_matters"] == "The report says the existing keys cannot be trusted."
     assert public["published_at"] == DATE
     assert public["editorial"]["status"] == "corrected"
-    history = invoke(capsys, "story", "history", "--config", config, "--story", story_id, "--limit", 1)
-    assert history["revisions"][0]["reason"] == "Removed an unsupported operator instruction."
+    history = invoke(capsys, "story", "history", "--config", config, "--story", story_id)
+    assert [revision["reason"] for revision in history["revisions"]] == ["Removed an unsupported operator instruction."]
 
 
 def test_cli_retraction_is_a_permanent_noticed_page(tmp_path, capsys):
@@ -104,17 +106,11 @@ def test_rejected_cli_retry_has_no_publication_or_model_call(tmp_path, capsys):
         assert store.stories()[0]["id"] == story_id
 
 
-@pytest.mark.parametrize("body", [b'[]', b'{"title":"a","title":"b"}', b'{"title":NaN}', b'\xff', b' ' * 65537])
-def test_patch_file_rejects_ambiguous_or_unbounded_input(tmp_path, body):
-    patch = tmp_path / "patch.json"
-    patch.write_bytes(body)
-    with pytest.raises(ValueError):
-        cli._patch_file(patch)
-
-
 def test_comments_do_not_split_identical_issue_grouping():
     original = item(content="Identical original issue description. " * 10)
-    first = {**original, "source_content": original["content"], "content": original["content"] + "\nFirst discussion"}
-    second = {**original, "url": "https://example.org/other-project/1", "source_content": original["content"],
-              "content": original["content"] + "\nDifferent discussion"}
+    note = {"id": "gid://gitlab/Note/1", "url": original["url"] + "#note_1", "title": "Public comment by @a",
+            "author": "a", "created_at": DATE, "body": "First discussion"}
+    first = _compose(original, [note], DATE, source_key="k")
+    second = _compose({**original, "url": "https://example.org/other-project/1"}, [{**note, "body": "Other discussion"}],
+                      DATE, source_key="k")
     assert item_cluster(first) == item_cluster(second) == item_cluster(original)

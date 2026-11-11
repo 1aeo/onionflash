@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .util import after, backoff_seconds, digest, item_cluster, item_identity
 from . import candidate, editorial, render
+from .comments import analysis_context
 from .candidate import ReviewRequired, StaleCandidate
 
 
@@ -101,13 +102,49 @@ class Store:
                 published_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS comment_cache (
+                item_id TEXT PRIMARY KEY, source_key TEXT NOT NULL, checked_at TEXT NOT NULL,
+                next_fetch_at TEXT NOT NULL, failures INTEGER NOT NULL DEFAULT 0, error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS comment_cache_checked ON comment_cache(checked_at);
+            CREATE TABLE IF NOT EXISTS comment_sources (
+                source_id TEXT PRIMARY KEY, source_key TEXT NOT NULL, failures INTEGER NOT NULL DEFAULT 0,
+                next_fetch_at TEXT, error TEXT, rotation_cursor TEXT NOT NULL DEFAULT '',
+                recent_first INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS comment_history_rotation ON items(source_id,id) WHERE story_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS comment_recent_pending ON items(source_id,priority_score DESC,last_seen DESC,id) WHERE status='pending';
+            CREATE TABLE IF NOT EXISTS review_jobs (
+                item_id TEXT PRIMARY KEY, writer_key TEXT NOT NULL,
+                policy_hash TEXT NOT NULL, stage TEXT NOT NULL,
+                draft_json TEXT, envelope_json TEXT, record_json TEXT NOT NULL,
+                approval_key TEXT, prepared_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS review_approvals (
+                key TEXT PRIMARY KEY, candidate_hash TEXT NOT NULL,
+                source_hash TEXT NOT NULL, policy_hash TEXT NOT NULL,
+                binding_hash TEXT NOT NULL, result_json TEXT NOT NULL,
+                review_record_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                last_used_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS review_approvals_used ON review_approvals(last_used_at,key);
+            CREATE TABLE IF NOT EXISTS rejection_actions (
+                action_id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT NOT NULL,
+                content_hash TEXT NOT NULL, action TEXT NOT NULL CHECK(action IN ('retry','dismiss')),
+                reason TEXT NOT NULL, created_at TEXT NOT NULL,
+                before_status TEXT NOT NULL, before_attempts INTEGER NOT NULL,
+                before_rejections INTEGER NOT NULL, before_error TEXT, before_next_attempt_at TEXT,
+                -- No longer written; earlier releases still read and write them after a code rollback.
+                superseded_analysis_key TEXT, superseded_analysis_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS rejection_actions_item ON rejection_actions(item_id,action_id);
             DROP TABLE IF EXISTS monitoring_observations;
             DROP TABLE IF EXISTS monitoring_counters;
             DROP TABLE IF EXISTS monitoring_groups;
         """)
         editorial.initialize(self.db)
         analysis_columns = {row[1] for row in self.db.execute("PRAGMA table_info(analyses)")}
-        for name, kind in (("source_payload", "TEXT"), ("source_item_id", "TEXT"), ("input_chars", "INTEGER"), ("review_record", "TEXT")):
+        for name, kind in (("source_payload", "TEXT"), ("source_item_id", "TEXT"), ("review_record", "TEXT")):
             if name not in analysis_columns:
                 self.db.execute(f"ALTER TABLE analyses ADD COLUMN {name} {kind}")
         self.db.execute("CREATE INDEX IF NOT EXISTS analyses_source_snapshot ON analyses(source_item_id,created_at DESC,cache_key DESC)")
@@ -204,20 +241,12 @@ class Store:
     def ingest(self, item: dict, observed: str) -> bool:
         item_id = digest(item_identity(item))[:24]
         item["id"] = item_id
-        content_hash = digest(
-            {
-                k: item.get(k)
-                for k in (
-                    "title",
-                    "content",
-                    "kind",
-                    "product",
-                    "labels",
-                    "authority",
-                    "upstream_state",
-                )
-            }
-        )
+        fields = {k: item.get(k) for k in ("title", "content", "kind", "product", "labels", "authority", "upstream_state")}
+        if item.get("public_comments"):
+            # Notes as the writer sees them, so a reaction that moves only a note's
+            # update time, or a verification time, never requeues an item.
+            fields["public_comments"] = analysis_context(item)[1]
+        content_hash = digest(fields)
         cluster = item_cluster(item)
         row = self.db.execute(
             "SELECT content_hash,payload FROM items WHERE id=?", (item_id,)
@@ -290,28 +319,23 @@ class Store:
         return self.db.execute("SELECT COUNT(*) FROM items WHERE status='rejected'").fetchone()[0]
 
     def record_analysis(self, row: dict, result: dict, cache_key: str, observed: str, *,
-                        input_chars: int | None = None, review_record: dict | None = None) -> str:
+                        review_record: dict | None = None) -> str:
         """Append immutable private evidence; the caller owns the transaction."""
         result_json = json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False)
         record_json = json.dumps(review_record, ensure_ascii=False, sort_keys=True, allow_nan=False) if review_record is not None else None
-        values = (result_json, row["payload"], row["id"], input_chars, record_json)
-        previous = self.db.execute("SELECT result,source_payload,source_item_id,input_chars,review_record FROM analyses WHERE cache_key=?", (cache_key,)).fetchone()
+        values = (result_json, row["payload"], row["id"], record_json)
+        previous = self.db.execute("SELECT result,source_payload,source_item_id,review_record FROM analyses WHERE cache_key=?", (cache_key,)).fetchone()
         if previous is not None:
             if tuple(previous) == values:
                 return cache_key
             cache_key = digest(["analysis-audit", cache_key, values, observed])
         self.db.execute("""INSERT OR IGNORE INTO analyses
-            (cache_key,result,created_at,source_payload,source_item_id,input_chars,review_record)
-            VALUES(?,?,?,?,?,?,?)""", (cache_key, result_json, observed, row["payload"], row["id"], input_chars, record_json))
+            (cache_key,result,created_at,source_payload,source_item_id,review_record)
+            VALUES(?,?,?,?,?,?)""", (cache_key, result_json, observed, row["payload"], row["id"], record_json))
         return cache_key
 
-    def prepare_candidate(self, row: dict, result: dict, observed: str, *, input_chars: int | None = None,
-                          review_settings: dict | None = None) -> dict:
-        return candidate.prepare(self.db, row, result, observed, input_chars=input_chars, review_settings=review_settings)
-
-    def _clear_review_job(self, item_id: str) -> None:
-        if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='review_jobs' AND type='table'").fetchone():
-            self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (item_id,))
+    def prepare_candidate(self, row: dict, result: dict, observed: str) -> dict:
+        return candidate.prepare(self.db, row, result, observed)
 
     def commit_candidate(self, prepared: dict, approved_candidate: dict | None, cache_key: str, observed: str, *,
                          approval_key: str | None = None, policy_hash: str | None = None,
@@ -348,9 +372,9 @@ class Store:
                 normalized = render._prepare_story(approved_candidate, editorial=original.get("editorial"))
                 if normalized != approved_candidate:
                     raise ReviewRequired("The approved candidate must already be normalized")
-                if prepared["missing_sources"]:
+                if prepared["packet"]["missing_sources"]:
                     raise ReviewRequired("Required source material is unavailable")
-                if not approval_key or not policy_hash or not self.db.execute("SELECT 1 FROM sqlite_master WHERE name='review_approvals'").fetchone():
+                if not approval_key or not policy_hash:
                     raise ReviewRequired("Exact final candidate needs a recorded review decision")
                 receipt = self.db.execute("SELECT * FROM review_approvals WHERE key=?", (approval_key,)).fetchone()
                 if receipt is None or any(receipt[key] != expected for key, expected in (
@@ -372,26 +396,20 @@ class Store:
                     payload.update({key: approved_candidate[key] for key in candidate.SEMANTIC_FIELDS})
                     if existing is None:  # Date publication, not the first draft.
                         payload["added_at"] = observed
-            if review_record is None and self.db.execute("SELECT 1 FROM sqlite_master WHERE name='review_jobs'").fetchone():
-                job = self.db.execute("SELECT record_json FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
-                review_record = json.loads(job[0]) if job else None
-            analysis_key = self.record_analysis(row, result, cache_key, observed,
-                                                input_chars=prepared["input_chars"], review_record=review_record)
+            analysis_key = self.record_analysis(row, result, cache_key, observed, review_record=review_record)
             if payload is not None:
                 if payload.get("editorial_item") == row["id"]:
                     payload["editorial_analysis_key"] = analysis_key
-                changed = self.db.execute("""INSERT INTO stories(id,cluster_key,payload,published_at,updated_at)
+                self.db.execute("""INSERT INTO stories(id,cluster_key,payload,published_at,updated_at)
                     VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at""",
                     (story_id, cluster, json.dumps(payload, ensure_ascii=False, allow_nan=False), payload["published_at"], payload["updated_at"]))
-                if changed.rowcount != 1:
-                    raise StaleCandidate("Story became editorially protected before publication")
             elif locked and result["publish"]:
-                editorial.record_held(self.db, story_id, observed)
+                editorial.record_held(self.db, story_id)
             published = result["publish"] and decision == "approve"
             mapped_id = story_id if published else row.get("story_id")
             self.db.execute("UPDATE items SET status=?,story_id=?,next_attempt_at=NULL,last_error=NULL WHERE id=?",
                             ("published" if published else "ignored", mapped_id, row["id"]))
-            self._clear_review_job(row["id"])
+            self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
         return {"story_id": mapped_id, "status": "locked" if locked and published else "published" if published else "ignored"}
 
     def skip_candidate(self, prepared: dict, reviewed_candidate: dict, cache_key: str, observed: str, *,
@@ -400,13 +418,6 @@ class Store:
         return self.commit_candidate(prepared, reviewed_candidate, cache_key, observed,
                                      approval_key=approval_key, policy_hash=policy_hash,
                                      review_record=review_record, decision="skip")
-
-    def finish(self, row: dict, result: dict, cache_key: str, observed: str, *, input_chars: int | None = None) -> None:
-        """Only ignored drafts and locked operator decisions bypass review."""
-        prepared = self.prepare_candidate(row, result, observed, input_chars=input_chars)
-        if prepared["requires_review"]:
-            raise ReviewRequired("Automatic publication requires the final review gate")
-        self.commit_candidate(prepared, prepared["candidate"], cache_key, observed)
 
     def stories(self, limit: int = -1) -> list[dict]:
         """Stored stories, newest activity first (all of them by default)."""

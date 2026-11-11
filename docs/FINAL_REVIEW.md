@@ -19,7 +19,12 @@ The writer selects literal evidence excerpts from its exact input. This prevents
 quote-copying errors; it does not establish that the excerpts support every
 claim. The reviewer therefore receives the full bounded numbered source packet,
 including retained source material and verified public comments that the writer
-may not have quoted. Previous generated summaries are never factual evidence.
+may not have quoted. The source the story's prose came from gets at least the text
+its writer saw. The other sources share the remaining passages, then characters,
+smallest need first, and leave it the room they do not need. A source's comments
+come before its description, so a long description is cut first. Comment passages
+name their author, so comment text cannot pose as another comment. Previous
+generated summaries are never factual evidence.
 
 A separate, bounded coverage background contains the existing article for a
 known update and compact recent articles. It is used only to compare novelty.
@@ -104,10 +109,13 @@ inspect failures. See [operator controls](REJECTED_ANALYSES.md) and
 
 ## Configuration and evaluation
 
-Review model, timeouts and input/output bounds remain in `[review]` in the
-[example configuration](../config.example.toml). Requests also obey the shared
-run deadline. The coverage background is bounded separately; truncation is
-explicit and never proves the absence of older coverage.
+The reviewer uses the `[llm]` endpoint, fallbacks, credential environment,
+network policy and request timeout, so no additional service is needed.
+`review.model` selects a different model; empty uses `llm.model`. The packet
+bounds, the reply length and the single repair are fixed, so the model endpoint
+needs enough context for a full packet. Requests also obey the shared run
+deadline. The coverage background is bounded separately; truncation is explicit
+and never proves the absence of older coverage.
 
 The controlled evaluation does not collect, open the application database or
 publish. It exercises both review rounds, records their outputs privately, and

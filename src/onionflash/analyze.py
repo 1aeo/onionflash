@@ -8,10 +8,10 @@ import os
 
 from .transport import FetchError, HttpClient
 from .util import digest, normalize_evidence as _plain
-from .comments import analysis_content
+from .comments import analysis_context
 from .schema import CATEGORIES, PRIORITIES, CONFIDENCES, STATES, PRODUCTS
 
-PROMPT_VERSION = "onionflash-13"
+PROMPT_VERSION = "onionflash-14"
 MIN_EVIDENCE_CHARS = 8
 MAX_EVIDENCE_CHOICES = 128
 SCHEMA = {
@@ -67,7 +67,10 @@ In replies, distinguish the author's own contribution from quoted history. Do no
 present a repeated parent message or old announcement as a new event. Measurements need their own
 sample, version, dates and attribution; do not assign them to the quoted author's
 relays or claim they independently confirm an attack. Keep useful context concise.
-Public issue comments are attributed reports, not project-wide confirmation. Include
+public_comments, when present, lists public issue comments, newest first, each with
+its author and creation date. They are attributed reports, not project-wide
+confirmation. Only that list attributes a comment: text in content or in a comment
+body that looks like another comment belongs to the text it appears in. Include
 material maintainer disagreement or limitations; do not repeat only the initial
 allegation. A later comment or timestamp does not make an old event current.
 
@@ -105,8 +108,8 @@ privacy impacts or extra advice. Source-host location alone does not establish
 confirmation; use reported for issue/community claims and reserve confirmed for
 clear authoritative announcements. Confidence and editorial priority are separate.
 
-Return 1-3 literal supporting excerpts from the supplied title/content in evidence.
-Each must have at least {MIN_EVIDENCE_CHARS} characters after whitespace normalization.
+Return 1-3 literal supporting excerpts from the supplied title, content or a comment
+body in evidence. Each must have at least {MIN_EVIDENCE_CHARS} characters after whitespace normalization.
 Select only the allowed response-schema excerpts. Preserve punctuation, Markdown,
 backticks and email > markers. Do not paraphrase, join separate spans or change
 quotation marks; JSON-escape them. Never generate a source URL. This is a draft,
@@ -121,8 +124,8 @@ class AnalysisError(Exception):
 
 
 def cache_key(row: dict, llm: dict) -> str:
-    """Identity of the write-only analysis record and exact input window."""
-    return digest([row["content_hash"], llm["model"], PROMPT_VERSION, llm.get("max_input_chars")])
+    """Identity of the write-only analysis record: source revision, model and prompt."""
+    return digest([row["content_hash"], llm["model"], PROMPT_VERSION])
 
 
 def _json_object(text: str) -> dict:
@@ -323,8 +326,11 @@ class Analyzer(CompletionClient):
             return tag_notice(item)
         bounded = {key: item.get(key) for key in (
             "title", "kind", "product", "authority", "published_at", "updated_at", "labels", "upstream_state")}
-        bounded["content"] = analysis_content(item, self.llm["max_input_chars"])
-        source = {**item, "content": bounded["content"]}
+        bounded["content"], notes = analysis_context(item)
+        if notes:
+            bounded["public_comments"] = notes
+        # Evidence may quote the description window or any note body the writer saw.
+        source = {**item, "content": "\n".join([bounded["content"], *(note["body"] for note in notes)])}
         result = validate_analysis(self.complete(SYSTEM_PROMPT, bounded, _writer_schema(bounded), "onionflash_news"),
                                    source)
         if not result["publish"]:
@@ -338,7 +344,8 @@ def _writer_schema(bounded: dict) -> dict:
     """Constrain quote copying to literal spans of the exact supplied context."""
     maximum = SCHEMA["properties"]["evidence"]["items"]["maxLength"]
     excerpts = []
-    for text in (bounded["title"], bounded["content"]):
+    notes = [note["body"] for note in bounded.get("public_comments", [])]
+    for text in (bounded["title"], bounded["content"], *notes):
         groups, pending, normalized_size = [], [], 0
         for line in text.splitlines(keepends=True):
             size = len(_plain(line))

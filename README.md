@@ -6,8 +6,9 @@ builds a static website, RSS feeds, and JSON Feed. It is an independent 1AEO
 project, not an official Tor Project publication.
 
 One Python application, one TOML configuration file, and SQLite. The public site
-uses HTML and CSS with no browser JavaScript. It does not call an LLM or need a
-database server. Deployment and scheduling live in
+uses HTML and CSS with no browser JavaScript or search service, and its Content
+Security Policy blocks all scripts. It does not call an LLM or need a database
+server. Deployment and scheduling live in
 [`1aeo/onionflash-deploy`](https://github.com/1aeo/onionflash-deploy).
 
 ## Quick start
@@ -39,23 +40,11 @@ python -m http.server 8080 --directory build/public
 The generated website is in `build/public/`. Open `http://localhost:8080/` after
 setting that address as `site.base_url`. Change it to the real deployment URL
 before publishing. `feed.xml` is the main RSS feed, `feed.json` is JSON Feed, and
-`tags/security.xml` is one of the topic-specific RSS feeds.
+`tags/security.xml` is one of the topic-specific RSS feeds. Topic links open
+static pages such as `topics/security/` that cover the whole history, including
+secondary topic tags.
 
-Topic links open static pages such as `topics/security/`, covering matching
-stories throughout the complete history, including secondary topic tags. Topic
-pages paginate like the homepage. The mobile menu, source-availability panel and
-editorial-history disclosures use native HTML. Essential navigation uses text,
-so it remains understandable when images or custom fonts are unavailable.
-
-There is no search box or search service. Use the browser's **Find in Page** for
-the currently loaded page. Content Security Policy blocks browser scripts with
-`script-src 'none'`. Cloudflare's routing Worker is server-side JavaScript and
-does not run in visitors' browsers.
-XML feeds alone allow the browser XML viewer's inline styling and `data:` icons,
-and keep the generic XML type so browsers show them instead of downloading them.
-Scripts remain blocked, and HTML pages retain their stricter stylesheet policy.
-
-The first run collects up to the configured lookback window and analyzes a
+The first run collects up to the fixed lookback window and analyzes a
 bounded number of items. More items remain queued for subsequent runs. An empty
 first page can mean the LLM is not configured or the queue has not yielded a
 publishable story yet; `onionflash status --config config.toml` explains queue
@@ -84,17 +73,17 @@ The API key is read only from the `ONIONFLASH_LLM_API_KEY` environment variable.
 
 | Section | Settings |
 | --- | --- |
-| `site` | Title, description, canonical URL, repository link, page/feed sizes |
-| `storage` | Private SQLite path, owned public output directory and bounded article-render batch size |
-| `comments` | Optional anonymous GitLab discussion enrichment, polling/backoff, per-run/page/text limits and bounded watch-cache size |
+| `site` | Title, description, canonical URL, repository link, page size |
+| `storage` | Private SQLite path and owned public output directory |
+| `comments` | Optional anonymous GitLab discussion enrichment (`enabled`) |
 | `llm` | Base URL and fallback URLs, model, private-network allowlist (`allowed_networks`, `allow_http`), request timeout, items per run, chat-template flag |
-| `review` | Reviewer model override, request/token/source bounds, one-repair limit and approval-cache size |
+| `review` | Reviewer model override |
 | `sources` | Stream ID, display name, public website URL, kind, collection URL, fallback URLs, product, authority, optional interval/page/item overrides |
 
-Collection, HTTP and writer model limits (lookback, budgets, retries, response sizes,
-backoff) are fixed defaults in `onionflash/config.py`; a file that still sets them
-loads, with each one logged as ignored. The separate final-review settings are
-operator-configurable in `[review]`.
+Collection, HTTP, model, comment, final-review and publication limits (lookback,
+budgets, retries, response sizes, backoff, source-packet bounds, feed length,
+render batch) are fixed in code; a file that still sets one loads, with each one
+logged as ignored.
 
 Public sources must use HTTPS. Private inference endpoints require explicit
 `llm.allowed_networks` CIDRs and `llm.allow_http = true` when using HTTP. Prefer
@@ -133,34 +122,21 @@ The Metrics Timeline source uses `kind = "metrics_timeline"` with the maintained
 repository's GitLab file JSON API URL and its repository root as `website_url`.
 It reads the Markdown table without running upstream scripts, validates the
 snapshot and uses conditional HTTP requests. The stale Metrics Atom feed is no
-longer configured, including as a fallback.
+longer configured, including as a fallback. Timeline entries keep their event
+dates; repository revisions do not turn old open-ended events into new incidents.
+Citations point to the exact commit and table line. Ambiguous recent rows are
+skipped with a source warning. See
+[timeline coverage and identity rules](docs/SOURCE_COVERAGE.md#tor-metrics-timeline).
 
 ### Public GitLab comments
 
-Set `[comments].enabled = true` to enrich relevant GitLab issues with public
-discussion. Each participating `gitlab_issue` source needs its exact
-`gitlab_project`, such as `tpo/core/tor`; the example already identifies the Tor
-projects. `comments_graphql_url` optionally overrides the same-origin GraphQL
-endpoint, and `comments_enabled = false` excludes an individual source.
-
-No GitLab account, token or browser session is used. The collector verifies the
-project identity and public visibility, the issue's non-confidential status,
-and each note's non-internal/non-system status. Unknown visibility never admits
-new comment content. Comment authors and dates stay explicit. Final review receives
-the bounded verified discussion independently of the quotes selected by the writer,
-so an uncited corrective comment is still available to the reviewer.
-
-Comments default to a 30-minute per-issue interval. Per-run limits rotate across
-projects and previously published issues, so this is bounded follow-up coverage,
-not an exhaustive discussion mirror. The phase shares collection time and keeps
-the configured analysis reserve; primary sources retain at least half the
-collection window. `onionflash status` reports comment scheduling and failures.
-See [source coverage](docs/SOURCE_COVERAGE.md#anonymous-public-gitlab-discussion-updates).
-
-Timeline entries keep their event dates; repository revisions do not turn old
-open-ended events into new incidents. Citations point to the exact commit and
-table line. Ambiguous recent rows are skipped with a source warning. See
-[timeline coverage and identity rules](docs/SOURCE_COVERAGE.md#tor-metrics-timeline).
+Set `[comments].enabled = true` to add public discussion to GitLab issues. Each
+participating `gitlab_issue` source needs its exact `gitlab_project`, such as
+`tpo/core/tor`; the example already identifies the Tor projects. Leave out
+`gitlab_project` to keep a source out. No GitLab account, token or browser
+session is used. This is bounded follow-up coverage, not an exhaustive discussion
+mirror; `onionflash status` reports comment scheduling and failures. See
+[source coverage](docs/SOURCE_COVERAGE.md#anonymous-public-gitlab-discussion-updates).
 
 For older source files, see [retired source compatibility](docs/SOURCE_COVERAGE.md#retired-monitoring-sources).
 
@@ -176,41 +152,6 @@ onionflash story show --config config.toml --story STORY_ID
 onionflash rejected list --config config.toml
 ```
 
-### Correct or retract a story
-
-Inspect the story first and copy its current `hash`. Put only the public fields
-to change in a small JSON file, for example:
-
-```json
-{"why_it_matters":"The report says the existing keys cannot be trusted and requests removal of the current entry from the software."}
-```
-
-```sh
-onionflash story correct --config config.toml --story STORY_ID \
-  --expect-hash CURRENT_HASH --patch correction.json \
-  --reason "The previous version included an unsupported operator instruction."
-onionflash build --config config.toml
-```
-
-The correction is locked against later automation. The reason is public; previous
-published text and the operator action are retained in revision history. A stale
-hash fails without changing anything. Retraction keeps the same article URL with
-a clear notice, and its pages and feeds publish none of the story's earlier text
-until it is restored; copies made before the retraction, including an enabled
-permanent archive, are not withdrawn. Explicit restore and unlock commands are available; a retraction
-must be restored before automation can resume. The next scheduled deployment
-publishes pending changes, or use the deployer's `publish` command after building.
-See [editorial commands and recovery](docs/EDITORIAL.md).
-
-### Review a rejected analysis
-
-`onionflash rejected list` shows terminally rejected items with their reason,
-attempt count and current content hash. `rejected show --item ITEM_ID` includes
-the saved source. Explicit `retry` and `dismiss` actions require that hash and a
-private operator reason; neither action invokes the model or publishes anything.
-A dismissed item stays dismissed while its content is unchanged. Substantive new
-source content can queue it again. See [rejected-analysis commands](docs/REJECTED_ANALYSES.md).
-
 Each command returns a compact JSON result. Invalid configuration or a build
 failure returns nonzero. A partial source outage or queued analysis is reported
 in the result and status without discarding the previous site. Runs and builds
@@ -225,6 +166,14 @@ installation. Changed files are staged beside the public directory, on the same
 filesystem, and replaced atomically. An unfinished build is marked so the
 publisher keeps the preceding release. Publishers use the same database lock
 while taking their upload snapshot.
+
+### Editorial controls
+
+`onionflash story show|history|correct|retract|restore|unlock` corrects or
+retracts a published story; `onionflash rejected list|show|retry|dismiss`
+handles failed analyses and, with `retry --reconsider-ignored`, an ignored item. See
+[editorial commands and recovery](docs/EDITORIAL.md) and
+[rejected-analysis commands](docs/REJECTED_ANALYSES.md).
 
 ## Reliability and editorial behavior
 
@@ -291,29 +240,12 @@ outages longer than those windows can leave gaps. GitLab pagination and source
 health make incomplete scans visible, but upstream data can change while a scan
 is in progress. Treat this as a news aid, not an incident-detection guarantee.
 
-Published stories keep their pages indefinitely. The homepage covers the entire
-history across numbered pages; `site.page_size` controls stories per page, not
-retention. `site.feed_size = 0` includes the complete history in RSS, JSON Feed
-and topic feeds. A positive feed size remains an optional reader-facing limit.
-The retired `storage.max_stories` setting is accepted and ignored.
-
-The incremental builder renders only changed articles, in batches controlled by
-`storage.render_batch_size` (250 by default). Each accepted story has HTML and a
-public `story.json`. The publication catalog retains compact last-good article
-JSON so a damaged source record or database-only restore does not erase a
-previously published page. A rejected source revision remains quarantined.
-
-Full-history feeds are streamed from the catalog in bounded batches. Indexes and
-feeds update when accepted content changes; normal polling does not rewrite old
-article files. Upgrades that change the publishing code, edits to `site.title`,
-`site.description`, `site.base_url` or `site.repository_url`, a missing output
-directory and `build --force` queue resumable rebuilds of every article.
-If `articles_pending` is nonzero, subsequent builds continue the work.
-
-Keep the SQLite database, raw source content, analysis evidence and private
-publication metadata outside the webroot. The deployment repository can publish
-durable objects through DigitalOcean Spaces while preserving the existing URLs.
-See [permanent history and recovery](docs/PERMANENT_HISTORY.md).
+Published stories never expire: numbered homepage and topic pages
+(`site.page_size` stories each) cover the whole history, while RSS, JSON Feed and
+topic feeds carry the most recently updated stories. Builds render only changed
+articles, in bounded batches. Keep the SQLite database, raw source content,
+analysis evidence and private publication metadata outside the webroot. See
+[permanent history and recovery](docs/PERMANENT_HISTORY.md).
 
 LLM availability and output quality depend on your model. The prompt, evidence
 checks and final review reduce unsupported statements but are **not proof of
@@ -333,6 +265,5 @@ python -m pytest -q
 Tests cover unsafe URLs and redirects, DNS rebinding, gzip expansion, timeouts,
 retry caps, hostile XML, malformed responses, pagination recovery, durable queues,
 deduplication/lifecycle changes, model validation, HTML/RSS escaping, native HTML
-navigation, full-history topic pages and safe script retirement. Browser rendering
-has no Node or JavaScript test dependency; the separate deployment repository
-tests its server-side Worker with Node. Apache 2.0; see [`LICENSE`](LICENSE).
+navigation, full-history topic pages and safe script retirement. Apache 2.0; see
+[`LICENSE`](LICENSE).

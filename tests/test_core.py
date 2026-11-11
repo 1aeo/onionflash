@@ -1,6 +1,7 @@
 from approval_helpers import ApprovingReviewer, finish_reviewed
 import copy
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,19 @@ def analysis(**kw):
         "evidence": ["The operator reported a plausible compromise"],
         **kw,
     }
+
+
+DAMAGE = ["invalid-json", "non-object", "invalid-utf8", "deep", "surrogate", "bom", "utf-16"]
+
+
+def damaged(document, kind):
+    """Bytes the app never saves for a JSON document: broken JSON, a non-object, bytes that are not
+    UTF-8, nesting past the parser's limit, or the document with a lone surrogate added, a BOM
+    prepended, or encoded as UTF-16."""
+    if kind == "surrogate":
+        return json.dumps({**json.loads(document), "\ud800": ""}, ensure_ascii=False).encode("utf-8", "surrogatepass")
+    return {"invalid-json": b"{", "non-object": b"[1]", "invalid-utf8": b'{"\xff"', "deep": b"[" * 100000,
+            "bom": b"\xef\xbb\xbf" + document.encode(), "utf-16": document.encode("utf-16")}[kind]
 
 
 def config(tmp_path):
@@ -804,15 +818,15 @@ def test_a_longer_llm_timeout_extends_the_fixed_attempt_total():
 def test_only_operator_settings_are_configurable_and_the_rest_are_ignored(tmp_path, caplog):
     path = tmp_path / "config.toml"
     path.write_text('[collection]\nlookback_days = 3\n[http]\nretry_attempts = 7\n'
-                    '[llm]\nmax_items_per_run = 20\nmax_input_chars = 5000\n'
+                    '[llm]\nmax_items_per_run = 20\nmax_input_chars = 5000\n[comments]\nmax_pages = 2\ninterval_seconds = 900\n'
                     '[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
     with caplog.at_level("WARNING", logger="onionflash.config"):
         config = load_config(path)
     assert config["llm"]["max_items_per_run"] == 20  # an operator setting
     assert config["collection"]["lookback_days"] == DEFAULTS["collection"]["lookback_days"]
     assert config["http"]["retry_attempts"] == DEFAULTS["http"]["retry_attempts"]
-    assert config["llm"]["max_input_chars"] == DEFAULTS["llm"]["max_input_chars"]
-    for key in ("collection.lookback_days", "http.retry_attempts", "llm.max_input_chars"):
+    assert "max_input_chars" not in config["llm"] and config["comments"] == {"enabled": False}
+    for key in ("collection.lookback_days", "http.retry_attempts", "llm.max_input_chars", "comments.max_pages", "comments.interval_seconds"):
         assert f"Ignoring setting {key}" in caplog.text
     path.write_text('[http]\nnot_a_setting = 1\n[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
     with pytest.raises(ValueError, match="Unknown http settings"):
@@ -838,13 +852,15 @@ def test_base_url_is_normalized_to_a_clean_directory(tmp_path, base):
 def test_retired_settings_are_accepted_and_ignored(tmp_path, caplog):
     path = tmp_path / "config.toml"
     path.write_text(
-        '[storage]\nmax_stories = 1000\n[http]\nrequests_per_minute = 30\n'
+        '[site]\nfeed_size = 0\n[storage]\nmax_stories = 1000\nrender_batch_size = 7\n[http]\nrequests_per_minute = 30\n'
         '[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n'
     )
     with caplog.at_level("WARNING", logger="onionflash.config"):
         loaded = load_config(path)
     assert "max_stories" not in loaded["storage"] and "requests_per_minute" not in loaded["http"]
-    assert "Ignoring setting http.requests_per_minute" in caplog.text
+    assert "feed_size" not in loaded["site"] and loaded["storage"]["render_batch_size"] == DEFAULTS["storage"]["render_batch_size"]
+    for key in ("http.requests_per_minute", "site.feed_size", "storage.render_batch_size"):
+        assert f"Ignoring setting {key}" in caplog.text
 
 
 def test_busy_lock_status_is_read_only_and_a_skipped_build_is_not_success(tmp_path, capsys):
@@ -862,6 +878,13 @@ def test_busy_lock_status_is_read_only_and_a_skipped_build_is_not_success(tmp_pa
         assert _json.loads(capsys.readouterr().out)["sources"][0]["last_success"] is None
     with Store(tmp_path / "db.sqlite3") as store:
         assert store.db.execute("SELECT COUNT(*) FROM source_state").fetchone()[0] == 0
+    writer = sqlite3.connect(tmp_path / "db.sqlite3", isolation_level=None)
+    writer.execute("BEGIN IMMEDIATE")  # as a run or build holds the write lock, inspection still opens
+    try:
+        assert main(["status", "--config", str(cfg_path)]) == 0
+        assert main(["rejected", "list", "--config", str(cfg_path)]) == 0
+    finally:
+        writer.close()
 
 
 def test_moved_installation_keeps_building(tmp_path):

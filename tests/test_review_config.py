@@ -2,6 +2,7 @@ import copy
 
 import pytest
 
+from onionflash import review
 from onionflash.config import DEFAULTS, load_config
 from onionflash.review import Reviewer
 
@@ -12,24 +13,21 @@ def configured(tmp_path, extra):
     return load_config(path)
 
 
-def test_review_settings_remain_configurable_after_writer_limits_were_retired(tmp_path):
-    cfg = configured(tmp_path, '[review]\nmodel="critic-model"\ntimeout_seconds=45\ntotal_timeout_seconds=30\nmax_output_tokens=1800\nmax_source_chars=12000\nmax_repairs=0\n')
-    assert cfg["review"]["model"] == "critic-model"
-    assert cfg["review"]["max_repairs"] == 0
+def test_review_keeps_only_its_model_and_older_review_settings_still_load(tmp_path, caplog):
+    # Older files may set limits that held every story or cut every reply short; they are ignored now.
+    with caplog.at_level("WARNING", logger="onionflash.config"):
+        cfg = configured(tmp_path, '[llm]\ntimeout_seconds=45\n[review]\nmodel="critic-model"\ntimeout_seconds=300\n'
+                                   'total_timeout_seconds=30\nmax_output_tokens=128\nmax_passages=1\nmax_repairs=0\n')
+    assert cfg["review"] == {"model": "critic-model"}
+    assert "Ignoring setting review.max_passages" in caplog.text and "Ignoring setting review.max_repairs" in caplog.text
     with Reviewer(cfg) as reviewer:
-        assert reviewer.llm["model"] == "critic-model"
-        assert reviewer.http_settings["timeout_seconds"] == 45
-        assert reviewer.http_settings["total_timeout_seconds"] == 30
-        assert reviewer.llm["max_output_tokens"] == 1800
+        assert reviewer.llm["model"] == "critic-model" and reviewer.llm["max_output_tokens"] == review.OUTPUT_TOKENS
+        assert (reviewer.http_settings["timeout_seconds"], reviewer.http_settings["total_timeout_seconds"]) == (45, 180)
 
 
-@pytest.mark.parametrize("setting", ["max_repairs=2", "max_repairs=-1", "max_cache_entries=true",
-                                    "max_sources=0", "max_source_chars=999", "timeout_seconds=nan",
-                                    "total_timeout_seconds=2\nconnect_timeout_seconds=10",
-                                    "max_source_chars=1000\npassage_chars=1800", "model=[]"])
-def test_review_bounds_fail_closed(tmp_path, setting):
-    with pytest.raises(ValueError):
-        configured(tmp_path, '[review]\n' + setting + '\n')
+def test_review_model_must_be_a_short_identifier(tmp_path):
+    with pytest.raises(ValueError, match="review.model"):
+        configured(tmp_path, '[review]\nmodel=[]\n')
 
 
 def test_empty_review_model_inherits_configured_writer():
