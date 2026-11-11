@@ -54,11 +54,6 @@ def test_cli_correct_build_lock_and_stale_guard(tmp_path, capsys):
     assert public["why_it_matters"] == "The report says the existing keys cannot be trusted."
     assert public["published_at"] == DATE
     assert public["editorial"]["status"] == "corrected"
-    with Store(cfg["storage"]["database"]) as store:
-        store.ingest(item(content="The operator updated the report with a new detail."), "2026-11-09T12:00:00Z")
-        row = store.pending(1, "2026-11-09T12:00:00Z")[0]
-        finish_reviewed(store, row, analysis(why_it_matters="Automation tried to replace the correction."), "later", "2026-11-09T12:00:00Z")
-        assert store.stories()[0]["why_it_matters"] == public["why_it_matters"]
     history = invoke(capsys, "story", "history", "--config", config, "--story", story_id, "--limit", 1)
     assert history["revisions"][0]["reason"] == "Removed an unsupported operator instruction."
 
@@ -105,7 +100,7 @@ def test_rejected_cli_retry_has_no_publication_or_model_call(tmp_path, capsys):
     assert retried["status"] == "pending"
     with Store(cfg["storage"]["database"]) as store:
         assert store.pending_count() == 1
-        assert store.story_count() == 1
+        assert len(store.stories()) == 1
         assert store.stories()[0]["id"] == story_id
 
 

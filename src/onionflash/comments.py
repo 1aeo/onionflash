@@ -60,13 +60,9 @@ def _initialize(store):
           next_fetch_at TEXT, error TEXT, rotation_cursor TEXT NOT NULL DEFAULT '',
           recent_first INTEGER NOT NULL DEFAULT 0
         );
-        DROP INDEX IF EXISTS comment_candidates;
         CREATE INDEX IF NOT EXISTS comment_history_rotation ON items(source_id,id) WHERE story_id IS NOT NULL;
         CREATE INDEX IF NOT EXISTS comment_recent_pending ON items(source_id,priority_score DESC,last_seen DESC,id) WHERE status='pending';
     """)
-    if "recent_first" not in {row[1] for row in store.db.execute("PRAGMA table_info(comment_sources)")}:
-        store.db.execute("ALTER TABLE comment_sources ADD COLUMN recent_first INTEGER NOT NULL DEFAULT 0")
-        store.db.commit()
 
 
 def _identity(source):

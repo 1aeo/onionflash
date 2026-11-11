@@ -48,10 +48,9 @@ editorial-history disclosures use native HTML. Essential navigation uses text,
 so it remains understandable when images or custom fonts are unavailable.
 
 There is no search box or search service. Use the browser's **Find in Page** for
-the currently loaded page. The publisher generates the copyright year and queues
-a bounded rebuild when the year changes. Content Security Policy blocks browser
-scripts with `script-src 'none'`. Cloudflare's routing Worker is server-side
-JavaScript and does not run in visitors' browsers.
+the currently loaded page. Content Security Policy blocks browser scripts with
+`script-src 'none'`. Cloudflare's routing Worker is server-side JavaScript and
+does not run in visitors' browsers.
 XML feeds alone allow the browser XML viewer's inline styling and `data:` icons,
 and keep the generic XML type so browsers show them instead of downloading them.
 Scripts remain blocked, and HTML pages retain their stricter stylesheet policy.
@@ -334,7 +333,9 @@ previously published page. A rejected source revision remains quarantined.
 
 Full-history feeds are streamed from the catalog in bounded batches. Indexes and
 feeds update when accepted content changes; normal polling does not rewrite old
-article files. Template/year changes and `build --force` queue resumable rebuilds.
+article files. Upgrades that change the publishing code, edits to `site.title`,
+`site.description`, `site.base_url` or `site.repository_url`, a missing output
+directory and `build --force` queue resumable rebuilds of every article.
 If `articles_pending` is nonzero, subsequent builds continue the work.
 
 Keep the SQLite database, raw source content, analysis evidence and private

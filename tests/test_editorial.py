@@ -103,7 +103,7 @@ def test_late_automation_is_cached_and_grouped_but_cannot_overwrite_locked_story
     assert store.db.execute("SELECT COUNT(*) FROM analyses WHERE cache_key='late'").fetchone()[0] == 1
     mapped = store.db.execute("SELECT status,story_id FROM items WHERE id=?", (row["id"],)).fetchone()
     assert tuple(mapped) == ("published", story_id)
-    assert store.story_count() == 1
+    assert len(store.stories()) == 1
 
 
 def test_sql_guard_covers_update_delete_insert_replace_and_raw_connections(seeded):
@@ -125,7 +125,7 @@ def test_sql_guard_covers_update_delete_insert_replace_and_raw_connections(seede
         assert raw.execute("SELECT COUNT(*) FROM stories").fetchone()[0] == 1
         with pytest.raises(sqlite3.OperationalError, match="onionflash_editorial_permit"):
             raw.execute("UPDATE stories SET payload='bad' WHERE id=?", (story_id,))
-    assert store.story_count() == 1
+    assert len(store.stories()) == 1
 
 
 def test_failed_operator_write_rolls_back_revision_and_cannot_leave_permit_open(seeded):
@@ -312,7 +312,7 @@ def test_reconstructed_monitor_group_reuses_locked_story(seeded, monkeypatch):
     store.ingest_alerts(source, notices, EDIT)
     assert store.db.execute("SELECT story_id FROM monitoring_groups").fetchone()[0] == story_id
     assert editorial.show(store.db, story_id)["hash"] == receipt["hash"]
-    assert store.story_count() == 2
+    assert len(store.stories()) == 2
 
 
 def note_item(body="The report’s old keys remain untrusted.", **changes):

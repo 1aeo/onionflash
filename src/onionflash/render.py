@@ -9,12 +9,8 @@ from __future__ import annotations
 import email.utils
 import html
 import json
-import logging
 import re
-import shutil
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
-from pathlib import Path
 from urllib.parse import urlsplit
 from .schema import CATEGORY_LABELS as CATEGORIES, PRIORITIES, PRODUCTS, CONFIDENCES, STATES
 from .util import canonical_url, parse_utc as _date, format_utc as _iso
@@ -249,9 +245,8 @@ def _navigation(base: str) -> str:
 
 
 def _shell(site: dict, base: str, title: str, description: str, body: str, canonical: str) -> str:
-    name = _text(site.get("title", "Onion Flash"), 80)
-    repository = _public_url(site.get("repository_url", "https://github.com/1aeo/onionflash"))
-    year = datetime.now(timezone.utc).year
+    name = _text(site["title"], 80)
+    repository = _public_url(site["repository_url"])
     repository_link = f'<a href="{_escape(repository)}">Source code ↗</a>' if repository else ""
     return f'''<!doctype html>
 <html lang="en"><head>
@@ -272,18 +267,18 @@ def _shell(site: dict, base: str, title: str, description: str, body: str, canon
 </div></header>
 {body}
 <footer class="footer"><div><a class="footer-name" href="{_escape(base)}">{_escape(name)}</a><p>AI-assisted summaries. Original sources linked. Independently published; not affiliated with the Tor Project.</p></div>
-<div class="footer-links">{repository_link}<a href="{_escape(base)}feed.xml">RSS feed</a><span>© {year} 1AEO. Code licensed Apache 2.0.</span></div></footer>
+<div class="footer-links">{repository_link}<a href="{_escape(base)}feed.xml">RSS feed</a><span>© 1AEO. Code licensed Apache 2.0.</span></div></footer>
 </body></html>'''
 
 
 def _rss_channel(site: dict, base: str, path: str, latest: str | None, category: str | None = None) -> ET.Element:
     channel = ET.Element("channel")
-    title = _text(site.get("title", "Onion Flash"), 80)
+    title = _text(site["title"], 80)
     if category:
         title += " · " + CATEGORIES[category]
     for key, value in {
         "title": title, "link": base,
-        "description": _text(site.get("description", "Important Tor news, distilled."), 400),
+        "description": _text(site["description"], 400),
         "language": "en",
     }.items():
         ET.SubElement(channel, key).text = value
@@ -315,19 +310,6 @@ def rss_header(site: dict, base: str, path: str, latest: str | None, category: s
     return b'<?xml version="1.0" encoding="utf-8"?>\n<rss xmlns:atom="http://www.w3.org/2005/Atom" version="2.0"><channel>' + b"".join(ET.tostring(child, encoding="utf-8") for child in _rss_channel(site, base, path, latest, category))
 
 
-def rss_chunks(site: dict, base: str, stories, path: str, latest: str | None, category: str | None = None):
-    # One story at a time: archive length does not set memory use.
-    yield rss_header(site, base, path, latest, category)
-    for story in stories:
-        yield ET.tostring(_rss_item(story, base), encoding="utf-8")
-    yield b"</channel></rss>"
-
-
-def _rss(site: dict, base: str, stories: list[dict], path: str, category: str | None = None) -> bytes:
-    latest = max((story["updated_at"] for story in stories), default=None)
-    return b"".join(rss_chunks(site, base, stories, path, latest, category))
-
-
 def _json_feed_item(story: dict, base: str) -> dict:
     content = story["summary"]
     notice = story.get("editorial")
@@ -340,18 +322,8 @@ def _json_feed_item(story: dict, base: str) -> dict:
 
 
 def json_feed_header(site: dict, base: str) -> bytes:
-    metadata = {"version": "https://jsonfeed.org/version/1.1", "title": _text(site.get("title", "Onion Flash"), 80), "home_page_url": base, "feed_url": base + "feed.json", "description": _text(site.get("description", "Important Tor news, distilled."), 400), "language": "en"}
+    metadata = {"version": "https://jsonfeed.org/version/1.1", "title": _text(site["title"], 80), "home_page_url": base, "feed_url": base + "feed.json", "description": _text(site["description"], 400), "language": "en"}
     return (json.dumps(metadata, ensure_ascii=False)[:-1] + ', "items": [').encode("utf-8")
-
-
-def json_feed_chunks(site: dict, base: str, stories):
-    yield json_feed_header(site, base)
-    separator = b""
-    for story in stories:
-        yield separator
-        yield json.dumps(_json_feed_item(story, base), ensure_ascii=False).encode("utf-8")
-        separator = b",\n"
-    yield b"]}\n"
 
 
 def _page_url(base: str, page: int, topic: str | None = None) -> str:
@@ -386,7 +358,7 @@ def index_html(site: dict, base: str, homepage: list[dict], source_health: list[
         empty_heading = "No stories in this topic yet." if topic else "The feed is getting started."
         cards = f'<section class="empty-state"><h2>{empty_heading}</h2><p>Stories appear here after collection and source checks. Subscribe to the RSS feed for new stories.</p></section>'
     body = f'''<main id="main" class="page">
-<section class="intro"><div><p class="eyebrow">Security. Releases. The network.</p><h1>{heading}</h1><p class="intro-copy">The developments that matter, with the sources to understand them.</p></div><div class="edition-note"><span class="live-dot" aria-hidden="true"></span>{latest_label}</div></section>
+<section class="intro"><div><p class="eyebrow">Security. Releases. The network.</p><h1>{heading}</h1><p class="intro-copy">The developments that matter, with the sources to understand them.</p></div>{f'<div class="edition-note"><span class="live-dot" aria-hidden="true"></span>{latest_label}</div>' if page == 1 else ''}</section>
 <div class="news-layout"><section class="news-column" aria-label="Latest news">
 <nav class="topics" aria-label="News topics">{topics}</nav>
 <div class="section-heading"><h2>Latest dispatches</h2><span>{len(homepage)} {'story' if len(homepage) == 1 else 'stories'}</span></div>
@@ -399,11 +371,11 @@ def index_html(site: dict, base: str, homepage: list[dict], source_health: list[
 {_health_details(source_health)}
 <p class="sidebar-footnote">An independent project by <a href="https://1aeo.com/">1AEO</a>.</p>
 </aside></div></main>'''
-    title = _text(site.get("title", "Onion Flash"), 80)
+    title = _text(site["title"], 80)
     title += " — " + (heading if topic else "Tor news, distilled")
     if page > 1:
         title += f", page {page}"
-    description = _text(site.get("description", "Important Tor news, distilled."), 400)
+    description = _text(site["description"], 400)
     return _shell(site, base, title, description, body, canonical)
 
 
@@ -418,7 +390,7 @@ def article_html(site: dict, base: str, story: dict) -> str:
 <section class="article-sources"><h2>Read the sources</h2>{_source_links(story, expanded=True)}</section>
 {_editorial_history(story)}
 <p class="article-note">This is an AI-assisted summary of the linked public sources. Consult the original reports for details and operator guidance.</p></article></main>'''
-    title = _text(site.get("title", "Onion Flash"), 80)
+    title = _text(site["title"], 80)
     return _shell(site, base, f"{story['title']} — {title}", story["summary"][:300], body, _permalink(base, story))
 
 
@@ -442,60 +414,3 @@ def headers_text(base: str) -> str:
   Content-Security-Policy: {feed_policy}
 '''
 
-
-def render_site(config: dict, stories: list[dict], source_health: list[dict], output_dir: Path) -> int:
-    """Compatibility renderer for a supplied batch; the CLI uses publication.build.
-
-    A single bad story is quarantined without blocking the other stories.
-    """
-    output_dir = Path(output_dir).absolute()
-    if output_dir.is_symlink():
-        raise ValueError("Output directory must not be a symlink")
-    output_dir = output_dir.resolve()
-    if output_dir.exists() and (not output_dir.is_dir() or any(output_dir.iterdir())):
-        raise ValueError("Output directory must be empty")
-    site = config.get("site", {})
-    base = site.get("base_url", "https://1aeo.com/onionflash/").rstrip("/") + "/"  # validated by load_config
-    public = []
-    for story in stories:
-        try:
-            public.append(_prepare_story(story))
-        except (ValueError, TypeError, KeyError, AttributeError) as exc:
-            story_id = story.get("id") if isinstance(story, dict) else None
-            logging.getLogger(__name__).warning(
-                "Skipping unrenderable story %s (%s)",
-                story_id if isinstance(story_id, str) and ID_PATTERN.fullmatch(story_id) else "with an invalid id",
-                type(exc).__name__,
-            )
-    if stories and not public:
-        raise ValueError("No stored story can be rendered")
-    if len({story["id"] for story in public}) != len(public):
-        raise ValueError("Duplicate story IDs")
-    public.sort(key=lambda story: (story["updated_at"], story["published_at"], story["id"]), reverse=True)
-    page_size = site.get("page_size", 100)
-    feed_size = site.get("feed_size", 0) or None
-    homepage = sorted(public, key=lambda story: (story["added_at"], story["updated_at"], story["id"]), reverse=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for name in ASSET_FILES:
-        shutil.copyfile(Path(__file__).with_name("assets") / name, output_dir / name)
-    for topic in [None, *CATEGORIES]:
-        selected = [story for story in homepage if topic is None or topic in story["tags"]]
-        pages = max(1, (len(selected) + page_size - 1) // page_size)
-        latest = max((story["updated_at"] for story in selected), default=None)
-        for page in range(1, pages + 1):
-            path = output_dir / _page_url("", page, topic) / "index.html"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(index_html(site, base, selected[(page - 1) * page_size:page * page_size], source_health if page == 1 else [], total=len(selected), page=page, pages=pages, latest=latest, topic=topic), encoding="utf-8")
-    for story in public:
-        target = output_dir / "news" / story["id"]
-        target.mkdir(parents=True)
-        (target / "index.html").write_text(article_html(site, base, story), encoding="utf-8")
-        (target / "story.json").write_text(json.dumps(story, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
-    (output_dir / "feed.xml").write_bytes(_rss(site, base, public[:feed_size], "feed.xml"))
-    (output_dir / "tags").mkdir()
-    for category in CATEGORIES:
-        path = f"tags/{category}.xml"
-        (output_dir / path).write_bytes(_rss(site, base, [story for story in public if category in story["tags"]][:feed_size], path, category))
-    (output_dir / "feed.json").write_bytes(b"".join(json_feed_chunks(site, base, public[:feed_size])))
-    (output_dir / "_headers").write_text(headers_text(base), encoding="utf-8")
-    return len(stories) - len(public)

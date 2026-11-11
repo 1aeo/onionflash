@@ -117,7 +117,7 @@ def test_review_timeout_or_malformed_verdict_resumes_without_regenerating_writer
         run(cfg, store, row, writer, checker)
     # A timeout backs off; a malformed verdict is one of the item's three strikes.
     assert caught.value.retryable == isinstance(failure, AnalysisError) and job(store)["stage"] == "review"
-    assert store.story_count() == 0
+    assert len(store.stories()) == 0
     paused = Reviewer(verdict())
     assert run(cfg, store, row, Writer(), paused, allow_network=False)["status"] == "deferred"
     assert paused.calls == [] and job(store)["stage"] == "review"
@@ -135,7 +135,7 @@ def test_repair_requires_fresh_verification_and_resumes_that_exact_stage(context
     with pytest.raises(AnalysisError):
         run(cfg, store, row, writer, first)
     assert [call[2] for call in first.calls] == [False, True]
-    assert job(store)["stage"] == "verify" and store.story_count() == 0
+    assert job(store)["stage"] == "verify" and len(store.stories()) == 0
     repaired = first.calls[1][0]
     assert repaired["why_it_matters"] == ""
     second = Reviewer(verdict())
@@ -154,7 +154,7 @@ def test_second_nonapproval_holds_once_and_never_rewrites_again(context, second)
     checker = Reviewer(verdict("revise", repair={"why_it_matters": ""}), second)
     result = run(cfg, store, row, Writer(), checker)
     assert result["status"] == "held" and result["review_calls"] == 2
-    assert store.pending_count() == 0 and store.rejected_count() == 1 and store.story_count() == 0
+    assert store.pending_count() == 0 and store.rejected_count() == 1 and len(store.stories()) == 0
     assert job(store)["stage"] == "held"
     audit = json.loads(store.db.execute("SELECT review_record FROM analyses").fetchone()[0])
     assert audit["outcome"] == "held" and len(audit["reviews"]) == 2
@@ -193,7 +193,7 @@ def test_completed_approval_resumes_after_crash_without_any_model_call(context, 
     monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash before commit")))
     with pytest.raises(RuntimeError, match="simulated crash"):
         run(cfg, store, row, Writer(), Reviewer(verdict()))
-    assert job(store)["stage"] == "approved" and store.story_count() == 0
+    assert job(store)["stage"] == "approved" and len(store.stories()) == 0
     monkeypatch.setattr(store, "commit_candidate", commit)
     writer, checker = Writer(), Reviewer()
     result = run(cfg, store, row, writer, checker, allow_network=False)
@@ -222,7 +222,7 @@ def test_source_change_during_review_fails_commit_cas(context):
         store.ingest(item(content="Changed while the final reviewer was running.", updated_at=LATER), LATER)
         return verdict()
     result = run(cfg, store, row, Writer(), Reviewer(change_source))
-    assert result["status"] == "stale" and store.story_count() == 0
+    assert result["status"] == "stale" and len(store.stories()) == 0
 
 
 def test_policy_change_reuses_writer_but_requires_a_new_review(context):
@@ -247,7 +247,7 @@ def test_final_merge_reviews_retained_old_bad_text_and_commits_only_the_verified
     assert checker.calls[0][0]["why_it_matters"] == wrong
     assert len(checker.calls[0][1]["sources"]) == 2
     assert result["status"] == "published" and store.stories()[0]["why_it_matters"] == ""
-    assert store.story_count() == 1
+    assert len(store.stories()) == 1
 
 
 def test_human_lock_during_review_invalidates_approval_and_preserves_operator_text(context):
@@ -556,7 +556,7 @@ def test_approval_receipt_and_job_pin_roll_back_together_if_job_save_fails(conte
         run(cfg, store, row, Writer(), Reviewer(verdict()))
     assert store.db.execute("SELECT COUNT(*) FROM review_approvals").fetchone()[0] == 0
     assert job(store)["stage"] == "review" and job(store)["approval_key"] is None
-    assert store.story_count() == 0
+    assert len(store.stories()) == 0
     store.db.execute("DROP TRIGGER fail_approved_job")
     store.db.commit()
     result = run(cfg, store, row, Writer(), Reviewer(verdict()))
