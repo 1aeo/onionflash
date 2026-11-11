@@ -94,6 +94,19 @@ def test_verified_repair_that_keeps_flagged_wording_is_a_false_approval(tmp_path
         assert json.loads(output.read_text().splitlines()[0])["kept_unsupported"] == kept
 
 
+def test_verified_repair_of_a_positive_case_is_an_approval(tmp_path, monkeypatch):
+    module = evaluator()
+    config = copy.deepcopy(DEFAULTS)
+    config["storage"]["output_dir"] = str(tmp_path / "public")
+    selected = [c for c in corpus() if c["id"] == "bastet-corrected"]
+    # The gate publishes the repaired story only if verification approves it.
+    for verified, matched in (("approve", 1), ("hold", 0)):
+        monkeypatch.setattr(module, "EvaluationReviewer", scripted(
+            lambda verification: {"verdict": verified} if verification else {"verdict": "revise", "repair": {"priority": "high"}}))
+        result = module.evaluate(config, selected, tmp_path / f"{verified}.jsonl", verify_repairs=True)
+        assert (result["matched"], result["positive_rejections"], result["false_approvals"]) == (matched, 1 - matched, 0)
+
+
 def test_repair_verification_refuses_a_negative_case_without_its_unsupported_wording(tmp_path):
     module = evaluator()
     config = copy.deepcopy(DEFAULTS)

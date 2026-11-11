@@ -158,7 +158,8 @@ PYTHONPATH=src python tools/evaluate_review.py --config config.toml \
 Add `--verify-repairs` to apply each proposed repair and send it to the same model
 in the gate's verification request. A verified repair of a negative case that
 still contains one of the case's `unsupported` phrases counts as a false approval,
-because the gate would publish it. That check compares wording only. It misses
+because the gate would publish it. A verified repair of a positive case counts
+as an approval for the same reason. That check compares wording only. It misses
 paraphrases and new claims, and it also counts a faithful repair that keeps a
 phrase inside a negation, such as "no evidence that ...". So read `repaired` in
 the private report for every verified repair, including each one counted as a

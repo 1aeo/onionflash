@@ -98,8 +98,10 @@ def evaluate(config, cases, output, *, rounds=1, verify_repairs=False, deadline=
                         record.update(repaired=repaired, verification=verified,
                                       kept_unsupported=kept_unsupported(case, repaired))
                         totals["repairs_verified" if verified["verdict"] == "approve" else "repairs_held"] += 1
-                        # The gate publishes a verified repair, so keeping flagged text approves unsupported wording.
-                        approved = verified["verdict"] == "approve" and bool(record["kept_unsupported"])
+                        # The gate publishes a verified repair. That approves a positive case, and a
+                        # negative one only if the repair kept its flagged wording.
+                        approved = verified["verdict"] == "approve" and (
+                            case["expected"] == "approve" or bool(record["kept_unsupported"]))
                     matched = approved == (case["expected"] == "approve")
                     totals["matched"] += matched
                     totals["false_approvals"] += approved and case["expected"] == "not_approve"
