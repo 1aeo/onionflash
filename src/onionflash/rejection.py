@@ -104,14 +104,18 @@ def _final_review(store, item_id):
     row = store.db.execute("SELECT stage,record_json FROM review_jobs WHERE item_id=?", (item_id,)).fetchone()
     if row is None:
         return None
-    record = json.loads(row["record_json"])
-    prepared = record.get("prepared", {})
-    reviews = record.get("reviews") or record.get("approval", {}).get("reviews", [])
-    latest = reviews[-1] if reviews else None
-    return {"stage": row["stage"], "candidate": record.get("candidate", prepared.get("candidate")),
-            "source_packet": prepared.get("packet"),
-            "latest_review": latest and {"phase": latest["stage"], "candidate_hash": latest["candidate_hash"],
-                                         **{key: latest["result"][key] for key in ("verdict", "criteria", "issues")}}}
+    try:
+        record = json.loads(row["record_json"])
+        prepared = record.get("prepared", {})
+        reviews = record.get("reviews") or record.get("approval", {}).get("reviews", [])
+        latest = reviews[-1] if reviews else None
+        return {"stage": row["stage"], "candidate": record.get("candidate", prepared.get("candidate")),
+                "source_packet": prepared.get("packet"),
+                "latest_review": latest and {**latest["result"], "phase": latest["stage"],
+                                             "candidate_hash": latest["candidate_hash"]}}
+    except (ValueError, TypeError, KeyError, AttributeError):
+        # A damaged record must not hide the item and its actions.
+        return {"stage": row["stage"], "error": "Saved review record cannot be read"}
 
 
 def _initialize(db):

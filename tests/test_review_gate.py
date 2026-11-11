@@ -401,6 +401,31 @@ def test_rejected_show_displays_repaired_candidate_pending_independent_verificat
     assert shown["latest_review"]["candidate_hash"] != digest(shown["candidate"])
 
 
+def test_rejected_show_reads_a_reused_approval_after_an_interrupted_commit(context, monkeypatch):
+    cfg, store = context
+    row = pending(store)
+    monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash")))
+    with pytest.raises(RuntimeError):
+        run(cfg, store, row, Writer(), Reviewer(verdict()))
+    with store.db:  # an operator retry starts a new record without reviews of its own
+        review_gate.reset_review_work(store, row["id"])
+    with pytest.raises(RuntimeError):  # the saved approval is reused, and the commit is interrupted again
+        run(cfg, store, row, Writer(), Reviewer())
+    shown = rejection.show_item(store, row["id"])["final_review"]
+    assert shown["stage"] == "approved" and shown["latest_review"]["verdict"] == "approve"
+
+
+def test_rejected_show_still_prints_the_item_when_its_review_record_is_damaged(context):
+    cfg, store = context
+    row = pending(store)
+    assert run(cfg, store, row, Writer(), Reviewer(verdict("hold")))["status"] == "held"
+    with store.db:
+        store.db.execute("UPDATE review_jobs SET record_json='{' WHERE item_id=?", (row["id"],))
+    shown = rejection.show_item(store, row["id"])
+    assert shown["final_review"] == {"stage": "held", "error": "Saved review record cannot be read"}
+    assert shown["saved_item"] is not None
+
+
 def test_rejected_show_without_a_current_job_stays_read_only(context):
     _, store = context
     row = pending(store)
