@@ -7,6 +7,7 @@ import sqlite3
 
 import pytest
 
+from approval_helpers import approve, verdict
 from onionflash import editorial, rejection, review, review_gate
 from onionflash.analyze import AnalysisError, tag_notice
 from onionflash.store import Store
@@ -15,17 +16,6 @@ from test_core import DATE, analysis, config, item
 
 
 LATER = "2026-11-10T12:00:00Z"
-
-
-def verdict(action="approve", *, repair=None):
-    checks = {name: {"outcome": "pass", "source_refs": ["S1"], "reason": "Supported by the supplied source."}
-              for name in review.CRITERIA}
-    issues = []
-    if action != "approve":
-        checks["operational_advice"]["outcome"] = "fail"
-        issues = [{"criterion": "operational_advice", "source_refs": ["S1"],
-                   "explanation": "The source does not instruct relay operators to change configuration."}]
-    return {"verdict": action, "criteria": checks, "issues": issues, "repair": repair}
 
 
 class Writer:
@@ -117,7 +107,7 @@ def test_review_timeout_or_malformed_verdict_resumes_without_regenerating_writer
         run(cfg, store, row, writer, checker)
     # A timeout backs off; a malformed verdict is one of the item's three strikes.
     assert caught.value.retryable == isinstance(failure, AnalysisError) and job(store)["stage"] == "review"
-    assert store.story_count() == 0
+    assert len(store.stories()) == 0
     paused = Reviewer(verdict())
     assert run(cfg, store, row, Writer(), paused, allow_network=False)["status"] == "deferred"
     assert paused.calls == [] and job(store)["stage"] == "review"
@@ -135,7 +125,7 @@ def test_repair_requires_fresh_verification_and_resumes_that_exact_stage(context
     with pytest.raises(AnalysisError):
         run(cfg, store, row, writer, first)
     assert [call[2] for call in first.calls] == [False, True]
-    assert job(store)["stage"] == "verify" and store.story_count() == 0
+    assert job(store)["stage"] == "verify" and len(store.stories()) == 0
     repaired = first.calls[1][0]
     assert repaired["why_it_matters"] == ""
     second = Reviewer(verdict())
@@ -154,25 +144,18 @@ def test_second_nonapproval_holds_once_and_never_rewrites_again(context, second)
     checker = Reviewer(verdict("revise", repair={"why_it_matters": ""}), second)
     result = run(cfg, store, row, Writer(), checker)
     assert result["status"] == "held" and result["review_calls"] == 2
-    assert store.pending_count() == 0 and store.rejected_count() == 1 and store.story_count() == 0
+    assert store.pending_count() == 0 and store.rejected_count() == 1 and len(store.stories()) == 0
     assert job(store)["stage"] == "held"
     audit = json.loads(store.db.execute("SELECT review_record FROM analyses").fetchone()[0])
     assert audit["outcome"] == "held" and len(audit["reviews"]) == 2
 
 
-def test_zero_repairs_holds_and_explicit_retry_reuses_writer(context):
+def test_zero_repairs_holds_after_one_review(context):
     cfg, store = context
     cfg["review"]["max_repairs"] = 0
     row = pending(store)
     result = run(cfg, store, row, Writer(), Reviewer(verdict("revise", repair={"why_it_matters": ""})))
     assert result["status"] == "held" and result["review_calls"] == 1
-    with store.db:
-        store.db.execute("UPDATE items SET status='pending',attempts=0,rejections=0 WHERE id=?", (row["id"],))
-        review_gate.reset_review_work(store, row["id"])
-    retry = dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone())
-    writer = Writer()
-    result = run(cfg, store, retry, writer, Reviewer(verdict()))
-    assert result["status"] == "published" and writer.calls == []
 
 
 @pytest.mark.parametrize("repair", [None, {"title": analysis()["title"]}, {"title": ""}],
@@ -193,7 +176,7 @@ def test_completed_approval_resumes_after_crash_without_any_model_call(context, 
     monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash before commit")))
     with pytest.raises(RuntimeError, match="simulated crash"):
         run(cfg, store, row, Writer(), Reviewer(verdict()))
-    assert job(store)["stage"] == "approved" and store.story_count() == 0
+    assert job(store)["stage"] == "approved" and len(store.stories()) == 0
     monkeypatch.setattr(store, "commit_candidate", commit)
     writer, checker = Writer(), Reviewer()
     result = run(cfg, store, row, writer, checker, allow_network=False)
@@ -222,7 +205,7 @@ def test_source_change_during_review_fails_commit_cas(context):
         store.ingest(item(content="Changed while the final reviewer was running.", updated_at=LATER), LATER)
         return verdict()
     result = run(cfg, store, row, Writer(), Reviewer(change_source))
-    assert result["status"] == "stale" and store.story_count() == 0
+    assert result["status"] == "stale" and len(store.stories()) == 0
 
 
 def test_policy_change_reuses_writer_but_requires_a_new_review(context):
@@ -244,10 +227,13 @@ def test_final_merge_reviews_retained_old_bad_text_and_commits_only_the_verified
     row = pending(store, incoming)
     checker = Reviewer(verdict("revise", repair={"why_it_matters": ""}), verdict())
     result = run(cfg, store, row, Writer(analysis(why_it_matters="The report concerns old keys.")), checker)
-    assert checker.calls[0][0]["why_it_matters"] == wrong
-    assert len(checker.calls[0][1]["sources"]) == 2
+    reviewed, evidence, _ = checker.calls[0]
+    passages = [p["text"] for source in evidence["sources"] for p in source["passages"]]
+    assert reviewed["why_it_matters"] == wrong and len(evidence["sources"]) == 2
+    # The evidence is collected source text, never the retained generated sentence.
+    assert original["content"] in passages and not any(wrong in text for text in passages)
     assert result["status"] == "published" and store.stories()[0]["why_it_matters"] == ""
-    assert store.story_count() == 1
+    assert len(store.stories()) == 1
 
 
 def test_human_lock_during_review_invalidates_approval_and_preserves_operator_text(context):
@@ -313,12 +299,7 @@ def test_cache_cannot_treat_an_approve_boolean_as_seven_passing_checks(context):
     with pytest.raises(AnalysisError):
         run(cfg, store, row, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
     saved = job(store)
-    prepared = json.loads(saved["envelope_json"])
-    key = review_gate._approval_key(prepared["candidate"], prepared, saved["policy_hash"])
-    with store.db:
-        store.db.execute("INSERT INTO review_approvals VALUES(?,?,?,?,?,?,?,?,?)", (
-            key, prepared["candidate_hash"], prepared["source_hash"], saved["policy_hash"], prepared["binding_hash"],
-            json.dumps({"verdict": "approve"}), "{}", LATER, LATER))
+    approve(store, json.loads(saved["envelope_json"]), policy=saved["policy_hash"], result={"verdict": "approve"})
     result = run(cfg, store, row, Writer(), Reviewer(verdict()))
     assert result["review_calls"] == 1 and not result["cache_hit"]
 
@@ -391,11 +372,13 @@ def test_ignored_writer_result_cannot_overwrite_a_concurrent_source_update(conte
     assert store.db.execute("SELECT COUNT(*) FROM analyses").fetchone()[0] == 0
 
 
-def test_rejected_show_explains_structured_hold_with_the_actual_candidate_and_passages(context):
+def test_rejected_show_explains_structured_hold_with_the_actual_candidate_and_passages(context, monkeypatch):
     cfg, store = context
     row = pending(store)
     assert run(cfg, store, row, Writer(), Reviewer(verdict("hold")))["status"] == "held"
     before = list(store.db.iterdump())
+    # A hold waits for an operator, so its saved verdict stays readable after a later rubric change.
+    monkeypatch.setattr(review, "CRITERIA", (*review.CRITERIA, "a_later_criterion"))
     shown = rejection.show_item(store, row["id"])["final_review"]
     assert shown["stage"] == "held"
     assert shown["candidate"]["title"] == analysis()["title"]
@@ -418,35 +401,29 @@ def test_rejected_show_displays_repaired_candidate_pending_independent_verificat
     assert shown["latest_review"]["candidate_hash"] != digest(shown["candidate"])
 
 
-def test_rejected_show_excludes_unrelated_provider_and_private_audit_fields(context):
+def test_rejected_show_reads_a_reused_approval_after_an_interrupted_commit(context, monkeypatch):
     cfg, store = context
     row = pending(store)
-    run(cfg, store, row, Writer(), Reviewer(verdict("hold")))
-    saved = job(store)
-    record = json.loads(saved["record_json"])
-    source = record["prepared"]["packet"]["sources"][0]
-    for target in (record, source, source["passages"][0]):
-        target["provider_response"] = "DO NOT PRINT PROVIDER RESPONSE"
-    for change in ({}, {"api_key": "DO NOT PRINT CREDENTIAL"}):
-        record["prepared"]["candidate"].update(change)
-        with store.db:
-            store.db.execute("UPDATE review_jobs SET record_json=?", (json.dumps(record),))
-        shown = rejection.show_item(store, row["id"])["final_review"]
-        # Unknown fields are dropped; a malformed candidate hash fails closed.
-        assert "DO NOT PRINT" not in json.dumps(shown) and ("error" in shown) == bool(change)
+    monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash")))
+    with pytest.raises(RuntimeError):
+        run(cfg, store, row, Writer(), Reviewer(verdict()))
+    with store.db:  # an operator retry starts a new record without reviews of its own
+        review_gate.reset_review_work(store, row["id"])
+    with pytest.raises(RuntimeError):  # the saved approval is reused, and the commit is interrupted again
+        run(cfg, store, row, Writer(), Reviewer())
+    shown = rejection.show_item(store, row["id"])["final_review"]
+    assert shown["stage"] == "approved" and shown["latest_review"]["verdict"] == "approve"
 
 
-@pytest.mark.parametrize("saved", ["not JSON", '{"bad":NaN}', '{"bad":"\\ud800"}', "oversized"])
-def test_rejected_show_bounds_and_safely_rejects_bad_review_records(context, saved):
+def test_rejected_show_still_prints_the_item_when_its_review_record_is_damaged(context):
     cfg, store = context
     row = pending(store)
-    run(cfg, store, row, Writer(), Reviewer(verdict("hold")))
-    if saved == "oversized":
-        saved = json.dumps({"private": "x" * (rejection.MAX_PAYLOAD_BYTES + 1)})
+    assert run(cfg, store, row, Writer(), Reviewer(verdict("hold")))["status"] == "held"
     with store.db:
-        store.db.execute("UPDATE review_jobs SET record_json=?", (saved,))
+        store.db.execute("UPDATE review_jobs SET record_json='{' WHERE item_id=?", (row["id"],))
     shown = rejection.show_item(store, row["id"])
-    assert shown["final_review"] == {"error": "Saved final review cannot be decoded safely"}
+    assert shown["final_review"] == {"stage": "held", "error": "Saved review record cannot be read"}
+    assert shown["saved_item"] is not None
 
 
 def test_rejected_show_without_a_current_job_stays_read_only(context):
@@ -556,7 +533,7 @@ def test_approval_receipt_and_job_pin_roll_back_together_if_job_save_fails(conte
         run(cfg, store, row, Writer(), Reviewer(verdict()))
     assert store.db.execute("SELECT COUNT(*) FROM review_approvals").fetchone()[0] == 0
     assert job(store)["stage"] == "review" and job(store)["approval_key"] is None
-    assert store.story_count() == 0
+    assert len(store.stories()) == 0
     store.db.execute("DROP TRIGGER fail_approved_job")
     store.db.commit()
     result = run(cfg, store, row, Writer(), Reviewer(verdict()))

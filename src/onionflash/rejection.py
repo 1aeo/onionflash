@@ -9,9 +9,9 @@ from __future__ import annotations
 import json
 import re
 
-from .analyze import AnalysisError, cache_key
+from .analyze import cache_key
 from .schema import PRODUCTS
-from .util import canonical_url, digest, format_utc, now_iso, parse_utc
+from .util import canonical_url, format_utc, now_iso, parse_utc
 
 
 MAX_LIMIT = 200
@@ -98,52 +98,24 @@ def show_item(store, item_id) -> dict:
 
 
 def _final_review(store, item_id):
-    """Read one bounded current job, selecting only operator-facing review data."""
+    """The current job's stage, candidate, source packet and latest verdict, as saved."""
     if not store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_jobs'").fetchone():
         return None
-    row = store.db.execute("SELECT stage,substr(record_json,1,?) AS payload FROM review_jobs WHERE item_id=?",
-                           (MAX_PAYLOAD_BYTES + 1, item_id)).fetchone()
+    row = store.db.execute("SELECT stage,record_json FROM review_jobs WHERE item_id=?", (item_id,)).fetchone()
     if row is None:
         return None
     try:
-        from . import review
-        from .render import _prepare_story
-        if row["stage"] not in {"drafted", "review", "verify", "approved", "held"}:
-            raise ValueError
-        record = _payload(row)
-        prepared = record.get("prepared") or {}
-        candidate = record.get("candidate", prepared.get("candidate"))
-        if candidate is not None:
-            candidate = _prepare_story(candidate, editorial=candidate.get("editorial"))
-        packet = prepared.get("packet")
-        if packet is not None:
-            # Discard unrelated private/provider fields even in a damaged job.
-            fields = {"id", "url", "title", "kind", "authority", "product", "published_at", "updated_at",
-                      "upstream_state", "snapshot", "captured_at", "author"}
-            packet = {"sources": [{**{key: value for key, value in source.items() if key in fields},
-                                   "passages": [{"id": p["id"], "text": p["text"]} for p in source["passages"]]}
-                                  for source in packet["sources"]],
-                      "missing_sources": packet["missing_sources"], "truncated": packet["truncated"]}
-        entries = record.get("reviews") or (record.get("approval") or {}).get("reviews", [])
-        latest = None
-        if entries:
-            entry = entries[-1]
-            origin = record if record.get("reviews") else record["approval"]
-            phase = entry["stage"]
-            if phase not in {"review", "verification"}:
-                raise ValueError
-            evaluated = origin.get("candidate") if phase == "verification" else origin["prepared"]["candidate"]
-            if digest(evaluated) != entry["candidate_hash"]:
-                raise ValueError
-            response = review.validate_review(entry["result"], packet)
-            latest = {"phase": phase, "candidate_hash": entry["candidate_hash"],
-                      **{key: response[key] for key in ("verdict", "criteria", "issues")}}
-        display = {"stage": row["stage"], "candidate": candidate, "source_packet": packet, "latest_review": latest}
-        if len(json.dumps(display, ensure_ascii=False, allow_nan=False).encode("utf-8")) > MAX_PAYLOAD_BYTES:
-            raise ValueError
-        return display
-    except (ValueError, TypeError, KeyError, AttributeError, IndexError, UnicodeError, RecursionError, AnalysisError):
-        return {"error": "Saved final review cannot be decoded safely"}
+        record = json.loads(row["record_json"])
+        prepared = record.get("prepared", {})
+        reviews = record.get("reviews") or record.get("approval", {}).get("reviews", [])
+        latest = reviews[-1] if reviews else None
+        return {"stage": row["stage"], "candidate": record.get("candidate", prepared.get("candidate")),
+                "source_packet": prepared.get("packet"),
+                "latest_review": latest and {**latest["result"], "phase": latest["stage"],
+                                             "candidate_hash": latest["candidate_hash"]}}
+    except (ValueError, TypeError, KeyError, AttributeError):
+        # A damaged record must not hide the item and its actions.
+        return {"stage": row["stage"], "error": "Saved review record cannot be read"}
 
 
 def _initialize(db):

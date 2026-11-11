@@ -8,8 +8,8 @@ import pytest
 
 from onionflash.analyze import SCHEMA, AnalysisError, Analyzer, cache_key, tag_notice, validate_analysis
 from onionflash.config import DEFAULTS, load_config
-from onionflash.render import render_site
 from onionflash.store import Store, after, item_priority, source_due
+from test_render import publish
 
 
 DATE = "2026-11-09T15:30:00Z"
@@ -99,8 +99,7 @@ def test_tag_notice_preserves_publication_dates_and_escapes_hostile_text(tmp_pat
     assert story["published_at"] == raw["published_at"]
     assert story["updated_at"] == raw["updated_at"]
     output = tmp_path / "public"
-    output.mkdir()
-    render_site(copy.deepcopy(DEFAULTS), [story], [], output)
+    publish([story], output)
     page = (output / "index.html").read_text()
     assert "<img src=x onerror=" not in page and "<script>attack()" not in page
     assert "&lt;img" in page and "attack()" not in page

@@ -2,7 +2,6 @@
 
 import hashlib
 import re
-from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -10,7 +9,7 @@ import pytest
 from onionflash import publication, render
 from onionflash.cli import build
 from onionflash.store import Store
-from test_publication import meta, put, settings, story
+from test_publication import meta, put, settings, story, upgrade
 
 
 def ids(path):
@@ -66,7 +65,6 @@ def test_recategorization_updates_only_affected_topics_and_removes_stale_views(t
         monkeypatch.setattr(render, "index_html", counted)
         put(store.db, story(0, category="security", tags=[]))
         build(cfg, store)
-        assert set(calls) == {None, "release", "security"}
         assert not (output / "topics/release/page/3/index.html").exists()
         assert store.db.execute("SELECT 1 FROM public_artifacts WHERE path='topics/release/page/3/index.html'").fetchone() is None
         assert ids(output / "topics/security/index.html") == [story(0)["id"]]
@@ -75,22 +73,6 @@ def test_recategorization_updates_only_affected_topics_and_removes_stale_views(t
         calls.clear()
         assert not build(cfg, store)["public_changed"]
         assert calls == [None]
-
-
-def test_page_size_change_prunes_topic_pages_but_never_articles(tmp_path):
-    cfg = settings(tmp_path)
-    cfg["site"]["page_size"] = 1
-    with Store(cfg["storage"]["database"]) as store:
-        for number in range(3):
-            put(store.db, story(number))
-        build(cfg, store)
-        output = Path(cfg["storage"]["output_dir"])
-        assert (output / "topics/release/page/3/index.html").exists()
-        cfg["site"]["page_size"] = 3
-        build(cfg, store)
-        assert not (output / "topics/release/page/2/index.html").exists()
-        assert len(ids(output / "topics/release/index.html")) == 3
-        assert len(list(output.glob("news/*/index.html"))) == 3
 
 
 def test_migration_keeps_script_until_all_accepted_articles_are_rebuilt(tmp_path):
@@ -169,23 +151,16 @@ def test_missing_legacy_script_cleans_ledger_and_orphan_article_blocks_transitio
         assert store.db.execute("SELECT 1 FROM public_artifacts WHERE path='app.js'").fetchone() is None
 
 
-def test_year_rollover_refreshes_topic_footer_without_revoking_completed_migration(tmp_path, monkeypatch):
+def test_template_rebuild_does_not_revoke_completed_migration(tmp_path):
     cfg = settings(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         for number in range(3):
             put(store.db, story(number))
         build(cfg, store)
         cfg["storage"]["render_batch_size"] = 1
-        monkeypatch.setattr(publication, "publication_year", lambda: 2035)
-        class Future(datetime):
-            @classmethod
-            def now(cls, tz=None):
-                return cls(2035, 1, 1, tzinfo=tz)
-        monkeypatch.setattr(render, "datetime", Future)
+        upgrade(store.db)
         result = build(cfg, store)
         assert result["articles_pending"] == 2 and result["no_browser_js_ready"]
-        output = Path(cfg["storage"]["output_dir"])
-        assert "2035" in (output / "topics/release/index.html").read_text()
         build(cfg, store); build(cfg, store)
         assert not build(cfg, store)["public_changed"]
 

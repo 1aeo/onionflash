@@ -8,6 +8,7 @@ private source row changes or disappears.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -15,14 +16,12 @@ import stat
 import re
 import tempfile
 from contextlib import ExitStack, contextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 
 from . import editorial, render
 from .util import digest, now_iso
 
 
-SCHEMA_VERSION = "4"
 _ARTICLE = r"news/[A-Za-z0-9_-]{1,64}/(?:index\.html|story\.json)"
 _TOPIC = "(?:" + "|".join(re.escape(topic) for topic in render.CATEGORIES) + ")"
 _PATH = re.compile(r"(?:" + _ARTICLE + r"|page/[1-9][0-9]*/index\.html|topics/" + _TOPIC
@@ -43,7 +42,9 @@ def initialize(db) -> None:
             template_hash TEXT NOT NULL, json_sha256 TEXT NOT NULL,
             public_json TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS public_catalog_published ON public_catalog(published_at DESC,updated_at DESC,story_id DESC);
+        -- No query uses this index, which earlier releases created.
+        DROP INDEX IF EXISTS public_catalog_published;
+        CREATE INDEX IF NOT EXISTS public_catalog_added ON public_catalog(added_at DESC,updated_at DESC,story_id DESC);
         CREATE INDEX IF NOT EXISTS public_catalog_updated ON public_catalog(updated_at DESC,published_at DESC,story_id DESC);
         CREATE TABLE IF NOT EXISTS public_story_topics (
             topic TEXT NOT NULL, story_id TEXT NOT NULL,
@@ -76,28 +77,6 @@ def initialize(db) -> None:
             UPDATE public_render_queue SET last_error=NULL WHERE story_id=OLD.id;
         END;
     """)
-    columns = {row[1] for row in db.execute("PRAGMA table_info(public_catalog)")}
-    if "public_json" not in columns:
-        db.execute("ALTER TABLE public_catalog ADD COLUMN public_json TEXT")
-        db.commit()
-    if "added_at" not in columns:
-        db.execute("ALTER TABLE public_catalog ADD COLUMN added_at TEXT")
-        db.commit()
-    while True:
-        rows = db.execute("SELECT story_id,published_at,public_json FROM public_catalog WHERE added_at IS NULL LIMIT 100").fetchall()
-        if not rows:
-            break
-        with db:
-            for row in rows:
-                payload = json.loads(row["public_json"]) if row["public_json"] else {}
-                added = render._iso(render._date(payload.get("added_at") or row["published_at"]))
-                db.execute("UPDATE public_catalog SET added_at=? WHERE story_id=?", (added, row["story_id"]))
-    db.execute("CREATE INDEX IF NOT EXISTS public_catalog_added ON public_catalog(added_at DESC,updated_at DESC,story_id DESC)")
-    db.commit()
-    if _meta(db, "publication_schema") != SCHEMA_VERSION:
-        with db:
-            db.execute("INSERT OR IGNORE INTO public_render_queue(story_id) SELECT id FROM stories UNION SELECT story_id FROM public_catalog")
-            _set_meta(db, "publication_schema", SCHEMA_VERSION)
 
 
 def _meta(db, key: str) -> str | None:
@@ -109,14 +88,11 @@ def _set_meta(db, key: str, value: str) -> None:
     db.execute("INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
 
-def publication_year() -> int:
-    return datetime.now(timezone.utc).year
-
-
 def template_identity(site: dict) -> str:
+    # Hashing this file stands in for a schema version: any change to it rebuilds every article.
     root = Path(__file__).parent
     files = [(name, hashlib.sha256((root / name).read_bytes()).hexdigest()) for name in ("render.py", "publication.py", "editorial.py", "schema.py", "util.py")]
-    return digest([SCHEMA_VERSION, files, publication_year(), {key: site.get(key) for key in ("title", "description", "base_url", "repository_url")}])
+    return digest([files, {key: site.get(key) for key in ("title", "description", "base_url", "repository_url")}])
 
 
 def _owned_output(value: str) -> Path:
@@ -167,7 +143,6 @@ TEMPORARY_PREFIX = ".onionflash-"
 class Artifacts:
     def __init__(self, db, output: Path, observed: str):
         self.db, self.output, self.observed = db, output, observed
-        self.changed = 0
         # Temporaries stay beside, never inside, the public tree, so a killed
         # build leaves nothing for the publisher to ship or reject.
         self.staging = output.parent / ("." + output.name + ".onionflash-staging")
@@ -204,7 +179,6 @@ class Artifacts:
                     VALUES(?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET
                     sha256=excluded.sha256,size=excluded.size,content_type=excluded.content_type,updated_at=excluded.updated_at""",
                     (relative, value, size, content_type, self.observed))
-                self.changed += 1
                 _set_meta(self.db, "publication_dirty", "1")
         finally:
             temporary.unlink(missing_ok=True)
@@ -253,10 +227,6 @@ def _public_story(row, current: str | None = None) -> dict | None:
 
 
 def _accepted(db, *, order: str = "added_at", batch_size: int = 100, topic: str | None = None):
-    if order not in {"added_at", "updated_at"}:
-        raise ValueError("Invalid catalog ordering")
-    if topic is not None and (topic not in render.CATEGORIES or order != "added_at"):
-        raise ValueError("Invalid topic catalog ordering")
     cursor = None
     secondary = "updated_at" if order == "added_at" else "published_at"
     current = _meta(db, "publication_template")
@@ -281,13 +251,11 @@ def _accepted(db, *, order: str = "added_at", batch_size: int = 100, topic: str 
         cursor = (rows[-1][order], rows[-1][secondary], rows[-1]["story_id"])
 
 
-def _story_topics(db, story: dict) -> set[str]:
-    old = {row[0] for row in db.execute("SELECT topic FROM public_story_topics WHERE story_id=?", (story["id"],))}
-    topics = {story["category"], *story["tags"]}
+def _story_topics(db, story: dict) -> None:
+    # Prepared tags are unique and start with the category.
     db.execute("DELETE FROM public_story_topics WHERE story_id=?", (story["id"],))
     db.executemany("INSERT INTO public_story_topics(topic,story_id,added_at,updated_at) VALUES(?,?,?,?)",
-                   [(topic, story["id"], story["added_at"], story["updated_at"]) for topic in topics])
-    return old | topics
+                   [(topic, story["id"], story["added_at"], story["updated_at"]) for topic in story["tags"]])
 
 
 def _backfill_topics(db) -> None:
@@ -306,25 +274,6 @@ def _backfill_topics(db) -> None:
         cursor = rows[-1]["story_id"]
     with db:
         _set_meta(db, "publication_topics", "1")
-
-
-def _backfill_public_json(db, output: Path) -> None:
-    # Upgrade early publication catalogs from their verified on-disk snapshots.
-    while True:
-        rows = db.execute("SELECT story_id,json_sha256 FROM public_catalog WHERE public_json IS NULL LIMIT 100").fetchall()
-        if not rows:
-            return
-        with db:
-            for row in rows:
-                path = _target(output, f"news/{row['story_id']}/story.json")
-                if not path.is_file() or _file_hash(path) != row["json_sha256"]:
-                    raise ValueError("Cannot migrate missing last-good story snapshot")
-                payload = path.read_text(encoding="utf-8")
-                decoded = json.loads(payload)
-                story = render._prepare_story(decoded, editorial=decoded.get("editorial"))
-                if story["id"] != row["story_id"]:
-                    raise ValueError("Invalid last-good story identity")
-                db.execute("UPDATE public_catalog SET public_json=? WHERE story_id=?", (payload, row["story_id"]))
 
 
 def _feeds(artifacts: Artifacts, db, site: dict, base: str, limit: int) -> None:
@@ -365,7 +314,6 @@ def _remove_owned_file(artifacts: Artifacts, row, target: Path) -> None:
         raise ValueError("Retired public artifact must be a regular file")
     target.unlink(missing_ok=True)
     artifacts.db.execute("DELETE FROM public_artifacts WHERE path=?", (row["path"],))
-    artifacts.changed += 1
     _set_meta(artifacts.db, "publication_dirty", "1")
 
 
@@ -415,36 +363,24 @@ def _remove_obsolete_pages(artifacts: Artifacts, pages: int, topic: str | None =
     # Pagination is a view, not a story permalink. Its old pages can disappear
     # when the configured page size grows; article artifacts are never removed.
     # A failed build may have rewritten a page after its last committed hash,
-    # so an obsolete page is removed whatever it contains.
-    prefix = "page/" if topic is None else f"topics/{topic}/page/"
-    cursor = ""
-    while True:
-        rows = artifacts.db.execute("SELECT path FROM public_artifacts WHERE path LIKE ? AND path>? ORDER BY path LIMIT 100", (prefix + "%", cursor)).fetchall()
-        if not rows:
+    # so an obsolete page is removed whatever it contains. A refresh records
+    # pages 1..P in one transaction, so the recorded pages are contiguous.
+    for page in itertools.count(pages + 1):
+        relative = render._page_url("", page, topic) + "index.html"
+        row = artifacts.db.execute("SELECT path FROM public_artifacts WHERE path=?", (relative,)).fetchone()
+        if row is None:
             return
-        cursor = rows[-1]["path"]
-        for row in rows:
-            match = re.fullmatch(re.escape(prefix) + r"([1-9][0-9]*)/index\.html", row["path"])
-            if not match or int(match[1]) <= pages:
-                continue
-            target = _target(artifacts.output, row["path"])
-            _remove_owned_file(artifacts, row, target)
+        _remove_owned_file(artifacts, row, _target(artifacts.output, relative))
 
 
 def _listing(artifacts: Artifacts, site: dict, base: str, health: list, *, count: int,
              latest: str | None, refresh: bool, topic: str | None = None) -> None:
     page_size = site["page_size"]
     pages = max(1, (count + page_size - 1) // page_size)
-    stories = iter(_accepted(artifacts.db, topic=topic))
-    prefix = "" if topic is None else f"topics/{topic}/"
+    stories = _accepted(artifacts.db, topic=topic)
     for page in range(1, pages + 1 if refresh else 2):
-        batch = []
-        for _ in range(page_size):
-            try:
-                batch.append(next(stories))
-            except StopIteration:
-                break
-        relative = prefix + ("index.html" if page == 1 else f"page/{page}/index.html")
+        batch = list(itertools.islice(stories, page_size))
+        relative = render._page_url("", page, topic) + "index.html"
         artifacts.text(relative, render.index_html(site, base, batch, health if page == 1 else [],
                        total=count, page=page, pages=pages, latest=latest, topic=topic), "text/html; charset=utf-8")
     if refresh:
@@ -457,7 +393,6 @@ def build(config: dict, store, *, force: bool = False) -> dict:
     initialize(db)
     output_missing = not Path(config["storage"]["output_dir"]).exists()
     output = _owned_output(config["storage"]["output_dir"])
-    _backfill_public_json(db, output)
     base = site["base_url"].rstrip("/") + "/"  # validated by load_config
     observed = now_iso()
     identity = template_identity(site)
@@ -483,7 +418,6 @@ def build(config: dict, store, *, force: bool = False) -> dict:
         WHERE public_render_queue.last_error IS NULL ORDER BY public_render_queue.rowid LIMIT ?""", (limit,)).fetchall()
     for row in candidates:
         quarantined = False
-        source_hash = digest(row["payload"])
         accepted = None
         if row["payload"] is None:
             accepted = db.execute("SELECT * FROM public_catalog WHERE story_id=?", (row["id"],)).fetchone()
@@ -491,7 +425,6 @@ def build(config: dict, store, *, force: bool = False) -> dict:
                 with db:
                     db.execute("DELETE FROM public_render_queue WHERE story_id=?", (row["id"],))
                 continue
-            source_hash = accepted["source_hash"]
         try:
             story = _public_story(accepted) if accepted is not None else render._prepare_story(
                 json.loads(row["payload"]), editorial=editorial.public_metadata(db, row["id"]))
@@ -512,7 +445,6 @@ def build(config: dict, store, *, force: bool = False) -> dict:
                 article = render.article_html(site, base, story)
             except (ValueError, TypeError, KeyError, AttributeError):
                 continue
-            source_hash = accepted["source_hash"]
             quarantined = True
         # Views trust a current catalog row, so it holds exactly what this release rendered.
         public_json = json.dumps(story, ensure_ascii=False, sort_keys=True) + "\n"
@@ -522,15 +454,14 @@ def build(config: dict, store, *, force: bool = False) -> dict:
             previous = db.execute("SELECT json_sha256 FROM public_catalog WHERE story_id=?", (story["id"],)).fetchone()
             changed = previous is None or previous[0] != checksum
             if changed:
-                revision = str(int(_meta(db, "publication_catalog_revision") or 0) + 1)
-                _set_meta(db, "publication_catalog_revision", revision)
-                for topic in _story_topics(db, story):
-                    _set_meta(db, "publication_topic_revision:" + topic, revision)
+                _set_meta(db, "publication_catalog_revision", str(int(_meta(db, "publication_catalog_revision") or 0) + 1))
+                _story_topics(db, story)
+            # Nothing reads source_hash; existing catalogs declare it NOT NULL.
             db.execute("""INSERT INTO public_catalog(story_id,published_at,updated_at,added_at,source_hash,template_hash,json_sha256,public_json)
-                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(story_id) DO UPDATE SET
-                published_at=excluded.published_at,updated_at=excluded.updated_at,added_at=excluded.added_at,source_hash=excluded.source_hash,
+                VALUES(?,?,?,?,'',?,?,?) ON CONFLICT(story_id) DO UPDATE SET
+                published_at=excluded.published_at,updated_at=excluded.updated_at,added_at=excluded.added_at,
                 template_hash=excluded.template_hash,json_sha256=excluded.json_sha256,public_json=excluded.public_json""",
-                (story["id"], story["published_at"], story["updated_at"], story["added_at"], source_hash, identity, checksum, public_json))
+                (story["id"], story["published_at"], story["updated_at"], story["added_at"], identity, checksum, public_json))
             if not quarantined:
                 db.execute("DELETE FROM public_render_queue WHERE story_id=?", (story["id"],))
     # Repair this bounded queue batch before validating historical snapshots.
@@ -547,12 +478,9 @@ def build(config: dict, store, *, force: bool = False) -> dict:
         if news.is_symlink() or next(news.glob("*/index.html"), None) is not None:
             raise ValueError("Refusing an empty catalog over existing published articles; restore publication history")
     latest = db.execute("SELECT MAX(updated_at) FROM public_catalog").fetchone()[0]
-    page_size, feed_size = site["page_size"], site.get("feed_size", 0)
-    index_settings = digest([page_size, site, identity])
-    revision = _meta(db, "publication_catalog_revision") or "0"
-    refresh_requested = force and restart_rebuild
-    refresh_all = template_changed or output_missing or refresh_requested or _meta(db, "publication_indexes") != index_settings
-    refresh_indexes = refresh_all or _meta(db, "publication_index_revision") != revision
+    # Every listing and feed is a view of the catalog, refreshed when it, the site or the code changes.
+    views = digest([site, identity, _meta(db, "publication_catalog_revision")])
+    refresh = restart_rebuild or _meta(db, "publication_views") != views
     health = store.health(config["sources"], config["collection"]["stale_after_seconds"], observed)
     with db:
         for name in render.ASSET_FILES:
@@ -560,20 +488,13 @@ def build(config: dict, store, *, force: bool = False) -> dict:
             content_type = {"style.css": "text/css; charset=utf-8", "mark.svg": "image/svg+xml"}[name]
             artifacts.write(name, [path.read_bytes()], content_type)
         artifacts.text("_headers", render.headers_text(base), "text/plain; charset=utf-8")
-        _listing(artifacts, site, base, health, count=count, latest=latest, refresh=refresh_indexes)
-        for topic in render.CATEGORIES:
-            topic_revision = _meta(db, "publication_topic_revision:" + topic) or "0"
-            if refresh_all or _meta(db, "publication_topic_index:" + topic) != topic_revision:
+        _listing(artifacts, site, base, health, count=count, latest=latest, refresh=refresh)
+        if refresh:
+            for topic in render.CATEGORIES:
                 stats = db.execute("SELECT COUNT(*),MAX(updated_at) FROM public_story_topics WHERE topic=?", (topic,)).fetchone()
                 _listing(artifacts, site, base, [], count=stats[0], latest=stats[1], refresh=True, topic=topic)
-                _set_meta(db, "publication_topic_index:" + topic, topic_revision)
-        feed_settings = digest([feed_size, site, identity])
-        if output_missing or refresh_requested or _meta(db, "publication_feeds") != feed_settings or _meta(db, "publication_feed_revision") != revision:
-            _feeds(artifacts, db, site, base, feed_size)
-            _set_meta(db, "publication_feeds", feed_settings)
-            _set_meta(db, "publication_feed_revision", revision)
-        _set_meta(db, "publication_indexes", index_settings)
-        _set_meta(db, "publication_index_revision", revision)
+            _feeds(artifacts, db, site, base, site["feed_size"])
+        _set_meta(db, "publication_views", views)
         ready = _migration_ready(artifacts, identity, pending)
         if ready:
             _retire_script(artifacts)
@@ -585,7 +506,6 @@ def build(config: dict, store, *, force: bool = False) -> dict:
         _set_meta(db, "publication_build_pending", "0")
         if not pending:
             _set_meta(db, "publication_rebuild_active", "")
-        _set_meta(db, "public_skipped", str(skipped))
         _set_meta(db, "published_stories", str(count))
     result = {"public_changed": changed, "published_stories": count, "stories_skipped": skipped, "no_browser_js_ready": ready}
     if pending:

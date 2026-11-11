@@ -48,7 +48,7 @@ def test_qualifying_monitor_candidates_never_add_articles_or_feed_entries(tmp_pa
         report = cli.run(cfg, store)
         assert report["alerts"]["test"]["candidates"] == 1
         assert report["alerts"]["test"]["published"] == 0
-        assert store.story_count() == store.pending_count() == 0
+        assert len(store.stories()) == store.pending_count() == 0
         assert store.db.execute("SELECT COUNT(*) FROM analyses").fetchone()[0] == 0
     public = Path(cfg["storage"]["output_dir"])
     assert ET.parse(public / "feed.xml").findall("./channel/item") == []

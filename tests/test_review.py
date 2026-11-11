@@ -5,23 +5,19 @@ import json
 
 import pytest
 
+from approval_helpers import verdict
 from onionflash import analyze, review
-from onionflash.analyze import Analyzer, AnalysisError
+from onionflash.analyze import AnalysisError
 from onionflash.config import DEFAULTS
 from onionflash.render import _prepare_story
 from onionflash.transport import FetchError, Response
 from test_analyze import FakeLLM, completion
-from test_core import analysis, item
 from test_render import STORY
 
 
 def config():
     result = copy.deepcopy(DEFAULTS)
     result["llm"]["base_url"] = "https://llm.example/v1"
-    result["review"] = {"model": "", "timeout_seconds": 90, "connect_timeout_seconds": 10,
-                        "total_timeout_seconds": 120, "max_output_tokens": 2200,
-                        "max_source_chars": 24000, "max_sources": 8, "max_passages": 64,
-                        "passage_chars": 1800, "max_repairs": 1, "max_cache_entries": 2000}
     return result
 
 
@@ -37,17 +33,6 @@ def packet():
             "missing_sources": [], "truncated": False}
 
 
-def verdict(kind="approve", *, repair=None, criterion="source_support"):
-    checks = {name: {"outcome": "pass", "source_refs": ["S1:P1"], "reason": "Supported by the source."}
-              for name in review.CRITERIA}
-    issues = []
-    if kind != "approve":
-        checks[criterion]["outcome"] = "fail"
-        issues = [{"criterion": criterion, "source_refs": ["S1:P1"], "explanation": "The source does not state this claim."}]
-    wire_repair = None if repair is None else {key: repair.get(key) for key in review.EDITABLE}
-    return {"verdict": kind, "criteria": checks, "issues": issues, "repair": wire_repair}
-
-
 def reviewer(monkeypatch, *responses, settings=None):
     monkeypatch.setenv("ONIONFLASH_LLM_API_KEY", "unit-test-secret")
     result = review.Reviewer(settings or config())
@@ -55,44 +40,21 @@ def reviewer(monkeypatch, *responses, settings=None):
     return result
 
 
-def test_normal_path_has_one_draft_and_one_exact_candidate_review(monkeypatch):
-    monkeypatch.setenv("ONIONFLASH_LLM_API_KEY", "unit-test-secret")
-    client = FakeLLM(completion(analysis()), completion(verdict()))
-    writer, checker = Analyzer(config()), review.Reviewer(config())
-    writer.client = checker.client = client
-    draft = writer.analyze(item())
-    public = candidate(**{key: draft[key] for key in review.EDITABLE})
-    assert checker.review(public, packet())["verdict"] == "approve"
-    assert len(client.requests) == 2
-    request = client.requests[1][1]
-    schema = request["response_format"]["json_schema"]["schema"]
-    allowed = sorted(review._packet_refs(packet()))
-    for check in schema["properties"]["criteria"]["properties"].values():
-        assert check["properties"]["source_refs"]["items"]["enum"] == allowed
-    assert "enum" not in review.REFS["items"]  # A request cannot contaminate another packet's schema.
-    assert json.loads(request["messages"][1]["content"]) == {"candidate": public, "packet": packet()}
-
-
-def test_repaired_path_has_three_calls_and_independent_verification(monkeypatch):
-    monkeypatch.setenv("ONIONFLASH_LLM_API_KEY", "unit-test-secret")
-    claim = "Operators must edit their configuration to exclude the compromised node."
-    client = FakeLLM(completion(analysis(why_it_matters=claim)),
-                     completion(verdict("revise", repair={"why_it_matters": ""}, criterion="operational_advice")),
-                     completion(verdict()))
-    writer, checker = Analyzer(config()), review.Reviewer(config())
-    writer.client = checker.client = client
-    draft = writer.analyze(item())
-    public = candidate(**{key: draft[key] for key in review.EDITABLE})
+def test_review_and_its_fresh_verification_send_only_the_exact_candidate_and_packet(monkeypatch):
+    public = candidate(why_it_matters="Operators must edit their configuration to exclude the compromised node.")
+    checker = reviewer(monkeypatch, completion(verdict("revise", repair={"why_it_matters": ""})), completion(verdict()))
     result = checker.review(public, packet())
-    assert result["repair"] == {"why_it_matters": ""}
+    assert result["repair"] == {"why_it_matters": ""}  # The reply's null fields are not edits.
     repaired = review.apply_repair(public, result["repair"])
     assert checker.review(repaired, packet(), verification=True)["verdict"] == "approve"
-    assert len(client.requests) == 3 and public["why_it_matters"] == claim
-    request = client.requests[-1][1]
-    assert len(request["messages"]) == 2
-    assert request["messages"][0]["content"] == review.VERIFY_PROMPT
-    assert json.loads(request["messages"][1]["content"]) == {"candidate": repaired, "packet": packet()}
-    assert claim not in request["messages"][1]["content"]
+    first, second = (body for _, body in checker.client.requests)
+    for check in first["response_format"]["json_schema"]["schema"]["properties"]["criteria"]["properties"].values():
+        assert check["properties"]["source_refs"]["items"]["enum"] == sorted(review._packet_refs(packet()))
+    assert "enum" not in review.REFS["items"]  # A request cannot contaminate another packet's schema.
+    assert json.loads(first["messages"][1]["content"]) == {"candidate": public, "packet": packet()}
+    # Verification starts afresh: its own prompt and the repaired text, never the earlier reply.
+    assert len(second["messages"]) == 2 and second["messages"][0]["content"] == review.VERIFY_PROMPT
+    assert json.loads(second["messages"][1]["content"]) == {"candidate": repaired, "packet": packet()}
 
 
 @pytest.mark.parametrize("bad", ["source-ref", "pass-with-issues", "failed-criterion", "changed-text", "missing-criterion", "missing-refs", "score", "unknown-verdict"])

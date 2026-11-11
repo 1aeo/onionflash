@@ -17,7 +17,11 @@ Operator corrections and retractions retain their separate, trusted local workfl
 5. Publish only an `approve` result with all seven criteria passing, no issues and
    no edits. A `revise` response may propose one minimal semantic repair. Normalize
    that repair, then send its exact text and sources in a fresh verification request.
-6. If verification does not approve, hold the update. Do not apply a second repair.
+6. Hold the update if required source material is unavailable, the review returns
+   `hold`, a `revise` arrives while `max_repairs = 0`, a repair is missing,
+   unchanged or invalid, or verification does not approve. Do not apply a second
+   repair. A candidate that was held before stays held without another review,
+   for example after a source reverts to a held revision.
 
 The normal successful path uses two model calls: writer and reviewer. One repair
 adds a third call. Transport failures may retry through configured endpoints or a
@@ -48,10 +52,13 @@ restatement of a source concern; no extra impact statement is required. A repair
 must remove or minimally correct unsupported claims, not add plausible advice.
 Trusted editorial history labeled superseded is not current reporting.
 
-Candidate and source content are untrusted data. The reviewer has no tools and
-cannot treat instructions embedded in either as authority. The response schema
-constrains references to identifiers in the packet, and application validation
-checks the complete verdict, criteria, references and repair fields again.
+Candidate and source content are untrusted data. The reviewer has no tools, and
+its prompt tells it to disregard instructions, role claims and purported
+approvals embedded in either. This reduces prompt-injection risk but does not
+remove it. The response schema constrains references to identifiers in the
+packet, and application validation checks the complete verdict, criteria,
+references and repair fields again; that checks a verdict's structure, not why
+the model reached it.
 
 ## Sources and exact approvals
 
@@ -59,7 +66,7 @@ The packet uses collected source text, not previous generated summaries as
 evidence. Current source records are preferred when they match the cited URL.
 Retained immutable citations can use exact saved historical snapshots with their
 true dates and historical labels. Text from a newer immutable URL is never labeled
-as the old citation. Missing required material holds the update.
+as the old citation.
 
 Source and passage counts and text lengths are bounded. Truncation is explicit;
 the model may not infer omitted material. Unknown legacy writers require the
@@ -76,69 +83,18 @@ review cannot backdate it.
 
 ## Configuration
 
-The reviewer uses the existing `[llm]` endpoint, fallbacks, credential environment
-and network policy. It defaults to the writer's model. No additional service is
-needed. These settings are configurable:
-
-```toml
-[review]
-model = ""                 # Empty inherits llm.model.
-timeout_seconds = 90
-connect_timeout_seconds = 10
-total_timeout_seconds = 120
-max_output_tokens = 2200
-max_source_chars = 24000
-max_sources = 8
-max_passages = 64
-passage_chars = 1800
-max_repairs = 1             # 0 or 1; never an unbounded rewrite loop.
-max_cache_entries = 2000
-```
-
-The overall application deadline can cut a request short. That leaves its stage
-queued with the normal backoff. Increasing model/source limits also requires a
-model endpoint with enough context and sufficient time in the scheduled run.
+The reviewer uses the `[llm]` endpoint, fallbacks, credential environment and
+network policy, so no additional service is needed. `review.model` selects a
+different model; empty uses `llm.model`. [`config.example.toml`](../config.example.toml)
+lists the other `[review]` settings and their defaults. Raising the source limits
+also needs a model endpoint with enough context and enough time in each run.
 
 ## Private state and operator inspection
 
-`review_jobs` retains one current job per item, including completed draft,
-candidate, source packet, review result and pending verification. Superseded work
-is preserved in private analysis audits before being replaced. Completed commits
-clear their jobs transactionally.
-
-`review_approvals` caches exact approval receipts. The configured cap applies to
-reusable inactive receipts; unfinished approved jobs pin their receipt until
-commit/recovery. Full bounded review evidence remains in `analyses.review_record`,
-including after a job or reusable cache entry is removed. None of these tables or
-source packets are rendered into the public site.
-
-`onionflash status` includes stage/cache counts. A semantic refusal goes directly
-to `rejected`, including a `revise` whose repair is missing, unchanged or invalid;
-automated rewriting stops for that revision. A truncated or invalid reply keeps
-its stage and, like an invalid draft, counts toward the item's three failed
-attempts before it also moves there. Inspect rejected items using:
-
-```sh
-onionflash rejected list --config config.toml
-onionflash rejected show --config config.toml --item ITEM_ID
-```
-
-On a deployment, the protected environment wrapper supplies the config:
-
-```sh
-./deploy.sh app rejected list
-./deploy.sh app rejected show --item ITEM_ID
-```
-
-The private inspection output includes the current candidate, structured findings
-and numbered passages. An explicit retry, with its current content hash and a
-reason, resumes review while retaining the completed writer draft when its inputs
-still match. It never bypasses the gate. See [rejection controls](REJECTED_ANALYSES.md).
-
-Existing published articles remain available. Future automatic publications and
-updates use this gate; unchanged history is not silently rewritten or retracted.
-Locked operator decisions still take precedence. Regular private SQLite backups
-include the review state and audit.
+Review jobs, approval receipts and review audits are private SQLite state; none
+of them, and no source packet, is rendered into the public site.
+`onionflash status` reports stage and cache counts. A hold enters `rejected`,
+where [rejection controls](REJECTED_ANALYSES.md) inspect, retry or dismiss it.
 
 ## Evaluate the configured model
 
