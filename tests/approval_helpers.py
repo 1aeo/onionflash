@@ -39,7 +39,7 @@ class ApprovingReviewer:
     def __exit__(self, *args):
         pass
 
-    def review(self, candidate, packet, *, coverage=None, verification=False):
+    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
         return approved_result(packet)
 
 

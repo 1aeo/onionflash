@@ -31,17 +31,18 @@ class Reviewer:
     """Returns validated verdicts, as review.Reviewer does."""
     def __init__(self, *responses):
         """Script reviewer responses, adding final approval only for approval shorthand."""
-        self.responses, self.calls, self.coverages = list(responses), [], []
+        self.responses, self.calls, self.coverages, self.issues = list(responses), [], [], []
         # A shorthand approval includes an independent final approval. Empty
         # and failure scripts remain strict, so unexpected calls still fail.
         if len(responses) == 1 and (callable(responses[0]) or
                 isinstance(responses[0], dict) and responses[0].get("verdict") == "approve"):
             self.responses.append(verdict())
 
-    def review(self, candidate, packet, *, coverage=None, verification=False):
+    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
         """Capture exact review inputs and validate or raise the next scripted response."""
         self.calls.append((copy.deepcopy(candidate), copy.deepcopy(packet), verification))
         self.coverages.append(copy.deepcopy(coverage))
+        self.issues.append(issue)
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -146,18 +147,263 @@ def test_repair_requires_fresh_verification_and_resumes_that_exact_stage(context
     assert [entry["stage"] for entry in audit["reviews"]] == ["review", "verification"]
 
 
-@pytest.mark.parametrize("second", [verdict("hold"), verdict("revise", repair={"summary": "A different proposed rewrite."}),
-                                    verdict("revise")], ids=["hold", "revise", "revise-without-repair"])
-def test_second_nonapproval_holds_once_and_never_rewrites_again(context, second):
+def failing(action, *criteria, repair=None):
+    """A reply in which each named criterion fails."""
+    reply = verdict(action, repair=repair, criterion=criteria[0])
+    for name in criteria[1:]:
+        reply["criteria"][name].update(reason="The source does not support this claim.", outcome="fail")
+    return reply
+
+
+def audit(store):
+    return json.loads(store.db.execute("SELECT review_record FROM analyses ORDER BY rowid DESC").fetchone()[0])
+
+
+def codes(store, row):
+    return [entry["code"] for entry in decisions.for_item(store.db, row["id"])]
+
+
+def test_verification_repairs_are_verified_fresh_until_one_approves(context):
+    """A verification that refuses proposes its own repair, and each repaired text gets another fresh verification."""
     cfg, store = context
     row = pending(store)
-    checker = Reviewer(verdict("revise", repair={"why_it_matters": ""}), second)
+    checker = Reviewer(verdict(), verdict("revise", repair={"summary": "A first repair."}),
+                       verdict("revise", repair={"summary": "A second repair."}), verdict())
     result = run(cfg, store, row, Writer(), checker)
+    assert result == {"status": "published", "writer_calls": 1, "review_calls": 4, "cache_hit": False}
+    assert [call[2] for call in checker.calls] == [False, True, True, True]
+    # Each verification receives only the latest text, with the same packet and coverage.
+    assert [call[0]["summary"] for call in checker.calls[1:]] == [checker.calls[0][0]["summary"], "A first repair.", "A second repair."]
+    assert all(call[1] == checker.calls[0][1] for call in checker.calls) and all(c == checker.coverages[0] for c in checker.coverages)
+    assert store.stories()[0]["summary"] == "A second repair."
+    assert [entry["stage"] for entry in audit(store)["reviews"]] == ["review", "verification", "verification", "verification"]
+    assert audit(store)["outcome"] == "approved"
+
+
+@pytest.mark.parametrize("case", ["hold", "revise-without-repair", "repeated-text", "tag-notice"])
+def test_verification_refusal_that_cannot_be_repaired_holds(context, case):
+    """Each holds with its own code. A repeated text, which the chain refused once already, costs no further request."""
+    cfg, store = context
+    tag = item(url="https://example.org/tags/tor-0.4.9.16", title="tor-0.4.9.16", kind="tag", content="")
+    incoming, draft = (tag, tag_notice(tag)) if case == "tag-notice" else (item(), analysis())
+    first = verdict() if case == "tag-notice" else verdict("revise", repair={"summary": "A shorter summary."})
+    second, reason = {"hold": (verdict("hold"), "model_hold"),
+                      "revise-without-repair": (verdict("revise"), "unusable_repair"),
+                      "repeated-text": (verdict("revise", repair={"summary": analysis()["summary"]}), "repeated_repair"),
+                      "tag-notice": (verdict("revise", repair={"title": "Tor 0.4.9.16 released"}), "tag_repair")}[case]
+    row = pending(store, incoming)
+    result = run(cfg, store, row, Writer(draft), Reviewer(first, second))
     assert result["status"] == "held" and result["review_calls"] == 2
-    assert store.pending_count() == 0 and store.rejected_count() == 1 and len(store.stories()) == 0
-    assert job(store)["stage"] == "held"
-    audit = json.loads(store.db.execute("SELECT review_record FROM analyses").fetchone()[0])
-    assert audit["outcome"] == "held" and len(audit["reviews"]) == 2
+    assert store.pending_count() == 0 and store.rejected_count() == 1 and store.stories() == [] and job(store)["stage"] == "held"
+    assert store.db.execute("SELECT last_error FROM items").fetchone()[0] == "Final review held: " + review_gate.HOLDS[reason]
+    assert codes(store, row) == ["held.verification." + reason]
+    assert (audit(store)["outcome"], audit(store)["hold_code"], len(audit(store)["reviews"])) == ("held", reason, 2)
+    assert audit(store)["verified_facts"] is False  # the verification failed a factual criterion
+
+
+def test_verification_repairs_stop_after_five_and_the_count_survives_interruption(context):
+    cfg, store = context
+    row = pending(store)
+    repairs = [verdict("revise", repair={"summary": f"Repair number {n}."}) for n in range(7)]
+    # The critique and three verifications each propose a repair; the fourth verification times out.
+    with pytest.raises(AnalysisError):
+        run(cfg, store, row, Writer(), Reviewer(*repairs[:4], AnalysisError("timeout", retryable=True)))
+    assert job(store)["stage"] == "verify"
+    writer, checker = Writer(), Reviewer(*repairs[4:])
+    result = run(cfg, store, row, writer, checker)
+    assert result["status"] == "held" and result["writer_calls"] == 0 and result["review_calls"] == 3
+    assert writer.calls == [] and [call[2] for call in checker.calls] == [True, True, True]
+    assert codes(store, row) == ["held.verification.repairs_exhausted"] and store.stories() == []
+    # Seven reviews: the critique and six verifications. The sixth verification's repair is never applied.
+    shown = rejection.show_item(store, row["id"])["final_review"]
+    assert shown["hold_code"] == "repairs_exhausted" and shown["candidate"]["summary"] == "Repair number 5."
+    assert shown["base_candidate"]["summary"] == analysis()["summary"]
+    assert [(entry["phase"], entry["verdict"]) for entry in shown["reviews"]] == [("review", "revise")] + [("verification", "revise")] * 6
+    assert all(entry["failed"] == {"operational_advice": "fail: The source does not support this claim."} for entry in shown["reviews"])
+    assert [entry["repair"]["summary"] for entry in shown["reviews"]] == [f"Repair number {n}." for n in range(7)]
+
+
+@pytest.mark.parametrize("replies,status", [
+    ([verdict(), verdict("skip", criterion="news_value")], "held"),
+    ([failing("revise", "news_value", "operational_advice", repair={"summary": "A shorter summary."}), verdict()], "held"),
+    ([verdict(), failing("revise", "news_value", "operational_advice", repair={"summary": "A shorter summary."})], "held"),
+    ([failing("revise", "news_value", "operational_advice", repair={"summary": "A shorter summary."}),
+      verdict("skip", criterion="news_value")], "ignored"),
+], ids=["approve-then-skip", "not-news-repair-then-approve", "approve-then-not-news-revise", "both-not-news"])
+def test_reviews_that_disagree_on_news_value_hold(context, replies, status):
+    """A verification that disagrees with the first review on whether news value and new information both pass
+    holds the item, either way and whatever its verdict; reviews that agree the item is not news skip it."""
+    cfg, store = context
+    row = pending(store)
+    result = run(cfg, store, row, Writer(), Reviewer(*replies))
+    assert (result["status"], result["review_calls"]) == (status, 2) and store.stories() == []
+    assert store.db.execute("SELECT last_error FROM items").fetchone()[0] == (
+        "Final review held: the reviews disagree on news value" if status == "held" else "Final review skipped: news_value")
+    assert codes(store, row) == (["held.verification.disagreed_news"] if status == "held" else ["skipped.verification.news_value"])
+
+
+OFFICIAL = {"authority": "official", "kind": "feed"}
+
+
+@pytest.mark.parametrize("source,replies,status,code", [
+    (OFFICIAL, [verdict("skip", criterion="news_value")] * 2, "held", "held.verification.official_not_news"),
+    (OFFICIAL, [verdict("skip", criterion="news_value"),
+                failing("revise", "news_value", "operational_advice", repair={"summary": "A shorter summary."}),
+                verdict("skip", criterion="news_value")], "held", "held.verification.official_not_news"),
+    (OFFICIAL, [verdict("revise", criterion="news_value"), verdict("skip", criterion="news_value")],
+     "held", "held.verification.official_not_news"),
+    (OFFICIAL, [verdict("revise", criterion="news_value"), failing("revise", "news_value", "operational_advice")],
+     "held", "held.verification.unusable_repair"),
+    (OFFICIAL, [verdict("skip", criterion="new_information")], "ignored", "skipped.review.new_information"),
+    (OFFICIAL, [failing("skip", "news_value", "new_information")], "ignored", "skipped.review.new_information_and_news_value"),
+    (OFFICIAL, [{**verdict("skip", criterion="news_value"),
+                 "criteria": {**verdict("skip", criterion="news_value")["criteria"],
+                              "new_information": {"reason": "Coverage is truncated.", "source_refs": [], "outcome": "insufficient"}}}],
+     "held", "held.review.model_hold"),
+    # Neither review finds the item news, so the verification's finding that it is covered already stands.
+    (OFFICIAL, [verdict("skip", criterion="news_value"), verdict("skip", criterion="new_information")],
+     "ignored", "skipped.verification.new_information"),
+    ({}, [verdict("skip", criterion="news_value")], "ignored", "skipped.review.news_value"),
+    ({**OFFICIAL, "kind": "tag", "title": "tor-0.4.9.16", "content": ""}, [verdict("skip", criterion="news_value")],
+     "ignored", "skipped.review.news_value"),
+], ids=["official-feed-news_value", "official-feed-fact-repair", "official-feed-no-usable-repair",
+        "official-feed-verification-without-a-usable-repair", "official-feed-new_information-only",
+        "official-feed-both", "official-feed-uncertain-novelty", "official-feed-then-duplicate",
+        "development-item", "official-tag"])
+def test_official_item_failing_news_value_is_held_not_skipped(context, source, replies, status, code):
+    """Only news value failing on an official item other than a tag holds it, after a fresh verification passed
+    its facts (repairing them first if needed, unless a verification's repair cannot be applied); a duplicate still skips."""
+    cfg, store = context
+    row = pending(store, item(**source))
+    checker = Reviewer(*replies)
+    result = run(cfg, store, row, Writer(), checker)
+    assert (result["status"], result["review_calls"]) == (status, len(replies)) and codes(store, row) == [code]
+    if status == "held":
+        reason = code.rsplit(".", 1)[1]
+        assert [call[2] for call in checker.calls] == [False] + [True] * (len(replies) - 1)
+        assert (audit(store)["hold_code"], audit(store)["verified_facts"]) == (reason, reason == "official_not_news")
+        assert store.db.execute("SELECT last_error FROM items").fetchone()[0] == "Final review held: " + review_gate.HOLDS[reason]
+
+
+def test_a_hold_whose_verification_cites_no_source_does_not_record_verified_facts(context):
+    cfg, store = context
+    uncited = verdict("skip", criterion="news_value")
+    uncited["criteria"]["source_support"]["source_refs"] = []
+    row = pending(store, item(**OFFICIAL))
+    assert run(cfg, store, row, Writer(), Reviewer(verdict("skip", criterion="news_value"), uncited))["status"] == "held"
+    assert (audit(store)["hold_code"], audit(store)["verified_facts"]) == ("official_not_news", False)
+
+
+@pytest.mark.parametrize("draft,replies,flags,status,code", [
+    ({"category": "release", "tags": ["release"]},
+     [verdict(), verdict("revise", repair={"category": "security", "tags": ["security"]}, criterion="status"), verdict()],
+     [False, False, True], "published", None),
+    ({}, [verdict(), verdict("revise", repair={"category": "release"}), verdict(),
+          verdict("revise", repair={"category": "feature", "tags": ["feature"]}, criterion="status"), verdict()],
+     [False, True, True, False, True], "published", None),
+    ({"category": "release", "tags": ["release"]}, [verdict(), verdict()], [False, False], "held", "held.review.release_labels"),
+    ({"category": "release", "tags": ["release"]}, [verdict(), verdict("revise", repair={"summary": "A shorter summary."})],
+     [False, False], "held", "held.review.release_labels"),
+    ({"category": "release", "tags": ["release"]}, [verdict(), verdict("hold", criterion="status")],
+     [False, False], "held", "held.review.release_labels"),
+    ({"category": "release", "tags": ["release"]}, [verdict(), verdict("skip", criterion="news_value")],
+     [False, False], "held", "held.review.disagreed_news"),
+], ids=["repaired", "introduced-by-a-verification", "unfixed", "left-by-a-repair", "held-by-the-request", "disagreed-by-the-request"])
+def test_release_labels_on_an_unreleased_story_get_a_repair_request_then_a_fresh_verification(context, draft, replies, flags, status, code):
+    """An approval of release labels on a state that is not released or tagged asks a review to repair them, naming
+    the problem, and a fresh verification checks the repair; labels the request leaves in place, or holds, hold."""
+    cfg, store = context
+    row = pending(store)
+    checker = Reviewer(*replies)
+    result = run(cfg, store, row, Writer(analysis(**draft)), checker)
+    assert result["status"] == status and [call[2] for call in checker.calls] == flags
+    repair = flags.index(False, 1)  # the repair request
+    assert checker.issues == [review.RELEASE_ISSUE if n == repair else None for n in range(len(flags))]
+    assert audit(store)["reviews"][repair]["issue"] == "release_labels"
+    if status == "published":
+        assert store.stories()[0]["category"] != "release" and "release" not in store.stories()[0]["tags"]
+    else:
+        assert codes(store, row) == [code] and audit(store)["verified_facts"] is False
+
+
+FIVE_REPAIRS = [verdict("revise", repair={"summary": f"Repair number {n}."}) for n in range(5)]
+
+
+@pytest.mark.parametrize("replies,code", [
+    # A request after the sixth review would leave no verification for its repair.
+    ([verdict("revise", repair={"summary": "A first repair."}), *FIVE_REPAIRS[:4], verdict()], "held.verification.release_labels"),
+    ([verdict("revise", repair={"summary": "A first repair."}), *FIVE_REPAIRS, verdict()], "held.verification.release_labels"),
+    ([verdict(), verdict("revise", repair={"category": "security", "tags": ["security"]}, criterion="status"), *FIVE_REPAIRS],
+     "held.verification.repairs_exhausted"),
+], ids=["labels-approved-after-four-repairs", "labels-approved-after-five-repairs", "after-a-release-label-request"])
+def test_an_item_gets_at_most_seven_review_requests(context, replies, code):
+    """At most five repairs follow the first review, a release-label repair request counting as one."""
+    cfg, store = context
+    row = pending(store)
+    result = run(cfg, store, row, Writer(analysis(category="release", tags=["release"])), Reviewer(*replies))
+    assert (result["status"], result["review_calls"]) == ("held", len(replies)) and codes(store, row) == [code]
+
+
+def test_a_decision_after_several_repairs_resumes_from_its_receipt_without_a_model_call(context, monkeypatch):
+    cfg, store = context
+    row = pending(store)
+    commit = store.commit_candidate
+    monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash before commit")))
+    checker = Reviewer(verdict("revise", repair={"summary": "A first repair."}),
+                       verdict("revise", repair={"summary": "A second repair."}), verdict())
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        run(cfg, store, row, Writer(), checker)
+    monkeypatch.setattr(store, "commit_candidate", commit)
+    writer, resumed = Writer(), Reviewer()
+    result = run(cfg, store, row, writer, resumed, allow_network=False)
+    assert result["status"] == "published" and result["cache_hit"] and writer.calls == resumed.calls == []
+    assert store.stories()[0]["summary"] == "A second repair."
+
+
+@pytest.mark.parametrize("column", ["draft_json", "envelope_json", "record_json"])
+@pytest.mark.parametrize("kind", DAMAGE)
+def test_a_damaged_review_job_fails_the_item_and_is_never_reviewed_afresh(context, column, kind):
+    cfg, store = context
+    row = pending(store)
+    with pytest.raises(AnalysisError):
+        run(cfg, store, row, Writer(), Reviewer(verdict(), AnalysisError("timeout", retryable=True)))
+    with store.db:
+        store.db.execute(f"UPDATE review_jobs SET {column}=CAST(? AS TEXT)", (damaged(job(store)[column], kind),))
+    writer, checker = Writer(), Reviewer()
+    with pytest.raises(AnalysisError, match="Saved review job is damaged") as caught:
+        run(cfg, store, row, writer, checker)
+    assert (caught.value.retryable, caught.value.code) == (False, "app.damaged_job") and writer.calls == checker.calls == []
+
+
+def test_a_damaged_review_job_never_stops_the_run(context, monkeypatch):
+    from onionflash import cli
+    cfg, store = context
+    cfg["sources"] = []
+    row = pending(store)
+    with pytest.raises(AnalysisError):
+        run(cfg, store, row, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
+    with store.db:
+        store.db.execute("UPDATE review_jobs SET record_json=CAST(? AS TEXT)", (b'{"\xff"',))
+    monkeypatch.setattr(cli, "build", lambda *args: {})
+    for _ in range(3):  # three failures reject it
+        assert cli.run(cfg, store)["analysis_failed"] == 1
+        with store.db:
+            store.db.execute("UPDATE items SET next_attempt_at=NULL")
+    assert tuple(store.db.execute("SELECT status,last_error FROM items").fetchone()) == ("rejected", "Saved review job is damaged")
+    assert codes(store, row) == ["failed.app.damaged_job"]
+
+
+@pytest.mark.parametrize("draft,stage", [({}, "verify"), ({"category": "release", "tags": ["release"]}, "repair")])
+def test_pending_resumes_an_unfinished_verification_or_repair_before_new_work(context, draft, stage):
+    cfg, store = context
+    store.ingest(item(), DATE)
+    store.ingest(item(url="https://example.org/routine", title="A routine report", labels=[]), DATE)
+    first, routine = store.pending(2, LATER)
+    assert routine["url"].endswith("/routine")  # it sorts after the security report
+    with pytest.raises(AnalysisError):
+        run(cfg, store, routine, Writer(analysis(**draft)), Reviewer(verdict(), AnalysisError("timeout", retryable=True)))
+    assert job(store)["stage"] == stage
+    assert [row["url"] for row in store.pending(2, LATER)] == [routine["url"], first["url"]]
 
 
 @pytest.mark.parametrize("repair", [None, {"title": analysis()["title"]}, {"title": ""}],
@@ -197,7 +443,7 @@ def test_completed_decision_resumes_after_crash_without_any_model_call(context, 
 
 @pytest.mark.parametrize("receipt", ["damaged", "missing"])
 def test_a_recorded_decision_without_a_usable_receipt_reviews_the_draft_again(context, monkeypatch, receipt):
-    """The repaired text is not reviewed as a first draft, so it cannot be repaired a second time."""
+    """Nothing shows that the repaired text was verified, so the review starts again from the writer's draft."""
     cfg, store = context
     row = pending(store)
     commit = store.commit_candidate
@@ -657,7 +903,7 @@ def test_unusable_replies_and_drafts_take_strikes_and_the_run_still_builds(conte
 
     class Replies:
         calls = 0
-        def review(self, candidate, packet, *, coverage=None, verification=False):
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
             """Return malformed replies only for the designated failure fixtures."""
             return review.validate_review({} if "/reply" in packet["sources"][0]["url"] else verdict(), packet)
 

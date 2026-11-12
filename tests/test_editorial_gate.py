@@ -5,7 +5,7 @@ import json
 import pytest
 
 from approval_helpers import approve, verdict
-from onionflash import candidate
+from onionflash import candidate, review_gate
 from onionflash.analyze import Analyzer, AnalysisError, tag_notice
 from onionflash.store import ReviewRequired
 from test_core import DATE, analysis, item
@@ -138,21 +138,21 @@ def test_recent_query_does_not_scan_unbounded_history_to_replace_retracted_rows(
 
 @pytest.mark.parametrize("final", ["hold", "skip"])
 def test_initial_approval_cannot_publish_when_fresh_verification_refuses(context, final):
-    """Make the final verdict authoritative when the first review approved the draft."""
+    """A verification refusal after an initial approval holds; a skip there disagrees with the approval."""
     cfg, store = context
     row = pending(store)
     response = skipped() if final == "skip" else verdict("hold")
     checker = Reviewer(verdict(), response)
     result = run(cfg, store, row, Writer(), checker)
-    assert result["status"] == ("ignored" if final == "skip" else "held")
+    assert result["status"] == "held"
     assert result["writer_calls"] == 1 and result["review_calls"] == 2
     assert [call[2] for call in checker.calls] == [False, True]
     assert checker.calls[0][:2] == checker.calls[1][:2]
     assert store.stories() == []
-    if final == "hold":
-        # The hold's text names no stage; its decision code does.
-        assert store.db.execute("SELECT last_error FROM items").fetchone()[0] == "Final review held: review did not approve the candidate"
-        assert store.db.execute("SELECT code FROM decision_log").fetchone()[0] == "held.verification.model_hold"
+    # The hold's text names no stage; its decision code does.
+    reason = "disagreed_news" if final == "skip" else "model_hold"
+    assert store.db.execute("SELECT last_error FROM items").fetchone()[0] == "Final review held: " + review_gate.HOLDS[reason]
+    assert store.db.execute("SELECT code FROM decision_log").fetchone()[0] == "held.verification." + reason
 
 
 def test_interrupted_verification_restarts_the_critique_when_coverage_changes(context):

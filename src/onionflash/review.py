@@ -190,6 +190,8 @@ the draft also contains factual defects; do not spend repairs polishing an item 
 should not publish. If you cannot tell whether the packet is news or new, hold.
 For important new material whose support is insufficient for a defensible account,
 use hold with repair null.
+An application_issue, when present, is a problem the application found in the
+candidate, not evidence. Repair it with the smallest change the packet supports, or hold.
 If all factual and editorial criteria pass, approve.
 A proposed repair is NOT approval: another fresh review must verify the exact result.
 An initial approval also requires a separate fresh verification before publication.
@@ -204,11 +206,16 @@ Check the headline and classification arrays as carefully as the summary.
 Any unsupported claim must prevent approval, even if the rest is accurate.
 
 """ + SYSTEM_PROMPT + """
-This is the final verification request. Evaluate the supplied candidate independently
+This is a fresh verification request. Evaluate the supplied candidate independently
 against the packet and coverage background; it may contain mistakes from an earlier
-edit. You may only approve, hold or skip. Never propose another repair, request another
-rewrite, or rely on an earlier verdict.
+edit. Do not rely on an earlier verdict. If unsupported wording or classification can
+be fixed from this packet, return revise with the smallest repair; another fresh
+verification checks every repair before anything publishes. Your approval publishes
+this exact candidate.
 """
+# The problem that review_gate.next_step names when it asks a review to repair release labels.
+RELEASE_ISSUE = ("A release category or tag needs state released or tagged: remove the release labels, "
+                 "or correct the state, as the packet supports.")
 
 
 class ReviewError(AnalysisError):
@@ -230,7 +237,7 @@ def policy_hash(config: dict) -> str:
     llm = _llm(config)
     identity = {key: llm[key] for key in ("model", "base_url", "fallback_base_urls", "max_output_tokens",
                                          "enable_thinking", "send_chat_template_kwargs")}
-    return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, SCHEMA, identity])
+    return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, RELEASE_ISSUE, SCHEMA, identity])
 
 
 def _text(value, maximum: int, *, empty: bool = False) -> None:
@@ -391,8 +398,10 @@ class Reviewer(CompletionClient):
     def __init__(self, config: dict, deadline: float | None = None):
         super().__init__({**config, "llm": _llm(config)}, deadline=deadline)
 
-    def review(self, candidate_public: dict, packet: dict, *, coverage: dict | None = None, verification: bool = False) -> dict:
-        """Review one exact candidate without carrying forward earlier model replies."""
+    def review(self, candidate_public: dict, packet: dict, *, coverage: dict | None = None, verification: bool = False,
+               issue: str | None = None) -> dict:
+        """Review one exact candidate without carrying forward earlier model replies; `issue` names a
+        problem the application found in it."""
         refs = _packet_refs(packet)
         schema = copy.deepcopy(SCHEMA)
         if refs:
@@ -408,16 +417,12 @@ class Reviewer(CompletionClient):
         payload = {"candidate": candidate_public, "packet": packet}
         if coverage is not None:
             payload["coverage_background"] = coverage
+        if issue is not None:
+            payload["application_issue"] = issue
         result = self.complete(VERIFY_PROMPT if verification else SYSTEM_PROMPT,
                                payload, schema, "onionflash_review")
         result = _validate(result, refs, wire=True)
-        criteria, verdict = result["criteria"], result["verdict"]
-        if verdict == "approve" and not release_labels_match_state(candidate_public):
-            criteria = {**criteria, "status": {"reason": "Release labels require a released or tagged state.",
-                                               "source_refs": [], "outcome": "fail"}}
-            verdict = "hold"
-        elif verdict == "skip" and not _skip_stands(criteria, coverage):
-            verdict = "hold"
-        if verdict != result["verdict"]:  # the record keeps the verdict a fixed rule replaced
-            result = {**result, "criteria": criteria, "verdict": verdict, "model_verdict": result["verdict"]}
+        if result["verdict"] == "skip" and not _skip_stands(result["criteria"], coverage):
+            # The record keeps the verdict that this fixed rule replaced.
+            result = {**result, "verdict": "hold", "model_verdict": "skip"}
         return result

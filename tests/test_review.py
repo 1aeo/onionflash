@@ -99,18 +99,17 @@ def test_release_metadata_allows_announced_and_tagged_states(monkeypatch, state,
     assert result["verdict"] == "approve"
 
 
-@pytest.mark.parametrize("category,tags", [("release", ["feature"]), ("feature", ["release"]), ("release", ["release"])])
-@pytest.mark.parametrize("verification", [False, True])
-def test_release_labels_cannot_approve_a_merged_change(monkeypatch, category, tags, verification):
-    """A model approval cannot override contradictory publication metadata."""
-    public = candidate(state="merged", category=category, tags=tags)
-    before = copy.deepcopy(public)
-    raw = verdict()
-    result = reviewer(monkeypatch, completion(raw)).review(public, packet(), verification=verification)
-    assert result["verdict"] == "hold" and result["repair"] is None
-    assert result["criteria"]["status"]["outcome"] == "fail" and result["model_verdict"] == "approve"
-    assert all(result["criteria"][key] == raw["criteria"][key] for key in review.CRITERIA if key != "status")
-    assert review.validate_review(result, packet()) == result and public == before
+def test_release_labels_on_a_merged_change_are_left_to_the_gate_which_names_the_problem(monkeypatch):
+    """The review returns the model's approval; the gate asks a review to repair the labels, naming the problem
+    beside the candidate (review_gate.next_step decides when)."""
+    public = candidate(state="merged", category="release", tags=["release"])
+    checker = reviewer(monkeypatch, completion(verdict()))
+    result = checker.review(public, packet(), issue=review.RELEASE_ISSUE)
+    assert result == review.validate_review(verdict(), packet()) and "model_verdict" not in result
+    body = checker.client.requests[0][1]
+    assert body["messages"][0]["content"] == review.SYSTEM_PROMPT
+    assert json.loads(body["messages"][1]["content"]) == {"candidate": public, "packet": packet(),
+                                                          "application_issue": review.RELEASE_ISSUE}
 
 
 def unit(kind, *texts, authority="development", state=""):
@@ -346,7 +345,7 @@ def test_final_verification_nonapproval_is_an_explicit_verdict_for_the_gate(monk
     public = candidate()
     revised = checker.review(public, packet(), verification=True)
     assert revised["verdict"] == "revise" and public == candidate()
-    # The durable gate holds this verdict and never applies a second repair.
+    # The durable gate applies this repair and sends the result to another fresh verification.
     held = reviewer(monkeypatch, completion(verdict("hold"))).review(candidate(), packet(), verification=True)
     assert held["verdict"] == "hold" and held["repair"] is None
 
@@ -418,3 +417,5 @@ def test_policy_hash_binds_effective_model_and_endpoint_but_not_credentials(monk
         changed = copy.deepcopy(cfg)
         changed[section][key] = value
         assert review.policy_hash(changed) != initial
+    monkeypatch.setattr(review, "RELEASE_ISSUE", "changed")
+    assert review.policy_hash(cfg) != initial

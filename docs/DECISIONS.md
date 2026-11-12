@@ -30,8 +30,8 @@ after a rollback, are not in it.
 A code is `<outcome>.<stage>.<reason>` or `<outcome>.<reason>`. The outcome is
 `published`, `skipped`, `held`, `failed` or `operator`. The stage names where the
 decision was made: `gate` (the application's checks around the review), `review`
-(the first review; in `failed` codes, a request to the reviewer, the first review
-or the verification), `verification` (the fresh verification), `final_check` (the
+(the first review, or a request to repair release labels; in `failed` codes, any
+request to the reviewer), `verification` (a fresh verification), `final_check` (the
 [final checks](FINAL_REVIEW.md#final-checks) of a verified approval), `writer`,
 or `app`. Codes are stable, so counts can be compared over time.
 
@@ -48,10 +48,20 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `held.gate.missing_sources` | Source material the candidate cites is unavailable. |
 | `held.gate.repeat_hold` | The candidate was held before, for example after a source reverted. |
 | `held.gate.story_locked` | The item updates a story that an editorial correction locked. |
-| `held.review.model_hold` | The first review held the candidate. |
-| `held.verification.model_hold` | The verification did not approve the candidate. |
+| `held.review.model_hold` | The first review held the candidate, or could not confirm whether an official item was already covered. |
+| `held.verification.model_hold` | A verification held the candidate, or refused it on news value or new information (a repair it proposes for an official item's facts is applied and verified instead). |
 | `held.review.tag_repair` | The review proposed editing a literal tag notice. |
+| `held.verification.tag_repair` | A verification proposed editing a literal tag notice. |
 | `held.review.unusable_repair` | The review proposed a repair that cannot be applied. |
+| `held.verification.unusable_repair` | A verification proposed a repair that cannot be applied. |
+| `held.review.repeated_repair` | A release-label repair request proposed a text the item's reviews already refused. |
+| `held.verification.repeated_repair` | A verification proposed a text the item's reviews already refused. |
+| `held.review.disagreed_news` | A release-label repair request and the first review disagree on whether news value and new information both pass. |
+| `held.verification.disagreed_news` | A verification and the first review disagree on whether news value and new information both pass. |
+| `held.review.release_labels` | A release-label repair request held the candidate, or left a release label on a state that is not released or tagged. |
+| `held.verification.release_labels` | A verification approved a release label on a state that is not released or tagged, with no attempt left to repair it. |
+| `held.verification.official_not_news` | An official item, other than a tag, failed news value in a verification that passed its facts. |
+| `held.verification.repairs_exhausted` | A verification still refused the candidate after the repair limit. |
 | `held.final_check.completed_action` | A story written from an issue reports a completed action that its sources do not. |
 | `held.final_check.compromise_headline` | The headline drops the sources' doubt about a compromise. |
 | `held.final_check.confirmed_source` | The story is confirmed without an official announcement or a merged merge request. |
@@ -70,6 +80,7 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `failed.app.invalid_tag_name` | A collected tag has an empty or overlong name. |
 | `failed.app.unexpected` | Processing failed unexpectedly. |
 | `failed.app.damaged_item` | The item's saved copy is damaged. |
+| `failed.app.damaged_job` | The item's saved review job is damaged. |
 | `operator.retried` | An operator retried a rejected, dismissed or failed item. |
 | `operator.reconsidered` | An operator retried an ignored (skipped) item. |
 | `operator.dismissed` | An operator dismissed an item. |

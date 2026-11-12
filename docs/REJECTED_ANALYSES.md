@@ -31,13 +31,16 @@ for items a review skipped; a skip's reason names the criteria that did not pass
 
 `show` prints the saved source item, up to 20 recent operator actions, the
 item's 20 newest entries in the [decision log](DECISIONS.md), and the final
-review's stage, current candidate, numbered source packet (for checking
-references such as `S1:P3`), coverage background and latest per-criterion
-verdict. They come from the item's review job or, once a commit has finished the
-current revision, from the decision that commit recorded, with stage `finished`,
-until the deployment's private evidence retention archives that record.
-That verdict's `candidate_hash` names the text it evaluated; during `verify`, the
-candidate shown is the unchanged draft or its one repair. The output is private
+review's stage, hold code, current candidate and the draft it started from
+(`base_candidate`), numbered source packet (for checking references such as
+`S1:P3`), coverage background, every review of the current chain (its phase,
+verdict, `candidate_hash`, failed criteria with their reasons, and repair) and the
+latest per-criterion verdict in full. They come from the item's review job or,
+once a commit has finished the current revision, from the decision that commit
+recorded, with stage `finished`, until the deployment's private evidence
+retention archives that record. Each `candidate_hash` names the text that review
+evaluated; during `verify` or `repair`, the candidate shown is the unchanged draft
+or its latest repair. The output is private
 operator data. `show` also accepts an explicit pending or ignored item ID;
 inspect the saved source and decision before deciding whether to intervene.
 
@@ -58,7 +61,9 @@ a damaged saved copy (not a JSON object in UTF-8 text) before any model call, as
 `Stored source item is damaged`. Collection replaces the copy when it sees the
 item again, and an unchanged revision keeps its status, so retry it then. For a
 GitLab issue whose source takes part in comment checks, the first comment check
-that succeeds adds its notes back and decides whether they changed.
+that succeeds adds its notes back and decides whether they changed. A review job
+whose saved record cannot be read fails the item without a model call, as
+`Saved review job is damaged`; retry starts its review again.
 
 The next scheduled run resumes the item. A completed writer draft in its current
 review job is retained; the writer runs again only if its source or writer-input

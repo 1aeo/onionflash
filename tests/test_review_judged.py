@@ -16,6 +16,7 @@ import unicodedata
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from approval_helpers import approved_result
 from onionflash.config import DEFAULTS
 from onionflash.review import CRITERIA, _packet_refs, release_labels_match_state
 
@@ -237,8 +238,8 @@ def test_judged_corpus_is_public_and_labeled(tmp_path, monkeypatch, capsys):
             return self
         def __exit__(self, *args):
             pass
-        def review(self, candidate, packet, *, coverage=None, verification=False):
-            return {"verdict": "approve"}
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
+            return approved_result(packet)
 
     config = copy.deepcopy(DEFAULTS)
     config["storage"]["output_dir"] = str(tmp_path / "public")

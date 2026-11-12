@@ -15,7 +15,8 @@ import time
 from onionflash.analyze import AnalysisError, Analyzer
 from onionflash.config import load_config
 from onionflash.render import _prepare_story
-from onionflash.review import EDITABLE, Reviewer, ReviewError, apply_repair, final_holds, policy_hash
+from onionflash.review import EDITABLE, Reviewer, final_holds, policy_hash
+from onionflash.review_gate import call_review, next_step
 
 CASE_FILES = ("review_cases.json", "review_cases_judged.json")
 # A judged case names the flaw of its labeled wording or labels; one without a flaw is clean.
@@ -117,12 +118,6 @@ def omitted(case: dict, story: dict) -> list[str]:
     return [phrase for phrase in case.get("required", []) if phrase.casefold() not in text]
 
 
-def model_verdict(reviewer, result: dict) -> str | None:
-    """The model's own verdict when validation replaced it."""
-    verdict = (reviewer.last_decoded or {}).get("verdict", result["verdict"])
-    return None if verdict == result["verdict"] else verdict
-
-
 def target_missed(judged: dict) -> list[str]:
     """Name each judged target a run missed: the paired catch rate overall and for every
     flaw with enough distinct cases, and the false-alarm rate. An empty set passes."""
@@ -167,8 +162,8 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
     descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     totals = {"cases": 0, "matched": 0, "false_approvals": 0, "positive_rejections": 0, "omissions": 0,
               "errors": 0, "editorial_misses": 0, "impact_cleared": 0, "draft_unsupported": 0, "repairs_verified": 0,
-              "repairs_held": 0, "repairs_skipped": 0, "final_holds": 0, "published_after_checks": 0,
-              "controlled_mismatches": 0, "incomplete": False}
+              "repairs_held": 0, "repairs_skipped": 0, "verification_repairs": 0, "holds": {}, "final_holds": 0,
+              "published_after_checks": 0, "controlled_mismatches": 0, "incomplete": False}
     judged, outcomes, seen = {}, {}, set()
     identity = policy_hash(config)
     with (os.fdopen(descriptor, "w", encoding="utf-8") as report, EvaluationReviewer(config, deadline=deadline) as reviewer,
@@ -200,41 +195,45 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                             {**candidate, **{field: drafts[key][field] for field in EDITABLE}}, editorial=candidate.get("editorial"))
                         record["draft_kept_unsupported"] = kept_unsupported(case, candidate)
                         totals["draft_unsupported"] += bool(record["draft_kept_unsupported"])
-                    result = reviewer.review(candidate, case["packet"], coverage=case.get("existing_coverage"))
-                    record["result"] = result
-                    if model := model_verdict(reviewer, result):
-                        record["model_verdict"] = model
-                    final_verdict = result["verdict"]
-                    published = unsafe = False  # only a verified candidate publishes
-                    if final_verdict == "revise" and case["packet"]["sources"][0]["kind"] == "tag":
-                        final_verdict = "hold"  # the gate keeps tag notices literal
-                        totals["repairs_held"] += 1
-                    if final_verdict == "revise":
-                        try:
-                            record["repaired"] = apply_repair(candidate, result["repair"])
-                        except ReviewError as exc:  # the gate holds an unusable repair
-                            final_verdict, record["repair_error"] = "hold", str(exc)
-                            totals["repairs_held"] += 1
-                    if final_verdict in {"approve", "revise"}:
-                        final_candidate = record.get("repaired", candidate)
-                        verified = reviewer.review(final_candidate, case["packet"],
-                                                   coverage=case.get("existing_coverage"), verification=True)
-                        record.update(verification=verified, kept_unsupported=kept_unsupported(case, final_candidate))
-                        if model := model_verdict(reviewer, verified):
-                            record["verification_model_verdict"] = model
-                        if result["verdict"] == "revise":
-                            totals[{"approve": "repairs_verified", "skip": "repairs_skipped"}.get(verified["verdict"], "repairs_held")] += 1
-                        final_verdict = verified["verdict"]
-                        published = final_verdict == "approve"
-                        unsafe = published and (case["expected"] in {"skip", "hold"} or bool(record["kept_unsupported"]))
-                        if published:  # scores measure the reviewer alone; the gate's final checks count apart
-                            # The first source wrote the candidate, as in draft mode.
-                            prepared = {"packet": case["packet"], "payload": {"editorial_kind": case["packet"]["sources"][0]["kind"]}}
-                            if held := final_holds(final_candidate, prepared):
-                                record["final_holds"] = held
-                            totals["final_holds"] += bool(held)
-                            totals["published_after_checks"] += not held
-                    published_candidate = record.get("repaired", candidate) if published else None
+                    # The reviews follow the gate's steps. The first source is the item that wrote the candidate,
+                    # as in draft mode.
+                    source = case["packet"]["sources"][0]
+                    prepared = {"packet": case["packet"], "coverage": case.get("existing_coverage"),
+                                "payload": {"editorial_kind": source["kind"]}, "row": {"payload": json.dumps(writer_item(source))}}
+                    stage, text, record["reviews"] = "review", candidate, []
+                    while True:
+                        record["reviews"].append(call_review(reviewer, stage, text, prepared))
+                        action, value = next_step(record["reviews"], text, prepared)
+                        if action not in {"verify", "repair"}:
+                            break
+                        stage, text = action, value
+                    first = record["reviews"][0]["result"]
+                    last = next((entry["result"] for entry in reversed(record["reviews"]) if entry["stage"] == "verification"), None)
+                    record.update(result=first, kept_unsupported=kept_unsupported(case, text))
+                    if last:
+                        record["verification"] = last
+                    for field, reply in (("model_verdict", first), ("verification_model_verdict", last or {})):
+                        if "model_verdict" in reply:  # the model's own verdict, where a fixed rule replaced it
+                            record[field] = reply["model_verdict"]
+                    # Scores treat a verified approval as published, so they measure the reviewer alone;
+                    # the gate's final checks count apart.
+                    checked = action == "hold" and value[0] == "final_check"
+                    published = action == "approve" or checked
+                    if action == "hold":
+                        record["hold"] = code = ".".join(("held", *value))
+                        totals["holds"][code] = totals["holds"].get(code, 0) + 1
+                    if checked:
+                        record["final_holds"] = final_holds(text, prepared)
+                    totals["final_holds"] += checked
+                    totals["published_after_checks"] += action == "approve"
+                    record["verification_repairs"] = sum(entry["stage"] == "verification" and entry["result"]["verdict"] == "revise"
+                                                         for entry in record["reviews"][:-1])
+                    totals["verification_repairs"] += record["verification_repairs"]
+                    if record["result"]["verdict"] == "revise":
+                        totals["repairs_verified" if published else "repairs_skipped" if action == "skip" else "repairs_held"] += 1
+                    final_verdict = "approve" if published else action
+                    unsafe = published and (case["expected"] in {"skip", "hold"} or bool(record["kept_unsupported"]))
+                    published_candidate = text if published else None
                     missing = omitted(case, published_candidate) if published else []
                     # not_approve marks news with a flawed draft: hold or a clean repair, never a skip.
                     missed = (final_verdict == "skip") != (case["expected"] == "skip") and case["expected"] != "approve"

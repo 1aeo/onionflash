@@ -18,13 +18,14 @@ CODES = frozenset({
     *(f"skipped.{stage}.{reason}" for stage in ("review", "verification")
       for reason in ("news_value", "new_information", "new_information_and_news_value")),
     "held.gate.missing_sources", "held.gate.repeat_hold", "held.gate.story_locked",
-    "held.review.model_hold", "held.verification.model_hold",
-    "held.review.tag_repair", "held.review.unusable_repair",
+    *(f"held.{stage}.{reason}" for stage in ("review", "verification")
+      for reason in ("model_hold", "tag_repair", "unusable_repair", "repeated_repair", "disagreed_news", "release_labels")),
+    "held.verification.official_not_news", "held.verification.repairs_exhausted",
     *(f"held.final_check.{reason}" for reason in ("completed_action", "compromise_headline", "confirmed_source", "merge_state")),
     *(f"failed.writer.{reason}" for reason in ("invalid_output", "evidence_too_short", "evidence_not_exact",
                                                "no_literal_evidence", "invalid_input", "truncated", "invalid_json")),
     *(f"failed.review.{reason}" for reason in ("invalid_reply", "invalid_input", "truncated", "invalid_json")),
-    "failed.app.invalid_tag_name", "failed.app.unexpected", "failed.app.damaged_item",
+    "failed.app.invalid_tag_name", "failed.app.unexpected", "failed.app.damaged_item", "failed.app.damaged_job",
     "operator.retried", "operator.reconsidered", "operator.dismissed",
 })
 EDITORIAL = ("new_information", "news_value")

@@ -59,8 +59,10 @@ may appear in the summary with its audience, scope and prerequisites preserved.
 Historical impact text remains readable. A review repair may clear it, but cannot
 create or rewrite an impact paragraph; operator corrections remain separate.
 Automatic approvals also require consistent metadata: a `release` category or
-tag needs state `released` or `tagged`. An inconsistent approval is held. This
-check does not infer facts from source text.
+tag needs state `released` or `tagged`. An approval of inconsistent labels gets a
+repair request that names the problem, then a fresh verification of the repaired
+text; labels that the request leaves in place hold the item. This check does not
+infer facts from source text.
 
 Existing issue/release identities allow meaningful updates to the same article.
 A potentially important follow-up with no established article match can be a
@@ -70,21 +72,41 @@ not change another article's identity or overwrite a protected correction.
 ## Decisions and calls
 
 - `approve`: every criterion passes, with no edits. An initial approval
-  advances to fresh final verification; it cannot publish by itself.
-- `revise`: one minimal repair is allowed, followed by fresh verification of its
-  exact normalized text. No rewrite loop or second repair is applied. Tag notices
-  stay literal, so a repair proposed for one holds the item.
+  advances to a fresh verification; it cannot publish by itself. A
+  verification's approval publishes, subject to the [final checks](#final-checks).
+- `revise`: the smallest repair, followed by a fresh verification of its exact
+  normalized text. A verification that can fix a problem from the packet
+  proposes its own smallest repair, which another fresh verification checks; no
+  request sees an earlier reply. Within the limit of seven review requests
+  below, at most five repairs follow the first review, a release-label repair
+  request counting as one; a refusal at the limit holds the item. A repair that
+  cannot be applied, or that repeats a text already reviewed, holds the item at
+  once. Tag notices stay literal, so a repair proposed for one holds the item.
 - `skip`: low-value or redundant material is recorded as ignored. It creates no
   article or revision and leaves existing coverage intact. A skip needs a failed
   news-value or new-information criterion, and a skip for new information alone
-  must name the covered story; otherwise the item is held.
+  must name the covered story; otherwise the item is held. An item from an
+  official source, other than a version tag, skips only when new information
+  fails; when news value fails while new information passes, it is held for the
+  operator once a fresh verification has passed its facts.
 - `hold`: potentially useful material is unsupported, ambiguous or not ready to
   publish. It remains available through the existing operator controls.
 
+A later review that disagrees with the first on whether news value and new
+information both pass holds the item, whatever its verdict. A later review that
+agrees the item is not news may skip it, but a repair it proposes is not applied:
+the item is held. The official items above are always verified before their
+hold: a later review's repair of their facts is applied and verified, and when
+the first review proposes no usable repair, the verification checks the
+unchanged text. Every hold records its [decision code](DECISIONS.md).
+
 A normal publication uses one writer request and two review requests. A repair
-uses the same number: writer, critique/repair, verification. Deterministic tag
-text skips the writer call but still needs both reviews; a tag is not an official
-release announcement. A first-round skip or hold ends without final verification.
+uses the same number: writer, critique/repair, verification. Each further repair
+adds one review request, a release-label repair two, and an item gets at most
+seven review requests. Deterministic tag text skips the writer call but still
+needs both reviews; a tag is not an official release announcement. A first-round
+skip or hold ends without a verification, except for the official items above. A
+run resumes items waiting for a verification or a repair before it starts others.
 
 ## Final checks
 
@@ -121,7 +143,8 @@ recheck them; publication never remerges different wording afterward.
 Private review jobs keep unfinished work, and a decision's receipt lasts until
 that decision commits. The analysis audit keeps the source, packet, coverage and
 reviews of each outcome, with the model's own verdict wherever a fixed rule
-replaced it.
+replaced it. A hold also records its code and whether its latest review was a
+fresh verification that passed every factual criterion and cited a source.
 
 Use the existing `status`, `rejected show`, `retry` and `dismiss` controls to
 inspect failures, and the [decision log](DECISIONS.md) for every outcome and its
@@ -133,14 +156,15 @@ code. See [operator controls](REJECTED_ANALYSES.md) and
 The reviewer uses the `[llm]` endpoint, fallbacks, credential environment,
 network policy and request timeout, so no additional service is needed.
 `review.model` selects a different model; empty uses `llm.model`. The packet
-bounds, the reply length and the single repair are fixed, so the model endpoint
+bounds, the reply length and the repair limit are fixed, so the model endpoint
 needs enough context for a full packet. Requests also obey the shared run
 deadline. The coverage background is bounded separately; truncation is explicit
 and never proves the absence of older coverage.
 
 The controlled evaluation does not collect, open the application database or
-publish. It exercises both review rounds, records their outputs privately, and
-scores the final candidate that would actually publish:
+publish. It takes the gate's steps, from the first review through every repair
+and verification, records each review privately, and scores the final candidate
+that would actually publish:
 
 ```sh
 PYTHONPATH=src python tools/evaluate_review.py --config config.toml \
@@ -164,6 +188,9 @@ model's own verdict when a fixed rule replaced it. Scores treat a verified
 approval as published, so they measure the reviewer alone. `final_holds` counts
 the verified approvals that the [final checks](#final-checks) would hold (each
 case's report names the checks), and `published_after_checks` counts the rest.
+`holds` counts the cases that end held, final-check holds included, by decision
+code, and `verification_repairs` counts the repairs that verifications proposed
+and the loop applied.
 `--draft` instead has the writer draft each packet once per round and reviews
 that draft under each coverage background its cases use; `draft_unsupported`
 counts drafts that contain flagged wording or labels. The default case files are

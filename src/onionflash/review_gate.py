@@ -12,11 +12,17 @@ from __future__ import annotations
 
 import json
 
-from . import decisions
+from . import decisions, review
 from .analyze import AnalysisError, cache_key
 from .util import digest, now_iso, saved_object
 
 MAX_APPROVALS = 2000  # cached approvals kept besides those unfinished jobs pin
+# The repairs that may follow the first review, a release-label repair request counting as one, each
+# checked by another fresh verification: an item gets at most MAX_VERIFY_REPAIRS + 2 review requests.
+MAX_VERIFY_REPAIRS = 5
+# An item from these sources, other than a version tag, that fails only news value is held for the
+# operator, never skipped.
+OFFICIAL_AUTHORITIES = frozenset({"official"})
 # Each hold reason and its operator text, which follows "Final review held: " in last_error. A hold
 # is logged as held.<stage>.<reason>, the stage being gate, review, verification or final_check.
 HOLDS = {
@@ -25,6 +31,11 @@ HOLDS = {
     "model_hold": "review did not approve the candidate",
     "tag_repair": "review proposed editing a literal tag notice",
     "unusable_repair": "review proposed an unusable repair",
+    "repeated_repair": "review proposed a text already reviewed",
+    "disagreed_news": "the reviews disagree on news value",
+    "official_not_news": "review found an official item not newsworthy",
+    "repairs_exhausted": "review still refused after the repair limit",
+    "release_labels": "release labels need a released or tagged state",
     # review.final_holds, which holds a verified approval
     "completed_action": "the story reports a completed action that its sources do not",
     "compromise_headline": "the headline drops the sources' doubt about a compromise",
@@ -96,10 +107,80 @@ def _prune(store, maximum):
         """, (maximum,))
 
 
+def _news(result) -> bool:
+    return all(result["criteria"][name]["outcome"] == "pass" for name in review.EDITORIAL_CRITERIA)
+
+
+def next_step(reviews, candidate, prepared):
+    """What follows the latest review of `candidate`, decided from the chain of reviews alone.
+
+    ("verify", text) sends text to a fresh verification, ("repair", text) asks a review to repair
+    its release labels, ("approve" | "skip", candidate) commits, and ("hold", (stage, reason))
+    holds. The evaluation follows the same steps.
+    """
+    latest = reviews[-1]
+    result, stage, later = latest["result"], latest["stage"], len(reviews) > 1
+    verdict = result["verdict"]
+    failed = {name for name, check in result["criteria"].items() if check["outcome"] != "pass"}
+    item = json.loads(prepared["row"]["payload"])
+    official = item.get("authority") in OFFICIAL_AUTHORITIES and item.get("kind") != "tag"
+    # An official item that fails only news value is the operator's to judge, once a fresh
+    # verification has passed its facts; a duplicate still skips.
+    disputed = official and failed & review.EDITORIAL_CRITERIA == {"news_value"}
+    if later and _news(result) != _news(reviews[0]["result"]):
+        return "hold", (stage, "disagreed_news")
+    if disputed:
+        if stage == "verification" and failed == {"news_value"}:
+            return "hold", (stage, "official_not_news")
+        if verdict != "revise":
+            return ("hold", (stage, "model_hold")) if later else ("verify", candidate)
+    elif verdict == "skip" and (not official or result["criteria"]["new_information"]["outcome"] == "fail"):
+        return "skip", candidate
+    if verdict == "approve":
+        if stage == "verification" and (held := review.final_holds(candidate, prepared)):
+            return "hold", ("final_check", held[0])
+        if not review.release_labels_match_state(candidate):
+            # A review told the problem may repair it, if the repair can still be verified within the limit.
+            if latest.get("issue") or len(reviews) > MAX_VERIFY_REPAIRS:
+                return "hold", (stage, "release_labels")
+            return "repair", candidate
+        return ("verify" if stage == "review" else "approve"), candidate
+    if verdict != "revise" or (later and failed & review.EDITORIAL_CRITERIA and not disputed):
+        return "hold", (stage, "release_labels" if latest.get("issue") else "model_hold")
+    if prepared["payload"]["editorial_kind"] == "tag":
+        return "hold", (stage, "tag_repair")
+    if len(reviews) > MAX_VERIFY_REPAIRS + 1:
+        return "hold", (stage, "repairs_exhausted")
+    try:
+        repaired = review.apply_repair(candidate, result["repair"])
+    except review.ReviewError:
+        # After a disputed official item's first review, the unchanged text goes to its fresh verification.
+        return ("verify", candidate) if disputed and not later else ("hold", (stage, "unusable_repair"))
+    if latest.get("issue") and not review.release_labels_match_state(repaired):
+        return "hold", (stage, "release_labels")  # the repair request left the labels in place
+    if digest(repaired) in {entry["candidate_hash"] for entry in reviews}:
+        return "hold", (stage, "repeated_repair")  # every text of the chain was refused once already
+    return "verify", repaired
+
+
+def call_review(reviewer, stage, candidate, prepared) -> dict:
+    """Ask for the review that `stage` names and return the chain entry that records its reply."""
+    result = reviewer.review(candidate, prepared["packet"], coverage=prepared["coverage"], verification=stage == "verify",
+                             issue=review.RELEASE_ISSUE if stage == "repair" else None)
+    return {"stage": "verification" if stage == "verify" else "review", **({"issue": "release_labels"} if stage == "repair" else {}),
+            "candidate_hash": digest(candidate), "result": result}
+
+
+def _verified(reviews) -> bool:
+    """Whether the latest review is a fresh verification that passed every factual criterion and cites a source."""
+    criteria = reviews[-1]["result"]["criteria"] if reviews and reviews[-1]["stage"] == "verification" else None
+    return bool(criteria and criteria["source_support"]["source_refs"]) and all(
+        check["outcome"] == "pass" for name, check in criteria.items() if name not in review.EDITORIAL_CRITERIA)
+
+
 def _hold(store, row, draft, writer_key, record, observed, stage, reason):
     """One semantic hold is terminal; only source change/operator retry requeues."""
-    record["outcome"] = "held"
-    record["hold_reason"] = HOLDS[reason]
+    record.update(outcome="held", hold_code=reason, hold_reason=HOLDS[reason], verified_facts=_verified(record["reviews"]))
     with store.db:
         store.record_analysis(row, draft, writer_key, observed, review_record=record)
         store.db.execute("""UPDATE items SET status='rejected',attempts=attempts+1,
@@ -111,28 +192,32 @@ def _hold(store, row, draft, writer_key, record, observed, stage, reason):
 
 
 def process_item(config, store, row, writer, reviewer, observed=None, *, allow_network=True):
-    """Resume writer → exact-candidate review → verification of an approval or repair → commit.
+    """Resume writer → exact-candidate review → fresh verification of each approved or repaired text → commit.
 
     Transport errors leave the current stage durable and raise a retryable
     AnalysisError for the existing queue's backoff. An unusable reply keeps the
-    stage too, but its AnalysisError counts toward the item's three failures.
-    Semantic rejection, including an unusable repair, marks the item rejected
-    immediately; it never starts an endless rewrite loop.
+    stage too, but its AnalysisError counts toward the item's three failures, as
+    a saved job that cannot be read does. next_step bounds the repairs; a hold
+    marks the item rejected immediately.
     """
-    from . import review
     from .candidate import ReviewRequired, StaleCandidate
 
     observed = observed or now_iso()
     policy = review.policy_hash(config)
     writer_key = cache_key(row, config["llm"])
     report = {"status": "pending", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
-    job = store.db.execute("SELECT * FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
+    job = store.db.execute("""SELECT writer_key,policy_hash,stage,approval_key,prepared_at,CAST(draft_json AS BLOB) AS draft,
+        CAST(envelope_json AS BLOB) AS envelope,CAST(record_json AS BLOB) AS record FROM review_jobs WHERE item_id=?""",
+        (row["id"],)).fetchone()
     if job is not None and job["writer_key"] == writer_key:
-        draft = json.loads(job["draft_json"]) if job["draft_json"] is not None else None
-        record = json.loads(job["record_json"])
+        draft, old, record = (saved_object(job[key]) for key in ("draft", "envelope", "record"))
+        # A job whose JSON cannot be read fails the item; reviewing it afresh could pass over its hold.
+        # The other columns hold only the ASCII keys, stages and times that the application writes.
+        if record is None or (draft is None) != (job["draft"] is None) or (old is None) != (job["envelope"] is None):
+            raise AnalysisError("Saved review job is damaged", code="app.damaged_job")
         prepared_at = job["prepared_at"]
     else:
-        job, draft = None, None
+        job, draft, old = None, None, None
         record = {"schema_version": 1, "writer": None, "input_row": row, "reviews": []}
         prepared_at = observed
     if draft is None:
@@ -144,7 +229,6 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         _save(store, row["id"], writer_key, policy, "drafted", draft, None, record, observed, prepared_at=prepared_at)
     try:
         prepared = store.prepare_candidate(row, draft, prepared_at)
-        old = json.loads(job["envelope_json"]) if job is not None and job["envelope_json"] else None
         same = old is not None and job["policy_hash"] == policy and _identity(old) == _identity(prepared)
         stage = job["stage"] if same else "review"
         fresh = {"schema_version": 1, "writer": record["writer"], "input_row": row, "reviews": [], "policy_hash": policy,
@@ -192,48 +276,26 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         if stage in {"approved", "skipped"}:  # without a usable receipt, review the writer's draft again
             stage, candidate, record = "review", prepared["candidate"], fresh
         while True:
-            verification = stage == "verify"
-            phase = "verification" if verification else "review"
             if not allow_network:
                 return {**report, "status": "deferred"}
             report["review_calls"] += 1
-            verdict = reviewer.review(candidate, prepared["packet"], coverage=prepared["coverage"], verification=verification)
-            record["reviews"].append({"stage": phase,
-                                      "candidate_hash": digest(candidate), "source_hash": prepared["source_hash"],
-                                      "coverage_hash": prepared["coverage_hash"],
-                                      "policy_hash": policy, "result": verdict})
-            if verdict["verdict"] == "approve" and not verification:
-                stage = "verify"
-                record["candidate"] = candidate
-                _save(store, row["id"], writer_key, policy, stage, draft, prepared, record, observed,
-                      prepared_at=prepared_at)
-                continue
-            if verdict["verdict"] == "approve" and (held := review.final_holds(candidate, prepared)):
-                _hold(store, row, draft, writer_key, record, observed, "final_check", held[0])
+            record["reviews"].append({**call_review(reviewer, stage, candidate, prepared), "source_hash": prepared["source_hash"],
+                                      "coverage_hash": prepared["coverage_hash"], "policy_hash": policy})
+            action, value = next_step(record["reviews"], candidate, prepared)
+            if action == "hold":
+                _hold(store, row, draft, writer_key, record, observed, *value)
                 return {**report, "status": "held"}
-            if verdict["verdict"] in {"approve", "skip"}:
+            if action in {"approve", "skip"}:
                 key = _approval_key(candidate, prepared, policy)
-                record.update(candidate=candidate, approval_key=key,
-                              outcome="skipped" if verdict["verdict"] == "skip" else "approved")
+                record.update(candidate=candidate, approval_key=key, outcome="skipped" if action == "skip" else "approved")
                 receipt = (key, digest(candidate), prepared["source_hash"], policy, prepared["binding_hash"],
-                           _json(verdict), _json(record), observed, observed)
+                           _json(record["reviews"][-1]["result"]), _json(record), observed, observed)
                 _save(store, row["id"], writer_key, policy, record["outcome"], draft, prepared, record, observed,
                       prepared_at=prepared_at, approval_key=key, approval_receipt=receipt)
                 committed = store.commit_candidate(prepared, candidate, writer_key, now_iso(), approval_key=key,
-                                                   policy_hash=policy, review_record=record, decision=verdict["verdict"])
+                                                   policy_hash=policy, review_record=record, decision=action)
                 return {**report, "status": committed["status"]}
-            if verdict["verdict"] == "hold" or verification:  # one repair at most, and only a verified one
-                _hold(store, row, draft, writer_key, record, observed, phase, "model_hold")
-                return {**report, "status": "held"}
-            if prepared["payload"]["editorial_kind"] == "tag":
-                _hold(store, row, draft, writer_key, record, observed, phase, "tag_repair")
-                return {**report, "status": "held"}
-            try:
-                candidate = review.apply_repair(candidate, verdict["repair"])
-            except review.ReviewError:
-                _hold(store, row, draft, writer_key, record, observed, phase, "unusable_repair")
-                return {**report, "status": "held"}
-            stage = "verify"
+            stage, candidate = action, value  # the next review: a verification or a release-label repair
             record["candidate"] = candidate
             _save(store, row["id"], writer_key, policy, stage, draft, prepared, record, observed, prepared_at=prepared_at)
     except (StaleCandidate, ReviewRequired):

@@ -9,7 +9,7 @@ import pytest
 
 from approval_helpers import verdict
 from onionflash.config import DEFAULTS
-from onionflash.review import CRITERIA, _packet_refs, final_holds
+from onionflash.review import CRITERIA, RELEASE_ISSUE, _packet_refs, final_holds, validate_review
 from onionflash.source_packet import build_packet
 
 
@@ -36,8 +36,17 @@ def corpus():
     return [case for name in module.CASE_FILES for case in module.expand(json.loads((ROOT / "tools" / name).read_text()))]
 
 
+def full(reply, packet):
+    """A reply validated as the reviewer validates one. Shorthand such as {"verdict": "skip"} becomes a complete
+    verdict, in which a skip fails news value and any other refusal operational advice."""
+    if "criteria" not in reply:
+        reply = verdict(reply["verdict"], repair=reply.get("repair"),
+                        criterion="news_value" if reply["verdict"] == "skip" else "operational_advice")
+    return validate_review(reply, packet)
+
+
 def scripted(reply):
-    """A reviewer stand-in whose verdict comes from reply(verification)."""
+    """A reviewer stand-in whose reply comes from reply(verification)."""
     class Reviewer:
         last_decoded = None
         def __init__(self, *args, **kwargs):
@@ -46,8 +55,8 @@ def scripted(reply):
             return self
         def __exit__(self, *args):
             pass
-        def review(self, candidate, packet, *, coverage=None, verification=False):
-            return reply(verification)
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
+            return full(reply(verification), packet)
     return Reviewer
 
 
@@ -194,15 +203,16 @@ def test_coverage_background_is_passed_to_both_reviews_and_saved_privately(evalu
     case = next(c for c in corpus() if c.get("existing_coverage", {}).get("recent"))
     seen = []
     class Inspector(scripted(lambda verification: {"verdict": "skip"})):
-        def review(self, candidate, packet, *, coverage=None, verification=False):
-            """Capture each background and simulate a repair followed by a final skip."""
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
+            """Capture each background and simulate a repair followed by a skip, which disagrees with the first review."""
             seen.append(coverage)
-            return ({"verdict": "skip"} if verification else
-                    {"verdict": "revise", "repair": {"summary": "A source-supported statement."}})
+            return full({"verdict": "skip"} if verification else
+                        {"verdict": "revise", "repair": {"summary": "A source-supported statement."}}, packet)
     monkeypatch.setattr(module, "EvaluationReviewer", Inspector)
     output = tmp_path / "coverage.jsonl"
     result = module.evaluate(config, [case], output)
-    assert result["repairs_skipped"] == 1 and result["repairs_held"] == 0
+    assert result["repairs_skipped"] == 0 and result["repairs_held"] == 1
+    assert result["holds"] == {"held.verification.disagreed_news": 1}
     assert seen == [case["existing_coverage"], case["existing_coverage"]]
     assert json.loads(output.read_text().splitlines()[0])["existing_coverage"] == case["existing_coverage"]
 
@@ -311,34 +321,72 @@ def test_missing_required_wording_is_an_omission_not_a_false_approval(evaluation
 
 
 def test_hold_case_matches_only_a_hold(evaluation, tmp_path, monkeypatch):
-    """Publishing a case that must be held is a false approval, and skipping it is an editorial miss."""
+    """Publishing a case that must be held is a false approval, and skipping it is an editorial miss. The gate
+    verifies an official item that both reviews find not newsworthy, then holds it instead of skipping it."""
     module, config = evaluation
     case = next(c for c in corpus() if c["id"] == "official-routine-post")
-    for outcome, matched, false, misses in (("hold", 1, 0, 0), ("approve", 0, 1, 0), ("skip", 0, 0, 1)):
+    community = copy.deepcopy(case)
+    community["packet"]["sources"][0]["authority"] = "community"
+    for name, selected, outcome, matched, false, misses, holds in (
+            ("hold", case, "hold", 1, 0, 0, {"held.review.model_hold": 1}), ("approve", case, "approve", 0, 1, 0, {}),
+            ("official-skip", case, "skip", 1, 0, 0, {"held.verification.official_not_news": 1}),
+            ("community-skip", community, "skip", 0, 0, 1, {})):
         monkeypatch.setattr(module, "EvaluationReviewer", scripted(lambda verification: {"verdict": outcome}))
-        result = module.evaluate(config, [case], tmp_path / f"{outcome}.jsonl")
-        assert (result["matched"], result["false_approvals"], result["editorial_misses"]) == (matched, false, misses)
+        result = module.evaluate(config, [selected], tmp_path / f"{name}.jsonl")
+        assert (result["matched"], result["false_approvals"], result["editorial_misses"], result["holds"]) == (
+            matched, false, misses, holds), name
 
 
 def test_model_verdict_keeps_the_reply_that_validation_replaced(evaluation, tmp_path, monkeypatch):
-    """An approval of release labels on an unreleased change holds; the report keeps the model's own verdict."""
+    """A skip that fails no editorial criterion holds; the report keeps the model's own verdict."""
     module, config = evaluation
-    cases = {c["id"]: c for c in corpus()}
-    monkeypatch.setattr(module.Reviewer, "complete", lambda self, *args: verdict())
+    case = next(c for c in corpus() if c["id"] == "bastet-original")
+    monkeypatch.setattr(module.Reviewer, "complete", lambda self, *args: verdict("skip", criterion="source_support"))
     output = tmp_path / "converted.jsonl"
-    assert module.evaluate(config, [cases["merged-is-not-release"]], output)["matched"] == 1
+    assert module.evaluate(config, [case], output)["matched"] == 1
     record = json.loads(output.read_text().splitlines()[0])
-    assert (record["model_verdict"], record["result"]["verdict"], record["final_verdict"]) == ("approve", "hold", "hold")
-    assert "verification" not in record
-    # A repair that adds a release label holds at verification, which keeps its own field.
-    replies = iter([verdict("revise", repair={"category": "release"}), verdict()])
-    monkeypatch.setattr(module.Reviewer, "complete", lambda self, *args: next(replies))
-    output = tmp_path / "verified.jsonl"
-    assert module.evaluate(config, [cases["bastet-corrected"]], output)["positive_rejections"] == 1
+    assert (record["model_verdict"], record["result"]["verdict"], record["final_verdict"]) == ("skip", "hold", "hold")
+    assert record["reviews"][0]["result"]["model_verdict"] == "skip" and "verification" not in record
+
+
+def test_release_labels_get_a_repair_request_that_names_the_problem(evaluation, tmp_path, monkeypatch):
+    """Like the gate, the evaluation asks a review to repair release labels on an unreleased change, then verifies
+    the repair; labels the request leaves in place hold."""
+    module, config = evaluation
+    case = next(c for c in corpus() if c["id"] == "merged-is-not-release")
+    payloads = []
+
+    def complete(self, prompt, payload, *args):
+        payloads.append(payload)
+        return next(replies)
+    monkeypatch.setattr(module.Reviewer, "complete", complete)
+    fixed = verdict("revise", repair={"title": "Opt-in exit proxying merged", "category": "feature", "tags": ["feature"]},
+                    criterion="status")
+    for name, replies, holds, published in (("unfixed", iter([verdict(), verdict()]), {"held.review.release_labels": 1}, None),
+                                            ("fixed", iter([verdict(), fixed, verdict()]), {}, "Opt-in exit proxying merged")):
+        payloads.clear()
+        output = tmp_path / f"{name}.jsonl"
+        result = module.evaluate(config, [case], output)
+        record = json.loads(output.read_text().splitlines()[0])
+        assert (result["matched"], result["holds"], (record["published_candidate"] or {}).get("title")) == (1, holds, published)
+        assert [entry["stage"] for entry in record["reviews"]] == ["review", "review", "verification"][:len(payloads)]
+        assert [payload.get("application_issue") for payload in payloads] == [None, RELEASE_ISSUE, None][:len(payloads)]
+        assert record["reviews"][1]["issue"] == "release_labels"
+
+
+def test_evaluation_follows_the_gate_fix_loop(evaluation, tmp_path, monkeypatch):
+    """A verification's own repair is verified afresh; the case scores the repaired publication."""
+    module, config = evaluation
+    case = next(c for c in corpus() if c["id"] == "bastet-original")
+    replies = iter([{"verdict": "approve"}, {"verdict": "revise", "repair": {"why_it_matters": ""}}, {"verdict": "approve"}])
+    monkeypatch.setattr(module, "EvaluationReviewer", scripted(lambda verification: next(replies)))
+    output = tmp_path / "loop.jsonl"
+    result = module.evaluate(config, [case], output)
     record = json.loads(output.read_text().splitlines()[0])
-    assert "model_verdict" not in record
-    assert (record["verification_model_verdict"], record["verification"]["verdict"], record["final_verdict"]) == (
-        "approve", "hold", "hold")
+    assert (result["matched"], result["false_approvals"], result["verification_repairs"]) == (1, 0, 1)
+    assert [(entry["stage"], entry["result"]["verdict"]) for entry in record["reviews"]] == [
+        ("review", "approve"), ("verification", "revise"), ("verification", "approve")]
+    assert record["published_candidate"]["why_it_matters"] == "" and record["final_verdict"] == "approve"
 
 
 def judged_cases(raw):
@@ -361,9 +409,9 @@ def test_judged_scoring_counts_catches_and_false_alarms(evaluation, tmp_path, mo
     cases = judged_cases(json.loads((ROOT / "tools/review_cases.json").read_text()))
 
     class Discerning(scripted(None)):
-        def review(self, candidate, packet, *, coverage=None, verification=False):
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
             flawed = "update their configurations" in candidate["why_it_matters"] or candidate["confidence"] == "confirmed"
-            return {"verdict": "hold" if flawed else "approve"}
+            return full({"verdict": "hold" if flawed else "approve"}, packet)
 
     def rows(sentence, badge, stale, clean, rounds=1):
         return {"invented_impact": dict(zip(("ok", "paired"), sentence), cases=rounds, unique=1),

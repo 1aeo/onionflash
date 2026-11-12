@@ -70,7 +70,8 @@ def show_item(store, item_id) -> dict:
 
 def _final_review(store, item_id):
     """The current job or, once a commit finished the current revision, the decision that commit recorded, if any
-    (stage "finished"): its candidate, source packet, coverage and latest verdict, as saved."""
+    (stage "finished"): its hold code, candidate and the draft it started from, source packet, coverage, every
+    review of the chain in brief and the latest verdict in full, as saved."""
     # Only a commit sets these statuses, and it writes the item's newest audit row.
     row = store.db.execute("SELECT stage,CAST(record_json AS BLOB) AS record_json FROM review_jobs WHERE item_id=?",
                            (item_id,)).fetchone() or store.db.execute(
@@ -83,8 +84,14 @@ def _final_review(store, item_id):
         prepared = record.get("prepared", {})
         reviews = record.get("reviews") or record.get("approval", {}).get("reviews", [])
         latest = reviews[-1] if reviews else None
-        return {"stage": row["stage"], "candidate": record.get("candidate", prepared.get("candidate")),
+        return {"stage": row["stage"], "hold_code": record.get("hold_code"),
+                "candidate": record.get("candidate", prepared.get("candidate")), "base_candidate": prepared.get("candidate"),
                 "source_packet": prepared.get("packet"), "coverage": prepared.get("coverage"),
+                "reviews": [{"phase": entry["stage"], **({"issue": entry["issue"]} if "issue" in entry else {}),
+                             "verdict": entry["result"]["verdict"], "candidate_hash": entry["candidate_hash"],
+                             "failed": {name: f"{check['outcome']}: {check['reason']}"
+                                        for name, check in entry["result"]["criteria"].items() if check["outcome"] != "pass"},
+                             "repair": entry["result"]["repair"]} for entry in reviews],
                 "latest_review": latest and {**latest["result"], "phase": latest["stage"],
                                              "candidate_hash": latest["candidate_hash"]}}
     except (TypeError, KeyError, AttributeError):

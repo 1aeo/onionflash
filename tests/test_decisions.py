@@ -46,11 +46,11 @@ def write_config(tmp_path):
 @pytest.mark.parametrize("replies,code,chain", [
     ([verdict()], "published.new", ["review:approve", "verification:approve"]),
     ([verdict("skip", criterion="news_value")], "skipped.review.news_value", ["review:skip"]),
-    ([verdict("revise", repair={"why_it_matters": ""}), both_editorial()],
+    ([verdict("revise", repair={"why_it_matters": ""}, criterion="news_value"), both_editorial()],
      "skipped.verification.new_information_and_news_value", ["review:revise", "verification:skip"]),
     ([verdict("hold")], "held.review.model_hold", ["review:hold"]),
-    ([verdict("revise", repair={"why_it_matters": ""}), verdict("revise")], "held.verification.model_hold",
-     ["review:revise", "verification:revise"]),
+    ([verdict("revise", repair={"why_it_matters": ""}), verdict("hold")], "held.verification.model_hold",
+     ["review:revise", "verification:hold"]),
     ([verdict("revise", repair={"title": ""})], "held.review.unusable_repair", ["review:revise"]),
 ], ids=["approve", "skip", "verified-skip", "hold", "verification-refusal", "unusable-repair"])
 def test_each_gate_outcome_writes_one_decision_row(context, replies, code, chain):
@@ -156,11 +156,13 @@ def test_a_resumed_commit_logs_its_decision_once(context, monkeypatch):
 
 def test_a_commit_from_a_reused_receipt_logs_the_reviews_behind_it(context, monkeypatch):
     cfg, store = context
-    row = pending(store)
+    # An official item whose news value alone fails is verified before it can end; this verification also
+    # finds it covered already, so it skips.
+    row = pending(store, item(authority="official", kind="feed"))
     commit = store.commit_candidate
     monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("crash")))
     with pytest.raises(RuntimeError):
-        run(cfg, store, row, Writer(), Reviewer(verdict(), verdict("skip", criterion="news_value")))
+        run(cfg, store, row, Writer(), Reviewer(verdict("skip", criterion="news_value"), both_editorial()))
     monkeypatch.setattr(store, "commit_candidate", commit)
     for _ in range(3):
         store.defer(row["id"], "Unexpected error", cfg["llm"], LATER, terminal=True)
@@ -168,9 +170,9 @@ def test_a_commit_from_a_reused_receipt_logs_the_reviews_behind_it(context, monk
     rejection.retry_item(store, row["id"], row["content_hash"], "Retry the item", LATER)
     assert run(cfg, store, store.pending(1, LATER)[0], Writer(), Reviewer(), allow_network=False)["cache_hit"]
     assert [entry["code"] for entry in logged(store)] == [
-        "failed.app.unexpected", "operator.retried", "skipped.verification.news_value"]
+        "failed.app.unexpected", "operator.retried", "skipped.verification.new_information_and_news_value"]
     detail = logged(store)[-1]["detail"]
-    assert (detail["verdicts"], list(detail["criteria"])) == (["review:approve", "verification:skip"], ["news_value"])
+    assert (detail["verdicts"], list(detail["criteria"])) == (["review:skip", "verification:skip"], ["new_information", "news_value"])
 
 
 def test_decision_rows_roll_back_with_their_outcome(context):
@@ -227,7 +229,7 @@ class Replies:
     def __init__(self, error=None):
         self.error = error
 
-    def review(self, candidate, packet, *, coverage=None, verification=False):
+    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
         url = packet["sources"][0]["url"]
         if url.endswith("/fail"):
             raise self.error

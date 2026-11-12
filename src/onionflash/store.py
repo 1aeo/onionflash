@@ -311,13 +311,15 @@ class Store:
         return True
 
     def pending(self, limit: int, observed: str) -> list[dict]:
-        """Due items, best first. An item whose saved copy is damaged, which reading the whole row
-        could fail on, is only its id and damaged=True, for the caller to reject."""
+        """Due items, best first, after those waiting for a verification or a release-label repair, so a
+        fix loop that a run's deadline cut short finishes first. An item whose saved copy is damaged,
+        which reading the whole row could fail on, is only its id and damaged=True, for the caller to reject."""
         rows = []
         for item_id, kind, payload in self.db.execute(
             """SELECT id,typeof(payload),CAST(payload AS BLOB) FROM items WHERE status='pending'
             AND (next_attempt_at IS NULL OR next_attempt_at<=?)
-            ORDER BY priority_score DESC,last_seen DESC,id LIMIT ?""",
+            ORDER BY id IN (SELECT item_id FROM review_jobs WHERE stage IN ('verify','repair')) DESC,
+            priority_score DESC,last_seen DESC,id LIMIT ?""",
             (observed, limit),
         ).fetchall():
             if kind == "text" and saved_object(payload) is not None:
