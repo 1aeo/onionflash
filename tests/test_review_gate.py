@@ -464,6 +464,19 @@ def test_rejected_show_and_retry_survive_a_damaged_review_record(context, kind):
     assert job(store)["stage"] == "drafted"
 
 
+@pytest.mark.parametrize("kind", DAMAGE)
+def test_retry_drops_a_damaged_draft_and_the_writer_drafts_again(context, kind):
+    cfg, store = context
+    row = pending(store)
+    assert run(cfg, store, row, Writer(), Reviewer(verdict("hold")))["status"] == "held"
+    with store.db:
+        store.db.execute("UPDATE review_jobs SET draft_json=CAST(? AS TEXT)", (damaged(job(store)["draft_json"], kind),))
+    rejection.retry_item(store, row["id"], row["content_hash"], "Retry after inspection", LATER)
+    writer = Writer()
+    assert run(cfg, store, store.pending(1, LATER)[0], writer, Reviewer(verdict()))["status"] == "published"
+    assert len(writer.calls) == 1
+
+
 def test_rejected_show_without_a_current_job_stays_read_only(context):
     _, store = context
     row = pending(store)

@@ -52,19 +52,24 @@ ineligible queue state stops the action. Retry resets the attempt/rejection coun
 and cooldown, then queues the item for the normal analysis pipeline. It does not
 bypass validation or approve a publication. An item whose saved source is
 incomplete or unreadable cannot be retried; this includes old ignored items whose
-source body the deployment's private evidence retention removed.
+source body the deployment's private evidence retention removed. Analysis rejects
+a damaged saved copy (not a JSON object in UTF-8 text) before any model call, as
+`Stored source item is damaged`. Collection replaces the copy when it sees the
+item again, and an unchanged revision keeps its status, so retry it then. For a
+GitLab issue whose source takes part in comment checks, the first comment check
+that succeeds adds its notes back and decides whether they changed.
 
 The next scheduled run resumes the item. A completed writer draft in its current
 review job is retained; the writer runs again only if its source or writer-input
-identity changed. Retry then repeats the final review with the same draft,
-candidate and source packet. An unchanged reviewer model and review policy
-normally return the same verdict, so retry a held item after its source material,
-`review.model` or the application's review policy changed. Review timeouts and
-endpoint failures resume the unfinished review/verification stage automatically
-using normal backoff, unless a story published in the meantime changed the
-coverage background, which restarts the critique; a malformed reply resumes it
-too, but counts toward the three failures. A retry never treats a proposed
-repair as approval.
+identity changed, or the saved draft cannot be read. Retry then repeats the final
+review with the same draft, candidate and source packet. An unchanged reviewer
+model and review policy normally return the same verdict, so retry a held item
+after its source material, `review.model` or the application's review policy
+changed. Review timeouts and endpoint failures resume the unfinished
+review/verification stage automatically using normal backoff, unless a story
+published in the meantime changed the coverage background, which restarts the
+critique; a malformed reply resumes it too, but counts toward the three failures.
+A retry never treats a proposed repair as approval.
 
 Retry does not change or delete private analysis records: a held review stays
 there, and the new attempt adds its own record. Accepted stories are unchanged.

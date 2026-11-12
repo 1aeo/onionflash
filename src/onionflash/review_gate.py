@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 
 from .analyze import AnalysisError, cache_key
-from .util import digest, now_iso
+from .util import digest, now_iso, saved_object
 
 MAX_APPROVALS = 2000  # cached approvals kept besides those unfinished jobs pin
 
@@ -33,13 +33,16 @@ def reset_review_work(store, item_id):
 
     The caller owns the transaction.
     """
-    row = store.db.execute("SELECT writer_key FROM review_jobs WHERE item_id=?", (item_id,)).fetchone()
+    row = store.db.execute("SELECT writer_key,CAST(draft_json AS BLOB) AS draft FROM review_jobs WHERE item_id=?",
+                           (item_id,)).fetchone()
     if row is None:
         return
     item = dict(store.db.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone())
     record = {"schema_version": 1, "writer": {"key": row["writer_key"]}, "input_row": item, "reviews": []}
-    store.db.execute("""UPDATE review_jobs SET stage='drafted',envelope_json=NULL,
-        record_json=?,approval_key=NULL,updated_at=? WHERE item_id=?""", (_json(record), now_iso(), item_id))
+    # A damaged draft is dropped, so the writer drafts again.
+    keep = saved_object(row["draft"]) is not None
+    store.db.execute("""UPDATE review_jobs SET stage='drafted',draft_json=CASE WHEN ? THEN draft_json END,envelope_json=NULL,
+        record_json=?,approval_key=NULL,updated_at=? WHERE item_id=?""", (keep, _json(record), now_iso(), item_id))
 
 
 def _save(store, item_id, writer_key, policy_hash, stage, draft, prepared, record, observed,

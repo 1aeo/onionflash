@@ -12,7 +12,7 @@ from onionflash.collect import CollectionError, collect_source
 from onionflash.config import DEFAULTS, load_config
 from onionflash.store import Store
 from onionflash.transport import FetchError, Response
-from onionflash.util import after, canonical_url, item_cluster, plain_text
+from onionflash.util import MAX_SAVED_DEPTH, after, canonical_url, item_cluster, plain_text, saved_object
 
 
 DATE = "2026-11-08T12:00:00Z"
@@ -69,17 +69,32 @@ def analysis(**kw):
     }
 
 
-DAMAGE = ["invalid-json", "non-object", "invalid-utf8", "deep", "surrogate", "bom", "utf-16"]
+DAMAGE = ["invalid-json", "non-object", "invalid-utf8", "deep", "nested", "surrogate", "escaped-surrogate", "bom", "utf-16"]
 
 
 def damaged(document, kind):
     """Bytes the app never saves for a JSON document: broken JSON, a non-object, bytes that are not
-    UTF-8, nesting past the parser's limit, or the document with a lone surrogate added, a BOM
-    prepended, or encoded as UTF-16."""
+    UTF-8, nesting past the parser's limit or past MAX_SAVED_DEPTH, or the document with a lone
+    surrogate added (as UTF-8 bytes or as a JSON escape), a BOM prepended, or encoded as UTF-16."""
     if kind == "surrogate":
         return json.dumps({**json.loads(document), "\ud800": ""}, ensure_ascii=False).encode("utf-8", "surrogatepass")
+    if kind == "escaped-surrogate":
+        return json.dumps({**json.loads(document), "\ud800": ""}).encode()
     return {"invalid-json": b"{", "non-object": b"[1]", "invalid-utf8": b'{"\xff"', "deep": b"[" * 100000,
+            "nested": b'{"x":' + b"[" * MAX_SAVED_DEPTH + b"]" * MAX_SAVED_DEPTH + b"}",
             "bom": b"\xef\xbb\xbf" + document.encode(), "utf-16": document.encode("utf-16")}[kind]
+
+
+def damage_item(db, item_id, kind):
+    """Save a damaged() copy of one item; for "blob", its intact copy typed as an SQLite BLOB, and for
+    "undated", the copy without its updated_at."""
+    expression = {"blob": "CAST(payload AS BLOB)", "undated": "json_remove(payload,'$.updated_at')"}.get(kind)
+    if expression:
+        db.execute(f"UPDATE items SET payload={expression} WHERE id=?", (item_id,))
+    else:
+        document = db.execute("SELECT payload FROM items WHERE id=?", (item_id,)).fetchone()[0]
+        db.execute("UPDATE items SET payload=CAST(? AS TEXT) WHERE id=?", (damaged(document, kind), item_id))
+    db.commit()
 
 
 def config(tmp_path):
@@ -990,13 +1005,16 @@ def test_rss_guid_that_is_not_a_permalink_is_never_a_citation():
     assert collect_source(FakeClient([response(xml)]), source(), {}, DEFAULTS["collection"], DATE)["items"] == []
 
 
-def test_an_unexpected_source_error_is_recorded_and_other_sources_still_run(tmp_path, monkeypatch):
+# A partial collection whose items cannot be saved fails its source the same way.
+@pytest.mark.parametrize("error, where", [(RuntimeError("unexpected parser crash"), "RuntimeError at test_core.py:"),
+                                          (CollectionError("unexpected parser crash", [{"title": "No URL"}]), "KeyError at ")])
+def test_an_unexpected_source_error_is_recorded_and_other_sources_still_run(tmp_path, monkeypatch, error, where):
     from onionflash import cli
     cfg = config(tmp_path)
     cfg["sources"] = [source(id="broken", url="https://broken.example/feed.xml"), source(id="fine")]
     def collect(client, stream, *args):
         if stream["id"] == "broken":
-            raise RuntimeError("unexpected parser crash")
+            raise error
         return {"items": [], "url": stream["url"]}
     monkeypatch.setattr(cli, "collect_source", collect)
     monkeypatch.setattr(cli, "build", lambda *args: {})
@@ -1004,5 +1022,118 @@ def test_an_unexpected_source_error_is_recorded_and_other_sources_still_run(tmp_
         report = cli.run(cfg, store)
         broken = store.source(cfg["sources"][0])
     assert report["sources_failed"] == 1 and report["sources_ok"] == 1
-    assert broken["error"].startswith("Unexpected RuntimeError at test_core.py:")
+    assert broken["error"].startswith("Unexpected " + where)
     assert "parser crash" not in broken["error"] and broken["failures"] == 1
+
+
+def test_a_saved_object_nests_at_most_the_cap_and_holds_no_lone_surrogate():
+    """App records nest about 7 levels; deeper reads as damaged, so every operator view can be printed."""
+    within = b'{"x":' + b"[" * (MAX_SAVED_DEPTH - 1) + b"]" * (MAX_SAVED_DEPTH - 1) + b"}"
+    assert saved_object(within) is not None and saved_object(damaged("{}", "nested")) is None
+    # An escaped surrogate pair is one character; an escaped lone surrogate reads as damaged, and NULL as missing.
+    assert saved_object(b'{"x":"\\ud83d\\ude00"}') == {"x": "\U0001f600"}
+    assert saved_object(b'{"x":"\\ud800"}') is None and saved_object(None) is None
+
+
+@pytest.mark.parametrize("kind", [*DAMAGE, "blob", "undated"])
+def test_collection_replaces_a_damaged_saved_copy(tmp_path, caplog, kind):
+    """A damaged copy counts as absent, so one bad row cannot stop collection and recollecting restores it."""
+    entry = lambda **kw: item(kind="feed", **kw)
+    with Store(tmp_path / "state.db") as store:
+        store.ingest(entry(), DATE)
+        item_id = store.db.execute("SELECT id FROM items").fetchone()[0]
+        store.db.execute("UPDATE items SET status='dismissed'")
+        damage_item(store.db, item_id, kind)
+        assert not store.ingest(entry(), DATE)  # the same revision: only its copy is restored, and the dismissal stands
+        assert tuple(store.db.execute("SELECT status,typeof(payload),json_extract(payload,'$.id') FROM items").fetchone()) == ("dismissed", "text", item_id)
+        damage_item(store.db, item_id, kind)
+        # A changed revision replaces the copy and queues, even dated before the timestamp the copy lost.
+        assert store.ingest(entry(content="A later account.", updated_at="2026-11-01T00:00:00Z"), DATE)
+        assert json.loads(store.pending(1, DATE)[0]["payload"])["content"] == "A later account."
+    assert caplog.text.count("Replacing damaged saved item") == 2
+
+
+@pytest.mark.parametrize("kind", [*DAMAGE, "blob"])
+def test_pending_reports_a_damaged_saved_copy_without_reading_or_changing_it(tmp_path, kind):
+    with Store(tmp_path / "state.db") as store:
+        store.ingest(item(url="https://example.org/damaged"), DATE)
+        store.ingest(item(url="https://example.org/intact", content="An intact report."), DATE)
+        damaged_id, intact_id = (store.db.execute("SELECT id FROM items WHERE url=?", (url,)).fetchone()[0]
+                                 for url in ("https://example.org/damaged", "https://example.org/intact"))
+        damage_item(store.db, damaged_id, kind)
+        before = store.db.execute("SELECT status,attempts,rejections,last_error,next_attempt_at FROM items ORDER BY id").fetchall()
+        rows = {row["id"]: row for row in store.pending(10, DATE)}
+        assert rows[damaged_id] == {"id": damaged_id, "damaged": True} and rows[intact_id]["url"] == "https://example.org/intact"
+        assert store.db.execute("SELECT status,attempts,rejections,last_error,next_attempt_at FROM items ORDER BY id").fetchall() == before
+
+
+@pytest.mark.parametrize("kind", ["invalid-utf8", "blob", "escaped-surrogate"])
+def test_a_run_rejects_a_damaged_pending_item_without_a_model_call_and_still_builds(tmp_path, monkeypatch, kind):
+    from onionflash import cli
+
+    class Writer:
+        calls = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def analyze(self, payload):
+            Writer.calls += 1
+            return analysis()
+
+    monkeypatch.setattr(cli, "Analyzer", Writer)
+    monkeypatch.setattr(cli, "Reviewer", ApprovingReviewer)
+    cfg = config(tmp_path)
+    cfg["sources"] = []
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest(item(url="https://example.org/damaged"), DATE)
+        store.ingest(item(url="https://example.org/intact", content="An intact report."), DATE)
+        damaged_id = store.db.execute("SELECT id FROM items WHERE url='https://example.org/damaged'").fetchone()[0]
+        store.defer(damaged_id, "LLM request failed (HTTP 503)", cfg["llm"], DATE)  # a retry time, due by now
+        damage_item(store.db, damaged_id, kind)
+        report = cli.run(cfg, store)
+        assert tuple(store.db.execute("SELECT status,last_error,next_attempt_at FROM items WHERE id=?", (damaged_id,)).fetchone()) == (
+            "rejected", "Stored source item is damaged", None)
+        assert len(store.stories()) == 1
+    assert (report["analyzed"], report["analysis_failed"], report["rejected_analysis"], Writer.calls) == (1, 1, 1, 1)
+    assert (tmp_path / "public" / "index.html").exists()
+
+
+@pytest.mark.parametrize("kind", ["invalid-json", "invalid-utf8"])
+def test_a_partial_collection_with_a_damaged_saved_copy_still_analyzes_and_builds(tmp_path, monkeypatch, kind):
+    from onionflash import cli
+
+    class Fake:
+        def __init__(self, *args, **kwargs):
+            self.calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def analyze(self, payload):
+            return analysis()
+
+    collected = [item(url="https://example.org/damaged", content="A changed report."), item(url="https://example.org/next")]
+
+    def partial(*args):
+        raise CollectionError("request deadline reached", collected)
+
+    monkeypatch.setattr(cli, "HttpClient", Fake)
+    monkeypatch.setattr(cli, "Analyzer", Fake)
+    monkeypatch.setattr(cli, "Reviewer", ApprovingReviewer)
+    monkeypatch.setattr(cli, "collect_source", partial)
+    cfg = config(tmp_path)
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest(item(url="https://example.org/damaged"), DATE)
+        damage_item(store.db, store.db.execute("SELECT id FROM items").fetchone()[0], kind)
+        result = cli.run(cfg, store)
+    assert (result["sources_failed"], result["items_changed"], result["analyzed"]) == (1, 2, 2)

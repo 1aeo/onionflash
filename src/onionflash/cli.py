@@ -147,26 +147,27 @@ def run(config: dict, store: Store) -> dict:
             client.deadline = time.monotonic() + min(remaining, config["collection"]["source_budget_seconds"])
             client.deadline_reached = False
             try:
-                result = collect_source(client, source, state, config["collection"], observed)
-                received = record_items(source, result["items"])
-                report["entries_skipped"] += result.get("skipped", 0)
-                store.source_success(source, result, received, schedule_from=observed)
-                report["sources_ok"] += 1
-            except CollectionError as exc:
-                received = record_items(source, exc.items)
-                out_of_time = shared and (client.deadline_reached or time.monotonic() >= collection_deadline)
-                store.source_failure(
-                    source,
-                    str(exc),
-                    config["collection"],
-                    received,
-                    exc.watermark,
-                    exc.catching_up or out_of_time,
-                )
-                report["sources_failed"] += 1
-                if out_of_time:
-                    report["budget_reached"] = True
-                    break
+                try:
+                    result = collect_source(client, source, state, config["collection"], observed)
+                    received = record_items(source, result["items"])
+                    report["entries_skipped"] += result.get("skipped", 0)
+                    store.source_success(source, result, received, schedule_from=observed)
+                    report["sources_ok"] += 1
+                except CollectionError as exc:  # saving its partial items is covered by the handler below too
+                    received = record_items(source, exc.items)
+                    out_of_time = shared and (client.deadline_reached or time.monotonic() >= collection_deadline)
+                    store.source_failure(
+                        source,
+                        str(exc),
+                        config["collection"],
+                        received,
+                        exc.watermark,
+                        exc.catching_up or out_of_time,
+                    )
+                    report["sources_failed"] += 1
+                    if out_of_time:
+                        report["budget_reached"] = True
+                        break
             except Exception as exc:  # untrusted input must not stop the other sources
                 # Record where it failed (file:line), never the exception text.
                 frame = traceback.extract_tb(exc.__traceback__)[-1]
@@ -189,6 +190,10 @@ def run(config: dict, store: Store) -> dict:
             if time.monotonic() >= run_deadline:
                 report["budget_reached"] = True
                 break
+            if row.get("damaged"):  # never sent to a model; collecting the item again restores its copy
+                store.reject(row["id"], "Stored source item is damaged")
+                report["analysis_failed"] += 1
+                continue
             try:
                 result = process_item(config, store, row, analyzer, reviewer, now_iso(),
                                       allow_network=endpoint_failures < 2)

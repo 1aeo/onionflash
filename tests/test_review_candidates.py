@@ -10,7 +10,7 @@ from onionflash.analyze import tag_notice
 from onionflash.candidate import ReviewRequired
 from onionflash.comments import INPUT_CHARS, _compose
 from onionflash.store import Store
-from test_core import DATE, analysis, item
+from test_core import DAMAGE, DATE, analysis, damage_item, item
 
 
 LATER = "2026-11-09T12:00:00Z"
@@ -292,6 +292,28 @@ def test_stable_timeline_identity_cannot_label_new_commit_bytes_with_old_citatio
             again = store.prepare_candidate(row, tag_notice(json.loads(row["payload"])), LATER)
             assert again["source_hash"] == prepared["source_hash"] and again["binding_hash"] != prepared["binding_hash"]
         assert store.stories()[0]["summary"] == old["summary"]
+
+
+@pytest.mark.parametrize("kind", [*DAMAGE, "blob"])
+def test_a_cited_source_with_a_damaged_saved_copy_reads_as_its_snapshot_or_missing(tmp_path, kind):
+    """A story's earlier source whose saved copy is damaged never stops the review of an update."""
+    with Store(tmp_path / "db") as store:
+        old = publish(store, item(content=BODY, updated_at=LATER), observed=LATER)
+        damage_item(store.db, old["editorial_item"], kind)
+        with store.db:  # a newer snapshot of the same citation; the story's own analysis is read first
+            store.db.execute("""INSERT INTO analyses(cache_key,result,created_at,source_payload,source_item_id)
+                SELECT 'newer',result,'2026-11-10T12:00:00Z',json_set(source_payload,'$.content','A newer account.'),source_item_id
+                FROM analyses WHERE cache_key=?""", (old["editorial_analysis_key"],))
+        row = pending(store, item(url="https://example.org/other", source_id="other", content=BODY), LATER)
+        prepared = store.prepare_candidate(row, analysis(), LATER)
+        cited = next(source for source in prepared["packet"]["sources"] if source["url"] == "https://example.org/news/1")
+        # A BLOB that is valid UTF-8 JSON still reads as the current copy.
+        assert cited["snapshot"] == ("current" if kind == "blob" else "historical-analysis")
+        assert cited["passages"][-1]["text"] == BODY and not prepared["packet"]["missing_sources"]
+        with store.db:
+            store.db.execute("DELETE FROM analyses WHERE source_item_id=?", (old["editorial_item"],))
+        missing = store.prepare_candidate(row, analysis(), LATER)["packet"]["missing_sources"]
+        assert missing == ([] if kind == "blob" else ["https://example.org/news/1"])
 
 
 @pytest.mark.parametrize("body", ["", None])

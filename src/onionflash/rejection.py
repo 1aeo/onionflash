@@ -6,12 +6,11 @@ not call a model, publish a story, or change editorial correction state.
 
 from __future__ import annotations
 
-import json
 import re
 
 from . import editorial
 from .schema import PRODUCTS
-from .util import canonical_url, format_utc, now_iso, parse_utc
+from .util import canonical_url, format_utc, now_iso, parse_utc, saved_object
 
 
 MAX_LIMIT = 200
@@ -24,19 +23,9 @@ def _identifier(value: str) -> str:
     return value
 
 
-# The payload is read as bytes, so a value that is not even UTF-8 reaches _object instead of failing the query.
-_COLUMNS = "id,content_hash,source_id,status,attempts,rejections,next_attempt_at,story_id,url,last_error,CAST(payload AS BLOB) AS payload"
-
-
-def _object(value):
-    """A saved JSON object read as bytes, or None when it is damaged, so one bad row cannot hide
-    the others. Decoding is strict UTF-8, as when the pipeline reads the row, not json.loads'
-    lenient bytes mode."""
-    try:
-        value = json.loads(str(value, "utf-8"))
-    except (ValueError, RecursionError):
-        return None
-    return value if isinstance(value, dict) else None
+# The payload is read as bytes, so a value that is not even UTF-8 reaches saved_object instead of failing the query.
+_COLUMNS = ("id,content_hash,source_id,status,attempts,rejections,next_attempt_at,story_id,url,last_error,"
+            "typeof(payload) AS payload_type,CAST(payload AS BLOB) AS payload")
 
 
 def _text(value):
@@ -46,7 +35,7 @@ def _text(value):
 def _summary(row):
     result = {key: row[key] for key in ("id", "content_hash", "source_id", "status", "attempts", "rejections", "next_attempt_at", "story_id")}
     # The CLI escapes printed text, so stored values are shown as the app wrote them.
-    result.update(source_url=row["url"], rejection_reason=row["last_error"], title=_text((_object(row["payload"]) or {}).get("title")))
+    result.update(source_url=row["url"], rejection_reason=row["last_error"], title=_text((saved_object(row["payload"]) or {}).get("title")))
     return result
 
 
@@ -70,7 +59,7 @@ def show_item(store, item_id) -> dict:
     if row is None:
         raise ValueError("Source item was not found")
     result = _summary(row)
-    result["saved_item"] = _object(row["payload"])
+    result["saved_item"] = saved_object(row["payload"])
     result["final_review"] = _final_review(store, item_id)
     result["actions"] = [dict(action) for action in store.db.execute(
         """SELECT action_id,action,content_hash,reason,created_at,before_status,before_attempts,before_rejections
@@ -88,7 +77,7 @@ def _final_review(store, item_id):
         AND (SELECT status FROM items WHERE id=?1) IN ('ignored','published') ORDER BY rowid DESC LIMIT 1""", (item_id,)).fetchone()
     if row is None or row["record_json"] is None:
         return None
-    record = _object(row["record_json"])
+    record = saved_object(row["record_json"])
     try:
         prepared = record.get("prepared", {})
         reviews = record.get("reviews") or record.get("approval", {}).get("reviews", [])
@@ -127,9 +116,9 @@ def _checked(db, item_id, expected_hash, *, statuses):
 
 def _ready(row):
     """Refuse to queue a structurally unreadable/cold item for model analysis."""
-    payload = _object(row["payload"]) or {}
+    payload = saved_object(row["payload"]) or {}
     try:
-        if payload.get("id") != row["id"]:
+        if payload.get("id") != row["id"] or row["payload_type"] != "text":
             raise ValueError
         for key in ("title", "content", "kind"):
             if not isinstance(payload.get(key), str) or (key != "content" and not payload[key]):

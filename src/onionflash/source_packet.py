@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import json
-
 from .comments import analysis_context
-from .util import canonical_url, digest
+from .util import canonical_url, digest, saved_object
 
 
 # The review packet's fixed bounds.
@@ -20,28 +18,22 @@ def source_fingerprint(item: dict) -> str:
 
 
 def _decode(value):
-    try:
-        item = json.loads(value)
-        if not isinstance(item, dict) or not isinstance(item.get("title"), str):
-            return None
-        body = item.get("source_content", item.get("content"))
-        # An explicit empty body is a valid title-only source. An absent body
-        # is a compacted/missing snapshot, not evidence of an empty document.
-        if not isinstance(body, str) or not (body.strip() or item["title"].strip()):
-            return None
-        return item
-    except (ValueError, TypeError):
+    item = saved_object(value)
+    if item is None or not isinstance(item.get("title"), str):
         return None
+    body = item.get("source_content", item.get("content"))
+    # An explicit empty body is a valid title-only source. An absent body
+    # is a compacted/missing snapshot, not evidence of an empty document.
+    if not isinstance(body, str) or not (body.strip() or item["title"].strip()):
+        return None
+    return item
 
 
 def _lookup_fingerprint(row):
     if row is None:
         return None
-    try:
-        item = json.loads(row["payload"])
-        return source_fingerprint(item) if isinstance(item, dict) else digest(row["payload"])
-    except (ValueError, TypeError):
-        return digest(row["payload"])
+    item = saved_object(row["payload"])
+    return source_fingerprint(item) if item is not None else digest(row["payload"].hex())
 
 
 def _matches_citation(item, source_id, url):
@@ -54,9 +46,11 @@ def _matches_citation(item, source_id, url):
 
 
 def _load(db, source_id: str | None, url: str, analysis_key: str | None = None):
-    row = db.execute("SELECT id,payload FROM items WHERE id=?", (source_id,)).fetchone() if source_id else None
+    # Saved copies are read as bytes, so a damaged one reads as missing instead of failing the query.
+    query = "SELECT id,CAST(payload AS BLOB) AS payload FROM items WHERE "
+    row = db.execute(query + "id=?", (source_id,)).fetchone() if source_id else None
     if row is None:
-        row = db.execute("SELECT id,payload FROM items WHERE url=?", (url,)).fetchone()
+        row = db.execute(query + "url=?", (url,)).fetchone()
     lookup = {"table": "item_lookup", "key": row["id"] if row else source_id or url,
               "by": "id" if row or source_id else "url", "hash": _lookup_fingerprint(row)}
     if row is not None:
@@ -74,13 +68,14 @@ def _load(db, source_id: str | None, url: str, analysis_key: str | None = None):
         return None
 
     if analysis_key:
-        saved = snapshot(db.execute("SELECT cache_key,source_payload,created_at FROM analyses WHERE cache_key=?", (analysis_key,)).fetchone())
+        saved = snapshot(db.execute("SELECT cache_key,CAST(source_payload AS BLOB) AS source_payload,created_at FROM analyses "
+                                    "WHERE cache_key=?", (analysis_key,)).fetchone())
         if saved:
             return saved
     if source_id:
         # Stream this one source's indexed history; a later snapshot at a
         # different URL must not hide an older exact citation match.
-        for row in db.execute("""SELECT cache_key,source_payload,created_at FROM analyses
+        for row in db.execute("""SELECT cache_key,CAST(source_payload AS BLOB) AS source_payload,created_at FROM analyses
                 WHERE source_item_id=? AND source_payload IS NOT NULL
                 ORDER BY created_at DESC,cache_key DESC""", (source_id,)):
             saved = snapshot(row)

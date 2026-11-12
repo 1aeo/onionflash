@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from .util import after, backoff_seconds, digest, item_cluster, item_identity
+from .util import after, backoff_seconds, digest, item_cluster, item_identity, saved_object
 from . import candidate, editorial, render
 from .comments import analysis_context
 from .candidate import ReviewRequired
@@ -63,6 +64,16 @@ def item_priority(item: dict) -> int:
         if word in words
     )
     return max(score, TAG_PRIORITY if item["kind"] == "tag" else 0)
+
+
+def item_hash(item: dict) -> str:
+    """A digest of the fields that make a new revision of an item."""
+    fields = {k: item.get(k) for k in ("title", "content", "kind", "product", "labels", "authority", "upstream_state")}
+    if item.get("public_comments"):
+        # Notes as the writer sees them, so a reaction that moves only a note's
+        # update time, or a verification time, never requeues an item.
+        fields["public_comments"] = analysis_context(item)[1]
+    return digest(fields)
 
 
 
@@ -238,21 +249,36 @@ class Store:
     def ingest(self, item: dict, observed: str) -> bool:
         item_id = digest(item_identity(item))[:24]
         item["id"] = item_id
-        fields = {k: item.get(k) for k in ("title", "content", "kind", "product", "labels", "authority", "upstream_state")}
-        if item.get("public_comments"):
-            # Notes as the writer sees them, so a reaction that moves only a note's
-            # update time, or a verification time, never requeues an item.
-            fields["public_comments"] = analysis_context(item)[1]
-        content_hash = digest(fields)
+        content_hash = item_hash(item)
         cluster = item_cluster(item)
         row = self.db.execute(
-            "SELECT content_hash,payload FROM items WHERE id=?", (item_id,)
+            "SELECT content_hash,status,typeof(payload) AS payload_type,CAST(payload AS BLOB) AS payload FROM items WHERE id=?",
+            (item_id,),
         ).fetchone()
-        if row and row["content_hash"] == content_hash:
+        old = saved_object(row["payload"]) if row and row["payload_type"] == "text" else None
+        if row and not isinstance((old or {}).get("updated_at"), str):
+            # A damaged saved copy counts as absent, so recollecting replaces it. The same revision is
+            # only restored, and so is an issue that is not pending while a comment check is requested
+            # for it, as merge_cached_comments does when comments are on: the item keeps its queue
+            # state and operator decision, and the first check that succeeds compares the notes with
+            # the kept hash.
+            logging.getLogger(__name__).warning("Replacing damaged saved item %s", item_id)
+            requested = "SELECT 1 FROM comment_cache WHERE item_id=? AND (failures>0 OR next_fetch_at<=checked_at)"
+            if row["content_hash"] == content_hash or (row["status"] != "pending" and item.get("kind") == "gitlab_issue"
+                                                       and "comments_source_key" not in item
+                                                       and self.db.execute(requested, (item_id,)).fetchone()):
+                with self.db:
+                    self.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps(item, ensure_ascii=False), item_id))
+                return False
+        elif row and row["content_hash"] == content_hash:
             # An upstream updated_at edit alone is not a new news event.
             return False
-        if row and item["updated_at"] < json.loads(row["payload"])["updated_at"]:
+        elif row and item["updated_at"] < old["updated_at"]:
             # A stale cache/fallback must not roll a newer incident back in time.
+            return False
+        elif row and row["status"] != "pending" and "comments_source_key" not in item and item_hash(old) == content_hash:
+            # The same revision as a copy restored above without its notes, listed again before a check
+            # succeeded: the kept hash still holds the notes, so this is no change.
             return False
         score = item_priority(item)
         with self.db:
@@ -277,13 +303,20 @@ class Store:
         return True
 
     def pending(self, limit: int, observed: str) -> list[dict]:
-        rows = self.db.execute(
-            """SELECT * FROM items WHERE status='pending'
+        """Due items, best first. An item whose saved copy is damaged, which reading the whole row
+        could fail on, is only its id and damaged=True, for the caller to reject."""
+        rows = []
+        for item_id, kind, payload in self.db.execute(
+            """SELECT id,typeof(payload),CAST(payload AS BLOB) FROM items WHERE status='pending'
             AND (next_attempt_at IS NULL OR next_attempt_at<=?)
             ORDER BY priority_score DESC,last_seen DESC,id LIMIT ?""",
             (observed, limit),
-        )
-        return [dict(row) for row in rows]
+        ).fetchall():
+            if kind == "text" and saved_object(payload) is not None:
+                rows.append(dict(self.db.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()))
+            else:
+                rows.append({"id": item_id, "damaged": True})
+        return rows
 
     def pending_count(self) -> int:
         return self.db.execute(
@@ -301,16 +334,24 @@ class Store:
         if row is None:
             return
         attempts, rejections = row[0] + 1, row[1] + terminal
+        if rejections >= 3:
+            self.reject(item_id, error)
+            return
         delay = backoff_seconds(
             attempts, llm["retry_base_seconds"], llm["retry_cap_seconds"]
         )
         with self.db:
             self.db.execute(
-                "UPDATE items SET status=?,attempts=?,rejections=?,last_error=?,next_attempt_at=? "
+                "UPDATE items SET attempts=?,rejections=?,last_error=?,next_attempt_at=? "
                 "WHERE id=? AND status='pending'",
-                ("rejected" if rejections >= 3 else "pending",
-                 attempts, rejections, error[:160], after(delay, observed), item_id),
+                (attempts, rejections, error[:160], after(delay, observed), item_id),
             )
+
+    def reject(self, item_id: str, error: str) -> None:
+        """Stop retrying a pending item, after its third failure or because its saved copy is damaged."""
+        with self.db:
+            self.db.execute("""UPDATE items SET status='rejected',attempts=attempts+1,rejections=MAX(rejections,3),
+                next_attempt_at=NULL,last_error=? WHERE id=? AND status='pending'""", (error[:160], item_id))
 
     def rejected_count(self) -> int:
         return self.db.execute("SELECT COUNT(*) FROM items WHERE status='rejected'").fetchone()[0]
