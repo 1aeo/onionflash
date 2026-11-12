@@ -81,7 +81,7 @@ The API key is read only from the `ONIONFLASH_LLM_API_KEY` environment variable.
 | `sources` | Stream ID, display name, public website URL, kind, collection URL, fallback URLs, product, authority, optional interval/page/item overrides |
 
 Collection, HTTP, model, comment, final-review and publication limits (lookback,
-budgets, retries, response sizes, backoff, source-packet bounds, feed length,
+budgets, retries, response sizes, backoff, source-packet bounds,
 render batch) are fixed in code; a file that still sets one loads, with each one
 logged as ignored.
 
@@ -241,8 +241,7 @@ health make incomplete scans visible, but upstream data can change while a scan
 is in progress. Treat this as a news aid, not an incident-detection guarantee.
 
 Published stories never expire: numbered homepage and topic pages
-(`site.page_size` stories each) cover the whole history, while RSS, JSON Feed and
-topic feeds carry the most recently updated stories. Builds render only changed
+(`site.page_size` stories each) cover the whole history. Builds render only changed
 articles, in bounded batches. Keep the SQLite database, raw source content,
 analysis evidence and private publication metadata outside the webroot. See
 [permanent history and recovery](docs/PERMANENT_HISTORY.md).
