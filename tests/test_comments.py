@@ -16,7 +16,7 @@ from onionflash.config import DEFAULTS, load_config
 from onionflash.store import Store
 from onionflash.transport import FetchError, HttpClient, Response
 from onionflash.util import after, digest, now_iso
-from test_core import DATE, FakeClient, analysis, config, item, source
+from test_core import DAMAGE, DATE, FakeClient, analysis, config, damage_item, item, source
 
 
 PROJECT = "tpo/core/tor"
@@ -550,13 +550,13 @@ def test_verified_snapshot_survives_scheduling_cache_eviction_but_not_identity_c
 
 @pytest.mark.parametrize("bad_payload", ["broken JSON", '{"kind":"gitlab_issue","title":"Cold item"}',
                                         '{"kind":"gitlab_issue","title":"Missing URL","content":"body"}',
-                                        json.dumps(issue(content="invalid\ud800text"))])
+                                        json.dumps(issue(content="invalid\ud800text")), b'{"\xff"'])
 def test_bad_local_history_does_not_back_off_other_issues(tmp_path, bad_payload):
     cfg = comments_config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         first = published_issues(store, 41473, 41474)[0]
-        with store.db:
-            store.db.execute("UPDATE items SET payload=? WHERE id=?", (bad_payload, first["id"]))
+        with store.db:  # saved as text, even bytes that are not UTF-8
+            store.db.execute("UPDATE items SET payload=CAST(? AS TEXT) WHERE id=?", (bad_payload, first["id"]))
         client = Issues()
         report = enrich(cfg, store, DATE, client)
         assert report["skipped"] == 1 and report["checked"] == 1 and report["failed"] == 0
@@ -716,3 +716,110 @@ def test_comment_config_requires_a_clean_identity_and_retired_source_keys_still_
         assert cfg["comments"]["enabled"] and ("gitlab_project" in cfg["sources"][0]) == participates
         if participates:
             assert _identity(cfg["sources"][0])[2] == ENDPOINT
+
+
+@pytest.mark.parametrize("kind", DAMAGE)
+def test_a_damaged_saved_issue_has_no_snapshot_and_requests_a_check(tmp_path, kind):
+    with Store(tmp_path / "state.db") as store:
+        store.ingest(issue(), DATE)
+        item_id = store.db.execute("SELECT id FROM items").fetchone()[0]
+        damage_item(store.db, item_id, kind)
+        assert merge_cached_comments(store, issue(), issue_source(), DATE) == issue()
+        assert tuple(store.db.execute("SELECT item_id,next_fetch_at FROM comment_cache").fetchone()) == (item_id, DATE)
+
+
+@pytest.mark.parametrize("status", ["dismissed", "ignored", "rejected"])
+@pytest.mark.parametrize("kind", ["invalid-json", "invalid-utf8", "blob"])
+@pytest.mark.parametrize("failing", [False, True])
+def test_an_issue_whose_saved_copy_lost_its_notes_keeps_its_status_until_a_check_finds_new_ones(tmp_path, status, kind, failing):
+    """REST lists the issue without notes; the requested check compares them with the kept hash."""
+    cfg = comments_config(tmp_path)
+    later, latest = after(60, DATE), after(120, DATE)
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest(issue(), DATE)
+        enrich(cfg, store, DATE, FakeClient([response(payload())]))
+        item_id, before = store.db.execute("SELECT id,content_hash FROM items").fetchone()
+        with store.db:
+            store.db.execute("UPDATE items SET status=?", (status,))
+            if failing:  # a failing check keeps its backoff, which counts as the request
+                store.db.execute("UPDATE comment_cache SET failures=1,next_fetch_at=?", (later,))
+        damage_item(store.db, item_id, kind)
+        assert not store.ingest(merge_cached_comments(store, issue(), issue_source(), later), later)
+        assert tuple(store.db.execute("SELECT status,content_hash FROM items").fetchone()) == (status, before)
+        assert enrich(cfg, store, later, FakeClient([response(payload())]))["changed"] == 0
+        saved = json.loads(store.db.execute("SELECT payload FROM items").fetchone()[0])
+        assert len(saved["public_comments"]) == 1 and store.db.execute("SELECT status FROM items").fetchone()[0] == status
+        # A new note moves the issue's REST update time; its check requeues the issue.
+        damage_item(store.db, item_id, kind)
+        assert not store.ingest(merge_cached_comments(store, issue(updated_at=latest), issue_source(), latest), latest)
+        notes = payload([note(), note("2", body="A maintainer confirms the keys were replaced.")])
+        assert enrich(cfg, store, latest, FakeClient([response(notes)]))["changed"] == 1
+        assert store.db.execute("SELECT status FROM items").fetchone()[0] == "pending"
+
+
+@pytest.mark.parametrize("status", ["dismissed", "ignored", "rejected"])
+@pytest.mark.parametrize("change", ["revision", "notes"])
+def test_a_restored_issue_listed_again_before_a_check_succeeds_keeps_its_status_until_it_changes(tmp_path, status, change):
+    """The requested check fails and REST lists the same revision again. A changed revision needs no
+    check; a check that succeeds finds the notes gone."""
+    cfg = comments_config(tmp_path)
+    later, latest = after(60, DATE), after(120, DATE)
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest(issue(), DATE)
+        enrich(cfg, store, DATE, FakeClient([response(payload())]))
+        item_id, before = store.db.execute("SELECT id,content_hash FROM items").fetchone()
+        with store.db:
+            store.db.execute("UPDATE items SET status=?", (status,))
+        damage_item(store.db, item_id, "invalid-json")
+        assert not store.ingest(merge_cached_comments(store, issue(), issue_source(), later), later)
+        assert enrich(cfg, store, later, Issues(fail=("41473",)))["failed"] == 1
+        assert not store.ingest(merge_cached_comments(store, issue(), issue_source(), latest), latest)
+        assert tuple(store.db.execute("SELECT status,content_hash FROM items").fetchone()) == (status, before)
+        if change == "revision":
+            assert store.ingest(merge_cached_comments(store, issue(title="A changed title"), issue_source(), latest), latest)
+        else:
+            assert enrich(cfg, store, after(86400, DATE), Issues())["changed"] == 1
+        assert store.db.execute("SELECT status FROM items").fetchone()[0] == "pending"
+
+
+@pytest.mark.parametrize("retried", [False, True])
+def test_a_pending_issue_whose_saved_copy_lost_its_notes_takes_a_new_hash(tmp_path, retried):
+    """The writer then drafts again instead of reusing a draft written with the notes. retried: a
+    dismissed issue restored as above, then retried before a check succeeded."""
+    cfg = comments_config(tmp_path)
+    later = after(60, DATE)
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest(issue(), DATE)
+        enrich(cfg, store, DATE, FakeClient([response(payload())]))
+        item_id, before = store.db.execute("SELECT id,content_hash FROM items").fetchone()
+        damage_item(store.db, item_id, "invalid-json")
+        if retried:
+            with store.db:
+                store.db.execute("UPDATE items SET status='dismissed'")
+            assert not store.ingest(merge_cached_comments(store, issue(), issue_source(), later), later)
+            with store.db:
+                store.db.execute("UPDATE items SET status='pending'")
+        assert store.ingest(merge_cached_comments(store, issue(), issue_source(), later), later)
+        assert store.db.execute("SELECT content_hash FROM items").fetchone()[0] != before
+
+
+@pytest.mark.parametrize("kind", ["invalid-json", "invalid-utf8"])
+@pytest.mark.parametrize("prior_cache", ["ok", "failed", "requested"])
+def test_with_comments_off_a_changed_revision_of_a_damaged_issue_is_queued(tmp_path, kind, prior_cache):
+    """No check is requested, so the damaged copy counts as absent even if comment_cache kept an old failure or request."""
+    cfg = comments_config(tmp_path)
+    later = after(60, DATE)
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest(issue(), DATE)
+        enrich(cfg, store, DATE, FakeClient([response(payload())]))  # a check from when comments were on
+        item_id = store.db.execute("SELECT id FROM items").fetchone()[0]
+        with store.db:
+            store.db.execute("UPDATE items SET status='dismissed'")
+            if prior_cache == "failed":
+                store.db.execute("UPDATE comment_cache SET failures=1,next_fetch_at=?", (later,))
+            elif prior_cache == "requested":
+                store.db.execute("UPDATE comment_cache SET next_fetch_at=checked_at")
+        damage_item(store.db, item_id, kind)
+        # With comments off, collection saves the issue as REST lists it.
+        assert store.ingest(issue(title="A changed title", updated_at=later), later)
+        assert store.db.execute("SELECT status FROM items").fetchone()[0] == "pending"

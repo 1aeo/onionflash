@@ -22,7 +22,6 @@ from . import editorial, render
 from .util import digest, now_iso
 
 
-FEED_ITEMS = 100  # the newest stories in each feed; pages and story.json keep the whole history
 _ARTICLE = r"news/[A-Za-z0-9_-]{1,64}/(?:index\.html|story\.json)"
 _TOPIC = "(?:" + "|".join(re.escape(topic) for topic in render.CATEGORIES) + ")"
 _PATH = re.compile(r"(?:" + _ARTICLE + r"|page/[1-9][0-9]*/index\.html|topics/" + _TOPIC
@@ -278,7 +277,7 @@ def _backfill_topics(db) -> None:
 
 
 def _feeds(artifacts: Artifacts, db, site: dict, base: str) -> None:
-    # Fan out one catalog pass, which stops once every feed is full, instead of rereading it per topic.
+    # Fan out one catalog pass instead of rereading it for every topic.
     with ExitStack() as stack:
         writers = {category: stack.enter_context(artifacts.stream(
             "feed.xml" if category is None else f"tags/{category}.xml",
@@ -289,7 +288,7 @@ def _feeds(artifacts: Artifacts, db, site: dict, base: str) -> None:
         for story in _accepted(db, order="updated_at"):
             xml = None
             for category, writer in writers.items():
-                if (category and category not in story["tags"]) or counts[category] >= FEED_ITEMS:
+                if category and category not in story["tags"]:
                     continue
                 if not counts[category]:
                     path = "feed.xml" if category is None else f"tags/{category}.xml"
@@ -302,8 +301,6 @@ def _feeds(artifacts: Artifacts, db, site: dict, base: str) -> None:
                         json_writer.write(b",\n")
                     json_writer.write(json.dumps(render._json_feed_item(story, base), ensure_ascii=False).encode("utf-8"))
                 counts[category] += 1
-            if min(counts.values()) >= FEED_ITEMS:
-                break
         for category, writer in writers.items():
             if not counts[category]:
                 path = "feed.xml" if category is None else f"tags/{category}.xml"

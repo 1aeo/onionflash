@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from .util import after, backoff_seconds, digest, item_cluster, item_identity
-from . import candidate, editorial, render
+from .util import after, backoff_seconds, digest, item_cluster, item_identity, saved_object
+from . import candidate, decisions, editorial, render
 from .comments import analysis_context
 from .candidate import ReviewRequired
 
@@ -63,6 +64,16 @@ def item_priority(item: dict) -> int:
         if word in words
     )
     return max(score, TAG_PRIORITY if item["kind"] == "tag" else 0)
+
+
+def item_hash(item: dict) -> str:
+    """A digest of the fields that make a new revision of an item."""
+    fields = {k: item.get(k) for k in ("title", "content", "kind", "product", "labels", "authority", "upstream_state")}
+    if item.get("public_comments"):
+        # Notes as the writer sees them, so a reaction that moves only a note's
+        # update time, or a verification time, never requeues an item.
+        fields["public_comments"] = analysis_context(item)[1]
+    return digest(fields)
 
 
 
@@ -138,6 +149,14 @@ class Store:
                 superseded_analysis_key TEXT, superseded_analysis_json TEXT
             );
             CREATE INDEX IF NOT EXISTS rejection_actions_item ON rejection_actions(item_id,action_id);
+            -- One row per terminal decision (see decisions.py); subject is the item ID or another decision's key.
+            CREATE TABLE IF NOT EXISTS decision_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, decided_at TEXT NOT NULL, subject TEXT NOT NULL,
+                item_id TEXT, content_hash TEXT, source_id TEXT, story_id TEXT,
+                code TEXT NOT NULL, detail_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS decision_log_time ON decision_log(decided_at);
+            CREATE INDEX IF NOT EXISTS decision_log_item ON decision_log(item_id,id);
         """)
         editorial.initialize(self.db)
         analysis_columns = {row[1] for row in self.db.execute("PRAGMA table_info(analyses)")}
@@ -147,6 +166,7 @@ class Store:
         self.db.execute("CREATE INDEX IF NOT EXISTS analyses_source_snapshot ON analyses(source_item_id,created_at DESC,cache_key DESC)")
         if "rejections" not in {row[1] for row in self.db.execute("PRAGMA table_info(items)")}:
             self.db.execute("ALTER TABLE items ADD COLUMN rejections INTEGER NOT NULL DEFAULT 0")
+        self._comment_requests: dict[str, str] = {}
         self.db.commit()
 
     def __enter__(self) -> Store:
@@ -238,22 +258,43 @@ class Store:
     def ingest(self, item: dict, observed: str) -> bool:
         item_id = digest(item_identity(item))[:24]
         item["id"] = item_id
-        fields = {k: item.get(k) for k in ("title", "content", "kind", "product", "labels", "authority", "upstream_state")}
-        if item.get("public_comments"):
-            # Notes as the writer sees them, so a reaction that moves only a note's
-            # update time, or a verification time, never requeues an item.
-            fields["public_comments"] = analysis_context(item)[1]
-        content_hash = digest(fields)
+        content_hash = item_hash(item)
         cluster = item_cluster(item)
+        check_requested = (item.get("kind") == "gitlab_issue" and "comments_source_key" not in item
+                           and self._comment_requests.pop(item_id, None) == observed)
         row = self.db.execute(
-            "SELECT content_hash,payload FROM items WHERE id=?", (item_id,)
+            """SELECT content_hash,status,story_id,cluster_key,typeof(payload) AS payload_type,
+               CAST(payload AS BLOB) AS payload FROM items WHERE id=?""",
+            (item_id,),
         ).fetchone()
-        if row and row["content_hash"] == content_hash:
+        old = saved_object(row["payload"]) if row and row["payload_type"] == "text" else None
+        if row and not isinstance((old or {}).get("updated_at"), str):
+            # A damaged saved copy counts as absent, so recollecting replaces it. The same revision is
+            # only restored, and so is an issue that is not pending while merge_cached_comments just
+            # requested a comment check for it: the item keeps its queue state and operator decision,
+            # and the first check that succeeds compares the notes with the kept hash.
+            logging.getLogger(__name__).warning("Replacing damaged saved item %s", item_id)
+            requested = "SELECT 1 FROM comment_cache WHERE item_id=? AND (failures>0 OR next_fetch_at<=checked_at)"
+            if row["content_hash"] == content_hash or (row["status"] != "pending" and check_requested
+                                                       and self.db.execute(requested, (item_id,)).fetchone()):
+                with self.db:
+                    self.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps(item, ensure_ascii=False), item_id))
+                return False
+        elif row and row["content_hash"] == content_hash:
             # An upstream updated_at edit alone is not a new news event.
             return False
-        if row and item["updated_at"] < json.loads(row["payload"])["updated_at"]:
+        elif row and item["updated_at"] < old["updated_at"]:
             # A stale cache/fallback must not roll a newer incident back in time.
             return False
+        elif row and row["status"] != "pending" and check_requested and item_hash(old) == content_hash:
+            # The same revision as a copy restored above without its notes, listed again before a check
+            # succeeded: the kept hash still holds the notes, so this is no change.
+            return False
+        if row is not None:
+            alias = editorial.retired(self.db, story_id=row["story_id"], cluster_key=row["cluster_key"])
+            if alias is not None and alias[1] is None:
+                # Keep a retired item's original cluster key across body edits so process_item still ignores it.
+                cluster = self.db.execute("SELECT cluster_key FROM story_aliases WHERE story_id=?", (alias[0],)).fetchone()[0]
         score = item_priority(item)
         with self.db:
             self.db.execute(
@@ -277,21 +318,31 @@ class Store:
         return True
 
     def pending(self, limit: int, observed: str) -> list[dict]:
-        rows = self.db.execute(
-            """SELECT * FROM items WHERE status='pending'
+        """Due items, best first, after those waiting for a verification or a release-label repair, so a
+        fix loop that a run's deadline cut short finishes first. An item whose saved copy is damaged,
+        which reading the whole row could fail on, is only its id and damaged=True, for the caller to reject."""
+        rows = []
+        for item_id, kind, payload in self.db.execute(
+            """SELECT id,typeof(payload),CAST(payload AS BLOB) FROM items WHERE status='pending'
             AND (next_attempt_at IS NULL OR next_attempt_at<=?)
-            ORDER BY priority_score DESC,last_seen DESC,id LIMIT ?""",
+            ORDER BY id IN (SELECT item_id FROM review_jobs WHERE stage IN ('verify','repair')) DESC,
+            priority_score DESC,last_seen DESC,id LIMIT ?""",
             (observed, limit),
-        )
-        return [dict(row) for row in rows]
+        ).fetchall():
+            if kind == "text" and saved_object(payload) is not None:
+                rows.append(dict(self.db.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()))
+            else:
+                rows.append({"id": item_id, "damaged": True})
+        return rows
 
     def pending_count(self) -> int:
         return self.db.execute(
             "SELECT COUNT(*) FROM items WHERE status='pending'"
         ).fetchone()[0]
 
-    def defer(self, item_id: str, error: str, llm: dict, observed: str, *, terminal: bool = False) -> None:
-        """Retry later; after three failures caused by the item itself, stop retrying.
+    def defer(self, item_id: str, error: str, llm: dict, observed: str, *, terminal: bool = False,
+              code: str = "app.unexpected") -> None:
+        """Retry later; after three failures caused by the item itself, stop retrying and log `failed.<code>`.
 
         A rejected item is queued again only when its source content changes.
         """
@@ -301,16 +352,25 @@ class Store:
         if row is None:
             return
         attempts, rejections = row[0] + 1, row[1] + terminal
+        if rejections >= 3:
+            self.reject(item_id, error, "failed." + code, observed)
+            return
         delay = backoff_seconds(
             attempts, llm["retry_base_seconds"], llm["retry_cap_seconds"]
         )
         with self.db:
             self.db.execute(
-                "UPDATE items SET status=?,attempts=?,rejections=?,last_error=?,next_attempt_at=? "
+                "UPDATE items SET attempts=?,rejections=?,last_error=?,next_attempt_at=? "
                 "WHERE id=? AND status='pending'",
-                ("rejected" if rejections >= 3 else "pending",
-                 attempts, rejections, error[:160], after(delay, observed), item_id),
+                (attempts, rejections, error[:160], after(delay, observed), item_id),
             )
+
+    def reject(self, item_id: str, error: str, code: str, observed: str) -> None:
+        """Stop retrying a pending item, after its third failure or because its saved copy is damaged."""
+        with self.db:
+            if self.db.execute("""UPDATE items SET status='rejected',attempts=attempts+1,rejections=MAX(rejections,3),
+                    next_attempt_at=NULL,last_error=? WHERE id=? AND status='pending'""", (error[:160], item_id)).rowcount:
+                decisions.record(self.db, item_id, code, observed, error=error[:160])
 
     def rejected_count(self) -> int:
         return self.db.execute("SELECT COUNT(*) FROM items WHERE status='rejected'").fetchone()[0]
@@ -338,14 +398,18 @@ class Store:
 
     def commit_candidate(self, prepared: dict, approved_candidate: dict | None, cache_key: str, observed: str, *,
                          approval_key: str | None = None, policy_hash: str | None = None,
-                         review_record: dict | None = None, decision: str = "approve") -> dict:
+                         review_record: dict | None = None, decision: str = "approve",
+                         operator: bool = False) -> dict:
         """Apply an exact reviewed publication or skip decision and delete its receipt."""
         if self.db.in_transaction:
             raise ValueError("Candidate commit requires a fresh transaction")
         self.db.execute("BEGIN IMMEDIATE")
         with self.db:
             row, result, story_id, locked = prepared["row"], prepared["result"], prepared["story_id"], prepared["locked"]
-            payload = skipped = None
+            payload = skipped = operator_reason = None
+            code = "held.gate.story_locked"  # the item maps to its story, and the update waits for the operator
+            if operator and locked:
+                raise ReviewRequired("Its story is editorially locked")
             if not locked:
                 original = prepared["candidate"]
                 if not isinstance(approved_candidate, dict) or set(approved_candidate) != set(original):
@@ -357,41 +421,65 @@ class Store:
                     raise ReviewRequired("The approved candidate must already be normalized")
                 if prepared["packet"]["missing_sources"]:
                     raise ReviewRequired("Required source material is unavailable")
-                receipt = self.db.execute("SELECT * FROM review_approvals WHERE key=?", (approval_key,)).fetchone()
-                if receipt is None or any(receipt[key] != expected for key, expected in (
-                        ("candidate_hash", digest(approved_candidate)), ("source_hash", prepared["source_hash"]),
-                        ("policy_hash", policy_hash), ("binding_hash", prepared["binding_hash"]))):
-                    raise ReviewRequired("Review decision does not match this candidate and its context")
-                from .review import validate_review
-                verdict = validate_review(json.loads(receipt["result_json"]), prepared["packet"])
-                if verdict["verdict"] != decision:
-                    raise ReviewRequired("Final review did not authorize this decision")
-                if review_record is None:
-                    review_record = json.loads(receipt["review_record_json"])
-                self.db.execute("DELETE FROM review_approvals WHERE key=?", (approval_key,))
+                if operator:
+                    approval_meta = review_record.get("operator_approval") if isinstance(review_record, dict) else None
+                    if (decision != "approve" or not isinstance(approval_meta, dict)
+                            or review_record.get("outcome") != "operator_approved"
+                            or not isinstance(approval_meta.get("reason"), str) or not approval_meta["reason"]):
+                        raise ReviewRequired("Operator approval requires an operator_approval audit record")
+                    current = candidate.prepare(self.db, row, result, prepared["observed"])
+                    held_job = self.db.execute("SELECT stage FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
+                    item_state = self.db.execute("SELECT status FROM items WHERE id=?", (row["id"],)).fetchone()
+                    if (current["locked"] or current["binding_hash"] != prepared["binding_hash"]
+                            or held_job is None or held_job["stage"] != "held"
+                            or item_state is None or item_state["status"] != "rejected"):
+                        raise candidate.StaleCandidate("Item or coverage changed before approval committed")
+                    operator_reason = approval_meta["reason"]
+                else:
+                    receipt = self.db.execute("SELECT * FROM review_approvals WHERE key=?", (approval_key,)).fetchone()
+                    if receipt is None or any(receipt[key] != expected for key, expected in (
+                            ("candidate_hash", digest(approved_candidate)), ("source_hash", prepared["source_hash"]),
+                            ("policy_hash", policy_hash), ("binding_hash", prepared["binding_hash"]))):
+                        raise ReviewRequired("Review decision does not match this candidate and its context")
+                    from .review import validate_review
+                    verdict = validate_review(json.loads(receipt["result_json"]), prepared["packet"])
+                    if verdict["verdict"] != decision:
+                        raise ReviewRequired("Final review did not authorize this decision")
+                    if review_record is None:
+                        review_record = json.loads(receipt["review_record_json"])
+                    self.db.execute("DELETE FROM review_approvals WHERE key=?", (approval_key,))
                 if decision == "approve":
                     payload = json.loads(json.dumps(prepared["payload"]))
                     payload.update({key: approved_candidate[key] for key in candidate.SEMANTIC_FIELDS})
-                    if candidate.existing_story(self.db, row) is None:  # Date publication, not the first draft.
+                    new = candidate.existing_story(self.db, row) is None
+                    if new:  # Date publication, not the first draft.
                         payload["added_at"] = observed
+                    code = "operator.approved" if operator else ("published.new" if new else "published.update")
                 else:
                     skipped = ("Final review skipped: " + ", ".join(
                         name for name, check in verdict["criteria"].items() if check["outcome"] != "pass"))[:160]
+                    code = decisions.skip_code(review_record, verdict)
             analysis_key = self.record_analysis(row, result, cache_key, observed, review_record=review_record)
             if payload is not None:
                 if payload.get("editorial_item") == row["id"]:
                     payload["editorial_analysis_key"] = analysis_key
-                self.db.execute("""INSERT INTO stories(id,cluster_key,payload,published_at,updated_at)
+                cursor = self.db.execute("""INSERT INTO stories(id,cluster_key,payload,published_at,updated_at)
                     VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at""",
                     (story_id, prepared["cluster_key"], json.dumps(payload, ensure_ascii=False, allow_nan=False), payload["published_at"], payload["updated_at"]))
+                if not cursor.rowcount:
+                    raise editorial.RetiredStory("Story is retired")
             elif locked:
+                if editorial.retired(self.db, story_id=story_id, cluster_key=prepared["cluster_key"]) is not None:
+                    raise editorial.RetiredStory("Story is retired")
                 editorial.record_held(self.db, story_id)
             published = decision == "approve"
             mapped_id = story_id if published else row.get("story_id")
             self.db.execute("UPDATE items SET status=?,story_id=?,next_attempt_at=NULL,last_error=? WHERE id=?",
                             ("published" if published else "ignored", mapped_id, skipped, row["id"]))
             self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
-        return {"story_id": mapped_id, "status": "locked" if locked and published else "published" if published else "ignored"}
+            decisions.record(self.db, row["id"], code, observed, review=review_record, reason=operator_reason)
+        return {"story_id": mapped_id, "status": "locked" if locked and published else "published" if published else "ignored",
+                "analysis_key": analysis_key}
 
     def stories(self, limit: int = -1) -> list[dict]:
         """Stored stories, newest activity first (all of them by default)."""

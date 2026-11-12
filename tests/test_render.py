@@ -11,9 +11,11 @@ from pathlib import Path
 from html.parser import HTMLParser
 from unittest.mock import patch
 
+from onionflash.analyze import SCHEMA
 from onionflash.cli import build
 from onionflash.config import DEFAULTS
 from onionflash.render import CATEGORIES, _page_url
+from onionflash.schema import UPDATE_CHARS
 from onionflash.store import Store
 
 
@@ -167,17 +169,94 @@ class RenderTests(unittest.TestCase):
         # An old issue first published today is new on Onion Flash; an edit to an
         # earlier story does not move it above newer additions.
         resurfaced = {**STORY, "id": "resurfaced", "published_at": "2026-09-22T12:00:00Z",
-                      "updated_at": "2026-11-09T12:00:00Z", "added_at": "2026-11-09T12:00:00Z"}
+                      "updated_at": "2026-09-22T12:00:00Z", "added_at": "2026-11-09T12:00:00Z"}
         earlier = {**STORY, "id": "earlier", "published_at": "2026-11-05T12:00:00Z",
                    "updated_at": "2026-11-10T12:00:00Z", "added_at": "2026-11-05T12:00:00Z"}
         page = (self.render([earlier, resurfaced]) / "index.html").read_text()
         self.assertLess(page.index('id="story-resurfaced"'), page.index('id="story-earlier"'))
-        # Each card shows the date that orders it; the story page keeps the source date.
+        # Cards and story pages show when Onion Flash first published the story; feeds keep the source date.
         card = page[page.index('id="story-resurfaced"'):page.index('id="story-earlier"')]
         self.assertIn('<span class="story-date"><time datetime="2026-11-09T12:00:00Z"', card)
         self.assertNotIn("updated-note", card)
         article = (self.root / "site" / "news" / "resurfaced" / "index.html").read_text()
-        self.assertIn('Published <time datetime="2026-09-22T12:00:00Z"', article)
+        self.assertIn('First published <time datetime="2026-11-09T12:00:00Z"', article)
+        # A source update before or at the first-published date is not a later update.
+        self.assertNotIn("Last updated", article)
+        same = self.render([{**resurfaced, "updated_at": resurfaced["added_at"]}], name="same") / "news" / "resurfaced" / "index.html"
+        self.assertNotIn("Last updated", same.read_text())
+        article = (self.root / "site" / "news" / "earlier" / "index.html").read_text()
+        self.assertIn('First published <time datetime="2026-11-05T12:00:00Z"', article)
+        self.assertIn('Last updated <time datetime="2026-11-10T12:00:00Z"', article)
+        dates = {item.findtext("link"): item.findtext("pubDate") for item in ET.parse(self.root / "site" / "feed.xml").findall("./channel/item")}
+        self.assertEqual(dates["https://example.com/onionflash/news/resurfaced/"], "Tue, 22 Sep 2026 12:00:00 GMT")
+
+    def test_dated_updates_list_newest_first_and_cards_and_feeds_show_the_latest(self):
+        source = {"url": "https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/1", "title": "<b>Merge request</b>"}
+        quoted = {"url": 'https://example.org/a"onmouseover=x', "title": "Quoted"}
+        third = {"url": "https://example.org/third", "title": "Third"}
+        story = copy.deepcopy(STORY)
+        story["updates"] = [
+            {"at": "2026-11-09T09:00:00Z", "text": "The fix was proposed.", "sources": [source]},
+            {"at": "2026-11-10T09:00:00+00:00", "text": "The fix was merged. <script>alert(1)</script>",
+             "sources": [source, {"url": "javascript:alert(1)", "title": "bad"}]},
+            # Text is cut, only the first three sources count, and on a tie the later entry is listed first.
+            {"at": "2026-11-09T09:00:00Z", "text": "x" * (UPDATE_CHARS + 50),
+             "sources": [quoted, source, third, {"url": "https://example.org/fourth", "title": "Fourth"}]},
+            # Malformed entries are dropped, never published and never fatal.
+            "not an update", {"at": "2026-11-11T09:00:00", "text": "No time zone.", "sources": [source]},
+            {"at": "2026-11-11T09:00:00Z", "text": "No source.", "sources": []},
+            {"at": "2026-11-11T09:00:00Z", "text": "Unsafe source.", "sources": [{"url": "http://example.org/", "title": "x"}]},
+            {"at": "2026-11-11T09:00:00Z", "text": " ", "sources": [source]},
+        ]
+        output = self.render([story])
+        public = json.loads((output / "news" / story["id"] / "story.json").read_text())
+        self.assertEqual(public["updates"], [
+            {"at": "2026-11-09T09:00:00Z", "text": "The fix was proposed.", "sources": [source]},
+            {"at": "2026-11-10T09:00:00Z", "text": "The fix was merged. <script>alert(1)</script>", "sources": [source]},
+            {"at": "2026-11-09T09:00:00Z", "text": "x" * UPDATE_CHARS, "sources": [quoted, source, third]}])
+        article = (output / "news" / story["id"] / "index.html").read_text()
+        positions = [article.index(text) for text in ("The fix was merged.", "x" * UPDATE_CHARS, "The fix was proposed.")]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn('<time datetime="2026-11-10T09:00:00Z" title="2026-11-10 09:00 UTC">Nov 10, 2026 · 09:00 UTC</time>', article)
+        self.assertIn('rel="noopener noreferrer">&lt;b&gt;Merge request&lt;/b&gt;</a>', article)
+        self.assertIn('href="https://example.org/a&quot;onmouseover=x"', article)
+        home = (output / "index.html").read_text()
+        rss = ET.parse(output / "feed.xml").findtext("./channel/item/description")
+        content = json.loads((output / "feed.json").read_text())["items"][0]["content_text"]
+        self.assertIn("Update · 2026-11-10T09:00:00Z: The fix was merged. <script>alert(1)</script>", content)
+        for text in (home, rss, article):
+            self.assertNotIn("<script>alert", text)
+            self.assertIn("&lt;script&gt;", text)
+        for text in (home, rss, content):
+            self.assertIn("The fix was merged.", text)
+            self.assertNotIn("The fix was proposed.", text)
+        for text in (home, rss, content, article, json.dumps(public)):
+            for dropped in ("No time zone.", "No source.", "Unsafe source.", "javascript:"):
+                self.assertNotIn(dropped, text)
+        # The card's latest update replaces its update date.
+        self.assertIn('<strong>Update · <time datetime="2026-11-10T09:00:00Z"', home)
+        self.assertNotIn("updated-note", home)
+
+    def test_a_story_without_updates_has_no_updates_key_or_markup(self):
+        for index, updates in enumerate([None, [], "text", [{"at": "2026-11-10T09:00:00Z", "text": "No source."}]]):
+            with self.subTest(updates=updates):
+                story = copy.deepcopy(STORY)
+                if updates is not None:
+                    story["updates"] = updates
+                output = self.render([story], name=f"plain-{index}")
+                self.assertNotIn("updates", json.loads((output / "news" / story["id"] / "story.json").read_text()))
+                home = (output / "index.html").read_text()
+                self.assertIn('<span class="updated-note">Updated <time datetime="2026-11-08T14:00:00Z"', home)
+                for text in (home, (output / "news" / story["id"] / "index.html").read_text(), (output / "feed.xml").read_text(),
+                             (output / "feed.json").read_text()):
+                    self.assertNotIn("Update ·", text)
+                    self.assertNotIn("update-list", text)
+
+    def test_no_longer_listed_is_a_public_state_the_writer_cannot_choose(self):
+        story = {**copy.deepcopy(STORY), "state": "no-longer-listed"}
+        article = (self.render([story]) / "news" / story["id"] / "index.html").read_text()
+        self.assertIn('<span>Event status</span> No longer listed', article)
+        self.assertNotIn("no-longer-listed", SCHEMA["properties"]["state"]["enum"])
 
     def test_source_panel_shows_only_freshness_not_times_or_errors(self):
         health = [{"name": "Fresh", "website_url": "https://example.org/a", "stale": False, "last_success": "2026-11-08T12:00:00Z", "error": "boom"},

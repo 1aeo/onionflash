@@ -12,7 +12,7 @@ from onionflash.collect import CollectionError, collect_source
 from onionflash.config import DEFAULTS, load_config
 from onionflash.store import Store
 from onionflash.transport import FetchError, Response
-from onionflash.util import after, canonical_url, item_cluster, plain_text
+from onionflash.util import MAX_SAVED_DEPTH, after, canonical_url, item_cluster, plain_text, saved_object
 
 
 DATE = "2026-11-08T12:00:00Z"
@@ -69,17 +69,33 @@ def analysis(**kw):
     }
 
 
-DAMAGE = ["invalid-json", "non-object", "invalid-utf8", "deep", "surrogate", "bom", "utf-16"]
+DAMAGE = ["invalid-json", "non-object", "invalid-utf8", "deep", "nested", "surrogate", "escaped-surrogate", "nan", "bom", "utf-16"]
 
 
 def damaged(document, kind):
     """Bytes the app never saves for a JSON document: broken JSON, a non-object, bytes that are not
-    UTF-8, nesting past the parser's limit, or the document with a lone surrogate added, a BOM
-    prepended, or encoded as UTF-16."""
+    UTF-8, nesting past the parser's limit or past MAX_SAVED_DEPTH, or the document with a lone
+    surrogate added (as UTF-8 bytes or as a JSON escape), a non-finite number, a BOM prepended, or
+    encoded as UTF-16."""
     if kind == "surrogate":
         return json.dumps({**json.loads(document), "\ud800": ""}, ensure_ascii=False).encode("utf-8", "surrogatepass")
+    if kind == "escaped-surrogate":
+        return json.dumps({**json.loads(document), "\ud800": ""}).encode()
     return {"invalid-json": b"{", "non-object": b"[1]", "invalid-utf8": b'{"\xff"', "deep": b"[" * 100000,
-            "bom": b"\xef\xbb\xbf" + document.encode(), "utf-16": document.encode("utf-16")}[kind]
+            "nested": b'{"x":' + b"[" * MAX_SAVED_DEPTH + b"]" * MAX_SAVED_DEPTH + b"}",
+            "nan": b'{"x":NaN}', "bom": b"\xef\xbb\xbf" + document.encode(), "utf-16": document.encode("utf-16")}[kind]
+
+
+def damage_item(db, item_id, kind):
+    """Save a damaged() copy of one item; for "blob", its intact copy typed as an SQLite BLOB, and for
+    "undated", the copy without its updated_at."""
+    expression = {"blob": "CAST(payload AS BLOB)", "undated": "json_remove(payload,'$.updated_at')"}.get(kind)
+    if expression:
+        db.execute(f"UPDATE items SET payload={expression} WHERE id=?", (item_id,))
+    else:
+        document = db.execute("SELECT payload FROM items WHERE id=?", (item_id,)).fetchone()[0]
+        db.execute("UPDATE items SET payload=CAST(? AS TEXT) WHERE id=?", (damaged(document, kind), item_id))
+    db.commit()
 
 
 def config(tmp_path):
@@ -990,13 +1006,121 @@ def test_rss_guid_that_is_not_a_permalink_is_never_a_citation():
     assert collect_source(FakeClient([response(xml)]), source(), {}, DEFAULTS["collection"], DATE)["items"] == []
 
 
-def test_an_unexpected_source_error_is_recorded_and_other_sources_still_run(tmp_path, monkeypatch):
+LIST_URL = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/feed/"
+
+
+def _list_rss(*author_xml: str) -> bytes:
+    entries = "".join(
+        f'<item><title>Message {n}</title><link>https://lists.torproject.org/m/{n}/</link>'
+        f'<description>Body</description>{xml}<pubDate>Sun, 08 Nov 2026 12:00:00 GMT</pubDate></item>'
+        for n, xml in enumerate(author_xml, 1)
+    )
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/" '
+        'xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"><channel>'
+        f'<title>tor-dev</title><link>https://lists.torproject.org/</link><description>List</description>{entries}'
+        '</channel></rss>'
+    ).encode()
+
+
+def _collected_items(body: bytes, *, src_url: str = LIST_URL, final_url: str = LIST_URL, authority: str = "community"):
+    resp = Response(200, body, {}, final_url)
+    return collect_source(FakeClient([resp]), source(url=src_url, authority=authority), {}, DEFAULTS["collection"], DATE)["items"]
+
+
+def test_a_torproject_org_sender_on_the_list_archive_is_project_sender():
+    from onionflash import review, review_gate
+
+    items = _collected_items(_list_rss(
+        "<author>dev＠torproject.org (A Developer)</author>",
+        "<author>Dev.Name+x_1-2＠TorProject.ORG</author>",
+        "<author>member＠example.org (Community Member)</author>",
+    ))
+    assert [entry["authority"] for entry in items] == ["project-sender", "project-sender", "community"]
+    assert all("dev@torproject.org" not in json.dumps(entry).lower() and "＠" not in json.dumps(entry) for entry in items)
+    # Final response URL after redirects decides the host, in both directions.
+    redirected_in = _collected_items(_list_rss("<author>dev＠torproject.org (Dev)</author>"),
+                                     src_url="https://example.org/feed.xml", final_url=LIST_URL)
+    redirected_out = _collected_items(_list_rss("<author>dev＠torproject.org (Dev)</author>"),
+                                      src_url=LIST_URL, final_url="https://example.org/feed.xml")
+    assert redirected_in[0]["authority"] == "project-sender" and redirected_out[0]["authority"] == "community"
+    # A configured official source keeps official authority regardless of sender.
+    official_items = _collected_items(_list_rss(
+        "<author>dev＠torproject.org (Dev)</author>",
+        "<author>member＠example.org (Member)</author>",
+    ), authority="official")
+    assert [entry["authority"] for entry in official_items] == ["official", "official"]
+    # review_gate treats project-sender as official for news-value holds, while Confirmed still refuses it.
+    criteria = {name: {"reason": "Supported.", "source_refs": ["S1P1"], "outcome": "pass"} for name in review.CRITERIA}
+    criteria["news_value"] = {"reason": "Routine reply.", "source_refs": ["S1P1"], "outcome": "fail"}
+    first = {"stage": "review", "candidate_hash": "h", "result": {"verdict": "skip", "criteria": criteria, "repair": None}}
+    prepared = {"row": {"payload": json.dumps(items[0])}, "payload": {"editorial_kind": "feed"},
+                "packet": {"sources": [{**items[0], "passages": [{"ref": "S1P1", "text": "Body"}]}]}, "coverage": {}}
+    assert review_gate.next_step([first], analysis(), prepared)[0] == "verify"
+    assert "confirmed_source" in review.final_holds(analysis(confidence="confirmed"), prepared)
+
+
+@pytest.mark.parametrize("author_entries,final_url", [
+    (["<author>mallory＠example.org (dev@torproject.org)</author>"], LIST_URL),
+    (["<author>mallory＠example.org (Dev &lt;dev＠torproject.org&gt;)</author>"], LIST_URL),
+    (["<author>dev＠torproject.org.example.org (Dev)</author>"], LIST_URL),
+    (["<author>dev＠example-torproject.org (Dev)</author>"], LIST_URL),
+    (["<author>alert＠monitor.torproject.org (Alert)</author>"], LIST_URL),
+    (["<author>tor-dev＠lists.torproject.org (Dev via tor-dev)</author>"], LIST_URL),
+    (["<author>dev%example.org＠torproject.org (Dev)</author>"], LIST_URL),
+    (["<author>a＠torproject.org＠example.org (Dev)</author>"], LIST_URL),
+    (["<author>dev@torproject.org (Dev)</author>"], LIST_URL),
+    (["<author>dev＠torprоject.org (Dev)</author>"], LIST_URL),  # Cyrillic o
+    (["<author>Kate＠torproject.org (Kate)</author>"], LIST_URL),  # Kelvin sign lowercases to k
+    (["<author>Real Dev dev＠torproject.org (Dev)</author>"], LIST_URL),
+    (["<author>dev＠torproject.org(Dev)</author>"], LIST_URL),
+    (["<dc:creator>dev@torproject.org</dc:creator>"], LIST_URL),
+    (["<dc:creator>dev＠torproject.org</dc:creator>"], LIST_URL),
+    (["<dc:creator>dev＠torproject.org (Real Dev)</dc:creator>"], LIST_URL),
+    (["<author>dev＠torproject.org (Dev)</author>", "<author>Plain Name</author>"], LIST_URL),
+    (["<author>dev＠torproject.org (Dev)</author>", "<dc:creator>Plain Name</dc:creator>"], LIST_URL),
+    (["<author>mallory＠example.org (M)</author><author>dev＠torproject.org (Dev)</author>"], LIST_URL),
+    (["<author>mallory＠example.org (M)</author><dc:creator>dev＠torproject.org (Dev)</dc:creator>"], LIST_URL),
+    (["<author>mallory＠example.org (M)</author><dc:author>dev＠torproject.org (Dev)</dc:author>"], LIST_URL),
+    (["<author>mallory＠example.org (M)</author><dc:author>Plain Name</dc:author>", "<author>dev＠torproject.org (Dev)</author>"], LIST_URL),
+    (["<author>mallory＠example.org (M)</author><itunes:author>dev＠torproject.org (Dev)</itunes:author>"], LIST_URL),
+    (["<author>mallory＠example.org (M)</author><managingEditor>dev＠torproject.org (Dev)</managingEditor>"], LIST_URL),
+    (["<Author>dev＠torproject.org (Dev)</Author>"], LIST_URL),
+    (["<author><name>dev＠torproject.org</name><email>mallory@example.org</email></author>"], LIST_URL),
+    (["<author>dev＠torproject.org<span/></author>"], LIST_URL),
+    (["<author>dev＠torproject.org (Dev)</author>"], "https://example.org/feed.xml"),
+    (["<author>dev＠torproject.org (Dev)</author>"], "https://lists.torproject.org.example.org/feed/"),
+])
+def test_names_lookalikes_and_other_hosts_never_make_a_sender_project_sender(author_entries, final_url):
+    items = _collected_items(_list_rss(*author_entries), final_url=final_url)
+    assert all(entry["authority"] == "community" for entry in items)
+
+
+def test_atom_and_namespaced_items_never_make_a_sender_project_sender():
+    atom = (b'<feed xmlns="http://www.w3.org/2005/Atom"><title>T</title><id>urn:t</id><updated>2026-11-08T12:00:00Z</updated>'
+            b'<entry><title>Msg</title><link href="https://lists.torproject.org/m/1/"/><id>urn:1</id>'
+            b'<updated>2026-11-08T12:00:00Z</updated><author><name>dev\xef\xbc\xa0torproject.org</name>'
+            b'<email>mallory@example.org</email></author></entry></feed>')
+    mixed = (b'<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/"><channel><title>T</title>'
+             b'<link>https://lists.torproject.org/</link><description>D</description>'
+             b'<item xmlns="http://purl.org/dc/elements/1.1/"><author>dev\xef\xbc\xa0torproject.org (Dev)</author></item>'
+             b'<entry><title>Msg</title><link>https://lists.torproject.org/m/1/</link>'
+             b'<dc:creator>dev\xef\xbc\xa0torproject.org (Dev)</dc:creator></entry></channel></rss>')
+    for raw in (atom, mixed):
+        assert [entry["authority"] for entry in _collected_items(raw)] == ["community"]
+
+
+# A partial collection whose items cannot be saved fails its source the same way.
+@pytest.mark.parametrize("error, where", [(RuntimeError("unexpected parser crash"), "RuntimeError at test_core.py:"),
+                                          (CollectionError("unexpected parser crash", [{"title": "No URL"}]), "KeyError at ")])
+def test_an_unexpected_source_error_is_recorded_and_other_sources_still_run(tmp_path, monkeypatch, error, where):
     from onionflash import cli
     cfg = config(tmp_path)
     cfg["sources"] = [source(id="broken", url="https://broken.example/feed.xml"), source(id="fine")]
     def collect(client, stream, *args):
         if stream["id"] == "broken":
-            raise RuntimeError("unexpected parser crash")
+            raise error
         return {"items": [], "url": stream["url"]}
     monkeypatch.setattr(cli, "collect_source", collect)
     monkeypatch.setattr(cli, "build", lambda *args: {})
@@ -1004,5 +1128,120 @@ def test_an_unexpected_source_error_is_recorded_and_other_sources_still_run(tmp_
         report = cli.run(cfg, store)
         broken = store.source(cfg["sources"][0])
     assert report["sources_failed"] == 1 and report["sources_ok"] == 1
-    assert broken["error"].startswith("Unexpected RuntimeError at test_core.py:")
+    assert broken["error"].startswith("Unexpected " + where)
     assert "parser crash" not in broken["error"] and broken["failures"] == 1
+
+
+def test_a_saved_object_nests_at_most_the_cap_and_holds_no_lone_surrogate():
+    """App records nest about 7 levels; deeper reads as damaged, so every operator view can be printed."""
+    within = b'{"x":' + b"[" * (MAX_SAVED_DEPTH - 1) + b"]" * (MAX_SAVED_DEPTH - 1) + b"}"
+    assert saved_object(within) is not None and saved_object(damaged("{}", "nested")) is None
+    # An escaped surrogate pair is one character; non-finite numbers, an escaped lone surrogate, and NULL read as damaged/missing.
+    assert saved_object(b'{"x":"\\ud83d\\ude00"}') == {"x": "\U0001f600"}
+    assert saved_object(b'{"x":"\\ud800"}') is None and saved_object(None) is None
+    for non_finite in (b'{"x":NaN}', b'{"x":Infinity}', b'{"x":-Infinity}'):
+        assert saved_object(non_finite) is None
+
+
+@pytest.mark.parametrize("kind", [*DAMAGE, "blob", "undated"])
+def test_collection_replaces_a_damaged_saved_copy(tmp_path, caplog, kind):
+    """A damaged copy counts as absent, so one bad row cannot stop collection and recollecting restores it."""
+    entry = lambda **kw: item(kind="feed", **kw)
+    with Store(tmp_path / "state.db") as store:
+        store.ingest(entry(), DATE)
+        item_id = store.db.execute("SELECT id FROM items").fetchone()[0]
+        store.db.execute("UPDATE items SET status='dismissed'")
+        damage_item(store.db, item_id, kind)
+        assert not store.ingest(entry(), DATE)  # the same revision: only its copy is restored, and the dismissal stands
+        assert tuple(store.db.execute("SELECT status,typeof(payload),json_extract(payload,'$.id') FROM items").fetchone()) == ("dismissed", "text", item_id)
+        damage_item(store.db, item_id, kind)
+        # A changed revision replaces the copy and queues, even dated before the timestamp the copy lost.
+        assert store.ingest(entry(content="A later account.", updated_at="2026-11-01T00:00:00Z"), DATE)
+        assert json.loads(store.pending(1, DATE)[0]["payload"])["content"] == "A later account."
+    assert caplog.text.count("Replacing damaged saved item") == 2
+
+
+@pytest.mark.parametrize("kind", [*DAMAGE, "blob"])
+def test_pending_reports_a_damaged_saved_copy_without_reading_or_changing_it(tmp_path, kind):
+    with Store(tmp_path / "state.db") as store:
+        store.ingest(item(url="https://example.org/damaged"), DATE)
+        store.ingest(item(url="https://example.org/intact", content="An intact report."), DATE)
+        damaged_id, intact_id = (store.db.execute("SELECT id FROM items WHERE url=?", (url,)).fetchone()[0]
+                                 for url in ("https://example.org/damaged", "https://example.org/intact"))
+        damage_item(store.db, damaged_id, kind)
+        before = store.db.execute("SELECT status,attempts,rejections,last_error,next_attempt_at FROM items ORDER BY id").fetchall()
+        rows = {row["id"]: row for row in store.pending(10, DATE)}
+        assert rows[damaged_id] == {"id": damaged_id, "damaged": True} and rows[intact_id]["url"] == "https://example.org/intact"
+        assert store.db.execute("SELECT status,attempts,rejections,last_error,next_attempt_at FROM items ORDER BY id").fetchall() == before
+
+
+@pytest.mark.parametrize("kind", ["invalid-utf8", "blob", "escaped-surrogate"])
+def test_a_run_rejects_a_damaged_pending_item_without_a_model_call_and_still_builds(tmp_path, monkeypatch, kind):
+    from onionflash import cli
+
+    class Writer:
+        calls = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def analyze(self, payload):
+            Writer.calls += 1
+            return analysis()
+
+    monkeypatch.setattr(cli, "Analyzer", Writer)
+    monkeypatch.setattr(cli, "Reviewer", ApprovingReviewer)
+    cfg = config(tmp_path)
+    cfg["sources"] = []
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest(item(url="https://example.org/damaged"), DATE)
+        store.ingest(item(url="https://example.org/intact", content="An intact report."), DATE)
+        damaged_id = store.db.execute("SELECT id FROM items WHERE url='https://example.org/damaged'").fetchone()[0]
+        store.defer(damaged_id, "LLM request failed (HTTP 503)", cfg["llm"], DATE)  # a retry time, due by now
+        damage_item(store.db, damaged_id, kind)
+        report = cli.run(cfg, store)
+        assert tuple(store.db.execute("SELECT status,last_error,next_attempt_at FROM items WHERE id=?", (damaged_id,)).fetchone()) == (
+            "rejected", "Stored source item is damaged", None)
+        assert len(store.stories()) == 1
+    assert (report["analyzed"], report["analysis_failed"], report["rejected_analysis"], Writer.calls) == (1, 1, 1, 1)
+    assert (tmp_path / "public" / "index.html").exists()
+
+
+@pytest.mark.parametrize("kind", ["invalid-json", "invalid-utf8"])
+def test_a_partial_collection_with_a_damaged_saved_copy_still_analyzes_and_builds(tmp_path, monkeypatch, kind):
+    from onionflash import cli
+
+    class Fake:
+        def __init__(self, *args, **kwargs):
+            self.calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def analyze(self, payload):
+            return analysis()
+
+    collected = [item(url="https://example.org/damaged", content="A changed report."), item(url="https://example.org/next")]
+
+    def partial(*args):
+        raise CollectionError("request deadline reached", collected)
+
+    monkeypatch.setattr(cli, "HttpClient", Fake)
+    monkeypatch.setattr(cli, "Analyzer", Fake)
+    monkeypatch.setattr(cli, "Reviewer", ApprovingReviewer)
+    monkeypatch.setattr(cli, "collect_source", partial)
+    cfg = config(tmp_path)
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest(item(url="https://example.org/damaged"), DATE)
+        damage_item(store.db, store.db.execute("SELECT id FROM items").fetchone()[0], kind)
+        result = cli.run(cfg, store)
+    assert (result["sources_failed"], result["items_changed"], result["analyzed"]) == (1, 2, 2)

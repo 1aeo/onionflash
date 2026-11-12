@@ -12,11 +12,16 @@ state when there are no stories. Existing `/tags/<topic>.xml` RSS URLs remain th
 same. Topic links, pagination, mobile navigation and editorial history require no
 browser JavaScript.
 
-`site.page_size` controls pagination. RSS and JSON Feed carry the 100 most
-recently updated stories, and each topic feed the 100 most recent of its topic;
-the pages keep the whole history. Homepage ordering follows the date Onion Flash
-added the story, with the original source date retained on the article and in
-RSS. Older records without `added_at` keep their existing date.
+`site.page_size` controls pagination. RSS and JSON Feed carry every story, and
+each topic feed every story of its topic, most recently updated first. Homepage
+ordering follows the date Onion Flash first published the story. Articles show
+that date and the last update; RSS and JSON Feed keep the original source date
+as the publication date. Older records without `added_at` keep their existing
+date.
+
+A story can carry dated updates, each with its own sources. Its article lists
+them newest first and `story.json` includes them; homepage cards, RSS and JSON
+Feed show the latest one. A story without updates has no `updates` key.
 
 ## Incremental work
 

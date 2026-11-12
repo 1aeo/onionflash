@@ -584,6 +584,778 @@
           ]
         }
       ]
+    },
+    "official-routine-post": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/bdf58c3e1c2ddd76536469bf",
+          "title": "Thank you for a great community meetup",
+          "kind": "feed",
+          "authority": "official",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "Thank you to everyone who joined last weekend's community meetup. It was great to meet so many relay operators and users in person, and we hope to see you at the next one."
+          ]
+        }
+      ]
+    },
+    "scope-correction": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/2428eec1be0fc04772dd66ec",
+          "title": "Relay crash on malformed consensus diff",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-09T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "opened",
+          "passages": [
+            {
+              "author": "user-a",
+              "created_at": "2026-11-10T11:00:00Z",
+              "url": "https://example.org/sources/2428eec1be0fc04772dd66ec#note_2",
+              "text": "Correction: after more testing I can reproduce this only on the unreleased 1.3 development branch, not on 1.2.x releases."
+            },
+            "Relays running Tor 1.2.x crash when they apply a malformed consensus diff. A reproducer is attached."
+          ]
+        }
+      ]
+    },
+    "refactor-with-disclosure": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/b5c53e1d432758098f005ab8",
+          "title": "Refactor download handling",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor-browser",
+          "published_at": "2026-11-08T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "closed",
+          "passages": [
+            {
+              "author": "user-b",
+              "created_at": "2026-11-10T10:00:00Z",
+              "url": "https://example.org/sources/b5c53e1d432758098f005ab8#note_5",
+              "text": "Merged for the next alpha. This refactor also fixes a proxy bypass on Android, where some downloads could skip the configured proxy."
+            },
+            "This issue tracks a refactor of download handling so that every platform shares one code path."
+          ]
+        }
+      ]
+    },
+    "duplicate-claim-comment": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/bd9f0e95eacf0d79dcf2b76f",
+          "title": "Remote relay crash with a malformed circuit-extension cell",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "opened",
+          "passages": [
+            {
+              "author": "user-c",
+              "created_at": "2026-11-10T09:00:00Z",
+              "url": "https://example.org/sources/bd9f0e95eacf0d79dcf2b76f#note_3",
+              "text": "Duplicate of an old issue, already announced; nothing new here."
+            },
+            "A remote client can crash a relay by sending a malformed circuit-extension cell. The attached reproducer triggers the crash on Tor 1.2.3 relays."
+          ]
+        }
+      ]
+    },
+    "list-proposal-official": {
+      "sources": [
+        {
+          "url": "https://example.invalid/lists/dev/message/p1",
+          "title": "[tor-dev] [Proposal] Fold extra-info fields into router descriptors",
+          "kind": "feed",
+          "authority": "project-sender",
+          "product": "torspec",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "I have written a specification proposal to stop publishing separate extra-info documents and to carry their remaining fields in router descriptors instead.",
+            "The full text and motivation are in a specification merge request. Comments are welcome."
+          ]
+        }
+      ]
+    },
+    "list-proposal-community": {
+      "sources": [
+        {
+          "url": "https://example.invalid/lists/dev/message/p2",
+          "title": "[tor-dev] [Proposal] Fold extra-info fields into router descriptors",
+          "kind": "feed",
+          "authority": "community",
+          "product": "torspec",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "I have written a specification proposal to stop publishing separate extra-info documents and to carry their remaining fields in router descriptors instead.",
+            "The full text and motivation are in a specification merge request. Comments are welcome."
+          ]
+        }
+      ]
+    },
+    "list-rfc-marker": {
+      "sources": [
+        {
+          "url": "https://example.invalid/lists/dev/message/p3",
+          "title": "[tor-dev] [RFC] Padding negotiation for onion service circuits",
+          "kind": "feed",
+          "authority": "community",
+          "product": "torspec",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "This RFC describes a way for clients and onion services to negotiate circuit padding before any data is sent.",
+            "Feedback on the design is welcome before it becomes a numbered proposal."
+          ]
+        }
+      ]
+    },
+    "list-numbered-proposal": {
+      "sources": [
+        {
+          "url": "https://example.invalid/lists/dev/message/p4",
+          "title": "[tor-dev] Proposal 901: Relay bandwidth self-reporting limits",
+          "kind": "feed",
+          "authority": "community",
+          "product": "torspec",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "Filename: 901-bandwidth-self-reporting-limits.md",
+            "Status: Open",
+            "This proposal caps the bandwidth a relay may self-report at twice its measured value. Comments are welcome."
+          ]
+        }
+      ]
+    },
+    "list-ietf-draft": {
+      "sources": [
+        {
+          "url": "https://example.invalid/lists/dev/message/p5",
+          "title": "[tor-dev] New Internet-Draft: draft-example-onion-resolution-00",
+          "kind": "feed",
+          "authority": "community",
+          "product": "network",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "We have posted draft-example-onion-resolution-00, an Internet-Draft that describes how DNS resolvers should refuse to resolve .onion names.",
+            "Comments from Tor developers are welcome on the IETF list or here."
+          ]
+        }
+      ]
+    },
+    "list-cited-rfc": {
+      "sources": [
+        {
+          "url": "https://example.invalid/lists/dev/message/p6",
+          "title": "[tor-dev] Re: Private address handling",
+          "kind": "feed",
+          "authority": "community",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "RFC 1918 already lists these address ranges as private.",
+            "Proposal 902 covers part of this too, so I don't think we need a new option."
+          ]
+        }
+      ]
+    },
+    "list-text-claims-official": {
+      "sources": [
+        {
+          "url": "https://example.invalid/lists/dev/message/p8",
+          "title": "[tor-dev] [Proposal] Weekly guard rotation",
+          "kind": "feed",
+          "authority": "community",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "From: Tor Project Core Team",
+            "As the Tor Project, we propose that clients rotate their entry guards every week.",
+            "-- The Tor Project core team"
+          ]
+        }
+      ]
+    },
+    "list-official-question": {
+      "sources": [
+        {
+          "url": "https://example.invalid/lists/dev/message/p9",
+          "title": "[tor-dev] Re: Building with an older compiler",
+          "kind": "feed",
+          "authority": "project-sender",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "You need a C99 compiler; older compilers are not supported.",
+            "Try updating your toolchain first."
+          ]
+        }
+      ]
+    },
+    "list-tool-announcement": {
+      "sources": [
+        {
+          "url": "https://example.invalid/lists/dev/message/p10",
+          "title": "[tor-dev] [TOOL PROPOSAL & PoC] guardscan: a scanner for guard relays",
+          "kind": "feed",
+          "authority": "community",
+          "product": "network",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "We wrote guardscan, an open-source tool that scans guard relays and onion service directories for configuration problems.",
+            "It complements existing exit scanners. The code and our first results are on our website."
+          ]
+        }
+      ]
+    },
+    "arti-bandwidthpool-partial-permit": {
+      "sources": [
+        {
+          "kind": "gitlab_mr",
+          "authority": "development",
+          "product": "arti",
+          "published_at": "2026-11-11T19:34:54Z",
+          "updated_at": "2026-11-11T19:34:54Z",
+          "upstream_state": "merged",
+          "url": "https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/4510",
+          "title": "async-utils: Support BandwidthPool partial permit",
+          "passages": [
+            "The first commit removes the rate limited `Sink` object as it is not used anywhere and there are no plans for now to use it. Reason is that partial permits complicate quite a bit that sink implementation.\n\nOnly the fast path can emit partial commit and with a minimum grant value (floor). Reason only the fast path emits them is because we want to avoid the \"ping pong\" effect I _**cleverly**_ named.\n\nFor example, 1 token in the pool, a claim for 10 arrives, we give out 1. Then the caller can't use that 1 token so refunds it and comes back with a claim of 10. I think one can see where this will go... To mitigate that, we make the slow path wait for the entirety of the request so we avoid this problem and also avoid the problem of deciding what is the minimum wait time we will use to start emitting partial permits.\n\nFor the floor, it is so we avoid connections being given the refunds breadcrumbs of very few tokens and waste CPU time with syscall(s) for very few bytes. So, for our channels, we can set that `min_grant` to the size of a cell so any partial permit will at the very least allow to read or write a full cell.\n\nTicket #2834"
+          ]
+        }
+      ]
+    },
+    "arti-relay-drain-rate-update": {
+      "sources": [
+        {
+          "kind": "gitlab_mr",
+          "authority": "development",
+          "product": "arti",
+          "published_at": "2026-11-11T17:50:49Z",
+          "updated_at": "2026-11-11T17:50:49Z",
+          "upstream_state": "merged",
+          "url": "https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/4577",
+          "title": "relay: Handle drain rate updates in the stream reactor",
+          "passages": [
+            "Send a drain rate update through the forward reactor to the stream\nreactor which checks the stream's XON/XOFF state. It can then decide to\nsend or not an XON/XOFF based on that update which will be sent to the\nbackward reactor.\n\nThis problem came out after arti-relay Chutney testing for which the\nrelay as an exit would hit the todo!() when sending an XON which would\ncrash the relay.\n\nDuring testing, the arti-relay would send an XOFF but then never an XON\nleading to a stall in the transfer."
+          ]
+        }
+      ]
+    },
+    "arti-relay-begin-hostname": {
+      "sources": [
+        {
+          "kind": "gitlab_mr",
+          "authority": "development",
+          "product": "arti",
+          "published_at": "2026-11-11T16:19:24Z",
+          "updated_at": "2026-11-11T16:19:24Z",
+          "upstream_state": "merged",
+          "url": "https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/4584",
+          "title": "arti-relay: Add hostname support in BEGIN handling",
+          "passages": [
+            "Part of arti#2699.\n\nFor now this just uses the first answer from the hostname lookup. This has a bunch of TODOs for follow-up work. I've been adding more TODOs than I've been removing, but I'm sure that will turn around one of these days...\n\nThe timeout includes both the hostname resolution and establishing the TCP connection. This code assumes that the `resolver.resolve(hostname)` is cancellation-safe, so should be fine if it times out. I think it should be since if `rx` is dropped in `DnsResolver::resolve()`, the `let _ = tx.send(response_rx)` in `DnsResolverReactor::handle_request()` ignores the error."
+          ]
+        }
+      ]
+    },
+    "arti-sendme-reactor-wake": {
+      "sources": [
+        {
+          "kind": "gitlab_mr",
+          "authority": "development",
+          "product": "arti",
+          "published_at": "2026-11-11T10:05:39Z",
+          "updated_at": "2026-11-11T10:05:39Z",
+          "upstream_state": "merged",
+          "url": "https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/4576",
+          "title": "proto: Wake stream reactor after receiving circuit SENDME",
+          "passages": [
+            "Share a per-hop waker between the backward and stream reactor so a\nchanged congestion window (after receiving a SENDME) resumes pending\nstream data.\n\nThis problem came up in arti-relay Chutney testing with a C-tor client\nafter a download would stall forever."
+          ]
+        }
+      ]
+    },
+    "torspec-prop324-congestion-section": {
+      "sources": [
+        {
+          "kind": "gitlab_mr",
+          "authority": "development",
+          "product": "torspec",
+          "published_at": "2026-11-11T17:47:55Z",
+          "updated_at": "2026-11-11T17:47:55Z",
+          "upstream_state": "merged",
+          "url": "https://gitlab.torproject.org/tpo/core/torspec/-/merge_requests/475",
+          "title": "Specification for Congestion Control (Prop#324)",
+          "passages": [
+            "Additionally contains clarifications to address questions from\nhttps://gitlab.torproject.org/tpo/core/arti/-/issues/1966, as well\nas the side channel mitigation clarity issues that caused\nhttps://gitlab.torproject.org/tpo/core/arti/-/issues/2400."
+          ]
+        }
+      ]
+    },
+    "arti-pow-verifier-warning-question": {
+      "sources": [
+        {
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "arti",
+          "published_at": "2026-10-07T16:12:35Z",
+          "updated_at": "2026-11-11T16:53:14Z",
+          "upstream_state": "opened",
+          "url": "https://gitlab.torproject.org/tpo/core/arti/-/work_items/2800",
+          "title": "PoW: Couldn't construct verifier (key not available?)",
+          "passages": [
+            "I'm running `./target/debug/arti --config hss.toml proxy` with my existing (possibly a bit old) state directory, and I'm seeing some PoW-related warnings in the logs:\n\n```\n026-10-07T16:06:51Z INFO tor_hsservice: Using existing identity for service [service nickname omitted]: [onion address omitted]\n2026-10-07T16:06:51Z INFO tor_hsservice: Launching onion service nickname=[service nickname omitted]\n2026-10-07T16:06:51Z WARN tor_hsservice::pow::v1: Couldn't construct verifier (key not available?). We will continue without this key, but this may prevent clients from connecting...\n2026-10-07T16:06:51Z WARN tor_hsservice::pow::v1: Couldn't construct verifier (key not available?). We will continue without this key, but this may prevent clients from connecting...\n2026-10-07T16:06:51Z WARN tor_hsservice::pow::v1: Couldn't construct verifier (key not available?). We will continue without this key, but this may prevent clients from connecting...\n2026-10-07T16:06:51Z WARN tor_hsservice::pow::v1: Couldn't construct verifier (key not available?). We will continue without this key, but this may prevent clients from connecting...\n```\n\nMy toml config is\n\n```toml\n[storage.permissions]\ndangerously_trust_everyone = true\n\n[logging]\nconsole = \"debug\"\nlog_sensitive_information = true\n\n[onion_services.\"[service nickname omitted]\"]\nproxy_ports = [\n [\"*\", \"127.0.0.1:10080\"],\n]\n```\n\nI am running the version on the current `main` (3ad05164ab37a7660ced971f03663a8dd33e6a9e).\n\nI wonder if something I did corrupted the on-disk pow state, or if we introduced a change that causes this warning to fire.\n\ncc @wesleyac"
+          ]
+        }
+      ]
+    },
+    "arti-oct-release-checklist": {
+      "sources": [
+        {
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "arti",
+          "published_at": "2026-09-28T15:16:17Z",
+          "updated_at": "2026-11-02T15:35:52Z",
+          "upstream_state": "closed",
+          "url": "https://gitlab.torproject.org/tpo/core/arti/-/work_items/2761",
+          "title": "Relase: Oct 1st, 2026",
+          "passages": [
+            "# Automatically scraped release checklist\n\nFor details of items, and further information, refer to `doc/dev/Release.md`.\n\n# How to release Arti\n\n## Checklist\n\n * [x] Create the checklist ticket\n\n## Prepare for confidential security patches (~1 week before release)\n\n * [x] Check for the existence of a confidential meta-issue\n * [x] Check for [issues tagged \"Security Patch Approved\"][security-patch-approved]\n * [ ] Look over all remaining confidential issues for any that have patches not listed\n * [ ] If the above meta-issue doesn't exist,\n * [x] In a *private* arti repository, create an `arti-next` branch.\n * [x] For each security patch listed in the meta-issue,\n * [x] Ensure that CI passes with all of the security patches.\n\n## Finalize confidential security patches (~3 day before release)\n\n * [x] Repeat steps in \"Prepare for confidential security patches\" section above.\n\n## Are we ready to release?\n\n * [x] Make sure CI is passing.\n * [ ] Do we have any open [issues] or [merge requests] tagged \"Blocker\"?\n * [x] Ensure `maint/fixup-features` is happy\n * [x] Does `maint/semver-checks \"arti-v$LAST_VERSION\" | tee ../semver.log` find any issues (!4442)\n\n[issues]: https://gitlab.torproject.org/tpo/core/arti/-/issues/?label_name%5B%5D=Blocker\n[merge requests]: https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/?label_name[]=Blocker\n\n## Preparing for the release\n\n * [x] Write a changelog.\n * [x] Finish the changelog.\n * [x] Determine what semver/version update to do to each crate.\n\n[issues]: https://gitlab.torproject.org/tpo/core/arti/-/issues/?label_name%5B%5D=Blocker\n[merge requests]: https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/?label_name[]=Blocker\n\n## Final preparation for a release.\n\n * [x] Tell `network-team` (via email and IRC) that the tree is ",
+            "now frozen,\n * [x] Repeat steps in \"Prepare for confidential security patches\" section above\n * [x] Merge changes from the private `arti-next` branch into the arti `main` branch.\n * [x] Finalize the changelog.\n * [x] Increase all appropriate version numbers.\n * [x] (Re)run `maint/semver-checks` (having addressed any expected problems)\n * [x] Run `maint/update-release-date`\n\n[issues]: https://gitlab.torproject.org/tpo/core/arti/-/issues/?label_name%5B%5D=Blocker\n[merge requests]: https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/?label_name[]=Blocker\n\n## The actual release itself.\n\n * [x] Recheck for *Blocker* [issues] and [merge requests].\n * [x] Make sure that CI passes, again, on `main`.\n * [x] Run `maint/cargo-publish`.\n * [x] Make the signed git tag `arti-v${THIS_VERSION}`\n\n[issues]: https://gitlab.torproject.org/tpo/core/arti/-/issues/?label_name%5B%5D=Blocker\n[merge requests]: https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/?label_name[]=Blocker\n\n## Post-release\n\n[issues]: https://gitlab.torproject.org/tpo/core/arti/-/issues/?label_name%5B%5D=Blocker\n[merge requests]: https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/?label_name[]=Blocker\n### ASAP\n\n * [x] Remove all of the semver.md files:\n * [x] Tell `network-team` (via email and IRC) that the tree is open\n * [ ] Run `cargo update`, to obtain non-breaking changes in our dependencies\n\n[issues]: https://gitlab.torproject.org/tpo/core/arti/-/issues/?label_name%5B%5D=Blocker\n[merge requests]: https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/?label_name[]=Blocker\n\n### Soon\n\n * [x] If new crates published, add appropriate owners.\n * [x] Write and publish a blog post.\n * [ ] For each security patch listed in the \"Private security patch tracking\" meta-issue,\n * [x] Re-apply ",
+            "changes from #2715\n\n[issues]: https://gitlab.torproject.org/tpo/core/arti/-/issues/?label_name%5B%5D=Blocker\n[merge requests]: https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/?label_name[]=Blocker\n\n### In due course\n\n * [ ] Consider dependency updates for breaking changes in our dependencies.\n * [ ] Consider updating CI Docker images.\n * [ ] Look at the current list of exceptions in our automated tooling.\n * [ ] Make MR(s) of any changes to `Release.md` and/or release tooling.\n\n[issues]: https://gitlab.torproject.org/tpo/core/arti/-/issues/?label_name%5B%5D=Blocker\n[merge requests]: https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/?label_name[]=Blocker\n\n# End of the release checklist"
+          ]
+        }
+      ]
+    },
+    "tordev-entrymap-module-update": {
+      "sources": [
+        {
+          "kind": "feed",
+          "authority": "community",
+          "product": "network",
+          "published_at": "2026-11-11T13:28:54Z",
+          "updated_at": "2026-11-11T13:28:54Z",
+          "upstream_state": "",
+          "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/XR4JD5WZX33EC7GTGUO2P5HCJ7AGOSHU/",
+          "title": "[tor-dev] Re: entrymap: A fast, modular scanner for Entry Guards & HSDirs (Complementing exitmap)",
+          "passages": [
+            "> Hi tor-dev team, Tor Network Health Team & Developers\n>\n> Following up on our initial proposal, we wanted to share a brief\n> update on three additional analysis modules we completed for entrymap\n> today, along with an automated 1:1 Tor Directory\n> Specification (dir-spec.txt) verification hook that executes after\n> every scan run.\n>\n>\n> ==============================================================================\n> 1. CONTEXT: HYGIENE & PROTOCOL DRIFT VS. MALICE\n>\n> ==============================================================================\n>\n> When analyzing ingress telemetry across the consensus, it is crucial\n> to emphasize that many observed anomalies are likely benign artifacts of\n> operator convenience or configuration\n> friction, rather than malicious intent:\n> • Managing MyFamily across dozens of dynamic instances is\n> notoriously cumbersome for well-meaning operators.\n> • Setting BandwidthRate to high or default maximum limits is often\n> an operator's way of saying \"use all available bandwidth,\" leaving it to\n> Bandwidth Authorities to measure true\n> capacity.\n>\n> However, from an architectural perspective, these configuration\n> patterns still create structural imbalances in circuit diversity and\n> consensus weights. entrymap was built to give the\n> Network Health team clear, automated visibility into these edge\n> cases.\n>\n>\n> ==============================================================================\n> 2. NEW MODULES ADDED TODAY\n>\n> ==============================================================================\n>\n> 1. ghost_bw (Bandwidth Disparity & Integer Limit Auditing)\n> • Inspects disparities between claimed BandwidthRate in\n> descriptors and real observed throughput.\n> • Automatically identifies configurations setting rates to 32-bit\n> integer bo",
+            "undaries (e.g. 2^30 B/s / 1 GiB/s) which, during descriptor churn\n> or measurement delays, can skew\n> consensus weight calculations before authorities re-balance them.\n>\n> 2. cidr_cluster (CIDR Subnet Diversity Auditing)\n> • Evaluates /24 IPv4 subnet concentration among Guard and HSDir\n> relays.\n> • Audits instances where multiple relays reside in the exact same\n> /24 subnet without mutual family declarations, surfacing potential gaps\n> where Tor clients might select path hops\n> within the same IP block despite the /16 diversity heuristic.\n>\n> 3. bulletproof (Offshore Ingress Hubs & Exit Policy Auditing)\n> • Audits ingress relays deployed in non-cooperative offshore or\n> privacy-centric hosting jurisdictions that enforce strict \"reject *:*\" exit\n> policies (operating purely as\n> ingress/directory funnels with zero exit capability).\n>\n>\n> ==============================================================================\n> 3. AUTOMATED 1:1 SPECIFICATION VERIFICATION HOOK (dir-spec.txt)\n>\n> ==============================================================================\n>\n> To ensure entrymap maintains zero false positives and adheres\n> strictly to official protocol standards, we implemented an automated\n> post-execution verifier (run_spec_verification):\n>\n> • Verifies mathematical calculations (disparity ratios, bandwidth\n> rates) against dir-spec §2.1.1.\n> • Evaluates family non-repudiation assertions against dir-spec §5.2\n> to distinguish true undeclared nodes from parser singletons.\n> • Executes automatically at the conclusion of every module run to\n> audit descriptor integrity against raw directory consensus.\n>\n> Verification Hook Output:\n>\n> ----------------------------------------------------------------------\n> 🔬 1:1 SPECIFICATION VERIFIER: Module audit complete.\n> • Mat",
+            "hematical & Descriptor Assertions Checked: Conforming\n> • Specification Drift / Inconsistencies Detected : 0\n> • Protocol Integrity Status: ✅ 100% VERIFIED TO DIR-SPEC\n>\n> ----------------------------------------------------------------------\n>\n>\n> ==============================================================================\n> 4. CONCLUSION\n>\n> ==============================================================================\n>\n> Our goal is simply to offer the Tor community an automated, modular\n> tool for the ingress boundary that operates with the same rigor and\n> reliability as exitmap does for the egress\n> boundary.\n>\n> We welcome feedback, suggestions for additional heuristics, or\n> collaboration on gitlab.torproject.org/tpo/network-health.\n>\n> Best regards,\n> Adam Keeves\n> FrogSec Research"
+          ]
+        }
+      ]
+    },
+    "tor-41412-cross-cancellation-edited": {
+      "sources": [
+        {
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-09-23T15:01:31Z",
+          "updated_at": "2026-11-11T14:48:45Z",
+          "upstream_state": "closed",
+          "labels": [
+            "Security",
+            "Severity::medium"
+          ],
+          "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41412",
+          "title": "Circuit cross-cancellation can still blame channels",
+          "passages": [
+            {
+              "author": "arma",
+              "created_at": "2026-10-07T17:17:10Z",
+              "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41412#note_3476175",
+              "text": "Scheduled for making public in a week, on Oct 15."
+            },
+            {
+              "author": "arma",
+              "created_at": "2026-10-07T17:16:54Z",
+              "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41412#note_3476174",
+              "text": "Closing the ticket because it is fixed in today's 0.4.9.14 release.\n\nIf there is more to do here, please re-open or make a fresh ticket."
+            },
+            {
+              "author": "mikeperry",
+              "created_at": "2026-10-02T13:21:01Z",
+              "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41412#note_3474171",
+              "text": "I suspect that this issue is actually related to https://gitlab.torproject.org/tpo/core/tor/-/work_items/41420. Under the CBT timeout calculation problems in that bug, Tor will keep creating new channels to the guard, making both situations much worse.\n\nI am preparing a fix on top of that MR."
+            },
+            "Our fix for #41360, #41365, and #41366 prevents remotely-induced Guard rotation cases.\n\nHowever, we did not change the code in `circuit_build_failed()` that marks `is_bad_for_new_circs = 1` for the channel.\n\nThis means that an adversary can still use these triggers (and the other ones David found while working on https://gitlab.torproject.org/dgoulet/tor-private/-/merge_requests/33) to cause clients to create an additional TLS connection to their existing Guard. \n\nThis effect can be observed by [netflow adversaries](https://spec.torproject.org/proposals/344-protocol-info-leaks.html#131-netflow-observation), potentially allowing them to confirm that a particular client was taking a particular action.\n\nThis is much much less severe than inducing Guard rotation, since the outcome is not immediate or definite. Existing circuits will continue to use the \"bad for new circuits\" TLS connection. New circuits might use the other guard before creating a new TLS connection.\n\nStill, this is not a great property. If we can fix it simply, we should.. However it might not be simple to fix without some additional mechanism to ensure we actually *do* give up on channels that are dead due to transient network conditions.\n\nWe should at least have an LLM enumerate as many of these cases as possible for us, so we can weigh if any of them would be useful for an adversary (such as one that wants to make an onion service use a new TLS connection, or one that wants to make a client use a new TLS connection once it has been observed to be doing some specific activity).\n\nCc: @dgoulet"
+          ]
+        }
+      ]
+    },
+    "tor-41420-cbt-failures-edited": {
+      "sources": [
+        {
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-09-30T16:22:39Z",
+          "updated_at": "2026-11-11T14:49:36Z",
+          "upstream_state": "closed",
+          "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41420",
+          "title": "Frequent Circuit Build Failures after 4.9.13 update.",
+          "passages": [
+            {
+              "author": "legoktm",
+              "created_at": "2026-10-14T14:52:35Z",
+              "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41420#note_3477912",
+              "text": "Hi, I hope it's okay to ask questions here about the new 0.4.9.14 log entry added in !1057. \n\nI've started seeing a lot of these on a SecureDrop test instance (https://gist.github.com/legoktm/96d22f2e05c1247db4250e1ebc8b07e5) and we've gotten at least one report of them on a production instance. I can provide more details from the test instance (and/or provide access to it) if it's useful for debugging.\n\nDoes the presence of a log entry alone indicate there is an issue that needs fixing? As best as I can tell there's no issues with the onion service on those machines. Should we be trying to set `LearnCircuitBuildTimeout 0` and `CircuitBuildTimeout 60` and see if the log entries go away?\n\nAnd second, I primarily noticed this because it contains the substring \"failed\", which our log watcher alerts on. If these messages are not actually actionable and just debugging info, would it be possible to e.g. only add \"connection_failed=0\" when the value is nonzero? (https://github.com/freedomofpress/securedrop/issues/7953 is our downstream issue for this.)"
+            },
+            {
+              "author": "roypranto39",
+              "created_at": "2026-10-10T02:23:25Z",
+              "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41420#note_3477087",
+              "text": "[tor-old2.log](/uploads/c92db694de4b16771eeb1fde0ad1e1cb/tor-old2.log)\n\nmy uptime monitor showed it went offline approximately 8 hours ago and was down since.\n\nedit: affected two instances were updated yesterday but was not restarted so they were running previous version binary (4.9.13) prior to this restart. \n\nall instances that was having this issue previously was updated (suggested custom branch above and later to the stable 4.9.14 ) and restarted, they have not shown any issues since."
+            },
+            {
+              "author": "roypranto39",
+              "created_at": "2026-10-10T02:19:11Z",
+              "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41420#note_3477086",
+              "text": "@arma @mikeperry it happened again. updated yesterday and today two instances went offline. restarted (new binary loads here, was running previous binary before) without deleting torrc \\> bootstrapped to 100% and started giving these logs. onions remain unreachable. (i believe the new fix was supposed to handle and clear timeout locks). also attaching the raw log of instance bellow\n\n```\nOct 10 01:49:38.000 [notice] Bootstrapped 100% (done): Done\nOct 10 01:50:40.000 [notice] Circuit build expiry summary: prefix_hops_0=1 prefix_hops_1=0 prefix_hops_2=0 post_prefix=0 open_channel=1 other_channel=0 late_firsthop=0 completed=1 abandoned=0 excluded=0 adaptive=1 connection_failed=0 channels_retired=1 firsthop_preserved=0 (build stages are at measurement or circuit expiry; recovery probes may finish later)\nOct 10 01:53:10.000 [notice] No circuits are opened. Relaxed timeout for circuit 223 (a Hidden service: Establishing introduction point 4-hop circuit in state doing handshakes with channel state open) to 60000ms. However, it appears the circuit has timed out anyway.\nOct 10 01:55:40.000 [notice] Circuit build expiry summary: prefix_hops_0=149 prefix_hops_1=0 prefix_hops_2=0 post_prefix=0 open_channel=149 other_channel=0 late_firsthop=0 completed=0 abandoned=0 excluded=0 adaptive=1 connection_failed=0 channels_retired=3 firsthop_preserved=0 (build stages are at measurement or circuit expiry; recovery probes may finish later)\nOct 10 01:55:51.000 [notice] All current guards excluded by path restriction type 2; using an additional guard.\nOct 10 02:00:42.000 [notice] Circuit build expiry summary: prefix_hops_0=3 prefix_hops_1=0 prefix_hops_2=0 post_prefix=0 open_channel=3 other_channel=0 late_firsthop=0 completed=1 abandoned=0 excluded=0 adaptive=1 connection_failed=0 channels_reti"
+            },
+            {
+              "author": "roypranto39",
+              "created_at": "2026-10-10T02:19:11Z",
+              "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41420#note_3477086",
+              "text": "red=2 firsthop_preserved=0 (build stages are at measurement or circuit expiry; recovery probes may finish later)\nOct 10 02:05:42.000 [notice] Circuit build expiry summary: prefix_hops_0=112 prefix_hop"
+            },
+            {
+              "author": "arma",
+              "created_at": "2026-10-07T17:14:17Z",
+              "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41420#note_3476172",
+              "text": "I'm going to close this ticket, as we list it as being fixed in today's 0.4.9.14 release.\n\nPlease re-open if it isn't fixed or if there are more things to do!"
+            },
+            {
+              "author": "roypranto39",
+              "created_at": "2026-10-03T00:48:04Z",
+              "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41420#note_3474303",
+              "text": "@mikeperry after one and half day the issue hasn't returned yet. So i am guessing this was a temporary network instability problem during the update wave. Issue was present on the first 4 days after update, now seems to be running fine. Feel free to close this if you also think it's resolved. I will report if that ever returns."
+            },
+            {
+              "author": "roypranto39",
+              "created_at": "2026-10-02T01:31:55Z",
+              "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41420#note_3474129",
+              "text": "I will build and run the branch if the issue returns and share logs."
+            },
+            {
+              "author": "roypranto39",
+              "created_at": "2026-10-02T01:26:33Z",
+              "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41420#note_3474128",
+              "text": "I have added the recommended torrc options to 6 instances and running separate 6 with existing config. It's been 12 hours. The issue has not returned yet on both setups. I will keep watching for another day."
+            },
+            {
+              "author": "mikeperry",
+              "created_at": "2026-10-01T20:40:39Z",
+              "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41420#note_3474089",
+              "text": "@roypranto39 This was a helpful datapoint. It might mean that there are other problems at work here.\n\nThe torrc change experiment is still useful to know if that improves your situation, so please keep me updated if it helps or not.\n\nIf you are able to run a custom branch, https://gitlab.torproject.org/mikeperry/tor/-/commits/bug41420_v3 also has fixes and further diagnostics. \n\nMost likely we will merge that (or some form of it) into the next release, as it fixes real issues with timeout learning.\n\nIt is still not clear if it will fix all of *your* issues, though."
+            },
+            {
+              "author": "roypranto39",
+              "created_at": "2026-09-30T18:48:17Z",
+              "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41420#note_3473056",
+              "text": "@mikeperry i will try that. This is what i get if i restart without deleting the state file. bootstrap gets stuck at 95%. \n\n```\n95% (circuit_create): Establishing a Tor circuit\nSep 30 18:43:11.000 [notice] No circuits are opened. Relaxed timeout for circuit 38 (a Unlinked conflux circuit 3-hop circuit in state doing handshakes with channel state open) to 60000ms. However, it appears the circuit has timed out anyway.\n```"
+            },
+            {
+              "author": "mikeperry",
+              "created_at": "2026-09-30T18:43:50Z",
+              "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41420#note_3473045",
+              "text": "@roypranto39 - it sounds like one of your guards could be experiencing a DoS attack? There is also a possibility that your services themselves are being connected to by clients specifying broken or slow rendezvous points (this could be an attack, but more likely is a consequence of network DoS conditions elsewhere).\n\nIn either case, setting the following torrc should change the behavior and at least prevent the issue from causing connectivity problems:\n\n```code\nLearnCircuitBuildTimeout 0\nCircuitBuildTimeout 60\n```\n\nIt would be useful to know if this does in fact address the connectivity issue for your services. If it solves the connectivity problem, it will rule out other potential causes.\n\nNote that this will degrade performance of your service, so once we have a fix you should remove these lines."
+            },
+            {
+              "author": "roypranto39",
+              "created_at": "2026-09-30T16:37:11Z",
+              "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41420#note_3472857",
+              "text": "that's the full torrc. no extra configs"
+            },
+            {
+              "author": "roypranto39",
+              "created_at": "2026-09-30T16:35:04Z",
+              "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41420#note_3472851",
+              "text": "\\# Managed by \\[scrubbed\\] — do not edit manually\n\nDataDirectory /var/\\[scrubbed\\]/instances/\\[scrubbed\\]/data\n\nSocksPort 0\n\nLog notice file /var/\\[scrubbed\\]/logs/tor-\\[scrubbed\\].log\n\nHiddenServiceDir /var/\\[scrubbed\\]/instances/\\[scrubbed\\]/services/\\[scrubbed\\]\n\nHiddenServicePort 80 127.0.0.1:8114\n\nHiddenServiceDir /var/\\[scrubbed\\]/instances/\\[scrubbed\\]/services/\\[scrubbed\\]\n\nHiddenServicePort 80 127.0.0.1:8116\n\nHiddenServiceDir /var/\\[scrubbed\\]/instances/\\[scrubbed\\]/services/\\[scrubbed\\]\n\nHiddenServicePort 80 127.0.0.1:8116\n\nHiddenServiceDir /var/\\[scrubbed\\]/instances/\\[scrubbed\\]/services/\\[scrubbed\\]\n\nHiddenServicePort 80 127.0.0.1:8116\n\nHiddenServiceDir /var/\\[scrubbed\\]/instances/\\[scrubbed\\]/services/\\[scrubbed\\]\n\nHiddenServicePort 80 127.0.0.1:8117\n\nHiddenServiceDir /var/\\[scrubbed\\]/instances/\\[scrubbed\\]/services/\\[scrubbed\\]\n\nHiddenServicePort 80 127.0.0.1:8117"
+            },
+            "Some of my tor instances becoming unreachable via all their onion services every day since 4.9.13 update. when issue occurs i find hundreds of these logs. deleting the state file and restarting seems to fix the issue temporarily. this happens randomly to at least 40% of my tor instances\n\n```\nSep 30 15:57:03.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:03.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:03.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:03.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:03.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:03.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:03.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:04.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:04.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:04.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:05.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:05.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:05.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, ha",
+            "ve_timeout=1, 465.000000ms\nSep 30 15:57:05.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:05.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:05.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:06.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:06.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:06.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:07.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:07.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:07.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:07.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:07.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:07.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:07.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:07.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:07.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep",
+            " 30 15:57:07.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:08.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:08.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:08.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:09.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:09.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:09.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:09.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:09.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:09.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:09.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:09.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:09.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:09.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:09.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:09.000 [warn] No val",
+            "id circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:09.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:10.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:10.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:10.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:10.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:10.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:11.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:11.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:11.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:11.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:11.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:11.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:11.000 [warn] No valid circuit build",
+            " time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:11.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:11.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:11.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:11.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:12.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:12.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:12.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:12.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:12.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:13.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:13.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:13.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:13.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:13.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:13.000 [warn] No valid circuit build time data out of 1000 times, ",
+            "10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:13.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:13.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:13.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:13.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:13.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:13.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:13.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:14.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:14.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:14.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:15.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:15.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:15.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:15.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:15.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.",
+            "000000ms\nSep 30 15:57:15.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:15.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:15.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:15.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:15.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:15.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:15.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:15.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:16.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:16.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:16.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:16.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\nSep 30 15:57:16.000 [warn] No valid circuit build time data out of 1000 times, 10 modes, have_timeout=1, 465.000000ms\n```"
+          ]
+        }
+      ]
+    },
+    "ctor-hs-pow-mr702": {
+      "sources": [
+        {
+          "url": "https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/702",
+          "title": "prop327: Implement PoW over Introduction Circuits",
+          "kind": "gitlab_mr",
+          "authority": "development",
+          "product": "tor",
+          "upstream_state": "merged",
+          "published_at": "2023-05-10T15:46:52Z",
+          "updated_at": "2023-05-10T15:46:52Z",
+          "passages": [
+            "This is an initial implementation of new functionality for mitigating DoS attacks on onion services using a proof-of-work client puzzle",
+            "This addresses ticket #40634 and provides an initial implementation.",
+            "As noted in the ticket there's room for improvement, but at this stage the feature might be considered useful and the wire protocol stabilized.",
+            "To get the new proof-of-work system, clients and services must both be built with `--enable-gpl` and services must have the `HiddenServicePoWDefensesEnabled` torrc option at runtime."
+          ]
+        }
+      ]
+    },
+    "ctor-conflux-0484": {
+      "sources": [
+        {
+          "url": "https://gitlab.torproject.org/tpo/core/tor/-/blob/release-0.4.9/ReleaseNotes",
+          "title": "Changes in version 0.4.8.4 - 2023-08-23",
+          "kind": "feed",
+          "authority": "official",
+          "product": "tor",
+          "upstream_state": "",
+          "published_at": "2023-08-23T00:00:00Z",
+          "updated_at": "2023-08-23T00:00:00Z",
+          "passages": [
+            "Finally, this is the very first stable release of the 0.4.8.x series making, among other features, Proof-of-Work (prop#327) and Conflux (prop#329) available to the entire network.",
+            "Implement Proposal 329 (conflux traffic splitting). Conflux splits traffic across two circuits to Exits that support the protocol.",
+            "When using conflux circuit pairs, clients choose the lower-latency circuit to send data to the Exit.",
+            "When the Exit sends data to the client, it maximizes throughput, by fully utilizing both circuits in a multiplexed fashion.",
+            "Onion services are not currently supported, but will be in arti."
+          ]
+        },
+        {
+          "url": "https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-0.4.8.4",
+          "title": "tor-0.4.8.4",
+          "kind": "tag",
+          "authority": "official",
+          "product": "tor",
+          "published_at": "2023-08-23T14:56:45Z",
+          "updated_at": "2023-08-23T14:56:45Z",
+          "upstream_state": null,
+          "passages": []
+        }
+      ]
+    },
+    "ctor-cgo-blog": {
+      "sources": [
+        {
+          "url": "https://blog.torproject.org/introducing-cgo/",
+          "title": "Counter Galois Onion: Improved encryption for Tor circuit traffic",
+          "kind": "feed",
+          "authority": "official",
+          "product": "network",
+          "upstream_state": "",
+          "published_at": "2025-11-24T00:00:00Z",
+          "updated_at": "2025-11-24T00:00:00Z",
+          "passages": [
+            "Especially when we are sunsetting one of the oldest and most important encryption algorithms in Tor and replacing it with a research-backed new design, called Counter Galois Onion.",
+            "This overhaul will defend users against a broader class of online attackers (described below), and form the basis for more encryption work in the future.",
+            "CGO makes it so that if anybody tampers with any part of your encrypted data, the entire message, and all future messages, become unrecoverable.",
+            "We've also implemented it in C, since it won't do us any good unless relays support it too, and the Arti relay project is still a work in progress."
+          ]
+        }
+      ]
+    },
+    "ctor-happy-families-0495": {
+      "sources": [
+        {
+          "url": "https://gitlab.torproject.org/tpo/core/tor/-/blob/release-0.4.9/ReleaseNotes",
+          "title": "Changes in version 0.4.9.5 - 2026-02-12",
+          "kind": "feed",
+          "authority": "official",
+          "product": "tor",
+          "upstream_state": "",
+          "published_at": "2026-02-12T00:00:00Z",
+          "updated_at": "2026-02-12T00:00:00Z",
+          "passages": [
+            "This first stable release in the 0.4.9 series introduces a new circuit-level encryption design for better client security, as well as a more scalable way for large relay operators to annotate which relays they run so clients can avoid using too many of them in a single circuit.",
+            "Clients and relays now support \"happy families\", a system to simplify relay family operation and improve directory performance.",
+            "With \"happy families\", relays in a family share a secret \"family key\", which they use to prove their membership in the family.",
+            "Note that until enough clients are upgraded, relay operators will still need to configure MyFamily lists.",
+            "But once clients no longer depend on those lists, we will be able to remove them entirely, thereby simplifying family operation, and making microdescriptor downloads approximately 80% smaller."
+          ]
+        },
+        {
+          "url": "https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-0.4.9.5",
+          "title": "tor-0.4.9.5",
+          "kind": "tag",
+          "authority": "official",
+          "product": "tor",
+          "published_at": "2026-02-12T14:59:30Z",
+          "updated_at": "2026-02-12T14:59:30Z",
+          "upstream_state": null,
+          "passages": []
+        }
+      ]
+    },
+    "arti-1.3.0-client-parity-onion-default": {
+      "sources": [
+        {
+          "url": "https://blog.torproject.org/arti_1_3_0_released/",
+          "title": "Arti 1.3.0 is released: memory quota tracking, onion services, and more",
+          "kind": "feed",
+          "authority": "official",
+          "product": "network",
+          "upstream_state": "",
+          "published_at": "2024-10-31T00:00:00Z",
+          "updated_at": "2024-10-31T00:00:00Z",
+          "passages": [
+            "This release is a significant milestone: we have achieved parity on most major client features with C Tor.",
+            "Now we're announcing the latest release, Arti 1.3.0."
+          ]
+        }
+      ]
+    },
+    "arti-1.4.2-rpc-stable": {
+      "sources": [
+        {
+          "url": "https://blog.torproject.org/arti_1_4_2_released/",
+          "title": "Arti 1.4.2 is released: RPC is stable, Conflux development continues",
+          "kind": "feed",
+          "authority": "official",
+          "product": "network",
+          "upstream_state": "",
+          "published_at": "2025-04-01T00:00:00Z",
+          "updated_at": "2025-04-01T00:00:00Z",
+          "passages": [
+            "With this release, Arti's RPC interface is now officially stable, and ready for testing.",
+            "Now we're announcing the latest release, Arti 1.4.2."
+          ]
+        }
+      ]
+    },
+    "arti-1.1.6-onion-service-client": {
+      "sources": [
+        {
+          "url": "https://blog.torproject.org/arti_116_released/",
+          "title": "Arti 1.1.6 is released: Now you can connect* to Onion Services!",
+          "kind": "feed",
+          "authority": "official",
+          "product": "network",
+          "upstream_state": "",
+          "published_at": "2023-06-30T00:00:00Z",
+          "updated_at": "2023-06-30T00:00:00Z",
+          "passages": [
+            "After months of hard work, Arti finally has working client-side onion service support!",
+            "That is, programs can* now use Arti to connect to onion services on the Tor network.",
+            "Note that this feature is not yet as secure as the equivalent feature in the C tor implementation, and as such you probably shouldn't use it for security-sensitive purposes.",
+            "For this reason, the feature is (for now) disabled by default."
+          ]
+        }
+      ]
+    },
+    "webtunnel-stable-release-2024": {
+      "sources": [
+        {
+          "url": "https://blog.torproject.org/introducing-webtunnel-evading-censorship-by-hiding-in-plain-sight/",
+          "title": "Hiding in plain sight: Introducing WebTunnel",
+          "kind": "feed",
+          "authority": "official",
+          "product": "network",
+          "upstream_state": "",
+          "published_at": "2024-03-12T00:00:00Z",
+          "updated_at": "2024-03-12T00:00:00Z",
+          "passages": [
+            "Today, March 12th, on the World Day Against Cyber Censorship, the Tor Project's Anti-Censorship Team is excited to officially announce the release of WebTunnel, a new type of Tor bridge designed to assist users in heavily censored regions to connect to the Tor network.",
+            "Available now in the stable version of Tor Browser, WebTunnel joined our collection of censorship circumvention tech developed and maintained by The Tor Project.",
+            "WebTunnel is a censorship-resistant pluggable transport designed to mimic encrypted web traffic (HTTPS) inspired by HTTPT.",
+            "It works by wrapping the payload connection into a WebSocket-like HTTPS connection, appearing to network observers as an ordinary HTTPS (WebSocket) connection.",
+            "WebTunnel can be used as an alternative to obfs4 for most Tor Browser users."
+          ]
+        }
+      ]
+    },
+    "tor-browser-14.5-connection-assist-android": {
+      "sources": [
+        {
+          "url": "https://blog.torproject.org/new-release-tor-browser-145/",
+          "title": "New Release: Tor Browser 14.5",
+          "kind": "feed",
+          "authority": "official",
+          "product": "network",
+          "upstream_state": "",
+          "published_at": "2025-04-16T00:00:00Z",
+          "updated_at": "2025-04-16T00:00:00Z",
+          "passages": [
+            "This release marks the introduction of Connection Assist to Android, empowering mobile users who are subjected to strict censorship to unblock Tor at the press of a button.",
+            "Subsequently, should Tor Browser fail to establish a direct connection to the Tor network, Connection Assist will offer to find and try bridges for you.",
+            "This project has now reached an important milestone, and we're proud to announce the release of Connection Assist for Android today.",
+            "On a human level, not only is Connection Assist now available for Android, but Tor Browser users can expect more stable and less error-prone connections in general."
+          ]
+        }
+      ]
+    },
+    "tor-browser-15.0-tabs-and-android-screen-lock": {
+      "sources": [
+        {
+          "url": "https://blog.torproject.org/new-release-tor-browser-150/",
+          "title": "New Release: Tor Browser 15.0",
+          "kind": "feed",
+          "authority": "official",
+          "product": "network",
+          "upstream_state": "",
+          "published_at": "2025-10-28T00:00:00Z",
+          "updated_at": "2025-10-28T00:00:00Z",
+          "passages": [
+            "This is our first stable release based on Firefox ESR 140, incorporating a year's worth of changes that have been shipped upstream in Firefox.",
+            "For desktop, these include vertical tabs: providing a more manageable, alternative layout with open and pinned tabs stacked in a sidebar rather than across the top of the window.",
+            "However, regardless of whether you prefer horizontal or vertical tabs, everyone benefits from the addition of tab groups: helping you keep on top of the clutter by organizing tabs into collapsible groups that can be given names and color-coded.",
+            "On Android, screen lock adds an extra layer of security to your browsing sessions.",
+            "After enabling screen lock in Settings > Tabs, your tabs will lock automatically when you switch away from the browser without closing it."
+          ]
+        }
+      ]
+    },
+    "tor-browser-16.0-settings-redesign-linux-arm64": {
+      "sources": [
+        {
+          "url": "https://blog.torproject.org/new-release-tor-browser-160/",
+          "title": "New Release: Tor Browser 16.0",
+          "kind": "feed",
+          "authority": "official",
+          "product": "network",
+          "upstream_state": "",
+          "published_at": "2026-10-29T00:00:00Z",
+          "updated_at": "2026-10-29T00:00:00Z",
+          "passages": [
+            "This is our first stable release based on Firefox ESR 153, incorporating a year's worth of changes that have been shipped upstream in Firefox.",
+            "To that end, Tor Browser 16.0 introduces a complete redesign of the Settings experience based on a parallel redesign shipped in Firefox in June.",
+            "Pages and components that are unique to Tor browser like Connection and Security Level have been rebuilt from scratch using Firefox's new components so they look and feel consistent with the rest of Settings.",
+            "Finally, after a year of testing, Tor Browser 16.0 now features native support for Linux computers with 64-bit ARM (AArch64) processors, such as Raspberry Pis and Apple Silicon Macs running Linux."
+          ]
+        }
+      ]
     }
   },
   "cases": [
@@ -676,7 +1448,7 @@
         "id": "fd9a8ddfeb14e466239c940d",
         "title": "Bastet reported plausibly compromised",
         "summary": "A public issue reports that bastet's machine is very plausibly compromised and requests removal of its existing entry from the software. The report says its current keys cannot be trusted.",
-        "why_it_matters": "The report says the existing keys cannot be trusted and requests removal of the current entry from the software.",
+        "why_it_matters": "The issue says the keys can't be trusted anymore in any scenario and that bastet will generate a new identity soon.",
         "category": "security"
       }
     },
@@ -978,7 +1750,7 @@
         "id": "e7fb770700a0f6b6a23e286c",
         "title": "Tor announcement asks relay operators to upgrade",
         "summary": "The Tor Project announces version 0.4.9.16 and asks relay operators to upgrade. The announcement says the release addresses a denial-of-service bug.",
-        "why_it_matters": "The announcement recommends upgrading to address the reported denial-of-service bug.",
+        "why_it_matters": "The announcement asks relay operators to upgrade to 0.4.9.16.",
         "category": "release",
         "confidence": "confirmed",
         "state": "released"
@@ -1069,7 +1841,7 @@
         "id": "fd9a8ddfeb14e466239c940d",
         "title": "Bastet reported plausibly compromised",
         "summary": "A public issue reports that bastet's machine is very plausibly compromised and requests removal of its existing entry from the software. The report says its current keys cannot be trusted.",
-        "why_it_matters": "The report says the existing keys cannot be trusted and requests removal of the current entry from the software.",
+        "why_it_matters": "The issue says the keys can't be trusted anymore in any scenario and that bastet will generate a new identity soon.",
         "category": "security",
         "editorial": {
           "status": "corrected",
@@ -1106,7 +1878,7 @@
         "id": "741200534441911111bc5804",
         "title": "Announcement limits a configuration change to custom overrides",
         "summary": "The announcement asks relay operators with a custom authority override to remove entry X. It explicitly says operators using the defaults need no configuration edit.",
-        "why_it_matters": "The stated instruction applies only to operators with the custom override.",
+        "why_it_matters": "The announcement asks relay operators with a custom authority override to remove entry X from that override.",
         "category": "directory-authority",
         "confidence": "confirmed"
       }
@@ -1597,6 +2369,1230 @@
         "new_information"
       ],
       "coverage_set": "related-issue"
+    },
+    {
+      "id": "bastet-removed-as-done",
+      "expected": "not_approve",
+      "coverage": [
+        "status",
+        "source_support"
+      ],
+      "packet": "bastet",
+      "unsupported": [
+        "bastet removed from source",
+        "has been removed"
+      ],
+      "candidate": {
+        "id": "fd9a8ddfeb14e466239c940d",
+        "title": "Tor authority bastet removed from source after reported compromise",
+        "summary": "A public issue reports that the directory authority bastet is very plausibly compromised, and bastet has been removed from the source code as its keys can no longer be trusted.",
+        "category": "security"
+      }
+    },
+    {
+      "id": "bastet-confirmed-badge",
+      "expected": "not_approve",
+      "coverage": [
+        "uncertainty_attribution"
+      ],
+      "packet": "bastet",
+      "forbidden_classifications": {
+        "confidence": [
+          "confirmed"
+        ]
+      },
+      "candidate": {
+        "id": "fd9a8ddfeb14e466239c940d",
+        "title": "Bastet reported plausibly compromised",
+        "summary": "A public issue reports that bastet's machine is very plausibly compromised and requests removal of its existing entry from the software. The report says its current keys cannot be trusted.",
+        "category": "security",
+        "why_it_matters": "The issue says the keys can't be trusted anymore in any scenario and that bastet will generate a new identity soon.",
+        "confidence": "confirmed"
+      }
+    },
+    {
+      "id": "merged-change-confirmed",
+      "expected": "approve",
+      "coverage": [
+        "status",
+        "uncertainty_attribution"
+      ],
+      "packet": "parser-merge",
+      "candidate": {
+        "id": "255438ae4a047e4eef086839",
+        "title": "Parser fix merged into development branch",
+        "summary": "The change fixes the parser in the development branch. The report explicitly says the change has not been released.",
+        "category": "protocol",
+        "state": "merged",
+        "confidence": "confirmed"
+      }
+    },
+    {
+      "id": "bastet-role-relabel",
+      "expected": "not_approve",
+      "coverage": [
+        "actor_and_action",
+        "technical_details"
+      ],
+      "packet": "bastet",
+      "unsupported": [
+        "the relay will generate"
+      ],
+      "candidate": {
+        "id": "fd9a8ddfeb14e466239c940d",
+        "title": "Bastet reported plausibly compromised",
+        "summary": "A public issue reports that bastet's machine is very plausibly compromised and requests removal of its existing entry from the software. The report says its current keys cannot be trusted.",
+        "category": "security",
+        "why_it_matters": "The issue states that bastet's keys can't be trusted anymore and that the relay will generate a new identity soon."
+      }
+    },
+    {
+      "id": "bastet-dropped-hedge",
+      "expected": "not_approve",
+      "coverage": [
+        "uncertainty_attribution",
+        "actor_and_action"
+      ],
+      "packet": "bastet",
+      "unsupported": [
+        "removal of a compromised authority"
+      ],
+      "candidate": {
+        "id": "fd9a8ddfeb14e466239c940d",
+        "title": "Bastet reported plausibly compromised",
+        "summary": "A public issue reports that bastet's machine is very plausibly compromised and requests removal of its existing entry from the software. The report says its current keys cannot be trusted.",
+        "category": "security",
+        "why_it_matters": "Directory authority operators and Tor developers are affected by the removal of a compromised authority from the source."
+      }
+    },
+    {
+      "id": "official-routine-post",
+      "expected": "hold",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "official-routine-post",
+      "candidate": {
+        "id": "bdf58c3e1c2ddd76536469bf",
+        "title": "Tor Project thanks community meetup attendees",
+        "summary": "The Tor Project thanked everyone who joined a recent community meetup and said it hopes to see them at the next one.",
+        "category": "network",
+        "tags": [
+          "network"
+        ]
+      }
+    },
+    {
+      "id": "merge-claimed-as-release-with-count",
+      "expected": "not_approve",
+      "coverage": [
+        "status",
+        "technical_details"
+      ],
+      "packet": "parser-merge",
+      "unsupported": [
+        "releases a parser fix",
+        "has shipped",
+        "thousands of relays"
+      ],
+      "candidate": {
+        "id": "255438ae4a047e4eef086839",
+        "title": "Tor releases a parser fix for thousands of relays",
+        "summary": "The parser fix has shipped to users in a new release, and thousands of relays are now protected.",
+        "category": "protocol",
+        "state": "released"
+      }
+    },
+    {
+      "id": "prior-scope-correction",
+      "expected": "approve",
+      "coverage": [
+        "new_information",
+        "scope_timing",
+        "uncertainty_attribution"
+      ],
+      "packet": "scope-correction",
+      "coverage_set": "prior-scope",
+      "candidate": {
+        "id": "b4da6d81114929477fd5f003",
+        "title": "Comment narrows reported relay crash to an unreleased branch",
+        "summary": "A public issue reports that relays running Tor 1.2.x crash when they apply a malformed consensus diff. A later comment says its author can reproduce the crash only on the unreleased 1.3 development branch, not on 1.2.x releases.",
+        "category": "security",
+        "tags": [
+          "security"
+        ]
+      }
+    },
+    {
+      "id": "prior-scope-narrowing-as-fact",
+      "expected": "not_approve",
+      "coverage": [
+        "uncertainty_attribution",
+        "scope_timing"
+      ],
+      "packet": "scope-correction",
+      "unsupported": [
+        "affects only the unreleased",
+        "are not affected"
+      ],
+      "coverage_set": "prior-scope",
+      "candidate": {
+        "id": "b4da6d81114929477fd5f003",
+        "title": "Relay crash affects only the unreleased 1.3 branch",
+        "summary": "The relay crash on malformed consensus diffs affects only the unreleased 1.3 development branch, and Tor 1.2.x releases are not affected.",
+        "category": "security",
+        "tags": [
+          "security"
+        ]
+      }
+    },
+    {
+      "id": "prior-dispute-update",
+      "expected": "approve",
+      "coverage": [
+        "new_information",
+        "uncertainty_attribution"
+      ],
+      "packet": "maintainer-dispute",
+      "coverage_set": "prior-allegation",
+      "candidate": {
+        "id": "2aa2f38981c9c5d6103851bf",
+        "title": "Maintainer disputes reported remote disk-exhaustion vulnerability",
+        "summary": "A reporter alleges that persistent nonce files permit practical remote disk exhaustion. A maintainer says the demonstration only calls a local helper and sends no network requests, and acknowledges a file-cleanup defect but disputes that a practical vulnerability was established.",
+        "category": "security",
+        "tags": [
+          "security"
+        ]
+      }
+    },
+    {
+      "id": "stale-update-omits-merge",
+      "expected": "not_approve",
+      "coverage": [
+        "new_information",
+        "status"
+      ],
+      "packet": "issue-update",
+      "unsupported": [
+        "fix is proposed"
+      ],
+      "coverage_set": "prior-issue",
+      "candidate": {
+        "id": "1d0b897c21b1d07101efff97",
+        "title": "Protocol-parser crash reported",
+        "summary": "A report describes a crash caused by malformed relay protocol tokens. A fix is proposed.",
+        "why_it_matters": "",
+        "category": "security",
+        "tags": [
+          "security"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "draft-omits-disclosure",
+      "expected": "not_approve",
+      "coverage": [
+        "news_value",
+        "technical_details"
+      ],
+      "packet": "refactor-with-disclosure",
+      "required": [
+        "proxy"
+      ],
+      "candidate": {
+        "id": "661a1fcfb2b192fe4ab78415",
+        "title": "Tor Browser refactors download handling",
+        "summary": "A Tor Browser issue tracks a refactor of download handling so that every platform shares one code path. A comment says the change is merged for the next alpha.",
+        "category": "feature",
+        "tags": [
+          "feature"
+        ],
+        "products": [
+          "tor-browser"
+        ],
+        "state": "merged"
+      }
+    },
+    {
+      "id": "disclosure-in-comment-reported",
+      "expected": "approve",
+      "coverage": [
+        "news_value",
+        "uncertainty_attribution",
+        "status"
+      ],
+      "packet": "refactor-with-disclosure",
+      "candidate": {
+        "id": "661a1fcfb2b192fe4ab78415",
+        "title": "Tor Browser download refactor also fixes an Android proxy bypass",
+        "summary": "A Tor Browser issue tracks a refactor of download handling so that every platform shares one code path. A comment says the change is merged for the next alpha and also fixes a proxy bypass on Android, where some downloads could skip the configured proxy.",
+        "category": "security",
+        "tags": [
+          "security"
+        ],
+        "products": [
+          "tor-browser"
+        ],
+        "state": "merged"
+      }
+    },
+    {
+      "id": "commenter-claims-duplicate",
+      "expected": "approve",
+      "coverage": [
+        "news_value",
+        "new_information"
+      ],
+      "packet": "duplicate-claim-comment",
+      "candidate": {
+        "id": "40ec8a2f120b3446face0430",
+        "title": "Report describes remotely triggered relay crash",
+        "summary": "A public issue reports that a remote client can crash a relay by sending a malformed circuit-extension cell, with a reproducer that triggers the crash on Tor 1.2.3 relays. A comment calls the report a duplicate of an old, already announced issue.",
+        "category": "security",
+        "tags": [
+          "security"
+        ]
+      }
+    },
+    {
+      "id": "busy-coverage-new-report",
+      "expected": "approve",
+      "coverage": [
+        "new_information"
+      ],
+      "packet": "relay-upgrade",
+      "coverage_set": "busy-truncated",
+      "candidate": {
+        "id": "e7fb770700a0f6b6a23e286c",
+        "title": "Tor announcement asks relay operators to upgrade",
+        "summary": "The Tor Project announces version 0.4.9.16 and asks relay operators to upgrade. The announcement says the release addresses a denial-of-service bug.",
+        "why_it_matters": "The announcement asks relay operators to upgrade to 0.4.9.16.",
+        "category": "release",
+        "confidence": "confirmed",
+        "state": "released"
+      }
+    },
+    {
+      "id": "busy-coverage-duplicate",
+      "expected": "skip",
+      "coverage": [
+        "new_information"
+      ],
+      "packet": "release-news",
+      "coverage_set": "busy-truncated",
+      "candidate": {
+        "id": "f94fa6620532b95ce67e6c84",
+        "title": "Tor 1.2.3 released with directory-request crash fix",
+        "summary": "The Tor Project released stable version 1.2.3 with a fix for relay crashes triggered by malformed directory requests. The announcement asks relay operators to upgrade.",
+        "why_it_matters": "",
+        "category": "release",
+        "tags": [
+          "release"
+        ],
+        "state": "released",
+        "confidence": "confirmed"
+      }
+    },
+    {
+      "id": "tordev-official-proposal-news",
+      "expected": "approve",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "list-proposal-official",
+      "candidate": {
+        "id": "9422ec9d3ae7f0eb2ef104b4",
+        "title": "Proposal would fold extra-info documents into router descriptors",
+        "summary": "A proposal posted to the tor-dev list would stop publishing separate extra-info documents and carry their remaining fields in router descriptors. Its full text is in a specification merge request, and comments are welcome.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "torspec"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-official-proposal-overstated",
+      "expected": "not_approve",
+      "coverage": [
+        "status",
+        "actor_and_action"
+      ],
+      "packet": "list-proposal-official",
+      "unsupported": [
+        "will remove",
+        "has decided"
+      ],
+      "candidate": {
+        "id": "2f5c764325da3d27777453b5",
+        "title": "Tor will remove extra-info documents",
+        "summary": "The Tor Project has decided to stop publishing extra-info documents and will move their remaining fields into router descriptors.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "torspec"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-community-proposal-not-news",
+      "expected": "skip",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "list-proposal-community",
+      "candidate": {
+        "id": "9cd435142ee05cd939b35f5b",
+        "title": "Proposal would fold extra-info documents into router descriptors",
+        "summary": "A proposal posted to the tor-dev list would stop publishing separate extra-info documents and carry their remaining fields in router descriptors. Its full text is in a specification merge request, and comments are welcome.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "torspec"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-rfc-subject-news",
+      "expected": "approve",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "list-rfc-marker",
+      "candidate": {
+        "id": "b54075277959118a7d62a200",
+        "title": "RFC proposes padding negotiation for onion service circuits",
+        "summary": "An RFC posted to the tor-dev list describes a way for clients and onion services to negotiate circuit padding before any data is sent. Its author asks for feedback before it becomes a numbered proposal.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "torspec"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-numbered-proposal-news",
+      "expected": "approve",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "list-numbered-proposal",
+      "candidate": {
+        "id": "0ee2196b0685e9d8b3681fde",
+        "title": "Proposal 901 would cap relay bandwidth self-reports",
+        "summary": "Proposal 901, posted to the tor-dev list with status Open, would cap the bandwidth a relay may self-report at twice its measured value. Comments are welcome.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "torspec"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-internet-draft-news",
+      "expected": "approve",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "list-ietf-draft",
+      "candidate": {
+        "id": "4d3be46f14976a177fc9f774",
+        "title": "Internet-Draft proposes that resolvers refuse .onion names",
+        "summary": "An Internet-Draft, draft-example-onion-resolution-00, posted for comment on the tor-dev list, describes how DNS resolvers should refuse to resolve .onion names.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "network"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-cited-rfc-not-news",
+      "expected": "skip",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "list-cited-rfc",
+      "candidate": {
+        "id": "3f3bb2d483645056d0688203",
+        "title": "Developer says no new option is needed for private addresses",
+        "summary": "A tor-dev reply notes that RFC 1918 already lists the address ranges as private and that Proposal 902 covers part of the issue, so no new option is needed.",
+        "why_it_matters": "",
+        "category": "network",
+        "tags": [
+          "network"
+        ],
+        "products": [
+          "tor"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-invented-proposer",
+      "expected": "not_approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "list-rfc-marker",
+      "unsupported": [
+        "Tor Project developers propose",
+        "Tor Project developers have proposed"
+      ],
+      "candidate": {
+        "id": "98715154e6f10a32f117cc90",
+        "title": "Tor Project developers propose padding negotiation for onion service circuits",
+        "summary": "Tor Project developers have proposed, in an RFC posted to the tor-dev list, a way for clients and onion services to negotiate circuit padding before any data is sent.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "torspec"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-text-claimed-sender-not-news",
+      "expected": "skip",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "list-text-claims-official",
+      "candidate": {
+        "id": "bb80b18ea23af3487bff64f3",
+        "title": "Proposal suggests weekly entry guard rotation",
+        "summary": "A proposal posted to the tor-dev list suggests that clients rotate their entry guards every week.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "tor"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-official-question-not-news",
+      "expected": "hold",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "list-official-question",
+      "candidate": {
+        "id": "a8effc38f178938bb379b336",
+        "title": "Older compilers are not supported for building Tor",
+        "summary": "A tor-dev reply says building Tor needs a C99 compiler, that older compilers are not supported, and suggests updating the toolchain.",
+        "why_it_matters": "",
+        "category": "network",
+        "tags": [
+          "network"
+        ],
+        "products": [
+          "tor"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-tool-announcement-not-news",
+      "expected": "skip",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "list-tool-announcement",
+      "candidate": {
+        "id": "9d6e8e8c3e3ba11f7a19f331",
+        "title": "Researchers release guardscan, a guard relay scanner",
+        "summary": "Researchers announced guardscan on the tor-dev list, an open-source tool that scans guard relays and onion service directories for configuration problems.",
+        "why_it_matters": "",
+        "category": "network",
+        "tags": [
+          "network"
+        ],
+        "products": [
+          "network"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "incremental-arti-bandwidthpool-merge",
+      "expected": "skip",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "arti-bandwidthpool-partial-permit",
+      "candidate": {
+        "id": "4bcf695bf108c022967d7731",
+        "title": "arti: Merge BandwidthPool partial permit support",
+        "summary": "A merged change to the arti project adds support for partial permits in the BandwidthPool utility. The implementation restricts partial permits to the fast path to avoid a 'ping pong' effect and sets a minimum grant value to prevent inefficient system calls for very small data transfers.",
+        "why_it_matters": "",
+        "category": "feature",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "merged",
+        "products": [
+          "arti"
+        ],
+        "tags": [
+          "feature",
+          "protocol",
+          "network"
+        ],
+        "published_at": "2026-11-11T19:34:54Z",
+        "updated_at": "2026-11-11T19:34:54Z",
+        "added_at": "2026-11-11T19:34:54Z"
+      }
+    },
+    {
+      "id": "incremental-arti-relay-drain-rate-merge",
+      "expected": "skip",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "arti-relay-drain-rate-update",
+      "candidate": {
+        "id": "c9910d19d86f53a1fb2f1ba8",
+        "title": "Arti relay handles drain rate updates in stream reactor",
+        "summary": "A merged change to the Arti relay routes drain rate updates through the forward reactor to the stream reactor, which then determines whether to send XON/XOFF signals to the backward reactor. The update addresses a crash triggered by a `todo!()` macro when sending XON during Chutney testing, as well as a transfer stall caused by the relay sending XOFF without a subsequent XON.",
+        "why_it_matters": "",
+        "category": "feature",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "merged",
+        "products": [
+          "arti"
+        ],
+        "tags": [
+          "feature",
+          "relay",
+          "network",
+          "protocol"
+        ],
+        "published_at": "2026-11-11T17:50:49Z",
+        "updated_at": "2026-11-11T17:50:49Z",
+        "added_at": "2026-11-11T17:50:49Z"
+      }
+    },
+    {
+      "id": "incremental-arti-relay-begin-hostname-merge",
+      "expected": "skip",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "arti-relay-begin-hostname",
+      "candidate": {
+        "id": "e9f7c970ac18333cb494d7f8",
+        "title": "arti-relay: Add hostname support in BEGIN handling",
+        "summary": "A merged change to the arti relay adds hostname support to BEGIN handling, currently using the first answer from hostname lookups. The implementation includes a timeout covering both resolution and TCP connection establishment, with several TODOs noted for follow-up work.",
+        "why_it_matters": "",
+        "category": "feature",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "merged",
+        "products": [
+          "arti"
+        ],
+        "tags": [
+          "feature",
+          "relay",
+          "protocol"
+        ],
+        "published_at": "2026-11-11T16:19:24Z",
+        "updated_at": "2026-11-11T16:19:24Z",
+        "added_at": "2026-11-11T16:19:24Z"
+      }
+    },
+    {
+      "id": "incremental-arti-sendme-wake-merge",
+      "expected": "skip",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "arti-sendme-reactor-wake",
+      "candidate": {
+        "id": "489b96608ece36aafafe6f04",
+        "title": "Arti merge: Wake stream reactor after circuit SENDME",
+        "summary": "A merged change in the Arti project shares a per-hop waker between the backward and stream reactors to resume pending stream data after a congestion window change triggered by a SENDME message. The fix addresses a stall observed during Chutney testing with a C-tor client.",
+        "why_it_matters": "",
+        "category": "feature",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "merged",
+        "products": [
+          "arti"
+        ],
+        "tags": [
+          "feature",
+          "protocol",
+          "relay"
+        ],
+        "published_at": "2026-11-11T10:05:39Z",
+        "updated_at": "2026-11-11T10:05:39Z",
+        "added_at": "2026-11-11T10:05:39Z"
+      }
+    },
+    {
+      "id": "incremental-torspec-congestion-control-section",
+      "expected": "skip",
+      "coverage": [
+        "news_value",
+        "source_support"
+      ],
+      "packet": "torspec-prop324-congestion-section",
+      "unsupported": [
+        "the specification is canonical"
+      ],
+      "candidate": {
+        "id": "79526059ff8b59d949297a99",
+        "title": "Tor specification adds congestion control section for Proposal 324",
+        "summary": "A merged change adds a congestion control section to the Tor specification; Proposal 324 now says its implementation is specified there and that the specification is canonical. The change also contains clarifications to address questions from Arti issue 1966 and the side-channel mitigation clarity issues that caused Arti issue 2400.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "merged",
+        "products": [
+          "torspec"
+        ],
+        "tags": [
+          "protocol"
+        ],
+        "published_at": "2026-11-11T17:47:55Z",
+        "updated_at": "2026-11-11T17:47:55Z",
+        "added_at": "2026-11-11T17:47:55Z"
+      }
+    },
+    {
+      "id": "user-question-arti-pow-verifier-warning",
+      "expected": "skip",
+      "coverage": [
+        "news_value",
+        "scope_timing"
+      ],
+      "packet": "arti-pow-verifier-warning-question",
+      "candidate": {
+        "id": "385b319870bb5919ade95f0b",
+        "title": "arti: PoW verifier construction fails with 'key not available' warning",
+        "summary": "A user running arti from the then-current main branch (commit 3ad05164) on October 7, with an existing state directory that may be a bit old, reports repeated PoW warnings in the logs: \"Couldn't construct verifier (key not available?). We will continue without this key, but this may prevent clients from connecting...\" The user asks whether something they did corrupted the on-disk PoW state or whether a code change causes the warning.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "arti"
+        ],
+        "tags": [
+          "protocol"
+        ],
+        "published_at": "2026-10-07T16:12:35Z",
+        "updated_at": "2026-11-11T16:53:14Z",
+        "added_at": "2026-10-07T16:12:35Z"
+      }
+    },
+    {
+      "id": "template-arti-october-release-checklist",
+      "expected": "skip",
+      "coverage": [
+        "news_value",
+        "status"
+      ],
+      "packet": "arti-oct-release-checklist",
+      "candidate": {
+        "id": "3ccbd12469d98b7762009bf2",
+        "title": "Arti October 1 release checklist records publication and tagging",
+        "summary": "The Arti release checklist for October 1, 2026 marks changelog finalization, crate publication and signed tagging as completed. Several checks and post-release tasks remain unchecked. The issue’s generic security-patch preparation steps do not identify particular fixes included in the release.",
+        "why_it_matters": "",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "arti"
+        ],
+        "tags": [
+          "release"
+        ],
+        "published_at": "2026-09-28T15:16:17Z",
+        "updated_at": "2026-11-02T15:35:52Z",
+        "added_at": "2026-09-28T15:16:17Z"
+      }
+    },
+    {
+      "id": "third-party-entrymap-module-update",
+      "expected": "skip",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "tordev-entrymap-module-update",
+      "candidate": {
+        "id": "1219fbd0c0c2438c05698a77",
+        "title": "FrogSec Research shares entrymap update with three new analysis modules",
+        "summary": "Adam Keeves of FrogSec Research posted an update to the tor-dev mailing list describing three new analysis modules for entrymap, a tool for scanning Entry Guards and HSDirs. The modules, named ghost_bw, cidr_cluster, and bulletproof, audit bandwidth disparities, CIDR subnet diversity, and offshore ingress hubs, respectively. The post also describes an automated verification hook that checks calculations against the Tor Directory Specification.",
+        "why_it_matters": "",
+        "category": "feature",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "network"
+        ],
+        "tags": [
+          "feature",
+          "network"
+        ],
+        "published_at": "2026-11-11T13:28:54Z",
+        "updated_at": "2026-11-11T13:28:54Z",
+        "added_at": "2026-11-11T13:28:54Z"
+      }
+    },
+    {
+      "id": "stale-0-4-9-14-cross-cancellation-issue-edit",
+      "expected": "skip",
+      "coverage": [
+        "news_value",
+        "scope_timing",
+        "source_support"
+      ],
+      "packet": "tor-41412-cross-cancellation-edited",
+      "candidate": {
+        "id": "07848049277d5ac753a069cb",
+        "title": "Tor 0.4.9.14 fixes circuit cross-cancellation channel marking",
+        "summary": "A Tor issue labeled medium severity reported that circuit cross-cancellation could still mark channels as bad for new circuits, letting an adversary cause clients to open an additional TLS connection to their existing Guard. @arma closed the issue on October 7, saying it is fixed in that day's 0.4.9.14 release.",
+        "why_it_matters": "The issue says netflow adversaries could observe this, potentially confirming that a particular client was taking a particular action, though it calls the effect much less severe than inducing Guard rotation.",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "released",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security",
+          "release",
+          "network"
+        ],
+        "published_at": "2026-09-23T15:01:31Z",
+        "updated_at": "2026-11-11T14:48:45Z",
+        "added_at": "2026-09-23T15:01:31Z",
+        "sources": [
+          {
+            "title": "Circuit cross-cancellation can still blame channels",
+            "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41412"
+          },
+          {
+            "title": "Public comment by @arma",
+            "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41412#note_3476174"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stale-0-4-9-14-circuit-build-issue-edit",
+      "expected": "skip",
+      "coverage": [
+        "news_value",
+        "scope_timing"
+      ],
+      "packet": "tor-41420-cbt-failures-edited",
+      "candidate": {
+        "id": "dc1469b51b78113b9b0bf8fb",
+        "title": "Tor 0.4.9.14 release addresses reported circuit build timeout issues",
+        "summary": "A user reported frequent circuit build failures and onion service unreachability on Tor 0.4.9.13. Maintainer arma closed the issue on October 7, 2026, stating it is listed as fixed in the 0.4.9.14 release. On October 10 the reporter said two instances still running the 0.4.9.13 binary had gone offline, and that previously affected instances, updated to a suggested custom branch and later to 0.4.9.14 and then restarted, had shown no issues since.",
+        "why_it_matters": "",
+        "category": "network",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "fixed",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "network"
+        ],
+        "published_at": "2026-09-30T16:22:39Z",
+        "updated_at": "2026-11-11T14:49:36Z",
+        "added_at": "2026-09-30T16:22:39Z",
+        "sources": [
+          {
+            "title": "Frequent Circuit Build Failures after 4.9.13 update.",
+            "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41420"
+          },
+          {
+            "title": "Public comment by @arma",
+            "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41420#note_3476172"
+          },
+          {
+            "title": "Public comment by @roypranto39",
+            "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41420#note_3477087"
+          }
+        ]
+      }
+    },
+    {
+      "id": "significant-ctor-hs-pow-mr702",
+      "expected": "approve",
+      "coverage": [
+        "news_value",
+        "status",
+        "uncertainty_attribution"
+      ],
+      "packet": "ctor-hs-pow-mr702",
+      "candidate": {
+        "id": "1e6e3f6079b75d7315b54e3c",
+        "title": "Tor merges initial proof-of-work DoS mitigation for onion services",
+        "summary": "A merged change to Tor adds an initial implementation of new functionality for mitigating DoS attacks on onion services using a proof-of-work client puzzle. The merge request says there is room for improvement, but at this stage the feature might be considered useful and the wire protocol stabilized. According to the merge request, to get the new proof-of-work system, clients and services must both be built with --enable-gpl, and services must have the HiddenServicePoWDefensesEnabled torrc option at runtime.",
+        "why_it_matters": "",
+        "category": "feature",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "merged",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "feature",
+          "dos"
+        ],
+        "published_at": "2023-05-10T15:46:52Z",
+        "updated_at": "2023-05-10T15:46:52Z",
+        "added_at": "2023-05-10T15:46:52Z"
+      }
+    },
+    {
+      "id": "significant-ctor-conflux-0484",
+      "expected": "approve",
+      "coverage": [
+        "news_value",
+        "status",
+        "scope_timing"
+      ],
+      "packet": "ctor-conflux-0484",
+      "candidate": {
+        "id": "22ff3377eb7f8afefe3471c6",
+        "title": "Tor 0.4.8.4, the first 0.4.8.x stable release, brings Conflux traffic splitting",
+        "summary": "The release notes for Tor 0.4.8.4, dated 2023-08-23, call it the very first stable release of the 0.4.8.x series, making, among other features, Proof-of-Work (prop#327) and Conflux (prop#329) available to the entire network. The release implements Proposal 329 (conflux traffic splitting): Conflux splits traffic across two circuits to Exits that support the protocol. According to the notes, clients using conflux circuit pairs choose the lower-latency circuit to send data to the Exit, and the Exit maximizes throughput when sending data to the client by fully utilizing both circuits in a multiplexed fashion. The notes say onion services are not currently supported, but will be in arti.",
+        "why_it_matters": "",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "released",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "release",
+          "feature"
+        ],
+        "published_at": "2023-08-23T00:00:00Z",
+        "updated_at": "2023-08-23T00:00:00Z",
+        "added_at": "2023-08-23T00:00:00Z"
+      }
+    },
+    {
+      "id": "significant-ctor-cgo-blog",
+      "expected": "approve",
+      "coverage": [
+        "news_value",
+        "status",
+        "technical_details"
+      ],
+      "packet": "ctor-cgo-blog",
+      "candidate": {
+        "id": "9282d34f6976a9c77e8ee8ac",
+        "title": "Tor is replacing one of its oldest encryption algorithms with Counter Galois Onion",
+        "summary": "A Tor Project blog post says Tor is sunsetting one of its oldest and most important encryption algorithms and replacing it with a research-backed new design called Counter Galois Onion (CGO), described as improved encryption for Tor circuit traffic. According to the post, CGO makes it so that if anybody tampers with any part of the encrypted data, the entire message and all future messages become unrecoverable, and the overhaul will defend users against a broader class of online attackers and form the basis for more encryption work in the future. The post says CGO has also been implemented in C, since it will not do any good unless relays support it too and the Arti relay project is still a work in progress.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "protocol"
+        ],
+        "published_at": "2025-11-24T00:00:00Z",
+        "updated_at": "2025-11-24T00:00:00Z",
+        "added_at": "2025-11-24T00:00:00Z"
+      }
+    },
+    {
+      "id": "significant-ctor-happy-families-0495",
+      "expected": "approve",
+      "coverage": [
+        "news_value",
+        "scope_timing",
+        "operational_advice"
+      ],
+      "packet": "ctor-happy-families-0495",
+      "candidate": {
+        "id": "c90e17baf14db42dac142f51",
+        "title": "Tor 0.4.9.5, the first 0.4.9.x stable release, introduces \"happy families\"",
+        "summary": "The release notes for Tor 0.4.9.5, dated 2026-02-12, say this first stable release in the 0.4.9 series introduces a new circuit-level encryption design for better client security, as well as a more scalable way for large relay operators to annotate which relays they run so clients can avoid using too many of them in a single circuit. Clients and relays now support \"happy families\", a system to simplify relay family operation and improve directory performance, in which relays in a family share a secret \"family key\" that they use to prove their membership in the family. The notes say relay operators will still need to configure MyFamily lists until enough clients are upgraded; once clients no longer depend on those lists, the lists can be removed entirely, which the notes say will simplify family operation and make microdescriptor downloads approximately 80% smaller.",
+        "why_it_matters": "",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "released",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "release",
+          "relay"
+        ],
+        "published_at": "2026-02-12T00:00:00Z",
+        "updated_at": "2026-02-12T00:00:00Z",
+        "added_at": "2026-02-12T00:00:00Z"
+      }
+    },
+    {
+      "id": "significant-arti-1.3.0-client-parity-onion-default",
+      "expected": "approve",
+      "coverage": [
+        "news_value",
+        "uncertainty_attribution"
+      ],
+      "packet": "arti-1.3.0-client-parity-onion-default",
+      "candidate": {
+        "id": "31dad79c846916df10bcf86f",
+        "title": "Arti 1.3.0 released, reaching parity with C Tor on most major client features",
+        "summary": "Arti 1.3.0 has been released. The release announcement calls it a significant milestone, saying Arti has achieved parity with C Tor on most major client features.",
+        "why_it_matters": "",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": [
+          "arti"
+        ],
+        "tags": [
+          "release",
+          "feature"
+        ],
+        "published_at": "2024-10-31T00:00:00Z",
+        "updated_at": "2024-10-31T00:00:00Z",
+        "added_at": "2024-10-31T00:00:00Z"
+      }
+    },
+    {
+      "id": "significant-arti-1.4.2-rpc-stable",
+      "expected": "approve",
+      "coverage": [
+        "news_value",
+        "uncertainty_attribution"
+      ],
+      "packet": "arti-1.4.2-rpc-stable",
+      "candidate": {
+        "id": "bc9d410926348f3db06ec409",
+        "title": "Arti 1.4.2 released with an officially stable RPC interface",
+        "summary": "Arti 1.4.2 has been released. Its announcement says that with this release, Arti's RPC interface is now officially stable, and ready for testing.",
+        "why_it_matters": "",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": [
+          "arti"
+        ],
+        "tags": [
+          "release",
+          "feature"
+        ],
+        "published_at": "2025-04-01T00:00:00Z",
+        "updated_at": "2025-04-01T00:00:00Z",
+        "added_at": "2025-04-01T00:00:00Z"
+      }
+    },
+    {
+      "id": "significant-arti-1.1.6-onion-service-client",
+      "expected": "approve",
+      "coverage": [
+        "news_value",
+        "uncertainty_attribution"
+      ],
+      "packet": "arti-1.1.6-onion-service-client",
+      "candidate": {
+        "id": "c4c8921e2d5411474d404e95",
+        "title": "Arti 1.1.6 adds client-side onion service support, disabled by default for now",
+        "summary": "Arti 1.1.6 has been released, and its announcement says Arti now has working client-side onion service support: programs can now use Arti to connect to onion services on the Tor network. The announcement notes that the feature is not yet as secure as the equivalent feature in the C tor implementation, and probably should not be used for security-sensitive purposes; for this reason, it is (for now) disabled by default.",
+        "why_it_matters": "",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": [
+          "arti"
+        ],
+        "tags": [
+          "release",
+          "feature"
+        ],
+        "published_at": "2023-06-30T00:00:00Z",
+        "updated_at": "2023-06-30T00:00:00Z",
+        "added_at": "2023-06-30T00:00:00Z"
+      }
+    },
+    {
+      "id": "significant-webtunnel-stable-release-2024",
+      "expected": "approve",
+      "coverage": [
+        "news_value",
+        "technical_details"
+      ],
+      "packet": "webtunnel-stable-release-2024",
+      "candidate": {
+        "id": "c23736fd0c11327a9bc1bc78",
+        "title": "Tor Project releases WebTunnel, a new bridge type for users in heavily censored regions",
+        "summary": "On March 12th, the World Day Against Cyber Censorship, the Tor Project's Anti-Censorship Team officially announced the release of WebTunnel, a new type of Tor bridge designed to assist users in heavily censored regions to connect to the Tor network. WebTunnel is available in the stable version of Tor Browser. It is a censorship-resistant pluggable transport, inspired by HTTPT, designed to mimic encrypted web traffic (HTTPS): it wraps the payload connection into a WebSocket-like HTTPS connection, appearing to network observers as an ordinary HTTPS (WebSocket) connection. The announcement says WebTunnel can be used as an alternative to obfs4 for most Tor Browser users.",
+        "why_it_matters": "",
+        "category": "feature",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": [
+          "tor-browser"
+        ],
+        "tags": [
+          "feature"
+        ],
+        "published_at": "2024-03-12T00:00:00Z",
+        "updated_at": "2024-03-12T00:00:00Z",
+        "added_at": "2024-03-12T00:00:00Z"
+      }
+    },
+    {
+      "id": "significant-tor-browser-14.5-connection-assist-android",
+      "expected": "approve",
+      "coverage": [
+        "news_value",
+        "scope_timing"
+      ],
+      "packet": "tor-browser-14.5-connection-assist-android",
+      "candidate": {
+        "id": "c11d7b75804f976e4c3d7a7d",
+        "title": "Tor Browser 14.5 brings Connection Assist to Android",
+        "summary": "Tor Browser 14.5 has been released. Its announcement says the release marks the introduction of Connection Assist to Android, empowering mobile users who are subjected to strict censorship to unblock Tor at the press of a button. The announcement describes Connection Assist as offering to find and try bridges should Tor Browser fail to establish a direct connection to the Tor network.",
+        "why_it_matters": "",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": [
+          "tor-browser"
+        ],
+        "tags": [
+          "release",
+          "feature"
+        ],
+        "published_at": "2025-04-16T00:00:00Z",
+        "updated_at": "2025-04-16T00:00:00Z",
+        "added_at": "2025-04-16T00:00:00Z"
+      }
+    },
+    {
+      "id": "significant-tor-browser-15.0-tabs-and-android-screen-lock",
+      "expected": "approve",
+      "coverage": [
+        "news_value",
+        "scope_timing"
+      ],
+      "packet": "tor-browser-15.0-tabs-and-android-screen-lock",
+      "candidate": {
+        "id": "5df88640cac277e1e9d2aa27",
+        "title": "Tor Browser 15.0 released with vertical tabs, tab groups and Android screen lock",
+        "summary": "Tor Browser 15.0 is the first stable release based on Firefox ESR 140, incorporating a year's worth of changes that have been shipped upstream in Firefox. According to the announcement, for desktop these include vertical tabs, an alternative layout with open and pinned tabs stacked in a sidebar rather than across the top of the window. The announcement also highlights the addition of tab groups, which organize tabs into collapsible groups that can be given names and color-coded. On Android, the announcement says screen lock adds an extra layer of security to browsing sessions: after it is enabled in Settings > Tabs, tabs lock automatically when the user switches away from the browser without closing it.",
+        "why_it_matters": "",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": [
+          "tor-browser"
+        ],
+        "tags": [
+          "release",
+          "feature"
+        ],
+        "published_at": "2025-10-28T00:00:00Z",
+        "updated_at": "2025-10-28T00:00:00Z",
+        "added_at": "2025-10-28T00:00:00Z"
+      }
+    },
+    {
+      "id": "significant-tor-browser-16.0-settings-redesign-linux-arm64",
+      "expected": "approve",
+      "coverage": [
+        "news_value",
+        "scope_timing"
+      ],
+      "packet": "tor-browser-16.0-settings-redesign-linux-arm64",
+      "candidate": {
+        "id": "c721c69382cc7a7b9fd92a81",
+        "title": "Tor Browser 16.0 released with redesigned Settings and native 64-bit ARM Linux support",
+        "summary": "Tor Browser 16.0 is the first stable release based on Firefox ESR 153, incorporating a year's worth of changes that have been shipped upstream in Firefox. It introduces a complete redesign of the Settings experience based on a parallel redesign shipped in Firefox in June; pages and components unique to Tor Browser, like Connection and Security Level, have been rebuilt from scratch using Firefox's new components so they look and feel consistent with the rest of Settings. After a year of testing, Tor Browser 16.0 also features native support for Linux computers with 64-bit ARM (AArch64) processors, such as Raspberry Pis and Apple Silicon Macs running Linux.",
+        "why_it_matters": "",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": [
+          "tor-browser"
+        ],
+        "tags": [
+          "release",
+          "feature"
+        ],
+        "published_at": "2026-10-29T00:00:00Z",
+        "updated_at": "2026-10-29T00:00:00Z",
+        "added_at": "2026-10-29T00:00:00Z"
+      }
     }
   ],
   "coverage_sets": {
@@ -1682,6 +3678,112 @@
         }
       ],
       "truncated": false
+    },
+    "prior-scope": {
+      "prior_story": {
+        "id": "b4da6d81114929477fd5f003",
+        "title": "Tor 1.2.x relays reported to crash on malformed consensus diffs",
+        "summary": "A public issue reports that relays running Tor 1.2.x crash when they apply a malformed consensus diff. A reproducer is attached.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-09T12:00:00Z",
+        "updated_at": "2026-11-09T12:00:00Z",
+        "added_at": "2026-11-09T12:00:00Z"
+      },
+      "recent": [],
+      "truncated": false
+    },
+    "prior-allegation": {
+      "prior_story": {
+        "id": "2aa2f38981c9c5d6103851bf",
+        "title": "Report alleges remote disk exhaustion through nonce files",
+        "summary": "A reporter alleges that persistent nonce files permit practical remote disk exhaustion.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-09T12:00:00Z",
+        "updated_at": "2026-11-09T12:00:00Z",
+        "added_at": "2026-11-09T12:00:00Z"
+      },
+      "recent": [],
+      "truncated": false
+    },
+    "busy-truncated": {
+      "prior_story": null,
+      "recent": [
+        {
+          "id": "f8aceaf9b30ece160b43ee77",
+          "title": "Arti 9.9.1 released",
+          "summary": "The Arti project released version 9.9.1 with onion service fixes.",
+          "category": "release",
+          "state": "released",
+          "updated_at": "2026-11-09T12:00:00Z",
+          "summary_truncated": false
+        },
+        {
+          "id": "ed519978cad1a0fbb6063bd0",
+          "title": "Snowflake proxies report fewer connections in Region Q",
+          "summary": "Volunteers report fewer Snowflake connections from Region Q. The cause is not known.",
+          "category": "network",
+          "state": "developing",
+          "updated_at": "2026-11-09T12:00:00Z",
+          "summary_truncated": false
+        },
+        {
+          "id": "a6b962c75054e118f79798c7",
+          "title": "Directory authority restarts after a hardware change",
+          "summary": "An authority operator reports a planned restart after a hardware change.",
+          "category": "directory-authority",
+          "state": "resolved",
+          "updated_at": "2026-11-09T12:00:00Z",
+          "summary_truncated": false
+        },
+        {
+          "id": "7d4b0c218e68f7d3d1c028d5",
+          "title": "Bridge distribution adds a new request channel",
+          "summary": "The bridge distribution service announced an additional request channel.",
+          "category": "feature",
+          "state": "released",
+          "updated_at": "2026-11-09T12:00:00Z",
+          "summary_truncated": false
+        },
+        {
+          "id": "4037100490e424f24d85f5b9",
+          "title": "Tor 1.2.3 released with directory-request crash fix",
+          "summary": "The Tor Project released stable version 1.2.3 with a fix for relay crashes triggered by malformed directory requests. The announcement asks relay operators to upgrade.",
+          "category": "release",
+          "state": "released",
+          "updated_at": "2026-11-10T10:00:00Z",
+          "summary_truncated": false
+        },
+        {
+          "id": "d85c889954c412c5c0df5ce3",
+          "title": "Tor Browser 99.5 fixes a startup crash",
+          "summary": "The Tor Browser team released version 99.5, which fixes a crash at startup on some systems.",
+          "category": "release",
+          "state": "released",
+          "updated_at": "2026-11-09T12:00:00Z",
+          "summary_truncated": false
+        }
+      ],
+      "truncated": true
     }
   }
 }

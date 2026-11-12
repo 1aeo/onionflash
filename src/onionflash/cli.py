@@ -13,7 +13,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import __version__, editorial, rejection
+from . import __version__, decisions, editorial, rejection
 from .analyze import AnalysisError, Analyzer
 from .review import Reviewer
 from .review_gate import process_item, status as review_status
@@ -59,9 +59,9 @@ def _operator_parsers(commands) -> None:
         if name == "restore":
             action.add_argument("--revision", required=True, type=int, help="Revision to restore and lock")
 
-    rejected = commands.add_parser("rejected", help="Inspect and explicitly retry or dismiss failed analyses, or retry an ignored item")
+    rejected = commands.add_parser("rejected", help="Inspect, retry, dismiss or approve held analyses")
     actions = rejected.add_subparsers(dest="action", required=True)
-    for name in ("list", "show", "retry", "dismiss"):
+    for name in ("list", "show", "retry", "dismiss", "approve"):
         action = actions.add_parser(name)
         action.add_argument("--config", required=True, type=Path)
         if name == "list":
@@ -73,10 +73,25 @@ def _operator_parsers(commands) -> None:
         if name in {"retry", "dismiss"}:
             action.add_argument("--expect-hash", required=True, help="Current content_hash returned by rejected show")
             action.add_argument("--reason", required=True, help="Private operator reason for this action")
+        if name == "approve":
+            action.add_argument("--approval-hash", required=True, help="final_review.approval.hash returned by rejected show")
+            action.add_argument("--reason", required=True, help="Private operator reason for this action")
+
+    log = commands.add_parser("decisions", help="Summarize or list recent private decisions")
+    actions = log.add_subparsers(dest="action", required=True)
+    for name in ("summary", "list"):
+        action = actions.add_parser(name)
+        action.add_argument("--config", required=True, type=Path)
+        action.add_argument("--since", default="7d", help="Hours or days before now, such as 7d, or a timestamp")
+        if name == "list":
+            action.add_argument("--code", help="A decision code or its dotted prefix, such as held.review")
+            action.add_argument("--source", help="Source ID")
+            action.add_argument("--limit", type=int, default=50)
+            action.add_argument("--after", type=int, help="Continuation cursor returned by the previous list")
 
 
-def _operator_command(args, store: Store) -> dict:
-    """Dispatch one operator action with its required hash and reason."""
+def _operator_command(args, store: Store, config: dict | None = None) -> dict:
+    """Dispatch one inspection, or one operator action with its required hash and reason."""
     if args.command == "story":
         if args.action == "show":
             return editorial.show(store.db, args.story)
@@ -90,10 +105,17 @@ def _operator_command(args, store: Store) -> dict:
         else:
             result = getattr(editorial, args.action)(store.db, args.story, **options)
         return {**result, "publication_pending": True}
+    if args.command == "decisions":
+        since = decisions.window(args.since)
+        if args.action == "summary":
+            return decisions.summary(store.db, since)
+        return decisions.list_entries(store.db, since, code=args.code, source=args.source, limit=args.limit, after=args.after)
     if args.action == "list":
         return rejection.list_items(store, status=args.status, limit=args.limit, after=args.after)
     if args.action == "show":
-        return rejection.show_item(store, args.item)
+        return rejection.show_item(store, args.item, config=config)
+    if args.action == "approve":
+        return rejection.approve_item(config, store, args.item, args.approval_hash, args.reason)
     return getattr(rejection, args.action + "_item")(store, args.item, args.expect_hash, args.reason)
 
 
@@ -108,8 +130,6 @@ def run(config: dict, store: Store) -> dict:
         "analysis_failed": 0,
         "budget_reached": False,
         "entries_skipped": 0,
-        "review_held": 0,
-        "review_skipped": 0,
         "review_cache_hits": 0,
         "review_stale": 0,
         "model_calls": 0,
@@ -147,26 +167,27 @@ def run(config: dict, store: Store) -> dict:
             client.deadline = time.monotonic() + min(remaining, config["collection"]["source_budget_seconds"])
             client.deadline_reached = False
             try:
-                result = collect_source(client, source, state, config["collection"], observed)
-                received = record_items(source, result["items"])
-                report["entries_skipped"] += result.get("skipped", 0)
-                store.source_success(source, result, received, schedule_from=observed)
-                report["sources_ok"] += 1
-            except CollectionError as exc:
-                received = record_items(source, exc.items)
-                out_of_time = shared and (client.deadline_reached or time.monotonic() >= collection_deadline)
-                store.source_failure(
-                    source,
-                    str(exc),
-                    config["collection"],
-                    received,
-                    exc.watermark,
-                    exc.catching_up or out_of_time,
-                )
-                report["sources_failed"] += 1
-                if out_of_time:
-                    report["budget_reached"] = True
-                    break
+                try:
+                    result = collect_source(client, source, state, config["collection"], observed)
+                    received = record_items(source, result["items"])
+                    report["entries_skipped"] += result.get("skipped", 0)
+                    store.source_success(source, result, received, schedule_from=observed)
+                    report["sources_ok"] += 1
+                except CollectionError as exc:  # saving its partial items is covered by the handler below too
+                    received = record_items(source, exc.items)
+                    out_of_time = shared and (client.deadline_reached or time.monotonic() >= collection_deadline)
+                    store.source_failure(
+                        source,
+                        str(exc),
+                        config["collection"],
+                        received,
+                        exc.watermark,
+                        exc.catching_up or out_of_time,
+                    )
+                    report["sources_failed"] += 1
+                    if out_of_time:
+                        report["budget_reached"] = True
+                        break
             except Exception as exc:  # untrusted input must not stop the other sources
                 # Record where it failed (file:line), never the exception text.
                 frame = traceback.extract_tb(exc.__traceback__)[-1]
@@ -184,27 +205,26 @@ def run(config: dict, store: Store) -> dict:
                               "error": f"Unexpected {type(exc).__name__} at {Path(frame.filename).name}:{frame.lineno}"}
     run_deadline = started + budget
     endpoint_failures = 0
+    first = decisions.latest_id(store.db)
     with Analyzer(config, deadline=run_deadline) as analyzer, Reviewer(config, deadline=run_deadline) as reviewer:
         for row in store.pending(config["llm"]["max_items_per_run"], now_iso()):
             if time.monotonic() >= run_deadline:
                 report["budget_reached"] = True
                 break
+            if row.get("damaged"):  # never sent to a model; collecting the item again restores its copy
+                store.reject(row["id"], "Stored source item is damaged", "failed.app.damaged_item", now_iso())
+                report["analysis_failed"] += 1
+                continue
             try:
                 result = process_item(config, store, row, analyzer, reviewer, now_iso(),
                                       allow_network=endpoint_failures < 2)
                 if result["status"] not in {"stale", "deferred"}:
                     report["analyzed"] += 1
                 report["review_cache_hits"] += bool(result["cache_hit"])
-                if result["status"] == "held":
-                    report["review_held"] += 1
-                    report["analysis_failed"] += 1
-                elif result["status"] == "stale":
-                    report["review_stale"] += 1
-                elif result["status"] == "ignored":
-                    report["review_skipped"] += 1
+                report["review_stale"] += result["status"] == "stale"
             except AnalysisError as exc:
                 # A request cut off by the run deadline is retryable: the item backs off.
-                store.defer(row["id"], str(exc), config["llm"], now_iso(), terminal=not exc.retryable)
+                store.defer(row["id"], str(exc), config["llm"], now_iso(), terminal=not exc.retryable, code=exc.code)
                 report["analysis_failed"] += 1
                 if exc.retryable:
                     # After a second endpoint failure, skip further network
@@ -222,6 +242,7 @@ def run(config: dict, store: Store) -> dict:
                             config["llm"], now_iso(), terminal=True)
                 report["analysis_failed"] += 1
         report["model_calls"] = analyzer.calls + reviewer.calls
+    report["decisions"] = decisions.codes_after(store.db, first)
     report["pending_analysis"] = store.pending_count()
     report["rejected_analysis"] = store.rejected_count()
     report["final_review"] = review_status(store)
@@ -277,17 +298,18 @@ def main(argv: list[str] | None = None) -> int:
                     else int(store.get_meta("published_stories")),
                     "comments": {"enabled": config["comments"]["enabled"], **comments_status(store)},
                     "final_review": review_status(store),
+                    "decisions_24h": decisions.recent(store.db, now_iso()),
                     "sources": store.health(
                         config["sources"], config["collection"]["stale_after_seconds"], now_iso()
                     ),
                 }, ensure_ascii=False))
             return 0
-        operator = args.command in {"story", "rejected"}
-        if operator and args.action in {"show", "history", "list"}:
+        operator = args.command in {"story", "rejected", "decisions"}
+        if operator and args.action in {"show", "history", "list", "summary"}:
             with Store(config["storage"]["database"]) as store:
                 # Explicit source inspection can contain arbitrary Unicode. JSON
                 # escapes keep terminal control/bidi characters visibly inert.
-                print(json.dumps(_operator_command(args, store), ensure_ascii=True))
+                print(json.dumps(_operator_command(args, store, config), ensure_ascii=True))
             return 0
         with run_lock(config["storage"]["database"]) as acquired:
             if not acquired:
@@ -297,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0 if args.command == "run" else 75
             with Store(config["storage"]["database"]) as store:
                 if operator:
-                    result = _operator_command(args, store)
+                    result = _operator_command(args, store, config)
                 elif args.command == "run":
                     result = run(config, store)
                 else:

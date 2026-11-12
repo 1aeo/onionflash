@@ -15,7 +15,7 @@ from itertools import zip_longest
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from .transport import FetchError, HttpClient
-from .util import after, backoff_seconds, canonical_url, digest, now_iso, plain_text, timestamp
+from .util import after, backoff_seconds, canonical_url, digest, now_iso, plain_text, saved_object, timestamp
 
 
 QUERY = """query PublicIssueNotes($project: ID!, $iid: String!, $size: Int!) {
@@ -166,19 +166,37 @@ def merge_cached_comments(store, item, source, observed=None):
     """
     if item.get("kind") != "gitlab_issue" or not source.get("gitlab_project"):
         return item
-    row = store.db.execute("SELECT id,payload FROM items WHERE url=?", (item["url"],)).fetchone()
+    row = store.db.execute("SELECT id,CAST(payload AS BLOB) AS payload FROM items WHERE url=?", (item["url"],)).fetchone()
     if row is None:
         return item
-    old, key = json.loads(row["payload"]), _source_key(source)
+    # A damaged saved copy has no snapshot: request a check, and Store.ingest replaces the copy.
+    old, key = saved_object(row["payload"]) or {}, _source_key(source)
     current = old.get("comments_source_key") == key
     if observed and (not current or item["updated_at"] > old["comments_checked_at"]):
-        with store.db:  # next_fetch_at=checked_at marks a request; an unserved request keeps its place, a failing issue its backoff.
-            store.db.execute("INSERT OR REPLACE INTO comment_cache SELECT ?,?,?,?,0,NULL WHERE NOT EXISTS(SELECT 1 FROM comment_cache"
-                             " WHERE item_id=? AND source_key=? AND (failures>0 OR next_fetch_at<=checked_at))",
-                             (row["id"], key, observed, observed, row["id"], key))
+        with store.db:
+            _request(store.db, row["id"], key, observed)
+        if not current:
+            store._comment_requests[row["id"]] = observed
     if not current:
         return item
     return _compose(item, old["public_comments"], old["comments_checked_at"], source_key=key)
+
+
+def _request(db, item_id, key, observed):
+    # next_fetch_at=checked_at marks a request; an unserved request keeps its place, a failing issue its backoff.
+    db.execute("INSERT OR REPLACE INTO comment_cache SELECT ?,?,?,?,0,NULL WHERE NOT EXISTS(SELECT 1 FROM comment_cache"
+               " WHERE item_id=? AND source_key=? AND (failures>0 OR next_fetch_at<=checked_at))",
+               (item_id, key, observed, observed, item_id, key))
+
+
+def request_check(db, config, row, observed):
+    """Ask the next comments phase to check an issue whose notes were never verified, whatever its status.
+
+    Nothing happens for a source without comments. The caller owns the transaction.
+    """
+    source = next((s for s in config["sources"] if s["id"] == row["source_id"]), None)
+    if config["comments"]["enabled"] and source and source["enabled"] and source.get("gitlab_project"):
+        _request(db, row["id"], _source_key(source), observed)
 
 
 def _candidates(store, source, observed, key):
@@ -197,13 +215,15 @@ def _candidates(store, source, observed, key):
     recent_first = bool(state["recent_first"]) if state and state["source_key"] == key else False
     due = "(c.item_id IS NULL OR c.source_key<>? OR c.next_fetch_at<=?)"
     unlocked = " AND NOT EXISTS(SELECT 1 FROM editorial_controls e WHERE e.story_id=i.story_id AND e.locked=1)"
-    select = "SELECT i.* FROM items i LEFT JOIN comment_cache c ON c.item_id=i.id WHERE i.source_id=? AND " + due + unlocked
+    # The payload is read as bytes, so a damaged one is skipped below instead of failing the query.
+    columns = "i.id,i.content_hash,CAST(i.payload AS BLOB) AS payload"
+    select = f"SELECT {columns} FROM items i LEFT JOIN comment_cache c ON c.item_id=i.id WHERE i.source_id=? AND " + due + unlocked
     args = (source["id"], key, observed)
     # Whatever the status: requests from merge_cached_comments (next_fetch_at<=checked_at), and retries
     # of failed checks of issues without a story, which the rotation below retries only while recent
     # and pending. CROSS JOIN keeps the bounded cache as the outer loop.
     requested = store.db.execute(
-        "SELECT i.* FROM comment_cache c CROSS JOIN items i ON i.id=c.item_id WHERE c.next_fetch_at<=? AND i.source_id=?"
+        f"SELECT {columns} FROM comment_cache c CROSS JOIN items i ON i.id=c.item_id WHERE c.next_fetch_at<=? AND i.source_id=?"
         " AND (c.next_fetch_at<=c.checked_at OR (c.failures>0 AND i.story_id IS NULL))" + unlocked +
         " ORDER BY i.status<>'pending',c.next_fetch_at,i.id LIMIT ?", (observed, source["id"], limit)).fetchall()
     recent = store.db.execute(select + " AND i.status='pending' AND i.last_seen>=? ORDER BY i.priority_score DESC,i.last_seen DESC,i.id LIMIT ?",
@@ -261,10 +281,8 @@ def enrich_comments(config, store, observed, *, deadline=None):
                     elif row["_comments_history"] is not None:  # a requested check takes no rotation turn
                         store.db.execute("UPDATE comment_sources SET recent_first=0 WHERE source_id=?", (source["id"],))
                 try:
-                    if not isinstance(row["payload"], str) or len(row["payload"]) > 1048576:
-                        raise ValueError
-                    item = json.loads(row["payload"])
-                    if (not isinstance(item, dict) or item.get("kind") != "gitlab_issue"
+                    item = saved_object(row["payload"]) if len(row["payload"]) <= 1048576 else None
+                    if (item is None or item.get("kind") != "gitlab_issue"
                             or not isinstance(item.get("title"), str)
                             or not isinstance(item.get("source_content", item.get("content")), str)):
                         raise ValueError
@@ -288,7 +306,7 @@ def enrich_comments(config, store, observed, *, deadline=None):
                         if not changed:
                             # Refresh verified provenance without requeuing an
                             # unchanged or operator-dismissed source revision.
-                            store.db.execute("UPDATE items SET payload=? WHERE id=? AND payload=? AND content_hash=?",
+                            store.db.execute("UPDATE items SET payload=? WHERE id=? AND CAST(payload AS BLOB)=? AND content_hash=?",
                                              (json.dumps(enriched, ensure_ascii=False), row["id"], row["payload"], row["content_hash"]))
                         store.db.execute("INSERT OR REPLACE INTO comment_cache VALUES(?,?,?,?,0,NULL)",
                                          (row["id"], key, observed, after(INTERVAL_SECONDS, observed)))

@@ -23,7 +23,8 @@ not contain:
 - names of internal tools, model routes or review services;
 - security exposures that are not fixed yet.
 
-Describe tests, rehearsals and reviews generically, for example: "a rehearsal on
+Evaluation cases may quote upstream reports and discussions that are already
+public. Describe tests, rehearsals and reviews generically, for example: "a rehearsal on
 a copy of a real catalog preserved every story and permalink." Rollout and
 operations steps go to the operator, not into PR text.
 

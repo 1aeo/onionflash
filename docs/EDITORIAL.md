@@ -46,10 +46,25 @@ appearance date. Its update date becomes the operator action time. Only its
 changed article and affected indexes/feeds need rebuilding.
 
 Editable fields are `title`, `summary`, `why_it_matters`, `category`, `priority`,
-`confidence`, `state`, `products`, `tags` and `sources`. Source replacements are
-lists of objects containing only a public HTTPS `url` and `title`. The regular
-classification vocabulary and public URL validation still apply. IDs, dates,
-private collection metadata and editorial history cannot be patched.
+`confidence`, `state`, `products`, `tags`, `sources` and `updates`. Source
+replacements are lists of objects containing only a public HTTPS `url` and
+`title`. The regular classification vocabulary and public URL validation still
+apply; `state` also accepts `no-longer-listed`, which the writer never chooses.
+IDs, dates, private collection metadata and editorial history cannot be patched.
+
+`updates` replaces the story's whole list of dated updates, so one patch can add,
+fix, re-cite or remove entries. Each entry contains only `at`, a timestamp with a
+time zone, `text`, at most 300 characters, and `sources`, one to three objects
+like those above:
+
+```json
+{
+  "updates": [
+    {"at": "2026-11-10T09:00:00Z", "text": "The fix was merged.",
+     "sources": [{"url": "https://example.org/merge-request", "title": "Merge request"}]}
+  ]
+}
+```
 
 The correction locks the story against automated replacement. Later source
 analyses are saved privately and mapped to the existing story, while its accepted
@@ -67,11 +82,11 @@ may have other sources, and a false claim that passed validation is not a
 Retraction replaces current reporting with a clearly labeled tombstone at the
 same URL. The homepage, RSS and JSON Feed show the retraction and its reason.
 While the story is retracted, its pages and feeds publish none of its earlier
-headline or text, not even as superseded history or in earlier correction
-reasons. Copies made before the retraction are not withdrawn: feed readers and
-caches keep theirs, and so does an enabled permanent archive. The notice keeps
-the story's source links: they are the upstream records it cited, not Onion
-Flash's text. A correction keeps
+headline, text or dated updates, not even as superseded history or in earlier
+correction reasons. Copies made before the retraction are not withdrawn: feed
+readers and caches keep theirs, and so does an enabled permanent archive. The
+notice keeps the story's source links: they are the upstream records it cited,
+not Onion Flash's text. A correction keeps
 replaced text public as superseded history; when text must not stay public,
 retract:
 
@@ -101,9 +116,10 @@ onionflash story restore --config config.toml --story STORY_ID --revision 1 \
 
 Restoring creates another revision; it does not erase the retraction or previous
 history. It retains the story dates and ID, advances the update date, and leaves
-the editorial lock on. A retraction tombstone cannot itself be used as the text
-of a restored account. A retracted story must be explicitly restored before
-automation can resume.
+the editorial lock on. Dated updates are not restored from the revision: the
+story keeps its current ones, which a retraction only hides. A retraction
+tombstone cannot itself be used as the text of a restored account. A retracted
+story must be explicitly restored before automation can resume.
 
 To allow future automated changes after review:
 
@@ -122,9 +138,10 @@ The article displays the current correction/retraction notice and a native HTML
 revision-history disclosure. It needs no JavaScript. Up to the latest 20 actions
 are shown, with the total count when more exist. Previously accepted public text
 is labeled **superseded** inside a separate disclosure, which a retracted story
-omits until it is restored. Homepage and feed summaries contain the current
-account and notice, never the obsolete full text. Canonical article JSON includes
-the same public notice/history as its article.
+omits until it is restored. Of the dated updates, it lists only those the
+revision removed or whose date or text it changed. Homepage and feed summaries
+contain the current account and notice, never the obsolete full text. Canonical
+article JSON includes the same public notice/history as its article.
 
 All revisions remain in the private SQLite ledger, and the history command prints
 all of them. Raw collected sources, unaccepted drafts, model evidence and private
@@ -142,6 +159,13 @@ writes and collector releases without editorial controls ignore them, so after
 running such a release, check each corrected or retracted story with `story show`.
 SQLite inspection and backups work with any version, and rolling back Cloudflare
 frontend files is independent of the collector database version.
+
+Retired story IDs and cluster keys recorded in `story_aliases` are permanent and
+insert-only. SQLite ignores any insert into `stories` that reuses a retired ID
+or cluster key, including from an older collector release after a rollback;
+items that map to a retired story are marked ignored as
+`skipped.gate.retired_story` without a model call, and `story show` and the
+story editing commands refuse a retired ID.
 
 Public source/model output cannot supply the correction metadata. Notices are
 built only from the operator ledger and HTML-escaped like the rest of the article.

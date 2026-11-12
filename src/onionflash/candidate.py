@@ -89,10 +89,29 @@ def item_fingerprint(row: dict) -> str:
 
 
 def existing_story(db, row: dict):
-    existing = db.execute("SELECT * FROM stories WHERE id=?", (row.get("story_id"),)).fetchone() if row.get("story_id") else None
+    def resolve(story_id: str | None = None, cluster_key: str | None = None):
+        alias = editorial.retired(db, story_id=story_id, cluster_key=cluster_key)
+        if alias is None:
+            return None
+        if alias[1] is None:
+            raise editorial.RetiredStory("Story is retired")
+        target = db.execute("SELECT * FROM stories WHERE id=?", (alias[1],)).fetchone()
+        if target is None:
+            raise editorial.RetiredStory("Story is retired")
+        return dict(target)
+
+    if row.get("story_id"):
+        if resolved := resolve(story_id=row["story_id"]):
+            return resolved
+        existing = db.execute("SELECT * FROM stories WHERE id=?", (row["story_id"],)).fetchone()
+        if existing is not None:
+            return resolve(cluster_key=existing["cluster_key"]) or dict(existing)
+    if resolved := resolve(cluster_key=row["cluster_key"]):
+        return resolved
+    existing = db.execute("SELECT * FROM stories WHERE cluster_key=?", (row["cluster_key"],)).fetchone()
     if existing is None:
-        existing = db.execute("SELECT * FROM stories WHERE cluster_key=?", (row["cluster_key"],)).fetchone()
-    return dict(existing) if existing is not None else None
+        return None
+    return resolve(story_id=existing["id"]) or dict(existing)
 
 
 def control_fingerprint(db, story_id: str) -> str:
@@ -110,6 +129,8 @@ def prepare(db, row: dict, result: dict, observed: str) -> dict:
     item = json.loads(row["payload"])
     existing = existing_story(db, row)
     story_id = existing["id"] if existing else digest(row["cluster_key"])[:24]
+    if existing is None and editorial.retired(db, story_id=story_id, cluster_key=row["cluster_key"]) is not None:
+        raise editorial.RetiredStory("Story is retired")
     locked = editorial.is_locked(db, story_id)
     binding = {"item": item_fingerprint(row), "prior_story": digest(existing),
                "lock": control_fingerprint(db, story_id), "sources": []}
@@ -145,6 +166,8 @@ def prepare(db, row: dict, result: dict, observed: str) -> dict:
                     published_at=previous["published_at"] if previous else item["published_at"],
                     added_at=previous.get("added_at", previous["published_at"]) if previous else observed,
                     updated_at=max(effective_updated, previous["updated_at"] if previous else item["published_at"]))
+        if previous and previous.get("updates"):  # a new draft never drops the story's dated updates
+            data["updates"] = previous["updates"]
         public = render._prepare_story(data, editorial=editorial.public_metadata(db, story_id))
         # Store exactly the normalized reviewed display fields while retaining
         # collection identities privately for future grouping and source lookup.

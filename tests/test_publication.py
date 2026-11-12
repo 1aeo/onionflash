@@ -66,12 +66,12 @@ def test_full_rebuild_is_bounded_and_rewrites_feeds_once(tmp_path, monkeypatch, 
         assert len(list((output / "news").glob("*/index.html"))) == 5
 
 
-def test_history_beyond_one_catalog_batch_is_permanent_and_feeds_carry_the_newest(tmp_path):
+def test_history_beyond_one_catalog_batch_is_permanent_and_feeds_carry_every_story(tmp_path):
     cfg = settings(tmp_path, render_batch_size=25)
     cfg["site"]["page_size"] = 10
     output = Path(cfg["storage"]["output_dir"])
     with Store(cfg["storage"]["database"]) as store:
-        for number in range(101):  # story(0) sorts last everywhere
+        for number in range(101):  # equal dates, so the story_id tie-break sorts story(0) last everywhere
             put(store.db, story(number, tags=["release", "security"] if number == 0 else ["release"]))
         first = build(cfg, store)
         assert first["articles_pending"] == 76
@@ -83,10 +83,10 @@ def test_history_beyond_one_catalog_batch_is_permanent_and_feeds_carry_the_newes
         assert (output / "news" / story(100)["id"] / "story.json").is_file()
         def guids(path):
             return [guid.text for guid in ET.parse(output / path).iter("guid")]
-        assert len(guids("feed.xml")) == len(guids("tags/release.xml")) == 100
+        assert len(guids("feed.xml")) == len(guids("tags/release.xml")) == 101
         assert [item["id"] for item in json.loads((output / "feed.json").read_text())["items"]] == guids("feed.xml")
-        assert not [guid for guid in guids("feed.xml") if story(0)["id"] in guid]
-        assert story(0)["id"] in guids("tags/security.xml")[0]  # each topic feed has its own newest stories
+        last = f"https://example.org/onionflash/news/{story(0)['id']}/"
+        assert guids("feed.xml")[-1] == last and guids("tags/security.xml") == [last]
         assert (output / "page/11/index.html").is_file()
         assert (output / "topics/release/page/11/index.html").is_file()
         assert store.db.execute("SELECT COUNT(*) FROM public_story_topics WHERE topic='release'").fetchone()[0] == 101
@@ -110,11 +110,10 @@ def test_history_beyond_one_catalog_batch_is_permanent_and_feeds_carry_the_newes
         store.db.execute("DELETE FROM stories WHERE id=?", (story(0)["id"],)); store.db.commit()
         build(cfg, store)
         assert (output / "news" / story(0)["id"] / "index.html").is_file()
-        assert len(guids("feed.xml")) == 100
+        assert len(guids("feed.xml")) == 101
 
 
-def test_once_every_feed_is_full_each_keeps_exactly_its_newest_stories(tmp_path, monkeypatch):
-    monkeypatch.setattr(publication, "FEED_ITEMS", 2)
+def test_every_feed_lists_all_its_stories_most_recently_updated_first(tmp_path):
     cfg = settings(tmp_path)
     output = Path(cfg["storage"]["output_dir"])
     with Store(cfg["storage"]["database"]) as store:
@@ -122,7 +121,7 @@ def test_once_every_feed_is_full_each_keeps_exactly_its_newest_stories(tmp_path,
             put(store.db, story(number, tags=render.CATEGORIES, published_at="2026-01-01T00:00:00Z",
                                 updated_at=f"2026-11-0{3 - number}T00:00:00Z"))
         build(cfg, store)
-    newest = [f"https://example.org/onionflash/news/{story(number)['id']}/" for number in (0, 1)]
+    newest = [f"https://example.org/onionflash/news/{story(number)['id']}/" for number in (0, 1, 2)]
     for path in ["feed.xml", *(f"tags/{topic}.xml" for topic in render.CATEGORIES)]:
         assert [guid.text for guid in ET.parse(output / path).iter("guid")] == newest, path
     assert [item["id"] for item in json.loads((output / "feed.json").read_text())["items"]] == newest

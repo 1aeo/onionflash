@@ -12,7 +12,7 @@ import json
 import re
 import xml.etree.ElementTree as ET
 from urllib.parse import urlsplit
-from .schema import CATEGORY_LABELS as CATEGORIES, PRIORITIES, PRODUCTS, CONFIDENCES, STATES
+from .schema import CATEGORY_LABELS as CATEGORIES, PRIORITIES, PRODUCTS, CONFIDENCES, PUBLIC_STATES, UPDATE_CHARS
 from .util import canonical_url, parse_utc as _date, format_utc as _iso
 
 
@@ -54,6 +54,29 @@ def _label(value: str) -> str:
     return value.replace("-", " ").capitalize()
 
 
+def _sources(values: list, limit: int) -> list[dict]:
+    sources = {}
+    for source in values[:limit]:
+        if not isinstance(source, dict):
+            continue
+        url = _public_url(source.get("url"))
+        if url and url not in sources:
+            sources[url] = {"url": url, "title": _text(source.get("title"), 200) or urlsplit(url).hostname}
+    return list(sources.values())
+
+
+def _update(value: object) -> dict | None:
+    """One dated update with its own citations; a malformed entry is dropped."""
+    if not isinstance(value, dict) or not isinstance(value.get("sources"), list):
+        return None
+    try:
+        at = _iso(_date(value.get("at")))
+    except ValueError:
+        return None
+    text, sources = _text(value.get("text"), UPDATE_CHARS), _sources(value["sources"], 3)
+    return {"at": at, "text": text, "sources": sources} if text and sources else None
+
+
 def _prepare_story(story: dict, *, editorial: dict | None = None) -> dict:
     story_id = story.get("id", "")
     if not isinstance(story_id, str) or not ID_PATTERN.fullmatch(story_id):
@@ -62,19 +85,13 @@ def _prepare_story(story: dict, *, editorial: dict | None = None) -> dict:
     priority = story.get("priority", "normal")
     confidence = story.get("confidence", "reported")
     state = story.get("state", "developing")
-    if category not in CATEGORIES or priority not in PRIORITIES or confidence not in CONFIDENCES or state not in STATES:
+    if category not in CATEGORIES or priority not in PRIORITIES or confidence not in CONFIDENCES or state not in PUBLIC_STATES:
         raise ValueError("Invalid public story classification")
     title = _text(story.get("title"), 180)
     summary = _text(story.get("summary"), 1600)
     if not title or not summary:
         raise ValueError("Published stories require a title and summary")
-    sources = {}
-    for source in story["sources"][:20]:
-        if not isinstance(source, dict):
-            continue
-        url = _public_url(source.get("url"))
-        if url and url not in sources:
-            sources[url] = {"url": url, "title": _text(source.get("title"), 200) or urlsplit(url).hostname}
+    sources = _sources(story["sources"], 20)
     if not sources:
         raise ValueError("Published stories require at least one safe source URL")
     # Only schema values reach the page, so one malformed stored field cannot break a build.
@@ -87,12 +104,17 @@ def _prepare_story(story: dict, *, editorial: dict | None = None) -> dict:
         "id": story_id, "title": title, "summary": summary,
         "why_it_matters": _text(story.get("why_it_matters"), 800),
         "category": category, "priority": priority, "confidence": confidence,
-        "state": state, "tags": tags, "sources": list(sources.values()),
+        "state": state, "tags": tags, "sources": sources,
         "products": [product for product in story.get("products", []) if isinstance(product, str) and product in PRODUCTS],
         "published_at": _iso(published), "updated_at": _iso(updated),
         # When Onion Flash first published the story; older records fall back to the source date.
         "added_at": _iso(_date(story.get("added_at") or story.get("published_at"))),
     }
+    updates = story.get("updates")
+    updates = [entry for entry in map(_update, updates if isinstance(updates, list) else []) if entry]
+    # Kept in stored order. A retracted story keeps them privately and shows none.
+    if updates and (editorial or {}).get("status") != "retracted":
+        public["updates"] = updates
     if editorial:  # built only from the operator ledger, never from source or model output
         public["editorial"] = editorial
     return public
@@ -130,17 +152,39 @@ def _source_links(story: dict, *, expanded: bool = False) -> str:
     return f'<div class="story-sources"><span class="sources-heading">Sources</span>{links}</div>'
 
 
+def _newest_updates(story: dict) -> list[dict]:
+    # Stored order is append order, so the later entry comes first on a tie.
+    return sorted(reversed(story.get("updates", [])), key=lambda update: update["at"], reverse=True)
+
+
+def _latest_update(story: dict) -> str:
+    if not story.get("updates"):
+        return ""
+    latest = _newest_updates(story)[0]
+    return f'<p class="latest-update"><strong>Update · {_time(latest["at"])}</strong> {_escape(latest["text"])}</p>'
+
+
+def _update_list(story: dict) -> str:
+    if not story.get("updates"):
+        return ""
+    rows = "".join(
+        f'<li>{_time(update["at"], full=True)}<p>{_escape(update["text"])}</p><span class="update-sources">'
+        + " · ".join(f'<a href="{_escape(source["url"])}" rel="noopener noreferrer">{_escape(source["title"])}</a>' for source in update["sources"])
+        + "</span></li>" for update in _newest_updates(story))
+    return f'<section class="article-updates"><h2>Updates</h2><ul class="update-list">{rows}</ul></section>'
+
+
 def _card(story: dict, base: str) -> str:
-    # Cards show when Onion Flash added the story, which orders the homepage; the
-    # story page keeps the source's own publication date.
+    # Cards show when Onion Flash added the story, which orders the homepage, and
+    # the latest dated update instead of the update date.
     updated = ""
-    if story["updated_at"] > story["added_at"]:
+    if story["updated_at"] > story["added_at"] and not story.get("updates"):
         updated = f'<span class="updated-note">Updated {_time(story["updated_at"])}</span>'
     return f'''<article class="story" id="story-{story['id']}">
       <div class="story-topline">{_badges(story)}<span class="story-date">{_time(story['added_at'])}</span></div>
       <h2><a href="{_escape(_permalink(base, story))}">{_escape(story['title'])}</a></h2>
       {_editorial_notice(story)}
-      <p class="story-summary">{_escape(story['summary'])}</p>
+      <p class="story-summary">{_escape(story['summary'])}</p>{_latest_update(story)}
       {f'<p class="why"><strong>Why it matters</strong> {_escape(story["why_it_matters"])}</p>' if story['why_it_matters'] else ''}
       <div class="story-bottom">{_source_links(story)}{updated}</div>
     </article>'''
@@ -167,7 +211,9 @@ def _editorial_history(story: dict) -> str:
         if previous:
             old_text = ('<details class="superseded-text"><summary>Superseded public text — not current reporting</summary>'
                         f'<h3>{_escape(previous["title"])}</h3><p>{_escape(previous["summary"])}</p>'
-                        + (f'<p><strong>Previous context:</strong> {_escape(previous["why_it_matters"])}</p>' if previous["why_it_matters"] else "") + '</details>')
+                        + (f'<p><strong>Previous context:</strong> {_escape(previous["why_it_matters"])}</p>' if previous["why_it_matters"] else "")
+                        + "".join(f'<p><strong>Previous update · {_time(update["at"])}</strong> {_escape(update["text"])}</p>' for update in previous.get("updates", []))
+                        + '</details>')
         rows.append(f'<li><strong>Revision {int(entry["revision"])}: {labels[entry["action"]]}</strong> · {_time(entry["created_at"], full=True)}<p>{_escape(entry["reason"])}</p>{old_text}</li>')
     total = int(notice["revision"])
     older = f'<p>Showing the latest {len(rows)} of {total} changes. Earlier revision records are retained by the publisher.</p>' if total > len(rows) else ""
@@ -266,7 +312,7 @@ def _rss_item(story: dict, base: str) -> ET.Element:
     ET.SubElement(item, "pubDate").text = email.utils.format_datetime(_date(story["published_at"]), usegmt=True)
     for tag in story["tags"]:
         ET.SubElement(item, "category").text = tag
-    description = _editorial_notice(story) + f'<p>{_escape(story["summary"])}</p>'
+    description = _editorial_notice(story) + f'<p>{_escape(story["summary"])}</p>' + _latest_update(story)
     if story["why_it_matters"]:
         description += f'<p><strong>Why it matters:</strong> {_escape(story["why_it_matters"])}</p>'
     if story.get("editorial", {}).get("status") != "retracted":
@@ -285,6 +331,9 @@ def _json_feed_item(story: dict, base: str) -> dict:
     notice = story.get("editorial")
     if notice:
         content = f'{notice["action"].capitalize()} · {notice["at"]}: {notice["reason"]}\n\n' + content
+    if story.get("updates"):
+        latest = _newest_updates(story)[0]
+        content += f'\n\nUpdate · {latest["at"]}: {latest["text"]}'
     if story["why_it_matters"]:
         content += "\n\nWhy it matters: " + story["why_it_matters"]
     content += "\n\nSources:\n" + "\n".join(source["url"] for source in story["sources"])
@@ -353,9 +402,9 @@ def article_html(site: dict, base: str, story: dict) -> str:
     body = f'''<main id="main" class="page article-page"><a class="back-link" href="{_escape(base)}">← All dispatches</a>
 <article class="full-story">{_badges(story)}<h1>{_escape(story['title'])}</h1>
 {_editorial_notice(story)}
-<div class="article-dates">Published {_time(story['published_at'], full=True)}{f' <span>·</span> Updated {_time(story["updated_at"], full=True)}' if story['updated_at'] != story['published_at'] else ''}</div>
+<div class="article-dates">First published {_time(story['added_at'], full=True)}{f' <span>·</span> Last updated {_time(story["updated_at"], full=True)}' if story['updated_at'] > story['added_at'] else ''}</div>
 <p class="article-summary">{_escape(story['summary'])}</p>
-{f'<section class="article-context"><h2>Why it matters</h2><p>{_escape(story["why_it_matters"])}</p></section>' if story['why_it_matters'] else ''}
+{f'<section class="article-context"><h2>Why it matters</h2><p>{_escape(story["why_it_matters"])}</p></section>' if story['why_it_matters'] else ''}{_update_list(story)}
 <p class="event-state"><span>Event status</span> {"Retracted" if story.get("editorial", {}).get("status") == "retracted" else _label(story['state'])}</p>
 <section class="article-sources"><h2>Read the sources</h2>{_source_links(story, expanded=True)}</section>
 {_editorial_history(story)}

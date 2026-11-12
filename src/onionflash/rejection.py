@@ -1,17 +1,17 @@
 """Private operator controls for failed, dismissed or ignored source items.
 
-The CLI must hold the application run lock for retry/dismiss. These actions do
-not call a model, publish a story, or change editorial correction state.
+The CLI must hold the application run lock for retry, dismiss and approve.
+These actions never call a model or change editorial correction state; only
+approve commits a story, publishing a held candidate exactly as reviewed.
 """
 
 from __future__ import annotations
 
-import json
 import re
 
-from . import editorial
+from . import decisions, editorial, review_gate
 from .schema import PRODUCTS
-from .util import canonical_url, format_utc, now_iso, parse_utc
+from .util import canonical_url, digest, format_utc, now_iso, parse_utc, saved_object
 
 
 MAX_LIMIT = 200
@@ -24,19 +24,9 @@ def _identifier(value: str) -> str:
     return value
 
 
-# The payload is read as bytes, so a value that is not even UTF-8 reaches _object instead of failing the query.
-_COLUMNS = "id,content_hash,source_id,status,attempts,rejections,next_attempt_at,story_id,url,last_error,CAST(payload AS BLOB) AS payload"
-
-
-def _object(value):
-    """A saved JSON object read as bytes, or None when it is damaged, so one bad row cannot hide
-    the others. Decoding is strict UTF-8, as when the pipeline reads the row, not json.loads'
-    lenient bytes mode."""
-    try:
-        value = json.loads(str(value, "utf-8"))
-    except (ValueError, RecursionError):
-        return None
-    return value if isinstance(value, dict) else None
+# The payload is read as bytes, so a value that is not even UTF-8 reaches saved_object instead of failing the query.
+_COLUMNS = ("id,content_hash,source_id,status,attempts,rejections,next_attempt_at,story_id,url,last_error,"
+            "typeof(payload) AS payload_type,CAST(payload AS BLOB) AS payload")
 
 
 def _text(value):
@@ -46,7 +36,7 @@ def _text(value):
 def _summary(row):
     result = {key: row[key] for key in ("id", "content_hash", "source_id", "status", "attempts", "rejections", "next_attempt_at", "story_id")}
     # The CLI escapes printed text, so stored values are shown as the app wrote them.
-    result.update(source_url=row["url"], rejection_reason=row["last_error"], title=_text((_object(row["payload"]) or {}).get("title")))
+    result.update(source_url=row["url"], rejection_reason=row["last_error"], title=_text((saved_object(row["payload"]) or {}).get("title")))
     return result
 
 
@@ -64,42 +54,57 @@ def list_items(store, *, status="rejected", limit=50, after=None) -> dict:
             "next_cursor": shown[-1]["id"] if len(rows) > limit else None}
 
 
-def show_item(store, item_id) -> dict:
+def show_item(store, item_id, config=None) -> dict:
     """Inspect saved source and structured final review, never raw provider output."""
     row = store.db.execute(f"SELECT {_COLUMNS} FROM items WHERE id=?", (_identifier(item_id),)).fetchone()
     if row is None:
         raise ValueError("Source item was not found")
     result = _summary(row)
-    result["saved_item"] = _object(row["payload"])
-    result["final_review"] = _final_review(store, item_id)
+    result["saved_item"] = saved_object(row["payload"])
+    result["final_review"] = _final_review(store, item_id, config=config)
     result["actions"] = [dict(action) for action in store.db.execute(
         """SELECT action_id,action,content_hash,reason,created_at,before_status,before_attempts,before_rejections
             FROM rejection_actions WHERE item_id=? ORDER BY action_id DESC LIMIT ?""", (item_id, HISTORY_LIMIT))]
+    result["decisions"] = decisions.for_item(store.db, item_id)
     return result
 
 
-def _final_review(store, item_id):
+def _final_review(store, item_id, *, config=None):
     """The current job or, once a commit finished the current revision, the decision that commit recorded, if any
-    (stage "finished"): its candidate, source packet, coverage and latest verdict, as saved."""
-    # Only a commit sets these statuses, and it writes the item's newest audit row.
+    (stage "finished"): its hold code, candidate and the draft it started from, source packet, coverage, every
+    review of the chain in brief and the latest verdict in full, as saved."""
+    # Only a reviewed publication or skip commit leaves these item states, and it writes the newest audit row.
     row = store.db.execute("SELECT stage,CAST(record_json AS BLOB) AS record_json FROM review_jobs WHERE item_id=?",
                            (item_id,)).fetchone() or store.db.execute(
         """SELECT 'finished' AS stage,CAST(review_record AS BLOB) AS record_json FROM analyses WHERE source_item_id=?1
-        AND (SELECT status FROM items WHERE id=?1) IN ('ignored','published') ORDER BY rowid DESC LIMIT 1""", (item_id,)).fetchone()
+        AND EXISTS(SELECT 1 FROM items WHERE id=?1 AND (status='published'
+            OR (status='ignored' AND last_error GLOB 'Final review skipped:*'))) ORDER BY rowid DESC LIMIT 1""",
+        (item_id,)).fetchone()
     if row is None or row["record_json"] is None:
         return None
-    record = _object(row["record_json"])
+    record = saved_object(row["record_json"])
+    extra = {"approval": review_gate.approval(config, store, item_id)} if config is not None and row["stage"] == "held" else {}
     try:
         prepared = record.get("prepared", {})
         reviews = record.get("reviews") or record.get("approval", {}).get("reviews", [])
         latest = reviews[-1] if reviews else None
-        return {"stage": row["stage"], "candidate": record.get("candidate", prepared.get("candidate")),
+        candidate = record.get("candidate", prepared.get("candidate"))
+        return {"stage": row["stage"], "hold_code": record.get("hold_code"),
+                "candidate": candidate, "candidate_hash": digest(candidate) if isinstance(candidate, dict) else None,
+                "base_candidate": prepared.get("candidate"),
                 "source_packet": prepared.get("packet"), "coverage": prepared.get("coverage"),
+                "reviews": [{"phase": entry["stage"], **({"issue": entry["issue"]} if "issue" in entry else {}),
+                             "verdict": entry["result"]["verdict"], "candidate_hash": entry["candidate_hash"],
+                             "failed": {name: f"{check['outcome']}: {check['reason']}"
+                                        for name, check in entry["result"]["criteria"].items() if check["outcome"] != "pass"},
+                             "repair": entry["result"]["repair"]} for entry in reviews],
                 "latest_review": latest and {**latest["result"], "phase": latest["stage"],
-                                             "candidate_hash": latest["candidate_hash"]}}
+                                             "candidate_hash": latest["candidate_hash"]},
+                **({"operator_approval": record["operator_approval"]} if "operator_approval" in record else {}),
+                **extra}
     except (TypeError, KeyError, AttributeError):
         # A damaged record must not hide the item and its actions.
-        return {"stage": row["stage"], "error": "Saved review record cannot be read"}
+        return {"stage": row["stage"], "error": "Saved review record cannot be read", **extra}
 
 
 def _request(item_id, expected_hash, reason, observed):
@@ -127,9 +132,9 @@ def _checked(db, item_id, expected_hash, *, statuses):
 
 def _ready(row):
     """Refuse to queue a structurally unreadable/cold item for model analysis."""
-    payload = _object(row["payload"]) or {}
+    payload = saved_object(row["payload"]) or {}
     try:
-        if payload.get("id") != row["id"]:
+        if payload.get("id") != row["id"] or row["payload_type"] != "text":
             raise ValueError
         for key in ("title", "content", "kind"):
             if not isinstance(payload.get(key), str) or (key != "content" and not payload[key]):
@@ -168,6 +173,9 @@ def _act(store, item_id, expected_hash, reason, action, observed):
              before_rejections,before_error,before_next_attempt_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
             (item_id, expected_hash, action, reason, stamp, row["status"], row["attempts"],
              row["rejections"], row["last_error"], row["next_attempt_at"]))
+        code = "operator.dismissed" if action == "dismiss" else (
+            "operator.reconsidered" if row["status"] == "ignored" else "operator.retried")
+        decisions.record(db, item_id, code, stamp, reason=reason, before_status=row["status"], before_error=row["last_error"])
         if action == "retry":
             from .review_gate import reset_review_work
             reset_review_work(store, item_id)
@@ -183,3 +191,15 @@ def retry_item(store, item_id, expected_hash, reason, observed=None) -> dict:
 def dismiss_item(store, item_id, expected_hash, reason, observed=None) -> dict:
     """Stop this revision; a genuinely changed upstream payload may queue again."""
     return _act(store, item_id, expected_hash, reason, "dismiss", observed)
+
+
+def approve_item(config, store, item_id, approval_hash, reason, observed=None) -> dict:
+    """Publish one held candidate whose facts passed fresh verification, without model calls."""
+    _identifier(item_id)
+    if config is None:
+        raise ValueError("Configuration is required to approve a held item")
+    if not isinstance(approval_hash, str) or not editorial._HASH.fullmatch(approval_hash):
+        raise ValueError("Approval hash must be its 64-character lowercase hexadecimal value")
+    reason = editorial._text(reason, "operator reason", 1000)
+    stamp = format_utc(parse_utc(observed or now_iso()))
+    return review_gate.approve(config, store, item_id, approval_hash, reason, stamp)

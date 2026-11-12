@@ -81,7 +81,7 @@ The API key is read only from the `ONIONFLASH_LLM_API_KEY` environment variable.
 | `sources` | Stream ID, display name, public website URL, kind, collection URL, fallback URLs, product, authority, optional interval/page/item overrides |
 
 Collection, HTTP, model, comment, final-review and publication limits (lookback,
-budgets, retries, response sizes, backoff, source-packet bounds, feed length,
+budgets, retries, response sizes, backoff, source-packet bounds,
 render batch) are fixed in code; a file that still sets one loads, with each one
 logged as ignored.
 
@@ -149,6 +149,7 @@ onionflash build --config config.toml --force    # Queue a bounded full-history 
 onionflash status --config config.toml           # Source freshness and queue
 onionflash story show --config config.toml --story STORY_ID
 onionflash rejected list --config config.toml
+onionflash decisions summary --config config.toml # Private decision counts for the last 7 days
 ```
 
 Each command returns a compact JSON result. Invalid configuration or a build
@@ -169,10 +170,12 @@ while taking their upload snapshot.
 ### Editorial controls
 
 `onionflash story show|history|correct|retract|restore|unlock` corrects or
-retracts a published story; `onionflash rejected list|show|retry|dismiss`
-handles failed analyses and ignored items. See
-[editorial commands and recovery](docs/EDITORIAL.md) and
-[rejected-analysis commands](docs/REJECTED_ANALYSES.md).
+retracts a published story; `onionflash rejected list|show|retry|dismiss|approve`
+handles failed analyses and ignored items; `onionflash decisions summary|list`
+reads the private log of every decision. See
+[editorial commands and recovery](docs/EDITORIAL.md),
+[rejected-analysis commands](docs/REJECTED_ANALYSES.md) and
+[the decision log](docs/DECISIONS.md).
 
 ## Reliability and editorial behavior
 
@@ -214,10 +217,11 @@ fresh verification. See
   collected URLs, never model-proposed URLs. Source text is treated as untrusted
   data. Repeated identical model labels are normalized rather than retried;
   invalid labels and unsupported evidence are still rejected.
-- Reports and suspected compromises retain explicit uncertainty. GitLab issue
-  hosting alone does not establish confirmation. Tags
-  are marked `tagged`; merges are marked `merged`. A later tag cannot downgrade an
-  already announced release.
+- Reports and suspected compromises retain explicit uncertainty. Confirmed needs
+  an official announcement (not a tag) or a merged merge request, so GitLab issue
+  hosting alone does not establish confirmation. Tags are marked `tagged`, and a
+  story told only by merge requests is `merged`. A later tag cannot downgrade an
+  already announced release. See the [final checks](docs/FINAL_REVIEW.md#final-checks).
 - Matching release versions/products, identical titled issue bodies, and
   canonical URLs provide conservative duplicate grouping. Semantic similarity
   alone does not combine unrelated incidents. Original publication dates and
@@ -238,8 +242,7 @@ health make incomplete scans visible, but upstream data can change while a scan
 is in progress. Treat this as a news aid, not an incident-detection guarantee.
 
 Published stories never expire: numbered homepage and topic pages
-(`site.page_size` stories each) cover the whole history, while RSS, JSON Feed and
-topic feeds carry the most recently updated stories. Builds render only changed
+(`site.page_size` stories each) cover the whole history. Builds render only changed
 articles, in bounded batches. Keep the SQLite database, raw source content,
 analysis evidence and private publication metadata outside the webroot. See
 [permanent history and recovery](docs/PERMANENT_HISTORY.md).

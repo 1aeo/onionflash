@@ -12,7 +12,7 @@ from onionflash.analyze import AnalysisError, cache_key
 from onionflash.config import DEFAULTS
 from onionflash.store import Store
 from onionflash.util import after
-from test_core import DAMAGE, DATE, analysis, damaged, item
+from test_core import DAMAGE, DATE, analysis, damage_item, item
 
 
 @pytest.fixture
@@ -54,26 +54,21 @@ def actions(store):
     return [dict(row) for row in store.db.execute("SELECT * FROM rejection_actions ORDER BY action_id")]
 
 
-def damage(store, row, kind):
-    store.db.execute("UPDATE items SET payload=CAST(? AS TEXT) WHERE id=?", (damaged(row["payload"], kind), row["id"]))
-    store.db.commit()
-
-
 @pytest.mark.parametrize("kind", DAMAGE)
 def test_a_damaged_saved_item_stays_listable_and_inspectable(store, kind):
     _, row = rejected(store, 0)
     _, intact = rejected(store, 1)
-    damage(store, row, kind)
+    damage_item(store.db, row["id"], kind)
     listed = {entry["id"]: entry["title"] for entry in rejection.list_items(store)["items"]}
     assert listed == {row["id"]: None, intact["id"]: json.loads(intact["payload"])["title"]}
     shown = rejection.show_item(store, row["id"])
     assert shown["saved_item"] is None and shown["content_hash"] == row["content_hash"]
 
 
-@pytest.mark.parametrize("kind", DAMAGE)
+@pytest.mark.parametrize("kind", [*DAMAGE, "blob"])  # the pipeline reads a payload only as text
 def test_a_damaged_saved_item_can_be_dismissed_but_not_retried(store, kind):
     _, row = rejected(store)
-    damage(store, row, kind)
+    damage_item(store.db, row["id"], kind)
     with pytest.raises(ValueError, match="incomplete or unreadable"):
         rejection.retry_item(store, row["id"], row["content_hash"], "try again")
     assert rejection.dismiss_item(store, row["id"], row["content_hash"], "damaged copy")["status"] == "dismissed"
@@ -103,7 +98,7 @@ def test_list_excludes_transient_failures_and_is_bounded_with_stable_pagination(
     entries = first["items"] + second["items"] + third["items"]
     assert [entry["id"] for entry in entries] == sorted(expected)
     assert third["next_cursor"] is None
-    assert all(entry["attempts"] == 3 and entry["rejections"] == 3 for entry in entries)
+    assert all(entry["attempts"] == 3 and entry["rejections"] == 3 and entry["next_attempt_at"] is None for entry in entries)
     assert all(entry["rejection_reason"] == "Model evidence is not present in source" for entry in entries)
     assert all(entry["source_url"].startswith("https://example.org/news/") for entry in entries)
     assert "The operator reported" not in json.dumps(first)
@@ -437,16 +432,22 @@ def test_ignored_reconsideration_is_explicit_audited_and_one_item_only(store):
 
 
 def reviewed_skip(store):
-    """Commit a skip for insufficient new information, which leaves neither its job nor its receipt."""
-    from onionflash import review_gate
+    """Commit a skip for no new information, which leaves neither its job nor its receipt."""
+    from onionflash import review, review_gate
     from test_review_gate import Reviewer, Writer, verdict
+    if not store.stories():
+        store.ingest(item(url="https://example.org/earlier-report", content="An earlier distinct report on the topic."), DATE)
+        first = store.pending(1, DATE)[0]
+        finish_reviewed(store, first, analysis(), cache_key(first, DEFAULTS["llm"]), DATE)
+    covered_id = store.stories()[0]["id"]
+    reply = verdict("skip", criterion="new_information")
+    reply["criteria"]["new_information"]["reason"] = f"Already covered in {covered_id}."
     source = item(url="https://example.org/reconsidered-report")
     store.ingest(source, DATE)
     row = store.pending(1, DATE)[0]
-    reply = verdict("skip", criterion="new_information")
-    reply["criteria"]["new_information"]["outcome"] = "insufficient"
     checker = Reviewer(reply)
     assert review_gate.process_item(DEFAULTS, store, row, Writer(), checker, DATE)["status"] == "ignored"
+    assert review._skip_stands(reply["criteria"], checker.coverages[0])
     assert not store.db.execute("SELECT 1 FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
     assert not store.db.execute("SELECT 1 FROM review_approvals").fetchone()
     return row, checker.calls[0][0]
@@ -461,7 +462,7 @@ def test_a_skip_is_listed_with_its_reason_and_shows_its_decision_and_coverage(st
     assert [(entry["id"], entry["story_id"], entry["rejection_reason"]) for entry in listed] == [
         (row["id"], None, "Final review skipped: new_information")]  # a skip maps the item to no story
     shown = rejection.show_item(store, row["id"])["final_review"]
-    assert shown["stage"] == "finished" and shown["latest_review"]["criteria"]["new_information"]["outcome"] == "insufficient"
+    assert shown["stage"] == "finished" and shown["latest_review"]["criteria"]["new_information"]["outcome"] == "fail"
     assert [entry["id"] for entry in shown["coverage"]["recent"]] == [store.stories()[0]["id"]]
     with store.db:  # earlier releases committed some revisions without a review record
         store.record_analysis(row, analysis(), "commit-without-a-record", DATE)

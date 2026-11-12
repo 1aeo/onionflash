@@ -5,13 +5,14 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 
 from .transport import DeadlineReached, FetchError, HttpClient
 from .util import digest, normalize_evidence as _plain
 from .comments import analysis_context
 from .schema import CATEGORIES, PRIORITIES, CONFIDENCES, STATES, PRODUCTS
 
-PROMPT_VERSION = "onionflash-14"
+PROMPT_VERSION = "onionflash-15"
 MIN_EVIDENCE_CHARS = 8
 MAX_EVIDENCE_CHOICES = 128
 SCHEMA = {
@@ -87,6 +88,10 @@ A fix present only in a proposed patch series does not establish a merged or
 generally available fix; preserve that limited scope.
 Use developing for observations, discussions and unresolved reports. Reserve merged
 for an explicitly completed code merge, not a measurement report mentioning software.
+A mailing-list proposal, [RFC] or Internet-Draft is its author's proposal for
+comment: attribute it to a proposal posted to the list, name an author or role only
+when the source text states one, keep confidence reported and state developing, and
+do not call it adopted, accepted or a Tor Project decision unless the source says so.
 
 Write a factual headline and 1-3 concise sentences. Brief sources
 can have brief summaries; never add filler to reach a word count. Preserve who did
@@ -96,17 +101,27 @@ BadExit, missing votes, overload, unresponsive metrics and inactive counters do 
 establish malicious activity, a particular cause or a defense bypass. Distinguish
 stream/request counts from bandwidth, and a measured sample from all affected relays.
 Preserve the source's inspection date for claims about versions or the main branch.
-Do not invent versions, CVEs, identities, consequences, fixes or operator guidance.
+Do not invent versions, CVEs, identities, counts, causal explanations, consequences,
+fixes or operator guidance. A count the source states may be restated.
 A developer changing source code is not an operator changing configuration.
 
-Set why_it_matters to an empty string. Do not write a separate impact paragraph.
-An explicitly stated consequence or requested action may appear in the summary,
-with its actual audience, scope and prerequisites preserved.
+why_it_matters is optional and conservative. Fill it only by closely
+paraphrasing one sentence of the supplied title, content or a comment body that
+itself states this event's impact or an action it asks its readers to take, such
+as an announcement saying "we encourage all relay operators to upgrade" or a
+report saying a malformed file "causes the daemon to exit at startup". Attribute
+that sentence to its source ("The announcement asks ...", "The report says ...")
+and keep its audience, hedges and scope. Add nothing it does not say: no severity,
+urgency, cause, number, version or benefit, no second sentence, and no impact
+inferred from a description of what changed. If no single source sentence states
+an impact or a requested action, set why_it_matters to an empty string. Empty is
+the expected result for most merges, tags, checklists, questions and discussions.
 Do not infer generic benefits to stability, reliability, security or privacy from
 the existence of a fix, or urgency from an editorial label. No caveats, filler, inferred
 privacy impacts or extra advice. Source-host location alone does not establish
-confirmation; use reported for issue/community claims and reserve confirmed for
-clear authoritative announcements. Confidence and editorial priority are separate.
+confirmation. Reserve confirmed for an official Tor Project announcement or a merged
+merge request's own change; use reported for issues, comments, maintainer statements,
+list posts and community claims. Confidence and editorial priority are separate.
 
 Return 1-3 literal supporting excerpts from the supplied title, content or a comment
 body in evidence. Each must have at least {MIN_EVIDENCE_CHARS} characters after whitespace normalization.
@@ -118,9 +133,25 @@ not approval to publish. Return only the requested JSON object.
 
 
 class AnalysisError(Exception):
-    def __init__(self, message: str, retryable: bool = False):
+    code = "writer.invalid_output"  # logged as failed.<code> when it is the item's third failure
+
+    def __init__(self, message: str, retryable: bool = False, *, code: str | None = None):
         super().__init__(message)
         self.retryable = retryable
+        if code is not None:
+            self.code = code
+
+
+def label_limits(sources: list[dict]) -> dict:
+    """The confidence and state labels a story told by these sources may carry: confirmed needs
+    an official source that is not a tag, or a merged merge request, and a story told only by
+    merge requests is merged."""
+    confirmable = any((source.get("authority") == "official" and source.get("kind") != "tag")
+                      or (source.get("kind") == "gitlab_mr" and source.get("upstream_state") == "merged")
+                      for source in sources)
+    merges = bool(sources) and all(source.get("kind") == "gitlab_mr" for source in sources)
+    return {"confidence": [value for value in CONFIDENCES if confirmable or value != "confirmed"],
+            "state": ["merged"] if merges else list(STATES)}
 
 
 def cache_key(row: dict, llm: dict) -> str:
@@ -128,7 +159,7 @@ def cache_key(row: dict, llm: dict) -> str:
     return digest([row["content_hash"], llm["model"], PROMPT_VERSION])
 
 
-def _json_object(text: str) -> dict:
+def _json_object(text: str, code: str = "writer.invalid_json") -> dict:
     def unique(pairs):
         result = {}
         for key, value in pairs:
@@ -143,10 +174,25 @@ def _json_object(text: str) -> dict:
         # model response reaches the queue.
         json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8")
     except (ValueError, TypeError, RecursionError) as exc:
-        raise AnalysisError("Model returned invalid JSON") from exc
+        raise AnalysisError("Model returned invalid JSON", code=code) from exc
     if not isinstance(result, dict):
-        raise AnalysisError("Model response is not an object")
+        raise AnalysisError("Model response is not an object", code=code)
     return result
+
+
+# Spelled-out numbers count as digits, except "one", which is mostly a pronoun.
+_NUMBER_WORDS = {word: str(value) for value, word in
+                 enumerate("two three four five six seven eight nine ten eleven twelve".split(), 2)}
+# A number or version keeps its letter suffixes, so 0.4.9 does not match 0.4.9.16, nor 15.0 match
+# 15.0a3. No repetition can consume a separator, so matching takes linear time.
+_NUMBER = re.compile(r"[0-9][0-9a-z]*(?:[.,][0-9][0-9a-z]*)*|\b(?:" + "|".join(_NUMBER_WORDS) + r")\b")
+
+
+def _numbers(text: str) -> set[str]:
+    """The numbers and versions in text; "three", "3" and "03" are one number. Leading zeros
+    are stripped as text, because int() refuses the longest digit runs a source can hold."""
+    tokens = (_NUMBER_WORDS.get(token, token) for token in _NUMBER.findall(_plain(text)))
+    return {(token.lstrip("0") or "0") if token.isdigit() else token for token in tokens}
 
 
 def validate_analysis(result: dict, item: dict) -> dict:
@@ -187,11 +233,17 @@ def validate_analysis(result: dict, item: dict) -> dict:
     for index, quote in enumerate(evidence, 1):
         normalized = _plain(quote)
         if len(normalized) < MIN_EVIDENCE_CHARS:
-            raise AnalysisError(f"Model evidence quote {index} is shorter than {MIN_EVIDENCE_CHARS} normalized characters")
+            raise AnalysisError(f"Model evidence quote {index} is shorter than {MIN_EVIDENCE_CHARS} normalized characters",
+                                code="writer.evidence_too_short")
         if normalized not in context:
-            raise AnalysisError(f"Model evidence quote {index} is not an exact excerpt of supplied title or content")
+            raise AnalysisError(f"Model evidence quote {index} is not an exact excerpt of supplied title or content",
+                                code="writer.evidence_not_exact")
     if not all(result[k] for k in ("title", "summary")) or not evidence:
         raise AnalysisError("Published story needs text and source evidence")
+    # The impact sentence may restate only numbers and versions from the title, content or comment
+    # bodies the writer saw. It is cleared, not refused: a retry would return the same reply.
+    if result["why_it_matters"] and _numbers(result["why_it_matters"]) - _numbers(context):
+        result["why_it_matters"] = ""
     return result
 
 
@@ -199,7 +251,7 @@ def tag_notice(item: dict) -> dict:
     """Report only the observed tag entry, without inferring a release."""
     name = item["title"].strip()
     if not name or len(name) > 500:
-        raise AnalysisError("Invalid tag name")
+        raise AnalysisError("Invalid tag name", code="app.invalid_tag_name")
     product = {
         "tor": "Tor",
         "arti": "Arti",
@@ -262,7 +314,7 @@ class CompletionClient:
             content = json.dumps(payload, ensure_ascii=False, allow_nan=False)
             content.encode("utf-8")
         except (ValueError, TypeError, RecursionError) as exc:
-            raise AnalysisError("Model input is not valid UTF-8 JSON") from exc
+            raise AnalysisError("Model input is not valid UTF-8 JSON", code=self.stage + ".invalid_input") from exc
         request = {
             "model": self.llm["model"],
             "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": content}],
@@ -305,17 +357,21 @@ class CompletionClient:
         except (FetchError, KeyError, IndexError, TypeError):
             raise AnalysisError("LLM returned an unexpected response", retryable=True) from None
         if finished != "stop":
-            raise AnalysisError("Model completion was truncated or refused")
+            raise AnalysisError("Model completion was truncated or refused", code=self.stage + ".truncated")
         if not isinstance(content, str):
             raise AnalysisError("Model returned no textual completion", retryable=True)
-        return _json_object(content)
+        return _json_object(content, self.stage + ".invalid_json")
 
 
 class Analyzer(CompletionClient):
     """Produce one structurally valid draft; final publication review is separate."""
 
+    stage = "writer"  # names the stage in the codes of failed requests
+    clears = 0  # 1 when validation cleared the latest draft's impact sentence, for the decision log
+
     def analyze(self, item: dict) -> dict:
         """Return a bounded draft with literal evidence, never a publication decision."""
+        self.clears = 0
         if item["kind"] == "tag":
             return tag_notice(item)
         bounded = {key: item.get(key) for key in (
@@ -325,15 +381,18 @@ class Analyzer(CompletionClient):
             bounded["public_comments"] = notes
         # Evidence may quote the description window or any note body the writer saw.
         source = {**item, "content": "\n".join([bounded["content"], *(note["body"] for note in notes)])}
-        result = validate_analysis(self.complete(SYSTEM_PROMPT, bounded, _writer_schema(bounded), "onionflash_news"),
-                                   source)
-        if result["why_it_matters"]:
-            raise AnalysisError("Writer must leave why_it_matters empty")
+        schema = _writer_schema(bounded)
+        reply = self.complete(SYSTEM_PROMPT, bounded, schema, "onionflash_news")
+        stated = reply.get("why_it_matters")
+        result = validate_analysis(reply, source)
+        if any(result[key] not in schema["properties"][key]["enum"] for key in ("confidence", "state")):
+            raise AnalysisError("Writer labels exceed this source's limits")
+        self.clears = int(result["why_it_matters"] != stated.strip())
         return result
 
 
 def _writer_schema(bounded: dict) -> dict:
-    """Constrain quote copying to literal spans of the exact supplied context."""
+    """Constrain quote copying to literal spans of the exact supplied context, and labels to its limits."""
     maximum = SCHEMA["properties"]["evidence"]["items"]["maxLength"]
     excerpts = []
     notes = [note["body"] for note in bounded.get("public_comments", [])]
@@ -362,7 +421,7 @@ def _writer_schema(bounded: dict) -> dict:
                     excerpts.append(excerpt)
     excerpts = list(dict.fromkeys(excerpts))
     if not excerpts:
-        raise AnalysisError("Source has no qualifying literal evidence excerpt")
+        raise AnalysisError("Source has no qualifying literal evidence excerpt", code="writer.no_literal_evidence")
     if len(excerpts) > MAX_EVIDENCE_CHOICES:
         # Bound grammar size while retaining options throughout the input,
         # including the first title and the last supplied comment.
@@ -370,8 +429,9 @@ def _writer_schema(bounded: dict) -> dict:
                     for index in range(MAX_EVIDENCE_CHOICES)]
     schema = copy.deepcopy(SCHEMA)
     schema["properties"]["publish"]["enum"] = [True]
-    schema["properties"]["why_it_matters"]["enum"] = [""]
     schema["properties"]["evidence"]["items"]["enum"] = excerpts
     schema["properties"]["title"]["minLength"] = schema["properties"]["summary"]["minLength"] = 1
     schema["properties"]["evidence"]["minItems"] = 1
+    for key, allowed in label_limits([bounded]).items():
+        schema["properties"][key]["enum"] = allowed
     return schema

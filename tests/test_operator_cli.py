@@ -1,6 +1,7 @@
 from approval_helpers import finish_reviewed
 import json
 from pathlib import Path
+import pytest
 
 from onionflash import cli
 from onionflash.comments import _compose
@@ -117,3 +118,74 @@ def test_comments_do_not_split_identical_issue_grouping():
     second = _compose({**original, "url": "https://example.org/other-project/1"}, [{**note, "body": "Other discussion"}],
                       DATE, source_key="k")
     assert item_cluster(first) == item_cluster(second) == item_cluster(original)
+
+
+def test_rejected_cli_approve_requires_flags_honors_lock_and_publishes(tmp_path, capsys):
+    from approval_helpers import verdict
+    from onionflash import review_gate
+    from test_review_gate import LATER, Reviewer, Writer
+
+    config, cfg, _ = setup_story(tmp_path)
+    with Store(cfg["storage"]["database"]) as store:
+        held_src = item(url="https://example.org/held-cli", content="Held CLI news development text. " * 4)
+        store.ingest(held_src, DATE)
+        row = store.pending(1, LATER)[0]
+        review_gate.process_item(
+            cfg,
+            store,
+            row,
+            Writer(analysis(title="CLI approved story", evidence=["Held CLI news development text."])),
+            Reviewer(verdict(), verdict("hold", criterion="news_value")),
+            LATER,
+        )
+
+    shown = invoke(capsys, "rejected", "show", "--config", config, "--item", row["id"])
+    approval = shown["final_review"]["approval"]
+    assert approval["eligible"] is True and approval["hash"]
+
+    # Missing required flags exit 2.
+    for missing in (
+        ("rejected", "approve", "--config", config, "--item", row["id"], "--reason", "Missing hash"),
+        ("rejected", "approve", "--config", config, "--item", row["id"], "--approval-hash", approval["hash"]),
+    ):
+        with pytest.raises(SystemExit) as caught:
+            cli.main(list(map(str, missing)))
+        assert caught.value.code == 2
+        capsys.readouterr()
+
+    # Busy run lock returns 75 without changing state.
+    with cli.run_lock(cfg["storage"]["database"]) as locked:
+        assert locked
+        busy = invoke(
+            capsys,
+            "rejected",
+            "approve",
+            "--config",
+            config,
+            "--item",
+            row["id"],
+            "--approval-hash",
+            approval["hash"],
+            "--reason",
+            "Busy check",
+            expected=75,
+        )
+    assert busy["status"] == "already-running"
+
+    approved = invoke(
+        capsys,
+        "rejected",
+        "approve",
+        "--config",
+        config,
+        "--item",
+        row["id"],
+        "--approval-hash",
+        approval["hash"],
+        "--reason",
+        "Approved via CLI",
+    )
+    assert approved["status"] == "published" and approved["publication_pending"] is True
+    invoke(capsys, "build", "--config", config)
+    article = Path(cfg["storage"]["output_dir"]) / "news" / approved["story_id"] / "story.json"
+    assert json.loads(article.read_text())["title"] == "CLI approved story"

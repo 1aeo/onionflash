@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
-from approval_helpers import ApprovingReviewer
+from approval_helpers import ApprovingReviewer, verdict
 import copy
 import json
 
 import pytest
 
+from onionflash import decisions
 from onionflash.analyze import (AnalysisError, Analyzer, MAX_EVIDENCE_CHOICES, MIN_EVIDENCE_CHARS, SCHEMA, _writer_schema,
                                 validate_analysis)
 from onionflash.comments import INPUT_CHARS
 from onionflash.config import DEFAULTS
+from onionflash.schema import CONFIDENCES, STATES
 from onionflash.store import Store
 from onionflash.transport import FetchError, Response
 from test_core import DATE, analysis, item
+from test_review_gate import Reviewer, context, pending, run  # noqa: F401 (fixture)
 
 
 def completion(result: dict, finish_reason: str = "stop") -> Response:
@@ -68,17 +71,138 @@ def test_writer_cannot_silently_skip_a_source_before_editorial_review(monkeypatc
 
 
 @pytest.mark.parametrize("use_fallback", [False, True])
-def test_writer_rejects_separate_impact_text_even_when_endpoint_ignores_schema(monkeypatch, use_fallback):
-    """Reject impact text from either endpoint without another validation retry."""
+def test_writer_keeps_a_source_stated_impact_sentence(monkeypatch, use_fallback):
+    """An impact sentence from either endpoint stays in the draft, with no other request."""
     responses = [FetchError("network request failed", retryable=True)] if use_fallback else []
-    responses.append(completion(analysis(why_it_matters="Operators must update to prevent consensus generation issues.")))
+    sentence = "The report says the keys must no longer be trusted."
+    responses.append(completion(analysis(why_it_matters=f" {sentence} ")))  # stripped spaces are not a clear
     llm = analyzer(monkeypatch, *responses, fallbacks=["https://fallback.example/v1"])
-    with pytest.raises(AnalysisError, match="leave why_it_matters empty") as caught:
-        llm.analyze(item())
-    assert not caught.value.retryable
+    assert llm.analyze(item())["why_it_matters"] == sentence and llm.clears == 0
     assert len(llm.client.requests) == llm.calls == 1 + use_fallback  # the run report counts each endpoint request
-    assert all(request[1]["response_format"]["json_schema"]["schema"]["properties"]["why_it_matters"]["enum"] == [""]
+    assert all("enum" not in request[1]["response_format"]["json_schema"]["schema"]["properties"]["why_it_matters"]
                for request in llm.client.requests)
+
+
+NUMBERED = item(title="Tor 0.4.8.20 and 0.4.9.16 are released",
+                content="Upgrade to 0.4.9.16 now. Tor Browser 15.0a3 is affected. 3 authorities voted. "
+                        "Release 2026-11-09. " + "7" * 5000)  # int() refuses a digit run this long
+
+
+@pytest.mark.parametrize("sentence,kept", [
+    ("The announcement asks operators to upgrade to 0.4.9.16.", True),
+    ("The announcement says 0.4.8.20 is released.", True),  # only in the title
+    ("The announcement says three authorities voted.", True),
+    ("The announcement says it ships on Nov 9.", True),  # 09 in the source
+    ("The announcement often matters to one canine.", True),  # number words count only as whole words, excluding "one"
+    ("The announcement asks operators to upgrade.", True),
+    ("The announcement asks operators to upgrade to 0.4.8.15.", False),
+    ("The announcement asks operators to upgrade to 0.4.9.", False),  # only a prefix of 0.4.9.16
+    ("The announcement says Tor Browser 15.0 is affected.", False),  # the source says 15.0a3
+    ("The announcement says four authorities voted.", False),
+])
+def test_impact_sentence_numbers_and_versions_must_appear_in_the_source(sentence, kept):
+    draft = analysis(why_it_matters=sentence, evidence=["Upgrade to 0.4.9.16 now."])
+    assert validate_analysis(copy.deepcopy(draft), NUMBERED) == {**draft, "why_it_matters": sentence if kept else ""}
+
+
+def test_impact_sentence_may_cite_numbers_from_a_comment_the_writer_saw(monkeypatch):
+    note = {"id": "gid://gitlab/DiscussionNote/1", "url": "https://example.org/issue#note_1",
+            "title": "Public comment by @operator", "author": "operator", "created_at": DATE,
+            "body": "Relays running 0.4.8.17 must upgrade."}
+    kept, dated = "A comment says relays running 0.4.8.17 must upgrade.", "The report was filed in 2026."
+    llm = analyzer(monkeypatch, completion(analysis(why_it_matters=kept)), completion(analysis(why_it_matters=dated)))
+    assert llm.analyze(item(public_comments=[note]))["why_it_matters"] == kept and llm.clears == 0
+    # Its year appears only in the item's and the comment's dates, which are metadata.
+    assert llm.analyze(item(public_comments=[note]))["why_it_matters"] == "" and llm.clears == 1
+    assert llm.analyze(item(kind="tag", title="tor-0.4.9.16", content=""))["why_it_matters"] == "" and llm.clears == 0
+    assert len(llm.client.requests) == 2  # one request per draft, and none for the tag
+
+
+def test_a_cleared_impact_sentence_is_counted_with_its_decision(context, monkeypatch):
+    cfg, store = context
+    for url, sentence in (("https://example.org/news/1", "The report says relays running 0.4.8.17 must upgrade."),
+                          ("https://example.org/news/2", "The report says the keys must no longer be trusted.")):
+        writer = analyzer(monkeypatch, completion(analysis(why_it_matters=sentence)))
+        assert run(cfg, store, pending(store, item(url=url)), writer, Reviewer(verdict()))["status"] == "published"
+    details = [json.loads(row[0]) for row in store.db.execute("SELECT detail_json FROM decision_log ORDER BY id")]
+    assert [detail.get("writer_clears") for detail in details] == [1, None]
+    assert decisions.summary(store.db, DATE)["writer_clears"] == 1
+
+
+def test_writer_clears_on_repeat_hold_operator_retry_and_operator_approve(context, monkeypatch):
+    from onionflash import rejection
+
+    cfg, store = context
+    cleared = "The report says relays running 0.4.8.17 must upgrade."
+    # 1. Held news dispute -> repeat hold keeps writer_clears -> operator retry resets it -> post-retry publish has None.
+    writer = analyzer(monkeypatch, completion(analysis(why_it_matters=cleared)))
+    row = pending(store, item(url="https://example.org/news/retry-clear"))
+    assert run(cfg, store, row, writer, Reviewer(verdict(), verdict("hold", criterion="news_value")))["status"] == "held"
+    with store.db:
+        store.db.execute("UPDATE items SET status='pending' WHERE id=?", (row["id"],))
+    row = store.pending(1, DATE)[0]
+    assert run(cfg, store, row, writer, Reviewer())["status"] == "held"  # repeat_hold without reset_review_work
+    rejection.retry_item(store, row["id"], row["content_hash"], "Retry kept draft", observed=DATE)
+    row = store.pending(1, DATE)[0]
+    assert run(cfg, store, row, writer, Reviewer(verdict()))["status"] == "published"
+
+    # 2. Held news dispute -> operator approve logs operator.approved without repeating writer_clears.
+    writer2 = analyzer(monkeypatch, completion(analysis(why_it_matters=cleared, evidence=["Second distinct report body."])))
+    row2 = pending(store, item(url="https://example.org/news/approve-clear", content="Second distinct report body. " * 5))
+    assert run(cfg, store, row2, writer2, Reviewer(verdict(), verdict("hold", criterion="news_value")))["status"] == "held"
+    shown = rejection.show_item(store, row2["id"], config=cfg)
+    rejection.approve_item(cfg, store, row2["id"], shown["final_review"]["approval"]["hash"], "Worth publishing", observed=DATE)
+
+    # 3. Skipped cleared draft keeps writer_clears; failure row does not.
+    writer3 = analyzer(monkeypatch, completion(analysis(why_it_matters=cleared, evidence=["Third distinct report body."])))
+    row3 = pending(store, item(url="https://example.org/news/skip-clear", content="Third distinct report body. " * 5))
+    assert run(cfg, store, row3, writer3, Reviewer(verdict("skip", criterion="news_value")))["status"] == "ignored"
+    writer4 = analyzer(monkeypatch, completion(analysis(why_it_matters=cleared, evidence=["Fourth distinct report body."])))
+    row4 = pending(store, item(url="https://example.org/news/fail-clear", content="Fourth distinct report body. " * 5))
+    store.reject(row4["id"], "Invalid review reply", "failed.review.invalid_reply", DATE)
+
+    rows = [
+        (code, json.loads(detail).get("writer_clears"))
+        for code, detail in store.db.execute("SELECT code, detail_json FROM decision_log ORDER BY id")
+    ]
+    assert rows == [
+        ("held.verification.disagreed_news", 1),
+        ("held.gate.repeat_hold", 1),
+        ("operator.retried", None),
+        ("published.new", None),
+        ("held.verification.disagreed_news", 1),
+        ("operator.approved", None),
+        ("skipped.review.news_value", 1),
+        ("failed.review.invalid_reply", None),
+    ]
+    assert decisions.summary(store.db, DATE)["writer_clears"] == 4
+
+
+@pytest.mark.parametrize("source,confidence,state", [
+    (item(), ["reported", "suspected", "observed-anomaly"], STATES),
+    (item(kind="gitlab_mr", upstream_state="merged"), CONFIDENCES, ["merged"]),
+    (item(kind="feed", authority="official"), CONFIDENCES, STATES)], ids=["issue", "merged-request", "official-feed"])
+def test_writer_schema_limits_labels_by_source(monkeypatch, source, confidence, state):
+    llm = analyzer(monkeypatch, completion(analysis(why_it_matters="", state=state[0])))
+    llm.analyze(source)
+    fields = llm.client.requests[0][1]["response_format"]["json_schema"]["schema"]["properties"]
+    assert (fields["confidence"]["enum"], fields["state"]["enum"]) == (confidence, state)
+    assert SCHEMA["properties"]["confidence"]["enum"] == CONFIDENCES  # review repairs copy the full rules
+
+
+@pytest.mark.parametrize("use_fallback", [False, True])
+@pytest.mark.parametrize("source,labels", [(item(), {"confidence": "confirmed"}),
+                                           (item(kind="gitlab_mr", upstream_state="merged"), {"state": "released"})],
+                         ids=["confirmed-issue", "released-merge-request"])
+def test_writer_rejects_labels_outside_the_source_limits_even_when_endpoint_ignores_schema(monkeypatch, use_fallback,
+                                                                                         source, labels):
+    responses = [FetchError("network request failed", retryable=True)] if use_fallback else []
+    responses.append(completion(analysis(why_it_matters="", **labels)))
+    llm = analyzer(monkeypatch, *responses, fallbacks=["https://fallback.example/v1"])
+    with pytest.raises(AnalysisError, match="labels exceed") as caught:
+        llm.analyze(source)
+    assert not caught.value.retryable
+    assert len(llm.client.requests) == llm.calls == 1 + use_fallback
 
 
 @pytest.mark.parametrize("sent", [0, 1])
@@ -174,7 +298,7 @@ def test_writer_request_requires_a_draft_and_the_existing_evidence_length_floor(
     request = llm.client.requests[0][1]
     fields = request["response_format"]["json_schema"]["schema"]["properties"]
     assert fields["publish"]["enum"] == [True]
-    assert fields["why_it_matters"]["enum"] == [""]
+    assert "enum" not in fields["why_it_matters"]
     assert fields["evidence"]["items"]["minLength"] == MIN_EVIDENCE_CHARS
     assert fields["title"]["minLength"] == fields["summary"]["minLength"] == fields["evidence"]["minItems"] == 1
     assert "minLength" not in SCHEMA["properties"]["title"] | SCHEMA["properties"]["summary"]  # review repairs copy these rules
@@ -296,7 +420,7 @@ def test_one_failing_item_does_not_stop_the_run_but_two_endpoint_failures_do(tmp
 
 def test_writer_produces_one_draft_without_premerge_grounding(monkeypatch):
     claim = "Operators must update their configurations to exclude the node."
-    draft = analysis(summary=claim, why_it_matters="", confidence="confirmed", state="released")
+    draft = analysis(summary=claim, why_it_matters="", confidence="reported", state="fixed")
     llm = analyzer(monkeypatch, completion(draft))
     assert llm.analyze(item()) == draft
     assert len(llm.client.requests) == 1
