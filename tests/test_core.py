@@ -69,20 +69,21 @@ def analysis(**kw):
     }
 
 
-DAMAGE = ["invalid-json", "non-object", "invalid-utf8", "deep", "nested", "surrogate", "escaped-surrogate", "bom", "utf-16"]
+DAMAGE = ["invalid-json", "non-object", "invalid-utf8", "deep", "nested", "surrogate", "escaped-surrogate", "nan", "bom", "utf-16"]
 
 
 def damaged(document, kind):
     """Bytes the app never saves for a JSON document: broken JSON, a non-object, bytes that are not
     UTF-8, nesting past the parser's limit or past MAX_SAVED_DEPTH, or the document with a lone
-    surrogate added (as UTF-8 bytes or as a JSON escape), a BOM prepended, or encoded as UTF-16."""
+    surrogate added (as UTF-8 bytes or as a JSON escape), a non-finite number, a BOM prepended, or
+    encoded as UTF-16."""
     if kind == "surrogate":
         return json.dumps({**json.loads(document), "\ud800": ""}, ensure_ascii=False).encode("utf-8", "surrogatepass")
     if kind == "escaped-surrogate":
         return json.dumps({**json.loads(document), "\ud800": ""}).encode()
     return {"invalid-json": b"{", "non-object": b"[1]", "invalid-utf8": b'{"\xff"', "deep": b"[" * 100000,
             "nested": b'{"x":' + b"[" * MAX_SAVED_DEPTH + b"]" * MAX_SAVED_DEPTH + b"}",
-            "bom": b"\xef\xbb\xbf" + document.encode(), "utf-16": document.encode("utf-16")}[kind]
+            "nan": b'{"x":NaN}', "bom": b"\xef\xbb\xbf" + document.encode(), "utf-16": document.encode("utf-16")}[kind]
 
 
 def damage_item(db, item_id, kind):
@@ -1135,9 +1136,11 @@ def test_a_saved_object_nests_at_most_the_cap_and_holds_no_lone_surrogate():
     """App records nest about 7 levels; deeper reads as damaged, so every operator view can be printed."""
     within = b'{"x":' + b"[" * (MAX_SAVED_DEPTH - 1) + b"]" * (MAX_SAVED_DEPTH - 1) + b"}"
     assert saved_object(within) is not None and saved_object(damaged("{}", "nested")) is None
-    # An escaped surrogate pair is one character; an escaped lone surrogate reads as damaged, and NULL as missing.
+    # An escaped surrogate pair is one character; non-finite numbers, an escaped lone surrogate, and NULL read as damaged/missing.
     assert saved_object(b'{"x":"\\ud83d\\ude00"}') == {"x": "\U0001f600"}
     assert saved_object(b'{"x":"\\ud800"}') is None and saved_object(None) is None
+    for non_finite in (b'{"x":NaN}', b'{"x":Infinity}', b'{"x":-Infinity}'):
+        assert saved_object(non_finite) is None
 
 
 @pytest.mark.parametrize("kind", [*DAMAGE, "blob", "undated"])

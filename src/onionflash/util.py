@@ -59,14 +59,18 @@ def timestamp(value: str | None, fallback: str | None = None) -> str:
 MAX_SAVED_DEPTH = 64  # the app's own records nest a few levels; deeper is damage the CLI could not print
 
 
+def _reject_constant(_: str):
+    raise ValueError("Non-finite JSON constant")
+
+
 def saved_object(value):
     """A saved JSON object read as bytes, or None when it is NULL or damaged, so one bad row cannot
     stop a run or hide the others. Decoding is strict UTF-8, as when the pipeline reads the row, not
-    json.loads' lenient bytes mode, and an escaped lone surrogate, which no saved text can hold and
-    the writer refuses, is damage too."""
+    json.loads' lenient bytes mode, and non-finite numbers or an escaped lone surrogate, which no
+    saved text can hold and the writer refuses, are damage too."""
     try:
-        value = json.loads(str(value, "utf-8"))
-        json.dumps(value, ensure_ascii=False).encode()
+        value = json.loads(str(value, "utf-8"), parse_constant=_reject_constant)
+        json.dumps(value, ensure_ascii=False, allow_nan=False).encode()
     except (TypeError, ValueError, RecursionError):
         return None
     return value if isinstance(value, dict) and _within(value, MAX_SAVED_DEPTH) else None

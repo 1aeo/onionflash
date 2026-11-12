@@ -175,6 +175,8 @@ def merge_cached_comments(store, item, source, observed=None):
     if observed and (not current or item["updated_at"] > old["comments_checked_at"]):
         with store.db:
             _request(store.db, row["id"], key, observed)
+        if not current:
+            store._comment_requests[row["id"]] = observed
     if not current:
         return item
     return _compose(item, old["public_comments"], old["comments_checked_at"], source_key=key)

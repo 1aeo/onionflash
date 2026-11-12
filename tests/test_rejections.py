@@ -433,13 +433,21 @@ def test_ignored_reconsideration_is_explicit_audited_and_one_item_only(store):
 
 def reviewed_skip(store):
     """Commit a skip for no new information, which leaves neither its job nor its receipt."""
-    from onionflash import review_gate
+    from onionflash import review, review_gate
     from test_review_gate import Reviewer, Writer, verdict
+    if not store.stories():
+        store.ingest(item(url="https://example.org/earlier-report", content="An earlier distinct report on the topic."), DATE)
+        first = store.pending(1, DATE)[0]
+        finish_reviewed(store, first, analysis(), cache_key(first, DEFAULTS["llm"]), DATE)
+    covered_id = store.stories()[0]["id"]
+    reply = verdict("skip", criterion="new_information")
+    reply["criteria"]["new_information"]["reason"] = f"Already covered in {covered_id}."
     source = item(url="https://example.org/reconsidered-report")
     store.ingest(source, DATE)
     row = store.pending(1, DATE)[0]
-    checker = Reviewer(verdict("skip", criterion="new_information"))
+    checker = Reviewer(reply)
     assert review_gate.process_item(DEFAULTS, store, row, Writer(), checker, DATE)["status"] == "ignored"
+    assert review._skip_stands(reply["criteria"], checker.coverages[0])
     assert not store.db.execute("SELECT 1 FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
     assert not store.db.execute("SELECT 1 FROM review_approvals").fetchone()
     return row, checker.calls[0][0]

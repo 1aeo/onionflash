@@ -11,7 +11,7 @@ from approval_helpers import approve, verdict
 from onionflash import decisions, editorial, rejection, review, review_gate
 from onionflash.analyze import AnalysisError, cache_key, tag_notice
 from onionflash.store import Store
-from onionflash.util import digest
+from onionflash.util import digest, item_cluster
 from test_core import DAMAGE, DATE, analysis, config, damaged, item
 
 
@@ -243,6 +243,14 @@ def test_reviews_that_disagree_on_news_value_hold(context, replies, status):
 
 
 OFFICIAL = {"authority": "official", "kind": "feed"}
+COVERED = {"url": "https://example.org/covered-story", "content": "Earlier distinct report."}
+COVERED_ID = digest(item_cluster(item(**COVERED)))[:24]
+
+
+def duplicate_skip(*extra_criteria):
+    reply = failing("skip", "new_information", *extra_criteria)
+    reply["criteria"]["new_information"]["reason"] = f"Already covered in {COVERED_ID}."
+    return reply
 
 
 @pytest.mark.parametrize("source,replies,status,code", [
@@ -254,14 +262,14 @@ OFFICIAL = {"authority": "official", "kind": "feed"}
      "held", "held.verification.official_not_news"),
     (OFFICIAL, [verdict("revise", criterion="news_value"), failing("revise", "news_value", "operational_advice")],
      "held", "held.verification.unusable_repair"),
-    (OFFICIAL, [verdict("skip", criterion="new_information")], "ignored", "skipped.review.new_information"),
-    (OFFICIAL, [failing("skip", "news_value", "new_information")], "ignored", "skipped.review.new_information_and_news_value"),
+    (OFFICIAL, [duplicate_skip()], "ignored", "skipped.review.new_information"),
+    (OFFICIAL, [duplicate_skip("news_value")], "ignored", "skipped.review.new_information_and_news_value"),
     (OFFICIAL, [{**verdict("skip", criterion="news_value"),
                  "criteria": {**verdict("skip", criterion="news_value")["criteria"],
                               "new_information": {"reason": "Coverage is truncated.", "source_refs": [], "outcome": "insufficient"}}}],
      "held", "held.review.model_hold"),
     # Neither review finds the item news, so the verification's finding that it is covered already stands.
-    (OFFICIAL, [verdict("skip", criterion="news_value"), verdict("skip", criterion="new_information")],
+    (OFFICIAL, [verdict("skip", criterion="news_value"), duplicate_skip()],
      "ignored", "skipped.verification.new_information"),
     ({}, [verdict("skip", criterion="news_value")], "ignored", "skipped.review.news_value"),
     ({**OFFICIAL, "kind": "tag", "title": "tor-0.4.9.16", "content": ""}, [verdict("skip", criterion="news_value")],
@@ -274,15 +282,20 @@ def test_official_item_failing_news_value_is_held_not_skipped(context, source, r
     """Only news value failing on an official item other than a tag holds it, after a fresh verification passed
     its facts (repairing them first if needed, unless a verification's repair cannot be applied); a duplicate still skips."""
     cfg, store = context
+    _, covered_id = seed_legacy(store, item(**COVERED))
+    assert covered_id == COVERED_ID
     row = pending(store, item(**source))
     checker = Reviewer(*replies)
     result = run(cfg, store, row, Writer(), checker)
     assert (result["status"], result["review_calls"]) == (status, len(replies)) and codes(store, row) == [code]
+    if status == "ignored":
+        assert review._skip_stands(audit(store)["reviews"][-1]["result"]["criteria"], checker.coverages[-1])
     if status == "held":
         reason = code.rsplit(".", 1)[1]
         assert [call[2] for call in checker.calls] == [False] + [True] * (len(replies) - 1)
         assert (audit(store)["hold_code"], audit(store)["verified_facts"]) == (reason, reason == "official_not_news")
-        assert store.db.execute("SELECT last_error FROM items").fetchone()[0] == "Final review held: " + review_gate.HOLDS[reason]
+        assert store.db.execute("SELECT last_error FROM items WHERE id=?", (row["id"],)).fetchone()[0] == (
+            "Final review held: " + review_gate.HOLDS[reason])
 
 
 def test_a_hold_whose_verification_cites_no_source_does_not_record_verified_facts(context):

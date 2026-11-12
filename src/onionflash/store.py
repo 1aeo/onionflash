@@ -166,6 +166,7 @@ class Store:
         self.db.execute("CREATE INDEX IF NOT EXISTS analyses_source_snapshot ON analyses(source_item_id,created_at DESC,cache_key DESC)")
         if "rejections" not in {row[1] for row in self.db.execute("PRAGMA table_info(items)")}:
             self.db.execute("ALTER TABLE items ADD COLUMN rejections INTEGER NOT NULL DEFAULT 0")
+        self._comment_requests: dict[str, str] = {}
         self.db.commit()
 
     def __enter__(self) -> Store:
@@ -259,6 +260,8 @@ class Store:
         item["id"] = item_id
         content_hash = item_hash(item)
         cluster = item_cluster(item)
+        check_requested = (item.get("kind") == "gitlab_issue" and "comments_source_key" not in item
+                           and self._comment_requests.pop(item_id, None) == observed)
         row = self.db.execute(
             """SELECT content_hash,status,story_id,cluster_key,typeof(payload) AS payload_type,
                CAST(payload AS BLOB) AS payload FROM items WHERE id=?""",
@@ -267,14 +270,12 @@ class Store:
         old = saved_object(row["payload"]) if row and row["payload_type"] == "text" else None
         if row and not isinstance((old or {}).get("updated_at"), str):
             # A damaged saved copy counts as absent, so recollecting replaces it. The same revision is
-            # only restored, and so is an issue that is not pending while a comment check is requested
-            # for it, as merge_cached_comments does when comments are on: the item keeps its queue
-            # state and operator decision, and the first check that succeeds compares the notes with
-            # the kept hash.
+            # only restored, and so is an issue that is not pending while merge_cached_comments just
+            # requested a comment check for it: the item keeps its queue state and operator decision,
+            # and the first check that succeeds compares the notes with the kept hash.
             logging.getLogger(__name__).warning("Replacing damaged saved item %s", item_id)
             requested = "SELECT 1 FROM comment_cache WHERE item_id=? AND (failures>0 OR next_fetch_at<=checked_at)"
-            if row["content_hash"] == content_hash or (row["status"] != "pending" and item.get("kind") == "gitlab_issue"
-                                                       and "comments_source_key" not in item
+            if row["content_hash"] == content_hash or (row["status"] != "pending" and check_requested
                                                        and self.db.execute(requested, (item_id,)).fetchone()):
                 with self.db:
                     self.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps(item, ensure_ascii=False), item_id))
@@ -285,7 +286,7 @@ class Store:
         elif row and item["updated_at"] < old["updated_at"]:
             # A stale cache/fallback must not roll a newer incident back in time.
             return False
-        elif row and row["status"] != "pending" and "comments_source_key" not in item and item_hash(old) == content_hash:
+        elif row and row["status"] != "pending" and check_requested and item_hash(old) == content_hash:
             # The same revision as a copy restored above without its notes, listed again before a check
             # succeeded: the kept hash still holds the notes, so this is no change.
             return False

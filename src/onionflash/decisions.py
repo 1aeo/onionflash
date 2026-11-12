@@ -43,11 +43,12 @@ _COLUMNS = "id,decided_at,code,subject,item_id,content_hash,source_id,story_id,C
 
 
 def _reviews(record) -> list:
-    """The reviews behind a decision: the record's own, or those of the approval it reused."""
+    """The reviews behind a decision: those of a reused approval, or the record's own."""
     if not isinstance(record, dict):
         return []
     approval = record.get("approval")
-    reviews = record.get("reviews") or (approval.get("reviews") if isinstance(approval, dict) else None)
+    approved = approval.get("reviews") if isinstance(approval, dict) else None
+    reviews = approved if isinstance(approved, list) and approved else record.get("reviews")
     return reviews if isinstance(reviews, list) else []
 
 

@@ -804,8 +804,9 @@ def test_a_pending_issue_whose_saved_copy_lost_its_notes_takes_a_new_hash(tmp_pa
 
 
 @pytest.mark.parametrize("kind", ["invalid-json", "invalid-utf8"])
-def test_with_comments_off_a_changed_revision_of_a_damaged_issue_is_queued(tmp_path, kind):
-    """No check is requested, so the damaged copy counts as absent, as for any other item."""
+@pytest.mark.parametrize("prior_cache", ["ok", "failed", "requested"])
+def test_with_comments_off_a_changed_revision_of_a_damaged_issue_is_queued(tmp_path, kind, prior_cache):
+    """No check is requested, so the damaged copy counts as absent even if comment_cache kept an old failure or request."""
     cfg = comments_config(tmp_path)
     later = after(60, DATE)
     with Store(cfg["storage"]["database"]) as store:
@@ -814,6 +815,10 @@ def test_with_comments_off_a_changed_revision_of_a_damaged_issue_is_queued(tmp_p
         item_id = store.db.execute("SELECT id FROM items").fetchone()[0]
         with store.db:
             store.db.execute("UPDATE items SET status='dismissed'")
+            if prior_cache == "failed":
+                store.db.execute("UPDATE comment_cache SET failures=1,next_fetch_at=?", (later,))
+            elif prior_cache == "requested":
+                store.db.execute("UPDATE comment_cache SET next_fetch_at=checked_at")
         damage_item(store.db, item_id, kind)
         # With comments off, collection saves the issue as REST lists it.
         assert store.ingest(issue(title="A changed title", updated_at=later), later)

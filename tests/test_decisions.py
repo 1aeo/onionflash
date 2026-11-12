@@ -174,6 +174,18 @@ def test_a_commit_from_a_reused_receipt_logs_the_reviews_behind_it(context, monk
     detail = logged(store)[-1]["detail"]
     assert (detail["verdicts"], list(detail["criteria"])) == (["review:skip", "verification:skip"], ["new_information", "news_value"])
 
+    # Even when the resumed job still carries an earlier partial review list, the reused approval's
+    # deciding review chain wins over the partial list.
+    partial_review = {"stage": "review", "result": verdict("revise", repair={"why_it_matters": ""})}
+    cached_skip = {"stage": "verification", "result": both_editorial()}
+    reused_record = {"reviews": [partial_review], "approval": {"reviews": [partial_review, cached_skip]}}
+    assert decisions.skip_code(reused_record, both_editorial()) == "skipped.verification.new_information_and_news_value"
+    with store.db:
+        decisions.record(store.db, row["id"], "skipped.verification.new_information_and_news_value", LATER, review=reused_record)
+    reused_detail = logged(store)[-1]["detail"]
+    assert reused_detail["verdicts"] == ["review:revise", "verification:skip"]
+    assert list(reused_detail["criteria"]) == ["new_information", "news_value"]
+
 
 def test_decision_rows_roll_back_with_their_outcome(context):
     cfg, store = context
