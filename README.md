@@ -149,6 +149,7 @@ onionflash build --config config.toml --force    # Queue a bounded full-history 
 onionflash status --config config.toml           # Source freshness and queue
 onionflash story show --config config.toml --story STORY_ID
 onionflash rejected list --config config.toml
+onionflash decisions summary --config config.toml # Private decision counts for the last 7 days
 ```
 
 Each command returns a compact JSON result. Invalid configuration or a build
@@ -170,9 +171,11 @@ while taking their upload snapshot.
 
 `onionflash story show|history|correct|retract|restore|unlock` corrects or
 retracts a published story; `onionflash rejected list|show|retry|dismiss`
-handles failed analyses and ignored items. See
-[editorial commands and recovery](docs/EDITORIAL.md) and
-[rejected-analysis commands](docs/REJECTED_ANALYSES.md).
+handles failed analyses and ignored items; `onionflash decisions summary|list`
+reads the private log of every decision. See
+[editorial commands and recovery](docs/EDITORIAL.md),
+[rejected-analysis commands](docs/REJECTED_ANALYSES.md) and
+[the decision log](docs/DECISIONS.md).
 
 ## Reliability and editorial behavior
 

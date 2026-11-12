@@ -202,6 +202,8 @@ rewrite, or rely on an earlier verdict.
 class ReviewError(AnalysisError):
     """An unusable review reply counts against the item, like an invalid draft."""
 
+    code = "review.invalid_reply"
+
 
 OUTPUT_TOKENS = 2200  # room for every criterion and a repair
 
@@ -330,6 +332,8 @@ def release_labels_match_state(candidate: dict) -> bool:
 
 
 class Reviewer(CompletionClient):
+    stage = "review"
+
     def __init__(self, config: dict, deadline: float | None = None):
         super().__init__({**config, "llm": _llm(config)}, deadline=deadline)
 

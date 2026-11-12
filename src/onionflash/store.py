@@ -10,7 +10,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .util import after, backoff_seconds, digest, item_cluster, item_identity, saved_object
-from . import candidate, editorial, render
+from . import candidate, decisions, editorial, render
 from .comments import analysis_context
 from .candidate import ReviewRequired
 
@@ -149,6 +149,14 @@ class Store:
                 superseded_analysis_key TEXT, superseded_analysis_json TEXT
             );
             CREATE INDEX IF NOT EXISTS rejection_actions_item ON rejection_actions(item_id,action_id);
+            -- One row per terminal decision (see decisions.py); subject is the item ID or another decision's key.
+            CREATE TABLE IF NOT EXISTS decision_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, decided_at TEXT NOT NULL, subject TEXT NOT NULL,
+                item_id TEXT, content_hash TEXT, source_id TEXT, story_id TEXT,
+                code TEXT NOT NULL, detail_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS decision_log_time ON decision_log(decided_at);
+            CREATE INDEX IF NOT EXISTS decision_log_item ON decision_log(item_id,id);
         """)
         editorial.initialize(self.db)
         analysis_columns = {row[1] for row in self.db.execute("PRAGMA table_info(analyses)")}
@@ -323,8 +331,9 @@ class Store:
             "SELECT COUNT(*) FROM items WHERE status='pending'"
         ).fetchone()[0]
 
-    def defer(self, item_id: str, error: str, llm: dict, observed: str, *, terminal: bool = False) -> None:
-        """Retry later; after three failures caused by the item itself, stop retrying.
+    def defer(self, item_id: str, error: str, llm: dict, observed: str, *, terminal: bool = False,
+              code: str = "app.unexpected") -> None:
+        """Retry later; after three failures caused by the item itself, stop retrying and log `failed.<code>`.
 
         A rejected item is queued again only when its source content changes.
         """
@@ -335,7 +344,7 @@ class Store:
             return
         attempts, rejections = row[0] + 1, row[1] + terminal
         if rejections >= 3:
-            self.reject(item_id, error)
+            self.reject(item_id, error, "failed." + code, observed)
             return
         delay = backoff_seconds(
             attempts, llm["retry_base_seconds"], llm["retry_cap_seconds"]
@@ -347,11 +356,12 @@ class Store:
                 (attempts, rejections, error[:160], after(delay, observed), item_id),
             )
 
-    def reject(self, item_id: str, error: str) -> None:
+    def reject(self, item_id: str, error: str, code: str, observed: str) -> None:
         """Stop retrying a pending item, after its third failure or because its saved copy is damaged."""
         with self.db:
-            self.db.execute("""UPDATE items SET status='rejected',attempts=attempts+1,rejections=MAX(rejections,3),
-                next_attempt_at=NULL,last_error=? WHERE id=? AND status='pending'""", (error[:160], item_id))
+            if self.db.execute("""UPDATE items SET status='rejected',attempts=attempts+1,rejections=MAX(rejections,3),
+                    next_attempt_at=NULL,last_error=? WHERE id=? AND status='pending'""", (error[:160], item_id)).rowcount:
+                decisions.record(self.db, item_id, code, observed, error=error[:160])
 
     def rejected_count(self) -> int:
         return self.db.execute("SELECT COUNT(*) FROM items WHERE status='rejected'").fetchone()[0]
@@ -387,6 +397,7 @@ class Store:
         with self.db:
             row, result, story_id, locked = prepared["row"], prepared["result"], prepared["story_id"], prepared["locked"]
             payload = skipped = None
+            code = "held.gate.story_locked"  # the item maps to its story, and the update waits for the operator
             if not locked:
                 original = prepared["candidate"]
                 if not isinstance(approved_candidate, dict) or set(approved_candidate) != set(original):
@@ -413,11 +424,14 @@ class Store:
                 if decision == "approve":
                     payload = json.loads(json.dumps(prepared["payload"]))
                     payload.update({key: approved_candidate[key] for key in candidate.SEMANTIC_FIELDS})
-                    if candidate.existing_story(self.db, row) is None:  # Date publication, not the first draft.
+                    new = candidate.existing_story(self.db, row) is None
+                    if new:  # Date publication, not the first draft.
                         payload["added_at"] = observed
+                    code = "published.new" if new else "published.update"
                 else:
                     skipped = ("Final review skipped: " + ", ".join(
                         name for name, check in verdict["criteria"].items() if check["outcome"] != "pass"))[:160]
+                    code = decisions.skip_code(review_record, verdict)
             analysis_key = self.record_analysis(row, result, cache_key, observed, review_record=review_record)
             if payload is not None:
                 if payload.get("editorial_item") == row["id"]:
@@ -432,6 +446,7 @@ class Store:
             self.db.execute("UPDATE items SET status=?,story_id=?,next_attempt_at=NULL,last_error=? WHERE id=?",
                             ("published" if published else "ignored", mapped_id, skipped, row["id"]))
             self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
+            decisions.record(self.db, row["id"], code, observed, review=review_record)
         return {"story_id": mapped_id, "status": "locked" if locked and published else "published" if published else "ignored"}
 
     def stories(self, limit: int = -1) -> list[dict]:

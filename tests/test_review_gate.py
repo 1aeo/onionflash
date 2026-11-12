@@ -569,9 +569,11 @@ def test_run_report_counts_review_outcomes(context, monkeypatch):
     for name in ("one", "two", "three", "four", "five"):
         store.ingest(item(url="https://example.org/" + name), DATE)
     report = cli.run(cfg, store)
-    counts = [report[key] for key in ("analyzed", "analysis_failed", "review_held", "review_stale",
-                                      "review_cache_hits", "review_skipped")]
-    assert counts == [4, 1, 1, 1, 2, 2]
+    counts = [report[key] for key in ("analyzed", "analysis_failed", "review_stale", "review_cache_hits")]
+    # A hold is a decision, not a failure. Holds and skips are counted by code under decisions, and
+    # this stand-in for the gate logs none, on a database that has no decisions yet.
+    assert counts == [4, 0, 1, 2] and report["decisions"] == {}
+    assert "review_held" not in report and "review_skipped" not in report
 
 
 def test_run_report_counts_the_model_requests_of_items_that_fail(context, monkeypatch):

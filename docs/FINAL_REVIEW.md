@@ -93,7 +93,8 @@ that decision commits. The analysis audit keeps the source, packet, coverage and
 reviews of each outcome.
 
 Use the existing `status`, `rejected show`, `retry` and `dismiss` controls to
-inspect failures. See [operator controls](REJECTED_ANALYSES.md) and
+inspect failures, and the [decision log](DECISIONS.md) for every outcome and its
+code. See [operator controls](REJECTED_ANALYSES.md) and
 [corrections and retractions](EDITORIAL.md).
 
 ## Configuration and evaluation

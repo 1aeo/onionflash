@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-from . import editorial
+from . import decisions, editorial
 from .schema import PRODUCTS
 from .util import canonical_url, format_utc, now_iso, parse_utc, saved_object
 
@@ -64,6 +64,7 @@ def show_item(store, item_id) -> dict:
     result["actions"] = [dict(action) for action in store.db.execute(
         """SELECT action_id,action,content_hash,reason,created_at,before_status,before_attempts,before_rejections
             FROM rejection_actions WHERE item_id=? ORDER BY action_id DESC LIMIT ?""", (item_id, HISTORY_LIMIT))]
+    result["decisions"] = decisions.for_item(store.db, item_id)
     return result
 
 
@@ -157,6 +158,9 @@ def _act(store, item_id, expected_hash, reason, action, observed):
              before_rejections,before_error,before_next_attempt_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
             (item_id, expected_hash, action, reason, stamp, row["status"], row["attempts"],
              row["rejections"], row["last_error"], row["next_attempt_at"]))
+        code = "operator.dismissed" if action == "dismiss" else (
+            "operator.reconsidered" if row["status"] == "ignored" else "operator.retried")
+        decisions.record(db, item_id, code, stamp, reason=reason, before_status=row["status"], before_error=row["last_error"])
         if action == "retry":
             from .review_gate import reset_review_work
             reset_review_work(store, item_id)

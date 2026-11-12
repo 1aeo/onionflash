@@ -150,7 +150,9 @@ def test_initial_approval_cannot_publish_when_fresh_verification_refuses(context
     assert checker.calls[0][:2] == checker.calls[1][:2]
     assert store.stories() == []
     if final == "hold":
-        assert store.db.execute("SELECT last_error FROM items").fetchone()[0] == "Final review held: final verification did not approve the candidate"
+        # The hold's text names no stage; its decision code does.
+        assert store.db.execute("SELECT last_error FROM items").fetchone()[0] == "Final review held: review did not approve the candidate"
+        assert store.db.execute("SELECT code FROM decision_log").fetchone()[0] == "held.verification.model_hold"
 
 
 def test_interrupted_verification_restarts_the_critique_when_coverage_changes(context):

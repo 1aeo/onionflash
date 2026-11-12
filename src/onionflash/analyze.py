@@ -118,9 +118,13 @@ not approval to publish. Return only the requested JSON object.
 
 
 class AnalysisError(Exception):
-    def __init__(self, message: str, retryable: bool = False):
+    code = "writer.invalid_output"  # logged as failed.<code> when it is the item's third failure
+
+    def __init__(self, message: str, retryable: bool = False, *, code: str | None = None):
         super().__init__(message)
         self.retryable = retryable
+        if code is not None:
+            self.code = code
 
 
 def cache_key(row: dict, llm: dict) -> str:
@@ -128,7 +132,7 @@ def cache_key(row: dict, llm: dict) -> str:
     return digest([row["content_hash"], llm["model"], PROMPT_VERSION])
 
 
-def _json_object(text: str) -> dict:
+def _json_object(text: str, code: str = "writer.invalid_json") -> dict:
     def unique(pairs):
         result = {}
         for key, value in pairs:
@@ -143,9 +147,9 @@ def _json_object(text: str) -> dict:
         # model response reaches the queue.
         json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8")
     except (ValueError, TypeError, RecursionError) as exc:
-        raise AnalysisError("Model returned invalid JSON") from exc
+        raise AnalysisError("Model returned invalid JSON", code=code) from exc
     if not isinstance(result, dict):
-        raise AnalysisError("Model response is not an object")
+        raise AnalysisError("Model response is not an object", code=code)
     return result
 
 
@@ -187,9 +191,11 @@ def validate_analysis(result: dict, item: dict) -> dict:
     for index, quote in enumerate(evidence, 1):
         normalized = _plain(quote)
         if len(normalized) < MIN_EVIDENCE_CHARS:
-            raise AnalysisError(f"Model evidence quote {index} is shorter than {MIN_EVIDENCE_CHARS} normalized characters")
+            raise AnalysisError(f"Model evidence quote {index} is shorter than {MIN_EVIDENCE_CHARS} normalized characters",
+                                code="writer.evidence_too_short")
         if normalized not in context:
-            raise AnalysisError(f"Model evidence quote {index} is not an exact excerpt of supplied title or content")
+            raise AnalysisError(f"Model evidence quote {index} is not an exact excerpt of supplied title or content",
+                                code="writer.evidence_not_exact")
     if not all(result[k] for k in ("title", "summary")) or not evidence:
         raise AnalysisError("Published story needs text and source evidence")
     return result
@@ -199,7 +205,7 @@ def tag_notice(item: dict) -> dict:
     """Report only the observed tag entry, without inferring a release."""
     name = item["title"].strip()
     if not name or len(name) > 500:
-        raise AnalysisError("Invalid tag name")
+        raise AnalysisError("Invalid tag name", code="app.invalid_tag_name")
     product = {
         "tor": "Tor",
         "arti": "Arti",
@@ -262,7 +268,7 @@ class CompletionClient:
             content = json.dumps(payload, ensure_ascii=False, allow_nan=False)
             content.encode("utf-8")
         except (ValueError, TypeError, RecursionError) as exc:
-            raise AnalysisError("Model input is not valid UTF-8 JSON") from exc
+            raise AnalysisError("Model input is not valid UTF-8 JSON", code=self.stage + ".invalid_input") from exc
         request = {
             "model": self.llm["model"],
             "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": content}],
@@ -305,14 +311,16 @@ class CompletionClient:
         except (FetchError, KeyError, IndexError, TypeError):
             raise AnalysisError("LLM returned an unexpected response", retryable=True) from None
         if finished != "stop":
-            raise AnalysisError("Model completion was truncated or refused")
+            raise AnalysisError("Model completion was truncated or refused", code=self.stage + ".truncated")
         if not isinstance(content, str):
             raise AnalysisError("Model returned no textual completion", retryable=True)
-        return _json_object(content)
+        return _json_object(content, self.stage + ".invalid_json")
 
 
 class Analyzer(CompletionClient):
     """Produce one structurally valid draft; final publication review is separate."""
+
+    stage = "writer"  # names the stage in the codes of failed requests
 
     def analyze(self, item: dict) -> dict:
         """Return a bounded draft with literal evidence, never a publication decision."""
@@ -362,7 +370,7 @@ def _writer_schema(bounded: dict) -> dict:
                     excerpts.append(excerpt)
     excerpts = list(dict.fromkeys(excerpts))
     if not excerpts:
-        raise AnalysisError("Source has no qualifying literal evidence excerpt")
+        raise AnalysisError("Source has no qualifying literal evidence excerpt", code="writer.no_literal_evidence")
     if len(excerpts) > MAX_EVIDENCE_CHOICES:
         # Bound grammar size while retaining options throughout the input,
         # including the first title and the last supplied comment.

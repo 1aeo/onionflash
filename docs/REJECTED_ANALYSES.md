@@ -29,8 +29,9 @@ returns a `next_cursor` for bounded ID-based pagination. Limits are 1–200 item
 Use `--status dismissed` to inspect dismissed revisions, or `--status ignored`
 for items a review skipped; a skip's reason names the criteria that did not pass.
 
-`show` prints the saved source item, up to 20 recent operator actions and the
-final review's stage, current candidate, numbered source packet (for checking
+`show` prints the saved source item, up to 20 recent operator actions, the
+item's 20 newest entries in the [decision log](DECISIONS.md), and the final
+review's stage, current candidate, numbered source packet (for checking
 references such as `S1:P3`), coverage background and latest per-criterion
 verdict. They come from the item's review job or, once a commit has finished the
 current revision, from the decision that commit recorded, with stage `finished`,
@@ -106,5 +107,6 @@ observed counters, error and cooldown. A failed audit write rolls back the whole
 action.
 
 The private `rejection_actions` table records each reason, source-version hash,
-timestamp, and prior status, counters and error. Operator commands return compact
-action metadata; these records never enter public pages or feeds.
+timestamp, and prior status, counters and error, and each action is also a
+[decision](DECISIONS.md). Operator commands return compact action metadata;
+these records never enter public pages or feeds.

@@ -12,10 +12,20 @@ from __future__ import annotations
 
 import json
 
+from . import decisions
 from .analyze import AnalysisError, cache_key
 from .util import digest, now_iso, saved_object
 
 MAX_APPROVALS = 2000  # cached approvals kept besides those unfinished jobs pin
+# Each hold reason and its operator text, which follows "Final review held: " in last_error. A hold
+# is logged as held.<stage>.<reason>, the stage being gate, review or verification.
+HOLDS = {
+    "missing_sources": "required source material is unavailable",
+    "repeat_hold": "operator review is required",
+    "model_hold": "review did not approve the candidate",
+    "tag_repair": "review proposed editing a literal tag notice",
+    "unusable_repair": "review proposed an unusable repair",
+}
 
 
 def _json(value):
@@ -81,17 +91,18 @@ def _prune(store, maximum):
         """, (maximum,))
 
 
-def _hold(store, row, draft, writer_key, record, observed, reason):
+def _hold(store, row, draft, writer_key, record, observed, stage, reason):
     """One semantic hold is terminal; only source change/operator retry requeues."""
     record["outcome"] = "held"
-    record["hold_reason"] = reason
+    record["hold_reason"] = HOLDS[reason]
     with store.db:
         store.record_analysis(row, draft, writer_key, observed, review_record=record)
         store.db.execute("""UPDATE items SET status='rejected',attempts=attempts+1,
             rejections=MAX(rejections,3),next_attempt_at=NULL,last_error=? WHERE id=?""",
-            ("Final review held: " + reason, row["id"]))
+            ("Final review held: " + HOLDS[reason], row["id"]))
         store.db.execute("""UPDATE review_jobs SET stage='held',record_json=?,approval_key=NULL,
             updated_at=? WHERE item_id=?""", (_json(record), observed, row["id"]))
+        decisions.record(store.db, row["id"], f"held.{stage}.{reason}", observed, review=record)
 
 
 def process_item(config, store, row, writer, reviewer, observed=None, *, allow_network=True):
@@ -142,12 +153,12 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             store.commit_candidate(prepared, prepared["candidate"], writer_key, now_iso(), review_record=record)
             return {**report, "status": record["outcome"]}
         if prepared["packet"]["missing_sources"]:
-            _hold(store, row, draft, writer_key, record, observed, "required source material is unavailable")
+            _hold(store, row, draft, writer_key, record, observed, "gate", "missing_sources")
             return {**report, "status": "held"}
         if stage == "held":
             # The same candidate held before: a source reverted to a held revision,
             # or an item was requeued without reset_review_work. Do not review it again.
-            _hold(store, row, draft, writer_key, record, observed, "operator review is required")
+            _hold(store, row, draft, writer_key, record, observed, "gate", "repeat_hold")
             return {**report, "status": "held"}
         key = _approval_key(candidate, prepared, policy)
         cached = store.db.execute("SELECT * FROM review_approvals WHERE key=?", (key,)).fetchone()
@@ -174,11 +185,12 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             stage, candidate, record = "review", prepared["candidate"], fresh
         while True:
             verification = stage == "verify"
+            phase = "verification" if verification else "review"
             if not allow_network:
                 return {**report, "status": "deferred"}
             report["review_calls"] += 1
             verdict = reviewer.review(candidate, prepared["packet"], coverage=prepared["coverage"], verification=verification)
-            record["reviews"].append({"stage": "verification" if verification else "review",
+            record["reviews"].append({"stage": phase,
                                       "candidate_hash": digest(candidate), "source_hash": prepared["source_hash"],
                                       "coverage_hash": prepared["coverage_hash"],
                                       "policy_hash": policy, "result": verdict})
@@ -200,16 +212,15 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                                                    policy_hash=policy, review_record=record, decision=verdict["verdict"])
                 return {**report, "status": committed["status"]}
             if verdict["verdict"] == "hold" or verification:  # one repair at most, and only a verified one
-                reason = "final verification did not approve the candidate" if verification else "review did not approve the candidate"
-                _hold(store, row, draft, writer_key, record, observed, reason)
+                _hold(store, row, draft, writer_key, record, observed, phase, "model_hold")
                 return {**report, "status": "held"}
             if prepared["payload"]["editorial_kind"] == "tag":
-                _hold(store, row, draft, writer_key, record, observed, "review proposed editing a literal tag notice")
+                _hold(store, row, draft, writer_key, record, observed, phase, "tag_repair")
                 return {**report, "status": "held"}
             try:
                 candidate = review.apply_repair(candidate, verdict["repair"])
             except review.ReviewError:
-                _hold(store, row, draft, writer_key, record, observed, "review proposed an unusable repair")
+                _hold(store, row, draft, writer_key, record, observed, phase, "unusable_repair")
                 return {**report, "status": "held"}
             stage = "verify"
             record["candidate"] = candidate
