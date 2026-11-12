@@ -160,5 +160,12 @@ running such a release, check each corrected or retracted story with `story show
 SQLite inspection and backups work with any version, and rolling back Cloudflare
 frontend files is independent of the collector database version.
 
+Retired story IDs and cluster keys recorded in `story_aliases` are permanent and
+insert-only. SQLite ignores any insert into `stories` that reuses a retired ID
+or cluster key, including from an older collector release after a rollback;
+items that map to a retired story are marked ignored as
+`skipped.gate.retired_story` without a model call, and `story show` and the
+story editing commands refuse a retired ID.
+
 Public source/model output cannot supply the correction metadata. Notices are
 built only from the operator ledger and HTML-escaped like the rest of the article.

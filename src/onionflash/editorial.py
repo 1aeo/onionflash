@@ -15,8 +15,13 @@ from .util import canonical_url, digest, format_utc, now_iso, parse_utc
 
 FIELDS = frozenset({"title", "summary", "why_it_matters", "category", "priority", "confidence", "state", "products", "tags", "sources", "updates"})
 PUBLIC_HISTORY_LIMIT = 20
+MAX_ALIAS_HOPS = 16
 _ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 _HASH = re.compile(r"[a-f0-9]{64}\Z")
+
+
+class RetiredStory(ValueError):
+    """A story ID or cluster key recorded as retired cannot be created or edited."""
 
 
 def initialize(db) -> None:
@@ -36,12 +41,49 @@ def initialize(db) -> None:
             before_hash TEXT NOT NULL, after_hash TEXT NOT NULL,
             PRIMARY KEY(story_id,revision)
         );
+        CREATE TABLE IF NOT EXISTS story_aliases (
+            story_id TEXT PRIMARY KEY, cluster_key TEXT NOT NULL UNIQUE,
+            survivor_id TEXT, reason TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TRIGGER IF NOT EXISTS story_aliases_no_replace BEFORE INSERT ON story_aliases
+            WHEN EXISTS (SELECT 1 FROM story_aliases WHERE story_id=NEW.story_id OR cluster_key=NEW.cluster_key)
+            BEGIN SELECT RAISE(ABORT, 'Story aliases are permanent'); END;
+        CREATE TRIGGER IF NOT EXISTS story_aliases_no_update BEFORE UPDATE ON story_aliases
+            BEGIN SELECT RAISE(ABORT, 'Story aliases are permanent'); END;
+        CREATE TRIGGER IF NOT EXISTS story_aliases_no_delete BEFORE DELETE ON story_aliases
+            BEGIN SELECT RAISE(ABORT, 'Story aliases are permanent'); END;
+        CREATE TRIGGER IF NOT EXISTS stories_never_recreated BEFORE INSERT ON stories
+            WHEN EXISTS (SELECT 1 FROM story_aliases WHERE story_id=NEW.id OR cluster_key=NEW.cluster_key)
+            BEGIN SELECT RAISE(IGNORE); END;
         -- Story guards of earlier releases call a function only those releases register,
         -- so left in place they fail every other story write. Automation checks locks itself.
         DROP TRIGGER IF EXISTS editorial_story_insert;
         DROP TRIGGER IF EXISTS editorial_story_update;
         DROP TRIGGER IF EXISTS editorial_story_delete;
     """)
+
+
+def retired(db, *, story_id: str | None = None, cluster_key: str | None = None) -> tuple[str, str | None] | None:
+    """Resolve a retired or merged story ID or cluster key to (first_id, final_survivor_or_None)."""
+    row = (db.execute("SELECT story_id,survivor_id FROM story_aliases WHERE story_id=?", (story_id,)).fetchone()
+           if story_id else None)
+    if row is None and cluster_key:
+        row = db.execute("SELECT story_id,survivor_id FROM story_aliases WHERE cluster_key=?", (cluster_key,)).fetchone()
+    if row is None:
+        return None
+    first_id, survivor = row["story_id"], row["survivor_id"]
+    seen = {first_id}
+    for _ in range(MAX_ALIAS_HOPS):
+        if survivor is None:
+            return first_id, None
+        if survivor in seen:
+            raise ValueError("Story alias loop")
+        seen.add(survivor)
+        next_row = db.execute("SELECT survivor_id FROM story_aliases WHERE story_id=?", (survivor,)).fetchone()
+        if next_row is None:
+            return first_id, survivor
+        survivor = next_row["survivor_id"]
+    raise ValueError("Story alias loop")
 
 
 def _id(value: str) -> str:
@@ -90,6 +132,9 @@ def _published(db, story_id: str) -> dict | None:
 
 def _snapshot(db, story_id: str) -> dict:
     _id(story_id)
+    alias = retired(db, story_id=story_id)
+    if alias is not None:
+        raise RetiredStory(f"Story was merged into {alias[1]}" if alias[1] else "Story is retired")
     row = db.execute("SELECT * FROM stories WHERE id=?", (story_id,)).fetchone()
     if row is None:
         raise ValueError("Unknown story; restore its stored record before editing")

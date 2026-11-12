@@ -258,11 +258,25 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
     marks the item rejected immediately.
     """
     from .candidate import ReviewRequired, StaleCandidate
+    from .editorial import RetiredStory, retired
 
     observed = observed or now_iso()
     policy = review.policy_hash(config)
     writer_key = cache_key(row, config["llm"])
     report = {"status": "pending", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
+    try:
+        if candidate_mod.existing_story(store.db, row) is None and retired(
+                store.db, story_id=digest(row["cluster_key"])[:24], cluster_key=row["cluster_key"]) is not None:
+            raise RetiredStory("Story is retired")
+    except RetiredStory:
+        with store.db:
+            if not store.db.execute("""UPDATE items SET status='ignored',story_id=NULL,next_attempt_at=NULL,
+                    last_error='Retired story; never recreated' WHERE id=? AND content_hash=? AND status='pending'""",
+                    (row["id"], row["content_hash"])).rowcount:
+                return {**report, "status": "stale"}
+            store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
+            decisions.record(store.db, row["id"], "skipped.gate.retired_story", observed)
+        return {**report, "status": "ignored"}
     skipped = _not_recent(config, store, row, json.loads(row["payload"]), observed)  # needs no network
     if skipped:
         return {**report, "status": skipped}

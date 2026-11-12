@@ -260,7 +260,8 @@ class Store:
         content_hash = item_hash(item)
         cluster = item_cluster(item)
         row = self.db.execute(
-            "SELECT content_hash,status,typeof(payload) AS payload_type,CAST(payload AS BLOB) AS payload FROM items WHERE id=?",
+            """SELECT content_hash,status,story_id,cluster_key,typeof(payload) AS payload_type,
+               CAST(payload AS BLOB) AS payload FROM items WHERE id=?""",
             (item_id,),
         ).fetchone()
         old = saved_object(row["payload"]) if row and row["payload_type"] == "text" else None
@@ -288,6 +289,11 @@ class Store:
             # The same revision as a copy restored above without its notes, listed again before a check
             # succeeded: the kept hash still holds the notes, so this is no change.
             return False
+        if row is not None:
+            alias = editorial.retired(self.db, story_id=row["story_id"], cluster_key=row["cluster_key"])
+            if alias is not None and alias[1] is None:
+                # Keep a retired item's original cluster key across body edits so process_item still ignores it.
+                cluster = self.db.execute("SELECT cluster_key FROM story_aliases WHERE story_id=?", (alias[0],)).fetchone()[0]
         score = item_priority(item)
         with self.db:
             self.db.execute(
@@ -456,10 +462,14 @@ class Store:
             if payload is not None:
                 if payload.get("editorial_item") == row["id"]:
                     payload["editorial_analysis_key"] = analysis_key
-                self.db.execute("""INSERT INTO stories(id,cluster_key,payload,published_at,updated_at)
+                cursor = self.db.execute("""INSERT INTO stories(id,cluster_key,payload,published_at,updated_at)
                     VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at""",
                     (story_id, prepared["cluster_key"], json.dumps(payload, ensure_ascii=False, allow_nan=False), payload["published_at"], payload["updated_at"]))
+                if not cursor.rowcount:
+                    raise editorial.RetiredStory("Story is retired")
             elif locked:
+                if editorial.retired(self.db, story_id=story_id, cluster_key=prepared["cluster_key"]) is not None:
+                    raise editorial.RetiredStory("Story is retired")
                 editorial.record_held(self.db, story_id)
             published = decision == "approve"
             mapped_id = story_id if published else row.get("story_id")
