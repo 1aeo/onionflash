@@ -984,6 +984,10 @@
           "published_at": "2026-09-23T15:01:31Z",
           "updated_at": "2026-11-11T14:48:45Z",
           "upstream_state": "closed",
+          "labels": [
+            "Security",
+            "Severity::medium"
+          ],
           "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41412",
           "title": "Circuit cross-cancellation can still blame channels",
           "passages": [
@@ -3195,9 +3199,6 @@
         "source_support"
       ],
       "packet": "tor-41412-cross-cancellation-edited",
-      "unsupported": [
-        "labeled medium severity"
-      ],
       "candidate": {
         "id": "07848049277d5ac753a069cb",
         "title": "Tor 0.4.9.14 fixes circuit cross-cancellation channel marking",

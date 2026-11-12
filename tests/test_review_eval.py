@@ -256,19 +256,23 @@ def test_evaluation_detects_unsupported_labels_after_text_is_repaired():
 
 
 def test_authored_passages_match_build_packet():
-    """An authored passage has a stored note's keys and place, and drafts back to the same note."""
+    """An authored passage has a stored note's keys and place, and drafts back to the same note and labels."""
     module = evaluator()
     raw = json.loads((ROOT / "tools/review_cases.json").read_text())
-    source = raw["packets"]["scope-correction"]["sources"][0]
     fields = ("url", "title", "kind", "authority", "product", "published_at", "updated_at", "upstream_state")
-    item = {"id": "a" * 24, **{key: source[key] for key in fields},
-            "content": "\n\n".join(passage for passage in source["passages"] if isinstance(passage, str)),
-            "public_comments": [{"author": note["author"], "created_at": note["created_at"], "url": note["url"], "body": note["text"]}
-                                for note in source["passages"] if isinstance(note, dict)]}
-    built, _ = build_packet(None, item, {"sources": [{"id": item["id"], "url": item["url"]}]}, {"sources": []}, item["id"])
-    expanded = next(c for c in module.expand(raw) if c["packet"]["sources"][0]["url"] == source["url"])["packet"]["sources"][0]
-    assert [list(passage.items()) for passage in expanded["passages"]] == [list(passage.items()) for passage in built["sources"][0]["passages"]]
-    assert module.writer_item(expanded) == {key: item[key] for key in (*fields[1:], "content", "public_comments")} | {"labels": []}
+    for packet_name, expected_labels in (("scope-correction", []),
+                                         ("tor-41412-cross-cancellation-edited", ["Security", "Severity::medium"])):
+        source = raw["packets"][packet_name]["sources"][0]
+        item = {"id": "a" * 24, **{key: source[key] for key in fields},
+                "labels": list(source.get("labels", [])),
+                "content": "\n\n".join(passage for passage in source["passages"] if isinstance(passage, str)),
+                "public_comments": [{"author": note["author"], "created_at": note["created_at"], "url": note["url"], "body": note["text"]}
+                                    for note in source["passages"] if isinstance(note, dict)]}
+        built, _ = build_packet(None, item, {"sources": [{"id": item["id"], "url": item["url"]}]}, {"sources": []}, item["id"])
+        expanded = next(c for c in module.expand(raw) if c["packet"]["sources"][0]["url"] == source["url"])["packet"]["sources"][0]
+        assert expanded["labels"] == built["sources"][0]["labels"] == expected_labels
+        assert [list(passage.items()) for passage in expanded["passages"]] == [list(passage.items()) for passage in built["sources"][0]["passages"]]
+        assert module.writer_item(expanded) == {key: item[key] for key in (*fields[1:], "labels", "content", "public_comments")}
 
 
 def test_draft_mode_drafts_each_packet_once_and_scores_draft_and_publication(evaluation, tmp_path, monkeypatch):

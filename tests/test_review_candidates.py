@@ -419,3 +419,49 @@ def test_empty_title_and_body_are_not_review_evidence(tmp_path):
         prepared = store.prepare_candidate(row, analysis(), DATE)
         assert prepared["packet"]["missing_sources"]
         assert prepared["packet"]["sources"] == []
+
+
+def test_source_labels_are_bounded_packet_metadata_never_passages(tmp_path):
+    from onionflash.analyze import _writer_schema
+    from onionflash.config import DEFAULTS
+
+    overlong = "Severity::" + ("x" * 120)
+    raw_labels = ["  Security \n", "Severity::medium", "<b>Tag</b>", "", "   ", overlong,
+                  *(f"extra-{n}" for n in range(35))]
+    labeled = item(kind="gitlab_issue", url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/41412",
+                   content=BODY, labels=raw_labels)
+    policy_before = review.policy_hash(DEFAULTS)
+    with Store(tmp_path / "db") as store:
+        row = pending(store, labeled)
+        prepared = store.prepare_candidate(row, analysis(), DATE)
+        [source] = prepared["packet"]["sources"]
+        assert set(source) == {"id", "kind", "authority", "product", "published_at", "updated_at",
+                               "upstream_state", "labels", "url", "title", "snapshot", "passages"}
+        assert len(source["labels"]) == 28  # first 30 entries kept, minus 2 blank strings
+        assert source["labels"][:3] == ["Security", "Severity::medium", "<b>Tag</b>"]
+        assert len(source["labels"][3]) == 100 and source["labels"][3].startswith("Severity::")
+        assert all("Severity::" not in passage["text"] and "<b>Tag</b>" not in passage["text"]
+                   for passage in source["passages"])
+        assert review._packet_refs(prepared["packet"]) == {"S1", *(p["id"] for p in source["passages"])}
+        excerpts = _writer_schema({"title": labeled["title"], "content": BODY, "labels": source["labels"],
+                                   "kind": "gitlab_issue", "authority": "development", "upstream_state": "opened"})
+        assert all("Severity::" not in choice for choice in excerpts["properties"]["evidence"]["items"]["enum"])
+        assert review.policy_hash(DEFAULTS) == policy_before
+
+        # Changing labels changes source_hash and binding_hash via packet content; non-string/non-list labels are bounded safely.
+        re_labeled = {**labeled, "labels": ["Security", "Severity::high"], "updated_at": LATER}
+        store.ingest(re_labeled, LATER)
+        updated_row = store.pending(1, LATER)[0]
+        updated_prepared = store.prepare_candidate(updated_row, analysis(), LATER)
+        assert updated_prepared["packet"]["sources"][0]["labels"] == ["Security", "Severity::high"]
+        assert updated_prepared["source_hash"] != prepared["source_hash"]
+        assert updated_prepared["binding_hash"] != prepared["binding_hash"]
+
+        for corrupt in ([7, None, "ValidLabel"], "not-a-list"):
+            plain = json.loads(updated_row["payload"])
+            plain["labels"] = corrupt
+            updated_row["payload"] = json.dumps(plain)
+            with store.db:
+                store.db.execute("UPDATE items SET payload=? WHERE id=?", (updated_row["payload"], updated_row["id"]))
+            expected = ["ValidLabel"] if isinstance(corrupt, list) else []
+            assert store.prepare_candidate(updated_row, analysis(), LATER)["packet"]["sources"][0]["labels"] == expected

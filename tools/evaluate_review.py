@@ -17,6 +17,7 @@ from onionflash.config import load_config
 from onionflash.render import _prepare_story
 from onionflash.review import EDITABLE, Reviewer, final_holds, policy_hash
 from onionflash.review_gate import call_review, next_step
+from onionflash.source_packet import _labels
 
 CASE_FILES = ("review_cases.json", "review_cases_judged.json")
 # A judged case names the flaw of its labeled wording or labels; one without a flaw is clean.
@@ -51,7 +52,7 @@ def expand(corpus: dict) -> list[dict]:
         packet, sources = corpus["packets"][case["packet"]], []
         for i, source in enumerate(packet["sources"], 1):
             texts = [source["title"], *source["passages"]]
-            sources.append({"id": f"S{i}", **source, "passages": [
+            sources.append({"id": f"S{i}", **source, "labels": _labels(source.get("labels")), "passages": [
                 {"id": f"S{i}:P{j}", **(text if isinstance(text, dict) else {"text": text})} for j, text in enumerate(texts, 1)]})
         story = {**corpus["defaults"], "sources": [{"url": s["url"], "title": s["title"]} for s in sources],
                  **case["candidate"]}
@@ -92,7 +93,8 @@ def writer_item(source: dict) -> dict:
     passages = source["passages"][1:]
     return {key: source.get(key) for key in ("title", "kind", "authority", "product", "published_at", "updated_at",
                                              "upstream_state")} | {
-        "labels": [], "content": "\n\n".join(passage["text"] for passage in passages if "author" not in passage),
+        "labels": _labels(source.get("labels")),
+        "content": "\n\n".join(passage["text"] for passage in passages if "author" not in passage),
         "public_comments": [{"author": passage["author"], "created_at": passage["created_at"], "url": passage["url"],
                              "body": passage["text"]} for passage in passages if "author" in passage]}
 

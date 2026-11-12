@@ -31,8 +31,9 @@ submits a draft for review; only the reviewer decides news value and novelty.
 The writer selects literal evidence excerpts from its exact input. This prevents
 quote-copying errors; it does not establish that the excerpts support every
 claim. The reviewer therefore receives the full bounded numbered source packet,
-including retained source material and verified public comments that the writer
-may not have quoted. The source the story's prose came from gets at least the text
+including each source's metadata (kind, authority, product, dates, upstream
+state and labels), retained source material and verified public comments that
+the writer may not have quoted. The source the story's prose came from gets at least the text
 its writer saw. The other sources share the remaining passages, then characters,
 smallest need first, and leave it the room they do not need. A source's comments
 come before its description, so a long description is cut first. Comment passages

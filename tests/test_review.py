@@ -29,6 +29,7 @@ def packet():
     return {"sources": [{"id": "S1", "url": STORY["sources"][0]["url"], "title": "Release notes",
                          "kind": "rss", "authority": "official", "product": "tor",
                          "published_at": STORY["published_at"], "updated_at": STORY["updated_at"],
+                         "labels": [],
                          "passages": [{"id": "S1:P1", "text": "The release includes improvements for relay operators."}]}],
             "missing_sources": [], "truncated": False}
 

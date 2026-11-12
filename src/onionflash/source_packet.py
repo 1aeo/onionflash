@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .comments import analysis_context
-from .util import canonical_url, digest, saved_object
+from .util import canonical_url, digest, plain_text, saved_object
 
 
 # The review packet's fixed bounds.
@@ -84,6 +84,12 @@ def _load(db, source_id: str | None, url: str, analysis_key: str | None = None):
     return None
 
 
+def _labels(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [text for label in value[:30] if isinstance(label, str) and (text := plain_text(label, 100, html=False))]
+
+
 def _passages(text, size, **note):
     """Split text into passages of at most size characters; a note's passages name it."""
     return [{**note, "text": text[start:start + size]} for start in range(0, len(text), size) if text[start:start + size].strip()]
@@ -133,7 +139,7 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
         item, source_bindings, snapshot, captured = loaded
         body = item.get("source_content", item.get("content"))
         unit = {key: item.get(key) for key in ("kind", "authority", "product", "published_at", "updated_at", "upstream_state")}
-        unit.update(url=canonical_url(item["url"]), title=item["title"], snapshot=snapshot)
+        unit.update(labels=_labels(item.get("labels")), url=canonical_url(item["url"]), title=item["title"], snapshot=snapshot)
         if captured:
             unit["captured_at"] = captured
         if source.get("source_item_id"):
