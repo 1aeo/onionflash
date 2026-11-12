@@ -314,6 +314,43 @@ def test_draft_mode_drafts_each_packet_once_and_scores_draft_and_publication(eva
     assert [record["draft_kept_unsupported"] for record in records] == [flagged.get(record["case"], []) for record in records]
 
 
+def test_draft_mode_writer_error_has_no_stale_or_missing_diagnostic(evaluation, tmp_path, monkeypatch):
+    """A writer failure before any review or after an earlier review records an error without missing or stale diagnostics."""
+    module, config = evaluation
+    raw = json.loads((ROOT / "tools/review_cases.json").read_text())
+    wanted = ["draft:bastet", "draft:refactor-with-disclosure", "draft:issue-update/prior-issue",
+              "draft:issue-update/related-issue"]
+    by_id = {case["id"]: case for case in module.draft_cases(raw) if case["id"] in wanted}
+    cases = [by_id[case_id] for case_id in wanted]
+    required_text = " ".join(by_id["draft:refactor-with-disclosure"].get("required") or [])
+
+    class FlakyWriter(module.Analyzer):
+        def complete(self, prompt, payload, schema, name):
+            if "bastet" in payload["title"] or "crash fix" in payload["title"]:
+                raise module.AnalysisError("LLM request failed (HTTP 500)")
+            return {"publish": True, "title": payload["title"], "summary": f"A faithful summary: {required_text}.",
+                    "why_it_matters": "", "category": "security", "priority": "normal", "confidence": "reported",
+                    "state": "developing", "products": [payload["product"]], "tags": ["security"],
+                    "evidence": [payload["title"]]}
+
+    replies = iter([{"invalid": True}, verdict("approve"), verdict("approve")])
+    monkeypatch.setattr(module, "Analyzer", FlakyWriter)
+    monkeypatch.setattr(module.Reviewer, "complete", lambda self, *args: next(replies))
+    with module.EvaluationReviewer(config) as fresh_reviewer:
+        assert fresh_reviewer.last_decoded is None
+    output = tmp_path / "draft-errors.jsonl"
+    result = module.evaluate(config, cases, output, rounds=2, draft=True)
+    records = [json.loads(line) for line in output.read_text().splitlines()[:-1]]
+    assert (result["cases"], result["errors"], result["matched"]) == (8, 7, 1)
+    by_case_round = {(record["case"], record["round"]): record for record in records}
+    assert by_case_round["draft:refactor-with-disclosure", 1]["decoded_diagnostic"] == {"invalid": True}
+    assert by_case_round["draft:refactor-with-disclosure", 2]["final_verdict"] == "approve"
+    for round_num in (1, 2):
+        for failed_id in ("draft:bastet", "draft:issue-update/prior-issue", "draft:issue-update/related-issue"):
+            rec = by_case_round[failed_id, round_num]
+            assert rec["error"] == "AnalysisError" and "decoded_diagnostic" not in rec
+
+
 def test_missing_required_wording_is_an_omission_not_a_false_approval(evaluation, tmp_path, monkeypatch):
     module, config = evaluation
     case = next(c for c in corpus() if c["id"] == "draft-omits-disclosure")

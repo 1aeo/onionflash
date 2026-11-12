@@ -28,6 +28,8 @@ MAX_CASES, MAX_SECONDS, MAX_FILE_BYTES = 400, 43200, 2097152
 
 class EvaluationReviewer(Reviewer):
     """Keep decoded diagnostic replies only in the explicitly private report."""
+    last_decoded = None
+
     def review(self, *args, **kwargs):
         self.last_decoded = None
         return super().review(*args, **kwargs)
@@ -181,6 +183,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                           "policy_hash": identity, "candidate": case["candidate"], "packet": case["packet"],
                           "existing_coverage": case.get("existing_coverage")}
                 totals["cases"] += 1
+                reviewer.last_decoded = None
                 try:
                     candidate = case["candidate"]
                     if draft:

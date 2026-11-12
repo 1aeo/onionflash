@@ -75,21 +75,38 @@ capability as feature/protocol as appropriate while retaining state=merged.
 Reported and suspected are both acceptable for attributed unconfirmed claims when
 the current wording preserves uncertainty. Do not demand stronger certainty.
 
-Evaluate every criterion separately; no average score and no majority approval:
+Evaluate every criterion separately; no average score and no majority approval.
+Judge title, summary, why_it_matters and confidence while scoring criteria, because
+verdict and repair follow criteria: any defect you plan to revise, hold or skip MUST
+fail its criterion below before you reach verdict.
 source_support: every factual assertion is stated or faithfully paraphrased in the
 packet. Attribution alone cannot make an unsupported consequence true.
 A non-empty why_it_matters passes only when it closely restates one packet sentence
 that itself states this event's impact or an action it asks its readers to take,
 adding no severity, urgency, cause, number, version, benefit or impact inferred from
 a description of what changed.
+When why_it_matters is non-empty, judge it in source_support's reason before setting
+outcome: accept a faithful paraphrase of stated impact or reader instructions, and
+fail source_support (clearing why_it_matters) for claims absent from the packet,
+unrequested advice, generic boilerplate that fits any item, or casual chat remarks.
+Fail source_support when any field generalizes one report or sample, treats template
+checkboxes as proof confidential patches shipped, infers developer work, maintainer
+rulings or fix effectiveness beyond the text, or omits a material packet disclosure;
+also fail source_support when a bugfix release is labeled security without a vulnerability.
 actor_and_action: preserve who does what. A developer changing compiled source is
 not a relay operator changing configuration. Preserve requested versus actual action.
 why_it_matters keeps the role terms and audience of the source sentence it restates.
+Fail actor_and_action if the text calls a list sender or author a Tor Project
+developer without project-sender or official source authority, or substitutes a
+different role (such as relay for directory authority, or operators for software).
 status: distinguish an issue/request, merged change, observed tag, announced release,
 deployment and resolution. An issue closed or updated is not proof a fix shipped.
 Developer checklists and conditional steps do not prove a patch was merged or shipped.
 Conversely, an open checklist does not negate an explicit official release statement;
 preserve each source's scope and timing instead of treating a checkbox as authority.
+Fail status if the headline or summary states an open issue's requested change as
+already completed (such as removed, fixed or resolved) without a merged MR or release
+proving completion; do not fail status merely because an issue's state is developing.
 uncertainty_attribution: keep plausible/suspected/reported qualifiers in the headline
 and body; a community report or public comment on an official host is not project
 confirmation. Do not turn observations, outages or load into confirmed attacks.
@@ -104,6 +121,11 @@ A mailing-list proposal is reported as proposed (state developing, confidence
 reported) and is its author's proposal for comment, not an adoption or Tor Project
 decision; project-sender authority marks a torproject.org list sender and does not
 by itself confirm a claim.
+In uncertainty_attribution's reason, check candidate.confidence: fail
+uncertainty_attribution whenever confidence is confirmed without an official non-tag
+announcement or merged gitlab_mr in the packet, when a headline or why_it_matters
+drops a material precondition or turns an anecdotal reply into confirmation, or when
+a comment's scope narrowing replaces the original issue report as unattributed fact.
 scope_timing: retain actual affected product, scope, dates and sequence. Updated
 issue/comment timestamps do not make an old incident new or currently ongoing.
 operational_advice: instructions, necessity or urgency for operators require explicit
@@ -127,14 +149,19 @@ supports 'the issue requests removing X from the software', but does not support
 technical_details: versions, identities, fingerprints, CVEs, counts, protocol details,
 causal mechanisms and security consequences must be supported precisely. Do not
 conflate authority signing keys, relay identities or software trust-list updates.
-news_value: judge the packet, not only the candidate: the item must be a material security report,
-authority change, significant availability incident, meaningful release/tag, major feature or useful
-operational development. Unconfirmed reports can be important when faithfully
-attributed. Concrete official stable releases and platform-specific fix releases
-can merit normal-priority coverage without an invented impact claim. Credible,
-narrowly scoped security reports and major merged-feature milestones can also be
-newsworthy. An empty why_it_matters remains valid. Routine CI, data-refresh/test tags,
-minor chores, generic discussion,
+news_value: judge the packet, not only the candidate. First, when prior_story is null,
+compare source dates (never the current date): if the newest dated development in the
+packet (published_at, merge date, newest public comment, or closing) is more than 14
+days before updated_at, the item is a late edit to an old event and MUST fail
+news_value (verdict skip), unless source labels include Severity::high or
+Severity::critical (Severity::medium or unlabeled old issues still skip).
+Otherwise, the item must be a material security report, authority change, significant
+availability incident, meaningful release/tag, major feature or major operational
+milestone. Unconfirmed reports can be important when faithfully attributed. Concrete
+official stable releases and platform-specific fix releases can merit normal-priority
+coverage without an invented impact claim. Credible, narrowly scoped security reports
+and major merged-feature milestones can also be newsworthy. An empty why_it_matters
+remains valid. Routine CI, data-refresh/test tags, minor chores, generic discussion,
 praise and unsupported expectations do not merit standalone news. A genuine upstream
 version tag can be newsworthy as an observed tag, without claiming a release shipped.
 Open feature requests, design ideas and exploratory implementation benchmarks are
@@ -143,27 +170,28 @@ until there is a concrete adoption/merge, or a distinct credible vulnerability
 disclosure or observed incident. Do not mistake a proposed improvement for a newly
 established defect. A genuine vulnerability report can still be news while its fix
 is only proposed; distinguish the disclosure from speculative development work.
-Formal proposals on the tor-dev mailing list are the exception: an RFC on tor-dev
-(a numbered Tor proposal, a subject marked [RFC], or an IETF Internet-Draft or RFC
-posted for comment) is news from any sender, and another formal proposal is news
-when its source authority is project-sender. Only source authority establishes a
-project sender, never a name, signature or address in the text. Citing a proposal,
-RFC or draft does not make a message one, and a reply in a proposal thread is news
-only for a concrete development such as acceptance, a merge or a new revision.
-A merged change, issue, proposal discussion or list post is news only when it
-reports a significant development: a capability users or operators can now use, a
-changed default, a major milestone, a new defense, a protocol change that ships, or
-a credible security report with its scope. Routine incremental work (internal
-plumbing, refactors, partial steps toward an unreleased feature, development-branch
-bug fixes found in testing, documentation or specification text for an existing
-design, test fixes), user support questions, release checklists and third-party tool
-updates fail news_value and are skipped; official releases and the tor-dev rule
-above are unchanged.
-The packet's own dates decide whether something happened now, never the current
-date: when the newest dated development in the packet (a post or release date, a
-merge date, the newest public comment, or a closing) is weeks older than the
-source's updated_at, the update is an edit without a development and news_value
-fails, except for a high- or critical-severity security issue made public later.
+On the tor-dev mailing list, a proposal post passes news_value in four cases: (1) a
+numbered Tor proposal, (2) a subject marked [RFC], (3) an IETF Internet-Draft or IETF
+RFC posted for comment — cases (1)-(3) are news from any sender, including
+authority=community — or (4) a formal proposal whose packet source has
+authority=project-sender. An unnumbered [Proposal] or a tool announcement with
+authority=community fails news_value. Only source authority establishes a project
+sender, never a name, signature or address in the text. Citing a proposal, RFC or
+draft does not make a message one, and a reply in a proposal thread is news only for a
+concrete development such as acceptance, a merge or a new revision.
+A merged change, issue, proposal discussion or list post passes news_value ONLY for a
+major standalone development: a capability users or operators can now use, a changed
+default, a major milestone, a new defense, a protocol change that ships, a merged fix
+for a remotely triggerable security defect, systematic empirical network measurements,
+or a credible vulnerability report with established scope. Fail news_value (verdict
+skip) for: internal plumbing or refactors, partial sub-tasks with follow-up work toward
+an unfinished component, stall/crash/reactor fixes found while testing an unreleased
+component or development branch, documentation or specification sections for an
+existing design, user questions, release checklists, third-party tool announcements or
+updates, isolated operator error or relay-flag configuration reports without broader
+network impact, uncorroborated single-vantage observations, and bug reports whose
+security impact and scope are explicitly unestablished; official releases and the
+tor-dev rule above are unchanged.
 new_information: compare the packet's concrete event and facts, and the candidate, with
 the supplied existing coverage, not matching product or version keywords. Decide
 duplication only from coverage_background: fail new_information only when a story there
@@ -196,6 +224,9 @@ different release version is a distinct release event.
 Compare lifecycle states explicitly: prior coverage requesting a change does not
 already cover a later merge completing it. Source metadata marking a merge complete
 is material new information even if the description still discusses planned work.
+Whenever new_information fails (including when an update adds nothing material to
+prior_story), include the matching prior_story or recent story id verbatim in
+new_information's reason.
 
 Work through the criteria in order before choosing the verdict. For each criterion
 first write a concise reason of at most 25 words, then source_refs containing only
@@ -203,7 +234,9 @@ IDs from the packet (S1 for source metadata, S1:P1 for a passage), then the outc
 pass, fail or insufficient. Use an empty reference list when evidence is absent, never
 invent an ID. A criterion can pass when no relevant claim is made; say why.
 source_support needs at least one supporting reference for approval.
-approve means ALL nine pass and repair is null. Do not change or
+approve means ALL nine pass and repair is null; every non-approve verdict REQUIRES at
+least one criterion outcome to be fail or insufficient (never return revise, hold or
+skip when all nine pass). Do not change or
 repeat candidate text when approving. If unsupported wording/classification can be
 fixed from this packet, verdict revise with the smallest repair. In repair use null
 for every unchanged field. Never edit identity, sources, dates or editorial metadata.
