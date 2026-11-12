@@ -15,7 +15,7 @@ import time
 from onionflash.analyze import AnalysisError, Analyzer
 from onionflash.config import load_config
 from onionflash.render import _prepare_story
-from onionflash.review import EDITABLE, Reviewer, ReviewError, apply_repair, policy_hash
+from onionflash.review import EDITABLE, Reviewer, ReviewError, apply_repair, final_holds, policy_hash
 
 CASE_FILES = ("review_cases.json", "review_cases_judged.json")
 # A judged case names the flaw of its labeled wording or labels; one without a flaw is clean.
@@ -167,7 +167,8 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
     descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     totals = {"cases": 0, "matched": 0, "false_approvals": 0, "positive_rejections": 0, "omissions": 0,
               "errors": 0, "editorial_misses": 0, "impact_cleared": 0, "draft_unsupported": 0, "repairs_verified": 0,
-              "repairs_held": 0, "repairs_skipped": 0, "controlled_mismatches": 0, "incomplete": False}
+              "repairs_held": 0, "repairs_skipped": 0, "final_holds": 0, "published_after_checks": 0,
+              "controlled_mismatches": 0, "incomplete": False}
     judged, outcomes, seen = {}, {}, set()
     identity = policy_hash(config)
     with (os.fdopen(descriptor, "w", encoding="utf-8") as report, EvaluationReviewer(config, deadline=deadline) as reviewer,
@@ -226,6 +227,13 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                         final_verdict = verified["verdict"]
                         published = final_verdict == "approve"
                         unsafe = published and (case["expected"] in {"skip", "hold"} or bool(record["kept_unsupported"]))
+                        if published:  # scores measure the reviewer alone; the gate's final checks count apart
+                            # The first source wrote the candidate, as in draft mode.
+                            prepared = {"packet": case["packet"], "payload": {"editorial_kind": case["packet"]["sources"][0]["kind"]}}
+                            if held := final_holds(final_candidate, prepared):
+                                record["final_holds"] = held
+                            totals["final_holds"] += bool(held)
+                            totals["published_after_checks"] += not held
                     published_candidate = record.get("repaired", candidate) if published else None
                     missing = omitted(case, published_candidate) if published else []
                     # not_approve marks news with a flawed draft: hold or a clean repair, never a skip.

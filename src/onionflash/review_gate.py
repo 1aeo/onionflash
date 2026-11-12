@@ -18,13 +18,18 @@ from .util import digest, now_iso, saved_object
 
 MAX_APPROVALS = 2000  # cached approvals kept besides those unfinished jobs pin
 # Each hold reason and its operator text, which follows "Final review held: " in last_error. A hold
-# is logged as held.<stage>.<reason>, the stage being gate, review or verification.
+# is logged as held.<stage>.<reason>, the stage being gate, review, verification or final_check.
 HOLDS = {
     "missing_sources": "required source material is unavailable",
     "repeat_hold": "operator review is required",
     "model_hold": "review did not approve the candidate",
     "tag_repair": "review proposed editing a literal tag notice",
     "unusable_repair": "review proposed an unusable repair",
+    # review.final_holds, which holds a verified approval
+    "completed_action": "the story reports a completed action that its sources do not",
+    "compromise_headline": "the headline drops the sources' doubt about a compromise",
+    "confirmed_source": "confirmed needs an official announcement or a merged merge request",
+    "merge_state": "a story told only by merge requests must be marked merged",
 }
 
 
@@ -172,6 +177,9 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             if valid:
                 record["approval"] = proof
                 record["approval_key"] = key
+                if verdict["verdict"] == "approve" and (held := review.final_holds(candidate, prepared)):
+                    _hold(store, row, draft, writer_key, record, observed, "final_check", held[0])
+                    return {**report, "status": "held", "cache_hit": True}
                 record["outcome"] = "skipped" if verdict["verdict"] == "skip" else "approved"
                 _save(store, row["id"], writer_key, policy, record["outcome"], draft, prepared, record, observed,
                       prepared_at=prepared_at, approval_key=key)
@@ -200,6 +208,9 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                 _save(store, row["id"], writer_key, policy, stage, draft, prepared, record, observed,
                       prepared_at=prepared_at)
                 continue
+            if verdict["verdict"] == "approve" and (held := review.final_holds(candidate, prepared)):
+                _hold(store, row, draft, writer_key, record, observed, "final_check", held[0])
+                return {**report, "status": "held"}
             if verdict["verdict"] in {"approve", "skip"}:
                 key = _approval_key(candidate, prepared, policy)
                 record.update(candidate=candidate, approval_key=key,

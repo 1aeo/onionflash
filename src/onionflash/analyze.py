@@ -106,8 +106,9 @@ with its actual audience, scope and prerequisites preserved.
 Do not infer generic benefits to stability, reliability, security or privacy from
 the existence of a fix, or urgency from an editorial label. No caveats, filler, inferred
 privacy impacts or extra advice. Source-host location alone does not establish
-confirmation; use reported for issue/community claims and reserve confirmed for
-clear authoritative announcements. Confidence and editorial priority are separate.
+confirmation. Reserve confirmed for an official Tor Project announcement or a merged
+merge request's own change; use reported for issues, comments, maintainer statements,
+list posts and community claims. Confidence and editorial priority are separate.
 
 Return 1-3 literal supporting excerpts from the supplied title, content or a comment
 body in evidence. Each must have at least {MIN_EVIDENCE_CHARS} characters after whitespace normalization.
@@ -126,6 +127,18 @@ class AnalysisError(Exception):
         self.retryable = retryable
         if code is not None:
             self.code = code
+
+
+def label_limits(sources: list[dict]) -> dict:
+    """The confidence and state labels a story told by these sources may carry: confirmed needs
+    an official source that is not a tag, or a merged merge request, and a story told only by
+    merge requests is merged."""
+    confirmable = any((source.get("authority") == "official" and source.get("kind") != "tag")
+                      or (source.get("kind") == "gitlab_mr" and source.get("upstream_state") == "merged")
+                      for source in sources)
+    merges = bool(sources) and all(source.get("kind") == "gitlab_mr" for source in sources)
+    return {"confidence": [value for value in CONFIDENCES if confirmable or value != "confirmed"],
+            "state": ["merged"] if merges else list(STATES)}
 
 
 def cache_key(row: dict, llm: dict) -> str:
@@ -334,15 +347,17 @@ class Analyzer(CompletionClient):
             bounded["public_comments"] = notes
         # Evidence may quote the description window or any note body the writer saw.
         source = {**item, "content": "\n".join([bounded["content"], *(note["body"] for note in notes)])}
-        result = validate_analysis(self.complete(SYSTEM_PROMPT, bounded, _writer_schema(bounded), "onionflash_news"),
-                                   source)
+        schema = _writer_schema(bounded)
+        result = validate_analysis(self.complete(SYSTEM_PROMPT, bounded, schema, "onionflash_news"), source)
         if result["why_it_matters"]:
             raise AnalysisError("Writer must leave why_it_matters empty")
+        if any(result[key] not in schema["properties"][key]["enum"] for key in ("confidence", "state")):
+            raise AnalysisError("Writer labels exceed this source's limits")
         return result
 
 
 def _writer_schema(bounded: dict) -> dict:
-    """Constrain quote copying to literal spans of the exact supplied context."""
+    """Constrain quote copying to literal spans of the exact supplied context, and labels to its limits."""
     maximum = SCHEMA["properties"]["evidence"]["items"]["maxLength"]
     excerpts = []
     notes = [note["body"] for note in bounded.get("public_comments", [])]
@@ -383,4 +398,6 @@ def _writer_schema(bounded: dict) -> dict:
     schema["properties"]["evidence"]["items"]["enum"] = excerpts
     schema["properties"]["title"]["minLength"] = schema["properties"]["summary"]["minLength"] = 1
     schema["properties"]["evidence"]["minItems"] = 1
+    for key, allowed in label_limits([bounded]).items():
+        schema["properties"][key]["enum"] = allowed
     return schema

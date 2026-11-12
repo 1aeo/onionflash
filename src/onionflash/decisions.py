@@ -20,6 +20,7 @@ CODES = frozenset({
     "held.gate.missing_sources", "held.gate.repeat_hold", "held.gate.story_locked",
     "held.review.model_hold", "held.verification.model_hold",
     "held.review.tag_repair", "held.review.unusable_repair",
+    *(f"held.final_check.{reason}" for reason in ("completed_action", "compromise_headline", "confirmed_source", "merge_state")),
     *(f"failed.writer.{reason}" for reason in ("invalid_output", "evidence_too_short", "evidence_not_exact",
                                                "no_literal_evidence", "invalid_input", "truncated", "invalid_json")),
     *(f"failed.review.{reason}" for reason in ("invalid_reply", "invalid_input", "truncated", "invalid_json")),

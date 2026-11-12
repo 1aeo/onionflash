@@ -31,8 +31,9 @@ A code is `<outcome>.<stage>.<reason>` or `<outcome>.<reason>`. The outcome is
 `published`, `skipped`, `held`, `failed` or `operator`. The stage names where the
 decision was made: `gate` (the application's checks around the review), `review`
 (the first review; in `failed` codes, a request to the reviewer, the first review
-or the verification), `verification` (the fresh verification), `writer`, or
-`app`. Codes are stable, so counts can be compared over time.
+or the verification), `verification` (the fresh verification), `final_check` (the
+[final checks](FINAL_REVIEW.md#final-checks) of a verified approval), `writer`,
+or `app`. Codes are stable, so counts can be compared over time.
 
 | Code | Meaning |
 | --- | --- |
@@ -51,6 +52,10 @@ or the verification), `verification` (the fresh verification), `writer`, or
 | `held.verification.model_hold` | The verification did not approve the candidate. |
 | `held.review.tag_repair` | The review proposed editing a literal tag notice. |
 | `held.review.unusable_repair` | The review proposed a repair that cannot be applied. |
+| `held.final_check.completed_action` | A story written from an issue reports a completed action that its sources do not. |
+| `held.final_check.compromise_headline` | The headline drops the sources' doubt about a compromise. |
+| `held.final_check.confirmed_source` | The story is confirmed without an official announcement or a merged merge request. |
+| `held.final_check.merge_state` | A story told only by merge requests is not marked merged. |
 | `failed.writer.invalid_output` | The writer's draft did not match its schema. |
 | `failed.writer.evidence_too_short` | A draft evidence quote was too short. |
 | `failed.writer.evidence_not_exact` | A draft evidence quote was not an exact excerpt of the source. |

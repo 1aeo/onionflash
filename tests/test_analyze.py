@@ -12,6 +12,7 @@ from onionflash.analyze import (AnalysisError, Analyzer, MAX_EVIDENCE_CHOICES, M
                                 validate_analysis)
 from onionflash.comments import INPUT_CHARS
 from onionflash.config import DEFAULTS
+from onionflash.schema import CONFIDENCES, STATES
 from onionflash.store import Store
 from onionflash.transport import FetchError, Response
 from test_core import DATE, analysis, item
@@ -79,6 +80,33 @@ def test_writer_rejects_separate_impact_text_even_when_endpoint_ignores_schema(m
     assert len(llm.client.requests) == llm.calls == 1 + use_fallback  # the run report counts each endpoint request
     assert all(request[1]["response_format"]["json_schema"]["schema"]["properties"]["why_it_matters"]["enum"] == [""]
                for request in llm.client.requests)
+
+
+@pytest.mark.parametrize("source,confidence,state", [
+    (item(), ["reported", "suspected", "observed-anomaly"], STATES),
+    (item(kind="gitlab_mr", upstream_state="merged"), CONFIDENCES, ["merged"]),
+    (item(kind="feed", authority="official"), CONFIDENCES, STATES)], ids=["issue", "merged-request", "official-feed"])
+def test_writer_schema_limits_labels_by_source(monkeypatch, source, confidence, state):
+    llm = analyzer(monkeypatch, completion(analysis(why_it_matters="", state=state[0])))
+    llm.analyze(source)
+    fields = llm.client.requests[0][1]["response_format"]["json_schema"]["schema"]["properties"]
+    assert (fields["confidence"]["enum"], fields["state"]["enum"]) == (confidence, state)
+    assert SCHEMA["properties"]["confidence"]["enum"] == CONFIDENCES  # review repairs copy the full rules
+
+
+@pytest.mark.parametrize("use_fallback", [False, True])
+@pytest.mark.parametrize("source,labels", [(item(), {"confidence": "confirmed"}),
+                                           (item(kind="gitlab_mr", upstream_state="merged"), {"state": "released"})],
+                         ids=["confirmed-issue", "released-merge-request"])
+def test_writer_rejects_labels_outside_the_source_limits_even_when_endpoint_ignores_schema(monkeypatch, use_fallback,
+                                                                                         source, labels):
+    responses = [FetchError("network request failed", retryable=True)] if use_fallback else []
+    responses.append(completion(analysis(why_it_matters="", **labels)))
+    llm = analyzer(monkeypatch, *responses, fallbacks=["https://fallback.example/v1"])
+    with pytest.raises(AnalysisError, match="labels exceed") as caught:
+        llm.analyze(source)
+    assert not caught.value.retryable
+    assert len(llm.client.requests) == llm.calls == 1 + use_fallback
 
 
 @pytest.mark.parametrize("sent", [0, 1])
@@ -296,7 +324,7 @@ def test_one_failing_item_does_not_stop_the_run_but_two_endpoint_failures_do(tmp
 
 def test_writer_produces_one_draft_without_premerge_grounding(monkeypatch):
     claim = "Operators must update their configurations to exclude the node."
-    draft = analysis(summary=claim, why_it_matters="", confidence="confirmed", state="released")
+    draft = analysis(summary=claim, why_it_matters="", confidence="reported", state="fixed")
     llm = analyzer(monkeypatch, completion(draft))
     assert llm.analyze(item()) == draft
     assert len(llm.client.requests) == 1

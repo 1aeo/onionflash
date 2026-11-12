@@ -113,6 +113,101 @@ def test_release_labels_cannot_approve_a_merged_change(monkeypatch, category, ta
     assert review.validate_review(result, packet()) == result and public == before
 
 
+def unit(kind, *texts, authority="development", state=""):
+    """A packet source whose first text is its title."""
+    return {"kind": kind, "authority": authority, "upstream_state": state, "title": texts[0],
+            "passages": [{"text": text} for text in texts]}
+
+
+# A public Tor issue, and the merged merge request that later made its change.
+ISSUE = unit("gitlab_issue", "dirauth: Remove bastet from list",
+             "Last night, bastet's operator notified us that the machine is very plausibly compromised.",
+             "In any kind of scenario here, the keys can’t be trusted anymore and bastet will generate a new identity soon.",
+             "In the meantime, remove bastet from source as we can't trust it anymore.", state="opened")
+MERGED = unit("gitlab_mr", "Remove bastet's keys from default dirauth list", state="merged")
+FEED = unit("feed", "Tor Browser 16.0.2 is released", "Tor Browser 16.0.2 is now available for Android.", authority="official")
+CRASH = unit("gitlab_issue", "Fix the crash in the parser", state="opened")
+COMPROMISED = unit("gitlab_issue", "Bastet", "The machine was compromised.", state="opened")
+DONE, HEADLINE, CONFIRMED, MERGE = ["completed_action"], ["compromise_headline"], ["confirmed_source"], ["merge_state"]
+FINAL_CASES = [  # (id, writer kind, sources, story fields, expected holds)
+    ("removed-headline", "gitlab_issue", [ISSUE], {"title": "Tor Directory Authority 'bastet' Removed Following Suspected Compromise"}, DONE),
+    ("removed-from-source", "gitlab_issue", [ISSUE], {"title": "Tor authority bastet removed from source after reported compromise",
+     "summary": "A public issue says bastet has been removed from the source code as its keys can no longer be trusted."}, DONE),
+    ("removes", "gitlab_issue", [ISSUE], {"summary": "Tor removes bastet from the authority list."}, DONE),
+    ("revoked", "gitlab_issue", [ISSUE], {"title": "Bastet's keys revoked after reported compromise"}, DONE),
+    ("ships", "gitlab_issue", [CRASH], {"summary": "Tor ships a fix for the reported crash."}, DONE),
+    ("patched", "gitlab_issue", [CRASH], {"summary": "Developers patched the crash."}, DONE),
+    ("impact-patched", "gitlab_issue", [CRASH], {"why_it_matters": "Developers patched the crash."}, DONE),
+    ("planned-deployment", "gitlab_issue", [unit("gitlab_issue", "Crash", "The fix will be deployed next week.")],
+     {"summary": "The fix was deployed."}, DONE),
+    ("negated-in-source", "gitlab_issue", [unit("gitlab_issue", "Crash", "This wasn’t fixed in 2.7.0.")],
+     {"summary": "The crash was fixed in 2.7.0."}, DONE),
+    ("compound-in-source", "gitlab_issue", [unit("gitlab_issue", "Crash", "The parser uses a fixed-size buffer and crashes on long input.")],
+     {"summary": "The crash was fixed."}, DONE),
+    ("requested", "gitlab_issue", [ISSUE], {"title": "Tor authority bastet to be removed from source after reported compromise"}, []),
+    ("asked", "gitlab_issue", [ISSUE], {"summary": "The issue asks that bastet be removed."}, []),
+    ("not-yet", "gitlab_issue", [ISSUE], {"summary": "Bastet has not been removed yet."}, []),
+    ("contractions", "gitlab_issue", [ISSUE], {"summary": "Bastet wasn't removed yet, and its keys haven’t been rotated."}, []),
+    ("no-fixed-release", "gitlab_issue", [ISSUE], {"summary": "No fixed release has been identified."}, []),
+    ("adjective", "gitlab_issue", [ISSUE], {"summary": "The parser uses a fixed-size buffer."}, []),
+    ("stated-elsewhere", "gitlab_issue", [unit("gitlab_issue", "Fix the crash in the parser", "The crash is fixed in main.")],
+     {"summary": "Developers fixed the crash."}, []),
+    ("stated-in-comment", "gitlab_issue", [unit("gitlab_issue", "Protover parser differential", "This was fixed in 2.7.0. Closing.")],
+     {"summary": "This was fixed in Arti 2.7.0."}, []),
+    ("noun", "gitlab_issue", [ISSUE], {"title": "Arti 2.8.0 released with low-severity security fixes"}, []),
+    ("not-issue-written", "feed", [ISSUE], {"summary": "Tor removes bastet from the authority list."}, []),
+    ("merged-title", "gitlab_issue", [ISSUE, MERGED], {"summary": "Bastet's keys were removed from the default authority list."}, []),
+    ("merged-title-other-change", "gitlab_issue", [ISSUE, MERGED], {"summary": "Bastet's keys were revoked."}, DONE),
+    ("unmerged-title", "gitlab_issue", [ISSUE, {**MERGED, "upstream_state": "opened"}],
+     {"summary": "Bastet's keys were removed from the default authority list."}, DONE),
+    ("compromised", "gitlab_issue", [ISSUE], {"title": "Bastet directory authority compromised"}, HEADLINE),
+    ("hacked", "gitlab_issue", [ISSUE], {"title": "Tor directory authority bastet hacked"}, HEADLINE),
+    ("breach", "gitlab_issue", [ISSUE], {"title": "Bastet authority breach forces key change"}, HEADLINE),
+    ("possibly", "gitlab_issue", [unit("gitlab_issue", "Bastet", "It was possibly compromised.")], {"title": "Bastet compromised"}, HEADLINE),
+    ("hedged-by-second-source", "gitlab_issue", [COMPROMISED, unit("feed", "Bastet", "It may have been compromised.")],
+     {"title": "Bastet compromised"}, HEADLINE),
+    ("qualified", "gitlab_issue", [ISSUE], {"title": "Bastet reported plausibly compromised"}, []),
+    ("may-have-been", "gitlab_issue", [ISSUE], {"title": "Bastet may have been compromised"}, []),
+    ("unhedged-source", "gitlab_issue", [COMPROMISED], {"title": "Bastet compromised"}, []),
+    ("issue-confirmed", "gitlab_issue", [ISSUE], {"confidence": "confirmed"}, CONFIRMED),
+    ("tag-and-issue-confirmed", "gitlab_issue", [unit("tag", "arti-v2.7.0", authority="official"), ISSUE], {"confidence": "confirmed"}, CONFIRMED),
+    ("unmerged-request-confirmed", "gitlab_mr", [{**MERGED, "upstream_state": ""}], {"confidence": "confirmed", "state": "merged"}, CONFIRMED),
+    ("merged-request-confirmed", "gitlab_mr", [MERGED], {"confidence": "confirmed", "state": "merged"}, []),
+    ("official-feed-confirmed", "feed", [FEED], {"confidence": "confirmed", "state": "released"}, []),
+    ("official-feed-and-issue-confirmed", "feed", [FEED, ISSUE], {"confidence": "confirmed"}, []),
+    ("release-shape-confirmed", "feed", [unit("tag", "tor-0.4.9.16", authority="official"), FEED,
+                                         unit("metrics_timeline", "Relay versions", authority="telemetry")],
+     {"confidence": "confirmed", "state": "released"}, []),
+    ("merge-request-released", "gitlab_mr", [MERGED], {"title": "Tor releases a parser fix", "state": "released"}, MERGE),
+    ("merge-request-and-issue-fixed", "gitlab_mr", [MERGED, ISSUE], {"state": "fixed"}, []),
+    ("operator-only-state", "gitlab_issue", [ISSUE], {"state": "no-longer-listed"}, []),
+]
+
+
+@pytest.mark.parametrize("writer,sources,fields,expected", [case[1:] for case in FINAL_CASES], ids=[case[0] for case in FINAL_CASES])
+def test_final_holds_on_real_cases(writer, sources, fields, expected):
+    """Fixed checks of a verified approval, over texts written for real public sources."""
+    story = candidate(**{"title": "Bastet reported plausibly compromised", "why_it_matters": "", "category": "security",
+                         "tags": ["security"], "summary": "A public issue reports that bastet's machine is very plausibly compromised.",
+                         "confidence": "reported", "state": "developing", **fields})
+    assert review.final_holds(story, {"packet": {"sources": sources}, "payload": {"editorial_kind": writer}}) == expected
+
+
+@pytest.mark.parametrize("source,confidence,state", [
+    (ISSUE, ["reported", "suspected", "observed-anomaly"], analyze.STATES), (MERGED, analyze.CONFIDENCES, ["merged"]),
+    (FEED, analyze.CONFIDENCES, analyze.STATES)], ids=["issue", "merged-request", "official-feed"])
+def test_repair_schema_offers_only_labels_the_packet_allows(monkeypatch, source, confidence, state):
+    evidence = {"sources": [{**source, "id": "S1", "passages": [{"id": "S1:P1", **source["passages"][0]}]}],
+                "missing_sources": [], "truncated": False}
+    checker = reviewer(monkeypatch, completion(verdict()), completion(verdict()))
+    checker.review(candidate(), evidence)
+    checker.review(candidate(), evidence, verification=True)
+    for _, request in checker.client.requests:
+        repair = request["response_format"]["json_schema"]["schema"]["properties"]["repair"]["anyOf"][1]["properties"]
+        assert (repair["confidence"]["anyOf"][0]["enum"], repair["state"]["anyOf"][0]["enum"]) == (confidence, state)
+    assert review.FIELDS["confidence"]["enum"] == analyze.CONFIDENCES  # another packet keeps its own limits
+
+
 def test_inconsistent_release_metadata_does_not_prevent_editorial_skip(monkeypatch):
     """Non-news can still be skipped without repairing metadata that will not publish."""
     result = reviewer(monkeypatch, completion(verdict("skip", criterion="news_value"))).review(

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import copy
+import re
 
-from .analyze import AnalysisError, CompletionClient, SCHEMA as DRAFT_SCHEMA
+from .analyze import AnalysisError, CompletionClient, SCHEMA as DRAFT_SCHEMA, label_limits
 from .candidate import SEMANTIC_FIELDS as EDITABLE
 from .render import _prepare_story
-from .util import digest
+from .util import digest, normalize_evidence
 
 REVIEW_VERSION = "onionflash-review-10"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
@@ -90,6 +91,9 @@ confirmation. Do not turn observations, outages or load into confirmed attacks.
 Counters, missing responses or a silent mitigation counter do not establish an
 attack, compromise or defense bypass. Include material source-specific maintainer
 disagreement or qualification; do not present a disputed report as settled fact.
+Reserve confirmed for an official Tor Project announcement or a merged merge request's
+own change; use reported for issues, comments, maintainer statements, list posts and
+community claims.
 scope_timing: retain actual affected product, scope, dates and sequence. Updated
 issue/comment timestamps do not make an old incident new or currently ongoing.
 operational_advice: instructions, necessity or urgency for operators require explicit
@@ -321,6 +325,56 @@ def release_labels_match_state(candidate: dict) -> bool:
             or (candidate["category"] != "release" and "release" not in candidate["tags"]))
 
 
+# Final checks (docs/FINAL_REVIEW.md#final-checks). Each completed-action word, with the
+# imperative that states the same change in a merged merge request's title.
+DONE = {"removed": "remove", "removes": "remove", "fixed": "fix", "patched": "patch", "resolved": "resolve",
+        "deployed": "deploy", "deploys": "deploy", "disabled": "disable", "disables": "disable",
+        "revoked": "revoke", "revokes": "revoke", "rotated": "rotate", "rotates": "rotate",
+        "shipped": "ship", "ships": "ship"}
+_DONE_WORD = re.compile(r"\b(" + "|".join(DONE) + r")\b(?!-)")
+# A story's word right after a modal, negation or request claims nothing: "to be removed".
+_EXCUSED = re.compile(r"\b(?:should|must|will|would|could|may|might|to|be|not|never|yet|no|without|asks?|"
+                      r"requests?|proposes?|wants?|plans?|needs?)\s+(?:(?:yet|been|be|being|to)\s+)*$")
+# Nor does a source's word within three words of one: "will be deployed".
+_UNPROVEN = re.compile(r"\b(?:not|never|cannot|should|must|will|would|could|may|might|to|no)\b(?:\s+\w+){0,3}\s*$")
+_HEDGED = re.compile(r"(?:plausib|suspect|possib|potential|alleg|unconfirmed|likely|(?:may|might|could)\s+(?:have\s+)?be(?:en)?)"
+                     r"\w*\s+(?:\w+\s+){0,2}(?:compromis|hack|breach)")
+_COMPROMISE = re.compile(r"compromis|hack|breach")
+_QUALIFIED = re.compile(r"suspect|report|plausib|possib|potential|alleg|concern|unconfirmed|likely|\b(?:may|might|could)\b")
+
+
+def _plain(text: str) -> str:
+    """Text as the final checks match it: normalized as evidence is, with n't as " not"."""
+    return normalize_evidence(text).replace("n't", " not")
+
+
+def _stated(text: str, word: str) -> bool:
+    return any(not _UNPROVEN.search(text[max(0, match.start() - 45):match.start()])
+               for match in re.finditer(rf"\b{word}\b(?!-)", text))
+
+
+def final_holds(candidate: dict, prepared: dict) -> list[str]:
+    """Why a verified approval may not publish, as review_gate.HOLDS reasons; empty when it may.
+
+    The checks read only the candidate, its packet and the kind of source that wrote its
+    text, so every caller reaches the same answer, and none needs a model call."""
+    sources = prepared["packet"]["sources"]
+    proof = _plain("\n".join(passage["text"] for source in sources for passage in source["passages"]))
+    merged = _plain("\n".join(source["title"] for source in sources
+                              if source.get("kind") == "gitlab_mr" and source.get("upstream_state") == "merged"))
+    claimed = []
+    if prepared["payload"]["editorial_kind"] == "gitlab_issue":  # text drafted from an issue, which requests work
+        for text in map(_plain, (candidate["title"], candidate["summary"], candidate["why_it_matters"])):
+            claimed += [match[1] for match in _DONE_WORD.finditer(text)
+                        if not _EXCUSED.search(text[max(0, match.start() - 90):match.start()])]
+    title, limits = _plain(candidate["title"]), label_limits(sources)
+    return [reason for reason, held in (
+        ("completed_action", any(not (_stated(proof, word) or _stated(merged, DONE[word])) for word in claimed)),
+        ("compromise_headline", bool(_HEDGED.search(proof) and _COMPROMISE.search(title) and not _QUALIFIED.search(title))),
+        ("confirmed_source", candidate["confidence"] not in limits["confidence"]),
+        ("merge_state", limits["state"] == ["merged"] and candidate["state"] != "merged")) if held]
+
+
 def _skip_stands(criteria: dict, coverage: dict | None) -> bool:
     """A skip needs a failed editorial criterion. Duplication is decided only from the
     coverage background, so a skip for new_information alone must name a story there."""
@@ -346,6 +400,9 @@ class Reviewer(CompletionClient):
             # them afterward; this avoids wasting retries on invented passage IDs.
             for check in schema["properties"]["criteria"]["properties"].values():
                 check["properties"]["source_refs"]["items"]["enum"] = sorted(refs)
+        # A repair offers only the labels this packet allows.
+        for key, allowed in label_limits(packet["sources"]).items():
+            schema["properties"]["repair"]["anyOf"][1]["properties"][key]["anyOf"][0]["enum"] = allowed
         # Each call starts with the rubric, exact candidate and bounded context.
         # A prior model response, critique or approval is never part of its history.
         payload = {"candidate": candidate_public, "packet": packet}

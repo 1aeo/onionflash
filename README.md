@@ -217,10 +217,11 @@ fresh verification. See
   collected URLs, never model-proposed URLs. Source text is treated as untrusted
   data. Repeated identical model labels are normalized rather than retried;
   invalid labels and unsupported evidence are still rejected.
-- Reports and suspected compromises retain explicit uncertainty. GitLab issue
-  hosting alone does not establish confirmation. Tags
-  are marked `tagged`; merges are marked `merged`. A later tag cannot downgrade an
-  already announced release.
+- Reports and suspected compromises retain explicit uncertainty. Confirmed needs
+  an official announcement (not a tag) or a merged merge request, so GitLab issue
+  hosting alone does not establish confirmation. Tags are marked `tagged`, and a
+  story told only by merge requests is `merged`. A later tag cannot downgrade an
+  already announced release. See the [final checks](docs/FINAL_REVIEW.md#final-checks).
 - Matching release versions/products, identical titled issue bodies, and
   canonical URLs provide conservative duplicate grouping. Semantic similarity
   alone does not combine unrelated incidents. Original publication dates and

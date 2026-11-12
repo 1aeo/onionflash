@@ -9,7 +9,7 @@ import pytest
 
 from approval_helpers import verdict
 from onionflash.config import DEFAULTS
-from onionflash.review import CRITERIA, _packet_refs
+from onionflash.review import CRITERIA, _packet_refs, final_holds
 from onionflash.source_packet import build_packet
 
 
@@ -217,6 +217,22 @@ def test_first_approval_is_not_publication_without_final_verification(evaluation
     assert result["positive_rejections"] == 1 and result["matched"] == 0
     record = json.loads((tmp_path / "final-hold.jsonl").read_text().splitlines()[0])
     assert record["published_candidate"] is None and record["final_verdict"] == "hold"
+
+
+def test_final_checks_count_apart_from_the_reviewer_scores(evaluation, tmp_path, monkeypatch):
+    """Scores measure the reviewer alone: an approval the gate's final checks would hold is still a false approval."""
+    module, config = evaluation
+    selected = [c for c in corpus() if c["id"] in {"bastet-removed-as-done", "bastet-corrected"}]
+    monkeypatch.setattr(module, "EvaluationReviewer", scripted(lambda verification: {"verdict": "approve"}))
+    output = tmp_path / "checks.jsonl"
+    result = module.evaluate(config, selected, output)
+    assert (result["false_approvals"], result["matched"], result["final_holds"], result["published_after_checks"]) == (1, 1, 1, 1)
+    records = {record["case"]: record for record in map(json.loads, output.read_text().splitlines()[:-1])}
+    assert records["bastet-removed-as-done"]["final_holds"] == ["completed_action"]
+    assert "final_holds" not in records["bastet-corrected"]
+    # No case that must publish is held by a final check.
+    assert not [case["id"] for case in corpus() if case["expected"] == "approve" and final_holds(case["candidate"], {
+        "packet": case["packet"], "payload": {"editorial_kind": case["packet"]["sources"][0]["kind"]}})]
 
 
 def test_evaluation_detects_unsupported_labels_after_text_is_repaired():

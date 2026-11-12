@@ -8,7 +8,7 @@ import sqlite3
 import pytest
 
 from approval_helpers import approve, verdict
-from onionflash import editorial, rejection, review, review_gate
+from onionflash import decisions, editorial, rejection, review, review_gate
 from onionflash.analyze import AnalysisError, cache_key, tag_notice
 from onionflash.store import Store
 from onionflash.util import digest
@@ -213,6 +213,47 @@ def test_a_recorded_decision_without_a_usable_receipt_reviews_the_draft_again(co
     assert [call[0] for call in checker.calls] == [first.calls[0][0]] * 2
     audit = json.loads(store.db.execute("SELECT review_record FROM analyses").fetchone()[0])
     assert [entry["stage"] for entry in audit["reviews"]] == ["review", "verification"]
+
+
+FINAL_CHECKS = {  # the source and the draft that fail each final check
+    "completed_action": ({}, {"title": "Tor authority bastet removed from source after reported compromise"}),
+    "compromise_headline": ({}, {"title": "Bastet directory authority compromised"}),
+    "confirmed_source": ({}, {"confidence": "confirmed"}),
+    "merge_state": ({"kind": "gitlab_mr", "upstream_state": "merged"}, {"state": "released"}),
+}
+
+
+@pytest.mark.parametrize("reason", FINAL_CHECKS)
+def test_verified_approval_failing_a_final_check_is_held_with_its_code(context, reason):
+    """The check runs on the verified text before any receipt; a skip is not checked."""
+    cfg, store = context
+    source, draft = FINAL_CHECKS[reason]
+    row = pending(store, item(**source))
+    result = run(cfg, store, row, Writer(analysis(**draft)), Reviewer(verdict()))
+    assert result["status"] == "held" and result["review_calls"] == 2
+    assert store.db.execute("SELECT last_error FROM items").fetchone()[0] == "Final review held: " + review_gate.HOLDS[reason]
+    assert [entry["code"] for entry in decisions.for_item(store.db, row["id"])] == [f"held.final_check.{reason}"]
+    assert store.stories() == [] and not store.db.execute("SELECT 1 FROM review_approvals").fetchone()
+    other = pending(store, item(**source, url="https://example.org/news/2"))
+    assert run(cfg, store, other, Writer(analysis(**draft)), Reviewer(verdict("skip", criterion="news_value")))["status"] == "ignored"
+
+
+def test_a_resumed_approval_is_checked_again_without_a_model_call(context, monkeypatch):
+    """An approval saved before a commit that did not happen is checked when it is reused."""
+    cfg, store = context
+    row = pending(store)
+    commit, check = store.commit_candidate, review.final_holds
+    monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash before commit")))
+    monkeypatch.setattr(review, "final_holds", lambda candidate, prepared: [])
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        run(cfg, store, row, Writer(analysis(confidence="confirmed")), Reviewer(verdict()))
+    monkeypatch.setattr(store, "commit_candidate", commit)
+    monkeypatch.setattr(review, "final_holds", check)
+    writer, checker = Writer(), Reviewer()
+    result = run(cfg, store, row, writer, checker, allow_network=False)
+    assert result["status"] == "held" and result["cache_hit"] and writer.calls == checker.calls == []
+    assert [entry["code"] for entry in decisions.for_item(store.db, row["id"])] == ["held.final_check.confirmed_source"]
+    assert rejection.show_item(store, row["id"])["final_review"]["latest_review"]["verdict"] == "approve"
 
 
 def test_changed_source_invalidates_staged_draft_and_prior_approval(context, monkeypatch):

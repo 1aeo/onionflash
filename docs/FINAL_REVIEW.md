@@ -86,6 +86,30 @@ uses the same number: writer, critique/repair, verification. Deterministic tag
 text skips the writer call but still needs both reviews; a tag is not an official
 release announcement. A first-round skip or hold ends without final verification.
 
+## Final checks
+
+A verified approval publishes only if four fixed checks also pass. They read the
+exact candidate, its source packet and the kind of source that wrote its text,
+make no model call, and run again when a saved approval is resumed. A failed
+check holds the item for the operator with its own [decision code](DECISIONS.md);
+skips are not checked.
+
+- Confirmed needs an official announcement that is not a tag, or a merged merge
+  request.
+- A story told only by merge requests is marked merged.
+- A story written from a GitLab issue may say that something was removed, fixed,
+  patched, resolved, deployed, disabled, revoked, rotated or shipped only where a
+  source uses the same word without a negation or modal just before it, or a
+  merged merge request's title names that change ("Remove ..." supports removed
+  and removes). A contraction such as "wasn't" counts as a negation, and a word
+  the story itself marks as requested, planned or not done claims nothing.
+- When a source hedges a compromise ("plausibly compromised", "may have been
+  hacked"), a headline about the compromise keeps a qualifier.
+
+The writer's request and every review's repair offer only the confidence and
+state labels that the first two checks allow, and a draft outside them is
+refused like any other invalid draft.
+
 ## Exact decisions and private state
 
 Decisions bind the normalized candidate, source packet, coverage background,
@@ -136,10 +160,13 @@ out (`required`); a publication without required wording counts as an omission,
 not a false approval. A passage may be a comment with its author, date and link,
 placed as the application places comments. `impact_cleared` counts approvals
 published only after their impact sentence was cleared, and a report keeps the
-model's own verdict when a fixed rule replaced it. `--draft` instead has the
-writer draft each packet once per round and reviews that draft under each
-coverage background its cases use; `draft_unsupported` counts drafts that
-contain flagged wording or labels. The default case files are
+model's own verdict when a fixed rule replaced it. Scores treat a verified
+approval as published, so they measure the reviewer alone. `final_holds` counts
+the verified approvals that the [final checks](#final-checks) would hold (each
+case's report names the checks), and `published_after_checks` counts the rest.
+`--draft` instead has the writer draft each packet once per round and reviews
+that draft under each coverage background its cases use; `draft_unsupported`
+counts drafts that contain flagged wording or labels. The default case files are
 `tools/review_cases.json` and `tools/review_cases_judged.json`, whose cases quote
 public upstream sources and carry labels from independent reviewers. An
 explicit `--cases` replaces the default case files and may be repeated.
