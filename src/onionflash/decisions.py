@@ -26,7 +26,7 @@ CODES = frozenset({
                                                "no_literal_evidence", "invalid_input", "truncated", "invalid_json")),
     *(f"failed.review.{reason}" for reason in ("invalid_reply", "invalid_input", "truncated", "invalid_json")),
     "failed.app.invalid_tag_name", "failed.app.unexpected", "failed.app.damaged_item", "failed.app.damaged_job",
-    "operator.retried", "operator.reconsidered", "operator.dismissed",
+    "operator.retried", "operator.reconsidered", "operator.dismissed", "operator.approved",
 })
 EDITORIAL = ("new_information", "news_value")
 EXAMPLES = 3  # newest examples per code in the summary
@@ -192,7 +192,8 @@ def summary(db, since: str) -> dict:
             # an update of it publishes after its latest hold; held_updates is the story's lifetime count.
             "held_updates": [{"story_id": story_id, "held_updates": held, "locked": bool(locked)} for story_id, held, locked
                              in db.execute("""SELECT story_id,held_updates,locked FROM editorial_controls c WHERE held_updates>0
-                                 AND NOT EXISTS (SELECT 1 FROM decision_log WHERE story_id=c.story_id AND code GLOB 'published.*'
+                                 AND NOT EXISTS (SELECT 1 FROM decision_log WHERE story_id=c.story_id
+                                 AND (code GLOB 'published.*' OR code='operator.approved')
                                  AND id>(SELECT COALESCE(MAX(id),0) FROM decision_log WHERE story_id=c.story_id
                                          AND code='held.gate.story_locked')) ORDER BY story_id""")],
         },

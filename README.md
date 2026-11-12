@@ -170,7 +170,7 @@ while taking their upload snapshot.
 ### Editorial controls
 
 `onionflash story show|history|correct|retract|restore|unlock` corrects or
-retracts a published story; `onionflash rejected list|show|retry|dismiss`
+retracts a published story; `onionflash rejected list|show|retry|dismiss|approve`
 handles failed analyses and ignored items; `onionflash decisions summary|list`
 reads the private log of every decision. See
 [editorial commands and recovery](docs/EDITORIAL.md),

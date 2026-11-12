@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 
-from . import decisions, review
+from . import candidate as candidate_mod, decisions, render, review
 from .analyze import AnalysisError, cache_key
 from .util import digest, now_iso, saved_object
 
@@ -302,3 +302,184 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         return {**report, "status": "stale"}
     finally:
         _prune(store, MAX_APPROVALS)
+
+
+def _new_coverage(old_coverage, current_coverage) -> list[dict]:
+    old_recent = old_coverage.get("recent") if isinstance(old_coverage, dict) else None
+    seen = {
+        (entry["id"], entry["updated_at"])
+        for entry in (old_recent if isinstance(old_recent, list) else ())
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str) and isinstance(entry.get("updated_at"), str)
+    }
+    return [
+        {"id": entry["id"], "title": entry["title"], "updated_at": entry["updated_at"]}
+        for entry in ((current_coverage or {}).get("recent") or ())
+        if (entry["id"], entry["updated_at"]) not in seen
+    ]
+
+
+def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
+    def refuse(reason: str, editorial_failures=(), new_coverage=()):
+        return {
+            "eligible": False,
+            "reason": reason,
+            "hash": None,
+            "editorial_failures": list(editorial_failures),
+            "new_coverage": list(new_coverage),
+        }, None
+
+    item_row = store.db.execute(
+        """SELECT id,url,source_id,content_hash,cluster_key,status,attempts,rejections,
+           next_attempt_at,last_error,story_id,first_seen,last_seen,priority_score,
+           typeof(payload) AS payload_type,CAST(payload AS BLOB) AS payload_blob
+           FROM items WHERE id=?""",
+        (item_id,),
+    ).fetchone()
+    job = store.db.execute(
+        """SELECT writer_key,policy_hash,stage,prepared_at,CAST(draft_json AS BLOB) AS draft,
+           CAST(envelope_json AS BLOB) AS envelope,CAST(record_json AS BLOB) AS record
+           FROM review_jobs WHERE item_id=?""",
+        (item_id,),
+    ).fetchone()
+    if item_row is None or item_row["status"] != "rejected" or job is None or job["stage"] != "held":
+        return refuse("Only a held final review can be approved")
+    payload_obj = saved_object(item_row["payload_blob"]) if item_row["payload_type"] == "text" else None
+    draft, saved_env, record = (saved_object(job[key]) for key in ("draft", "envelope", "record"))
+    if (payload_obj is None or draft is None or saved_env is None or record is None
+            or not isinstance(job["writer_key"], str) or not job["writer_key"]
+            or not isinstance(job["prepared_at"], str)):
+        return refuse("Saved review record cannot be read")
+    reviews = record.get("reviews")
+    if not isinstance(reviews, list):
+        return refuse("Saved review record cannot be read")
+    try:
+        if any(not isinstance(entry, dict) or entry["stage"] not in {"review", "verification"} for entry in reviews):
+            return refuse("Saved review record cannot be read")
+        editorial_failures = [
+            f"{entry['stage']}:{name}"
+            for entry in reviews
+            for name in ("news_value", "new_information")
+            if entry["result"]["criteria"][name]["outcome"] != "pass"
+        ]
+    except (TypeError, KeyError, AttributeError):
+        return refuse("Saved review record cannot be read")
+    policy = review.policy_hash(config)
+    if (job["policy_hash"] != policy or record.get("policy_hash") != policy
+            or any(entry.get("policy_hash") != policy for entry in reviews)):
+        return refuse("An earlier review policy or packet reviewed it; retry it", editorial_failures)
+    row = {key: item_row[key] for key in (
+        "id", "url", "source_id", "content_hash", "cluster_key", "status", "attempts", "rejections",
+        "next_attempt_at", "last_error", "story_id", "first_seen", "last_seen", "priority_score")}
+    row["payload"] = item_row["payload_blob"].decode("utf-8")
+    try:
+        prepared = store.prepare_candidate(row, draft, job["prepared_at"])
+    except Exception:
+        return refuse("Its story or sources changed since the review; retry it", editorial_failures)
+    if prepared["locked"]:
+        return refuse("Its story is editorially locked", editorial_failures)
+    held_prepared = record.get("prepared")
+    if not isinstance(held_prepared, dict):
+        return refuse("Saved review record cannot be read", editorial_failures)
+    new_coverage = _new_coverage(held_prepared.get("coverage"), prepared["coverage"])
+    if prepared["packet"]["missing_sources"]:
+        return refuse("Final review held: " + HOLDS["missing_sources"], editorial_failures, new_coverage)
+    saved_binding = saved_env.get("binding") if isinstance(saved_env.get("binding"), dict) else {}
+    if (prepared["story_id"] != saved_env.get("story_id")
+            or prepared["candidate_hash"] != held_prepared.get("candidate_hash")
+            or prepared["candidate_hash"] != saved_env.get("candidate_hash")
+            or prepared["source_hash"] != held_prepared.get("source_hash")
+            or prepared["source_hash"] != saved_env.get("source_hash")
+            or any(prepared["binding"][key] != saved_binding.get(key)
+                   for key in ("prior_story", "lock", "sources", "payload_hash"))):
+        return refuse("Its story or sources changed since the review; retry it", editorial_failures, new_coverage)
+    if any(entry.get("source_hash") != prepared["source_hash"] for entry in reviews):
+        return refuse("An earlier review policy or packet reviewed it; retry it", editorial_failures, new_coverage)
+    try:
+        validated = [review.validate_review(entry["result"], prepared["packet"]) for entry in reviews]
+    except (AnalysisError, ValueError, TypeError, KeyError):
+        return refuse("Saved review record cannot be read", editorial_failures, new_coverage)
+    if any(result["criteria"]["new_information"]["outcome"] != "pass" for result in validated):
+        return refuse("A review failed new_information (already covered); dismiss it", editorial_failures, new_coverage)
+    candidate = record.get("candidate")
+    original = prepared["candidate"]
+    if not isinstance(candidate, dict) or set(candidate) != set(original):
+        return refuse("No fresh verification reviewed this exact text", editorial_failures, new_coverage)
+    if any(candidate[key] != original[key] for key in original if key not in candidate_mod.SEMANTIC_FIELDS):
+        return refuse("Saved review record cannot be read", editorial_failures, new_coverage)
+    try:
+        if render._prepare_story(candidate, editorial=original.get("editorial")) != candidate:
+            return refuse("Saved review record cannot be read", editorial_failures, new_coverage)
+    except (ValueError, TypeError, KeyError):
+        return refuse("Saved review record cannot be read", editorial_failures, new_coverage)
+    candidate_hash = digest(candidate)
+    reviews_of_text = [
+        (entry, result)
+        for entry, result in zip(reviews, validated)
+        if entry.get("candidate_hash") == candidate_hash
+    ]
+    if not any(entry.get("stage") == "verification" for entry, _ in reviews_of_text):
+        return refuse("No fresh verification reviewed this exact text", editorial_failures, new_coverage)
+    failed_facts = [
+        name for name in review.CRITERIA
+        if name not in review.EDITORIAL_CRITERIA
+        and any(result["criteria"][name]["outcome"] != "pass" for _, result in reviews_of_text)
+    ]
+    if failed_facts:
+        return refuse(f"A review failed {', '.join(failed_facts)}; dismiss or retry it", editorial_failures, new_coverage)
+    if (record.get("verified_facts") is not True or not _verified(reviews)
+            or any(not result["criteria"]["source_support"]["source_refs"] for _, result in reviews_of_text)):
+        return refuse("No fresh verification with cited sources approved the facts; retry or dismiss it",
+                      editorial_failures, new_coverage)
+    if held := review.final_holds(candidate, prepared):
+        return refuse("Final review held: " + HOLDS[held[0]], editorial_failures, new_coverage)
+    if not review.release_labels_match_state(candidate):
+        return refuse("Final review held: " + HOLDS["release_labels"], editorial_failures, new_coverage)
+    if not editorial_failures:
+        return refuse("Only a held news-value dispute can be approved", editorial_failures, new_coverage)
+    exact_entries = [entry for entry, _ in reviews_of_text]
+    approval_hash = digest(["approve-as-reviewed", prepared["binding_hash"], candidate_hash, policy, digest(exact_entries)])
+    return {
+        "eligible": True,
+        "reason": None,
+        "hash": approval_hash,
+        "editorial_failures": editorial_failures,
+        "new_coverage": new_coverage,
+    }, (prepared, candidate, job["writer_key"], record)
+
+
+def approval(config, store, item_id: str) -> dict:
+    """Read-only eligibility and binding hash for `rejected approve`; never raises on damaged rows."""
+    return _check_approval(config, store, item_id)[0]
+
+
+def approve(config, store, item_id: str, approval_hash: str, reason: str, stamp: str) -> dict:
+    """Publish an eligible held candidate exactly as reviewed, without model calls."""
+    if store.db.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone() is None:
+        raise ValueError("Source item was not found")
+    info, handle = _check_approval(config, store, item_id)
+    if not info["eligible"]:
+        raise ValueError(info["reason"])
+    if info["hash"] != approval_hash:
+        raise ValueError("Approval hash does not match the current candidate, coverage and policy; inspect the item before approving")
+    prepared, candidate, writer_key, record = handle
+    audit = json.loads(_json(record))
+    audit["outcome"] = "operator_approved"
+    audit["operator_approval"] = {
+        "reason": reason,
+        "approved_at": stamp,
+        "approval_hash": approval_hash,
+        "new_coverage": info["new_coverage"],
+    }
+    try:
+        committed = store.commit_candidate(prepared, candidate, writer_key, stamp, review_record=audit, operator=True)
+    except (candidate_mod.StaleCandidate, candidate_mod.ReviewRequired) as exc:
+        raise ValueError(str(exc)) from None
+    return {
+        "item_id": item_id,
+        "content_hash": prepared["row"]["content_hash"],
+        "action": "approve",
+        "status": committed["status"],
+        "story_id": committed["story_id"],
+        "analysis_key": committed["analysis_key"],
+        "publication_pending": True,
+    }

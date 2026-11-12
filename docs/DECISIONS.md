@@ -6,7 +6,7 @@ same transaction that applies it, so the log always agrees with the item states:
 
 - the pipeline publishes an item, skips it, holds it for the operator, or stops
   retrying it after its third failure or because its saved copy is damaged;
-- an operator retries or dismisses an item with the
+- an operator retries, dismisses or approves an item with the
   [rejected-item commands](REJECTED_ANALYSES.md).
 
 A failure that will be retried, a stale candidate, an unfinished review and a
@@ -84,6 +84,7 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `operator.retried` | An operator retried a rejected, dismissed or failed item. |
 | `operator.reconsidered` | An operator retried an ignored (skipped) item. |
 | `operator.dismissed` | An operator dismissed an item. |
+| `operator.approved` | An operator approved a held candidate whose facts passed fresh verification. |
 
 A held update of a locked story leaves the item `published`: it maps to that
 story and the story's held-update count grows. Unlocking the story does not apply

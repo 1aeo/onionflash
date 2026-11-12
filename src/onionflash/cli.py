@@ -59,9 +59,9 @@ def _operator_parsers(commands) -> None:
         if name == "restore":
             action.add_argument("--revision", required=True, type=int, help="Revision to restore and lock")
 
-    rejected = commands.add_parser("rejected", help="Inspect and explicitly retry or dismiss failed analyses, or retry an ignored item")
+    rejected = commands.add_parser("rejected", help="Inspect, retry, dismiss or approve held analyses")
     actions = rejected.add_subparsers(dest="action", required=True)
-    for name in ("list", "show", "retry", "dismiss"):
+    for name in ("list", "show", "retry", "dismiss", "approve"):
         action = actions.add_parser(name)
         action.add_argument("--config", required=True, type=Path)
         if name == "list":
@@ -72,6 +72,9 @@ def _operator_parsers(commands) -> None:
             action.add_argument("--item", required=True, help="Collected item ID")
         if name in {"retry", "dismiss"}:
             action.add_argument("--expect-hash", required=True, help="Current content_hash returned by rejected show")
+            action.add_argument("--reason", required=True, help="Private operator reason for this action")
+        if name == "approve":
+            action.add_argument("--approval-hash", required=True, help="final_review.approval.hash returned by rejected show")
             action.add_argument("--reason", required=True, help="Private operator reason for this action")
 
     log = commands.add_parser("decisions", help="Summarize or list recent private decisions")
@@ -87,7 +90,7 @@ def _operator_parsers(commands) -> None:
             action.add_argument("--after", type=int, help="Continuation cursor returned by the previous list")
 
 
-def _operator_command(args, store: Store) -> dict:
+def _operator_command(args, store: Store, config: dict | None = None) -> dict:
     """Dispatch one inspection, or one operator action with its required hash and reason."""
     if args.command == "story":
         if args.action == "show":
@@ -110,7 +113,9 @@ def _operator_command(args, store: Store) -> dict:
     if args.action == "list":
         return rejection.list_items(store, status=args.status, limit=args.limit, after=args.after)
     if args.action == "show":
-        return rejection.show_item(store, args.item)
+        return rejection.show_item(store, args.item, config=config)
+    if args.action == "approve":
+        return rejection.approve_item(config, store, args.item, args.approval_hash, args.reason)
     return getattr(rejection, args.action + "_item")(store, args.item, args.expect_hash, args.reason)
 
 
@@ -304,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
             with Store(config["storage"]["database"]) as store:
                 # Explicit source inspection can contain arbitrary Unicode. JSON
                 # escapes keep terminal control/bidi characters visibly inert.
-                print(json.dumps(_operator_command(args, store), ensure_ascii=True))
+                print(json.dumps(_operator_command(args, store, config), ensure_ascii=True))
             return 0
         with run_lock(config["storage"]["database"]) as acquired:
             if not acquired:
@@ -314,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0 if args.command == "run" else 75
             with Store(config["storage"]["database"]) as store:
                 if operator:
-                    result = _operator_command(args, store)
+                    result = _operator_command(args, store, config)
                 elif args.command == "run":
                     result = run(config, store)
                 else:

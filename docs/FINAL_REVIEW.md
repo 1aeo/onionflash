@@ -2,8 +2,9 @@
 
 The application drafts a story from bounded source text, assembles the exact
 candidate, then asks the configured model to critique it and verify it in a fresh
-request. Only a final approval can publish. The same endpoint and model serve
-these requests unless a separate review model is configured.
+request. Only a final approval, or an operator's audited approval of a held
+candidate whose facts passed fresh verification, can publish. The same endpoint
+and model serve these requests unless a separate review model is configured.
 
 ## Selection and grounding
 
@@ -90,7 +91,9 @@ not change another article's identity or overwrite a protected correction.
   fails; when news value fails while new information passes, it is held for the
   operator once a fresh verification has passed its facts.
 - `hold`: potentially useful material is unsupported, ambiguous or not ready to
-  publish. It remains available through the existing operator controls.
+  publish. It remains available through the existing operator controls; a hold
+  whose facts passed fresh verification and whose reviews disputed only news
+  value can be approved as reviewed.
 
 A later review that disagrees with the first on whether news value and new
 information both pass holds the item, whatever its verdict. A later review that
@@ -146,9 +149,9 @@ reviews of each outcome, with the model's own verdict wherever a fixed rule
 replaced it. A hold also records its code and whether its latest review was a
 fresh verification that passed every factual criterion and cited a source.
 
-Use the existing `status`, `rejected show`, `retry` and `dismiss` controls to
-inspect failures, and the [decision log](DECISIONS.md) for every outcome and its
-code. See [operator controls](REJECTED_ANALYSES.md) and
+Use the existing `status`, `rejected show`, `retry`, `dismiss` and `approve`
+controls to inspect failures, and the [decision log](DECISIONS.md) for every
+outcome and its code. See [operator controls](REJECTED_ANALYSES.md) and
 [corrections and retractions](EDITORIAL.md).
 
 ## Configuration and evaluation

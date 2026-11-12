@@ -7,7 +7,8 @@ content/validation failures, or unexpected processing errors, move an item to
 immediately; automation does not keep rewriting that source revision.
 
 These local CLI commands act on one item at a time. They do not call the LLM,
-publish a story, retract a story or unlock an editorial correction.
+retract a story or unlock an editorial correction; only `approve` commits a
+story, publishing a held candidate exactly as reviewed.
 Retry and dismiss also accept a `pending` item that has already failed: its
 attempt count must be positive and its saved error must be nonblank. This lets
 an operator act on a reviewed failure without waiting for terminal rejection.
@@ -31,18 +32,20 @@ for items a review skipped; a skip's reason names the criteria that did not pass
 
 `show` prints the saved source item, up to 20 recent operator actions, the
 item's 20 newest entries in the [decision log](DECISIONS.md), and the final
-review's stage, hold code, current candidate and the draft it started from
-(`base_candidate`), numbered source packet (for checking references such as
-`S1:P3`), coverage background, every review of the current chain (its phase,
-verdict, `candidate_hash`, failed criteria with their reasons, and repair) and the
-latest per-criterion verdict in full. They come from the item's review job or,
-once a commit has finished the current revision, from the decision that commit
-recorded, with stage `finished`, until the deployment's private evidence
-retention archives that record. Each `candidate_hash` names the text that review
-evaluated; during `verify` or `repair`, the candidate shown is the unchanged draft
-or its latest repair. The output is private
-operator data. `show` also accepts an explicit pending or ignored item ID;
-inspect the saved source and decision before deciding whether to intervene.
+review's stage, hold code, current candidate, `candidate_hash` and the draft it
+started from (`base_candidate`), numbered source packet (for checking references
+such as `S1:P3`), coverage background, every review of the current chain (its
+phase, verdict, `candidate_hash`, failed criteria with their reasons, and
+repair), the latest per-criterion verdict in full, any `operator_approval`
+recorded on a finished approval, and (for a held job) `approval` with `eligible`,
+`reason`, `hash`, `editorial_failures` and `new_coverage`. They come from the
+item's review job or, once a commit has finished the current revision, from the
+decision that commit recorded, with stage `finished`, until the deployment's
+private evidence retention archives that record. Each `candidate_hash` names the
+text that review evaluated; during `verify` or `repair`, the candidate shown is
+the unchanged draft or its latest repair. The output is private operator data.
+`show` also accepts an explicit pending or ignored item ID; inspect the saved
+source and decision before deciding whether to intervene.
 
 ## Retry one failed or dismissed revision
 
@@ -111,7 +114,57 @@ additional content-hash, payload and queue-state guard in SQLite, including the
 observed counters, error and cooldown. A failed audit write rolls back the whole
 action.
 
-The private `rejection_actions` table records each reason, source-version hash,
-timestamp, and prior status, counters and error, and each action is also a
-[decision](DECISIONS.md). Operator commands return compact action metadata;
-these records never enter public pages or feeds.
+The private `rejection_actions` table records each retry or dismiss reason,
+source-version hash, timestamp, and prior status, counters and error, and each
+action is also a [decision](DECISIONS.md). Operator commands return compact
+action metadata; these records never enter public pages or feeds.
+
+## Approve one held candidate as reviewed
+
+```sh
+onionflash rejected show --config config.toml --item ITEM_ID
+onionflash rejected approve --config config.toml --item ITEM_ID \
+  --approval-hash APPROVAL_HASH --reason "Concrete development worth publishing"
+```
+
+`approve` publishes `final_review.candidate` exactly as reviewed, without editing
+its wording or calling a model. The operator decides only a disputed `news_value`
+call; factual checks remain with the model reviews and deterministic guards.
+
+An item is eligible only when all of these hold:
+
+- the item is `rejected` and its review job is `held`;
+- the exact held text (`final_review.candidate`) has at least one saved
+  `verification` review;
+- every saved review of that exact text re-validates against the current source
+  packet, passes all seven factual criteria with `pass`, and cites at least one
+  `source_support` reference;
+- no review anywhere in the record (including the first review of an earlier
+  base draft) failed `new_information`—already-covered items are dismissed, not
+  approved;
+- the reviews ran under the current `review` policy and packet;
+- re-preparing the candidate from the saved draft matches the held base
+  candidate, source packet and target story, with no missing sources and an
+  unlocked, unretracted story;
+- all deterministic [final checks](FINAL_REVIEW.md#final-checks) and release-label
+  rules pass on the held candidate.
+
+Factual refusals, including items held after the repair limit, cannot be
+approved; they can only be retried or dismissed.
+
+Copy `APPROVAL_HASH` from `final_review.approval.hash` in `rejected show`. It
+binds the source revision, target story, lock and source bindings, current
+coverage background, exact candidate text, its reviews and the review policy.
+`final_review.approval.new_coverage` lists stories created or updated since the
+review (compared by `id` and `updated_at`); inspect them for duplicates before
+approving. If coverage, sources, story state or review policy changed after
+`show`, `approve` refuses without writing anything; run `show` again.
+
+Under the application run lock, `approve` commits the story, marks the item
+`published`, deletes the review job, writes an `operator_approved` analysis audit
+with `operator_approval` (returning its `analysis_key`), and logs
+`operator.approved` in the [decision log](DECISIONS.md). It returns
+`publication_pending: true`; the next `build` renders the permalink, listings and
+feeds. A later upstream source edit re-queues the item through normal review
+against the published story. The private reason and review audit never enter
+public output.
