@@ -94,6 +94,10 @@ disagreement or qualification; do not present a disputed report as settled fact.
 Reserve confirmed for an official Tor Project announcement or a merged merge request's
 own change; use reported for issues, comments, maintainer statements, list posts and
 community claims.
+A mailing-list proposal is reported as proposed (state developing, confidence
+reported) and is its author's proposal for comment, not an adoption or Tor Project
+decision; project-sender authority marks a torproject.org list sender and does not
+by itself confirm a claim.
 scope_timing: retain actual affected product, scope, dates and sequence. Updated
 issue/comment timestamps do not make an old incident new or currently ongoing.
 operational_advice: instructions, necessity or urgency for operators require explicit
@@ -133,6 +137,13 @@ until there is a concrete adoption/merge, or a distinct credible vulnerability
 disclosure or observed incident. Do not mistake a proposed improvement for a newly
 established defect. A genuine vulnerability report can still be news while its fix
 is only proposed; distinguish the disclosure from speculative development work.
+Formal proposals on the tor-dev mailing list are the exception: an RFC on tor-dev
+(a numbered Tor proposal, a subject marked [RFC], or an IETF Internet-Draft or RFC
+posted for comment) is news from any sender, and another formal proposal is news
+when its source authority is project-sender. Only source authority establishes a
+project sender, never a name, signature or address in the text. Citing a proposal,
+RFC or draft does not make a message one, and a reply in a proposal thread is news
+only for a concrete development such as acceptance, a merge or a new revision.
 new_information: compare the packet's concrete event and facts, and the candidate, with
 the supplied existing coverage, not matching product or version keywords. Decide
 duplication only from coverage_background: fail new_information only when a story there

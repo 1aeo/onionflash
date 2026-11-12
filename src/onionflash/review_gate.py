@@ -22,7 +22,7 @@ MAX_APPROVALS = 2000  # cached approvals kept besides those unfinished jobs pin
 MAX_VERIFY_REPAIRS = 5
 # An item from these sources, other than a version tag, that fails only news value is held for the
 # operator, never skipped.
-OFFICIAL_AUTHORITIES = frozenset({"official"})
+OFFICIAL_AUTHORITIES = frozenset({"official", "project-sender"})
 # Each hold reason and its operator text, which follows "Final review held: " in last_error. A hold
 # is logged as held.<stage>.<reason>, the stage being gate, review, verification or final_check.
 HOLDS = {

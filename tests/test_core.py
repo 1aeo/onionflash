@@ -1005,6 +1005,111 @@ def test_rss_guid_that_is_not_a_permalink_is_never_a_citation():
     assert collect_source(FakeClient([response(xml)]), source(), {}, DEFAULTS["collection"], DATE)["items"] == []
 
 
+LIST_URL = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/feed/"
+
+
+def _list_rss(*author_xml: str) -> bytes:
+    entries = "".join(
+        f'<item><title>Message {n}</title><link>https://lists.torproject.org/m/{n}/</link>'
+        f'<description>Body</description>{xml}<pubDate>Sun, 08 Nov 2026 12:00:00 GMT</pubDate></item>'
+        for n, xml in enumerate(author_xml, 1)
+    )
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/" '
+        'xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"><channel>'
+        f'<title>tor-dev</title><link>https://lists.torproject.org/</link><description>List</description>{entries}'
+        '</channel></rss>'
+    ).encode()
+
+
+def _collected_items(body: bytes, *, src_url: str = LIST_URL, final_url: str = LIST_URL, authority: str = "community"):
+    resp = Response(200, body, {}, final_url)
+    return collect_source(FakeClient([resp]), source(url=src_url, authority=authority), {}, DEFAULTS["collection"], DATE)["items"]
+
+
+def test_a_torproject_org_sender_on_the_list_archive_is_project_sender():
+    from onionflash import review, review_gate
+
+    items = _collected_items(_list_rss(
+        "<author>dev＠torproject.org (A Developer)</author>",
+        "<author>Dev.Name+x_1-2＠TorProject.ORG</author>",
+        "<author>member＠example.org (Community Member)</author>",
+    ))
+    assert [entry["authority"] for entry in items] == ["project-sender", "project-sender", "community"]
+    assert all("dev@torproject.org" not in json.dumps(entry).lower() and "＠" not in json.dumps(entry) for entry in items)
+    # Final response URL after redirects decides the host, in both directions.
+    redirected_in = _collected_items(_list_rss("<author>dev＠torproject.org (Dev)</author>"),
+                                     src_url="https://example.org/feed.xml", final_url=LIST_URL)
+    redirected_out = _collected_items(_list_rss("<author>dev＠torproject.org (Dev)</author>"),
+                                      src_url=LIST_URL, final_url="https://example.org/feed.xml")
+    assert redirected_in[0]["authority"] == "project-sender" and redirected_out[0]["authority"] == "community"
+    # A configured official source keeps official authority regardless of sender.
+    official_items = _collected_items(_list_rss(
+        "<author>dev＠torproject.org (Dev)</author>",
+        "<author>member＠example.org (Member)</author>",
+    ), authority="official")
+    assert [entry["authority"] for entry in official_items] == ["official", "official"]
+    # review_gate treats project-sender as official for news-value holds, while Confirmed still refuses it.
+    criteria = {name: {"reason": "Supported.", "source_refs": ["S1P1"], "outcome": "pass"} for name in review.CRITERIA}
+    criteria["news_value"] = {"reason": "Routine reply.", "source_refs": ["S1P1"], "outcome": "fail"}
+    first = {"stage": "review", "candidate_hash": "h", "result": {"verdict": "skip", "criteria": criteria, "repair": None}}
+    prepared = {"row": {"payload": json.dumps(items[0])}, "payload": {"editorial_kind": "feed"},
+                "packet": {"sources": [{**items[0], "passages": [{"ref": "S1P1", "text": "Body"}]}]}, "coverage": {}}
+    assert review_gate.next_step([first], analysis(), prepared)[0] == "verify"
+    assert "confirmed_source" in review.final_holds(analysis(confidence="confirmed"), prepared)
+
+
+@pytest.mark.parametrize("author_entries,final_url", [
+    (["<author>mallory＠example.org (dev@torproject.org)</author>"], LIST_URL),
+    (["<author>mallory＠example.org (Dev &lt;dev＠torproject.org&gt;)</author>"], LIST_URL),
+    (["<author>dev＠torproject.org.example.org (Dev)</author>"], LIST_URL),
+    (["<author>dev＠example-torproject.org (Dev)</author>"], LIST_URL),
+    (["<author>alert＠monitor.torproject.org (Alert)</author>"], LIST_URL),
+    (["<author>tor-dev＠lists.torproject.org (Dev via tor-dev)</author>"], LIST_URL),
+    (["<author>dev%example.org＠torproject.org (Dev)</author>"], LIST_URL),
+    (["<author>a＠torproject.org＠example.org (Dev)</author>"], LIST_URL),
+    (["<author>dev@torproject.org (Dev)</author>"], LIST_URL),
+    (["<author>dev＠torprоject.org (Dev)</author>"], LIST_URL),  # Cyrillic o
+    (["<author>Kate＠torproject.org (Kate)</author>"], LIST_URL),  # Kelvin sign lowercases to k
+    (["<author>Real Dev dev＠torproject.org (Dev)</author>"], LIST_URL),
+    (["<author>dev＠torproject.org(Dev)</author>"], LIST_URL),
+    (["<dc:creator>dev@torproject.org</dc:creator>"], LIST_URL),
+    (["<dc:creator>dev＠torproject.org</dc:creator>"], LIST_URL),
+    (["<dc:creator>dev＠torproject.org (Real Dev)</dc:creator>"], LIST_URL),
+    (["<author>dev＠torproject.org (Dev)</author>", "<author>Plain Name</author>"], LIST_URL),
+    (["<author>dev＠torproject.org (Dev)</author>", "<dc:creator>Plain Name</dc:creator>"], LIST_URL),
+    (["<author>mallory＠example.org (M)</author><author>dev＠torproject.org (Dev)</author>"], LIST_URL),
+    (["<author>mallory＠example.org (M)</author><dc:creator>dev＠torproject.org (Dev)</dc:creator>"], LIST_URL),
+    (["<author>mallory＠example.org (M)</author><dc:author>dev＠torproject.org (Dev)</dc:author>"], LIST_URL),
+    (["<author>mallory＠example.org (M)</author><dc:author>Plain Name</dc:author>", "<author>dev＠torproject.org (Dev)</author>"], LIST_URL),
+    (["<author>mallory＠example.org (M)</author><itunes:author>dev＠torproject.org (Dev)</itunes:author>"], LIST_URL),
+    (["<author>mallory＠example.org (M)</author><managingEditor>dev＠torproject.org (Dev)</managingEditor>"], LIST_URL),
+    (["<Author>dev＠torproject.org (Dev)</Author>"], LIST_URL),
+    (["<author><name>dev＠torproject.org</name><email>mallory@example.org</email></author>"], LIST_URL),
+    (["<author>dev＠torproject.org<span/></author>"], LIST_URL),
+    (["<author>dev＠torproject.org (Dev)</author>"], "https://example.org/feed.xml"),
+    (["<author>dev＠torproject.org (Dev)</author>"], "https://lists.torproject.org.example.org/feed/"),
+])
+def test_names_lookalikes_and_other_hosts_never_make_a_sender_project_sender(author_entries, final_url):
+    items = _collected_items(_list_rss(*author_entries), final_url=final_url)
+    assert all(entry["authority"] == "community" for entry in items)
+
+
+def test_atom_and_namespaced_items_never_make_a_sender_project_sender():
+    atom = (b'<feed xmlns="http://www.w3.org/2005/Atom"><title>T</title><id>urn:t</id><updated>2026-11-08T12:00:00Z</updated>'
+            b'<entry><title>Msg</title><link href="https://lists.torproject.org/m/1/"/><id>urn:1</id>'
+            b'<updated>2026-11-08T12:00:00Z</updated><author><name>dev\xef\xbc\xa0torproject.org</name>'
+            b'<email>mallory@example.org</email></author></entry></feed>')
+    mixed = (b'<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/"><channel><title>T</title>'
+             b'<link>https://lists.torproject.org/</link><description>D</description>'
+             b'<item xmlns="http://purl.org/dc/elements/1.1/"><author>dev\xef\xbc\xa0torproject.org (Dev)</author></item>'
+             b'<entry><title>Msg</title><link>https://lists.torproject.org/m/1/</link>'
+             b'<dc:creator>dev\xef\xbc\xa0torproject.org (Dev)</dc:creator></entry></channel></rss>')
+    for raw in (atom, mixed):
+        assert [entry["authority"] for entry in _collected_items(raw)] == ["community"]
+
+
 # A partial collection whose items cannot be saved fails its source the same way.
 @pytest.mark.parametrize("error, where", [(RuntimeError("unexpected parser crash"), "RuntimeError at test_core.py:"),
                                           (CollectionError("unexpected parser crash", [{"title": "No URL"}]), "KeyError at ")])

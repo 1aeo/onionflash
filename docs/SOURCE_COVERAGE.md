@@ -15,9 +15,12 @@ protocol changes. The additional configured streams are:
 | [Tor Browser Security-labeled public issues](https://gitlab.torproject.org/api/v4/projects/472/issues?labels=Security) | `tor-browser-security`, enabled | Earlier visibility into Browser security work; labels do not establish confirmed vulnerabilities or completed fixes. |
 | [Anti-Censorship team issues](https://gitlab.torproject.org/api/v4/projects/549/issues) | `anti-censorship-team`, enabled | Human investigations of blocking and bridge/transport availability, including unlabeled reports. |
 | [Tor Metrics Timeline repository](https://gitlab.torproject.org/tpo/network-health/metrics/timeline) | `tor-metrics-news`, enabled | Curated event rows from the maintained README; validated repository snapshots replace the stale Atom feed. |
-| [Tor Project Development Mailing List](https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/) | `tor-dev`, enabled | Proposal and protocol-change discussions; the normal importance and evidence checks filter routine messages. |
+| [Tor Project Development Mailing List](https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/) | `tor-dev`, enabled | An RFC on `tor-dev` (numbered Tor proposal, `[RFC]` subject, or IETF Internet-Draft or RFC posted for comment) is news from any sender, a formal proposal from a `project-sender` address is news, and other messages need a significant development. |
 
-Browser release announcements were already present in Tor Blog and tor-announce.
+On `lists.torproject.org` archives whose RSS items carry HyperKitty's `local＠domain`
+`<author>` element, an entry from an exact `torproject.org` address is classified
+`project-sender` unless the stream is already `official`; display names never count,
+and the address is not stored. Browser release announcements were already present in Tor Blog and tor-announce.
 The Browser issue stream is deliberately filtered; it does not replace those
 announcements or promise comprehensive vulnerability coverage.
 

@@ -87,6 +87,10 @@ A fix present only in a proposed patch series does not establish a merged or
 generally available fix; preserve that limited scope.
 Use developing for observations, discussions and unresolved reports. Reserve merged
 for an explicitly completed code merge, not a measurement report mentioning software.
+A mailing-list proposal, [RFC] or Internet-Draft is its author's proposal for
+comment: attribute it to a proposal posted to the list, name an author or role only
+when the source text states one, keep confidence reported and state developing, and
+do not call it adopted, accepted or a Tor Project decision unless the source says so.
 
 Write a factual headline and 1-3 concise sentences. Brief sources
 can have brief summaries; never add filler to reach a word count. Preserve who did

@@ -20,6 +20,22 @@ from .util import (
 MAX_FEED_ELEMENTS, MAX_FEED_DEPTH, MAX_FEED_BASE_CHARS = 50000, 128, 8_000_000
 # "scheme://..." or "//...": resolving it replaces the inherited base instead of extending it.
 ABSOLUTE_BASE = re.compile(r"(?:[A-Za-z][A-Za-z0-9+.-]*:)?//")
+LIST_ARCHIVE_HOST = "lists.torproject.org"
+# HyperKitty's RSS <author> writes the archived From address with @ as U+FF20,
+# optionally followed by the display name in parentheses; only that address counts.
+HYPERKITTY_AUTHOR = re.compile(r"[^@\s()＠]+＠[^@\s()＠]+(?: \(.*\))?\Z", re.DOTALL)
+PROJECT_SENDER = re.compile(r"[a-z0-9._+-]+@torproject\.org")
+
+
+def _hyperkitty_address(author: object) -> str | None:
+    if not isinstance(author, str) or not HYPERKITTY_AUTHOR.match(author):
+        return None
+    return author.partition(" (")[0].replace("＠", "@")
+
+
+def _project_sender(author: object) -> bool:
+    address = _hyperkitty_address(author)
+    return address is not None and address.isascii() and PROJECT_SENDER.fullmatch(address.lower()) is not None
 
 
 class CollectionError(Exception):
@@ -111,7 +127,7 @@ def _feed(
         }
     # Expat recognizes the actual XML encoding (including UTF-16). A raw byte
     # regexp misses encoded declarations and is not a security boundary.
-    parser = expat.ParserCreate()
+    parser = expat.ParserCreate(namespace_separator="\n")
 
     def reject_declaration(*args):
         raise CollectionError("Feed contains disallowed XML declarations")
@@ -128,29 +144,47 @@ def _feed(
     # bound only grows: the longest base feedparser could hold by then is an absolute
     # value, or the longest so far plus a relative one and a separator. Every element
     # is charged that bound, and the sum bounds every copy.
-    elements = depth = base_chars = longest = 0
+    elements = base_chars = longest = item_authors = 0
+    stack: list[str] = []
+    rss_authors: list[str | None] = []
+    plain_author = False
+    author_buf: list[str] = []
 
     def start_element(name, attributes):
-        nonlocal elements, depth, base_chars, longest
-        elements, depth = elements + 1, depth + 1
+        nonlocal elements, base_chars, longest, item_authors, plain_author, author_buf
+        elements += 1
+        stack.append(name)
         for key, value in attributes.items():
-            if key.lower().rpartition(":")[2] == "base":
+            if key.lower().rsplit("\n", 1)[-1].rpartition(":")[2] == "base":
                 # +16 covers the scheme that urljoin adds to "//host" values.
                 grown = len(value) + 16 if ABSOLUTE_BASE.match(value) else longest + len(value) + 1
                 longest = max(longest, grown)
         base_chars += longest
         if elements > MAX_FEED_ELEMENTS:
             raise CollectionError("Feed has too many XML elements")
-        if depth > MAX_FEED_DEPTH:
+        if len(stack) > MAX_FEED_DEPTH:
             raise CollectionError("Feed XML is nested too deeply")
         if base_chars > MAX_FEED_BASE_CHARS:
             raise CollectionError("Feed xml:base text exceeds the limit")
+        if stack == ["rss", "channel", "item"]:
+            item_authors, plain_author, author_buf = 0, True, []
+        elif stack == ["rss", "channel", "item", "author"]:
+            item_authors += 1
+        elif stack[:4] == ["rss", "channel", "item", "author"]:
+            plain_author = False
+
+    def char_data(data):
+        if stack == ["rss", "channel", "item", "author"] and item_authors == 1 and sum(map(len, author_buf)) < 1000:
+            author_buf.append(data[:1000])
 
     def end_element(name):
-        nonlocal depth
-        depth -= 1
+        if stack == ["rss", "channel", "item"]:
+            text = "".join(author_buf).strip()
+            rss_authors.append(text if item_authors == 1 and plain_author and len(text) < 1000 else None)
+        stack.pop()
 
     parser.StartElementHandler = start_element
+    parser.CharacterDataHandler = char_data
     parser.EndElementHandler = end_element
     try:
         parser.Parse(response.body, True)
@@ -159,10 +193,22 @@ def _feed(
     feed = feedparser.parse(response.body, sanitize_html=False, resolve_relative_uris=False)
     if not feed.get("version") or feed.get("bozo"):
         raise CollectionError("Invalid RSS/Atom document")
+    archive_senders = (
+        source["authority"] != "official"
+        and urlsplit(response.url).hostname == LIST_ARCHIVE_HOST
+        and feed.version == "rss20"
+        and len(rss_authors) == len(feed.entries) > 0
+        and all(
+            raw is not None
+            and [raw] == [a.get("name") for a in (entry.get("authors") or ()) if set(a) == {"name"}]
+            and _hyperkitty_address(raw) is not None
+            for raw, entry in zip(rss_authors, feed.entries)
+        )
+    )
     cutoff = after(-settings["lookback_days"] * 86400, started)
     items = []
     identities, conflicts, skipped = {}, set(), 0
-    for entry in feed.entries:
+    for index, entry in enumerate(feed.entries):
         published = _entry_time(
             entry, "published", _entry_time(entry, "updated", started)
         )
@@ -201,6 +247,8 @@ def _feed(
             continue
         if not item["title"]:
             continue
+        if archive_senders and _project_sender(rss_authors[index]):
+            item["authority"] = "project-sender"
         # Some Atom archives omit alternate links and reuse an ID for distinct
         # events. Do not silently choose one event when that fallback is ambiguous.
         if feed.version.startswith("atom") and not entry.get("links") and entry.get("id") == link:
