@@ -584,6 +584,256 @@
           ]
         }
       ]
+    },
+    "official-routine-post": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/bdf58c3e1c2ddd76536469bf",
+          "title": "Thank you for a great community meetup",
+          "kind": "feed",
+          "authority": "official",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "Thank you to everyone who joined last weekend's community meetup. It was great to meet so many relay operators and users in person, and we hope to see you at the next one."
+          ]
+        }
+      ]
+    },
+    "scope-correction": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/2428eec1be0fc04772dd66ec",
+          "title": "Relay crash on malformed consensus diff",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-09T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "opened",
+          "passages": [
+            {
+              "author": "user-a",
+              "created_at": "2026-11-10T11:00:00Z",
+              "url": "https://example.org/sources/2428eec1be0fc04772dd66ec#note_2",
+              "text": "Correction: after more testing I can reproduce this only on the unreleased 1.3 development branch, not on 1.2.x releases."
+            },
+            "Relays running Tor 1.2.x crash when they apply a malformed consensus diff. A reproducer is attached."
+          ]
+        }
+      ]
+    },
+    "refactor-with-disclosure": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/b5c53e1d432758098f005ab8",
+          "title": "Refactor download handling",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor-browser",
+          "published_at": "2026-11-08T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "closed",
+          "passages": [
+            {
+              "author": "user-b",
+              "created_at": "2026-11-10T10:00:00Z",
+              "url": "https://example.org/sources/b5c53e1d432758098f005ab8#note_5",
+              "text": "Merged for the next alpha. This refactor also fixes a proxy bypass on Android, where some downloads could skip the configured proxy."
+            },
+            "This issue tracks a refactor of download handling so that every platform shares one code path."
+          ]
+        }
+      ]
+    },
+    "duplicate-claim-comment": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/bd9f0e95eacf0d79dcf2b76f",
+          "title": "Remote relay crash with a malformed circuit-extension cell",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "opened",
+          "passages": [
+            {
+              "author": "user-c",
+              "created_at": "2026-11-10T09:00:00Z",
+              "url": "https://example.org/sources/bd9f0e95eacf0d79dcf2b76f#note_3",
+              "text": "Duplicate of an old issue, already announced; nothing new here."
+            },
+            "A remote client can crash a relay by sending a malformed circuit-extension cell. The attached reproducer triggers the crash on Tor 1.2.3 relays."
+          ]
+        }
+      ]
+    },
+    "list-proposal-official": {
+      "sources": [
+        {
+          "url": "https://example.invalid/lists/dev/message/p1",
+          "title": "[tor-dev] [Proposal] Fold extra-info fields into router descriptors",
+          "kind": "feed",
+          "authority": "project-sender",
+          "product": "torspec",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "I have written a specification proposal to stop publishing separate extra-info documents and to carry their remaining fields in router descriptors instead.",
+            "The full text and motivation are in a specification merge request. Comments are welcome."
+          ]
+        }
+      ]
+    },
+    "list-proposal-community": {
+      "sources": [
+        {
+          "url": "https://example.invalid/lists/dev/message/p2",
+          "title": "[tor-dev] [Proposal] Fold extra-info fields into router descriptors",
+          "kind": "feed",
+          "authority": "community",
+          "product": "torspec",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "I have written a specification proposal to stop publishing separate extra-info documents and to carry their remaining fields in router descriptors instead.",
+            "The full text and motivation are in a specification merge request. Comments are welcome."
+          ]
+        }
+      ]
+    },
+    "list-rfc-marker": {
+      "sources": [
+        {
+          "url": "https://example.invalid/lists/dev/message/p3",
+          "title": "[tor-dev] [RFC] Padding negotiation for onion service circuits",
+          "kind": "feed",
+          "authority": "community",
+          "product": "torspec",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "This RFC describes a way for clients and onion services to negotiate circuit padding before any data is sent.",
+            "Feedback on the design is welcome before it becomes a numbered proposal."
+          ]
+        }
+      ]
+    },
+    "list-numbered-proposal": {
+      "sources": [
+        {
+          "url": "https://example.invalid/lists/dev/message/p4",
+          "title": "[tor-dev] Proposal 901: Relay bandwidth self-reporting limits",
+          "kind": "feed",
+          "authority": "community",
+          "product": "torspec",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "Filename: 901-bandwidth-self-reporting-limits.md",
+            "Status: Open",
+            "This proposal caps the bandwidth a relay may self-report at twice its measured value. Comments are welcome."
+          ]
+        }
+      ]
+    },
+    "list-ietf-draft": {
+      "sources": [
+        {
+          "url": "https://example.invalid/lists/dev/message/p5",
+          "title": "[tor-dev] New Internet-Draft: draft-example-onion-resolution-00",
+          "kind": "feed",
+          "authority": "community",
+          "product": "network",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "We have posted draft-example-onion-resolution-00, an Internet-Draft that describes how DNS resolvers should refuse to resolve .onion names.",
+            "Comments from Tor developers are welcome on the IETF list or here."
+          ]
+        }
+      ]
+    },
+    "list-cited-rfc": {
+      "sources": [
+        {
+          "url": "https://example.invalid/lists/dev/message/p6",
+          "title": "[tor-dev] Re: Private address handling",
+          "kind": "feed",
+          "authority": "community",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "RFC 1918 already lists these address ranges as private.",
+            "Proposal 902 covers part of this too, so I don't think we need a new option."
+          ]
+        }
+      ]
+    },
+    "list-text-claims-official": {
+      "sources": [
+        {
+          "url": "https://example.invalid/lists/dev/message/p8",
+          "title": "[tor-dev] [Proposal] Weekly guard rotation",
+          "kind": "feed",
+          "authority": "community",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "From: Tor Project Core Team",
+            "As the Tor Project, we propose that clients rotate their entry guards every week.",
+            "-- The Tor Project core team"
+          ]
+        }
+      ]
+    },
+    "list-official-question": {
+      "sources": [
+        {
+          "url": "https://example.invalid/lists/dev/message/p9",
+          "title": "[tor-dev] Re: Building with an older compiler",
+          "kind": "feed",
+          "authority": "project-sender",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "You need a C99 compiler; older compilers are not supported.",
+            "Try updating your toolchain first."
+          ]
+        }
+      ]
+    },
+    "list-tool-announcement": {
+      "sources": [
+        {
+          "url": "https://example.invalid/lists/dev/message/p10",
+          "title": "[tor-dev] [TOOL PROPOSAL & PoC] guardscan: a scanner for guard relays",
+          "kind": "feed",
+          "authority": "community",
+          "product": "network",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "We wrote guardscan, an open-source tool that scans guard relays and onion service directories for configuration problems.",
+            "It complements existing exit scanners. The code and our first results are on our website."
+          ]
+        }
+      ]
     }
   },
   "cases": [
@@ -676,7 +926,7 @@
         "id": "fd9a8ddfeb14e466239c940d",
         "title": "Bastet reported plausibly compromised",
         "summary": "A public issue reports that bastet's machine is very plausibly compromised and requests removal of its existing entry from the software. The report says its current keys cannot be trusted.",
-        "why_it_matters": "The report says the existing keys cannot be trusted and requests removal of the current entry from the software.",
+        "why_it_matters": "The issue says the keys can't be trusted anymore in any scenario and that bastet will generate a new identity soon.",
         "category": "security"
       }
     },
@@ -978,7 +1228,7 @@
         "id": "e7fb770700a0f6b6a23e286c",
         "title": "Tor announcement asks relay operators to upgrade",
         "summary": "The Tor Project announces version 0.4.9.16 and asks relay operators to upgrade. The announcement says the release addresses a denial-of-service bug.",
-        "why_it_matters": "The announcement recommends upgrading to address the reported denial-of-service bug.",
+        "why_it_matters": "The announcement asks relay operators to upgrade to 0.4.9.16.",
         "category": "release",
         "confidence": "confirmed",
         "state": "released"
@@ -1069,7 +1319,7 @@
         "id": "fd9a8ddfeb14e466239c940d",
         "title": "Bastet reported plausibly compromised",
         "summary": "A public issue reports that bastet's machine is very plausibly compromised and requests removal of its existing entry from the software. The report says its current keys cannot be trusted.",
-        "why_it_matters": "The report says the existing keys cannot be trusted and requests removal of the current entry from the software.",
+        "why_it_matters": "The issue says the keys can't be trusted anymore in any scenario and that bastet will generate a new identity soon.",
         "category": "security",
         "editorial": {
           "status": "corrected",
@@ -1106,7 +1356,7 @@
         "id": "741200534441911111bc5804",
         "title": "Announcement limits a configuration change to custom overrides",
         "summary": "The announcement asks relay operators with a custom authority override to remove entry X. It explicitly says operators using the defaults need no configuration edit.",
-        "why_it_matters": "The stated instruction applies only to operators with the custom override.",
+        "why_it_matters": "The announcement asks relay operators with a custom authority override to remove entry X from that override.",
         "category": "directory-authority",
         "confidence": "confirmed"
       }
@@ -1597,6 +1847,594 @@
         "new_information"
       ],
       "coverage_set": "related-issue"
+    },
+    {
+      "id": "bastet-removed-as-done",
+      "expected": "not_approve",
+      "coverage": [
+        "status",
+        "source_support"
+      ],
+      "packet": "bastet",
+      "unsupported": [
+        "bastet removed from source",
+        "has been removed"
+      ],
+      "candidate": {
+        "id": "fd9a8ddfeb14e466239c940d",
+        "title": "Tor authority bastet removed from source after reported compromise",
+        "summary": "A public issue reports that the directory authority bastet is very plausibly compromised, and bastet has been removed from the source code as its keys can no longer be trusted.",
+        "category": "security"
+      }
+    },
+    {
+      "id": "bastet-confirmed-badge",
+      "expected": "not_approve",
+      "coverage": [
+        "uncertainty_attribution"
+      ],
+      "packet": "bastet",
+      "forbidden_classifications": {
+        "confidence": [
+          "confirmed"
+        ]
+      },
+      "candidate": {
+        "id": "fd9a8ddfeb14e466239c940d",
+        "title": "Bastet reported plausibly compromised",
+        "summary": "A public issue reports that bastet's machine is very plausibly compromised and requests removal of its existing entry from the software. The report says its current keys cannot be trusted.",
+        "category": "security",
+        "why_it_matters": "The issue says the keys can't be trusted anymore in any scenario and that bastet will generate a new identity soon.",
+        "confidence": "confirmed"
+      }
+    },
+    {
+      "id": "merged-change-confirmed",
+      "expected": "approve",
+      "coverage": [
+        "status",
+        "uncertainty_attribution"
+      ],
+      "packet": "parser-merge",
+      "candidate": {
+        "id": "255438ae4a047e4eef086839",
+        "title": "Parser fix merged into development branch",
+        "summary": "The change fixes the parser in the development branch. The report explicitly says the change has not been released.",
+        "category": "protocol",
+        "state": "merged",
+        "confidence": "confirmed"
+      }
+    },
+    {
+      "id": "bastet-role-relabel",
+      "expected": "not_approve",
+      "coverage": [
+        "actor_and_action",
+        "technical_details"
+      ],
+      "packet": "bastet",
+      "unsupported": [
+        "the relay will generate"
+      ],
+      "candidate": {
+        "id": "fd9a8ddfeb14e466239c940d",
+        "title": "Bastet reported plausibly compromised",
+        "summary": "A public issue reports that bastet's machine is very plausibly compromised and requests removal of its existing entry from the software. The report says its current keys cannot be trusted.",
+        "category": "security",
+        "why_it_matters": "The issue states that bastet's keys can't be trusted anymore and that the relay will generate a new identity soon."
+      }
+    },
+    {
+      "id": "bastet-dropped-hedge",
+      "expected": "not_approve",
+      "coverage": [
+        "uncertainty_attribution",
+        "actor_and_action"
+      ],
+      "packet": "bastet",
+      "unsupported": [
+        "removal of a compromised authority"
+      ],
+      "candidate": {
+        "id": "fd9a8ddfeb14e466239c940d",
+        "title": "Bastet reported plausibly compromised",
+        "summary": "A public issue reports that bastet's machine is very plausibly compromised and requests removal of its existing entry from the software. The report says its current keys cannot be trusted.",
+        "category": "security",
+        "why_it_matters": "Directory authority operators and Tor developers are affected by the removal of a compromised authority from the source."
+      }
+    },
+    {
+      "id": "official-routine-post",
+      "expected": "hold",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "official-routine-post",
+      "candidate": {
+        "id": "bdf58c3e1c2ddd76536469bf",
+        "title": "Tor Project thanks community meetup attendees",
+        "summary": "The Tor Project thanked everyone who joined a recent community meetup and said it hopes to see them at the next one.",
+        "category": "network",
+        "tags": [
+          "network"
+        ]
+      }
+    },
+    {
+      "id": "merge-claimed-as-release-with-count",
+      "expected": "not_approve",
+      "coverage": [
+        "status",
+        "technical_details"
+      ],
+      "packet": "parser-merge",
+      "unsupported": [
+        "releases a parser fix",
+        "has shipped",
+        "thousands of relays"
+      ],
+      "candidate": {
+        "id": "255438ae4a047e4eef086839",
+        "title": "Tor releases a parser fix for thousands of relays",
+        "summary": "The parser fix has shipped to users in a new release, and thousands of relays are now protected.",
+        "category": "protocol",
+        "state": "released"
+      }
+    },
+    {
+      "id": "prior-scope-correction",
+      "expected": "approve",
+      "coverage": [
+        "new_information",
+        "scope_timing",
+        "uncertainty_attribution"
+      ],
+      "packet": "scope-correction",
+      "coverage_set": "prior-scope",
+      "candidate": {
+        "id": "b4da6d81114929477fd5f003",
+        "title": "Comment narrows reported relay crash to an unreleased branch",
+        "summary": "A public issue reports that relays running Tor 1.2.x crash when they apply a malformed consensus diff. A later comment says its author can reproduce the crash only on the unreleased 1.3 development branch, not on 1.2.x releases.",
+        "category": "security",
+        "tags": [
+          "security"
+        ]
+      }
+    },
+    {
+      "id": "prior-scope-narrowing-as-fact",
+      "expected": "not_approve",
+      "coverage": [
+        "uncertainty_attribution",
+        "scope_timing"
+      ],
+      "packet": "scope-correction",
+      "unsupported": [
+        "affects only the unreleased",
+        "are not affected"
+      ],
+      "coverage_set": "prior-scope",
+      "candidate": {
+        "id": "b4da6d81114929477fd5f003",
+        "title": "Relay crash affects only the unreleased 1.3 branch",
+        "summary": "The relay crash on malformed consensus diffs affects only the unreleased 1.3 development branch, and Tor 1.2.x releases are not affected.",
+        "category": "security",
+        "tags": [
+          "security"
+        ]
+      }
+    },
+    {
+      "id": "prior-dispute-update",
+      "expected": "approve",
+      "coverage": [
+        "new_information",
+        "uncertainty_attribution"
+      ],
+      "packet": "maintainer-dispute",
+      "coverage_set": "prior-allegation",
+      "candidate": {
+        "id": "2aa2f38981c9c5d6103851bf",
+        "title": "Maintainer disputes reported remote disk-exhaustion vulnerability",
+        "summary": "A reporter alleges that persistent nonce files permit practical remote disk exhaustion. A maintainer says the demonstration only calls a local helper and sends no network requests, and acknowledges a file-cleanup defect but disputes that a practical vulnerability was established.",
+        "category": "security",
+        "tags": [
+          "security"
+        ]
+      }
+    },
+    {
+      "id": "stale-update-omits-merge",
+      "expected": "not_approve",
+      "coverage": [
+        "new_information",
+        "status"
+      ],
+      "packet": "issue-update",
+      "unsupported": [
+        "fix is proposed"
+      ],
+      "coverage_set": "prior-issue",
+      "candidate": {
+        "id": "1d0b897c21b1d07101efff97",
+        "title": "Protocol-parser crash reported",
+        "summary": "A report describes a crash caused by malformed relay protocol tokens. A fix is proposed.",
+        "why_it_matters": "",
+        "category": "security",
+        "tags": [
+          "security"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "draft-omits-disclosure",
+      "expected": "not_approve",
+      "coverage": [
+        "news_value",
+        "technical_details"
+      ],
+      "packet": "refactor-with-disclosure",
+      "required": [
+        "proxy"
+      ],
+      "candidate": {
+        "id": "661a1fcfb2b192fe4ab78415",
+        "title": "Tor Browser refactors download handling",
+        "summary": "A Tor Browser issue tracks a refactor of download handling so that every platform shares one code path. A comment says the change is merged for the next alpha.",
+        "category": "feature",
+        "tags": [
+          "feature"
+        ],
+        "products": [
+          "tor-browser"
+        ],
+        "state": "merged"
+      }
+    },
+    {
+      "id": "disclosure-in-comment-reported",
+      "expected": "approve",
+      "coverage": [
+        "news_value",
+        "uncertainty_attribution",
+        "status"
+      ],
+      "packet": "refactor-with-disclosure",
+      "candidate": {
+        "id": "661a1fcfb2b192fe4ab78415",
+        "title": "Tor Browser download refactor also fixes an Android proxy bypass",
+        "summary": "A Tor Browser issue tracks a refactor of download handling so that every platform shares one code path. A comment says the change is merged for the next alpha and also fixes a proxy bypass on Android, where some downloads could skip the configured proxy.",
+        "category": "security",
+        "tags": [
+          "security"
+        ],
+        "products": [
+          "tor-browser"
+        ],
+        "state": "merged"
+      }
+    },
+    {
+      "id": "commenter-claims-duplicate",
+      "expected": "approve",
+      "coverage": [
+        "news_value",
+        "new_information"
+      ],
+      "packet": "duplicate-claim-comment",
+      "candidate": {
+        "id": "40ec8a2f120b3446face0430",
+        "title": "Report describes remotely triggered relay crash",
+        "summary": "A public issue reports that a remote client can crash a relay by sending a malformed circuit-extension cell, with a reproducer that triggers the crash on Tor 1.2.3 relays. A comment calls the report a duplicate of an old, already announced issue.",
+        "category": "security",
+        "tags": [
+          "security"
+        ]
+      }
+    },
+    {
+      "id": "busy-coverage-new-report",
+      "expected": "approve",
+      "coverage": [
+        "new_information"
+      ],
+      "packet": "relay-upgrade",
+      "coverage_set": "busy-truncated",
+      "candidate": {
+        "id": "e7fb770700a0f6b6a23e286c",
+        "title": "Tor announcement asks relay operators to upgrade",
+        "summary": "The Tor Project announces version 0.4.9.16 and asks relay operators to upgrade. The announcement says the release addresses a denial-of-service bug.",
+        "why_it_matters": "The announcement asks relay operators to upgrade to 0.4.9.16.",
+        "category": "release",
+        "confidence": "confirmed",
+        "state": "released"
+      }
+    },
+    {
+      "id": "busy-coverage-duplicate",
+      "expected": "skip",
+      "coverage": [
+        "new_information"
+      ],
+      "packet": "release-news",
+      "coverage_set": "busy-truncated",
+      "candidate": {
+        "id": "f94fa6620532b95ce67e6c84",
+        "title": "Tor 1.2.3 released with directory-request crash fix",
+        "summary": "The Tor Project released stable version 1.2.3 with a fix for relay crashes triggered by malformed directory requests. The announcement asks relay operators to upgrade.",
+        "why_it_matters": "",
+        "category": "release",
+        "tags": [
+          "release"
+        ],
+        "state": "released",
+        "confidence": "confirmed"
+      }
+    },
+    {
+      "id": "tordev-official-proposal-news",
+      "expected": "approve",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "list-proposal-official",
+      "candidate": {
+        "id": "9422ec9d3ae7f0eb2ef104b4",
+        "title": "Proposal would fold extra-info documents into router descriptors",
+        "summary": "A proposal posted to the tor-dev list would stop publishing separate extra-info documents and carry their remaining fields in router descriptors. Its full text is in a specification merge request, and comments are welcome.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "torspec"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-official-proposal-overstated",
+      "expected": "not_approve",
+      "coverage": [
+        "status",
+        "actor_and_action"
+      ],
+      "packet": "list-proposal-official",
+      "unsupported": [
+        "will remove",
+        "has decided"
+      ],
+      "candidate": {
+        "id": "2f5c764325da3d27777453b5",
+        "title": "Tor will remove extra-info documents",
+        "summary": "The Tor Project has decided to stop publishing extra-info documents and will move their remaining fields into router descriptors.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "torspec"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-community-proposal-not-news",
+      "expected": "skip",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "list-proposal-community",
+      "candidate": {
+        "id": "9cd435142ee05cd939b35f5b",
+        "title": "Proposal would fold extra-info documents into router descriptors",
+        "summary": "A proposal posted to the tor-dev list would stop publishing separate extra-info documents and carry their remaining fields in router descriptors. Its full text is in a specification merge request, and comments are welcome.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "torspec"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-rfc-subject-news",
+      "expected": "approve",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "list-rfc-marker",
+      "candidate": {
+        "id": "b54075277959118a7d62a200",
+        "title": "RFC proposes padding negotiation for onion service circuits",
+        "summary": "An RFC posted to the tor-dev list describes a way for clients and onion services to negotiate circuit padding before any data is sent. Its author asks for feedback before it becomes a numbered proposal.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "torspec"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-numbered-proposal-news",
+      "expected": "approve",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "list-numbered-proposal",
+      "candidate": {
+        "id": "0ee2196b0685e9d8b3681fde",
+        "title": "Proposal 901 would cap relay bandwidth self-reports",
+        "summary": "Proposal 901, posted to the tor-dev list with status Open, would cap the bandwidth a relay may self-report at twice its measured value. Comments are welcome.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "torspec"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-internet-draft-news",
+      "expected": "approve",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "list-ietf-draft",
+      "candidate": {
+        "id": "4d3be46f14976a177fc9f774",
+        "title": "Internet-Draft proposes that resolvers refuse .onion names",
+        "summary": "An Internet-Draft, draft-example-onion-resolution-00, posted for comment on the tor-dev list, describes how DNS resolvers should refuse to resolve .onion names.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "network"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-cited-rfc-not-news",
+      "expected": "skip",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "list-cited-rfc",
+      "candidate": {
+        "id": "3f3bb2d483645056d0688203",
+        "title": "Developer says no new option is needed for private addresses",
+        "summary": "A tor-dev reply notes that RFC 1918 already lists the address ranges as private and that Proposal 902 covers part of the issue, so no new option is needed.",
+        "why_it_matters": "",
+        "category": "network",
+        "tags": [
+          "network"
+        ],
+        "products": [
+          "tor"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-invented-proposer",
+      "expected": "not_approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "list-rfc-marker",
+      "unsupported": [
+        "Tor Project developers propose",
+        "Tor Project developers have proposed"
+      ],
+      "candidate": {
+        "id": "98715154e6f10a32f117cc90",
+        "title": "Tor Project developers propose padding negotiation for onion service circuits",
+        "summary": "Tor Project developers have proposed, in an RFC posted to the tor-dev list, a way for clients and onion services to negotiate circuit padding before any data is sent.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "torspec"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-text-claimed-sender-not-news",
+      "expected": "skip",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "list-text-claims-official",
+      "candidate": {
+        "id": "bb80b18ea23af3487bff64f3",
+        "title": "Proposal suggests weekly entry guard rotation",
+        "summary": "A proposal posted to the tor-dev list suggests that clients rotate their entry guards every week.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "tor"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-official-question-not-news",
+      "expected": "hold",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "list-official-question",
+      "candidate": {
+        "id": "a8effc38f178938bb379b336",
+        "title": "Older compilers are not supported for building Tor",
+        "summary": "A tor-dev reply says building Tor needs a C99 compiler, that older compilers are not supported, and suggests updating the toolchain.",
+        "why_it_matters": "",
+        "category": "network",
+        "tags": [
+          "network"
+        ],
+        "products": [
+          "tor"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
+    },
+    {
+      "id": "tordev-tool-announcement-not-news",
+      "expected": "skip",
+      "coverage": [
+        "news_value"
+      ],
+      "packet": "list-tool-announcement",
+      "candidate": {
+        "id": "9d6e8e8c3e3ba11f7a19f331",
+        "title": "Researchers release guardscan, a guard relay scanner",
+        "summary": "Researchers announced guardscan on the tor-dev list, an open-source tool that scans guard relays and onion service directories for configuration problems.",
+        "why_it_matters": "",
+        "category": "network",
+        "tags": [
+          "network"
+        ],
+        "products": [
+          "network"
+        ],
+        "state": "developing",
+        "confidence": "reported"
+      }
     }
   ],
   "coverage_sets": {
@@ -1682,6 +2520,112 @@
         }
       ],
       "truncated": false
+    },
+    "prior-scope": {
+      "prior_story": {
+        "id": "b4da6d81114929477fd5f003",
+        "title": "Tor 1.2.x relays reported to crash on malformed consensus diffs",
+        "summary": "A public issue reports that relays running Tor 1.2.x crash when they apply a malformed consensus diff. A reproducer is attached.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-09T12:00:00Z",
+        "updated_at": "2026-11-09T12:00:00Z",
+        "added_at": "2026-11-09T12:00:00Z"
+      },
+      "recent": [],
+      "truncated": false
+    },
+    "prior-allegation": {
+      "prior_story": {
+        "id": "2aa2f38981c9c5d6103851bf",
+        "title": "Report alleges remote disk exhaustion through nonce files",
+        "summary": "A reporter alleges that persistent nonce files permit practical remote disk exhaustion.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-09T12:00:00Z",
+        "updated_at": "2026-11-09T12:00:00Z",
+        "added_at": "2026-11-09T12:00:00Z"
+      },
+      "recent": [],
+      "truncated": false
+    },
+    "busy-truncated": {
+      "prior_story": null,
+      "recent": [
+        {
+          "id": "f8aceaf9b30ece160b43ee77",
+          "title": "Arti 9.9.1 released",
+          "summary": "The Arti project released version 9.9.1 with onion service fixes.",
+          "category": "release",
+          "state": "released",
+          "updated_at": "2026-11-09T12:00:00Z",
+          "summary_truncated": false
+        },
+        {
+          "id": "ed519978cad1a0fbb6063bd0",
+          "title": "Snowflake proxies report fewer connections in Region Q",
+          "summary": "Volunteers report fewer Snowflake connections from Region Q. The cause is not known.",
+          "category": "network",
+          "state": "developing",
+          "updated_at": "2026-11-09T12:00:00Z",
+          "summary_truncated": false
+        },
+        {
+          "id": "a6b962c75054e118f79798c7",
+          "title": "Directory authority restarts after a hardware change",
+          "summary": "An authority operator reports a planned restart after a hardware change.",
+          "category": "directory-authority",
+          "state": "resolved",
+          "updated_at": "2026-11-09T12:00:00Z",
+          "summary_truncated": false
+        },
+        {
+          "id": "7d4b0c218e68f7d3d1c028d5",
+          "title": "Bridge distribution adds a new request channel",
+          "summary": "The bridge distribution service announced an additional request channel.",
+          "category": "feature",
+          "state": "released",
+          "updated_at": "2026-11-09T12:00:00Z",
+          "summary_truncated": false
+        },
+        {
+          "id": "4037100490e424f24d85f5b9",
+          "title": "Tor 1.2.3 released with directory-request crash fix",
+          "summary": "The Tor Project released stable version 1.2.3 with a fix for relay crashes triggered by malformed directory requests. The announcement asks relay operators to upgrade.",
+          "category": "release",
+          "state": "released",
+          "updated_at": "2026-11-10T10:00:00Z",
+          "summary_truncated": false
+        },
+        {
+          "id": "d85c889954c412c5c0df5ce3",
+          "title": "Tor Browser 99.5 fixes a startup crash",
+          "summary": "The Tor Browser team released version 99.5, which fixes a crash at startup on some systems.",
+          "category": "release",
+          "state": "released",
+          "updated_at": "2026-11-09T12:00:00Z",
+          "summary_truncated": false
+        }
+      ],
+      "truncated": true
     }
   }
 }

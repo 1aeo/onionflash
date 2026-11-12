@@ -120,6 +120,32 @@ results and case labels are not sent to the model. Inspect approved articles and
 repairs against the sources as well as checking the automatic scores: phrase
 checks cannot establish semantic correctness.
 
+A case expects `approve`, `skip`, `hold`, or `not_approve`: news with a flawed
+draft, which must end in a hold or a clean verified repair, never a skip. A
+flawed draft names the wording (`unsupported`) or labels
+(`forbidden_classifications`) it must not publish, or wording it must not leave
+out (`required`); a publication without required wording counts as an omission,
+not a false approval. A passage may be a comment with its author, date and link,
+placed as the application places comments. `impact_cleared` counts approvals
+published only after their impact sentence was cleared, and a report keeps the
+model's own verdict when a fixed rule replaced it. `--draft` instead has the
+writer draft each packet once per round and reviews that draft under each
+coverage background its cases use; `draft_unsupported` counts drafts that
+contain flagged wording or labels. An explicit `--cases` replaces the default
+case files and may be repeated, so cases that cannot be public stay in a
+private file of the same format.
+
+Judged cases carry an `audit`, naming a set labeled by independent reviewers,
+and a `flaw` unless the reviewers found the draft clean. A flawed case is caught
+when its flaw never publishes and the news is not skipped; a clean case must
+publish unchanged, and anything else is a false alarm. A catch is paired only
+when every clean case on the same packet was right in the same round, and a
+refusal also needs one such case in the run, so refusing an item never counts as
+catching its flaw. The run fails unless paired catches reach 90% overall and 80%
+for each flaw with at least 10 distinct cases, with at most 10% false alarms.
+Use `--rounds 2` for acceptance, and add each new audit's labeled set before the
+prompt changes it leads to.
+
 Using the same model for drafting and review can retain shared blind spots.
 Finite tests are not a production accuracy estimate. Keep primary-source links,
 editorial corrections and periodic audits of new output.
