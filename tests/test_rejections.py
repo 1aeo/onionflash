@@ -432,15 +432,13 @@ def test_ignored_reconsideration_is_explicit_audited_and_one_item_only(store):
 
 
 def reviewed_skip(store):
-    """Commit a skip for insufficient new information, which leaves neither its job nor its receipt."""
+    """Commit a skip for no new information, which leaves neither its job nor its receipt."""
     from onionflash import review_gate
     from test_review_gate import Reviewer, Writer, verdict
     source = item(url="https://example.org/reconsidered-report")
     store.ingest(source, DATE)
     row = store.pending(1, DATE)[0]
-    reply = verdict("skip", criterion="new_information")
-    reply["criteria"]["new_information"]["outcome"] = "insufficient"
-    checker = Reviewer(reply)
+    checker = Reviewer(verdict("skip", criterion="new_information"))
     assert review_gate.process_item(DEFAULTS, store, row, Writer(), checker, DATE)["status"] == "ignored"
     assert not store.db.execute("SELECT 1 FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
     assert not store.db.execute("SELECT 1 FROM review_approvals").fetchone()
@@ -456,7 +454,7 @@ def test_a_skip_is_listed_with_its_reason_and_shows_its_decision_and_coverage(st
     assert [(entry["id"], entry["story_id"], entry["rejection_reason"]) for entry in listed] == [
         (row["id"], None, "Final review skipped: new_information")]  # a skip maps the item to no story
     shown = rejection.show_item(store, row["id"])["final_review"]
-    assert shown["stage"] == "finished" and shown["latest_review"]["criteria"]["new_information"]["outcome"] == "insufficient"
+    assert shown["stage"] == "finished" and shown["latest_review"]["criteria"]["new_information"]["outcome"] == "fail"
     assert [entry["id"] for entry in shown["coverage"]["recent"]] == [store.stories()[0]["id"]]
     with store.db:  # earlier releases committed some revisions without a review record
         store.record_analysis(row, analysis(), "commit-without-a-record", DATE)

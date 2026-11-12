@@ -416,7 +416,7 @@ def test_rejected_show_explains_structured_hold_with_the_actual_candidate_and_pa
     assert shown["candidate"]["title"] == analysis()["title"]
     assert shown["latest_review"]["verdict"] == "hold"
     assert shown["latest_review"]["criteria"]["operational_advice"]["outcome"] == "fail"
-    assert shown["latest_review"]["issues"][0]["source_refs"] == ["S1"]
+    assert shown["latest_review"]["criteria"]["operational_advice"]["source_refs"] == ["S1"]
     assert shown["source_packet"]["sources"][0]["passages"][0]["id"] == "S1:P1"
     assert list(store.db.iterdump()) == before
 

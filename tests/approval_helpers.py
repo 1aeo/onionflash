@@ -12,16 +12,14 @@ from onionflash.util import digest
 
 
 def verdict(action="approve", *, repair=None, criterion="operational_advice", ref="S1"):
-    """A reviewer reply in which every criterion passes, or `criterion` fails with one issue."""
-    checks = {name: {"outcome": "pass", "source_refs": [ref], "reason": "Supported by the supplied source."}
+    """A reviewer reply in which every criterion passes, or `criterion` fails."""
+    checks = {name: {"reason": "Supported by the supplied source.", "source_refs": [ref], "outcome": "pass"}
               for name in review.CRITERIA}
-    issues = []
     if action != "approve":
-        checks[criterion]["outcome"] = "fail"
-        issues = [{"criterion": criterion, "source_refs": [ref], "explanation": "The source does not support this claim."}]
+        checks[criterion].update(reason="The source does not support this claim.", outcome="fail")
     # A reply names every editable field and leaves the unchanged ones null.
     wire = None if repair is None else {key: repair.get(key) for key in review.EDITABLE}
-    return {"verdict": action, "criteria": checks, "issues": issues, "repair": wire}
+    return {"criteria": checks, "verdict": action, "repair": wire}
 
 
 def approved_result(packet):

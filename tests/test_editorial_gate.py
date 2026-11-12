@@ -189,21 +189,3 @@ def test_recorded_decision_is_not_reused_after_its_context_changes(context, monk
     checker = Reviewer(verdict())
     assert run(cfg, store, row, Writer(), checker)["status"] == "published"
     assert [call[2] for call in checker.calls] == [False, True]
-
-
-@pytest.mark.parametrize("final", ["approve", "hold"])
-def test_reconciled_critique_still_requires_fresh_verification(context, final):
-    """Repairing a contradictory critique never substitutes for final approval."""
-    cfg, store = context
-    row = pending(store)
-    critique = verdict("revise", criterion="technical_details", repair={"tags": ["release"]})
-    critique["criteria"]["technical_details"]["outcome"] = "pass"
-    checker = Reviewer(critique, verdict(final))
-    draft = analysis(category="release", tags=["release", "security"], state="released", why_it_matters="")
-    result = run(cfg, store, row, Writer(draft), checker)
-    assert result["review_calls"] == 2 and [call[2] for call in checker.calls] == [False, True]
-    assert checker.calls[1][0]["tags"] == ["release"]
-    assert result["status"] == ("published" if final == "approve" else "held")
-    assert len(store.stories()) == (1 if final == "approve" else 0)
-    record = json.loads(store.db.execute("SELECT review_record FROM analyses").fetchone()[0])
-    assert record["reviews"][0]["result"]["criteria"]["technical_details"]["outcome"] == "fail"

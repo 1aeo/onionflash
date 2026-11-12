@@ -57,13 +57,15 @@ def test_review_and_its_fresh_verification_send_only_the_exact_candidate_and_pac
     assert json.loads(second["messages"][1]["content"]) == {"candidate": repaired, "packet": packet()}
 
 
-@pytest.mark.parametrize("bad", ["source-ref", "pass-with-issues", "failed-criterion", "changed-text", "missing-criterion", "missing-refs", "score", "unknown-verdict"])
+@pytest.mark.parametrize("bad", ["source-ref", "issues", "model-verdict", "failed-criterion", "changed-text", "missing-criterion", "missing-refs", "score", "unknown-verdict"])
 def test_malformed_or_ambiguous_approval_is_rejected(monkeypatch, bad):
     response = verdict()
     if bad == "source-ref":
         response["criteria"]["source_support"]["source_refs"] = ["S2:P99"]
-    elif bad == "pass-with-issues":
-        response["issues"] = [{"criterion": "source_support", "explanation": "Unsupported", "source_refs": ["S1:P1"]}]
+    elif bad == "issues":
+        response["issues"] = []
+    elif bad == "model-verdict":
+        response["model_verdict"] = "hold"  # only the application records a replaced verdict
     elif bad == "failed-criterion":
         response["criteria"]["source_support"]["outcome"] = "fail"
     elif bad == "changed-text":
@@ -106,9 +108,7 @@ def test_release_labels_cannot_approve_a_merged_change(monkeypatch, category, ta
     raw = verdict()
     result = reviewer(monkeypatch, completion(raw)).review(public, packet(), verification=verification)
     assert result["verdict"] == "hold" and result["repair"] is None
-    assert result["criteria"]["status"]["outcome"] == "fail"
-    assert result["issues"] == [{"criterion": "status", "source_refs": [],
-                                 "explanation": "Release labels require a released or tagged state."}]
+    assert result["criteria"]["status"]["outcome"] == "fail" and result["model_verdict"] == "approve"
     assert all(result["criteria"][key] == raw["criteria"][key] for key in review.CRITERIA if key != "status")
     assert review.validate_review(result, packet()) == result and public == before
 
@@ -118,61 +118,6 @@ def test_inconsistent_release_metadata_does_not_prevent_editorial_skip(monkeypat
     result = reviewer(monkeypatch, completion(verdict("skip", criterion="news_value"))).review(
         candidate(state="merged"), packet())
     assert result["verdict"] == "skip"
-
-
-@pytest.mark.parametrize("action", ["revise", "hold", "skip"])
-@pytest.mark.parametrize("long_reason", [False, True])
-def test_refusal_issues_conservatively_override_pass_checks_without_mutating_input(action, long_reason):
-    """A stated problem may downgrade a refusal's check, never authorize publication."""
-    criterion = "news_value" if action == "skip" else "technical_details"
-    response = verdict(action, criterion=criterion, repair={"tags": ["release"]} if action == "revise" else None)
-    response["criteria"][criterion]["outcome"] = "pass"
-    issue = response["issues"][0]
-    issue["source_refs"] = ["S1:P1"]
-    issue["explanation"] = "Security classification is unsupported." if not long_reason else "Unsupported classification. " * 8
-    original = copy.deepcopy(response)
-    normalized = review.validate_review(response, packet())
-    check = normalized["criteria"][criterion]
-    assert normalized["verdict"] == action and check["outcome"] == "fail"
-    assert check["source_refs"] == issue["source_refs"]
-    assert 0 < len(check["reason"]) <= review.CHECK["properties"]["reason"]["maxLength"]
-    if not long_reason:
-        assert check["reason"] == issue["explanation"]
-    if action == "revise":
-        assert normalized["repair"] == {"tags": ["release"]}
-    assert response == original
-    normalized["issues"][0]["source_refs"].clear()
-    normalized["criteria"][criterion]["source_refs"].clear()
-    assert response == original
-
-
-@pytest.mark.parametrize("problem", ["approve", "bad-reference", "unexplained-failure", "unknown-criterion"])
-def test_issue_reconciliation_preserves_fail_closed_review_rules(problem):
-    """Contradictory critiques cannot bypass approval, reference or completeness checks."""
-    response = verdict("revise", criterion="technical_details", repair={"tags": ["release"]})
-    response["criteria"]["technical_details"]["outcome"] = "pass"
-    if problem == "approve":
-        response.update(verdict="approve", repair=None)
-    elif problem == "bad-reference":
-        response["issues"][0]["source_refs"] = ["S9:P99"]
-    elif problem == "unexplained-failure":
-        response["criteria"]["source_support"]["outcome"] = "fail"
-    else:
-        response["issues"][0]["criterion"] = "invented"
-    original = copy.deepcopy(response)
-    with pytest.raises(review.ReviewError):
-        review.validate_review(response, packet())
-    assert response == original
-
-
-def test_issue_reconciliation_never_upgrades_existing_failed_or_insufficient_checks():
-    """Existing refusal reasons retain their outcomes and evidence during normalization."""
-    for outcome in ("fail", "insufficient"):
-        response = verdict("hold", criterion="technical_details")
-        response["criteria"]["technical_details"]["outcome"] = outcome
-        prior = copy.deepcopy(response["criteria"]["technical_details"])
-        normalized = review.validate_review(response, packet())
-        assert normalized["criteria"]["technical_details"] == prior
 
 
 def test_repairs_can_clear_but_cannot_generate_an_impact_paragraph(monkeypatch):
@@ -208,35 +153,68 @@ def test_editorial_coverage_is_background_and_never_an_evidence_reference(monkey
         reviewer(monkeypatch, completion(forged)).review(public, packet(), coverage=background)
 
 
-@pytest.mark.parametrize("criterion", ["news_value", "new_information"])
-@pytest.mark.parametrize("outcome", ["fail", "insufficient"])
-def test_editorial_skip_requires_a_recorded_editorial_failure(criterion, outcome):
-    """Require a failed selection criterion before accepting a skip verdict."""
-    response = verdict("skip", criterion=criterion)
-    response["criteria"][criterion]["outcome"] = outcome
-    result = review.validate_review(response, packet())
-    assert result["verdict"] == "skip" and result["repair"] is None
+COVERED = "0123456789abcdef01234567"
+COVERAGE = {"prior_story": None, "recent": [{"id": COVERED, "title": "Earlier coverage"}], "truncated": False}
+PRIOR = {"prior_story": {"id": COVERED, "title": "Earlier coverage"}, "recent": [], "truncated": False}
+
+
+@pytest.mark.parametrize("criterion,outcome,expected", [
+    ("news_value", "fail", "skip"), ("new_information", "fail", "skip"),
+    ("news_value", "insufficient", "hold"), ("new_information", "insufficient", "hold"),
+    ("source_support", "fail", "hold"),  # a factual failure alone is not an editorial skip
+])
+@pytest.mark.parametrize("verification", [False, True])
+def test_a_skip_stands_only_on_a_failed_editorial_criterion(monkeypatch, criterion, outcome, expected, verification):
+    """An uncertain or factual-only skip holds, and the record keeps the model's own verdict."""
+    reply = verdict("skip", criterion=criterion)
+    reply["criteria"][criterion].update(outcome=outcome, reason=f"Story {COVERED} reports the same event.")
+    result = reviewer(monkeypatch, completion(reply)).review(candidate(), packet(), coverage=COVERAGE,
+                                                             verification=verification)
+    assert (result["verdict"], result["repair"], result["criteria"]) == (expected, None, reply["criteria"])
+    assert result.get("model_verdict") == (None if expected == "skip" else "skip")
+    assert review.validate_review(result, packet()) == result  # the saved review stays valid
+    if expected == "hold":  # a saved skip of this kind is damaged
+        with pytest.raises(review.ReviewError, match="editorial criterion"):
+            review.validate_review(reply, packet())
+
+
+@pytest.mark.parametrize("coverage,reason,expected", [
+    (COVERAGE, "Earlier coverage reports the same event.", "hold"),
+    (COVERAGE, f"Story {COVERED} reports the same event.", "skip"),
+    (PRIOR, f"The existing story {COVERED} already reports this.", "skip"),
+    (None, f"Story {COVERED} reports the same event.", "hold"),
+], ids=["unnamed", "recent", "prior", "no-coverage"])
+def test_a_skip_for_new_information_alone_names_a_story_from_coverage(monkeypatch, coverage, reason, expected):
+    """Duplication is decided only from the coverage background, so the reason names the story."""
+    reply = verdict("skip", criterion="new_information")
+    reply["criteria"]["new_information"]["reason"] = reason
+    result = reviewer(monkeypatch, completion(reply)).review(candidate(), packet(), coverage=coverage)
+    assert result["verdict"] == expected
+    # A failed news_value is enough by itself.
+    reply["criteria"]["news_value"]["outcome"] = "fail"
+    assert reviewer(monkeypatch, completion(reply)).review(candidate(), packet(), coverage=coverage)["verdict"] == "skip"
+
+
+def test_reply_reasons_before_outcomes_and_verdict(monkeypatch):
+    """The schema orders the generated reply: each reason before its outcome, every criterion before the verdict."""
+    checker = reviewer(monkeypatch, completion(verdict()))
+    checker.review(candidate(), packet())
+    schema = checker.client.requests[0][1]["response_format"]["json_schema"]["schema"]
+    assert list(schema["properties"]) == schema["required"] == ["criteria", "verdict", "repair"]
+    for check in schema["properties"]["criteria"]["properties"].values():
+        assert list(check["properties"]) == check["required"] == ["reason", "source_refs", "outcome"]
+        assert check["properties"]["reason"]["maxLength"] == 240  # room for a 25-word reason
 
 
 def test_skip_can_record_factual_defects_without_polishing_non_news():
     response = verdict("skip", criterion="new_information")
     response["criteria"]["source_support"]["outcome"] = "fail"
-    response["issues"].append({"criterion": "source_support", "explanation": "The draft overstates a repeated report.", "source_refs": ["S1:P1"]})
     assert review.validate_review(response, packet())["verdict"] == "skip"
 
 
-def test_factual_failure_alone_is_not_an_editorial_skip():
-    with pytest.raises(review.ReviewError, match="editorial criterion"):
-        review.validate_review(verdict("skip", criterion="source_support"), packet())
-
-
-def test_skip_cannot_repair_text_or_omit_its_issues():
+def test_skip_cannot_repair_text():
     response = verdict("skip", criterion="news_value", repair={"summary": "Different text"})
     with pytest.raises(review.ReviewError, match="Only a revise"):
-        review.validate_review(response, packet())
-    response = verdict("skip", criterion="news_value")
-    response["issues"] = []
-    with pytest.raises(review.ReviewError, match="every failed criterion"):
         review.validate_review(response, packet())
 
 
@@ -282,7 +260,7 @@ def test_cached_api_response_validation_checks_refs_and_sparse_repairs():
     response = verdict("revise", repair={"why_it_matters": ""})
     response["repair"] = {"why_it_matters": ""}
     assert review.validate_review(response, packet())["repair"] == {"why_it_matters": ""}
-    response["issues"][0]["source_refs"] = ["S9"]
+    response["criteria"]["operational_advice"]["source_refs"] = ["S9"]
     with pytest.raises(review.ReviewError, match="source reference"):
         review.validate_review(response, packet())
 
@@ -300,7 +278,7 @@ def test_reviewer_sends_app_built_packet_text_without_rechecking_it(monkeypatch)
 
 
 def test_duplicate_verdict_and_truncated_review_are_never_approved(monkeypatch):
-    encoded = json.dumps(verdict()).replace('{"verdict":', '{"verdict":"hold","verdict":', 1)
+    encoded = json.dumps(verdict()).replace('"verdict":', '"verdict":"hold","verdict":', 1)
     raw = {"choices": [{"finish_reason": "stop", "message": {"content": encoded}}]}
     checker = reviewer(monkeypatch, Response(200, json.dumps(raw).encode(), {}, "https://llm.example/v1"))
     with pytest.raises(AnalysisError, match="invalid JSON") as caught:

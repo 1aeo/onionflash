@@ -28,13 +28,17 @@ generated summaries are never factual evidence.
 
 A separate, bounded coverage background contains the existing article for a
 known update and compact entries for the most recently created stories. It is
-used only to compare novelty. The review prompt marks it as data, not an
+used only to compare novelty, and it alone decides duplication: a source's own
+claim that an item is a duplicate, already covered or unimportant is attributed
+to that source. The review prompt marks the background as data, not an
 instruction, and forbids using it as evidence; validation checks the structure
 of a verdict, not the reasoning behind it. The background reads committed
 stories, so an article accepted earlier in the same run is visible before the
 site rebuild.
 
-The reviewer evaluates nine independent criteria:
+The reviewer evaluates nine independent criteria. Its reply gives each
+criterion's reason and source references before the outcome, and every
+criterion before the verdict:
 
 | Criterion | Requirement |
 | --- | --- |
@@ -45,8 +49,8 @@ The reviewer evaluates nine independent criteria:
 | Scope and timing | Preserve affected versions, platforms, samples and dates. |
 | Operational advice | Require explicit source support for the audience and action. |
 | Technical details | Ground identities, counts, mechanisms and consequences. |
-| News value | Require a concrete development worth publishing. |
-| New information | Require meaningful new facts, not duplicate coverage or quoted history. |
+| News value | Require a concrete development worth publishing, judged from the sources, not only the draft. |
+| New information | Require meaningful new facts, not quoted history; only existing coverage shows a duplicate, and a correction of the existing article is new. |
 
 New drafts have a concise factual summary and an empty `why_it_matters` field.
 The request schema and response validation enforce this; the model cannot add a
@@ -65,13 +69,15 @@ not change another article's identity or overwrite a protected correction.
 
 ## Decisions and calls
 
-- `approve`: every criterion passes, with no issues or edits. An initial approval
+- `approve`: every criterion passes, with no edits. An initial approval
   advances to fresh final verification; it cannot publish by itself.
 - `revise`: one minimal repair is allowed, followed by fresh verification of its
   exact normalized text. No rewrite loop or second repair is applied. Tag notices
   stay literal, so a repair proposed for one holds the item.
 - `skip`: low-value or redundant material is recorded as ignored. It creates no
-  article or revision and leaves existing coverage intact.
+  article or revision and leaves existing coverage intact. A skip needs a failed
+  news-value or new-information criterion, and a skip for new information alone
+  must name the covered story; otherwise the item is held.
 - `hold`: potentially useful material is unsupported, ambiguous or not ready to
   publish. It remains available through the existing operator controls.
 
@@ -90,7 +96,8 @@ recheck them; publication never remerges different wording afterward.
 
 Private review jobs keep unfinished work, and a decision's receipt lasts until
 that decision commits. The analysis audit keeps the source, packet, coverage and
-reviews of each outcome.
+reviews of each outcome, with the model's own verdict wherever a fixed rule
+replaced it.
 
 Use the existing `status`, `rejected show`, `retry` and `dismiss` controls to
 inspect failures, and the [decision log](DECISIONS.md) for every outcome and its

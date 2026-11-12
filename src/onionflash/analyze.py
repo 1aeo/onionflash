@@ -11,7 +11,7 @@ from .util import digest, normalize_evidence as _plain
 from .comments import analysis_context
 from .schema import CATEGORIES, PRIORITIES, CONFIDENCES, STATES, PRODUCTS
 
-PROMPT_VERSION = "onionflash-14"
+PROMPT_VERSION = "onionflash-15"
 MIN_EVIDENCE_CHARS = 8
 MAX_EVIDENCE_CHOICES = 128
 SCHEMA = {
@@ -96,7 +96,8 @@ BadExit, missing votes, overload, unresponsive metrics and inactive counters do 
 establish malicious activity, a particular cause or a defense bypass. Distinguish
 stream/request counts from bandwidth, and a measured sample from all affected relays.
 Preserve the source's inspection date for claims about versions or the main branch.
-Do not invent versions, CVEs, identities, consequences, fixes or operator guidance.
+Do not invent versions, CVEs, identities, counts, causal explanations, consequences,
+fixes or operator guidance. A count the source states may be restated.
 A developer changing source code is not an operator changing configuration.
 
 Set why_it_matters to an empty string. Do not write a separate impact paragraph.

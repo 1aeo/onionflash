@@ -33,7 +33,6 @@ def item_id(store, url):
 def both_editorial():
     reply = verdict("skip", criterion="news_value")
     reply["criteria"]["new_information"]["outcome"] = "fail"
-    reply["issues"].append({"criterion": "new_information", "source_refs": ["S1"], "explanation": "Coverage reports it."})
     return reply
 
 
