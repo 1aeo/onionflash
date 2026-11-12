@@ -9,11 +9,11 @@ import json
 import hashlib
 import re
 
-from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, STATES
+from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, PUBLIC_STATES, UPDATE_CHARS
 from .util import canonical_url, digest, format_utc, now_iso, parse_utc
 
 
-FIELDS = frozenset({"title", "summary", "why_it_matters", "category", "priority", "confidence", "state", "products", "tags", "sources"})
+FIELDS = frozenset({"title", "summary", "why_it_matters", "category", "priority", "confidence", "state", "products", "tags", "sources", "updates"})
 PUBLIC_HISTORY_LIMIT = 20
 _ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 _HASH = re.compile(r"[a-f0-9]{64}\Z")
@@ -150,7 +150,7 @@ def public_metadata(db, story_id: str) -> dict | None:
     control = db.execute("SELECT * FROM editorial_controls WHERE story_id=?", (story_id,)).fetchone()
     if control is None:
         return None
-    rows = db.execute("SELECT revision,action,reason,created_at,before_public_json FROM editorial_revisions WHERE story_id=? ORDER BY revision DESC LIMIT ?", (story_id, PUBLIC_HISTORY_LIMIT)).fetchall()
+    rows = db.execute("SELECT revision,action,reason,created_at,before_public_json,after_public_json FROM editorial_revisions WHERE story_id=? ORDER BY revision DESC LIMIT ?", (story_id, PUBLIC_HISTORY_LIMIT)).fetchall()
     entries = []
     for row in rows:
         entry = {key: row[key] for key in ("revision", "action", "reason", "created_at")}
@@ -159,11 +159,28 @@ def public_metadata(db, story_id: str) -> dict | None:
         if row["before_public_json"] is not None and row["action"] != "unlock" and not control["retracted"]:
             before = json.loads(row["before_public_json"])
             entry["superseded"] = {key: before.get(key, "") for key in ("title", "summary", "why_it_matters")}
+            # Of the dated updates, only those this revision removed or whose date or text it changed.
+            kept = {(update["at"], update["text"]) for update in json.loads(row["after_public_json"]).get("updates", [])}
+            if replaced := [{"at": update["at"], "text": update["text"]} for update in before.get("updates", []) if (update["at"], update["text"]) not in kept]:
+                entry["superseded"]["updates"] = replaced
         entries.append(entry)
     # history_total repeats revision; earlier releases require it, so a rollback still builds.
     return {"status": "retracted" if control["retracted"] else "corrected", "revision": control["revision"],
             "action": control["notice_action"], "reason": control["notice_reason"], "at": control["notice_at"],
             "history": entries, "history_total": control["revision"]}
+
+
+def _sources(value, limit: int) -> list[dict]:
+    if not isinstance(value, list) or not 1 <= len(value) <= limit:
+        raise ValueError(f"Between one and {limit} public sources are required")
+    sources = []
+    for source in value:
+        if not isinstance(source, dict) or set(source) != {"url", "title"}:
+            raise ValueError("Sources require only url and title")
+        sources.append({"url": canonical_url(source["url"]), "title": _text(source["title"], "source title", 200)})
+    if len({s["url"] for s in sources}) != len(sources):
+        raise ValueError("Duplicate source URL")
+    return sources
 
 
 def _validated_patch(patch: dict) -> dict:
@@ -173,7 +190,7 @@ def _validated_patch(patch: dict) -> dict:
     for field, limit in (("title", 180), ("summary", 1600), ("why_it_matters", 800)):
         if field in clean:
             clean[field] = _text(clean[field], field, limit, empty=field == "why_it_matters")
-    for field, allowed in (("category", CATEGORIES), ("priority", PRIORITIES), ("confidence", CONFIDENCES), ("state", STATES)):
+    for field, allowed in (("category", CATEGORIES), ("priority", PRIORITIES), ("confidence", CONFIDENCES), ("state", PUBLIC_STATES)):
         if field in clean and (not isinstance(clean[field], str) or clean[field] not in allowed):
             raise ValueError(f"Invalid {field}")
     for field, allowed in (("products", PRODUCTS), ("tags", CATEGORIES)):
@@ -183,16 +200,17 @@ def _validated_patch(patch: dict) -> dict:
                 raise ValueError(f"Invalid {field}")
             clean[field] = list(dict.fromkeys(value))
     if "sources" in clean:
-        if not isinstance(clean["sources"], list) or not 1 <= len(clean["sources"]) <= 20:
-            raise ValueError("A story requires between one and twenty public sources")
-        sources = []
-        for source in clean["sources"]:
-            if not isinstance(source, dict) or set(source) != {"url", "title"}:
-                raise ValueError("Sources require only url and title")
-            sources.append({"url": canonical_url(source["url"]), "title": _text(source["title"], "source title", 200)})
-        if len({s["url"] for s in sources}) != len(sources):
-            raise ValueError("Duplicate source URL")
-        clean["sources"] = sources
+        clean["sources"] = _sources(clean["sources"], 20)
+    if "updates" in clean:  # the whole list replaces the stored one
+        if not isinstance(clean["updates"], list):
+            raise ValueError("Updates must be a list")
+        updates = []
+        for update in clean["updates"]:
+            if not isinstance(update, dict) or set(update) != {"at", "text", "sources"}:
+                raise ValueError("Updates require only at, text and sources")
+            updates.append({"at": format_utc(parse_utc(update["at"])), "text": _text(update["text"], "update text", UPDATE_CHARS),
+                            "sources": _sources(update["sources"], 3)})
+        clean["updates"] = updates
     return clean
 
 
@@ -236,7 +254,8 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
             if row is None or row[0] is None:
                 raise ValueError("That revision has no accepted public text to restore")
             previous = _public(json.loads(row[0]))
-            public.update({key: previous[key] for key in FIELDS})
+            # Dated updates stay as they are: automated ones have no revision to restore.
+            public.update({key: previous[key] for key in FIELDS - {"updates"}})
             retracted = False
         elif action == "unlock":
             if not control.get("locked"):
@@ -251,6 +270,7 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
         public = _public(public)
         candidate = dict(current["raw"])
         candidate.pop("editorial", None)
+        candidate.pop("updates", None)  # public leaves out an empty list
         candidate.update(public)
         # Reuse collection identities only where an operator keeps that exact URL.
         previous_sources = {s.get("url"): s for s in current["raw"].get("sources", []) if isinstance(s, dict)}

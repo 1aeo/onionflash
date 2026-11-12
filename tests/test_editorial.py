@@ -14,6 +14,7 @@ import pytest
 from onionflash import editorial, render
 from onionflash.cli import build
 from onionflash.comments import _compose
+from onionflash.schema import UPDATE_CHARS
 from onionflash.store import Store, backup_database
 from test_core import DATE, analysis, config, item
 
@@ -21,6 +22,9 @@ from test_core import DATE, analysis, config, item
 EDIT = "2026-11-09T12:00:00Z"
 LATER = "2026-11-10T12:00:00Z"
 FIX = "The report requests removal of the old keys from the software."
+UPDATE_SOURCE = {"url": "https://example.org/news/2", "title": "Follow-up report"}
+UPDATES = [{"at": "2026-11-08T18:00:00Z", "text": "The operator rotated the keys.", "sources": [UPDATE_SOURCE]},
+           {"at": "2026-11-09T06:00:00+00:00", "text": "Relays picked up the new keys.", "sources": [UPDATE_SOURCE]}]
 
 
 @pytest.fixture
@@ -232,8 +236,15 @@ def test_mismatched_draft_identity_uses_last_good_snapshot_without_moving_permal
     {"sources": [{"url": "http://example.org", "title": "Bad"}]},
     {"sources": [{"url": "https://127.0.0.1/", "title": "Private"}]},
     {"sources": [{"url": "https://example.org", "title": "Source", "secret": "hidden"}]},
+    {"updates": {}}, {"updates": [UPDATE_SOURCE]},
+    {"updates": [{**UPDATES[0], "at": "not a date"}]}, {"updates": [{**UPDATES[0], "at": "2026-11-08T18:00:00"}]},
+    {"updates": [{**UPDATES[0], "sources": []}]}, {"updates": [{**UPDATES[0], "sources": [UPDATE_SOURCE, UPDATE_SOURCE]}]},
+    {"updates": [{**UPDATES[0], "sources": [{"url": f"https://example.org/{n}", "title": "Source"} for n in range(4)]}]},
+    {"updates": [{**UPDATES[0], "sources": [{"url": "http://example.org/news/2", "title": "Plain"}]}]},
+    {"updates": [{**UPDATES[0], "id": "extra"}]}, {"updates": [{**UPDATES[0], "text": "x" * (UPDATE_CHARS + 1)}]},
+    {"updates": [{**UPDATES[0], "text": " "}]}, {"state": "hacked"},
     # No-ops once normalized: the category is always a tag, and whitespace collapses.
-    {"category": "security"}, {"tags": []}, {"title": "Operator reports  possible compromise"}])
+    {"category": "security"}, {"tags": []}, {"title": "Operator reports  possible compromise"}, {"updates": []}])
 def test_invalid_patch_cannot_mutate_or_unlock_story(seeded, patch):
     cfg, store, story_id = seeded
     before = editorial.show(store.db, story_id)
@@ -241,6 +252,68 @@ def test_invalid_patch_cannot_mutate_or_unlock_story(seeded, patch):
         edit(store, story_id, patch=patch)
     assert editorial.show(store.db, story_id)["hash"] == before["hash"]
     assert not store.db.in_transaction
+
+
+def test_operator_updates_publish_and_history_supersedes_only_replaced_entries(seeded):
+    cfg, store, story_id = seeded
+    marked = {**UPDATES[1], "text": "<b>Relays</b> picked up the new keys."}
+    edit(store, story_id, patch={"updates": [UPDATES[0], marked], "state": "no-longer-listed"}, reason="Added the follow-up reports.")
+    build(cfg, store)
+    files = current_files(cfg, story_id)
+    assert files["json"]["updates"] == [UPDATES[0], {**marked, "at": "2026-11-09T06:00:00Z"}]
+    assert files["json"]["state"] == "no-longer-listed"
+    assert files["article"].index("picked up the new keys") < files["article"].index("The operator rotated")
+    assert 'First published <time datetime="2026-11-08T12:00:00Z"' in files["article"]
+    assert 'Last updated <time datetime="2026-11-09T12:00:00Z"' in files["article"]
+    for text in (files["home"], files["rss"], files["feed"]["content_text"]):
+        assert "picked up the new keys." in text and "The operator rotated the keys." not in text
+    edit(store, story_id, patch={"priority": "normal"}, observed=LATER)
+    edited = {**files["json"]["updates"][1], "text": "Relays began using the new keys."}
+    edit(store, story_id, patch={"updates": [UPDATES[0], edited]}, observed=LATER)
+    build(cfg, store)
+    files = current_files(cfg, story_id)
+    history = files["json"]["editorial"]["history"]
+    assert history[0]["superseded"]["updates"] == [{"at": "2026-11-09T06:00:00Z", "text": marked["text"]}]
+    assert all("updates" not in entry["superseded"] for entry in history[1:])  # a badge change, then no earlier updates
+    assert files["article"].count("Previous update") == 1
+    assert "&lt;b&gt;Relays&lt;/b&gt; picked up" in files["article"] and "<b>Relays" not in files["article"]
+    assert files["article"].count("The operator rotated the keys.") == 1  # unchanged, so only current
+    for text in (files["home"], files["rss"], files["feed"]["content_text"]):
+        assert "Relays began using the new keys." in text and "picked up the new keys." not in text
+    # Re-citing an update keeps its date and text, so it is not superseded either.
+    recited = {**UPDATES[0], "sources": [{"url": "https://example.org/news/3", "title": "Notice"}]}
+    edit(store, story_id, patch={"updates": [recited, edited]}, observed=LATER)
+    build(cfg, store)
+    files = current_files(cfg, story_id)
+    assert "updates" not in files["json"]["editorial"]["history"][0]["superseded"]
+    assert files["article"].count("The operator rotated the keys.") == 1
+    # Moving an update to another time supersedes its old date and text.
+    edit(store, story_id, patch={"updates": [{**recited, "at": "2026-11-08T19:00:00Z"}, edited]}, observed=LATER)
+    build(cfg, store)
+    history = current_files(cfg, story_id)["json"]["editorial"]["history"]
+    assert history[0]["superseded"]["updates"] == [{"at": "2026-11-08T18:00:00Z", "text": UPDATES[0]["text"]}]
+    edit(store, story_id, patch={"updates": []}, observed=LATER)
+    build(cfg, store)
+    assert "updates" not in current_files(cfg, story_id)["json"] and "updates" not in store.stories()[0]
+
+
+def test_retraction_hides_updates_and_restore_keeps_them(seeded):
+    cfg, store, story_id = seeded
+    edit(store, story_id, patch={"updates": UPDATES[:1]})
+    edit(store, story_id, patch={"updates": UPDATES}, observed=LATER)
+    build(cfg, store)
+    act(editorial.retract, store, story_id, reason="The source withdrew this report.")
+    build(cfg, store)
+    files = current_files(cfg, story_id)
+    assert "updates" not in files["json"]
+    for text in (files["home"], files["rss"], files["feed"]["content_text"], files["article"], json.dumps(files["json"])):
+        for update in UPDATES:
+            assert update["text"] not in text
+    assert len(store.stories()[0]["updates"]) == 2  # kept privately
+    # Restoring an earlier revision's text leaves the current updates in place.
+    act(editorial.restore, store, story_id, 1)
+    build(cfg, store)
+    assert [update["text"] for update in current_files(cfg, story_id)["json"]["updates"]] == [update["text"] for update in UPDATES]
 
 
 def test_list_field_correction_publishes_canonical_sources_tags_and_products(seeded):

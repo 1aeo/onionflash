@@ -91,6 +91,21 @@ def test_locked_story_skips_model_prose_but_records_analysis_and_grouping(tmp_pa
         assert store.db.execute("SELECT story_id FROM items WHERE id=?", (row["id"],)).fetchone()[0] == old["id"]
 
 
+def test_a_model_rewrite_keeps_the_dated_updates_an_operator_added(tmp_path):
+    update = {"at": LATER, "text": "The operator rotated the keys.", "sources": [{"url": "https://example.org/news/2", "title": "Follow-up"}]}
+    with Store(tmp_path / "db") as store:
+        old = publish(store)
+        for action, arguments in ((editorial.correct, ({"updates": [update]},)), (editorial.unlock, ())):
+            action(store.db, old["id"], *arguments, reason="Reviewed the follow-up.",
+                   expect_hash=editorial.show(store.db, old["id"])["hash"], observed=LATER)
+        row = pending(store, item(content=BODY + " Updated detail.", updated_at=LATER), LATER)
+        prepared = store.prepare_candidate(row, analysis(summary="A rewritten account."), LATER)
+        assert prepared["candidate"]["updates"] == [update]
+        store.commit_candidate(prepared, prepared["candidate"], "rewrite", LATER, **approve(store, prepared))
+        assert store.stories()[0]["summary"] == "A rewritten account."
+        assert store.stories()[0]["updates"] == [update]
+
+
 def test_cold_required_source_holds_and_hot_historical_snapshot_is_labeled(tmp_path):
     with Store(tmp_path / "db") as store:
         old = publish(store, item(content=BODY, updated_at=LATER), observed=LATER)

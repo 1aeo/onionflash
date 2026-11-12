@@ -145,6 +145,8 @@ def prepare(db, row: dict, result: dict, observed: str) -> dict:
                     published_at=previous["published_at"] if previous else item["published_at"],
                     added_at=previous.get("added_at", previous["published_at"]) if previous else observed,
                     updated_at=max(effective_updated, previous["updated_at"] if previous else item["published_at"]))
+        if previous and previous.get("updates"):  # a new draft never drops the story's dated updates
+            data["updates"] = previous["updates"]
         public = render._prepare_story(data, editorial=editorial.public_metadata(db, story_id))
         # Store exactly the normalized reviewed display fields while retaining
         # collection identities privately for future grouping and source lookup.
