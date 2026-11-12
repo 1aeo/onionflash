@@ -226,6 +226,8 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         report["writer_calls"] += json.loads(row["payload"])["kind"] != "tag"
         draft = writer.analyze(json.loads(row["payload"]))
         record["writer"] = {"key": writer_key}  # The draft itself is saved in the job, then in analyses.
+        if getattr(writer, "clears", 0):  # writer validation cleared the draft's impact sentence
+            record["writer"]["clears"] = writer.clears  # kept until an operator retry resets the record
         _save(store, row["id"], writer_key, policy, "drafted", draft, None, record, observed, prepared_at=prepared_at)
     try:
         prepared = store.prepare_candidate(row, draft, prepared_at)

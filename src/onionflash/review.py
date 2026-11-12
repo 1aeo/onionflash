@@ -78,8 +78,13 @@ the current wording preserves uncertainty. Do not demand stronger certainty.
 Evaluate every criterion separately; no average score and no majority approval:
 source_support: every factual assertion is stated or faithfully paraphrased in the
 packet. Attribution alone cannot make an unsupported consequence true.
+A non-empty why_it_matters passes only when it closely restates one packet sentence
+that itself states this event's impact or an action it asks its readers to take,
+adding no severity, urgency, cause, number, version, benefit or impact inferred from
+a description of what changed.
 actor_and_action: preserve who does what. A developer changing compiled source is
 not a relay operator changing configuration. Preserve requested versus actual action.
+why_it_matters keeps the role terms and audience of the source sentence it restates.
 status: distinguish an issue/request, merged change, observed tag, announced release,
 deployment and resolution. An issue closed or updated is not proof a fix shipped.
 Developer checklists and conditional steps do not prove a patch was merged or shipped.
@@ -91,6 +96,7 @@ confirmation. Do not turn observations, outages or load into confirmed attacks.
 Counters, missing responses or a silent mitigation counter do not establish an
 attack, compromise or defense bypass. Include material source-specific maintainer
 disagreement or qualification; do not present a disputed report as settled fact.
+why_it_matters keeps the hedges and scope of the source sentence it restates.
 Reserve confirmed for an official Tor Project announcement or a merged merge request's
 own change; use reported for issues, comments, maintainer statements, list posts and
 community claims.
@@ -193,8 +199,8 @@ from the source packet. Add only supplied facts needed to correct the specific
 problem. If the packet holds a worthwhile development not already in coverage_background
 that the candidate omits, understates or buries behind quoted old news, revise to state
 it from the packet, or hold; never skip it. Trivial asides are not novelty.
-New stories use only a concise summary. Do not add or rewrite a why_it_matters
-paragraph: leave a supported historical paragraph unchanged, or clear it with "".
+In repair, set why_it_matters to "" when any criterion fails because of it,
+otherwise null; never write or reword it.
 Skip only when the packet itself is not news or repeats covered events: verdict skip
 with repair null and news_value or new_information failed. Then prefer skip even when
 the draft also contains factual defects; do not spend repairs polishing an item that
@@ -213,7 +219,7 @@ Try to falsify each claim and label by locating its exact support in the packet.
 Do not supply a missing premise from common sense or technical expectations.
 In particular, distinguish a useful/emergency fix from an explicit instruction
 to operators; a bugfix from a security fix; and merged code from a released version.
-Check the headline and classification arrays as carefully as the summary.
+Check the headline, why_it_matters and classification arrays as carefully as the summary.
 Any unsupported claim must prevent approval, even if the rest is accurate.
 
 """ + SYSTEM_PROMPT + """

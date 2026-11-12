@@ -21,6 +21,10 @@ failures), or the operator's reason and the item's previous status and error. It
 never keeps the draft, the full review reply or the source's content. If a saved
 record cannot be read, the row keeps the title and URL, or no detail; logging
 never prevents the outcome.
+Rows of publications, skips and holds also keep `writer_clears` when writer
+validation cleared the draft's impact sentence, so a repeat hold counts the
+clear again. Failure and operator rows do not keep it, and neither do the rows
+of the new review that an operator retry starts with a kept draft.
 
 The log starts empty: decisions made before it existed, or by an older release
 after a rollback, are not in it.

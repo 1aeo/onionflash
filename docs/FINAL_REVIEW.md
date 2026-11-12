@@ -53,10 +53,12 @@ criterion before the verdict:
 | News value | Require a concrete development worth publishing, judged from the sources, not only the draft. |
 | New information | Require meaningful new facts, not quoted history; only existing coverage shows a duplicate, and a correction of the existing article is new. |
 
-New drafts have a concise factual summary and an empty `why_it_matters` field.
-The request schema and response validation enforce this; the model cannot add a
-separate impact paragraph. An explicitly sourced consequence or requested action
-may appear in the summary with its audience, scope and prerequisites preserved.
+A draft has a concise factual summary and may have one `why_it_matters` sentence:
+a close, attributed restatement of one source sentence that states the event's
+impact or an action it asks its readers to take, with that sentence's audience,
+hedges and scope. Most drafts leave it empty. Validation clears a sentence with a
+number or version absent from the title, content and comment bodies the writer
+saw (source metadata does not count).
 Historical impact text remains readable. A review repair may clear it, but cannot
 create or rewrite an impact paragraph; operator corrections remain separate.
 Automatic approvals also require consistent metadata: a `release` category or

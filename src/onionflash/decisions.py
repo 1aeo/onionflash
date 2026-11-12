@@ -77,6 +77,9 @@ def _detail(row, code, review, extra) -> dict:
         detail["verdicts"] = verdicts
     if criteria:
         detail["criteria"] = criteria
+    writer = review.get("writer") if isinstance(review, dict) else None
+    if isinstance(writer, dict) and writer.get("clears") and code.startswith(("published.", "skipped.", "held.")):
+        detail["writer_clears"] = writer["clears"]
     detail.update((key, value[:300] if isinstance(value, str) else value) for key, value in extra.items() if value is not None)
     return detail
 

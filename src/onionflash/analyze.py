@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 
 from .transport import DeadlineReached, FetchError, HttpClient
 from .util import digest, normalize_evidence as _plain
@@ -104,9 +105,17 @@ Do not invent versions, CVEs, identities, counts, causal explanations, consequen
 fixes or operator guidance. A count the source states may be restated.
 A developer changing source code is not an operator changing configuration.
 
-Set why_it_matters to an empty string. Do not write a separate impact paragraph.
-An explicitly stated consequence or requested action may appear in the summary,
-with its actual audience, scope and prerequisites preserved.
+why_it_matters is optional and conservative. Fill it only by closely
+paraphrasing one sentence of the supplied title, content or a comment body that
+itself states this event's impact or an action it asks its readers to take, such
+as an announcement saying "we encourage all relay operators to upgrade" or a
+report saying a malformed file "causes the daemon to exit at startup". Attribute
+that sentence to its source ("The announcement asks ...", "The report says ...")
+and keep its audience, hedges and scope. Add nothing it does not say: no severity,
+urgency, cause, number, version or benefit, no second sentence, and no impact
+inferred from a description of what changed. If no single source sentence states
+an impact or a requested action, set why_it_matters to an empty string. Empty is
+the expected result for most merges, tags, checklists, questions and discussions.
 Do not infer generic benefits to stability, reliability, security or privacy from
 the existence of a fix, or urgency from an editorial label. No caveats, filler, inferred
 privacy impacts or extra advice. Source-host location alone does not establish
@@ -171,6 +180,21 @@ def _json_object(text: str, code: str = "writer.invalid_json") -> dict:
     return result
 
 
+# Spelled-out numbers count as digits, except "one", which is mostly a pronoun.
+_NUMBER_WORDS = {word: str(value) for value, word in
+                 enumerate("two three four five six seven eight nine ten eleven twelve".split(), 2)}
+# A number or version keeps its letter suffixes, so 0.4.9 does not match 0.4.9.16, nor 15.0 match
+# 15.0a3. No repetition can consume a separator, so matching takes linear time.
+_NUMBER = re.compile(r"[0-9][0-9a-z]*(?:[.,][0-9][0-9a-z]*)*|\b(?:" + "|".join(_NUMBER_WORDS) + r")\b")
+
+
+def _numbers(text: str) -> set[str]:
+    """The numbers and versions in text; "three", "3" and "03" are one number. Leading zeros
+    are stripped as text, because int() refuses the longest digit runs a source can hold."""
+    tokens = (_NUMBER_WORDS.get(token, token) for token in _NUMBER.findall(_plain(text)))
+    return {(token.lstrip("0") or "0") if token.isdigit() else token for token in tokens}
+
+
 def validate_analysis(result: dict, item: dict) -> dict:
     """Validate draft structure and literal evidence; model review judges claims."""
     fields = SCHEMA["properties"]
@@ -216,6 +240,10 @@ def validate_analysis(result: dict, item: dict) -> dict:
                                 code="writer.evidence_not_exact")
     if not all(result[k] for k in ("title", "summary")) or not evidence:
         raise AnalysisError("Published story needs text and source evidence")
+    # The impact sentence may restate only numbers and versions from the title, content or comment
+    # bodies the writer saw. It is cleared, not refused: a retry would return the same reply.
+    if result["why_it_matters"] and _numbers(result["why_it_matters"]) - _numbers(context):
+        result["why_it_matters"] = ""
     return result
 
 
@@ -339,9 +367,11 @@ class Analyzer(CompletionClient):
     """Produce one structurally valid draft; final publication review is separate."""
 
     stage = "writer"  # names the stage in the codes of failed requests
+    clears = 0  # 1 when validation cleared the latest draft's impact sentence, for the decision log
 
     def analyze(self, item: dict) -> dict:
         """Return a bounded draft with literal evidence, never a publication decision."""
+        self.clears = 0
         if item["kind"] == "tag":
             return tag_notice(item)
         bounded = {key: item.get(key) for key in (
@@ -352,11 +382,12 @@ class Analyzer(CompletionClient):
         # Evidence may quote the description window or any note body the writer saw.
         source = {**item, "content": "\n".join([bounded["content"], *(note["body"] for note in notes)])}
         schema = _writer_schema(bounded)
-        result = validate_analysis(self.complete(SYSTEM_PROMPT, bounded, schema, "onionflash_news"), source)
-        if result["why_it_matters"]:
-            raise AnalysisError("Writer must leave why_it_matters empty")
+        reply = self.complete(SYSTEM_PROMPT, bounded, schema, "onionflash_news")
+        stated = reply.get("why_it_matters")
+        result = validate_analysis(reply, source)
         if any(result[key] not in schema["properties"][key]["enum"] for key in ("confidence", "state")):
             raise AnalysisError("Writer labels exceed this source's limits")
+        self.clears = int(result["why_it_matters"] != stated.strip())
         return result
 
 
@@ -398,7 +429,6 @@ def _writer_schema(bounded: dict) -> dict:
                     for index in range(MAX_EVIDENCE_CHOICES)]
     schema = copy.deepcopy(SCHEMA)
     schema["properties"]["publish"]["enum"] = [True]
-    schema["properties"]["why_it_matters"]["enum"] = [""]
     schema["properties"]["evidence"]["items"]["enum"] = excerpts
     schema["properties"]["title"]["minLength"] = schema["properties"]["summary"]["minLength"] = 1
     schema["properties"]["evidence"]["minItems"] = 1
