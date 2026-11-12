@@ -734,9 +734,22 @@ def test_release_clusters_include_two_part_versions_and_alpha_suffixes():
     assert key("tor-0.4.9.16", kind="tag") == "release:tor:0.4.9.16" and key("arti-v2.8.0", kind="tag") == "release:arti:2.8.0"
     assert key("Tor Browser 16.0-alpha.1 released") != key("Tor Browser 16.0-alpha.2 released")
     assert key("Tor Browser 16.0-alpha.1 released") == "release:tor-browser:16.0-alpha.1"
-    # A version that does not directly follow the product name never forms a release cluster.
-    assert key("Tor Browser for Ubuntu 24.04: 15.0.26 released").startswith("url:")
-    assert key("Tails 7.16 released with Tor Browser 16.0 and Tor 0.4.9.15").startswith("url:")
+    # Release qualifiers may sit between the product name and the version.
+    assert key("[tor-announce] [RELEASE] Tor release 0.4.9.17") == key("tor-0.4.9.17", kind="tag") == "release:tor:0.4.9.17"
+    assert key("Tor stable release 1.2.3") == "release:tor:1.2.3"
+    assert key("New Tor stable release 0.4.8.19") == "release:tor:0.4.8.19"
+    for q in ("new", "stable", "alpha", "beta", "security", "bugfix", "release", "version"):
+        assert key(f"Tor {q} 1.2.3 released") == "release:tor:1.2.3", q
+    # A title that says "released" stays a release even when it says "postponed", and so does
+    # a release title that mentions a delay in other words.
+    assert key("Arti 1.8.0 is released after being postponed") == "release:arti:1.8.0"
+    assert key("New Release: Tor Browser 15.0.3 (fixes a startup delay)") == "release:tor-browser:15.0.3"
+    # A version that does not follow the product name (or its release qualifiers) never forms
+    # a release cluster, and delay and end-of-life notices keep their own identity.
+    for title in ("Tor Browser for Ubuntu 24.04: 15.0.26 released", "Tails 7.16 released with Tor Browser 16.0 and Tor 0.4.9.15",
+                  "Tor release 0.4.9.17 delayed", "Tor 0.4.9.17 release postponed", "Tor 0.4.8 is out of support",
+                  "Tor 0.4.9.16 packages available for Debian", "Tor Browser 15.0 is no longer available on older systems"):
+        assert key(title).startswith("url:"), title
 
 
 def test_precedence_compares_with_the_writing_item_not_later_losers(tmp_path):
