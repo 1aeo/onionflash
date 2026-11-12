@@ -14,6 +14,18 @@ maintenance, template checklists, acknowledgments, unsupported speculation and
 repeated quotations do not merit standalone news. A later timestamp or another
 distribution channel does not make an old event new.
 
+The application enforces that for new stories before any model request. An item
+that would start a story is ignored, as `skipped.gate.not_recent`, when its newest
+dated development is more than 14 days older than the collection of its current
+revision, unless it is an issue labeled `Security` with high or critical severity.
+That development is the post, creation, merge, tag or timeline event date, a
+verified public comment, or the date an issue was closed; an upstream
+`updated_at`, which an edit, a label or a visibility change also moves, never
+counts. Updates of existing stories, locked ones included, still go to review,
+and an operator retry of the revision lifts the limit. A new revision, such as a
+fresh public comment, queues the item again; an issue whose comments were not yet
+verified also gets a comment check, so a fresh comment is not missed.
+
 The writer summarizes the source without selecting news. Its `publish=true` field
 submits a draft for review; only the reviewer decides news value and novelty.
 The writer selects literal evidence excerpts from its exact input. This prevents

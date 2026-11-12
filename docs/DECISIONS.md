@@ -49,6 +49,7 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `skipped.verification.news_value` | The verification found no news value. |
 | `skipped.verification.new_information` | The verification found nothing new beyond existing coverage. |
 | `skipped.verification.new_information_and_news_value` | The verification failed both editorial criteria. |
+| `skipped.gate.not_recent` | The item would start a new story, but its newest dated development is more than 14 days older than its collection. No model was asked. |
 | `held.gate.missing_sources` | Source material the candidate cites is unavailable. |
 | `held.gate.repeat_hold` | The candidate was held before, for example after a source reverted. |
 | `held.gate.story_locked` | The item updates a story that an editorial correction locked. |

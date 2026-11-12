@@ -14,9 +14,13 @@ import json
 
 from . import candidate as candidate_mod, decisions, render, review
 from .analyze import AnalysisError, cache_key
-from .util import digest, now_iso, saved_object
+from .util import after, digest, now_iso, saved_object
 
 MAX_APPROVALS = 2000  # cached approvals kept besides those unfinished jobs pin
+# An item starts a new story only if its newest dated development is at most this many days older
+# than the collection of its current revision: the same window the collector's lookback uses.
+NEW_STORY_DAYS = 14
+HIGH_SECURITY_SEVERITIES = frozenset({"severity::high", "severity::critical"})
 # The repairs that may follow the first review, a release-label repair request counting as one, each
 # checked by another fresh verification: an item gets at most MAX_VERIFY_REPAIRS + 2 review requests.
 MAX_VERIFY_REPAIRS = 5
@@ -191,6 +195,59 @@ def _hold(store, row, draft, writer_key, record, observed, stage, reason):
         decisions.record(store.db, row["id"], f"held.{stage}.{reason}", observed, review=record)
 
 
+def developed_at(item: dict) -> str:
+    """The newest dated public development the pipeline can cite; an upstream updated_at never counts.
+
+    published_at is the post, creation, merge, tag or timeline event date the collector stored. An
+    issue adds its verified public notes and the date it was closed. Collected dates are all
+    format_utc strings, so string order is time order.
+    """
+    dates = [item["published_at"]]
+    if item.get("kind") == "gitlab_issue":
+        dates += [note["created_at"] for note in item.get("public_comments") or []]
+        if item.get("upstream_state") == "closed" and item.get("closed_at"):
+            dates.append(item["closed_at"])
+    return max(dates)
+
+
+def _security_disclosure(item: dict) -> bool:
+    """A high- or critical-severity security issue may become public long after it was filed."""
+    if item.get("kind") != "gitlab_issue":
+        return False
+    labels = {label.strip().casefold() for label in (item.get("labels") or []) if isinstance(label, str)}
+    return "security" in labels and bool(labels & HIGH_SECURITY_SEVERITIES)
+
+
+def _not_recent(config, store, row, item, observed) -> str | None:
+    """Ignore, before any model call, an item that would start a story from an old development.
+
+    An update of an existing story, a locked one included, is left to review, and so is a revision
+    an operator retried or a high- or critical-severity security issue. Like any skip, a new
+    revision of the item queues it again; an issue whose notes were never verified also gets a
+    comment check, so a fresh public note does that.
+    """
+    developed = developed_at(item)
+    if (developed >= after(-NEW_STORY_DAYS * 86400, row["last_seen"])
+            or _security_disclosure(item)
+            or candidate_mod.existing_story(store.db, row) is not None):
+        return None
+    if store.db.execute("SELECT 1 FROM rejection_actions WHERE item_id=? AND content_hash=? AND action='retry'",
+                        (row["id"], row["content_hash"])).fetchone():
+        return None
+    reason = f"Not recent: newest dated development {developed} is over {NEW_STORY_DAYS} days before collection"
+    with store.db:
+        if not store.db.execute("""UPDATE items SET status='ignored',next_attempt_at=NULL,last_error=?
+                WHERE id=? AND content_hash=? AND status='pending'""", (reason, row["id"], row["content_hash"])).rowcount:
+            return "stale"  # the row changed since it was read, as a stale candidate does
+        store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
+        if item.get("kind") == "gitlab_issue" and "comments_source_key" not in item:
+            from .comments import request_check
+            request_check(store.db, config, row, observed)
+        decisions.record(store.db, row["id"], "skipped.gate.not_recent", observed,
+                         developed_at=developed, collected_at=row["last_seen"])
+    return "ignored"
+
+
 def process_item(config, store, row, writer, reviewer, observed=None, *, allow_network=True):
     """Resume writer → exact-candidate review → fresh verification of each approved or repaired text → commit.
 
@@ -206,6 +263,9 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
     policy = review.policy_hash(config)
     writer_key = cache_key(row, config["llm"])
     report = {"status": "pending", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
+    skipped = _not_recent(config, store, row, json.loads(row["payload"]), observed)  # needs no network
+    if skipped:
+        return {**report, "status": skipped}
     job = store.db.execute("""SELECT writer_key,policy_hash,stage,approval_key,prepared_at,CAST(draft_json AS BLOB) AS draft,
         CAST(envelope_json AS BLOB) AS envelope,CAST(record_json AS BLOB) AS record FROM review_jobs WHERE item_id=?""",
         (row["id"],)).fetchone()

@@ -73,11 +73,13 @@ def _final_review(store, item_id, *, config=None):
     """The current job or, once a commit finished the current revision, the decision that commit recorded, if any
     (stage "finished"): its hold code, candidate and the draft it started from, source packet, coverage, every
     review of the chain in brief and the latest verdict in full, as saved."""
-    # Only a commit sets these statuses, and it writes the item's newest audit row.
+    # Only a reviewed publication or skip commit leaves these item states, and it writes the newest audit row.
     row = store.db.execute("SELECT stage,CAST(record_json AS BLOB) AS record_json FROM review_jobs WHERE item_id=?",
                            (item_id,)).fetchone() or store.db.execute(
         """SELECT 'finished' AS stage,CAST(review_record AS BLOB) AS record_json FROM analyses WHERE source_item_id=?1
-        AND (SELECT status FROM items WHERE id=?1) IN ('ignored','published') ORDER BY rowid DESC LIMIT 1""", (item_id,)).fetchone()
+        AND EXISTS(SELECT 1 FROM items WHERE id=?1 AND (status='published'
+            OR (status='ignored' AND last_error GLOB 'Final review skipped:*'))) ORDER BY rowid DESC LIMIT 1""",
+        (item_id,)).fetchone()
     if row is None or row["record_json"] is None:
         return None
     record = saved_object(row["record_json"])

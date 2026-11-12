@@ -340,6 +340,10 @@ def _gitlab(
                 )
             except (KeyError, ValueError, TypeError):
                 continue
+            # Closing is a dated development of an issue; an invalid date is left out, never the item.
+            closed = timestamp(record.get("closed_at"), "") if source["kind"] == "gitlab_issue" and item["upstream_state"] == "closed" else ""
+            if closed:
+                item["closed_at"] = min(closed, started)
             if item["title"]:
                 items.append(item)
         if len(records) < page_size:

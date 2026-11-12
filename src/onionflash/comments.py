@@ -173,13 +173,28 @@ def merge_cached_comments(store, item, source, observed=None):
     old, key = saved_object(row["payload"]) or {}, _source_key(source)
     current = old.get("comments_source_key") == key
     if observed and (not current or item["updated_at"] > old["comments_checked_at"]):
-        with store.db:  # next_fetch_at=checked_at marks a request; an unserved request keeps its place, a failing issue its backoff.
-            store.db.execute("INSERT OR REPLACE INTO comment_cache SELECT ?,?,?,?,0,NULL WHERE NOT EXISTS(SELECT 1 FROM comment_cache"
-                             " WHERE item_id=? AND source_key=? AND (failures>0 OR next_fetch_at<=checked_at))",
-                             (row["id"], key, observed, observed, row["id"], key))
+        with store.db:
+            _request(store.db, row["id"], key, observed)
     if not current:
         return item
     return _compose(item, old["public_comments"], old["comments_checked_at"], source_key=key)
+
+
+def _request(db, item_id, key, observed):
+    # next_fetch_at=checked_at marks a request; an unserved request keeps its place, a failing issue its backoff.
+    db.execute("INSERT OR REPLACE INTO comment_cache SELECT ?,?,?,?,0,NULL WHERE NOT EXISTS(SELECT 1 FROM comment_cache"
+               " WHERE item_id=? AND source_key=? AND (failures>0 OR next_fetch_at<=checked_at))",
+               (item_id, key, observed, observed, item_id, key))
+
+
+def request_check(db, config, row, observed):
+    """Ask the next comments phase to check an issue whose notes were never verified, whatever its status.
+
+    Nothing happens for a source without comments. The caller owns the transaction.
+    """
+    source = next((s for s in config["sources"] if s["id"] == row["source_id"]), None)
+    if config["comments"]["enabled"] and source and source["enabled"] and source.get("gitlab_project"):
+        _request(db, row["id"], _source_key(source), observed)
 
 
 def _candidates(store, source, observed, key):

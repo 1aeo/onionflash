@@ -17,6 +17,7 @@ CODES = frozenset({
     "published.new", "published.update",
     *(f"skipped.{stage}.{reason}" for stage in ("review", "verification")
       for reason in ("news_value", "new_information", "new_information_and_news_value")),
+    "skipped.gate.not_recent",
     "held.gate.missing_sources", "held.gate.repeat_hold", "held.gate.story_locked",
     *(f"held.{stage}.{reason}" for stage in ("review", "verification")
       for reason in ("model_hold", "tag_repair", "unusable_repair", "repeated_repair", "disagreed_news", "release_labels")),

@@ -150,6 +150,20 @@ when its source authority is project-sender. Only source authority establishes a
 project sender, never a name, signature or address in the text. Citing a proposal,
 RFC or draft does not make a message one, and a reply in a proposal thread is news
 only for a concrete development such as acceptance, a merge or a new revision.
+A merged change, issue, proposal discussion or list post is news only when it
+reports a significant development: a capability users or operators can now use, a
+changed default, a major milestone, a new defense, a protocol change that ships, or
+a credible security report with its scope. Routine incremental work (internal
+plumbing, refactors, partial steps toward an unreleased feature, development-branch
+bug fixes found in testing, documentation or specification text for an existing
+design, test fixes), user support questions, release checklists and third-party tool
+updates fail news_value and are skipped; official releases and the tor-dev rule
+above are unchanged.
+The packet's own dates decide whether something happened now, never the current
+date: when the newest dated development in the packet (a post or release date, a
+merge date, the newest public comment, or a closing) is weeks older than the
+source's updated_at, the update is an edit without a development and news_value
+fails, except for a high- or critical-severity security issue made public later.
 new_information: compare the packet's concrete event and facts, and the candidate, with
 the supplied existing coverage, not matching product or version keywords. Decide
 duplication only from coverage_background: fail new_information only when a story there
