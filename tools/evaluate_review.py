@@ -17,7 +17,7 @@ from onionflash.config import load_config
 from onionflash.render import _prepare_story
 from onionflash.review import EDITABLE, Reviewer, ReviewError, apply_repair, policy_hash
 
-CASE_FILES = ("review_cases.json",)
+CASE_FILES = ("review_cases.json", "review_cases_judged.json")
 # A judged case names the flaw of its labeled wording or labels; one without a flaw is clean.
 FLAWS = ("invented_impact", "dropped_hedge", "overclaim", "filler", "badge_misuse", "stale_fact")
 CATCH_TARGET, FLAW_FLOOR, FLOOR_CASES, FALSE_ALARM_LIMIT = 0.90, 0.80, 10, 0.10

@@ -401,12 +401,13 @@ def test_main_reads_repeated_case_files(evaluation, tmp_path, monkeypatch):
     base = ["--config", str(tmp_path / "config.toml"), "--output", str(tmp_path / "report.jsonl")]
     default, public = [case["id"] for case in corpus()], ROOT / "tools/review_cases.json"
     raw = json.loads(public.read_text())
+    synthetic = [case["id"] for case in module.expand(raw)]
     extra, large = tmp_path / "extra.json", tmp_path / "large.json"
     extra.write_text(json.dumps({**raw, "cases": [{**raw["cases"][0], "id": "extra-case"}]}))
     large.write_text(" " * (module.MAX_FILE_BYTES + 1))
-    assert module.main(base) == 0 and calls[-1] == (default, False)
-    assert module.main([*base, "--cases", str(public)]) == 0 and calls[-1] == (default, False)
-    assert module.main([*base, "--cases", str(public), "--cases", str(extra)]) == 0 and calls[-1] == (default + ["extra-case"], False)
+    assert module.main(base) == 0 and calls[-1] == (default, False) and len(default) > len(synthetic)
+    assert module.main([*base, "--cases", str(public)]) == 0 and calls[-1] == (synthetic, False)
+    assert module.main([*base, "--cases", str(public), "--cases", str(extra)]) == 0 and calls[-1] == (synthetic + ["extra-case"], False)
     assert module.main([*base, "--draft", "--case-id", "draft:bastet"]) == 0 and calls[-1] == (["draft:bastet"], True)
     for options in (["--cases", str(public), "--cases", str(public)], ["--cases", str(large)],
                     ["--cases", str(public), "--cases", str(large)], ["--max-seconds", str(module.MAX_SECONDS + 1)]):

@@ -132,9 +132,10 @@ published only after their impact sentence was cleared, and a report keeps the
 model's own verdict when a fixed rule replaced it. `--draft` instead has the
 writer draft each packet once per round and reviews that draft under each
 coverage background its cases use; `draft_unsupported` counts drafts that
-contain flagged wording or labels. An explicit `--cases` replaces the default
-case files and may be repeated, so cases that cannot be public stay in a
-private file of the same format.
+contain flagged wording or labels. The default case files are
+`tools/review_cases.json` and `tools/review_cases_judged.json`, whose cases quote
+public upstream sources and carry labels from independent reviewers. An
+explicit `--cases` replaces the default case files and may be repeated.
 
 Judged cases carry an `audit`, naming a set labeled by independent reviewers,
 and a `flaw` unless the reviewers found the draft clean. A flawed case is caught
