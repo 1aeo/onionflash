@@ -224,7 +224,9 @@ fresh verification. See
   story told only by merge requests is `merged`. A later tag cannot downgrade an
   already announced release. See the [final checks](docs/FINAL_REVIEW.md#final-checks).
 - Matching release versions/products, identical titled issue bodies, and
-  canonical URLs provide conservative duplicate grouping. Semantic similarity
+  canonical URLs provide conservative duplicate grouping, and reviewer-confirmed
+  same-event candidates attach to existing stories instead of opening second
+  headlines (see [editorial controls](docs/EDITORIAL.md)). Semantic similarity
   alone does not combine unrelated incidents. Follow-ups add short dated updates
   instead of rewriting a prose story; only a literal tag notice or timeline
   entry is replaced in place by a richer source. Original publication dates and

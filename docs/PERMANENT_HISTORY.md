@@ -2,7 +2,9 @@
 
 There is no article-count or age expiry. The whole history remains browsable
 through `/`, `/page/2/`, and subsequent pages. Every story retains
-`/news/<id>/`; its public structured representation is `/news/<id>/story.json`.
+`/news/<id>/`; its public structured representation is `/news/<id>/story.json`
+(see [merging duplicate stories](EDITORIAL.md#merge-a-duplicate-story) for
+merged pointers).
 Paths are relative to `site.base_url`.
 
 Static topic pages use `/topics/<topic>/` and

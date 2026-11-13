@@ -45,13 +45,17 @@ def run_lock(database: str):
 
 def _operator_parsers(commands) -> None:
     """Register explicit inspection and guarded editorial or retry commands."""
-    story = commands.add_parser("story", help="Inspect, correct, or retract a published story")
+    story = commands.add_parser("story", help="Inspect, correct, merge, or retract a published story")
     actions = story.add_subparsers(dest="action", required=True)
-    for name in ("show", "history", "correct", "retract", "restore", "unlock"):
+    for name in ("show", "history", "correct", "retract", "restore", "unlock", "merge"):
         action = actions.add_parser(name)
         action.add_argument("--config", required=True, type=Path)
         action.add_argument("--story", required=True, help="Stable story ID")
-        if name not in {"show", "history"}:
+        if name == "merge":
+            action.add_argument("--into", dest="into_story", required=True, help="Survivor story ID")
+            action.add_argument("--expect-hash", required=True, help="Current hash returned by story show")
+            action.add_argument("--reason", required=True, help="Private operator reason recorded with the merge")
+        elif name not in {"show", "history"}:
             action.add_argument("--expect-hash", required=True, help="Current hash returned by story show")
             action.add_argument("--reason", required=True, help="Public reason for this editorial action")
         if name == "correct":
@@ -98,7 +102,10 @@ def _operator_command(args, store: Store, config: dict | None = None) -> dict:
         if args.action == "history":
             return editorial.history(store.db, args.story)
         options = {"reason": args.reason, "expect_hash": args.expect_hash}
-        if args.action == "correct":
+        if args.action == "merge":
+            base_url = (config or {}).get("site", {}).get("base_url", "https://1aeo.com/onionflash/")
+            result = editorial.merge(store.db, args.story, args.into_story, base_url=base_url, **options)
+        elif args.action == "correct":
             result = editorial.correct(store.db, args.story, json.loads(args.patch.read_text(encoding="utf-8")), **options)
         elif args.action == "restore":
             result = editorial.restore(store.db, args.story, revision=args.revision, **options)
@@ -132,6 +139,7 @@ def run(config: dict, store: Store) -> dict:
         "entries_skipped": 0,
         "review_cache_hits": 0,
         "review_stale": 0,
+        "review_routed": 0,
         "model_calls": 0,
     }
     started = time.monotonic()
@@ -222,6 +230,7 @@ def run(config: dict, store: Store) -> dict:
                     report["analyzed"] += 1
                 report["review_cache_hits"] += bool(result["cache_hit"])
                 report["review_stale"] += result["status"] == "stale"
+                report["review_routed"] += result["status"] == "routed"
             except AnalysisError as exc:
                 # A request cut off by the run deadline is retryable: the item backs off.
                 store.defer(row["id"], str(exc), config["llm"], now_iso(), terminal=not exc.retryable, code=exc.code)

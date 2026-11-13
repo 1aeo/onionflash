@@ -33,7 +33,7 @@ after a rollback, are not in it.
 ## Codes
 
 A code is `<outcome>.<stage>.<reason>` or `<outcome>.<reason>`. The outcome is
-`published`, `skipped`, `held`, `failed` or `operator`. The stage names where the
+`published`, `skipped`, `held`, `failed`, `merged` or `operator`. The stage names where the
 decision was made: `gate` (the application's checks around the review), `review`
 (the first review, or a request to repair release labels; in `failed` codes, any
 request to the reviewer), `verification` (a fresh verification), `final_check` (the
@@ -89,10 +89,12 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `failed.app.unexpected` | Processing failed unexpectedly. |
 | `failed.app.damaged_item` | The item's saved copy is damaged. |
 | `failed.app.damaged_job` | The item's saved review job is damaged. |
+| `merged.auto.same_event` | Both review and fresh verification confirmed two published stories report the same event, and the newer story merged into the earlier one. |
 | `operator.retried` | An operator retried a rejected, dismissed or failed item. |
 | `operator.reconsidered` | An operator retried an ignored (skipped) item. |
 | `operator.dismissed` | An operator dismissed an item. |
 | `operator.approved` | An operator approved a held candidate whose facts passed fresh verification. |
+| `operator.merged` | An operator merged a published duplicate story into a survivor story. |
 
 A held update of a locked story leaves the item `published`: it maps to that
 story and the story's held-update count grows. Unlocking the story re-queues
@@ -139,6 +141,7 @@ its history when collecting a new revision clears its rejection reason.
 
 ## Run report and status
 
-The run report's `decisions` counts the run's decisions by code. Holds count
+The run report's `decisions` counts the run's decisions by code, and
+`review_routed` counts items attached to an existing story for update review. Holds count
 there, not in `analysis_failed`, which counts failures and damaged items. `status`
 reports `decisions_24h`, the decisions of the last 24 hours by outcome.

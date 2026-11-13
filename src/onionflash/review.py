@@ -215,7 +215,9 @@ whether it materially changes the account. Mere corroborating anecdotes, request
 for logging, praise and generic advice do not justify another incident headline.
 The application has already chosen the publication action:
 - When prior_story is present, this candidate UPDATES that same article and
-  permalink (keep same_story null). A changed title is not a new article. A supported
+  permalink (set same_story to a separate non-retracted recent entry's id ONLY when
+  that entry and prior_story report the exact same concrete event; otherwise keep
+  same_story null). A changed title is not a new article. A supported
   meaningful fix, resolution, merged change or release announcement can pass
   new_information; do not demand a separate association or reject it for being a followup.
   Compare lifecycle states explicitly: prior_story requesting a change does not
@@ -417,7 +419,8 @@ Evaluate all nine criteria in order before choosing verdict:
 VERDICT AND REPAIR RULES:
 - For each criterion write a concise reason (at most 25 words), source_refs (only packet IDs such as S1 or S1:P1;
   [] when absent; never invent IDs), and outcome ("pass", "fail" or "insufficient") BEFORE verdict.
-- Keep same_story null in latest_update mode.
+- Set same_story to a separate non-retracted recent entry's id ONLY when that entry and prior_story report the exact
+  same concrete event; otherwise keep same_story null.
 - When new_information fails because the follow-up is non-material or already covered by this story (items (1)-(8)
   above), ALWAYS return verdict "skip" with repair null (never revise a non-material update even if updates[-1].text
   or state also failed a check), and include coverage_background.prior_story.id verbatim in new_information.reason.
@@ -537,11 +540,13 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool 
     same_story = result["same_story"]
     if same_story is not None and (not isinstance(same_story, str) or not STORY_ID_RE.fullmatch(same_story)):
         raise ReviewError("Invalid same_story identifier")
-    if update or (coverage is not None and coverage.get("prior_story") is not None):
+    prior_id = ((coverage or {}).get("prior_story") or {}).get("id")
+    if same_story is not None and prior_id is not None and same_story == prior_id:
         same_story = None
     elif same_story is not None and coverage is not None:
         allowed_ids = {row["id"] for row in (coverage.get("recent") or ())
-                       if isinstance(row, dict) and not row.get("retracted") and isinstance(row.get("id"), str)}
+                       if isinstance(row, dict) and not row.get("retracted")
+                       and isinstance(row.get("id"), str) and row["id"] != prior_id}
         if same_story not in allowed_ids:
             raise ReviewError("Review same_story is not listed in coverage")
 
@@ -697,9 +702,11 @@ class Reviewer(CompletionClient):
         if update:
             schema["properties"]["repair"] = copy.deepcopy(UPDATE_REPAIR)
         prior_id = ((coverage or {}).get("prior_story") or {}).get("id")
-        recent_ids = (sorted({row["id"] for row in ((coverage or {}).get("recent") or ())
-                              if isinstance(row, dict) and not row.get("retracted") and isinstance(row.get("id"), str)})
-                      if not update and prior_id is None else [])
+        recent_ids = sorted({
+            row["id"] for row in ((coverage or {}).get("recent") or ())
+            if isinstance(row, dict) and not row.get("retracted")
+            and isinstance(row.get("id"), str) and row["id"] != prior_id
+        })
         schema["properties"]["same_story"] = (
             {"anyOf": [{"type": "null"}, {"type": "string", "enum": recent_ids}]}
             if recent_ids else {"type": "null", "enum": [None]}

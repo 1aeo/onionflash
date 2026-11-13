@@ -105,6 +105,7 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS items_pending ON items(status, next_attempt_at, priority_score);
             DROP INDEX IF EXISTS items_cluster;
+            CREATE INDEX IF NOT EXISTS items_cluster_story ON items(cluster_key) WHERE story_id IS NOT NULL;
             CREATE TABLE IF NOT EXISTS analyses (
                 cache_key TEXT PRIMARY KEY, result TEXT NOT NULL, created_at TEXT NOT NULL
             );

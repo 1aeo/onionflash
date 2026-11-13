@@ -260,15 +260,17 @@ def _navigation(base: str) -> str:
             f'<div class="site-nav-links">{items}</div></details></nav>')
 
 
-def _shell(site: dict, base: str, title: str, description: str, body: str, canonical: str) -> str:
+def _shell(site: dict, base: str, title: str, description: str, body: str, canonical: str, *,
+           redirect: str | None = None) -> str:
     name = _text(site["title"], 80)
     repository = _public_url(site["repository_url"])
     repository_link = f'<a href="{_escape(repository)}">Source code ↗</a>' if repository else ""
+    refresh = f'<meta http-equiv="refresh" content="0; url={_escape(redirect)}">' if redirect else ""
     return f'''<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_escape(title)}</title><meta name="description" content="{_escape(description)}">
-<meta name="theme-color" content="#121212"><link rel="canonical" href="{_escape(canonical)}">
+<meta name="theme-color" content="#121212"><link rel="canonical" href="{_escape(canonical)}">{refresh}
 <link rel="icon" href="{_escape(base)}mark.svg" type="image/svg+xml">
 <link rel="stylesheet" href="{_escape(base)}style.css">
 <link rel="alternate" type="application/rss+xml" title="{_escape(name)} RSS" href="{_escape(base)}feed.xml">
@@ -411,6 +413,38 @@ def article_html(site: dict, base: str, story: dict) -> str:
 <p class="article-note">This is an AI-assisted summary of the linked public sources. Consult the original reports for details and operator guidance.</p></article></main>'''
     title = _text(site["title"], 80)
     return _shell(site, base, f"{story['title']} — {title}", story["summary"][:300], body, _permalink(base, story))
+
+
+def pointer_json(base: str, story_id: str, survivor_id: str) -> dict:
+    if not isinstance(story_id, str) or not ID_PATTERN.fullmatch(story_id):
+        raise ValueError("Unsafe story ID")
+    if not isinstance(survivor_id, str) or not ID_PATTERN.fullmatch(survivor_id):
+        raise ValueError("Unsafe survivor story ID")
+    root = base.rstrip("/") + "/"
+    return {"id": story_id, "merged_into": survivor_id, "url": f"{root}news/{survivor_id}/"}
+
+
+def pointer_html(site: dict, base: str, survivor_id: str) -> str:
+    if not isinstance(survivor_id, str) or not ID_PATTERN.fullmatch(survivor_id):
+        raise ValueError("Unsafe survivor story ID")
+    root = base.rstrip("/") + "/"
+    target = f"{root}news/{survivor_id}/"
+    body = (
+        f'<main id="main" class="page article-page"><a class="back-link" href="{_escape(root)}">← All dispatches</a>'
+        '<article class="full-story"><h1>This story has moved</h1>'
+        '<p class="article-summary">Onion Flash combined this report with its coverage of the same event.</p>'
+        f'<p><a href="{_escape(target)}">Read the combined story</a></p></article></main>'
+    )
+    title = _text(site["title"], 80)
+    return _shell(
+        site,
+        root,
+        f"This story has moved — {title}",
+        "Onion Flash combined this report with its coverage of the same event.",
+        body,
+        target,
+        redirect=target,
+    )
 
 
 def headers_text(base: str) -> str:

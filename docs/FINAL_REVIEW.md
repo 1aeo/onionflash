@@ -120,7 +120,10 @@ the gate attaches the item to that story and re-queues it once for update review
 repair, routing precedes the official-item hold and verification repair loop
 rather than publishing a second headline). Entries marked `related` share only a
 reference, version or thread, and entries marked `retracted` hold any candidate
-that repeats their withdrawn claim.
+that repeats their withdrawn claim. When `prior_story` is present and both the
+initial review and fresh verification name the same overlapping published story
+in `same_story`, the newer duplicate merges automatically into the earlier
+story; see [merging duplicate stories](EDITORIAL.md#merge-a-duplicate-story).
 
 ## Decisions and calls
 
@@ -165,8 +168,10 @@ uses the same number: writer, critique/repair, verification. Each further repair
 adds one review request, a release-label repair two, and an item gets at most
 seven review requests. Deterministic tag text skips the writer call but still
 needs both reviews; a tag is not an official release announcement. A first-round
-skip or hold ends without a verification, except for the official items above. A
-run resumes items waiting for a verification or a repair before it starts others.
+skip or hold ends without a verification, except for the official items above
+and an update-scope skip that names an overlapping published duplicate in
+`same_story`. A run resumes items waiting for a verification or a repair before
+it starts others.
 
 ## Final checks
 
