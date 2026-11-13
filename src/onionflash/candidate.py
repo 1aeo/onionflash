@@ -665,13 +665,23 @@ def prepare(db, row: dict, result: dict, observed: str) -> dict:
             changed_ids = _changed_note_ids(old_item, item) if is_own else frozenset()
             body_changed = _own_body_changed(db, previous, item) if is_own else True
             comments = _comment_sources(item, result, after_at=cutoff, include_body=body_changed, changed_ids=changed_ids)
+            note_edits = {
+                note["id"]: note["edited_at"]
+                for note in item.get("public_comments") or []
+                if isinstance(note.get("id"), str) and isinstance(note.get("edited_at"), str) and note["edited_at"]
+            }
+            fallback_edit_at = max(d for d in (item["updated_at"], item.get("comments_checked_at")) if isinstance(d, str) and d)
             dates = [
                 *(
-                    item["updated_at"] if comment["id"].removeprefix(item["id"] + ":") in changed_ids else comment["published_at"]
+                    note_edits.get(nid, max(fallback_edit_at, comment["published_at"]))
+                    if (nid := comment["id"].removeprefix(item["id"] + ":")) in changed_ids
+                    else comment["published_at"]
                     for comment in comments
                 ),
                 *([item["updated_at"]] if state_changed else []),
             ]
+            if not dates and changed_ids and not body_changed:
+                dates = [note_edits.get(nid, fallback_edit_at) for nid in changed_ids]
             at = max(dates) if dates else item["updated_at"]
             comment_links = list({comment["url"]: {"url": comment["url"], "title": comment["title"]}
                                   for comment in comments if comment["url"] != source["url"]}.values())

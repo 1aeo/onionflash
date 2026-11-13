@@ -821,7 +821,7 @@ def test_unexpected_exception_in_evaluate_does_not_stop_run(tmp_path, monkeypatc
         assert report["no_browser_js_ready"] is True
 
 
-def test_multiple_enabled_consensus_sources_rejected_and_rule_c_counts_distinct_hours(tmp_path):
+def test_multiple_enabled_consensus_sources_rejected_and_rule_c_counts_distinct_hours(tmp_path, monkeypatch):
     path, cfg = make_config(tmp_path, publish=True, enabled=True)
     second_disabled = {**cfg["sources"][0], "id": "consensus-mirror", "url": "https://example.org/consensus.xml", "enabled": False}
     extra_toml = (
@@ -838,10 +838,15 @@ def test_multiple_enabled_consensus_sources_rejected_and_rule_c_counts_distinct_
     with pytest.raises(ValueError, match="At most one enabled consensus alert source is supported"):
         load_config(path)
 
+    def forbid_http(*_args, **_kwargs):
+        raise AssertionError("HttpClient must not be constructed before consensus-source validation")
+
+    monkeypatch.setattr(cli, "HttpClient", forbid_http)
     cfg_two = {**cfg, "sources": [cfg["sources"][0], {**second_disabled, "enabled": True}]}
     with Store(cfg["storage"]["database"]) as store:
         with pytest.raises(ValueError, match="At most one enabled consensus alert source is supported"):
             cli.run(cfg_two, store)
+        assert store.db.execute("SELECT COUNT(*) FROM source_state").fetchone()[0] == 0
 
     # Six SRV reports in the same UTC hour (00:05..00:10) count as one reporting hour, not six.
     srv_line = "NOTICE: Consensus is missing a current shared random value"

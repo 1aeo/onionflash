@@ -48,9 +48,10 @@ error text are never saved or logged. Each check reads an issue's newest notes i
 one bounded request; checks repeat after 30 minutes and share fixed per-run
 limits, so older notes can be missing. A failed or unverifiable check keeps the
 last verified notes. Notes stay attributed, untrusted reports with their authors,
-creation dates and exact URLs. A new, edited or deleted note queues the issue for
-analysis again, and only a newly cited note moves the story's date, to the time
-the note was written. Once comments are turned off, or a source loses its
+creation dates (and edit timestamps when edited) and exact URLs. A new, edited or
+deleted note queues the issue for analysis again, and only a newly cited note
+moves the story's date, to the time the note was written (or edited, when an
+update cites a changed note). Once comments are turned off, or a source loses its
 `gitlab_project`, an issue's next revision is analyzed without its notes.
 
 ### Tor Metrics timeline

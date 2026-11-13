@@ -128,6 +128,9 @@ def _operator_command(args, store: Store, config: dict | None = None) -> dict:
 
 def run(config: dict, store: Store) -> dict:
     """Collect and review pending items within one deadline, then build the site."""
+    consensus_sources = [s for s in config["sources"] if s.get("alert_format") == "consensus" and s["enabled"]]
+    if len(consensus_sources) > 1:
+        raise ValueError("At most one enabled consensus alert source is supported")
     observed = now_iso()
     report = {
         "sources_ok": 0,
@@ -222,9 +225,6 @@ def run(config: dict, store: Store) -> dict:
     run_deadline = started + budget
     endpoint_failures = 0
     first = decisions.latest_id(store.db)
-    consensus_sources = [s for s in config["sources"] if s.get("alert_format") == "consensus" and s["enabled"]]
-    if len(consensus_sources) > 1:
-        raise ValueError("At most one enabled consensus alert source is supported")
     with (
         Analyzer(config, deadline=run_deadline) as analyzer,
         Reviewer(config, deadline=run_deadline) as reviewer,
