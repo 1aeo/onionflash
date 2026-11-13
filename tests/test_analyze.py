@@ -105,6 +105,40 @@ def test_impact_sentence_numbers_and_versions_must_appear_in_the_source(sentence
     assert validate_analysis(copy.deepcopy(draft), NUMBERED) == {**draft, "why_it_matters": sentence if kept else ""}
 
 
+@pytest.mark.parametrize("source_version, sentence_version, kept", [
+    ("1.2.3-rc1", "1.2.3-rc1", True),
+    ("1.2.3-rc.1", "1.2.3-rc.1", True),
+    ("1.2.3-rc-1", "1.2.3-rc-1", True),
+    ("1.2.3-alpha", "1.2.3-alpha", True),
+    ("1.2.3-beta2", "1.2.3-beta2", True),
+    ("1.2.3-pre.2", "1.2.3-pre.2", True),
+    ("1.2.3-dev4", "1.2.3-dev4", True),
+    ("1.2-rc1a", "1.2-rc1a", True),
+    ("1.2.3-rc1", "1.2.3", False),
+    ("1.2.3-rc.1", "1.2.3", False),
+    ("1.2.3-alpha", "1.2.3", False),
+    ("1.2.3-beta2", "1.2.3", False),
+    ("1.2.3-pre.2", "1.2.3", False),
+    ("1.2.3-dev4", "1.2.3", False),
+    ("1.2.3-rc1", "1.2.3-rc2", False),
+    ("1.2.3-rc1", "1.2.3-beta1", False),
+    ("1.2.3", "1.2.3-rc1", False),
+])
+def test_impact_versions_keep_their_prerelease_qualifier(source_version, sentence_version, kept):
+    source = f"Version {source_version} includes the reported correction."
+    sentence = f"The report says version {sentence_version} includes the correction."
+    draft = analysis(why_it_matters=sentence, evidence=[source])
+    assert validate_analysis(copy.deepcopy(draft), item(title="Software correction", content=source)) == {
+        **draft, "why_it_matters": sentence if kept else ""}
+
+
+def test_prerelease_words_in_prose_do_not_change_a_count():
+    source = "The developers corrected 3 connection failures. A separate release candidate is under review."
+    sentence = "The report says developers corrected three connection failures."
+    draft = analysis(why_it_matters=sentence, evidence=[source])
+    assert validate_analysis(copy.deepcopy(draft), item(title="Connection correction", content=source)) == draft
+
+
 def test_impact_sentence_may_cite_numbers_from_a_comment_the_writer_saw(monkeypatch):
     note = {"id": "gid://gitlab/DiscussionNote/1", "url": "https://example.org/issue#note_1",
             "title": "Public comment by @operator", "author": "operator", "created_at": DATE,

@@ -241,7 +241,9 @@ class Replies:
     def __init__(self, error=None):
         self.error = error
 
-    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
+    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, on_request=None):
+        if on_request is not None:
+            on_request(1)
         url = packet["sources"][0]["url"]
         if url.endswith("/fail"):
             raise self.error
@@ -363,7 +365,7 @@ def test_operator_actions_are_logged_with_their_private_reason(tmp_path):
         with pytest.raises(ValueError):
             rejection.retry_item(store, other["id"], "0" * 64, "A stale hash is refused", LATER)
         entries = logged(store)
-    assert [entry["code"] for entry in entries[:3]] == ["failed.app.unexpected", "skipped.verification.news_value", "failed.app.unexpected"]
+    assert [entry["code"] for entry in entries[:3]] == ["failed.app.unexpected", "skipped.review.news_value", "failed.app.unexpected"]
     assert [(entry["code"], entry["item_id"], entry["decided_at"], entry["detail"]["reason"], entry["detail"]["before_status"])
             for entry in entries[3:]] == [
         ("operator.retried", failed["id"], LATER, "The grounding rule was fixed", "rejected"),

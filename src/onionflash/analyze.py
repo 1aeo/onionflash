@@ -12,7 +12,7 @@ from .util import digest, normalize_evidence as _plain
 from .comments import analysis_context
 from .schema import CATEGORIES, PRIORITIES, CONFIDENCES, STATES, PRODUCTS
 
-PROMPT_VERSION = "onionflash-15"
+PROMPT_VERSION = "onionflash-16"
 MIN_EVIDENCE_CHARS = 8
 MAX_EVIDENCE_CHOICES = 128
 SCHEMA = {
@@ -111,13 +111,18 @@ itself states this event's impact or an action it asks its readers to take, such
 as an announcement saying "we encourage all relay operators to upgrade" or a
 report saying a malformed file "causes the daemon to exit at startup". Attribute
 that sentence to its source ("The announcement asks ...", "The report says ...")
-and keep its audience, hedges and scope. Add nothing it does not say: no severity,
+and keep its audience, hedges and scope. Attribution does not replace uncertainty:
+retain the source's belief, possibility or conditional language in the claim itself.
+Keep entity names and stated role terms; do not substitute an unstated role for a name.
+Read all supplied comments before selecting the sentence. If another passage disputes
+or materially narrows its impact, leave this field empty unless the selected sentence
+itself carries that qualification. Add nothing it does not say: no severity,
 urgency, cause, number, version or benefit, no second sentence, and no impact
 inferred from a description of what changed. If no single source sentence states
 an impact or a requested action, set why_it_matters to an empty string. Empty is
 the expected result for most merges, tags, checklists, questions and discussions.
 Do not infer generic benefits to stability, reliability, security or privacy from
-the existence of a fix, or urgency from an editorial label. No caveats, filler, inferred
+the existence of a fix, or urgency from an editorial label. No filler, inferred
 privacy impacts or extra advice. Source-host location alone does not establish
 confirmation. Reserve confirmed for an official Tor Project announcement or a merged
 merge request's own change; use reported for issues, comments, maintainer statements,
@@ -183,9 +188,13 @@ def _json_object(text: str, code: str = "writer.invalid_json") -> dict:
 # Spelled-out numbers count as digits, except "one", which is mostly a pronoun.
 _NUMBER_WORDS = {word: str(value) for value, word in
                  enumerate("two three four five six seven eight nine ten eleven twelve".split(), 2)}
-# A number or version keeps its letter suffixes, so 0.4.9 does not match 0.4.9.16, nor 15.0 match
-# 15.0a3. No repetition can consume a separator, so matching takes linear time.
-_NUMBER = re.compile(r"[0-9][0-9a-z]*(?:[.,][0-9][0-9a-z]*)*|\b(?:" + "|".join(_NUMBER_WORDS) + r")\b")
+# Keep standard prerelease suffixes attached to dotted versions; a release
+# candidate does not supply the corresponding final-version token.
+_PRERELEASE = (r"[0-9][0-9a-z]*(?:\.[0-9][0-9a-z]*)+-(?:alpha|beta|rc|pre|dev)"
+               r"(?:[0-9][0-9a-z]*)?(?:[.-][0-9a-z]+)*(?![0-9a-z])")
+# Numeric components never repeat over their separators, including in suffixes.
+# Thus 0.4.9 does not match 0.4.9.16, nor 15.0 match 15.0a3, with linear matching.
+_NUMBER = re.compile(_PRERELEASE + r"|[0-9][0-9a-z]*(?:[.,][0-9][0-9a-z]*)*|\b(?:" + "|".join(_NUMBER_WORDS) + r")\b")
 
 
 def _numbers(text: str) -> set[str]:
@@ -299,7 +308,7 @@ class CompletionClient:
         if self.client is not None:
             self.client.close()
 
-    def complete(self, prompt: str, payload: dict, schema: dict, name: str) -> dict:
+    def complete(self, prompt: str, payload: dict, schema: dict, name: str, *, on_request=None) -> dict:
         """One fresh request; both drafting and review share transport policy."""
         if not self.llm["base_url"]:
             raise AnalysisError("LLM endpoint is not configured", retryable=True)
@@ -325,12 +334,14 @@ class CompletionClient:
         }
         if self.llm["send_chat_template_kwargs"]:
             request["chat_template_kwargs"] = {"enable_thinking": self.llm["enable_thinking"]}
-        return self._complete(request, key)
+        return self._complete(request, key, **({"on_request": on_request} if on_request is not None else {}))
 
-    def _complete(self, request: dict, key: str) -> dict:
+    def _complete(self, request: dict, key: str, *, on_request=None) -> dict:
         """POST one chat completion; only transport failures move on to a fallback."""
         failure = AnalysisError("All LLM endpoints failed", retryable=True)
         for base_url in [self.llm["base_url"], *self.llm["fallback_base_urls"]]:
+            if on_request is not None:
+                on_request(1)  # Reserve durably before any endpoint attempt.
             self.calls += 1
             try:
                 response = self.client.request(
@@ -348,6 +359,8 @@ class CompletionClient:
                 )
                 if isinstance(exc, DeadlineReached):  # refused unsent, as every later endpoint would be
                     self.calls -= 1
+                    if on_request is not None:
+                        on_request(-1)
                     raise failure from None
         else:
             raise failure

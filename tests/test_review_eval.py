@@ -55,7 +55,9 @@ def scripted(reply):
             return self
         def __exit__(self, *args):
             pass
-        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, on_request=None):
+            if on_request is not None:
+                on_request(1)
             return full(reply(verification), packet)
     return Reviewer
 
@@ -203,8 +205,10 @@ def test_coverage_background_is_passed_to_both_reviews_and_saved_privately(evalu
     case = next(c for c in corpus() if c.get("existing_coverage", {}).get("recent"))
     seen = []
     class Inspector(scripted(lambda verification: {"verdict": "skip"})):
-        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, on_request=None):
             """Capture each background and simulate a repair followed by a skip, which disagrees with the first review."""
+            if on_request is not None:
+                on_request(1)
             seen.append(coverage)
             return full({"verdict": "skip"} if verification else
                         {"verdict": "revise", "repair": {"summary": "A source-supported statement."}}, packet)
@@ -335,7 +339,11 @@ def test_draft_mode_writer_error_has_no_stale_or_missing_diagnostic(evaluation, 
 
     replies = iter([{"invalid": True}, verdict("approve"), verdict("approve")])
     monkeypatch.setattr(module, "Analyzer", FlakyWriter)
-    monkeypatch.setattr(module.Reviewer, "complete", lambda self, *args: next(replies))
+    def complete(self, *args, on_request=None):
+        if on_request is not None:
+            on_request(1)
+        return next(replies)
+    monkeypatch.setattr(module.Reviewer, "complete", complete)
     with module.EvaluationReviewer(config) as fresh_reviewer:
         assert fresh_reviewer.last_decoded is None
     output = tmp_path / "draft-errors.jsonl"
@@ -382,7 +390,11 @@ def test_model_verdict_keeps_the_reply_that_validation_replaced(evaluation, tmp_
     """A skip that fails no editorial criterion holds; the report keeps the model's own verdict."""
     module, config = evaluation
     case = next(c for c in corpus() if c["id"] == "bastet-original")
-    monkeypatch.setattr(module.Reviewer, "complete", lambda self, *args: verdict("skip", criterion="source_support"))
+    def complete(self, *args, on_request=None):
+        if on_request is not None:
+            on_request(1)
+        return verdict("skip", criterion="source_support")
+    monkeypatch.setattr(module.Reviewer, "complete", complete)
     output = tmp_path / "converted.jsonl"
     assert module.evaluate(config, [case], output)["matched"] == 1
     record = json.loads(output.read_text().splitlines()[0])
@@ -397,7 +409,9 @@ def test_release_labels_get_a_repair_request_that_names_the_problem(evaluation, 
     case = next(c for c in corpus() if c["id"] == "merged-is-not-release")
     payloads = []
 
-    def complete(self, prompt, payload, *args):
+    def complete(self, prompt, payload, *args, on_request=None):
+        if on_request is not None:
+            on_request(1)
         payloads.append(payload)
         return next(replies)
     monkeypatch.setattr(module.Reviewer, "complete", complete)
@@ -450,7 +464,9 @@ def test_judged_scoring_counts_catches_and_false_alarms(evaluation, tmp_path, mo
     cases = judged_cases(json.loads((ROOT / "tools/review_cases.json").read_text()))
 
     class Discerning(scripted(None)):
-        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, on_request=None):
+            if on_request is not None:
+                on_request(1)
             flawed = "update their configurations" in candidate["why_it_matters"] or candidate["confidence"] == "confirmed"
             return full({"verdict": "hold" if flawed else "approve"}, packet)
 

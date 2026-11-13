@@ -39,7 +39,9 @@ class ApprovingReviewer:
     def __exit__(self, *args):
         pass
 
-    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
+    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, on_request=None):
+        if on_request is not None:
+            on_request(1)
         return approved_result(packet)
 
 
@@ -48,10 +50,18 @@ def approve(store, prepared, candidate=None, *, policy="test-policy", result=Non
     candidate = candidate or prepared["candidate"]
     result = result or approved_result(prepared["packet"])
     key = review_gate._approval_key(candidate, prepared, policy)
-    stage = {"stage": "verification", "candidate_hash": digest(candidate), "source_hash": prepared["source_hash"],
-             "coverage_hash": prepared["coverage_hash"], "policy_hash": policy, "result": result}
-    audit = {"candidate": candidate, "packet": prepared["packet"], "coverage": prepared["coverage"], "reviews": [stage],
-             "outcome": "skipped" if result.get("verdict") == "skip" else "approved"}
+    context = {"source_hash": prepared["source_hash"], "coverage_hash": prepared["coverage_hash"],
+               "binding_hash": prepared["binding_hash"], "policy_hash": policy}
+    if result["verdict"] == "skip":
+        reviews = [{"stage": "review", "candidate_hash": digest(candidate), "request": 1, "result": result, **context}]
+    else:
+        changes = {key: candidate[key] for key in review.EDITABLE if candidate[key] != prepared["candidate"][key]}
+        first = review.validate_review(verdict("revise", repair=changes) if changes else verdict(), prepared["packet"])
+        reviews = [{"stage": "review", "candidate_hash": digest(prepared["candidate"]), "request": 1, "result": first, **context},
+                   {"stage": "verification", "candidate_hash": digest(candidate), "request": 2, "result": result, **context}]
+    audit = {"candidate": candidate, "packet": prepared["packet"], "coverage": prepared["coverage"], "reviews": reviews,
+             "policy_hash": policy, "request_budget": {"reserved": len(reviews), "inconsistent_requests": []},
+             "untrusted_proposals": [], "approval_key": key, "outcome": "skipped" if result.get("verdict") == "skip" else "approved"}
     with store.db:
         store.db.execute("""INSERT OR REPLACE INTO review_approvals (key,candidate_hash,source_hash,policy_hash,
             binding_hash,result_json,review_record_json,created_at,last_used_at) VALUES(?,?,?,?,?,?,?,?,?)""",

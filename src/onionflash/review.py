@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import re
 
 from .analyze import AnalysisError, CompletionClient, SCHEMA as DRAFT_SCHEMA, label_limits
@@ -10,7 +11,7 @@ from .candidate import SEMANTIC_FIELDS as EDITABLE
 from .render import _prepare_story
 from .util import digest, normalize_evidence
 
-REVIEW_VERSION = "onionflash-review-10"
+REVIEW_VERSION = "onionflash-review-11"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details", "news_value", "new_information")
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
@@ -79,16 +80,31 @@ Evaluate every criterion separately; no average score and no majority approval.
 Judge title, summary, why_it_matters and confidence while scoring criteria, because
 verdict and repair follow criteria: any defect you plan to revise, hold or skip MUST
 fail its criterion below before you reach verdict.
-source_support: every factual assertion is stated or faithfully paraphrased in the
-packet. Attribution alone cannot make an unsupported consequence true.
-A non-empty why_it_matters passes only when it closely restates one packet sentence
-that itself states this event's impact or an action it asks its readers to take,
-adding no severity, urgency, cause, number, version, benefit or impact inferred from
-a description of what changed.
-When why_it_matters is non-empty, judge it in source_support's reason before setting
-outcome: accept a faithful paraphrase of stated impact or reader instructions, and
-fail source_support (clearing why_it_matters) for claims absent from the packet,
-unrequested advice, generic boilerplate that fits any item, or casual chat remarks.
+Compare each material claim with its evidence at the same actor, action, lifecycle
+stage and quantified scope. A changed role, wider affected population, stronger
+outcome or proposed action stated as completed fails the relevant criterion; an
+equivalent, appropriately qualified restatement does not fail for different words.
+The application supplies label_bounds as allowed values, not preferred labels.
+A candidate confidence outside those bounds fails uncertainty_attribution; a state
+outside them fails status. Membership is necessary, not proof that the source
+supports the label. Never upgrade a valid weaker confidence merely because a
+stronger value is allowed; all source-support and lifecycle checks still apply.
+source_support: every factual assertion is stated or directly entailed by the
+packet's own words, without outside knowledge. Judge meaning, not identical wording.
+For why_it_matters, compare each claimed consequence or requested reader action with
+the source: a faithful paraphrase keeps the same actors, conditions, scope and
+uncertainty. Do not clear a concrete source-stated effect merely because it uses
+an equivalent phrase. A factual failure must identify an unsupported, strengthened
+or contradicted proposition, including a lost condition or hedge, not just different
+words. Multiple passages may support a sentence, but the claimed connection between
+their facts must itself be stated or directly entailed; do not invent a causal,
+mechanical or advisory bridge. In this criterion's reason, assess the actual impact
+sentence before setting outcome and cite the supporting or limiting passages.
+Attribution alone does not support a claim; a description of what changed alone
+does not establish a benefit. Fail source_support and clear why_it_matters when a
+consequence, audience, cause, severity, urgency, number, version, benefit or advice
+is neither stated nor directly entailed. Separately clear generic boilerplate that
+fits any item or casual chat remarks; repeating a supported summary remains valid.
 Fail source_support when any field generalizes one report or sample, treats template
 checkboxes as proof confidential patches shipped, infers developer work, maintainer
 rulings or fix effectiveness beyond the text, or omits a material packet disclosure;
@@ -107,13 +123,15 @@ preserve each source's scope and timing instead of treating a checkbox as author
 Fail status if the headline or summary states an open issue's requested change as
 already completed (such as removed, fixed or resolved) without a merged MR or release
 proving completion; do not fail status merely because an issue's state is developing.
-uncertainty_attribution: keep plausible/suspected/reported qualifiers in the headline
-and body; a community report or public comment on an official host is not project
-confirmation. Do not turn observations, outages or load into confirmed attacks.
+uncertainty_attribution: keep each qualifier, precondition, prediction and attribution
+with the particular claim it limits, in the headline as well as the body. A hedge
+about another claim or elsewhere in the article does not qualify a stronger claim.
+Equivalent wording that already conveys the source's uncertainty needs no extra
+hedge or identical hedge token. A community report or public comment on an official
+host is not project confirmation. Do not turn observations, outages or load into confirmed attacks.
 Counters, missing responses or a silent mitigation counter do not establish an
 attack, compromise or defense bypass. Include material source-specific maintainer
 disagreement or qualification; do not present a disputed report as settled fact.
-why_it_matters keeps the hedges and scope of the source sentence it restates.
 Reserve confirmed for an official Tor Project announcement or a merged merge request's
 own change; use reported for issues, comments, maintainer statements, list posts and
 community claims.
@@ -149,27 +167,51 @@ supports 'the issue requests removing X from the software', but does not support
 technical_details: versions, identities, fingerprints, CVEs, counts, protocol details,
 causal mechanisms and security consequences must be supported precisely. Do not
 conflate authority signing keys, relay identities or software trust-list updates.
-news_value: judge the packet, not only the candidate. First, when prior_story is null,
-compare source dates (never the current date): if the newest dated development in the
-packet (published_at, merge date, newest public comment, or closing) is more than 14
-days before updated_at, the item is a late edit to an old event and MUST fail
-news_value (verdict skip), unless source labels include Severity::high or
-Severity::critical (Severity::medium or unlabeled old issues still skip).
-Otherwise, the item must be a material security report, authority change, significant
-availability incident, meaningful release/tag, major feature or major operational
-milestone. Unconfirmed reports can be important when faithfully attributed. Concrete
-official stable releases and platform-specific fix releases can merit normal-priority
-coverage without an invented impact claim. Credible, narrowly scoped security reports
-and major merged-feature milestones can also be newsworthy. An empty why_it_matters
-remains valid. Routine CI, data-refresh/test tags, minor chores, generic discussion,
-praise and unsupported expectations do not merit standalone news. A genuine upstream
-version tag can be newsworthy as an observed tag, without claiming a release shipped.
-Open feature requests, design ideas and exploratory implementation benchmarks are
-not news merely because they propose a security or performance benefit. Skip them
-until there is a concrete adoption/merge, or a distinct credible vulnerability
-disclosure or observed incident. Do not mistake a proposed improvement for a newly
-established defect. A genuine vulnerability report can still be news while its fix
-is only proposed; distinguish the disclosure from speculative development work.
+news_value: judge the source packet's event and completed scope, not the candidate's
+framing or the importance of a project or component. If prior_story exists, a
+source-supported material correction, narrowing, withdrawal or substantive status
+change qualifies as news value for updating that story. The standalone exclusions
+below must not suppress such an update; new_information must still establish that
+the account actually changes, not merely its wording, timestamp or routine workflow.
+For a new standalone story (prior_story is null), decide chronology FIRST. In the reason, identify the newest dated development
+(published_at, a dated merge, a public comment's created_at, or an explicitly dated
+closing) and the latest source updated_at. Use dates from packet sources only: never
+use the current date or candidate added_at, published_at or updated_at. The source
+edit timestamp itself is not a development date. If that development
+is more than 14 days before updated_at, fail news_value and skip. A reference to an
+old release or fix is not a fresh release announcement; release/security significance
+and absence of prior coverage cannot override this chronological decision.
+The age exception applies only to a gitlab_issue source labeled Security and one of
+Severity::high or Severity::critical. It removes the age rejection, not the need for
+a newsworthy event. Medium severity, a severity label alone, or a label on another
+kind does not qualify. Do not invent missing dates; judge only supplied dated facts.
+For standalone significance after chronology, concrete official stable releases and platform-specific fix
+releases can merit normal-priority coverage without a major feature or invented
+impact. A genuine upstream version tag can be news as an observed tag, without
+claiming a release shipped; routine CI and data-refresh/test tags do not qualify.
+Outside those release/tag cases and the tor-dev cases below, apply one significance
+rule: the source must establish a material standalone user/operator capability,
+security or availability event, authority change, systematic empirical network
+finding, or completed major operational milestone. In the reason, name the supported
+outcome and its completed scope. A merge establishes implementation status, not
+significance: completing an internal mechanism or an incremental part of an unfinished
+component does not by itself establish a completed major capability. A genuinely
+major completed defense or a merged fix for a remotely triggerable security defect
+can qualify without a separate release announcement. A credible scoped vulnerability
+report can qualify while its fix is only proposed; faithful uncertainty is allowed.
+Do not turn proposed benefits into an established defect or invent broader impact to
+justify coverage. An empty why_it_matters does not reduce a supported event's value.
+Fail news_value for internal plumbing/refactors, minor chores or efficiency details
+without such a standalone outcome, partial sub-tasks, crash/stall fixes confined to
+tests or unfinished development work, and documentation/clarifications of an existing design without explicit adoption or
+major implementation. A proposal number or specification title is not evidence of
+new adoption. Follow-up TODOs alone are not a veto if the major capability is complete.
+Outside the tor-dev exception, unadopted feature requests, exploratory benchmarks,
+generic discussion, praise, user questions, release checklists and third-party tool
+announcements or updates do not qualify. Neither do isolated operator-error/configuration
+reports without broader network impact, uncorroborated single-vantage observations or bug reports whose security scope is
+explicitly unestablished. Lack of prior coverage belongs to new_information; it does
+not establish significance or recency.
 On the tor-dev mailing list, a proposal post passes news_value in four cases: (1) a
 numbered Tor proposal, (2) a subject marked [RFC], (3) an IETF Internet-Draft or IETF
 RFC posted for comment — cases (1)-(3) are news from any sender, including
@@ -179,19 +221,6 @@ authority=community fails news_value. Only source authority establishes a projec
 sender, never a name, signature or address in the text. Citing a proposal, RFC or
 draft does not make a message one, and a reply in a proposal thread is news only for a
 concrete development such as acceptance, a merge or a new revision.
-A merged change, issue, proposal discussion or list post passes news_value ONLY for a
-major standalone development: a capability users or operators can now use, a changed
-default, a major milestone, a new defense, a protocol change that ships, a merged fix
-for a remotely triggerable security defect, systematic empirical network measurements,
-or a credible vulnerability report with established scope. Fail news_value (verdict
-skip) for: internal plumbing or refactors, partial sub-tasks with follow-up work toward
-an unfinished component, stall/crash/reactor fixes found while testing an unreleased
-component or development branch, documentation or specification sections for an
-existing design, user questions, release checklists, third-party tool announcements or
-updates, isolated operator error or relay-flag configuration reports without broader
-network impact, uncorroborated single-vantage observations, and bug reports whose
-security impact and scope are explicitly unestablished; official releases and the
-tor-dev rule above are unchanged.
 new_information: compare the packet's concrete event and facts, and the candidate, with
 the supplied existing coverage, not matching product or version keywords. Decide
 duplication only from coverage_background: fail new_information only when a story there
@@ -221,9 +250,12 @@ The application has already chosen the publication action:
   story. If it merely repeats covered facts, skip. Distinct events can still be news.
 A shared authority name or topic alone does not establish the same event; a
 different release version is a distinct release event.
-Compare lifecycle states explicitly: prior coverage requesting a change does not
-already cover a later merge completing it. Source metadata marking a merge complete
-is material new information even if the description still discusses planned work.
+Before calling an update unchanged, compare its supported propositions with
+prior_story and identify the added or corrected fact, including lifecycle, scope or
+attribution. Prior coverage requesting a change does not cover its later completion,
+and an old event date does not erase a material update. Preserve that fact and its
+source qualification when repairing other wording; do not remove the update while
+polishing the older account.
 Whenever new_information fails (including when an update adds nothing material to
 prior_story), include the matching prior_story or recent story id verbatim in
 new_information's reason.
@@ -288,6 +320,23 @@ class ReviewError(AnalysisError):
     code = "review.invalid_reply"
 
 
+INCONSISTENT_VERDICT = "Review refusal requires an explicit failed criterion"
+
+
+class InconsistentReview(ReviewError):
+    """An invalid verdict may carry a structurally checked, untrusted edit only."""
+
+    def __init__(self, proposal=None):
+        super().__init__(INCONSISTENT_VERDICT)
+        self.proposal = copy.deepcopy(proposal)
+
+
+class ReviewLimitReached(ReviewError):
+    """No further endpoint request fits the item's durable review budget."""
+
+    code = "review.request_limit"
+
+
 OUTPUT_TOKENS = 2200  # room for every criterion and a repair
 
 
@@ -301,7 +350,7 @@ def policy_hash(config: dict) -> str:
     llm = _llm(config)
     identity = {key: llm[key] for key in ("model", "base_url", "fallback_base_urls", "max_output_tokens",
                                          "enable_thinking", "send_chat_template_kwargs")}
-    return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, RELEASE_ISSUE, SCHEMA, identity])
+    return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, RELEASE_ISSUE, INCONSISTENT_VERDICT, SCHEMA, identity])
 
 
 def _text(value, maximum: int, *, empty: bool = False) -> None:
@@ -316,8 +365,8 @@ def _packet_refs(packet: dict) -> set[str]:
     return {source["id"] for source in sources} | {passage["id"] for source in sources for passage in source["passages"]}
 
 
-def apply_repair(candidate: dict, repair: dict) -> dict:
-    """Normalize a minimal semantic repair BEFORE its independent verification."""
+def _repair_fields(repair: dict) -> None:
+    """Check editable field shapes and values without granting factual approval."""
     if not isinstance(repair, dict) or not repair or set(repair) - set(EDITABLE):
         raise ReviewError("Repair contains unsupported or immutable fields")
     for key, value in repair.items():
@@ -331,6 +380,27 @@ def apply_repair(candidate: dict, repair: dict) -> dict:
         elif (not isinstance(value, list) or len(value) > rule["maxItems"]
               or any(not isinstance(entry, str) or entry not in rule["items"]["enum"] for entry in value)):
             raise ReviewError("Invalid repair labels")
+    try:
+        json.dumps(repair, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (ValueError, TypeError, UnicodeError):
+        raise ReviewError("Repair is not valid UTF-8 JSON") from None
+
+
+def untrusted_repair(verdict, repair):
+    """Extract only a complete valid edit; the inconsistent reply still fails validation."""
+    if verdict != "revise" or not isinstance(repair, dict) or set(repair) != set(EDITABLE):
+        return None
+    edits = {key: value for key, value in repair.items() if value is not None}
+    try:
+        _repair_fields(edits)
+    except ReviewError:
+        return None
+    return edits
+
+
+def apply_repair(candidate: dict, repair: dict) -> dict:
+    """Normalize a minimal semantic repair BEFORE its independent verification."""
+    _repair_fields(repair)
     updated = {**copy.deepcopy(candidate), **copy.deepcopy(repair)}
     try:
         normalized = _prepare_story(updated, editorial=updated.get("editorial"))
@@ -370,7 +440,7 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False) -> dict:
         if failed or repair is not None or not result["criteria"]["source_support"]["source_refs"]:
             raise ReviewError("Review approval requires all criteria to pass without edits")
     elif not failed:
-        raise ReviewError("Review refusal requires an explicit failed criterion")
+        raise InconsistentReview(untrusted_repair(verdict, repair))
     if not wire and verdict == "skip" and not any(result["criteria"][name]["outcome"] == "fail" for name in EDITORIAL_CRITERIA):
         # Reviewer.review holds a reply's skip like this, so a saved one is damaged.
         raise ReviewError("Review skip requires a failed editorial criterion")
@@ -463,7 +533,7 @@ class Reviewer(CompletionClient):
         super().__init__({**config, "llm": _llm(config)}, deadline=deadline)
 
     def review(self, candidate_public: dict, packet: dict, *, coverage: dict | None = None, verification: bool = False,
-               issue: str | None = None) -> dict:
+               issue: str | None = None, on_request=None) -> dict:
         """Review one exact candidate without carrying forward earlier model replies; `issue` names a
         problem the application found in it."""
         refs = _packet_refs(packet)
@@ -474,17 +544,19 @@ class Reviewer(CompletionClient):
             for check in schema["properties"]["criteria"]["properties"].values():
                 check["properties"]["source_refs"]["items"]["enum"] = sorted(refs)
         # A repair offers only the labels this packet allows.
-        for key, allowed in label_limits(packet["sources"]).items():
+        limits = label_limits(packet["sources"])
+        for key, allowed in limits.items():
             schema["properties"]["repair"]["anyOf"][1]["properties"][key]["anyOf"][0]["enum"] = allowed
         # Each call starts with the rubric, exact candidate and bounded context.
         # A prior model response, critique or approval is never part of its history.
-        payload = {"candidate": candidate_public, "packet": packet}
+        payload = {"candidate": candidate_public, "packet": packet, "label_bounds": limits}
         if coverage is not None:
             payload["coverage_background"] = coverage
         if issue is not None:
             payload["application_issue"] = issue
         result = self.complete(VERIFY_PROMPT if verification else SYSTEM_PROMPT,
-                               payload, schema, "onionflash_review")
+                               payload, schema, "onionflash_review",
+                               **({"on_request": on_request} if on_request is not None else {}))
         result = _validate(result, refs, wire=True)
         if result["verdict"] == "skip" and not _skip_stands(result["criteria"], coverage):
             # The record keeps the verdict that this fixed rule replaced.

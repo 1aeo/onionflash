@@ -126,6 +126,31 @@ needs both reviews; a tag is not an official release announcement. A first-round
 skip or hold ends without a verification, except for the official items above. A
 run resumes items waiting for a verification or a repair before it starts others.
 
+A refusal whose criteria all pass remains an invalid reply, never an approval.
+Only a complete, structurally valid `revise` edit may become an **untrusted
+proposal**. It must change the text, obey the packet's label limits, avoid a
+previously reviewed candidate, and leave literal tag notices untouched. The
+application saves its error, edits, candidate hashes and disposition separately
+from validated reviews, then requires a fresh verification of that exact text.
+The previous reply is never included in the verifier's input. Pending proposals
+bypass cached approvals and cannot borrow facts verified for an earlier text.
+
+When the initial reply was invalid, the first valid verification is the first
+trusted news decision. Later trusted decisions still obey the ordinary
+disagreement rule. A changed source context discards the pending proposal and
+starts again from a freshly assembled candidate. Raw inconsistencies, accepted
+proposals and unresolved recovery outcomes remain distinct in the private
+evaluation; a hold caused by an unusable or repeated repair is not a successful
+recovery. Malformed/no-op edits and damaged saved recovery state fail closed.
+
+Every endpoint attempt, including invalid replies and fallback attempts, spends
+the same seven-request budget. Reservations are saved before sending, so an
+interruption or coverage change cannot replenish them. An unsent deadline
+refusal is refunded; a crash can conservatively retain an uncertain reservation.
+Exhaustion rejects the item with `failed.review.request_limit`. A changed source
+revision/policy or explicit operator retry starts a new budget. The evaluator
+reports observed endpoint attempts in `review_request_count`.
+
 ## Final checks
 
 A verified approval publishes only if four fixed checks also pass. They read the
