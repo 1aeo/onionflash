@@ -11,10 +11,11 @@ reads, because earlier releases read it after a code rollback.
 from __future__ import annotations
 
 import json
+import re
 
 from . import candidate as candidate_mod, decisions, render, review
 from .analyze import AnalysisError, cache_key
-from .util import after, digest, now_iso, saved_object
+from .util import after, digest, now_iso, saved_object, thread_subject
 
 MAX_APPROVALS = 2000  # cached approvals kept besides those unfinished jobs pin
 # An item starts a new story only if its newest dated development is at most this many days older
@@ -111,19 +112,67 @@ def _prune(store, maximum):
         """, (maximum,))
 
 
+_REF_MARKER = re.compile(r"(?<![\w/#!])[#!]\d+\b")
+
+
 def _news(result) -> bool:
     return all(result["criteria"][name]["outcome"] == "pass" for name in review.EDITORIAL_CRITERIA)
+
+
+def _can_route(candidate: dict, prepared: dict, result: dict, target_id) -> bool:
+    """Only route new non-tag, non-release candidates when deterministic context overlaps."""
+    if not isinstance(target_id, str) or not target_id:
+        return False
+    if prepared.get("mode", "story") != "story" or prepared["row"].get("story_id"):
+        return False
+    coverage = prepared.get("coverage") or {}
+    if coverage.get("prior_story") is not None:
+        return False
+    verdict = result["verdict"]
+    if verdict not in {"approve", "revise", "skip"}:
+        return False
+    if verdict == "skip" and result["criteria"]["new_information"]["outcome"] != "fail":
+        return False
+    item = json.loads(prepared["row"]["payload"])
+    cluster_key = prepared.get("cluster_key") or prepared["row"].get("cluster_key") or ""
+    if (item.get("kind") == "tag" or item.get("origin") == "network-health"
+            or cluster_key.startswith(("release:", "network:"))):
+        return False
+    target = next(
+        (row for row in (coverage.get("recent") or ())
+         if isinstance(row, dict) and row.get("id") == target_id and not row.get("retracted")),
+        None,
+    )
+    if target is None:
+        return False
+    cand_products = set(candidate.get("products") or ())
+    if isinstance(item.get("product"), str) and item["product"]:
+        cand_products.add(item["product"])
+    target_products = set(target.get("products") or ())
+    if cand_products & target_products or target.get("related"):
+        return True
+    item_text = "\n".join([str(item.get("title") or ""), str(item.get("content") or ""),
+                           *(str(note.get("body") or "") for note in item.get("public_comments") or [])])
+    target_text = f"{target.get('title') or ''}\n{target.get('summary') or ''}\n{target.get('latest_update') or ''}"
+    if set(_REF_MARKER.findall(item_text)) & set(_REF_MARKER.findall(target_text)):
+        return True
+    item_subj, _ = thread_subject(item)
+    target_subj, _ = thread_subject({"url": item.get("url"), "title": target.get("title")})
+    return bool(item_subj and item_subj == target_subj)
 
 
 def next_step(reviews, candidate, prepared):
     """What follows the latest review of `candidate`, decided from the chain of reviews alone.
 
-    ("verify", text) sends text to a fresh verification, ("repair", text) asks a review to repair
-    its release labels, ("approve" | "skip", candidate) commits, and ("hold", (stage, reason))
-    holds. The evaluation follows the same steps.
+    ("route", story_id) attaches an unmapped item to an existing story, ("verify", text) sends text
+    to a fresh verification, ("repair", text) asks a review to repair its release labels,
+    ("approve" | "skip", candidate) commits, and ("hold", (stage, reason)) holds.
+    The evaluation follows the same steps.
     """
     latest = reviews[-1]
     result, stage, later = latest["result"], latest["stage"], len(reviews) > 1
+    if _can_route(candidate, prepared, result, result.get("same_story")):
+        return "route", result["same_story"]
     verdict = result["verdict"]
     failed = {name for name, check in result["criteria"].items() if check["outcome"] != "pass"}
     item = json.loads(prepared["row"]["payload"])
@@ -197,6 +246,46 @@ def _hold(store, row, draft, writer_key, record, observed, stage, reason):
         decisions.record(store.db, row["id"], f"held.{stage}.{reason}", observed, review=record)
 
 
+def _route(store, row, draft, writer_key, record, observed, target, stage) -> str:
+    """Attach an unmapped item to `target` once and clear its standalone draft for update review."""
+    from .candidate import StaleCandidate
+    from .editorial import retired
+
+    live = store.db.execute(
+        """SELECT 1 FROM stories s LEFT JOIN editorial_controls e ON e.story_id=s.id
+           WHERE s.id=? AND COALESCE(e.retracted,0)=0""",
+        (target,),
+    ).fetchone()
+    if live is None or retired(store.db, story_id=target) is not None:
+        _hold(store, row, draft, writer_key, record, observed, stage, "model_hold")
+        return "held"
+    record.update(outcome="routed", routed_to=target)
+    with store.db:
+        live_now = store.db.execute(
+            """SELECT 1 FROM stories s LEFT JOIN editorial_controls e ON e.story_id=s.id
+               WHERE s.id=? AND COALESCE(e.retracted,0)=0""",
+            (target,),
+        ).fetchone()
+        if live_now is None or retired(store.db, story_id=target) is not None:
+            can_route_now = False
+        else:
+            can_route_now = True
+            updated = store.db.execute(
+                """UPDATE items SET status='pending',story_id=?,attempts=0,rejections=0,
+                   next_attempt_at=NULL,last_error='Attached to an existing story for update review'
+                   WHERE id=? AND content_hash=? AND status='pending' AND story_id IS NULL""",
+                (target, row["id"], row["content_hash"]),
+            ).rowcount
+            if not updated:
+                raise StaleCandidate("Source item changed before routing")
+            store.record_analysis(row, draft, writer_key, observed, review_record=record)
+            store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
+    if not can_route_now:
+        _hold(store, row, draft, writer_key, record, observed, stage, "model_hold")
+        return "held"
+    return "routed"
+
+
 def developed_at(item: dict) -> str:
     """The newest dated public development the pipeline can cite; an upstream updated_at never counts.
 
@@ -263,7 +352,6 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
     from .editorial import RetiredStory, is_locked, retired
 
     observed = observed or now_iso()
-    policy = review.policy_hash(config)
     report = {"status": "pending", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
     try:
         existing = candidate_mod.existing_story(store.db, row)
@@ -283,6 +371,21 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
     skipped = _not_recent(config, store, row, item_payload, observed)  # needs no network
     if skipped:
         return {**report, "status": skipped}
+    if existing is not None and candidate_mod.relation(json.loads(existing["payload"]), item_payload, store.db) == "citation":
+        try:
+            cited = store.add_citation(row, existing["id"], observed)
+        except RetiredStory:
+            with store.db:
+                if not store.db.execute("""UPDATE items SET status='ignored',story_id=NULL,next_attempt_at=NULL,
+                        last_error='Retired story; never recreated' WHERE id=? AND content_hash=? AND status='pending'""",
+                        (row["id"], row["content_hash"])).rowcount:
+                    return {**report, "status": "stale"}
+                store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
+                decisions.record(store.db, row["id"], "skipped.gate.retired_story", observed)
+            return {**report, "status": "ignored"}
+        except StaleCandidate:
+            return {**report, "status": "stale"}
+        return {**report, "status": cited["status"]}
     own_state, writer_item = candidate_mod.own_update_input(store.db, row, item_payload)
     if own_state == "skip":
         with store.db:
@@ -293,6 +396,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
             decisions.record(store.db, row["id"], "skipped.gate.no_new_content", observed)
         return {**report, "status": "ignored"}
+    policy = review.policy_hash(config)
     prior = candidate_mod.update_target(store.db, row)
     writer_key = cache_key(row, config["llm"], prior)
     job = store.db.execute("""SELECT writer_key,policy_hash,stage,approval_key,prepared_at,CAST(draft_json AS BLOB) AS draft,
@@ -349,9 +453,9 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         if cached is not None:
             try:
                 verdict = review.validate_review(json.loads(cached["result_json"]), prepared["packet"],
-                                                 update=prepared.get("mode") == "update")
+                                                 update=prepared.get("mode") == "update", coverage=prepared["coverage"])
                 proof = json.loads(cached["review_record_json"])
-                valid = verdict["verdict"] in {"approve", "skip"}
+                valid = verdict["verdict"] in {"approve", "skip"} and verdict.get("same_story") is None
             except (AnalysisError, ValueError, TypeError, KeyError):
                 valid = False
             if valid:
@@ -378,6 +482,9 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             record["reviews"].append({**call_review(reviewer, stage, candidate, prepared), "source_hash": prepared["source_hash"],
                                       "coverage_hash": prepared["coverage_hash"], "policy_hash": policy})
             action, value = next_step(record["reviews"], candidate, prepared)
+            if action == "route":
+                status_out = _route(store, row, draft, writer_key, record, observed, value, record["reviews"][-1]["stage"])
+                return {**report, "status": status_out}
             if action == "hold":
                 _hold(store, row, draft, writer_key, record, observed, *value)
                 return {**report, "status": "held"}
@@ -493,7 +600,9 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
         return refuse("An earlier review policy or packet reviewed it; retry it", editorial_failures, new_coverage)
     is_update = prepared.get("mode") == "update"
     try:
-        validated = [review.validate_review(entry["result"], prepared["packet"], update=is_update) for entry in reviews]
+        validated = [review.validate_review(entry["result"], prepared["packet"],
+                                            update=is_update, coverage=held_prepared.get("coverage"))
+                     for entry in reviews]
     except (AnalysisError, ValueError, TypeError, KeyError):
         return refuse("Saved review record cannot be read", editorial_failures, new_coverage)
     if any(result["criteria"]["new_information"]["outcome"] != "pass" for result in validated):

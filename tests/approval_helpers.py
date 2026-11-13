@@ -24,7 +24,7 @@ def update_analysis(**overrides):
     return draft
 
 
-def verdict(action="approve", *, repair=None, criterion="operational_advice", ref="S1", update=False):
+def verdict(action="approve", *, repair=None, criterion="operational_advice", ref="S1", update=False, same_story=None):
     """A reviewer reply in which every criterion passes, or `criterion` fails."""
     checks = {name: {"reason": "Supported by the supplied source.", "source_refs": [ref], "outcome": "pass"}
               for name in review.CRITERIA}
@@ -33,11 +33,11 @@ def verdict(action="approve", *, repair=None, criterion="operational_advice", re
     # A reply names every editable field and leaves the unchanged ones null.
     fields = review.UPDATE_EDITABLE if update else review.EDITABLE
     wire = None if repair is None else {key: repair.get(key) for key in fields}
-    return {"criteria": checks, "verdict": action, "repair": wire}
+    return {"criteria": checks, "verdict": action, "same_story": same_story, "repair": wire}
 
 
-def approved_result(packet, *, update=False):
-    return review.validate_review(verdict(update=update), packet, update=update)
+def approved_result(packet, *, update=False, coverage=None):
+    return review.validate_review(verdict(update=update), packet, update=update, coverage=coverage)
 
 
 class ApprovingReviewer:
@@ -54,14 +54,14 @@ class ApprovingReviewer:
         pass
 
     def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False):
-        return approved_result(packet, update=update)
+        return approved_result(packet, update=update, coverage=coverage)
 
 
 def approve(store, prepared, candidate=None, *, policy="test-policy", result=None):
     """Record the receipt the gate saves when review approves this exact candidate."""
     candidate = candidate or prepared["candidate"]
     is_update = prepared.get("mode") == "update"
-    result = result or approved_result(prepared["packet"], update=is_update)
+    result = result or approved_result(prepared["packet"], update=is_update, coverage=prepared.get("coverage"))
     key = review_gate._approval_key(candidate, prepared, policy)
     stage = {"stage": "verification", "candidate_hash": digest(candidate), "source_hash": prepared["source_hash"],
              "coverage_hash": prepared["coverage_hash"], "policy_hash": policy, "result": result}
@@ -76,8 +76,11 @@ def approve(store, prepared, candidate=None, *, policy="test-policy", result=Non
 
 
 def finish_reviewed(store, row, result, key, observed, *, decision="approve"):
+    item = json.loads(row["payload"])
+    if (existing := candidate_mod.existing_story(store.db, row)) is not None:
+        if candidate_mod.relation(json.loads(existing["payload"]), item, store.db) == "citation" and decision == "approve":
+            return store.add_citation(row, existing["id"], observed)
     if "update" not in result and (prior := candidate_mod.update_target(store.db, row)) is not None:
-        item = json.loads(row["payload"])
         if item.get("kind") == "tag":
             result = tag_update(item, prior)
         else:

@@ -214,6 +214,22 @@ def item_identity(item: dict) -> str:
 _PRODUCT_NAMES = {"tor": "tor", "arti": "arti", "tor-browser": "tor browser"}
 _VERSION = re.compile(r"\d+\.\d+(?:\.\d+){0,2}(?:[-.]?(?:alpha|beta|rc|a)\.?\d*)?")
 _RELEASE_QUALIFIERS = r"(?:(?:new|stable|alpha|beta|security|bugfix|release|version)\s+)*"
+_RELEASE_AFTER = re.compile(r"\s+(?:is\s+)?(?:now\s+)?available\b")
+_RELEASE_EOL = re.compile(r"\b(?:end[- ]of[- ]life|eol|out of support|no longer supported)\b")
+_GITLAB_OWN = re.compile(r"^(https://[^/?#]+)/(.+?)/-/(?:issues|work_items|merge_requests|tags|blob)/\S+")
+_GITLAB_URL_REF = re.compile(r"^(https://[^/?#]+)/(.+?)/-/(issues|work_items|merge_requests)/(\d+)(?:/|$)")
+_GITLAB_SHORT_REF = re.compile(r"^(?:([a-z0-9_.-]+(?:/[a-z0-9_.-]+)+))?([#!])(\d+)$", re.I)
+_REF_TOKEN = r"(?:https://[^\s<>()\[\]\"']+|(?<![\w/#!])(?:[a-z0-9_.-]+(?:/[a-z0-9_.-]+)+)?[#!]\d+\b)"
+_CLOSING_SPAN = re.compile(
+    r"\b(?:clos(?:e|es|ed|ing)|fix(?:|es|ed|ing)|resolv(?:e|es|ed|ing))\s*:?\s+("
+    + _REF_TOKEN + r"(?:\s*(?:,|and)\s*" + _REF_TOKEN + r")*)",
+    re.I,
+)
+_ANY_REF = re.compile(_REF_TOKEN, re.I)
+_RELEASE_MENTION = re.compile(
+    r"\b(tor[- ]browser|arti|tor)[- ](?:v|" + _RELEASE_QUALIFIERS + r")?(\d+\.\d+(?:[\w.-]*\w)?)(?![\w.])",
+    re.I,
+)
 
 
 def item_cluster(item: dict) -> str:
@@ -230,18 +246,23 @@ def item_cluster(item: dict) -> str:
             product = "arti"
         elif re.search(r"\btor\b", title):
             product = "tor"
-    if product in _PRODUCT_NAMES and (item.get("kind") == "tag" or re.search(r"\breleas(?:e|ed|ing)\b", title)):
+    if product in _PRODUCT_NAMES:
         # Only the first version in the title, and only when it follows the product
         # name, directly or after release qualifiers ("Tor Browser 16.0", "arti-v2.8.0",
         # "Tor stable release 0.4.8.19"); titles such as "Tails 7.16 ... Tor Browser
-        # 16.0" keep their own identity, and so do delay notices, which say "delayed" or
-        # "postponed" without saying "released".
+        # 16.0" keep their own identity, and so do delay and end-of-life notices.
         match = re.search(r"(?<![\w.])v?(\d+\.\d+(?:[\w.-]*\w)?)", title)
         if (
             match
             and _VERSION.fullmatch(match.group(1))
+            and (
+                item.get("kind") == "tag"
+                or re.search(r"\breleas(?:e|ed|ing)\b", title)
+                or _RELEASE_AFTER.match(title[match.end() :])
+            )
             and re.search(r"\b" + _PRODUCT_NAMES[product] + r"[- ]" + _RELEASE_QUALIFIERS + "$", title[: match.start()])
             and (re.search(r"\breleased\b", title) or not re.search(r"\b(?:delayed|postponed)\b", title))
+            and not _RELEASE_EOL.search(title)
         ):
             return f"release:{product}:{match.group(1)}"
     body = re.sub(r"\s+", " ", item["content"]).strip().lower()
@@ -252,3 +273,95 @@ def item_cluster(item: dict) -> str:
         )
         return "body:" + digest([clean_title, body])
     return "url:" + digest(item_identity(item))
+
+
+def gitlab_refs(item: dict) -> tuple[list[str], list[str]]:
+    """Extract canonical closing and mentioned GitLab issue and merge-request URLs."""
+    own_url = str(item.get("url") or "")
+    own_match = _GITLAB_OWN.match(own_url)
+    origin = own_match.group(1) if own_match else "https://gitlab.torproject.org"
+    own_project = own_match.group(2) if own_match else None
+
+    def normalize_ref(token: str) -> str | None:
+        cleaned = token.rstrip(".,;:!?)>]").split("#", 1)[0] if token.startswith("https://") else token
+        if cleaned.startswith("https://"):
+            match = _GITLAB_URL_REF.match(cleaned)
+            if not match:
+                return None
+            ref_origin, project, kind_seg, number = match.groups()
+            if ref_origin not in {"https://gitlab.torproject.org", origin}:
+                return None
+            seg = "work_items" if kind_seg in {"issues", "work_items"} else "merge_requests"
+            raw = f"{ref_origin}/{project.lower()}/-/{seg}/{number}"
+            if ref_origin != "https://gitlab.torproject.org":
+                return raw
+            try:
+                return canonical_url(raw)
+            except ValueError:
+                return None
+        short = _GITLAB_SHORT_REF.match(token)
+        if not short:
+            return None
+        project = (short.group(1) or own_project or "").lower() or None
+        if not project:
+            return None
+        seg = "work_items" if short.group(2) == "#" else "merge_requests"
+        raw = f"{origin}/{project}/-/{seg}/{short.group(3)}"
+        if origin != "https://gitlab.torproject.org":
+            return raw
+        try:
+            return canonical_url(raw)
+        except ValueError:
+            return None
+
+    own_canonical = normalize_ref(own_url) if own_url.startswith("https://") else None
+    closing, mentioned = [], []
+    header_text = f"{item.get('title') or ''}\n{item.get('content') or ''}"
+    for span in _CLOSING_SPAN.finditer(header_text):
+        for ref_match in _ANY_REF.finditer(span.group(1)):
+            resolved = normalize_ref(ref_match.group(0))
+            if resolved and resolved != own_canonical and resolved not in closing:
+                closing.append(resolved)
+    full_text = "\n".join([header_text, *(str(note.get("body") or "") for note in item.get("public_comments") or [])])
+    for ref_match in _ANY_REF.finditer(full_text):
+        resolved = normalize_ref(ref_match.group(0))
+        if resolved and resolved != own_canonical and resolved not in closing and resolved not in mentioned:
+            mentioned.append(resolved)
+    return closing, mentioned
+
+
+def release_mentions(item: dict) -> list[str]:
+    """Extract release:<product>:<version> keys explicitly named with their product."""
+    texts = [str(item.get("title") or ""), str(item.get("content") or ""),
+             *(str(note.get("body") or "") for note in item.get("public_comments") or [])]
+    found = []
+    for match in _RELEASE_MENTION.finditer("\n".join(texts)):
+        raw_prod, raw_ver = match.group(1).lower(), match.group(2).lower()
+        version = raw_ver.removeprefix("v")
+        if not _VERSION.fullmatch(version):
+            continue
+        product = "tor-browser" if raw_prod.startswith("tor") and len(raw_prod) > 3 else raw_prod
+        key = f"release:{product}:{version}"
+        if key not in found:
+            found.append(key)
+    return found
+
+
+def thread_subject(item: dict) -> tuple[str | None, bool]:
+    """Normalized subject for HyperKitty list items (>= 3 words) and whether it is a reply."""
+    if "/hyperkitty/list/" not in str(item.get("url") or ""):
+        return None, False
+    text = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()
+    is_reply = False
+    while text:
+        if tag_match := re.match(r"^\[[^\]]+\]\s*", text):
+            text = text[tag_match.end() :]
+        elif reply_match := re.match(r"^(?:re|aw|sv)(?:\[\d+\])?\s*[:.]\s*", text, re.I):
+            is_reply = True
+            text = text[reply_match.end() :]
+        elif fwd_match := re.match(r"^(?:fwd?\s*:\s*|\(fwd\)\s*)", text, re.I):
+            text = text[fwd_match.end() :]
+        else:
+            break
+    cleaned = text.strip().lower()
+    return (cleaned if len(cleaned.split()) >= 3 else None), is_reply

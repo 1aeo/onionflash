@@ -775,6 +775,7 @@ def test_release_clusters_include_two_part_versions_and_alpha_suffixes():
     assert key("[tor-announce] [RELEASE] Tor release 0.4.9.17") == key("tor-0.4.9.17", kind="tag") == "release:tor:0.4.9.17"
     assert key("Tor stable release 1.2.3") == "release:tor:1.2.3"
     assert key("New Tor stable release 0.4.8.19") == "release:tor:0.4.8.19"
+    assert key("Arti 1.7.0 is now available") == "release:arti:1.7.0"
     for q in ("new", "stable", "alpha", "beta", "security", "bugfix", "release", "version"):
         assert key(f"Tor {q} 1.2.3 released") == "release:tor:1.2.3", q
     # A title that says "released" stays a release even when it says "postponed", and so does
@@ -1081,7 +1082,7 @@ def test_a_torproject_org_sender_on_the_list_archive_is_project_sender():
     # review_gate treats project-sender as official for news-value holds, while Confirmed still refuses it.
     criteria = {name: {"reason": "Supported.", "source_refs": ["S1P1"], "outcome": "pass"} for name in review.CRITERIA}
     criteria["news_value"] = {"reason": "Routine reply.", "source_refs": ["S1P1"], "outcome": "fail"}
-    first = {"stage": "review", "candidate_hash": "h", "result": {"verdict": "skip", "criteria": criteria, "repair": None}}
+    first = {"stage": "review", "candidate_hash": "h", "result": {"verdict": "skip", "criteria": criteria, "same_story": None, "repair": None}}
     prepared = {"row": {"payload": json.dumps(items[0])}, "payload": {"editorial_kind": "feed"},
                 "packet": {"sources": [{**items[0], "passages": [{"ref": "S1P1", "text": "Body"}]}]}, "coverage": {}}
     assert review_gate.next_step([first], analysis(), prepared)[0] == "verify"

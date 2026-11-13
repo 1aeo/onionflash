@@ -38,12 +38,14 @@ SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
     "criteria": {"type": "object", "additionalProperties": False,
                  "properties": {key: CHECK for key in CRITERIA}, "required": list(CRITERIA)},
     "verdict": {"type": "string", "enum": list(VERDICTS)},
+    "same_story": {"anyOf": [{"type": "null"}, {"type": "string", "maxLength": 64}]},
     # Strict endpoints require every object property. Null means no edit; the
     # validated application response exposes only the actual changed fields.
     "repair": {"anyOf": [{"type": "null"}, {"type": "object", "additionalProperties": False,
         "properties": {key: {"anyOf": [rule, {"type": "null"}]} for key, rule in FIELDS.items()},
         "required": list(EDITABLE)}]},
-}, "required": ["criteria", "verdict", "repair"]}
+}, "required": ["criteria", "verdict", "same_story", "repair"]}
+STORY_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 
 SYSTEM_PROMPT = """You are the independent final publication reviewer for Onion Flash.
 Judge the EXACT candidate public story against the supplied numbered source packet.
@@ -213,25 +215,48 @@ whether it materially changes the account. Mere corroborating anecdotes, request
 for logging, praise and generic advice do not justify another incident headline.
 The application has already chosen the publication action:
 - When prior_story is present, this candidate UPDATES that same article and
-  permalink. A changed title is not a new article. A supported meaningful fix,
-  resolution, merged change or release announcement can pass new_information;
-  do not demand a separate association or reject it for being a followup.
+  permalink (keep same_story null). A changed title is not a new article. A supported
+  meaningful fix, resolution, merged change or release announcement can pass
+  new_information; do not demand a separate association or reject it for being a followup.
+  Compare lifecycle states explicitly: prior_story requesting a change does not
+  already cover a later merge completing it, and source metadata marking a merge complete
+  is material new information even if the description still discusses planned work.
+  If prior_story concerns a different concrete event unrelated to this source (such as a
+  wrong association), fail new_information and return hold. Never retitle or rewrite
+  prior_story to a development that another coverage entry already reports; keep this
+  story's own event or skip.
   A correction, narrowing or withdrawal of a prior_story claim (status, versions,
   scope, attribution or severity), or a material maintainer dispute of it, is
   material: never skip it, and revise or hold a candidate that repeats a claim the
   packet now contradicts. A correction made in a comment is attributed to its author;
   keep the original claim, attributed, unless the description or metadata changed.
   Skip only when the packet adds no material facts to that prior account.
-- When prior_story is null, this candidate would be a NEW article. If recent
-  coverage describes the same event, require a material new development such as
-  a completed fix, merge, resolution or release. Such a supported followup can be
-  a concise standalone article; do not invent an association or overwrite another
-  story. If it merely repeats covered facts, skip. Distinct events can still be news.
+- When prior_story is null, attach an earlier or later stage of a concrete bug, incident,
+  request or single-fix emergency release already in non-retracted recent coverage to that
+  story via same_story instead of publishing a second standalone article. Treat all of the
+  following as the same story (even when this candidate adds material lifecycle progress such
+  as a merge or release): (a) a merge completing an already-covered issue or removal request,
+  (b) a single-fix hotfix or emergency release whose main change is an already-covered merge
+  or incident, (c) an earlier merge or incident-timeline issue for the problem or mechanism
+  that an already-covered emergency or hotfix release addresses (note that recent entries with
+  summary_truncated true show only the opening sentence, so match shared technical mechanisms
+  even if the merge also includes a companion workaround), or (d) a follow-up resolution,
+  closing note or cross-channel report of an already-covered incident. In every such case —
+  whether you fail new_information (returning verdict skip with repair null) or pass all nine
+  criteria because this stage adds new facts (returning verdict approve with repair null;
+  never return revise or skip when all nine pass), or return verdict revise when a criterion
+  failed — you MUST set same_story to that recent entry's id so the application attaches the
+  item to that story for update review. Keep same_story null for: a different software
+  version's release, a general release shipping multiple distinct fixes or features, a newly
+  reported bug or regression in an already-released version, a distinct bug found while
+  auditing an earlier issue, or a different incident on the same authority or topic. Entries
+  marked related only share a reference, version or thread; check whether they match (a)-(d)
+  rather than routing from the related marker alone. An entry marked retracted is a withdrawn
+  story: if the candidate repeats its withdrawn claim, fail new_information (keeping
+  news_value pass) and return verdict hold (never skip, same_story null). Otherwise keep
+  same_story null.
 A shared authority name or topic alone does not establish the same event; a
 different release version is a distinct release event.
-Compare lifecycle states explicitly: prior coverage requesting a change does not
-already cover a later merge completing it. Source metadata marking a merge complete
-is material new information even if the description still discusses planned work.
 Whenever new_information fails (including when an update adds nothing material to
 prior_story), include the matching prior_story or recent story id verbatim in
 new_information's reason.
@@ -265,6 +290,14 @@ use hold with repair null.
 An application_issue, when present, is a problem the application found in the
 candidate, not evidence. Repair it with the smallest change the packet supports, or hold.
 If all factual and editorial criteria pass, approve.
+After choosing verdict (remembering that all nine criteria passing requires verdict approve
+with repair null, never revise or skip), set same_story: when prior_story is null and this
+candidate is an earlier or later stage of the same concrete bug, removal request, merge,
+incident or emergency/hotfix release as a non-retracted recent entry under (a)-(d) above —
+even when verdict is approve or revise because this item adds a merge, single-fix hotfix,
+incident timeline or resolution — set same_story to that recent entry's id; keep same_story
+null for distinct software versions, multi-fix releases, new bugs in released versions,
+distinct issues, different incidents on the same authority, or retracted entries.
 A proposed repair is NOT approval: another fresh review must verify the exact result.
 An initial approval also requires a separate fresh verification before publication.
 Return only the requested JSON object, without Markdown or additional prose.
@@ -375,16 +408,21 @@ Evaluate all nine criteria in order before choosing verdict:
          incident thread (such as "Yes guard and hsdir flags" or "Just to confirm ... HSDir flag did not stick")
          that add no quantitative measurements, multi-relay telemetry, new affected version or root-cause finding;
      (8) Restating facts already covered in candidate.title, candidate.summary or candidate.updates[:-1].
-   - Unrelated-event guard: If the incoming source is genuine news about a completely different, unrelated event
-     wrongly attached to prior_story, fail source_support or actor_and_action and return verdict "hold" with
-     repair null (never approve onto the wrong story and never skip genuine unrelated news).
+   - Unrelated-event guard: If candidate.updates[-1] or its packet source concerns a completely different,
+     unrelated event or product wrongly attached to this story (not a follow-up, fix, release or discussion of
+     candidate.title / candidate.summary), fail actor_and_action (or technical_details), keep new_information "pass"
+     (never claim prior_story.id already covers an unrelated event), and return verdict "hold" with repair null
+     (never approve onto the wrong story and never return "skip" for genuine unrelated news).
 
 VERDICT AND REPAIR RULES:
 - For each criterion write a concise reason (at most 25 words), source_refs (only packet IDs such as S1 or S1:P1;
   [] when absent; never invent IDs), and outcome ("pass", "fail" or "insufficient") BEFORE verdict.
-- Whenever new_information fails, ALWAYS return verdict "skip" with repair null (never revise a non-material
-  update even if updates[-1].text or state also failed a check), and include coverage_background.prior_story.id
-  verbatim in new_information.reason.
+- Keep same_story null in latest_update mode.
+- When new_information fails because the follow-up is non-material or already covered by this story (items (1)-(8)
+  above), ALWAYS return verdict "skip" with repair null (never revise a non-material update even if updates[-1].text
+  or state also failed a check), and include coverage_background.prior_story.id verbatim in new_information.reason.
+  When the incoming source is instead an unrelated event wrongly attached to this story, return verdict "hold" with
+  repair null (never "skip").
 - Return verdict "approve" with repair null ONLY when ALL nine criteria pass and source_support.source_refs is
   non-empty (never return revise, hold or skip when all nine pass).
 - When new_information passes and a factual or classification defect (such as unsupported wording in updates[-1].text
@@ -402,9 +440,11 @@ passes the new_information gate rather than echoing a covered release, triage no
 
 """ + UPDATE_SYSTEM_PROMPT + """
 This is a fresh verification request. Evaluate candidate.updates[-1] and the post-update classification fields
-independently without relying on any earlier review. If new_information fails, return skip (with prior_story.id in
-new_information.reason and repair null). If new_information passes and a remaining wording or state/label defect can
-be fixed from packet, return revise with the smallest repair; otherwise hold, or approve only if all nine pass.
+independently without relying on any earlier review. If new_information fails because the follow-up is non-material or
+already covered, return skip (with prior_story.id in new_information.reason and repair null); if the source is an
+unrelated event wrongly attached to this story, return hold with repair null. If new_information passes and a remaining
+wording or state/label defect can be fixed from packet, return revise with the smallest repair; otherwise hold, or
+approve only if all nine pass.
 """
 # The problem that review_gate.next_step names when it asks a review to repair release labels.
 RELEASE_ISSUE = ("A release category or tag needs state released or tagged: remove the release labels, "
@@ -485,7 +525,8 @@ def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict
     return normalized
 
 
-def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool = False) -> dict:
+def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool = False,
+              coverage: dict | None = None) -> dict:
     """Validate a complete review. A saved one may also keep model_verdict, the model's
     own verdict where Reviewer.review replaced it."""
     saved = set() if wire else {"model_verdict"}
@@ -493,6 +534,16 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool 
             or result["verdict"] not in VERDICTS or result.get("model_verdict", result["verdict"]) not in VERDICTS
             or not isinstance(result["criteria"], dict) or set(result["criteria"]) != set(CRITERIA)):
         raise ReviewError("Review response fields do not match schema")
+    same_story = result["same_story"]
+    if same_story is not None and (not isinstance(same_story, str) or not STORY_ID_RE.fullmatch(same_story)):
+        raise ReviewError("Invalid same_story identifier")
+    if update or (coverage is not None and coverage.get("prior_story") is not None):
+        same_story = None
+    elif same_story is not None and coverage is not None:
+        allowed_ids = {row["id"] for row in (coverage.get("recent") or ())
+                       if isinstance(row, dict) and not row.get("retracted") and isinstance(row.get("id"), str)}
+        if same_story not in allowed_ids:
+            raise ReviewError("Review same_story is not listed in coverage")
 
     def references(values):
         if (not isinstance(values, list) or len(values) > 12
@@ -527,12 +578,12 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool 
         repair = {key: value for key, value in repair.items() if value is not None}
     elif repair is not None:
         raise ReviewError("Only a revise verdict can propose repair")
-    return {**result, "repair": repair}
+    return {**result, "same_story": same_story, "repair": repair}
 
 
-def validate_review(result: dict, packet: dict, *, update: bool = False) -> dict:
+def validate_review(result: dict, packet: dict, *, update: bool = False, coverage: dict | None = None) -> dict:
     """Validate saved/API responses with the same rubric and source-reference rules."""
-    return _validate(result, _packet_refs(packet), update=update)
+    return _validate(result, _packet_refs(packet), update=update, coverage=coverage)
 
 
 def release_labels_match_state(candidate: dict) -> bool:
@@ -614,14 +665,21 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
         ("merge_state", limits["state"] == ["merged"] and candidate["state"] != "merged")) if held]
 
 
-def _skip_stands(criteria: dict, coverage: dict | None) -> bool:
+def _skip_stands(criteria: dict, coverage: dict | None, same_story: str | None = None) -> bool:
     """A skip needs a failed editorial criterion. Duplication is decided only from the
     coverage background, so a skip for new_information alone must name a story there."""
     failed = {name for name in EDITORIAL_CRITERIA if criteria[name]["outcome"] == "fail"}
-    if failed != {"new_information"}:
-        return bool(failed)
-    stories = [coverage["prior_story"], *coverage["recent"]] if coverage else []
-    return any(story["id"] in criteria["new_information"]["reason"] for story in stories if story)
+    if not failed:
+        return False
+    stories = [row for row in ([coverage.get("prior_story"), *(coverage.get("recent") or ())] if coverage else ())
+               if isinstance(row, dict) and not row.get("retracted") and isinstance(row.get("id"), str)]
+    retracted = [row for row in ((coverage.get("recent") or ()) if coverage else ())
+                 if isinstance(row, dict) and row.get("retracted") and isinstance(row.get("id"), str)]
+    reason = criteria["new_information"]["reason"]
+    names_live = any(story["id"] == same_story or story["id"] in reason for story in stories)
+    if "new_information" in failed and not names_live and any(row["id"] in reason for row in retracted):
+        return False
+    return True if failed != {"new_information"} else names_live
 
 
 class Reviewer(CompletionClient):
@@ -638,6 +696,14 @@ class Reviewer(CompletionClient):
         schema = copy.deepcopy(SCHEMA)
         if update:
             schema["properties"]["repair"] = copy.deepcopy(UPDATE_REPAIR)
+        prior_id = ((coverage or {}).get("prior_story") or {}).get("id")
+        recent_ids = (sorted({row["id"] for row in ((coverage or {}).get("recent") or ())
+                              if isinstance(row, dict) and not row.get("retracted") and isinstance(row.get("id"), str)})
+                      if not update and prior_id is None else [])
+        schema["properties"]["same_story"] = (
+            {"anyOf": [{"type": "null"}, {"type": "string", "enum": recent_ids}]}
+            if recent_ids else {"type": "null", "enum": [None]}
+        )
         if refs:
             # Constrain guided generation to real references as well as checking
             # them afterward; this avoids wasting retries on invented passage IDs.
@@ -659,15 +725,26 @@ class Reviewer(CompletionClient):
                 # The candidate already carries the prior text and updates; avoid duplicating them.
                 prior = coverage["prior_story"]
                 wire_coverage = {**coverage, "prior_story": {
-                    key: prior[key] for key in ("id", "state", "confidence", "updated_at") if key in prior}}
+                    key: prior[key] for key in ("id", "state", "confidence", "updated_at", "associated") if key in prior}}
             payload["coverage_background"] = wire_coverage
         if issue is not None:
             payload["application_issue"] = issue
         prompt = ((UPDATE_VERIFY_PROMPT if verification else UPDATE_SYSTEM_PROMPT) if update
                   else (VERIFY_PROMPT if verification else SYSTEM_PROMPT))
         result = self.complete(prompt, payload, schema, "onionflash_review")
-        result = _validate(result, refs, wire=True, update=update)
-        if result["verdict"] == "skip" and not _skip_stands(result["criteria"], coverage):
+        result = _validate(result, refs, wire=True, update=update, coverage=coverage)
+        if (not update and prior_id is None and result["verdict"] == "skip" and result["same_story"] is None
+                and result["criteria"]["news_value"]["outcome"] == "pass"
+                and result["criteria"]["new_information"]["outcome"] == "fail"):
+            reason = result["criteria"]["new_information"]["reason"]
+            named_live = [rid for rid in recent_ids if rid in reason]
+            named_retracted = any(
+                isinstance(row, dict) and row.get("retracted") and isinstance(row.get("id"), str) and row["id"] in reason
+                for row in ((coverage or {}).get("recent") or ())
+            )
+            if len(named_live) == 1 and not named_retracted:
+                result = {**result, "same_story": named_live[0]}
+        if result["verdict"] == "skip" and not _skip_stands(result["criteria"], coverage, result.get("same_story")):
             # The record keeps the verdict that this fixed rule replaced.
-            result = {**result, "verdict": "hold", "model_verdict": "skip"}
+            result = {**result, "verdict": "hold", "same_story": None, "model_verdict": "skip"}
         return result

@@ -295,7 +295,7 @@ def test_reply_reasons_before_outcomes_and_verdict(monkeypatch):
     checker = reviewer(monkeypatch, completion(verdict()))
     checker.review(candidate(), packet())
     schema = checker.client.requests[0][1]["response_format"]["json_schema"]["schema"]
-    assert list(schema["properties"]) == schema["required"] == ["criteria", "verdict", "repair"]
+    assert list(schema["properties"]) == schema["required"] == ["criteria", "verdict", "same_story", "repair"]
     for check in schema["properties"]["criteria"]["properties"].values():
         assert list(check["properties"]) == check["required"] == ["reason", "source_refs", "outcome"]
         assert check["properties"]["reason"]["maxLength"] == 240  # room for a 25-word reason

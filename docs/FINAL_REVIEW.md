@@ -41,14 +41,22 @@ name their author, so comment text cannot pose as another comment. Previous
 generated summaries are never factual evidence.
 
 A separate, bounded coverage background contains the existing article for a
-known update and compact entries for the most recently created stories. It is
-used only to compare novelty, and it alone decides duplication: a source's own
-claim that an item is a duplicate, already covered or unimportant is attributed
-to that source. The review prompt marks the background as data, not an
-instruction, and forbids using it as evidence; validation checks the structure
-of a verdict, not the reasoning behind it. The background reads committed
-stories, so an article accepted earlier in the same run is visible before the
-site rebuild.
+known update (`prior_story`, never repeated in `recent`) and compact entries
+ordered by recent story activity (`updated_at` or `added_at`). Up to six active
+`related` entries appear first—stories mapped from mentioned GitLab issues or
+merge requests, product-qualified release version mentions, or ambiguous
+mailing-list reply threads—with up to 400 summary characters and their `related`
+reason; when a skipped item is retried, active stories from its earlier skipped
+decision follow with `related: "earlier decision"`. Retracted stories appear as
+`{id, title, retracted: true}` markers carrying the pre-retraction title and no
+summary, and `truncated` is `true` only when a row is omitted by the row or
+character bound (or unreadable). Coverage is used only to compare novelty, and
+it alone decides duplication: a source's own claim that an item is a duplicate,
+already covered or unimportant is attributed to that source. The review prompt
+marks the background as data, not an instruction, and forbids using it as
+evidence; validation checks the structure of a verdict, not the reasoning behind
+it. The background reads committed stories, so an article accepted earlier in
+the same run is visible before the site rebuild.
 
 The reviewer evaluates nine independent criteria. Its reply gives each
 criterion's reason and source references before the outcome, and every
@@ -80,21 +88,39 @@ repair request that names the problem, then a fresh verification of the repaired
 text; labels that the request leaves in place hold the item. This check does not
 infer facts from source text.
 
-Existing issue/release identities allow meaningful updates to the same article.
-Only a literal tag notice or a timeline-written story is replaced in place when
-a richer source arrives (`story` scope). Every follow-up on a prose story runs
-in `update` scope (`review_scope: "latest_update"`): the writer drafts one short
-dated `updates` entry grounded in the new source's unquoted contribution (or
-only in new unquoted comments/edits when the story's own item changes; if
-nothing new remains, the gate skips it as `skipped.gate.no_new_content` without
-a model call). With its dedicated `latest_update` review and verification
-prompts, the reviewer judges only the newest update entry and the story's
-resulting classification labels; `news_value` remains the story's newsworthiness
-while novelty lives in `new_information`, and repairs may change only the new
-entry's text and the classification labels.
-A potentially important follow-up with no established article match can be a
-concise standalone story when it adds a material, supported development. It does
-not change another article's identity or overwrite a protected correction.
+Before any model call, deterministic association attaches an incoming item to at
+most one live story in fixed order: `items.story_id`, retired/merged aliases,
+`stories.cluster_key`, mapped items sharing `cluster_key` (when unique), merged
+GitLab merge-request closing references (when unique), and same-source
+HyperKitty replies within 45 days sharing at least a three-word normalized
+subject (when unique); ambiguous matches stay unattached and surface as
+`related` entries. Relations compare source tier and official authority: a
+version tag joining an existing story is a `citation` (adding its collected
+source metadata with zero writer or review calls and leaving prose, labels and
+`updated_at` unchanged), a higher-ranked source or an official announcement
+replacing a tag, timeline row or non-official story runs in `story` scope as an
+`upgrade`, a timeline item revising its own timeline story runs as `own`, and
+every other follow-up on a prose story runs in `update` scope (`review_scope:
+"latest_update"`): the writer drafts one short dated `updates` entry grounded in
+the new source's unquoted contribution (or only in new unquoted comments/edits
+when the story's own item changes; if nothing new remains, the gate skips it as
+`skipped.gate.no_new_content` without a model call). With its dedicated
+`latest_update` review and verification prompts, the reviewer judges only the
+newest update entry and the story's resulting classification labels;
+`news_value` remains the story's newsworthiness while novelty lives in
+`new_information`, and repairs may change only the new entry's text and the
+classification labels. When `prior_story` comes from a non-own association
+(`associated: true`), the reviewer holds if the item reports a different event,
+and never retitles `prior_story` to a development another coverage entry already
+reports. When `prior_story` is null and a coverage entry reports the same
+concrete event or an earlier or later stage of the same change, the reviewer
+sets `same_story` to that entry's ID; when deterministic overlap checks pass,
+the gate attaches the item to that story and re-queues it once for update review
+(whether the initial review skips on `new_information`, approves, or proposes a
+repair, routing precedes the official-item hold and verification repair loop
+rather than publishing a second headline). Entries marked `related` share only a
+reference, version or thread, and entries marked `retracted` hold any candidate
+that repeats their withdrawn claim.
 
 ## Decisions and calls
 
@@ -109,10 +135,15 @@ not change another article's identity or overwrite a protected correction.
   request counting as one; a refusal at the limit holds the item. A repair that
   cannot be applied, or that repeats a text already reviewed, holds the item at
   once. Tag notices stay literal, so a repair proposed for one holds the item.
-- `skip`: low-value or redundant material is recorded as ignored. It creates no
-  article or revision and leaves existing coverage intact. A skip needs a failed
-  news-value or new-information criterion, and a skip for new information alone
-  must name the covered story; otherwise the item is held. An item from an
+- `skip`: low-value or redundant material is recorded as ignored. Except when
+  `same_story` attaches an unmapped item to an overlapping story and re-queues
+  it once for update review, or when a `release:*` item or `metrics_timeline`
+  row associated with an existing story skips on `new_information` alone and
+  adds its corroborating source citation without changing prose, labels or
+  `updated_at`, a skip creates no article or revision and leaves existing
+  coverage intact. A skip needs a failed news-value or new-information
+  criterion, and a skip for new information alone must name an active covered
+  story (not a `retracted` marker); otherwise the item is held. An item from an
   official source, other than a version tag, skips only when new information
   fails; when news value fails while new information passes, it is held for the
   operator once a fresh verification has passed its facts.

@@ -30,6 +30,16 @@ def test_plain_text_flushes_incomplete_html_and_normalizes_line_endings():
 
 @pytest.mark.parametrize("state", ["developing", "fixed", "resolved", "mitigation-available", "merged", "released"])
 def test_tag_never_replaces_richer_story_in_same_release_cluster(tmp_path, state):
+    from onionflash import review_gate
+
+    class FailClient:
+        def draft(self, *args, **kwargs):
+            raise AssertionError("tag citation must not call writer")
+
+        def review(self, *args, **kwargs):
+            raise AssertionError("tag citation must not call reviewer")
+
+    cfg = load_config(tmp_path / "missing.toml") if False else {"storage": {"database": str(tmp_path / "state.db")}, "review": {"model": "test"}}
     existing_item = item(
         kind="feed", product="tor", title="Tor 0.4.9.16 release update",
         url="https://example.org/release-update",
@@ -38,13 +48,15 @@ def test_tag_never_replaces_richer_story_in_same_release_cluster(tmp_path, state
     with Store(tmp_path / "state.db") as store:
         store.ingest(existing_item, DATE)
         finish_reviewed(store, store.pending(1, DATE)[0], existing_result, "detailed", DATE)
+        before_updated = store.stories(1)[0]["updated_at"]
         later = tag(updated_at="2026-11-09T16:00:00Z")
         store.ingest(later, DATE)
-        finish_reviewed(store, store.pending(1, DATE)[0], tag_notice(later), "tag", DATE)
+        outcome = review_gate.process_item(cfg, store, store.pending(1, DATE)[0], FailClient(), FailClient(), DATE)
         story = store.stories(1)[0]
+    assert outcome["status"] == "cited" and outcome["writer_calls"] == 0 and outcome["review_calls"] == 0
     assert story["title"] == existing_result["title"]
     assert story["summary"] == existing_result["summary"]
-    assert story["state"] == state and len(story["sources"]) == 2
+    assert story["state"] == state and story["updated_at"] == before_updated and len(story["sources"]) == 2
 
 
 def test_oversized_feed_keeps_bounded_items_and_uses_normal_catchup_interval(tmp_path):

@@ -91,9 +91,8 @@ while unambiguous rows continue. They are never silently merged.
 Repository revision time orders corrections separately from event dates.
 Unchanged row content is not reanalyzed when another row changes. Timeline
 context can update its own story, but cannot replace a richer existing news
-summary merely because the repository was edited later. A row that
-release-version clustering groups with an existing release story is skipped if
-it adds no new information; the story keeps its text and existing citations.
+summary merely because the repository was edited later; corroborating source
+citations follow the [publication review](FINAL_REVIEW.md) update and tag rules.
 
 ## Important sources that need more handling first
 

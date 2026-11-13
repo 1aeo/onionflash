@@ -22,7 +22,8 @@ AFTER_SHOW = "2026-11-10T15:30:00Z"
 
 def hold_news_dispute(cfg, store, incoming=None, draft=None):
     row = pending(store, incoming)
-    report = run(cfg, store, row, Writer(draft), Reviewer(verdict(), verdict("hold", criterion="news_value")))
+    is_update = isinstance(draft, dict) and "update" in draft
+    report = run(cfg, store, row, Writer(draft), Reviewer(verdict(update=is_update), verdict("hold", criterion="news_value", update=is_update)))
     assert report["status"] == "held"
     return row
 
@@ -312,16 +313,16 @@ def test_only_holds_whose_reviews_passed_every_factual_check_can_be_approved(tmp
             seeded, _ = seed_legacy(store, incoming=item(url="https://example.org/release", title="Tor 0.4.9.5 released"))
             with store.db:
                 store.db.execute("DELETE FROM items WHERE url=?", (seeded["url"],))
-            tag_follow = item(kind="tag", title="tor-0.4.9.5", content="", url="https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-0.4.9.5")
-            row = pending(store, tag_follow)
-            assert run(cfg, store, row, Writer(tag_notice(tag_follow)), Reviewer())["status"] == "held"
+            followup = item(url="https://example.org/followup", title="Tor 0.4.9.5 released", content="Follow-up details on Tor 0.4.9.5.")
+            row = pending(store, followup)
+            assert run(cfg, store, row, Writer(update_analysis(evidence=["Follow-up details on Tor 0.4.9.5."])), Reviewer())["status"] == "held"
         elif case == "missing_retained_source":
             seed = item(url="https://example.org/release", title="Tor 0.4.9.5 released")
             store.ingest(seed, DATE)
             seed_row = store.pending(1, LATER)[0]
             finish_reviewed(store, seed_row, analysis(title="Tor 0.4.9.5 released"), "seed", DATE)
-            tag_follow = item(kind="tag", title="tor-0.4.9.5", content="", url="https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-0.4.9.5")
-            row = hold_news_dispute(cfg, store, incoming=tag_follow, draft=tag_notice(tag_follow))
+            followup = item(url="https://example.org/followup", title="Tor 0.4.9.5 released", content="Follow-up details on Tor 0.4.9.5.")
+            row = hold_news_dispute(cfg, store, incoming=followup, draft=update_analysis(evidence=["Follow-up details on Tor 0.4.9.5."]))
             with store.db:
                 store.db.execute("DELETE FROM items WHERE id=?", (seed_row["id"],))
                 store.db.execute("UPDATE analyses SET source_payload=NULL WHERE source_item_id=?", (seed_row["id"],))

@@ -115,7 +115,7 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
     # Legacy grouped stories may predate writer provenance. Their complete
     # collected source set can still support a fresh review of the final prose;
     # every source then becomes required, within the same bounds.
-    require_all = writer_id is None
+    require_all = writer_id is None and payload.get("origin") != "network-health"
     # Required sources come first, so the max_sources cap below drops optional links before them.
     references = sorted(payload["sources"], key=lambda source: (
         source.get("source_item_id", source.get("id")) not in required_ids,

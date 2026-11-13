@@ -135,7 +135,8 @@ def test_recent_query_does_not_scan_unbounded_history_to_replace_retracted_rows(
                     (story_id,revision,locked,retracted,notice_action,notice_reason,notice_at)
                     VALUES(?,1,1,1,'retract','Withdrawn',?)""", (f"background-{number:02d}", LATER))
     background = candidate.coverage_background(store.db, None)
-    assert background["recent"] == [] and background["truncated"]
+    assert len(background["recent"]) == candidate.COVERAGE_ROWS and background["truncated"]
+    assert all(row.get("retracted") is True and "summary" not in row for row in background["recent"])
 
 
 @pytest.mark.parametrize("final", ["hold", "skip"])

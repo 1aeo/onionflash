@@ -57,7 +57,12 @@ class Reviewer:
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
-        return review.validate_review(response() if callable(response) else copy.deepcopy(response), packet, update=update)
+        return review.validate_review(
+            response() if callable(response) else copy.deepcopy(response),
+            packet,
+            update=update,
+            coverage=coverage,
+        )
 
 
 @pytest.fixture
@@ -590,16 +595,16 @@ def test_human_lock_during_review_preserves_operator_text(context):
 
 
 def test_tag_update_holds_on_repair_and_keeps_prose_on_approval(context):
-    """Hold a repaired literal tag update rather than letting repair invent release prose."""
+    """A tag joining an existing prose story records a citation with zero model calls and unchanged prose."""
     cfg, store = context
     original = item(title="Tor 0.4.9.16 released", kind="feed", content="Tor 0.4.9.16 was released with an announced change.")
     seed_legacy(store, original, analysis(title="Tor release announcement", state="tagged"))
     tag = item(url="https://example.org/tags/tor-0.4.9.16", title="tor-0.4.9.16", kind="tag", content="")
     row = pending(store, tag)
-    checker = Reviewer(verdict("revise", repair={"update": "Tor 0.4.9.16 was released."}, update=True))
-    result = run(cfg, store, row, Writer(), checker)
-    assert result["status"] == "held" and result["writer_calls"] == 0 and result["review_calls"] == 1
-    assert store.stories()[0]["title"] == "Tor release announcement" and "updates" not in store.stories()[0]
+    result = run(cfg, store, row, Writer(), Reviewer())
+    assert result["status"] == "cited" and result["writer_calls"] == 0 and result["review_calls"] == 0
+    story = store.stories()[0]
+    assert story["title"] == "Tor release announcement" and "updates" not in story and len(story["sources"]) == 2
 
 
 def test_tag_draft_requires_final_review_and_waits_when_network_is_disabled(context):
