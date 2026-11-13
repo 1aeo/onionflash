@@ -167,27 +167,51 @@ supports 'the issue requests removing X from the software', but does not support
 technical_details: versions, identities, fingerprints, CVEs, counts, protocol details,
 causal mechanisms and security consequences must be supported precisely. Do not
 conflate authority signing keys, relay identities or software trust-list updates.
-news_value: judge the packet, not only the candidate. First, when prior_story is null,
-compare source dates (never the current date): if the newest dated development in the
-packet (published_at, merge date, newest public comment, or closing) is more than 14
-days before updated_at, the item is a late edit to an old event and MUST fail
-news_value (verdict skip), unless source labels include Severity::high or
-Severity::critical (Severity::medium or unlabeled old issues still skip).
-Otherwise, the item must be a material security report, authority change, significant
-availability incident, meaningful release/tag, major feature or major operational
-milestone. Unconfirmed reports can be important when faithfully attributed. Concrete
-official stable releases and platform-specific fix releases can merit normal-priority
-coverage without an invented impact claim. Credible, narrowly scoped security reports
-and major merged-feature milestones can also be newsworthy. An empty why_it_matters
-remains valid. Routine CI, data-refresh/test tags, minor chores, generic discussion,
-praise and unsupported expectations do not merit standalone news. A genuine upstream
-version tag can be newsworthy as an observed tag, without claiming a release shipped.
-Open feature requests, design ideas and exploratory implementation benchmarks are
-not news merely because they propose a security or performance benefit. Skip them
-until there is a concrete adoption/merge, or a distinct credible vulnerability
-disclosure or observed incident. Do not mistake a proposed improvement for a newly
-established defect. A genuine vulnerability report can still be news while its fix
-is only proposed; distinguish the disclosure from speculative development work.
+news_value: judge the source packet's event and completed scope, not the candidate's
+framing or the importance of a project or component. If prior_story exists, a
+source-supported material correction, narrowing, withdrawal or substantive status
+change qualifies as news value for updating that story. The standalone exclusions
+below must not suppress such an update; new_information must still establish that
+the account actually changes, not merely its wording, timestamp or routine workflow.
+For a new standalone story (prior_story is null), decide chronology FIRST. In the reason, identify the newest dated development
+(published_at, a dated merge, a public comment's created_at, or an explicitly dated
+closing) and the latest source updated_at. Use dates from packet sources only: never
+use the current date or candidate added_at, published_at or updated_at. The source
+edit timestamp itself is not a development date. If that development
+is more than 14 days before updated_at, fail news_value and skip. A reference to an
+old release or fix is not a fresh release announcement; release/security significance
+and absence of prior coverage cannot override this chronological decision.
+The age exception applies only to a gitlab_issue source labeled Security and one of
+Severity::high or Severity::critical. It removes the age rejection, not the need for
+a newsworthy event. Medium severity, a severity label alone, or a label on another
+kind does not qualify. Do not invent missing dates; judge only supplied dated facts.
+For standalone significance after chronology, concrete official stable releases and platform-specific fix
+releases can merit normal-priority coverage without a major feature or invented
+impact. A genuine upstream version tag can be news as an observed tag, without
+claiming a release shipped; routine CI and data-refresh/test tags do not qualify.
+Outside those release/tag cases and the tor-dev cases below, apply one significance
+rule: the source must establish a material standalone user/operator capability,
+security or availability event, authority change, systematic empirical network
+finding, or completed major operational milestone. In the reason, name the supported
+outcome and its completed scope. A merge establishes implementation status, not
+significance: completing an internal mechanism or an incremental part of an unfinished
+component does not by itself establish a completed major capability. A genuinely
+major completed defense or a merged fix for a remotely triggerable security defect
+can qualify without a separate release announcement. A credible scoped vulnerability
+report can qualify while its fix is only proposed; faithful uncertainty is allowed.
+Do not turn proposed benefits into an established defect or invent broader impact to
+justify coverage. An empty why_it_matters does not reduce a supported event's value.
+Fail news_value for internal plumbing/refactors, minor chores or efficiency details
+without such a standalone outcome, partial sub-tasks, crash/stall fixes confined to
+tests or unfinished development work, and documentation/clarifications of an existing design without explicit adoption or
+major implementation. A proposal number or specification title is not evidence of
+new adoption. Follow-up TODOs alone are not a veto if the major capability is complete.
+Outside the tor-dev exception, unadopted feature requests, exploratory benchmarks,
+generic discussion, praise, user questions, release checklists and third-party tool
+announcements or updates do not qualify. Neither do isolated operator-error/configuration
+reports without broader network impact, uncorroborated single-vantage observations or bug reports whose security scope is
+explicitly unestablished. Lack of prior coverage belongs to new_information; it does
+not establish significance or recency.
 On the tor-dev mailing list, a proposal post passes news_value in four cases: (1) a
 numbered Tor proposal, (2) a subject marked [RFC], (3) an IETF Internet-Draft or IETF
 RFC posted for comment — cases (1)-(3) are news from any sender, including
@@ -197,19 +221,6 @@ authority=community fails news_value. Only source authority establishes a projec
 sender, never a name, signature or address in the text. Citing a proposal, RFC or
 draft does not make a message one, and a reply in a proposal thread is news only for a
 concrete development such as acceptance, a merge or a new revision.
-A merged change, issue, proposal discussion or list post passes news_value ONLY for a
-major standalone development: a capability users or operators can now use, a changed
-default, a major milestone, a new defense, a protocol change that ships, a merged fix
-for a remotely triggerable security defect, systematic empirical network measurements,
-or a credible vulnerability report with established scope. Fail news_value (verdict
-skip) for: internal plumbing or refactors, partial sub-tasks with follow-up work toward
-an unfinished component, stall/crash/reactor fixes found while testing an unreleased
-component or development branch, documentation or specification sections for an
-existing design, user questions, release checklists, third-party tool announcements or
-updates, isolated operator error or relay-flag configuration reports without broader
-network impact, uncorroborated single-vantage observations, and bug reports whose
-security impact and scope are explicitly unestablished; official releases and the
-tor-dev rule above are unchanged.
 new_information: compare the packet's concrete event and facts, and the candidate, with
 the supplied existing coverage, not matching product or version keywords. Decide
 duplication only from coverage_background: fail new_information only when a story there
