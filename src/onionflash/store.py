@@ -740,11 +740,18 @@ class Store:
                 mapped_id = prior_story_id if keep_mapping else None
             else:
                 mapped_id = None
-            self.db.execute(
-                "UPDATE items SET status=?,story_id=?,next_attempt_at=NULL,last_error=? WHERE id=?",
-                ("published" if published else "ignored", mapped_id, skipped, row["id"]),
-            )
-            self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
+            self.db.execute("UPDATE items SET status=?,story_id=?,next_attempt_at=NULL,last_error=? WHERE id=?",
+                            ("published" if published else "ignored", mapped_id, skipped, row["id"]))
+            if locked and self.db.execute("SELECT 1 FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone():
+                from .review_gate import validate_review_state
+                validate_review_state(review_record, "locked", None, prepared)
+                # Unlocking or transferring a held update changes its context,
+                # but must not replenish attempts already spent before the lock.
+                self.db.execute("""UPDATE review_jobs SET stage='locked',record_json=?,approval_key=NULL,updated_at=?
+                                   WHERE item_id=?""", (json.dumps(review_record, ensure_ascii=False, sort_keys=True,
+                                                                  allow_nan=False), observed, row["id"]))
+            else:
+                self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
             decisions.record(self.db, row["id"], code, observed, review=review_record, reason=operator_reason)
         return {"story_id": mapped_id, "status": "locked" if locked and published else "published" if published else "ignored",
                 "analysis_key": analysis_key}

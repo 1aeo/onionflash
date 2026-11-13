@@ -200,7 +200,9 @@ def run_with(monkeypatch, cfg, store, error=None):
     class Replies:
         calls = 0
 
-        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, on_request=None):
+            if on_request is not None:
+                on_request(1)
             url = packet["sources"][0]["url"]
             if url.endswith("/fail"):
                 raise error
@@ -316,7 +318,7 @@ def test_operator_actions_and_rejected_show_history(context):
     with pytest.raises(ValueError):
         rejection.retry_item(store, other["id"], "0" * 64, "A stale hash is refused", LATER)
     entries = logged(store)
-    assert [e["code"] for e in entries[:3]] == ["failed.app.unexpected", "skipped.verification.news_value", "failed.app.unexpected"]
+    assert [e["code"] for e in entries[:3]] == ["failed.app.unexpected", "skipped.review.news_value", "failed.app.unexpected"]
     assert [(e["code"], e["item_id"], e["decided_at"], e["detail"]["reason"], e["detail"]["before_status"]) for e in entries[3:]] == [
         ("operator.retried", failed["id"], LATER, "The grounding rule was fixed", "rejected"),
         ("operator.reconsidered", skipped["id"], LATER, "Worth another look", "ignored"),

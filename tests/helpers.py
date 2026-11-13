@@ -206,6 +206,18 @@ def approved_result(packet, *, update=False, coverage=None):
     return review.validate_review(verdict(update=update), packet, update=update, coverage=coverage)
 
 
+def scripted_completion(reply):
+    """Meter a synthetic completion while retaining the real reply validator."""
+    def complete(self, *args, on_request=None, **kwargs):
+        if on_request is not None:
+            on_request(1)
+        result = reply(*args, **kwargs)
+        if hasattr(on_request, "response_received"):
+            on_request.response_received()
+        return result
+    return complete
+
+
 class CallLog(list):
     def __add__(self, other):
         return len(self) + other if isinstance(other, int) else CallLog(super().__add__(other))
@@ -283,7 +295,9 @@ class ScriptedReviewer:
     def __exit__(self, *args):
         pass
 
-    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False):
+    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False, on_request=None):
+        if on_request is not None:
+            on_request(1)
         self.calls.append((copy.deepcopy(candidate), copy.deepcopy(packet), verification))
         self.coverages.append(copy.deepcopy(coverage))
         self.issues.append(issue)
@@ -322,7 +336,9 @@ class ApprovingReviewer:
     def __exit__(self, *args):
         pass
 
-    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False):
+    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False, on_request=None):
+        if on_request is not None:
+            on_request(1)
         return approved_result(packet, update=update, coverage=coverage)
 
 
@@ -341,10 +357,27 @@ def insert_approval(store, prepared=None, candidate=None, *, key=None, candidate
         created_at = created_at or prepared["observed"]
         last_used_at = last_used_at or created_at
         if record is None:
-            stage = {"stage": "verification", "candidate_hash": candidate_hash, "source_hash": source_hash,
-                     "coverage_hash": prepared["coverage_hash"], "policy_hash": policy, "result": result}
-            record = {"candidate": candidate, "packet": prepared["packet"], "coverage": prepared["coverage"],
-                      "reviews": [stage], "outcome": "skipped" if result.get("verdict") == "skip" else "approved"}
+            context = {"source_hash": source_hash, "coverage_hash": prepared["coverage_hash"],
+                       "binding_hash": binding_hash, "policy_hash": policy}
+            if result["verdict"] == "skip":
+                reviews = [{"stage": "review", "candidate_hash": candidate_hash, "request": 1, "result": result, **context}]
+            else:
+                if is_update:
+                    changes = {key: candidate[key] for key in review.UPDATE_EDITABLE if key != "update"
+                               and candidate[key] != prepared["candidate"][key]}
+                    if candidate["updates"][-1]["text"] != prepared["candidate"]["updates"][-1]["text"]:
+                        changes["update"] = candidate["updates"][-1]["text"]
+                else:
+                    changes = {key: candidate[key] for key in review.EDITABLE if candidate[key] != prepared["candidate"][key]}
+                first = review.validate_review(verdict("revise", repair=changes, update=is_update) if changes else verdict(update=is_update),
+                                               prepared["packet"], update=is_update, coverage=prepared.get("coverage"))
+                reviews = [{"stage": "review", "candidate_hash": digest(prepared["candidate"]), "request": 1, "result": first, **context},
+                           {"stage": "verification", "candidate_hash": candidate_hash, "request": 2, "result": result, **context}]
+            state = review_gate.initial_review_state()
+            state["request_budget"]["reserved"] = len(reviews)
+            record = {"candidate": candidate, "packet": prepared["packet"], "coverage": prepared["coverage"], "reviews": reviews,
+                      "policy_hash": policy, "approval_key": key, **state,
+                      "outcome": "skipped" if result.get("verdict") == "skip" else "approved"}
     result_text = result if isinstance(result, str) else json.dumps(result if result is not None else verdict())
     record_text = record if isinstance(record, str) else json.dumps(record if record is not None else {})
     stamp = created_at or DATE
@@ -398,6 +431,14 @@ def seed_story(store, incoming=None, draft=None, *, key=None, at=DATE, decision=
     if decision != "approve" or not outcome.get("story_id"):
         return outcome
     return next(s for s in store.stories(100) if s["id"] == outcome["story_id"])
+
+
+def seed_source_story(store, incoming, draft=None, *, at=DATE):
+    """Seed a source-shaped account when an association test needs its actual topic."""
+    text = incoming["content"]
+    used = draft or analysis(title=incoming["title"][:120], summary=text[:220] or incoming["title"],
+                             evidence=[text[:80] or incoming["title"]])
+    return seed_story(store, incoming, used, at=at)
 
 
 def seed_legacy(store, incoming=None, result=None, *, at=DATE):

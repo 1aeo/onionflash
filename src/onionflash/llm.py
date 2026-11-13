@@ -144,7 +144,7 @@ class CompletionClient:
     def _fail_retryable(self, message: str) -> AnalysisError:
         return AnalysisError(message, retryable=True)
 
-    def complete(self, prompt: str, payload: dict, schema: dict, name: str) -> dict:
+    def complete(self, prompt: str, payload: dict, schema: dict, name: str, *, on_request=None) -> dict:
         """One fresh request; drafting, review and link checks share transport policy."""
         if not self.llm["base_url"]:
             raise self._fail_retryable("LLM endpoint is not configured")
@@ -172,12 +172,14 @@ class CompletionClient:
         }
         if self.llm["send_chat_template_kwargs"]:
             request["chat_template_kwargs"] = {"enable_thinking": self.llm["enable_thinking"]}
-        return self._complete(request, key)
+        return self._complete(request, key, **({"on_request": on_request} if on_request is not None else {}))
 
-    def _complete(self, request: dict, key: str) -> dict:
+    def _complete(self, request: dict, key: str, *, on_request=None) -> dict:
         """POST one chat completion; only transport failures move on to a fallback."""
         failure = AnalysisError("All LLM endpoints failed", retryable=True)
         for base_url in [self.llm["base_url"], *self.llm["fallback_base_urls"]]:
+            if on_request is not None:
+                on_request(1)  # Reserve durably before any endpoint attempt.
             self.calls += 1
             try:
                 response = self.client.request(
@@ -195,6 +197,8 @@ class CompletionClient:
                 )
                 if isinstance(exc, DeadlineReached):  # refused unsent, as every later endpoint would be
                     self.calls -= 1
+                    if on_request is not None:
+                        on_request(-1)
                     raise failure from None
         else:
             raise failure

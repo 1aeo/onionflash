@@ -11,6 +11,7 @@ jobs resume only when the item's content is unchanged.
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import re
 
@@ -26,6 +27,7 @@ HIGH_SECURITY_SEVERITIES = frozenset({"severity::high", "severity::critical"})
 # The repairs that may follow the first review, a release-label repair request counting as one, each
 # checked by another fresh verification: an item gets at most MAX_VERIFY_REPAIRS + 2 review requests.
 MAX_VERIFY_REPAIRS = 5
+MAX_REVIEW_REQUESTS = MAX_VERIFY_REPAIRS + 2
 # An item from these sources, other than a version tag, that fails only news value is held for the
 # operator, never skipped.
 OFFICIAL_AUTHORITIES = frozenset({"official", "project-sender"})
@@ -63,6 +65,19 @@ def _record_input_hash(record: object) -> str | None:
     return legacy.get("content_hash") if isinstance(legacy, dict) else None
 
 
+def initial_review_state():
+    """Only newly created chains initialize these fields; saved chains require them."""
+    return {"request_budget": {"reserved": 0, "inconsistent_requests": []}, "untrusted_proposals": []}
+
+
+def _carried_requests(record):
+    """A different automatic review target invalidates proof, not spent requests."""
+    ReviewRequests(record)
+    return {"request_budget": copy.deepcopy(record["request_budget"]),
+            "untrusted_proposals": [{**copy.deepcopy(proposal), "disposition": "discarded_context"}
+                                    for proposal in record["untrusted_proposals"]]}
+
+
 def status(store):
     """Read compact stage/cache counts without loading bodies."""
     stages = store.db.execute(
@@ -83,8 +98,8 @@ def reset_review_work(store, item_id):
                            (item_id,)).fetchone()
     if row is None:
         return
-    content_hash = store.db.execute("SELECT content_hash FROM items WHERE id=?", (item_id,)).fetchone()["content_hash"]
-    record = {"schema_version": 1, "writer": {"key": row["writer_key"]}, "input_hash": content_hash, "reviews": []}
+    item = dict(store.db.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone())
+    record = {"schema_version": 1, "writer": {"key": row["writer_key"]}, "input_hash": item["content_hash"], "input_proof": 1, "input_row": item, "reviews": [], **initial_review_state()}
     # A damaged draft is dropped, so the writer drafts again.
     keep = saved_object(row["draft"]) is not None
     store.db.execute("""UPDATE review_jobs SET stage='drafted',draft_json=CASE WHEN ? THEN draft_json END,envelope_json=NULL,
@@ -99,6 +114,9 @@ def _save(store, row, writer_key, policy_hash, stage, draft, prepared, record, o
             (row["id"], row["content_hash"]),
         ).fetchone():
             raise candidate_mod.StaleCandidate("Source item changed before saving review state")
+        if prepared is not None and record.get("input_proof") == 1:
+            # The envelope already retains this source snapshot.
+            record.pop("input_row", None)
         if approval_receipt is not None:
             # Receipt and the unfinished job's pin become durable together.
             store.db.execute("""INSERT OR REPLACE INTO review_approvals
@@ -382,13 +400,341 @@ def next_step(reviews, candidate, prepared):
     return "verify", repaired
 
 
-def call_review(reviewer, stage, candidate, prepared) -> dict:
-    """Ask for the review that `stage` names and return the chain entry that records its reply."""
-    extra = {"update": True} if prepared.get("mode") == "update" else {}
+class ReviewRequests:
+    """Reserve endpoint attempts before sending; interruptions never replenish them."""
+
+    def __init__(self, record, persist=lambda: None):
+        self.record, self.persist, self.actual = record, persist, 0
+        if not isinstance(record, dict) or not isinstance(record.get("reviews"), list):
+            raise AnalysisError("Saved review state is damaged", code="app.damaged_job")
+        if "request_budget" not in record or not isinstance(record.get("untrusted_proposals"), list):
+            raise AnalysisError("Saved review ledger is missing", code="app.damaged_job")
+        state = record["request_budget"]
+        if (not isinstance(state, dict) or set(state) != {"reserved", "inconsistent_requests"}
+                or type(state.get("reserved")) is not int
+                or not len(record["reviews"]) <= state["reserved"] <= MAX_REVIEW_REQUESTS
+                or not isinstance(state.get("inconsistent_requests"), list)
+                or any(type(n) is not int or not 1 <= n <= state["reserved"] for n in state["inconsistent_requests"])
+                or state["inconsistent_requests"] != sorted(set(state["inconsistent_requests"]))):
+            raise AnalysisError("Saved review request budget is damaged", code="app.damaged_job")
+        self.state = state
+
+    def callback(self):
+        previous = None
+
+        def count(delta):
+            nonlocal previous
+            if delta == 1:
+                if self.state["reserved"] >= MAX_REVIEW_REQUESTS:
+                    raise review.ReviewLimitReached("Review request budget exhausted")
+                previous = self.state["reserved"]
+                self.state["reserved"] += 1
+            elif delta == -1 and previous is not None:
+                self.state["reserved"] = previous
+                previous = None
+            else:
+                raise ValueError("Invalid review request accounting")
+            self.persist()
+            self.actual += delta
+        return count
+
+
+def _context(prepared, policy):
+    """Bind a proposal to sources, coverage and the current candidate assembly."""
+    source, coverage = digest(prepared["packet"]), digest(prepared.get("coverage"))
+    binding = digest(prepared["binding"]) if "binding" in prepared else digest([prepared.get("mode", "story"), prepared["row"], prepared["payload"]])
+    for key, value in (("source_hash", source), ("coverage_hash", coverage), ("binding_hash", binding)):
+        if key in prepared and prepared[key] != value:
+            raise AnalysisError("Saved proposal binding is damaged", code="app.damaged_job")
+    return {"source_hash": source, "coverage_hash": coverage, "binding_hash": binding, "policy_hash": policy}
+
+
+def pending_proposal(record):
+    return next((proposal for proposal in record.get("untrusted_proposals", [])
+                 if proposal["disposition"] == "pending"), None)
+
+
+def proposal_needs_check(record):
+    """Earlier verified facts cannot clear a later invalid proposal attempt."""
+    active = [p for p in record.get("untrusted_proposals", []) if p["disposition"] != "discarded_context"]
+    latest = max((entry.get("request", 0) for entry in record["reviews"]), default=0)
+    return bool(pending_proposal(record)) or bool(active and latest <= active[-1]["request"])
+
+
+def validate_review_state(record, stage, candidate, prepared, *, allow_cached=True):
+    """Fail closed on damaged bookkeeping before it can reach a cached approval."""
+    budget = ReviewRequests(record).state
+    proposals = record.get("untrusted_proposals", [])
+    dispositions = {"pending", "superseded_unverified", "discarded_context", "unusable", "literal_tag", "labels", "repeated",
+                    "checked_approve", "checked_revise", "checked_hold", "checked_skip"}
+    fields = {"error", "request", "stage", "mode", "candidate_before_hash", "candidate_after_hash", "context", "changed_fields", "repair",
+              "accepted", "disposition"}
+    def hashed(value):
+        return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+    try:
+        if stage == "drafted":
+            if (prepared is not None or record["reviews"] or "candidate" in record
+                    or any(p.get("disposition") != "discarded_context" for p in proposals)):
+                raise ValueError()
+        elif not isinstance(prepared, dict):
+            raise ValueError()
+        if not isinstance(proposals, list) or len(proposals) > MAX_REVIEW_REQUESTS:
+            raise ValueError()
+        for entry in record["reviews"]:
+            if (not isinstance(entry, dict) or entry.get("stage") not in {"review", "verification"}
+                    or not hashed(entry.get("candidate_hash"))):
+                raise ValueError()
+            review.validate_review(entry["result"], prepared["packet"],
+                                   update=prepared.get("mode") == "update", coverage=prepared.get("coverage"))
+        for proposal in proposals:
+            if (not isinstance(proposal, dict) or set(proposal) != fields
+                    or proposal["error"] != review.INCONSISTENT_VERDICT
+                    or type(proposal["request"]) is not int or not 1 <= proposal["request"] <= budget["reserved"]
+                    or proposal["stage"] not in {"review", "verify", "repair"}
+                    or proposal["mode"] not in {"story", "update"}
+                    or not hashed(proposal["candidate_before_hash"])
+                    or (proposal["candidate_after_hash"] is not None and not hashed(proposal["candidate_after_hash"]))
+                    or type(proposal["accepted"]) is not bool or proposal["disposition"] not in dispositions
+                    or not isinstance(proposal["context"], dict)
+                    or set(proposal["context"]) != {"source_hash", "coverage_hash", "binding_hash", "policy_hash"}
+                    or not all(hashed(value) for value in proposal["context"].values())
+                    or not isinstance(proposal["changed_fields"], list)
+                    or proposal["changed_fields"] != sorted(set(proposal["changed_fields"]))
+                    or set(proposal["changed_fields"]) - set(candidate_mod.UPDATE_FIELDS if proposal["mode"] == "update" else review.EDITABLE)):
+                raise ValueError()
+            accepted = proposal["accepted"]
+            if (proposal["repair"] is not None and not isinstance(proposal["repair"], dict)):
+                raise ValueError()
+            if proposal["repair"] is not None:
+                review._repair_fields(proposal["repair"], update=proposal["mode"] == "update")
+            if accepted and (proposal["candidate_after_hash"] is None or not proposal["changed_fields"]):
+                raise ValueError()
+            if accepted and proposal["disposition"] in {"unusable", "literal_tag", "labels", "repeated"}:
+                raise ValueError()
+            if proposal["disposition"] in {"pending", "superseded_unverified"} and not accepted:
+                raise ValueError()
+            if proposal["disposition"].startswith("checked_"):
+                verdict = proposal["disposition"].removeprefix("checked_")
+                if not accepted or not any(entry["stage"] == "verification"
+                        and entry["candidate_hash"] == proposal["candidate_after_hash"]
+                        and type(entry.get("request")) is int and proposal["request"] < entry["request"] <= budget["reserved"]
+                        and entry["result"]["verdict"] == verdict
+                        and all(entry.get(key) == value for key, value in proposal["context"].items())
+                        for entry in record["reviews"]):
+                    raise ValueError()
+        if [p["request"] for p in proposals] != budget["inconsistent_requests"]:
+            raise ValueError()
+        if stage == "drafted":
+            return
+        if stage == "locked":
+            if (not prepared.get("locked") or candidate is not None or prepared.get("candidate") is not None
+                    or record.get("outcome") != "locked" or record["reviews"]
+                    or any(p["disposition"] != "discarded_context" for p in proposals)):
+                raise ValueError()
+            _context(prepared, record["policy_hash"])
+            return
+        waiting = [p for p in proposals if p["disposition"] == "pending"]
+        if len(waiting) > 1:
+            raise ValueError()
+        if waiting:
+            if (stage != "verify" or waiting[0]["candidate_after_hash"] != digest(candidate)
+                    or waiting[0]["context"] != _context(prepared, record["policy_hash"])
+                    or any(entry["candidate_hash"] == waiting[0]["candidate_after_hash"]
+                           and entry.get("request", 0) > waiting[0]["request"] for entry in record["reviews"])):
+                raise ValueError()
+        _validate_candidate_path(record, stage, candidate, prepared, allow_cached=allow_cached)
+    except (ValueError, TypeError, KeyError, AttributeError, review.ReviewError):
+        raise AnalysisError("Saved review proposal state is damaged", code="app.damaged_job") from None
+
+
+def _validate_candidate_path(record, stage, candidate, prepared, *, allow_cached):
+    """Reconstruct the exact edited text; removing a pending flag cannot bless it."""
+    context = _context(prepared, record["policy_hash"])
+    current = prepared.get("candidate", record.get("candidate"))
+    expected_stage, trusted, seen = "review", [], {digest(current)}
+    last_action, last_value = None, None
+    events = [(entry.get("request"), False, entry) for entry in record["reviews"]]
+    events += [(proposal["request"], True, proposal) for proposal in record["untrusted_proposals"]
+               if proposal["disposition"] != "discarded_context"]
+    if (any(type(number) is not int or not 1 <= number <= record["request_budget"]["reserved"] for number, _, _ in events)
+            or len({number for number, _, _ in events}) != len(events)):
+        raise ValueError()
+    for _, proposal, entry in sorted(events, key=lambda value: value[0]):
+        if proposal:
+            if (entry["context"] != context or entry["stage"] != expected_stage
+                    or entry["mode"] != prepared.get("mode", "story") or entry["candidate_before_hash"] != digest(current)):
+                raise ValueError()
+            if entry["candidate_after_hash"] is not None:
+                after = review.apply_repair(current, entry["repair"], update=entry["mode"] == "update")
+                if (digest(after) != entry["candidate_after_hash"]
+                        or entry["changed_fields"] != sorted(key for key in current if after.get(key) != current[key])):
+                    raise ValueError()
+            if entry["accepted"]:
+                if (_literal_tag(prepared) or digest(after) in seen
+                        or not _allowed_proposal(current, after, prepared)):
+                    raise ValueError()
+                current, expected_stage = after, "verify"
+                seen.add(digest(current))
+        else:
+            actual_stage = "repair" if entry.get("issue") == "release_labels" else "verify" if entry["stage"] == "verification" else "review"
+            if (actual_stage != expected_stage or entry["candidate_hash"] != digest(current)
+                    or any(entry.get(key) != value for key, value in context.items())):
+                raise ValueError()
+            trusted.append(entry)
+            action, value = next_step(trusted, current, prepared)
+            last_action, last_value = action, value
+            if action in {"verify", "repair"}:
+                if digest(value) != digest(current) and digest(value) in seen:
+                    expected_stage = "held"
+                else:
+                    current, expected_stage = value, action
+                    seen.add(digest(current))
+            else:
+                expected_stage = {"approve": "approved", "skip": "skipped", "hold": "held", "route": "routed"}[action]
+    if (digest(current) != digest(candidate)
+            or (not allow_cached and digest(record.get("candidate")) != digest(candidate))):
+        raise ValueError()
+    # A zero-call cache hit records its validated proof separately from the
+    # current chain. It does not manufacture current-chain reviewer requests.
+    cached_terminal = False
+    if stage in {"approved", "skipped"} or "approval" in record:
+        key = digest([digest(candidate), context["source_hash"], record["policy_hash"], context["binding_hash"]])
+        if record.get("approval_key") != key:
+            raise ValueError()
+        if "approval" in record:
+            proof = record["approval"]
+            proof_stage = stage
+            if stage == "held" and record.get("hold_code") in review.final_holds(candidate, prepared):
+                proof_stage = "approved"
+            if (not allow_cached or proposal_needs_check(record) or proof_stage not in {"approved", "skipped"}
+                    or record.get("outcome") != stage or not isinstance(proof, dict)
+                    or proof.get("policy_hash") != record["policy_hash"] or proof.get("approval_key") != key
+                    or proof.get("outcome") != proof_stage):
+                raise ValueError()
+            validate_review_state(proof, proof_stage, candidate, prepared, allow_cached=False)
+            cached_terminal = True
+    # A completed approval may now hit a final guard. Its validated receipt
+    # still lets the normal cache path record that hold without a model call.
+    guarded_approval = (stage == "approved" and expected_stage == "held" and last_action == "hold"
+                        and last_value[0] == "final_check")
+    merged_handoff = (stage == "routed" and expected_stage in {"approved", "skipped"}
+                      and record.get("merged_duplicate") == prepared.get("story_id")
+                      and len(trusted) >= 2 and trusted[-1]["stage"] == "verification"
+                      and trusted[0]["result"].get("same_story") == record.get("routed_to")
+                      and trusted[-1]["result"].get("same_story") == record.get("routed_to")
+                      and _can_auto_merge_review(candidate, prepared, trusted[-1]["result"]))
+    if stage == "routed" and last_action == "route" and record.get("routed_to") != last_value:
+        raise ValueError()
+    if (stage != expected_stage and not guarded_approval and not cached_terminal and not merged_handoff
+            and not (stage == "held" and record.get("hold_code") in {"missing_sources", "repeat_hold"})):
+        raise ValueError()
+
+
+def _literal_tag(prepared):
+    return (json.loads(prepared["row"]["payload"]).get("kind") if prepared.get("mode") == "update"
+            else prepared["payload"]["editorial_kind"]) == "tag"
+
+
+def _allowed_proposal(before, after, prepared):
+    update = prepared.get("mode") == "update"
+    limits = review.repair_limits(prepared["packet"], prepared.get("coverage"), update=update)
+    editable = candidate_mod.UPDATE_FIELDS if update else review.EDITABLE
+    if (set(after) != set(before)
+            or any(after[key] != before[key] for key in before if key not in editable)
+            or any(after[field] not in allowed for field, allowed in limits.items())
+            or any(tag not in limits["category"] for tag in after["tags"])):
+        return False
+    if update:
+        old, new = before.get("updates"), after.get("updates")
+        return bool(old and new and len(old) == len(new) and old[:-1] == new[:-1]
+                    and {k: v for k, v in old[-1].items() if k != "text"}
+                    == {k: v for k, v in new[-1].items() if k != "text"})
+    return True
+
+
+def _seen_candidates(record, candidate, prepared):
+    context = _context(prepared, record["policy_hash"])
+    return {digest(candidate), *(entry["candidate_hash"] for entry in record["reviews"]),
+            *(value for proposal in record.get("untrusted_proposals", [])
+              if proposal["context"] == context and proposal["disposition"] != "discarded_context"
+              for value in (proposal["candidate_before_hash"], proposal["candidate_after_hash"]) if value)}
+
+
+def recovery_status(record):
+    """Report protocol failures separately from legitimate final review decisions."""
+    proposals = record.get("untrusted_proposals", [])
+    terminal = record.get("outcome") in {"approved", "skipped", "held", "locked", "routed"}
+    unresolved = bool(proposals) and (proposal_needs_check(record) or not terminal
+        or record.get("hold_code") in {"unusable_repair", "repeated_repair", "repairs_exhausted", "release_labels"})
+    return {"raw_inconsistency_count": len(proposals), "accepted_proposal_count": sum(p["accepted"] for p in proposals),
+            "unresolved_inconsistency": unresolved}
+
+
+def call_review(reviewer, stage, candidate, prepared, *, requests) -> dict:
+    """Return only a genuinely validated reply; an invalid reply remains an exception."""
     result = reviewer.review(candidate, prepared["packet"], coverage=prepared["coverage"], verification=stage == "verify",
-                             issue=review.RELEASE_ISSUE if stage == "repair" else None, **extra)
+                             issue=review.RELEASE_ISSUE if stage == "repair" else None, on_request=requests.callback(),
+                             **({"update": True} if prepared.get("mode") == "update" else {}))
     return {"stage": "verification" if stage == "verify" else "review", **({"issue": "release_labels"} if stage == "repair" else {}),
-            "candidate_hash": digest(candidate), "result": result}
+            "candidate_hash": digest(candidate), "request": requests.state["reserved"], "result": result}
+
+
+def advance_review(reviewer, stage, candidate, prepared, record, requests):
+    """Runtime and evaluation share the same untrusted-proposal transition.
+
+    The first valid fresh verification after an invalid initial reply is the first
+    trusted news decision. Invalid criteria never become a disagreement anchor.
+    """
+    validate_review_state(record, stage, candidate, prepared)
+    seen = _seen_candidates(record, candidate, prepared)
+    waiting = pending_proposal(record)
+    before = requests.actual
+    try:
+        entry = call_review(reviewer, stage, candidate, prepared, requests=requests)
+    except review.InconsistentReview as error:
+        if requests.actual == before:
+            raise
+        event = {"error": review.INCONSISTENT_VERDICT, "request": requests.state["reserved"], "stage": stage,
+                 "mode": prepared.get("mode", "story"),
+                 "candidate_before_hash": digest(candidate), "candidate_after_hash": None,
+                 "context": _context(prepared, record["policy_hash"]), "changed_fields": [],
+                 "repair": None, "accepted": False, "disposition": "unusable"}
+        requests.state["inconsistent_requests"].append(event["request"])
+        record.setdefault("untrusted_proposals", []).append(event)
+        try:
+            if _literal_tag(prepared):
+                event["disposition"] = "literal_tag"
+                raise review.ReviewError("Literal tags cannot use untrusted edits")
+            repaired = review.apply_repair(candidate, error.proposal, update=prepared.get("mode") == "update")
+            event["candidate_after_hash"] = digest(repaired)
+            event["changed_fields"] = sorted(key for key in candidate if repaired.get(key) != candidate[key])
+            event["repair"] = {key: repaired[key] for key in event["changed_fields"] if key != "updates"}
+            if "updates" in event["changed_fields"]:
+                event["repair"]["update"] = repaired["updates"][-1]["text"]
+            if not _allowed_proposal(candidate, repaired, prepared):
+                event["disposition"] = "labels"
+                raise review.ReviewError("Untrusted edit exceeds packet label limits")
+            if event["candidate_after_hash"] in seen:
+                event["disposition"] = "repeated"
+                raise review.ReviewError("Untrusted edit repeats a reviewed candidate")
+        except review.ReviewError:
+            requests.persist()
+            raise error
+        if waiting is not None:
+            waiting["disposition"] = "superseded_unverified"
+        event.update(accepted=True, disposition="pending")
+        # The caller persists this audit, exact candidate and verify stage before
+        # requesting its next step. No invalid reply is appended to reviews.
+        return "verify", repaired
+    if waiting is not None:
+        if entry["stage"] != "verification" or entry["candidate_hash"] != waiting["candidate_after_hash"]:
+            raise AnalysisError("Proposal verification identity changed", code="app.damaged_job")
+        waiting["disposition"] = "checked_" + entry["result"]["verdict"]
+    record["reviews"].append({**entry, **_context(prepared, record["policy_hash"])})
+    action, value = next_step(record["reviews"], candidate, prepared)
+    if action in {"verify", "repair"} and digest(value) != digest(candidate) and digest(value) in seen:
+        return "hold", ("verification" if stage == "verify" else "review", "repeated_repair")
+    return action, value
 
 
 def _verified(reviews) -> bool:
@@ -427,12 +773,13 @@ def _attach_item(store, db, row: dict, draft: dict, writer_key: str, routed_reco
     if updated != 1:
         raise candidate_mod.StaleCandidate("Source item changed before routing")
     store.record_analysis(row, draft, writer_key, observed, review_record=routed_record)
-    db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
+    _save_handoff(store, row, routed_record, observed)
 
 
 def _hold(store, row, draft, writer_key, record, observed, stage, reason):
     """One semantic hold is terminal; only source change/operator retry requeues."""
-    record.update(outcome="held", hold_code=reason, hold_reason=HOLDS[reason], verified_facts=_verified(record["reviews"]))
+
+    record.update(outcome="held", hold_code=reason, hold_reason=HOLDS[reason], verified_facts=not proposal_needs_check(record) and _verified(record["reviews"]))
     with store.db:
         if not store.db.execute("""UPDATE items SET status='rejected',attempts=attempts+1,
             rejections=MAX(rejections,3),next_attempt_at=NULL,last_error=?
@@ -483,7 +830,7 @@ def _try_auto_merge(config, store, pair: tuple[str, str], *, propagate: bool,
             raise ValueError("Duplicate story changed before automatic merge")
 
     if propagate:
-        routed_record = {**record, "outcome": "routed", "routed_to": survivor_id, "merged_duplicate": dup_id}
+        routed_record = {**record, "candidate": record.get("candidate", prepared["candidate"]), "outcome": "routed", "routed_to": survivor_id, "merged_duplicate": dup_id}
         complete = lambda db: _attach_item(
             store, db, prepared["row"], draft, writer_key, routed_record, observed,
             survivor_id, "Attached to survivor story after duplicate merge",
@@ -507,8 +854,18 @@ def _try_auto_merge(config, store, pair: tuple[str, str], *, propagate: bool,
     except ValueError:
         return False
     if propagate:
-        record.update(outcome="routed", routed_to=survivor_id, merged_duplicate=dup_id)
+        record.update(candidate=routed_record["candidate"], outcome="routed", routed_to=survivor_id, merged_duplicate=dup_id)
     return True
+
+
+def _save_handoff(store, row, record, observed):
+    """Keep the exact old proof and budget until the routed item is prepared again.
+
+    The caller owns the transaction that changes the item's association.
+    """
+    if not store.db.execute("""UPDATE review_jobs SET stage='routed',record_json=?,approval_key=NULL,updated_at=?
+                               WHERE item_id=?""", (_json(record), observed, row["id"])).rowcount:
+        raise AnalysisError("Review handoff has no durable job", code="app.damaged_job")
 
 
 def developed_at(item: dict) -> str:
@@ -613,7 +970,16 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
     locked_reuse = (job is not None and existing is not None and is_locked(store.db, existing["id"])
                     and _record_input_hash(saved_object(job["record"])) == row["content_hash"]
                     and saved_object(job["draft"]) is not None)
-    if job is not None and (job["writer_key"] == writer_key or locked_reuse):
+    saved_record = saved_object(job["record"]) if job is not None else None
+    carry = None
+    if (job is not None and job["policy_hash"] == policy
+            and _record_input_hash(saved_record) == row["content_hash"]
+            and (job["writer_key"] != writer_key or job["stage"] == "routed")):
+        saved_prepared = saved_object(job["envelope"])
+        validate_review_state(saved_record, job["stage"],
+                              saved_record.get("candidate", (saved_prepared or {}).get("candidate")), saved_prepared)
+        carry = _carried_requests(saved_record)
+    if job is not None and job["stage"] != "routed" and (job["writer_key"] == writer_key or locked_reuse):
         writer_key = job["writer_key"]
         draft, old, record = (saved_object(job[key]) for key in ("draft", "envelope", "record"))
         # A job whose JSON cannot be read fails the item; reviewing it afresh could pass over its hold.
@@ -623,9 +989,17 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         prepared_at = job["prepared_at"]
     else:
         job, draft, old = None, None, None
-        record = {"schema_version": 1, "writer": None, "input_hash": row["content_hash"], "reviews": []}
+        record = {"schema_version": 1, "writer": None, "input_hash": row["content_hash"], "input_proof": 1, "input_row": row, "reviews": [], **initial_review_state()}
+        if carry is not None:
+            record.update(carry)
         prepared_at = observed
     try:
+        if job is not None and job["policy_hash"] == policy:
+            if job["stage"] != "drafted" and record.get("policy_hash") != policy:
+                raise AnalysisError("Saved review policy is damaged", code="app.damaged_job")
+            if job["stage"] in {"approved", "skipped"} and job["approval_key"] != record.get("approval_key"):
+                raise AnalysisError("Saved approval key is damaged", code="app.damaged_job")
+            validate_review_state(record, job["stage"], record.get("candidate", (old or {}).get("candidate")), old)
         if draft is None:
             if not allow_network and item_payload["kind"] != "tag":
                 return {**report, "status": "deferred"}
@@ -638,10 +1012,15 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         prepared = store.prepare_candidate(row, draft, prepared_at)
         same = old is not None and job["policy_hash"] == policy and _identity(old) == _identity(prepared)
         stage = job["stage"] if same else "review"
-        fresh = {"schema_version": 1, "writer": record["writer"], "input_hash": row["content_hash"], "reviews": [], "policy_hash": policy,
+        fresh = {"schema_version": 1, "writer": record["writer"], "input_hash": row["content_hash"], "input_proof": 1, "input_row": row, "reviews": [], "policy_hash": policy, **initial_review_state(),
                  "prepared": {key: prepared[key] for key in ("mode", "candidate", "packet", "coverage", "candidate_hash", "source_hash", "coverage_hash", "binding_hash")}}
+        # A coverage change invalidates old reviews, not the request budget of
+        # this source revision and policy. Explicit operator retry starts afresh.
+        if (job is not None and job["policy_hash"] == policy) or carry is not None:
+            fresh.update(_carried_requests(record))
         record = record if same else fresh
         candidate = record.get("candidate", prepared["candidate"])
+        validate_review_state(record, stage, candidate, prepared)
         _save(store, row, writer_key, policy, stage, draft, prepared, record, observed, prepared_at=prepared_at,
               approval_key=job["approval_key"] if same else None)
         if prepared.get("locked"):
@@ -657,12 +1036,15 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             _hold(store, row, draft, writer_key, record, observed, "gate", "repeat_hold")
             return {**report, "status": "held"}
         key = _approval_key(candidate, prepared, policy)
-        cached = store.db.execute("SELECT * FROM review_approvals WHERE key=?", (key,)).fetchone()
+        cached = None if proposal_needs_check(record) else store.db.execute("SELECT * FROM review_approvals WHERE key=?", (key,)).fetchone()
         if cached is not None:
             try:
                 verdict = review.validate_review(json.loads(cached["result_json"]), prepared["packet"],
                                                  update=prepared.get("mode") == "update", coverage=prepared["coverage"])
                 proof = json.loads(cached["review_record_json"])
+                if not isinstance(proof, dict) or proof.get("policy_hash") != policy:
+                    raise AnalysisError("Cached review policy is damaged", code="app.damaged_job")
+                validate_review_state(proof, "approved" if verdict["verdict"] == "approve" else "skipped", candidate, prepared, allow_cached=False)
                 valid = verdict["verdict"] in {"approve", "skip"} and verdict.get("same_story") is None
             except (AnalysisError, ValueError, TypeError, KeyError):
                 valid = False
@@ -683,14 +1065,20 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                 store.db.execute("DELETE FROM review_approvals WHERE key=?", (key,))
         if stage in {"approved", "skipped"}:  # without a usable receipt, review the writer's draft again
             stage, candidate, record = "review", prepared["candidate"], fresh
+        requests = ReviewRequests(record, lambda: _save(store, row, writer_key, policy, stage, draft, prepared,
+                                                        record, observed, prepared_at=prepared_at))
         while True:
             if not allow_network:
                 return {**report, "status": "deferred"}
-            report["review_calls"] += 1
-            record["reviews"].append({**call_review(reviewer, stage, candidate, prepared), "source_hash": prepared["source_hash"],
-                                      "coverage_hash": prepared["coverage_hash"], "policy_hash": policy})
-            action, value = next_step(record["reviews"], candidate, prepared)
+            try:
+                action, value = advance_review(reviewer, stage, candidate, prepared, record, requests)
+            except review.ReviewLimitReached as exc:
+                store.reject(row["id"], str(exc), "failed." + exc.code, observed)
+                raise
+            finally:
+                report["review_calls"] = requests.actual
             if action == "route":
+                record["candidate"] = candidate
                 status_out = _route(store, row, draft, writer_key, record, observed, value, record["reviews"][-1]["stage"])
                 return {**report, "status": status_out}
             if action == "hold":
@@ -845,6 +1233,12 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
         return refuse("Final review held: " + HOLDS["release_labels"], editorial_failures, new_coverage)
     if not editorial_failures:
         return refuse("Only a held news-value dispute can be approved", editorial_failures, new_coverage)
+    try:
+        validate_review_state(record, "held", record.get("candidate", saved_env.get("candidate")), saved_env)
+    except (AnalysisError, ValueError, TypeError, KeyError):
+        return refuse("Saved proposal or review state cannot be read")
+    if proposal_needs_check(record):
+        return refuse("An untrusted proposal still needs a fresh valid review")
     exact_entries = [entry for entry, _ in reviews_of_text]
     approval_hash = digest(["approve-as-reviewed", prepared["binding_hash"], candidate_hash, policy, digest(exact_entries)])
     return {"eligible": True, "reason": None, "hash": approval_hash,

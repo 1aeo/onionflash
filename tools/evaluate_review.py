@@ -17,7 +17,7 @@ from onionflash.analyze import AnalysisError, Analyzer
 from onionflash.config import load_config
 from onionflash.render import prepare_story
 from onionflash.review import EDITABLE, Reviewer, final_holds, policy_hash
-from onionflash.review_gate import call_review, next_step
+from onionflash.review_gate import ReviewRequests, advance_review, initial_review_state, recovery_status
 from onionflash.source_packet import normalize_labels, number_sources
 from onionflash.util import item_cluster
 
@@ -217,7 +217,8 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                 record = {"case": case["id"], "round": iteration, "scope": scope, "expected": case["expected"],
                           **({"expected_same_story": case["expected_same_story"]} if "expected_same_story" in case else {}),
                           "policy_hash": identity, "candidate": case["candidate"], "packet": case["packet"],
-                          "existing_coverage": case.get("existing_coverage")}
+                          "existing_coverage": case.get("existing_coverage"), "reviews": [], **initial_review_state()}
+                requests = ReviewRequests(record)
                 totals["cases"] += 1
                 reviewer.last_decoded = None
                 try:
@@ -251,8 +252,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                                         "payload": json.dumps(item)}}
                     stage, text, record["reviews"] = "review", candidate, []
                     while True:
-                        record["reviews"].append(call_review(reviewer, stage, text, prepared))
-                        action, value = next_step(record["reviews"], text, prepared)
+                        action, value = advance_review(reviewer, stage, text, prepared, record, requests)
                         if action not in {"verify", "repair"}:
                             break
                         stage, text = action, value
@@ -274,7 +274,9 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                     published = action == "approve" or checked
                     if action == "hold":
                         record["hold"] = code = ".".join(("held", *value))
+                        record["hold_code"] = value[1]
                         totals["holds"][code] = totals["holds"].get(code, 0) + 1
+                    record["outcome"] = {"approve": "approved", "skip": "skipped", "hold": "held", "route": "routed"}[action]
                     if checked:
                         record["final_holds"] = final_holds(text, prepared)
                     totals["final_holds"] += checked
@@ -338,6 +340,10 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                     if reviewer.last_decoded is not None:
                         record["decoded_diagnostic"] = reviewer.last_decoded
                     record.setdefault("matched", False)
+                record["review_request_count"] = requests.actual
+                record.update(recovery_status(record))
+                totals["raw_inconsistencies"] = totals.get("raw_inconsistencies", 0) + record["raw_inconsistency_count"]
+                totals["unresolved_inconsistencies"] = totals.get("unresolved_inconsistencies", 0) + int(record["unresolved_inconsistency"])
                 record["seconds"] = round(time.monotonic() - started, 2)
                 encoded = json.dumps(record, ensure_ascii=False, allow_nan=False)
                 credential = os.environ.get(config["llm"]["api_key_env"], "")

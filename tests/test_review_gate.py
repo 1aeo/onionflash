@@ -118,16 +118,17 @@ def test_verification_repairs_are_verified_fresh_and_stop_after_five(tmp_path):
             run(cfg, store, row, Writer(), Reviewer(*repairs[:4], AnalysisError("timeout", retryable=True)))
         assert job(store)["stage"] == "verify"
         writer, checker = Writer(), Reviewer(*repairs[4:])
-        result = run(cfg, store, row, writer, checker)
-        assert result["status"] == "held" and result["writer_calls"] == 0 and result["review_calls"] == 3
-        assert writer.calls == [] and [c[2] for c in checker.calls] == [True, True, True]
-        assert codes(store, row) == ["held.verification.repairs_exhausted"] and store.stories() == []
+        with pytest.raises(review.ReviewLimitReached):
+            run(cfg, store, row, writer, checker)
+        assert writer.calls == [] and [c[2] for c in checker.calls] == [True, True]
+        assert codes(store, row) == ["failed.review.request_limit"] and store.stories() == []
+        assert json.loads(job(store)["record_json"])["request_budget"]["reserved"] == 7
         shown = rejection.show_item(store, row["id"])["final_review"]
-        assert shown["hold_code"] == "repairs_exhausted" and shown["candidate"]["summary"] == "Repair number 5."
+        assert shown["candidate"]["summary"] == "Repair number 5."
         assert shown["base_candidate"]["summary"] == analysis()["summary"]
-        assert [(e["phase"], e["verdict"]) for e in shown["reviews"]] == [("review", "revise")] + [("verification", "revise")] * 6
+        assert [(e["phase"], e["verdict"]) for e in shown["reviews"]] == [("review", "revise")] + [("verification", "revise")] * 5
         assert all(e["failed"] == {"operational_advice": "fail: The source does not support this claim."} for e in shown["reviews"])
-        assert [e["repair"]["summary"] for e in shown["reviews"]] == [f"Repair number {n}." for n in range(7)]
+        assert [e["repair"]["summary"] for e in shown["reviews"]] == [f"Repair number {n}." for n in range(6)]
 
 
 @pytest.mark.parametrize("case", ["hold", "revise-without-repair", "repeated-text", "tag-notice"])
@@ -507,9 +508,13 @@ def test_update_review_repairs_human_lock_and_missing_retained_source(context):
     with pytest.raises(AnalysisError):
         run(cfg, store, row_lock, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
     with store.db:
-        legacy_rec = json.dumps({"schema_version": 1, "writer": {"key": "legacy"},
-                                 "input_row": {"content_hash": row_lock["content_hash"]}, "reviews": []})
-        store.db.execute("UPDATE review_jobs SET record_json=? WHERE item_id=?", (legacy_rec, row_lock["id"]))
+        saved = job(store)
+        legacy = json.loads(saved["record_json"])
+        for field in ("request_budget", "untrusted_proposals", "input_proof", "input_row"):
+            legacy.pop(field, None)
+        legacy["policy_hash"] = "a" * 64
+        store.db.execute("UPDATE review_jobs SET policy_hash=?,record_json=? WHERE item_id=?",
+                         (legacy["policy_hash"], json.dumps(legacy), row_lock["id"]))
     locked_rev = editorial.correct(store.db, story_id, {"why_it_matters": "Operator-reviewed wording."},
                                    reason="Corrected unsupported advice.", expect_hash=editorial.show(store.db, story_id)["hash"], observed=LATER)
     second = run(cfg, store, row_lock, Writer(), Reviewer(), allow_network=False)
@@ -824,9 +829,13 @@ def test_run_report_counts_outcomes_model_calls_and_isolates_invalid_outputs(tmp
     built = []
     monkeypatch.setattr(cli, "Analyzer", lambda *a, **kw: contextlib.nullcontext(
         Writer(lambda inc: analysis(title="\uffff") if inc["url"].endswith("/draft") else analysis())))
-    monkeypatch.setattr(cli, "Reviewer", lambda *a, **kw: contextlib.nullcontext(
-        type("R", (), {"calls": 0, "review": lambda self, cand, pkt, **k: review.validate_review(
-            {} if "/reply" in pkt["sources"][0]["url"] else verdict(), pkt)})()))
+    class Replies:
+        calls = 0
+        def review(self, cand, pkt, *, on_request=None, **kwargs):
+            if on_request is not None:
+                on_request(1)
+            return review.validate_review({} if "/reply" in pkt["sources"][0]["url"] else verdict(), pkt)
+    monkeypatch.setattr(cli, "Reviewer", lambda *a, **kw: contextlib.nullcontext(Replies()))
     monkeypatch.setattr(cli, "build", lambda *a: built.append(True) or {})
     with Store(cfg3["storage"]["database"]) as store:
         for name in ("reply-1", "reply-2", "draft"):
