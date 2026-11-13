@@ -128,9 +128,10 @@ onionflash story unlock --config config.toml --story STORY_ID \
   --expect-hash CURRENT_HASH --reason 'The corrected source can now be followed automatically.'
 ```
 
-Unlocking is explicit and recorded. It does not replay held analyses or rerun the
-model; the next normal source update can change the story. The existing public
-correction notice and revision history remain available after automated updates.
+Unlocking is explicit and recorded. It re-queues items held during the lock at
+their current revision so the next run reviews them as updates without calling a
+model during `unlock`. The existing public correction notice and revision
+history remain available after automated updates.
 
 ## What readers see and what stays private
 

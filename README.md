@@ -225,7 +225,9 @@ fresh verification. See
   already announced release. See the [final checks](docs/FINAL_REVIEW.md#final-checks).
 - Matching release versions/products, identical titled issue bodies, and
   canonical URLs provide conservative duplicate grouping. Semantic similarity
-  alone does not combine unrelated incidents. Original publication dates and
+  alone does not combine unrelated incidents. Follow-ups add short dated updates
+  instead of rewriting a prose story; only a literal tag notice or timeline
+  entry is replaced in place by a richer source. Original publication dates and
   stable story IDs remain intact when stories are updated.
 - Every run checks queued article changes and refreshes the homepage; only
   changed artifact bytes need publication. The public Source availability panel shows only

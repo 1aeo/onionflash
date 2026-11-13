@@ -335,6 +335,19 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
             (story_id, next_revision, action, reason, stamp, current["record"]["payload"],
              _json(current["published"]) if current["published"] is not None else None,
              after_story, _json(public), current["hash"], after_hash))
+        if action == "unlock" and {r[0] for r in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('items','decision_log','review_jobs')")} == {
+                "items", "decision_log", "review_jobs"}:
+            requeued = [r[0] for r in db.execute("""
+                SELECT id FROM items WHERE status='published' AND story_id=?
+                AND EXISTS (SELECT 1 FROM decision_log d
+                    WHERE d.id=(SELECT MAX(id) FROM decision_log WHERE item_id=items.id)
+                    AND d.story_id=? AND d.code='held.gate.story_locked'
+                    AND d.content_hash=items.content_hash)""", (story_id, story_id)).fetchall()]
+            if requeued:
+                marks = ",".join("?" * len(requeued))
+                db.execute(f"UPDATE items SET status='pending',attempts=0,rejections=0,next_attempt_at=NULL,last_error=NULL WHERE id IN ({marks})", requeued)
+                db.execute(f"DELETE FROM review_jobs WHERE item_id IN ({marks})", requeued)
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_render_queue'").fetchone():
             # Like a changed story, an editorial action renders before any rebuild backlog.
             db.execute("INSERT OR REPLACE INTO public_render_queue(rowid,story_id) SELECT IFNULL(MIN(rowid),0)-1,? FROM public_render_queue", (story_id,))

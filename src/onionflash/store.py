@@ -412,10 +412,19 @@ class Store:
                 raise ReviewRequired("Its story is editorially locked")
             if not locked:
                 original = prepared["candidate"]
+                mode = prepared.get("mode", "story")
+                editable_fields = candidate.UPDATE_FIELDS if mode == "update" else candidate.SEMANTIC_FIELDS
                 if not isinstance(approved_candidate, dict) or set(approved_candidate) != set(original):
                     raise ReviewRequired("Approval must identify the complete public candidate")
-                if any(approved_candidate[key] != original[key] for key in original if key not in candidate.SEMANTIC_FIELDS):
+                if any(approved_candidate[key] != original[key] for key in original if key not in editable_fields):
                     raise ReviewRequired("Review cannot change story identity, sources, dates or editorial metadata")
+                if mode == "update":
+                    orig_updates, app_updates = original.get("updates") or [], approved_candidate.get("updates") or []
+                    if (len(app_updates) != len(orig_updates) or not orig_updates
+                            or app_updates[:-1] != orig_updates[:-1]
+                            or app_updates[-1]["at"] != orig_updates[-1]["at"]
+                            or app_updates[-1]["sources"] != orig_updates[-1]["sources"]):
+                        raise ReviewRequired("Update review cannot change earlier updates or the new update's date or citations")
                 normalized = render._prepare_story(approved_candidate, editorial=original.get("editorial"))
                 if normalized != approved_candidate:
                     raise ReviewRequired("The approved candidate must already be normalized")
@@ -442,7 +451,7 @@ class Store:
                             ("policy_hash", policy_hash), ("binding_hash", prepared["binding_hash"]))):
                         raise ReviewRequired("Review decision does not match this candidate and its context")
                     from .review import validate_review
-                    verdict = validate_review(json.loads(receipt["result_json"]), prepared["packet"])
+                    verdict = validate_review(json.loads(receipt["result_json"]), prepared["packet"], update=mode == "update")
                     if verdict["verdict"] != decision:
                         raise ReviewRequired("Final review did not authorize this decision")
                     if review_record is None:
@@ -450,7 +459,7 @@ class Store:
                     self.db.execute("DELETE FROM review_approvals WHERE key=?", (approval_key,))
                 if decision == "approve":
                     payload = json.loads(json.dumps(prepared["payload"]))
-                    payload.update({key: approved_candidate[key] for key in candidate.SEMANTIC_FIELDS})
+                    payload.update({key: approved_candidate[key] for key in editable_fields})
                     new = candidate.existing_story(self.db, row) is None
                     if new:  # Date publication, not the first draft.
                         payload["added_at"] = observed
@@ -461,7 +470,7 @@ class Store:
                     code = decisions.skip_code(review_record, verdict)
             analysis_key = self.record_analysis(row, result, cache_key, observed, review_record=review_record)
             if payload is not None:
-                if payload.get("editorial_item") == row["id"]:
+                if prepared.get("mode", "story") == "story" and payload.get("editorial_item") == row["id"]:
                     payload["editorial_analysis_key"] = analysis_key
                 cursor = self.db.execute("""INSERT INTO stories(id,cluster_key,payload,published_at,updated_at)
                     VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at""",

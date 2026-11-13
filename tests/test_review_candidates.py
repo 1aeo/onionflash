@@ -4,9 +4,9 @@ import json
 
 import pytest
 
-from approval_helpers import approve, finish_reviewed
+from approval_helpers import approve, finish_reviewed, update_analysis
 from onionflash import editorial, render, review, source_packet
-from onionflash.analyze import tag_notice
+from onionflash.analyze import tag_notice, tag_update
 from onionflash.candidate import ReviewRequired
 from onionflash.comments import INPUT_CHARS, _compose
 from onionflash.store import Store
@@ -91,19 +91,21 @@ def test_locked_story_skips_model_prose_but_records_analysis_and_grouping(tmp_pa
         assert store.db.execute("SELECT story_id FROM items WHERE id=?", (row["id"],)).fetchone()[0] == old["id"]
 
 
-def test_a_model_rewrite_keeps_the_dated_updates_an_operator_added(tmp_path):
+def test_a_model_update_keeps_the_dated_updates_an_operator_added(tmp_path):
     update = {"at": LATER, "text": "The operator rotated the keys.", "sources": [{"url": "https://example.org/news/2", "title": "Follow-up"}]}
     with Store(tmp_path / "db") as store:
         old = publish(store)
         for action, arguments in ((editorial.correct, ({"updates": [update]},)), (editorial.unlock, ())):
             action(store.db, old["id"], *arguments, reason="Reviewed the follow-up.",
                    expect_hash=editorial.show(store.db, old["id"])["hash"], observed=LATER)
-        row = pending(store, item(content=BODY + " Updated detail.", updated_at=LATER), LATER)
-        prepared = store.prepare_candidate(row, analysis(summary="A rewritten account."), LATER)
-        assert prepared["candidate"]["updates"] == [update]
-        store.commit_candidate(prepared, prepared["candidate"], "rewrite", LATER, **approve(store, prepared))
-        assert store.stories()[0]["summary"] == "A rewritten account."
-        assert store.stories()[0]["updates"] == [update]
+        later2 = "2026-11-10T12:00:00Z"
+        row = pending(store, item(content=BODY + " Updated detail.", updated_at=later2), later2)
+        prepared = store.prepare_candidate(row, update_analysis(update="Updated detail reported.", evidence=["Updated detail."]), later2)
+        assert prepared["candidate"]["updates"][0] == update
+        assert prepared["candidate"]["updates"][1]["text"] == "Updated detail reported."
+        store.commit_candidate(prepared, prepared["candidate"], "rewrite", later2, **approve(store, prepared))
+        assert store.stories()[0]["summary"] == old["summary"]
+        assert [u["text"] for u in store.stories()[0]["updates"]] == [update["text"], "Updated detail reported."]
 
 
 def test_cold_required_source_holds_and_hot_historical_snapshot_is_labeled(tmp_path):
@@ -114,13 +116,13 @@ def test_cold_required_source_holds_and_hot_historical_snapshot_is_labeled(tmp_p
             source.pop("content")
             store.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps(source), old["editorial_item"]))
         row = pending(store, item(url="https://example.org/other", source_id="other", content=BODY), LATER)
-        prepared = store.prepare_candidate(row, analysis(), LATER)
+        prepared = store.prepare_candidate(row, update_analysis(), LATER)
         assert not prepared["packet"]["missing_sources"]
         historical = next(source for source in prepared["packet"]["sources"] if source["snapshot"] == "historical-analysis")
         assert historical["published_at"] == DATE and historical["updated_at"] == LATER
         with store.db:
             store.db.execute("DELETE FROM analyses WHERE source_item_id=?", (old["editorial_item"],))
-        missing = store.prepare_candidate(row, analysis(), LATER)
+        missing = store.prepare_candidate(row, update_analysis(), LATER)
         assert missing["packet"]["missing_sources"]
         with pytest.raises(ReviewRequired):
             store.commit_candidate(missing, missing["candidate"], "cold", LATER, **approve(store, missing))
@@ -132,7 +134,7 @@ def test_packet_limits_and_required_source_overflow(tmp_path, monkeypatch):
         row = pending(store, item(url="https://example.org/other", source_id="other", content=BODY * 100), LATER)
         limits = {"max_sources": 2, "max_passages": 6, "passage_chars": 100, "max_source_chars": 450}
         monkeypatch.setattr(source_packet, "LIMITS", limits)
-        prepared = store.prepare_candidate(row, analysis(), LATER)
+        prepared = store.prepare_candidate(row, update_analysis(), LATER)
         packet = prepared["packet"]
         assert packet["truncated"] and not packet["missing_sources"]
         assert len(packet["sources"]) == 2
@@ -141,7 +143,7 @@ def test_packet_limits_and_required_source_overflow(tmp_path, monkeypatch):
         assert all(len(p["text"]) <= 100 for p in passages)
         assert len({p["id"] for p in passages}) == len(passages)
         limits["max_sources"] = 1
-        overflow = store.prepare_candidate(row, analysis(), LATER)
+        overflow = store.prepare_candidate(row, update_analysis(), LATER)
         assert overflow["packet"]["missing_sources"]
 
 
@@ -243,7 +245,7 @@ def test_legacy_multi_source_prose_requires_all_evidence_not_guessed_writer(tmp_
                 store.db.execute("DELETE FROM analyses WHERE source_item_id=?", (first["id"],))
         second["content"] += " A further detail in the related report."
         row = pending(store, second, LATER)
-        prepared = store.prepare_candidate(row, analysis(), LATER)
+        prepared = store.prepare_candidate(row, update_analysis(evidence=["A further detail in the related report."]), LATER)
         assert prepared["payload"]["editorial_item"] is None
         assert prepared["candidate"]["summary"] == old["summary"]
         if missing_body:
@@ -255,7 +257,7 @@ def test_legacy_multi_source_prose_requires_all_evidence_not_guessed_writer(tmp_
             assert {source["url"] for source in prepared["packet"]["sources"]} == {first["url"], second["url"]}
             # Resource bounds still hold even when the writer is unidentified.
             monkeypatch.setitem(source_packet.LIMITS, "max_sources", 1)
-            bounded = store.prepare_candidate(row, analysis(), LATER)
+            bounded = store.prepare_candidate(row, update_analysis(evidence=["A further detail in the related report."]), LATER)
             assert bounded["packet"]["missing_sources"]
             receipt = approve(store, prepared)
             store.commit_candidate(prepared, prepared["candidate"], "legacy-reviewed", LATER, **receipt)
@@ -286,7 +288,7 @@ def test_stable_timeline_identity_cannot_label_new_commit_bytes_with_old_citatio
         tag = item(kind="tag", title="tor-0.4.9.16", url="https://example.org/tag/0.4.9.16", content="", updated_at=LATER)
         store.ingest(tag, LATER)
         row = dict(store.db.execute("SELECT * FROM items WHERE id=?", (tag["id"],)).fetchone())
-        prepared = store.prepare_candidate(row, tag_notice(json.loads(row["payload"])), LATER)
+        prepared = store.prepare_candidate(row, tag_update(json.loads(row["payload"]), old), LATER)
         assert old_url in {source["url"] for source in prepared["candidate"]["sources"]}
         assert new_url not in {source["url"] for source in prepared["candidate"]["sources"]}
         packet_text = "".join(p["text"] for source in prepared["packet"]["sources"] for p in source["passages"])
@@ -304,7 +306,7 @@ def test_stable_timeline_identity_cannot_label_new_commit_bytes_with_old_citatio
             # Even an exact historical packet stays bound to the current source state
             # that selected it, so a later update changes the binding but not the packet.
             store.ingest({**moved, "content": "A further timeline correction.", "updated_at": "2026-11-10T12:00:00Z"}, "2026-11-10T12:00:00Z")
-            again = store.prepare_candidate(row, tag_notice(json.loads(row["payload"])), LATER)
+            again = store.prepare_candidate(row, tag_update(json.loads(row["payload"]), old), LATER)
             assert again["source_hash"] == prepared["source_hash"] and again["binding_hash"] != prepared["binding_hash"]
         assert store.stories()[0]["summary"] == old["summary"]
 
@@ -320,14 +322,14 @@ def test_a_cited_source_with_a_damaged_saved_copy_reads_as_its_snapshot_or_missi
                 SELECT 'newer',result,'2026-11-10T12:00:00Z',json_set(source_payload,'$.content','A newer account.'),source_item_id
                 FROM analyses WHERE cache_key=?""", (old["editorial_analysis_key"],))
         row = pending(store, item(url="https://example.org/other", source_id="other", content=BODY), LATER)
-        prepared = store.prepare_candidate(row, analysis(), LATER)
+        prepared = store.prepare_candidate(row, update_analysis(), LATER)
         cited = next(source for source in prepared["packet"]["sources"] if source["url"] == "https://example.org/news/1")
         # A BLOB that is valid UTF-8 JSON still reads as the current copy.
         assert cited["snapshot"] == ("current" if kind == "blob" else "historical-analysis")
         assert cited["passages"][-1]["text"] == BODY and not prepared["packet"]["missing_sources"]
         with store.db:
             store.db.execute("DELETE FROM analyses WHERE source_item_id=?", (old["editorial_item"],))
-        missing = store.prepare_candidate(row, analysis(), LATER)["packet"]["missing_sources"]
+        missing = store.prepare_candidate(row, update_analysis(), LATER)["packet"]["missing_sources"]
         assert missing == ([] if kind == "blob" else ["https://example.org/news/1"])
 
 
@@ -371,12 +373,14 @@ def test_writer_source_keeps_the_text_its_writer_saw_and_short_sources_leave_roo
                               url=url, updated_at=LATER), notes, LATER, source_key="k")
     long_mirror = release("0-long", "A longer mirror of the announcement. " * 130)  # listed before the short ones
     with Store(tmp_path / "db") as store:
-        for name in ["a", "b", "c", "d", "e", "f"]:
-            publish(store, release(name, f"Short mirror {name}."), key=name)
-        publish(store, long_mirror, key="long")
-        row = pending(store, writer, LATER)
-        prepared = store.prepare_candidate(row, analysis(evidence=["The oldest note confirms TROVE-2026-001"]), LATER)
-        assert prepared["payload"]["editorial_item"] == row["id"] and not prepared["packet"]["missing_sources"]
+        publish(store, writer, analysis(evidence=["The oldest note confirms TROVE-2026-001"]), observed=LATER, key="writer")
+        for name in ["a", "b", "c", "d", "e"]:
+            publish(store, release(name, f"Short mirror {name}."),
+                    update_analysis(update=f"Short mirror {name}.", evidence=[f"Short mirror {name}."]), key=name)
+        publish(store, long_mirror, update_analysis(update="Long mirror posted.", evidence=["A longer mirror of the announcement."]), key="long")
+        row = pending(store, release("f", "Short mirror f."), LATER)
+        prepared = store.prepare_candidate(row, update_analysis(update="Short mirror f.", evidence=["Short mirror f."]), LATER)
+        assert prepared["payload"]["editorial_item"] == writer["id"] and not prepared["packet"]["missing_sources"]
         assert url + "#note_1" in {source["url"] for source in prepared["candidate"]["sources"]}
         packet = {source["url"]: source["passages"] for source in prepared["packet"]["sources"]}
         assert len(packet) == 8
@@ -403,9 +407,12 @@ def test_kept_prose_keeps_its_writer_window_and_an_incoming_issue_keeps_every_no
     with Store(tmp_path / "db") as store:
         publish(store, post, analysis(confidence="confirmed", evidence=["The release fixes the reported crash"]), key="post")
         for name in "abcdef":
-            publish(store, release(name, f"Mirror {name} of the announcement. " * 75), key=name)
+            publish(store, release(name, f"Mirror {name} of the announcement. " * 75),
+                    update_analysis(update=f"Mirror {name} posted.", confidence="confirmed",
+                                    evidence=[f"Mirror {name} of the announcement."]), key=name)
         row = pending(store, incoming, LATER)
-        prepared = store.prepare_candidate(row, analysis(evidence=["Release tracking notes"]), LATER)
+        prepared = store.prepare_candidate(row, update_analysis(update="Release tracking notes updated.",
+                                                                confidence="confirmed", evidence=["Release tracking notes"]), LATER)
         assert prepared["payload"]["editorial_item"] != row["id"] and not prepared["packet"]["missing_sources"]
         packet = {source["url"]: source["passages"] for source in prepared["packet"]["sources"]}
         assert len(packet) == 8
@@ -465,3 +472,118 @@ def test_source_labels_are_bounded_packet_metadata_never_passages(tmp_path):
                 store.db.execute("UPDATE items SET payload=? WHERE id=?", (updated_row["payload"], updated_row["id"]))
             expected = ["ValidLabel"] if isinstance(corrupt, list) else []
             assert store.prepare_candidate(updated_row, analysis(), LATER)["packet"]["sources"][0]["labels"] == expected
+
+
+def test_tag_and_timeline_notices_upgrade_in_story_scope_while_prose_uses_update_scope(tmp_path):
+    from onionflash.candidate import StaleCandidate, coverage_background
+
+    with Store(tmp_path / "db") as store:
+        tag = item(kind="tag", title="tor-0.4.9.16", url="https://example.org/tag/0.4.9.16", content="")
+        first = publish(store, tag, tag_notice(tag), key="tag")
+        update_entry = {"at": DATE, "text": "Earlier operator note.", "sources": [{"url": "https://example.org/note", "title": "Note"}]}
+        for action, args in ((editorial.correct, ({"updates": [update_entry]},)), (editorial.unlock, ())):
+            action(store.db, first["id"], *args, reason="Seed update.",
+                   expect_hash=editorial.show(store.db, first["id"])["hash"], observed=LATER)
+        post = item(kind="feed", title="Tor 0.4.9.16 released", url="https://example.org/post/0.4.9.16",
+                    content="Tor 0.4.9.16 was released with directory fixes.", updated_at=LATER)
+        row = pending(store, post, LATER)
+        with pytest.raises(StaleCandidate):
+            store.prepare_candidate(row, update_analysis(evidence=["Tor 0.4.9.16 was released"]), LATER)
+        upgraded = store.prepare_candidate(row, analysis(title="Tor 0.4.9.16 released", state="released",
+                                                         evidence=["Tor 0.4.9.16 was released"]), LATER)
+        assert upgraded["mode"] == "story" and upgraded["story_id"] == first["id"]
+        assert upgraded["candidate"]["updates"] == [update_entry]
+        store.commit_candidate(upgraded, upgraded["candidate"], "upgraded", LATER, **approve(store, upgraded))
+
+        # Once upgraded to a prose story, a subsequent source must use update scope, and commit guards immutable fields.
+        later2 = "2026-11-10T12:00:00Z"
+        followup = pending(store, item(kind="feed", title="Tor 0.4.9.16 released", url="https://example.org/mirror/0.4.9.16",
+                                       content="Mirror reports package availability.", updated_at=later2), later2)
+        with pytest.raises(StaleCandidate):
+            store.prepare_candidate(followup, analysis(evidence=["Mirror reports package availability."]), later2)
+        upd = store.prepare_candidate(followup, update_analysis(update="Mirror reports package availability.",
+                                                                state="released", evidence=["Mirror reports package availability."]), later2)
+        assert upd["mode"] == "update" and upd["binding"]["mode"] == "update"
+        for tampered in (
+            {**upd["candidate"], "title": "Tampered title"},
+            {**upd["candidate"], "summary": "Tampered summary"},
+            {**upd["candidate"], "updates": [upd["candidate"]["updates"][-1]]},
+            {**upd["candidate"], "updates": [upd["candidate"]["updates"][0], {**upd["candidate"]["updates"][1], "at": DATE}]},
+            {**upd["candidate"], "updates": [upd["candidate"]["updates"][0], {**upd["candidate"]["updates"][1], "sources": [{"url": "https://example.org/other", "title": "Other"}]}]},
+        ):
+            with pytest.raises(ReviewRequired):
+                store.commit_candidate(upd, tampered, "tampered", later2, **approve(store, upd, tampered))
+
+        store.commit_candidate(upd, upd["candidate"], "valid-update", later2, **approve(store, upd))
+        bg = coverage_background(store.db, None)
+        assert bg["recent"][0]["latest_update"] == "Mirror reports package availability."
+        prior_row = dict(store.db.execute("SELECT * FROM stories WHERE id=?", (first["id"],)).fetchone())
+        assert len(coverage_background(store.db, prior_row)["prior_story"]["updates"]) == 2
+
+        # A prose story whose state happens to be "tagged" is not a literal tag notice and must still use update scope.
+        later3 = "2026-11-11T12:00:00Z"
+        later4 = "2026-11-12T12:00:00Z"
+        tagged_prose = publish(store, item(kind="feed", title="Tor 0.4.9.17 released", url="https://example.org/post/0.4.9.17",
+                                           content="Upstream tagged Tor 0.4.9.17 ahead of packaging.", published_at=later3, updated_at=later3),
+                               analysis(title="Tor 0.4.9.17 tagged ahead of packaging", state="tagged",
+                                        evidence=["Upstream tagged Tor 0.4.9.17 ahead of packaging."]), observed=later3, key="tagged-prose")
+        prose_followup = pending(store, item(kind="feed", title="Tor 0.4.9.17 released", url="https://example.org/release/0.4.9.17",
+                                             content="Tor 0.4.9.17 packages are now available.", published_at=later4, updated_at=later4),
+                                 later4)
+        with pytest.raises(StaleCandidate):
+            store.prepare_candidate(prose_followup, analysis(state="released", evidence=["Tor 0.4.9.17 packages are now available."]), later4)
+        prose_upd = store.prepare_candidate(prose_followup, update_analysis(update="Tor 0.4.9.17 packages are now available.",
+                                                                            state="released", evidence=["Tor 0.4.9.17 packages are now available."]), later4)
+        assert prose_upd["mode"] == "update" and prose_upd["story_id"] == tagged_prose["id"]
+
+
+def test_closed_issue_update_cites_parent_issue_and_named_short_closing_note(tmp_path):
+    url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41499"
+    opened = item(kind="gitlab_issue", title="dirauth: Remove retired authority from list", url=url,
+                  content=BODY, upstream_state="opened", published_at=DATE, updated_at=DATE)
+    user_at = "2026-11-09T01:00:00Z"
+    done_at = "2026-11-10T14:00:00Z"
+    closed_at = "2026-11-10T14:05:00Z"
+    notes = [
+        {"id": "gid://gitlab/Note/3", "url": f"{url}#note_3", "title": "Public comment by @maintainer",
+         "author": "maintainer", "created_at": done_at, "body": "Done."},
+        {"id": "gid://gitlab/Note/2", "url": f"{url}#note_2", "title": "Public comment by @maint",
+         "author": "maint", "created_at": user_at, "body": "Ok."},
+        {"id": "gid://gitlab/Note/1", "url": f"{url}#note_1", "title": "Public comment by @reader",
+         "author": "reader", "created_at": user_at, "body": "Thank you for tracking when updated keys become available."},
+    ]
+    closed = _compose({**opened, "upstream_state": "closed", "updated_at": closed_at}, notes, closed_at, source_key="k1")
+    with Store(tmp_path / "db") as store:
+        first = publish(store, opened, analysis(state="developing", evidence=["requests a source-code change"]), key="opened")
+        row = pending(store, closed, closed_at)
+        prepared = store.prepare_candidate(
+            row,
+            update_analysis(
+                update='maintainer commented "Done." and closed the issue.',
+                state="resolved",
+                evidence=["Thank you for tracking when updated keys become available."],
+            ),
+            closed_at,
+        )
+        assert prepared["mode"] == "update" and prepared["story_id"] == first["id"]
+        entry = prepared["candidate"]["updates"][-1]
+        assert entry["at"] == closed_at
+        assert entry["sources"] == [
+            {"url": url, "title": opened["title"]},
+            {"url": f"{url}#note_1", "title": "Public comment by @reader"},
+            {"url": f"{url}#note_3", "title": "Public comment by @maintainer"},
+        ]
+        # Prefix author names (@maint vs @maintainer) and unnamed short notes must never be cited.
+        only_closing = store.prepare_candidate(
+            row,
+            update_analysis(
+                update='maintainer commented "Done." and closed the issue.',
+                state="resolved",
+                evidence=["requests a source-code change"],
+            ),
+            closed_at,
+        )["candidate"]["updates"][-1]
+        assert only_closing["sources"] == [
+            {"url": url, "title": opened["title"]},
+            {"url": f"{url}#note_3", "title": "Public comment by @maintainer"},
+        ]

@@ -420,3 +420,85 @@ def test_policy_hash_binds_effective_model_and_endpoint_but_not_credentials(monk
         assert review.policy_hash(changed) != initial
     monkeypatch.setattr(review, "RELEASE_ISSUE", "changed")
     assert review.policy_hash(cfg) != initial
+    monkeypatch.undo()
+    assert review.policy_hash(cfg) == initial
+    for attr in ("UPDATE_SYSTEM_PROMPT", "UPDATE_VERIFY_PROMPT"):
+        with monkeypatch.context() as mp:
+            mp.setattr(review, attr, "changed")
+            assert review.policy_hash(cfg) != initial
+
+
+def test_update_scope_schema_wire_payload_repairs_and_guards(monkeypatch):
+    prior = candidate(
+        title="Relay compromise confirmed by maintainer",
+        summary="The release fixed the issue before this follow-up.",
+        updates=[
+            {"at": "2026-11-08T14:00:00Z", "text": "Maintainers opened a tracking ticket.",
+             "sources": [{"url": STORY["sources"][0]["url"], "title": "Release notes"}]},
+            {"at": "2026-11-08T16:00:00Z", "text": "Operators reported new telemetry.",
+             "sources": [{"url": "https://gitlab.torproject.org/tpo/core/tor/-/issues/41400", "title": "Issue"}]},
+        ],
+    )
+    coverage = {
+        "prior_story": {key: prior[key] for key in ("id", "title", "summary", "why_it_matters", "category",
+                                                    "priority", "confidence", "state", "products", "tags",
+                                                    "published_at", "updated_at", "added_at", "updates")},
+        "recent": [],
+        "truncated": False,
+    }
+    pkt = {
+        "sources": [
+            packet()["sources"][0],
+            {"id": "S2", "url": "https://gitlab.torproject.org/tpo/core/tor/-/issues/41400", "title": "Issue",
+             "kind": "gitlab_issue", "authority": "development", "product": "tor", "upstream_state": "opened",
+             "published_at": STORY["published_at"], "updated_at": STORY["updated_at"], "labels": [],
+             "passages": [{"id": "S2:P1", "text": "Operators reported new telemetry."}]},
+        ],
+        "missing_sources": [],
+        "truncated": False,
+    }
+    checker = reviewer(
+        monkeypatch,
+        completion(verdict("revise", repair={"update": "Operators reported verified telemetry.", "state": "developing"}, update=True)),
+        completion(verdict(update=True)),
+    )
+    res = checker.review(prior, pkt, coverage=coverage, update=True)
+    assert res["repair"] == {"update": "Operators reported verified telemetry.", "state": "developing"}
+    _, body = checker.client.requests[0]
+    assert body["messages"][0]["content"] == review.UPDATE_SYSTEM_PROMPT
+    repair_props = body["response_format"]["json_schema"]["schema"]["properties"]["repair"]["anyOf"][1]["properties"]
+    assert tuple(repair_props) == review.UPDATE_EDITABLE
+    sent = json.loads(body["messages"][1]["content"])
+    assert sent["review_scope"] == "latest_update"
+    assert set(sent["coverage_background"]["prior_story"]) == {"id", "state", "confidence", "updated_at"}
+
+    repaired = review.apply_repair(prior, res["repair"], update=True)
+    assert checker.review(repaired, pkt, coverage=coverage, verification=True, update=True)["verdict"] == "approve"
+    assert checker.client.requests[1][1]["messages"][0]["content"] == review.UPDATE_VERIFY_PROMPT
+    assert repaired["title"] == prior["title"] and repaired["summary"] == prior["summary"]
+    assert repaired["updates"][0] == prior["updates"][0]
+    assert repaired["updates"][1] == {**prior["updates"][1], "text": "Operators reported verified telemetry."}
+    assert repaired["state"] == "developing"
+
+    with pytest.raises(review.ReviewError):
+        review.apply_repair(prior, {"title": "Forbidden headline edit"}, update=True)
+    with pytest.raises(review.ReviewError):
+        review.apply_repair(prior, {"update": "Truncated mid-word fragment"}, update=True)
+    with pytest.raises(review.ReviewError):
+        review.apply_repair(prior, {"update": "Forbidden in story scope."}, update=False)
+
+    # In update scope, final_holds ignores inherited compromise_headline/completed_action on prior prose,
+    # and checks completed_action and unhedged compromise claims on updates[-1].
+    assert review.final_holds(repaired, {"mode": "update", "packet": pkt}) == []
+    bad_update = review.apply_repair(prior, {"update": "Maintainers fixed the issue in S2."}, update=True)
+    assert "completed_action" in review.final_holds(bad_update, {"mode": "update", "packet": pkt})
+    hedged_pkt = {**pkt, "sources": [{**pkt["sources"][0], "passages": [{"id": "S1:P1", "text": "A plausibly compromised authority went offline."}]}, pkt["sources"][1]]}
+    unhedged_upd = review.apply_repair(prior, {"update": "The compromised authority remained offline."}, update=True)
+    assert "compromise_headline" in review.final_holds(unhedged_upd, {"mode": "update", "packet": hedged_pkt})
+
+    confirmed_prior = {**prior, "confidence": "confirmed"}
+    confirmed_cov = {**coverage, "prior_story": {**coverage["prior_story"], "confidence": "confirmed"}}
+    confirmed_checker = reviewer(monkeypatch, completion(verdict(update=True)))
+    confirmed_checker.review(confirmed_prior, pkt, coverage=confirmed_cov, update=True)
+    confirmed_props = confirmed_checker.client.requests[0][1]["response_format"]["json_schema"]["schema"]["properties"]["repair"]["anyOf"][1]["properties"]
+    assert confirmed_props["confidence"]["anyOf"][0]["enum"] == ["confirmed"]

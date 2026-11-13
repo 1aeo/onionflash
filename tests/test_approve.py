@@ -8,7 +8,7 @@ import sqlite3
 
 import pytest
 
-from approval_helpers import approve as seed_receipt, finish_reviewed, verdict
+from approval_helpers import approve as seed_receipt, finish_reviewed, update_analysis, verdict
 from onionflash import cli, decisions, editorial, rejection, review, review_gate
 from onionflash.analyze import AnalysisError, tag_notice
 from onionflash.candidate import ReviewRequired, StaleCandidate
@@ -565,14 +565,15 @@ def test_later_source_change_reviews_normally_and_clears_held_updates_summary(tm
         editorial.unlock(store.db, story_id, reason="Resume updates", expect_hash=locked["hash"])
         rev3 = item(content="Third upstream revision disputed on news value. " * 4, updated_at="2026-11-10T14:00:00Z")
         assert store.ingest(rev3, "2026-11-10T14:00:00Z") is True
-        writer3 = Writer(analysis(title="Third revision headline", evidence=["Third upstream revision disputed on news value."]))
-        reviewer3 = Reviewer(verdict(), verdict("hold", criterion="news_value"))
+        writer3 = Writer(update_analysis(update="Third revision update.", evidence=["Third upstream revision disputed on news value."]))
+        reviewer3 = Reviewer(verdict(update=True), verdict("hold", criterion="news_value", update=True))
         assert run(cfg, store, store.pending(1, "2026-11-10T14:05:00Z")[0], writer3, reviewer3)["status"] == "held"
         assert len(writer3.calls) == 1 and len(reviewer3.calls) == 2
 
         upd_hash = rejection.show_item(store, row["id"], config=cfg)["final_review"]["approval"]["hash"]
         rejection.approve_item(cfg, store, row["id"], upd_hash, "Approve follow-up", observed=AFTER_SHOW)
-        assert store.stories()[0]["title"] == "Third revision headline"
+        assert store.stories()[0]["title"] == "Operator reports possible compromise"
+        assert store.stories()[0]["updates"][-1]["text"] == "Third revision update."
         assert decisions.summary(store.db, DATE)["awaiting_operator"]["held_updates"] == []
 
 

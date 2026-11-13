@@ -151,12 +151,13 @@ def next_step(reviews, candidate, prepared):
         return ("verify" if stage == "review" else "approve"), candidate
     if verdict != "revise" or (later and failed & review.EDITORIAL_CRITERIA and not disputed):
         return "hold", (stage, "release_labels" if latest.get("issue") else "model_hold")
-    if prepared["payload"]["editorial_kind"] == "tag":
+    is_update = prepared.get("mode") == "update"
+    if (item.get("kind") == "tag") if is_update else (prepared["payload"]["editorial_kind"] == "tag"):
         return "hold", (stage, "tag_repair")
     if len(reviews) > MAX_VERIFY_REPAIRS + 1:
         return "hold", (stage, "repairs_exhausted")
     try:
-        repaired = review.apply_repair(candidate, result["repair"])
+        repaired = review.apply_repair(candidate, result["repair"], update=is_update)
     except review.ReviewError:
         # After a disputed official item's first review, the unchanged text goes to its fresh verification.
         return ("verify", candidate) if disputed and not later else ("hold", (stage, "unusable_repair"))
@@ -169,8 +170,9 @@ def next_step(reviews, candidate, prepared):
 
 def call_review(reviewer, stage, candidate, prepared) -> dict:
     """Ask for the review that `stage` names and return the chain entry that records its reply."""
+    extra = {"update": True} if prepared.get("mode") == "update" else {}
     result = reviewer.review(candidate, prepared["packet"], coverage=prepared["coverage"], verification=stage == "verify",
-                             issue=review.RELEASE_ISSUE if stage == "repair" else None)
+                             issue=review.RELEASE_ISSUE if stage == "repair" else None, **extra)
     return {"stage": "verification" if stage == "verify" else "review", **({"issue": "release_labels"} if stage == "repair" else {}),
             "candidate_hash": digest(candidate), "result": result}
 
@@ -258,14 +260,14 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
     marks the item rejected immediately.
     """
     from .candidate import ReviewRequired, StaleCandidate
-    from .editorial import RetiredStory, retired
+    from .editorial import RetiredStory, is_locked, retired
 
     observed = observed or now_iso()
     policy = review.policy_hash(config)
-    writer_key = cache_key(row, config["llm"])
     report = {"status": "pending", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
     try:
-        if candidate_mod.existing_story(store.db, row) is None and retired(
+        existing = candidate_mod.existing_story(store.db, row)
+        if existing is None and retired(
                 store.db, story_id=digest(row["cluster_key"])[:24], cluster_key=row["cluster_key"]) is not None:
             raise RetiredStory("Story is retired")
     except RetiredStory:
@@ -277,13 +279,30 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
             decisions.record(store.db, row["id"], "skipped.gate.retired_story", observed)
         return {**report, "status": "ignored"}
-    skipped = _not_recent(config, store, row, json.loads(row["payload"]), observed)  # needs no network
+    item_payload = json.loads(row["payload"])
+    skipped = _not_recent(config, store, row, item_payload, observed)  # needs no network
     if skipped:
         return {**report, "status": skipped}
+    own_state, writer_item = candidate_mod.own_update_input(store.db, row, item_payload)
+    if own_state == "skip":
+        with store.db:
+            if not store.db.execute("""UPDATE items SET status='ignored',next_attempt_at=NULL,
+                    last_error='No new content after story update' WHERE id=? AND content_hash=? AND status='pending'""",
+                    (row["id"], row["content_hash"])).rowcount:
+                return {**report, "status": "stale"}
+            store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
+            decisions.record(store.db, row["id"], "skipped.gate.no_new_content", observed)
+        return {**report, "status": "ignored"}
+    prior = candidate_mod.update_target(store.db, row)
+    writer_key = cache_key(row, config["llm"], prior)
     job = store.db.execute("""SELECT writer_key,policy_hash,stage,approval_key,prepared_at,CAST(draft_json AS BLOB) AS draft,
         CAST(envelope_json AS BLOB) AS envelope,CAST(record_json AS BLOB) AS record FROM review_jobs WHERE item_id=?""",
         (row["id"],)).fetchone()
-    if job is not None and job["writer_key"] == writer_key:
+    locked_reuse = (job is not None and existing is not None and is_locked(store.db, existing["id"])
+                    and (saved_object(job["record"]) or {}).get("input_row", {}).get("content_hash") == row["content_hash"]
+                    and saved_object(job["draft"]) is not None)
+    if job is not None and (job["writer_key"] == writer_key or locked_reuse):
+        writer_key = job["writer_key"]
         draft, old, record = (saved_object(job[key]) for key in ("draft", "envelope", "record"))
         # A job whose JSON cannot be read fails the item; reviewing it afresh could pass over its hold.
         # The other columns hold only the ASCII keys, stages and times that the application writes.
@@ -295,10 +314,10 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         record = {"schema_version": 1, "writer": None, "input_row": row, "reviews": []}
         prepared_at = observed
     if draft is None:
-        if not allow_network and json.loads(row["payload"])["kind"] != "tag":
+        if not allow_network and item_payload["kind"] != "tag":
             return {**report, "status": "deferred"}
-        report["writer_calls"] += json.loads(row["payload"])["kind"] != "tag"
-        draft = writer.analyze(json.loads(row["payload"]))
+        report["writer_calls"] += item_payload["kind"] != "tag"
+        draft = writer.analyze(writer_item) if prior is None else writer.analyze(writer_item, prior=prior)
         record["writer"] = {"key": writer_key}  # The draft itself is saved in the job, then in analyses.
         if getattr(writer, "clears", 0):  # writer validation cleared the draft's impact sentence
             record["writer"]["clears"] = writer.clears  # kept until an operator retry resets the record
@@ -308,7 +327,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         same = old is not None and job["policy_hash"] == policy and _identity(old) == _identity(prepared)
         stage = job["stage"] if same else "review"
         fresh = {"schema_version": 1, "writer": record["writer"], "input_row": row, "reviews": [], "policy_hash": policy,
-                 "prepared": {key: prepared[key] for key in ("candidate", "packet", "coverage", "candidate_hash", "source_hash", "coverage_hash", "binding_hash")}}
+                 "prepared": {key: prepared[key] for key in ("mode", "candidate", "packet", "coverage", "candidate_hash", "source_hash", "coverage_hash", "binding_hash")}}
         record = record if same else fresh
         candidate = record.get("candidate", prepared["candidate"])
         _save(store, row["id"], writer_key, policy, stage, draft, prepared, record, observed, prepared_at=prepared_at,
@@ -329,7 +348,8 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         cached = store.db.execute("SELECT * FROM review_approvals WHERE key=?", (key,)).fetchone()
         if cached is not None:
             try:
-                verdict = review.validate_review(json.loads(cached["result_json"]), prepared["packet"])
+                verdict = review.validate_review(json.loads(cached["result_json"]), prepared["packet"],
+                                                 update=prepared.get("mode") == "update")
                 proof = json.loads(cached["review_record_json"])
                 valid = verdict["verdict"] in {"approve", "skip"}
             except (AnalysisError, ValueError, TypeError, KeyError):
@@ -466,12 +486,14 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
             or prepared["source_hash"] != held_prepared.get("source_hash")
             or prepared["source_hash"] != saved_env.get("source_hash")
             or any(prepared["binding"][key] != saved_binding.get(key)
-                   for key in ("prior_story", "lock", "sources", "payload_hash"))):
+                   for key in ("prior_story", "lock", "sources", "payload_hash",
+                               *(["mode"] if "mode" in saved_binding else [])))):
         return refuse("Its story or sources changed since the review; retry it", editorial_failures, new_coverage)
     if any(entry.get("source_hash") != prepared["source_hash"] for entry in reviews):
         return refuse("An earlier review policy or packet reviewed it; retry it", editorial_failures, new_coverage)
+    is_update = prepared.get("mode") == "update"
     try:
-        validated = [review.validate_review(entry["result"], prepared["packet"]) for entry in reviews]
+        validated = [review.validate_review(entry["result"], prepared["packet"], update=is_update) for entry in reviews]
     except (AnalysisError, ValueError, TypeError, KeyError):
         return refuse("Saved review record cannot be read", editorial_failures, new_coverage)
     if any(result["criteria"]["new_information"]["outcome"] != "pass" for result in validated):
@@ -480,8 +502,16 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
     original = prepared["candidate"]
     if not isinstance(candidate, dict) or set(candidate) != set(original):
         return refuse("No fresh verification reviewed this exact text", editorial_failures, new_coverage)
-    if any(candidate[key] != original[key] for key in original if key not in candidate_mod.SEMANTIC_FIELDS):
+    editable_fields = candidate_mod.UPDATE_FIELDS if is_update else candidate_mod.SEMANTIC_FIELDS
+    if any(candidate[key] != original[key] for key in original if key not in editable_fields):
         return refuse("Saved review record cannot be read", editorial_failures, new_coverage)
+    if is_update:
+        orig_updates, cand_updates = original.get("updates") or [], candidate.get("updates") or []
+        if (len(cand_updates) != len(orig_updates) or not orig_updates
+                or cand_updates[:-1] != orig_updates[:-1]
+                or cand_updates[-1]["at"] != orig_updates[-1]["at"]
+                or cand_updates[-1]["sources"] != orig_updates[-1]["sources"]):
+            return refuse("Saved review record cannot be read", editorial_failures, new_coverage)
     try:
         if render._prepare_story(candidate, editorial=original.get("editorial")) != candidate:
             return refuse("Saved review record cannot be read", editorial_failures, new_coverage)

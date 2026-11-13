@@ -5,7 +5,7 @@ import sqlite3
 
 import pytest
 
-from approval_helpers import finish_reviewed, verdict
+from approval_helpers import finish_reviewed, update_analysis, verdict
 from onionflash import candidate, cli, editorial, rejection, review_gate
 from onionflash.analyze import cache_key
 from onionflash.config import DEFAULTS
@@ -262,7 +262,7 @@ def test_merged_alias_resolves_to_live_survivor_or_refuses_missing_survivor(cont
     by_id = dict(store.db.execute("SELECT * FROM items WHERE id=?", (f_row["id"],)).fetchone())
     by_id["payload"] = f_row["payload"]
     assert candidate.existing_story(store.db, by_id)["id"] == survivor["id"]
-    prepared = candidate.prepare(store.db, by_id, analysis(title="Followup"), after(60, DATE))
+    prepared = candidate.prepare(store.db, by_id, update_analysis(update="Followup"), after(60, DATE))
     assert (prepared["story_id"], prepared["cluster_key"]) == (survivor["id"], survivor_cluster)
 
     with store.db:

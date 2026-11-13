@@ -7,23 +7,37 @@ tests script their reviewer replies with `verdict`.
 
 import json
 
-from onionflash import review, review_gate
+from onionflash import candidate as candidate_mod, review, review_gate
+from onionflash.analyze import tag_update
 from onionflash.util import digest
 
 
-def verdict(action="approve", *, repair=None, criterion="operational_advice", ref="S1"):
+def update_analysis(**overrides):
+    draft = {
+        "publish": True,
+        "update": "A material upstream follow-up was posted.",
+        "confidence": "reported",
+        "state": "developing",
+        "evidence": ["The operator reports that old directory-authority keys cannot be trusted"],
+    }
+    draft.update(overrides)
+    return draft
+
+
+def verdict(action="approve", *, repair=None, criterion="operational_advice", ref="S1", update=False):
     """A reviewer reply in which every criterion passes, or `criterion` fails."""
     checks = {name: {"reason": "Supported by the supplied source.", "source_refs": [ref], "outcome": "pass"}
               for name in review.CRITERIA}
     if action != "approve":
         checks[criterion].update(reason="The source does not support this claim.", outcome="fail")
     # A reply names every editable field and leaves the unchanged ones null.
-    wire = None if repair is None else {key: repair.get(key) for key in review.EDITABLE}
+    fields = review.UPDATE_EDITABLE if update else review.EDITABLE
+    wire = None if repair is None else {key: repair.get(key) for key in fields}
     return {"criteria": checks, "verdict": action, "repair": wire}
 
 
-def approved_result(packet):
-    return review.validate_review(verdict(), packet)
+def approved_result(packet, *, update=False):
+    return review.validate_review(verdict(update=update), packet, update=update)
 
 
 class ApprovingReviewer:
@@ -39,14 +53,15 @@ class ApprovingReviewer:
     def __exit__(self, *args):
         pass
 
-    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
-        return approved_result(packet)
+    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False):
+        return approved_result(packet, update=update)
 
 
 def approve(store, prepared, candidate=None, *, policy="test-policy", result=None):
     """Record the receipt the gate saves when review approves this exact candidate."""
     candidate = candidate or prepared["candidate"]
-    result = result or approved_result(prepared["packet"])
+    is_update = prepared.get("mode") == "update"
+    result = result or approved_result(prepared["packet"], update=is_update)
     key = review_gate._approval_key(candidate, prepared, policy)
     stage = {"stage": "verification", "candidate_hash": digest(candidate), "source_hash": prepared["source_hash"],
              "coverage_hash": prepared["coverage_hash"], "policy_hash": policy, "result": result}
@@ -61,7 +76,16 @@ def approve(store, prepared, candidate=None, *, policy="test-policy", result=Non
 
 
 def finish_reviewed(store, row, result, key, observed, *, decision="approve"):
+    if "update" not in result and (prior := candidate_mod.update_target(store.db, row)) is not None:
+        item = json.loads(row["payload"])
+        if item.get("kind") == "tag":
+            result = tag_update(item, prior)
+        else:
+            result = update_analysis(update=(result.get("summary") or result.get("title"))[:300],
+                                     confidence=result["confidence"], state=result["state"],
+                                     evidence=result["evidence"])
     prepared = store.prepare_candidate(row, result, observed)
-    reply = verdict("skip", criterion="news_value") if decision == "skip" else None
+    is_update = prepared.get("mode") == "update"
+    reply = verdict("skip", criterion="news_value", update=is_update) if decision == "skip" else None
     receipt = {} if prepared["locked"] else approve(store, prepared, result=reply)
     return store.commit_candidate(prepared, prepared["candidate"], key, observed, decision=decision, **receipt)

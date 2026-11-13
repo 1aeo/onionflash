@@ -81,6 +81,17 @@ text; labels that the request leaves in place hold the item. This check does not
 infer facts from source text.
 
 Existing issue/release identities allow meaningful updates to the same article.
+Only a literal tag notice or a timeline-written story is replaced in place when
+a richer source arrives (`story` scope). Every follow-up on a prose story runs
+in `update` scope (`review_scope: "latest_update"`): the writer drafts one short
+dated `updates` entry grounded in the new source's unquoted contribution (or
+only in new unquoted comments/edits when the story's own item changes; if
+nothing new remains, the gate skips it as `skipped.gate.no_new_content` without
+a model call). With its dedicated `latest_update` review and verification
+prompts, the reviewer judges only the newest update entry and the story's
+resulting classification labels; `news_value` remains the story's newsworthiness
+while novelty lives in `new_information`, and repairs may change only the new
+entry's text and the classification labels.
 A potentially important follow-up with no established article match can be a
 concise standalone story when it adds a material, supported development. It does
 not change another article's identity or overwrite a protected correction.
@@ -141,10 +152,12 @@ skips are not checked.
   patched, resolved, deployed, disabled, revoked, rotated or shipped only where a
   source uses the same word without a negation or modal just before it, or a
   merged merge request's title names that change ("Remove ..." supports removed
-  and removes). A contraction such as "wasn't" counts as a negation, and a word
-  the story itself marks as requested, planned or not done claims nothing.
+  and removes). In update scope, this check scans only the new update entry
+  against its own cited source (and any merged merge requests in the packet). A
+  contraction such as "wasn't" counts as a negation, and a word the story itself
+  marks as requested, planned or not done claims nothing.
 - When a source hedges a compromise ("plausibly compromised", "may have been
-  hacked"), a headline about the compromise keeps a qualifier.
+  hacked"), a new headline or update entry about the compromise keeps a qualifier.
 
 The writer's request and every review's repair offer only the confidence and
 state labels that the first two checks allow, and a draft outside them is

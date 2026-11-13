@@ -21,10 +21,11 @@ failures), or the operator's reason and the item's previous status and error. It
 never keeps the draft, the full review reply or the source's content. If a saved
 record cannot be read, the row keeps the title and URL, or no detail; logging
 never prevents the outcome.
-Rows of publications, skips and holds also keep `writer_clears` when writer
-validation cleared the draft's impact sentence, so a repeat hold counts the
-clear again. Failure and operator rows do not keep it, and neither do the rows
-of the new review that an operator retry starts with a kept draft.
+Rows of publications, skips and holds also keep `scope` (`story` or `update`),
+and keep `writer_clears` when writer validation cleared the draft's impact
+sentence, so a repeat hold counts the clear again. Failure and operator rows do
+not keep `writer_clears`, and neither do the rows of the new review that an
+operator retry starts with a kept draft.
 
 The log starts empty: decisions made before it existed, or by an older release
 after a rollback, are not in it.
@@ -51,6 +52,7 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `skipped.verification.new_information_and_news_value` | The verification failed both editorial criteria. |
 | `skipped.gate.not_recent` | The item would start a new story, but its newest dated development is more than 14 days older than its collection. No model was asked. |
 | `skipped.gate.retired_story` | The item maps to a retired story identity or cluster key, which is never recreated. No model was asked. |
+| `skipped.gate.no_new_content` | A re-observed item for its own published story adds no new unquoted comment or body text (or re-observes its own tag notice). No model was asked. |
 | `held.gate.missing_sources` | Source material the candidate cites is unavailable. |
 | `held.gate.repeat_hold` | The candidate was held before, for example after a source reverted. |
 | `held.gate.story_locked` | The item updates a story that an editorial correction locked. |
@@ -93,9 +95,10 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `operator.approved` | An operator approved a held candidate whose facts passed fresh verification. |
 
 A held update of a locked story leaves the item `published`: it maps to that
-story and the story's held-update count grows. Unlocking the story does not apply
-the update, so the summary lists the story under `awaiting_operator` until an
-update of it is published after its latest hold.
+story and the story's held-update count grows. Unlocking the story re-queues
+items whose latest decision is `held.gate.story_locked` at their current
+revision; the summary lists the story under `awaiting_operator` until an update
+of it is published after its latest hold.
 
 ## Commands
 

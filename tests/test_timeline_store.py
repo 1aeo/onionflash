@@ -1,6 +1,6 @@
 """Repository revisions must preserve story identity and richer reporting."""
 
-from approval_helpers import finish_reviewed
+from approval_helpers import finish_reviewed, update_analysis
 import copy
 
 import pytest
@@ -23,7 +23,7 @@ def timeline(**changes):
 def finish(store, incoming, result):
     assert store.ingest(incoming, DATE)
     row = dict(store.db.execute("SELECT * FROM items WHERE id=?", (incoming["id"],)).fetchone())
-    finish_reviewed(store, row, result, incoming["id"] + result["summary"], DATE)
+    finish_reviewed(store, row, result, incoming["id"] + result.get("summary", result.get("update", "")), DATE)
     return store.stories(10)[0]
 
 
@@ -62,13 +62,15 @@ def test_timeline_adds_context_without_replacing_existing_release(tmp_path):
         legacy = {k: v for k, v in first.items() if k != "editorial_kind"}
         store.db.execute("UPDATE stories SET payload=? WHERE id=?", (json.dumps(legacy), first["id"]))
         store.db.commit()
-        final = finish(store, context, analysis(summary="Brief timeline context."))
+        final = finish(store, context, update_analysis(update="Brief timeline context.", confidence="confirmed",
+                                                       state="released", evidence=[context["title"]]))
         assert len(store.stories(10)) == 1
         assert final["id"] == first["id"]
         assert final["summary"] == first["summary"]
         assert final["confidence"] == "confirmed"
         assert final["state"] == "released"
         assert len(final["sources"]) == 2
+        assert final["updates"][-1]["text"] == "Brief timeline context."
 
 
 def test_primary_reporting_can_replace_newer_timeline_context(tmp_path):

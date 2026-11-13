@@ -17,7 +17,7 @@ CODES = frozenset({
     "published.new", "published.update",
     *(f"skipped.{stage}.{reason}" for stage in ("review", "verification")
       for reason in ("news_value", "new_information", "new_information_and_news_value")),
-    "skipped.gate.not_recent", "skipped.gate.retired_story",
+    "skipped.gate.not_recent", "skipped.gate.retired_story", "skipped.gate.no_new_content",
     "held.gate.missing_sources", "held.gate.repeat_hold", "held.gate.story_locked",
     *(f"held.{stage}.{reason}" for stage in ("review", "verification")
       for reason in ("model_hold", "tag_repair", "unusable_repair", "repeated_repair", "disagreed_news", "release_labels")),
@@ -82,6 +82,9 @@ def _detail(row, code, review, extra) -> dict:
     writer = review.get("writer") if isinstance(review, dict) else None
     if isinstance(writer, dict) and writer.get("clears") and code.startswith(("published.", "skipped.", "held.")):
         detail["writer_clears"] = writer["clears"]
+    prepared = review.get("prepared") if isinstance(review, dict) else None
+    if isinstance(prepared, dict) and prepared.get("mode") in {"story", "update"}:
+        detail["scope"] = prepared["mode"]
     detail.update((key, value[:300] if isinstance(value, str) else value) for key, value in extra.items() if value is not None)
     return detail
 

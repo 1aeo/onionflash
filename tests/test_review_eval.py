@@ -36,13 +36,13 @@ def corpus():
     return [case for name in module.CASE_FILES for case in module.expand(json.loads((ROOT / "tools" / name).read_text()))]
 
 
-def full(reply, packet):
+def full(reply, packet, *, update=False):
     """A reply validated as the reviewer validates one. Shorthand such as {"verdict": "skip"} becomes a complete
     verdict, in which a skip fails news value and any other refusal operational advice."""
     if "criteria" not in reply:
-        reply = verdict(reply["verdict"], repair=reply.get("repair"),
+        reply = verdict(reply["verdict"], repair=reply.get("repair"), update=update,
                         criterion="news_value" if reply["verdict"] == "skip" else "operational_advice")
-    return validate_review(reply, packet)
+    return validate_review(reply, packet, update=update)
 
 
 def scripted(reply):
@@ -55,8 +55,8 @@ def scripted(reply):
             return self
         def __exit__(self, *args):
             pass
-        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
-            return full(reply(verification), packet)
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False):
+            return full(reply(verification), packet, update=update)
     return Reviewer
 
 
@@ -465,9 +465,9 @@ def test_judged_scoring_counts_catches_and_false_alarms(evaluation, tmp_path, mo
     cases = judged_cases(json.loads((ROOT / "tools/review_cases.json").read_text()))
 
     class Discerning(scripted(None)):
-        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False):
             flawed = "update their configurations" in candidate["why_it_matters"] or candidate["confidence"] == "confirmed"
-            return full({"verdict": "hold" if flawed else "approve"}, packet)
+            return full({"verdict": "hold" if flawed else "approve"}, packet, update=update)
 
     def rows(sentence, badge, stale, clean, rounds=1):
         return {"invented_impact": dict(zip(("ok", "paired"), sentence), cases=rounds, unique=1),
@@ -647,12 +647,12 @@ def test_expected_same_story_scores_matched_missed_wrong_and_false_routes(evalua
                 return self
             def __exit__(self, *args):
                 pass
-            def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
+            def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False):
                 verdict_name, same_story = reply_fn(candidate, verification)
-                base = verdict(verdict_name, criterion="new_information" if verdict_name == "skip" else "operational_advice")
+                base = verdict(verdict_name, update=update, criterion="new_information" if verdict_name == "skip" else "operational_advice")
                 if verdict_name == "skip":
                     base["criteria"]["new_information"]["reason"] = f"Same event as {same_story or target_id}."
-                validated = validate_review(base, packet)
+                validated = validate_review(base, packet, update=update)
                 return {**validated, "same_story": same_story}
         return RoutedReviewer
 

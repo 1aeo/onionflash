@@ -433,3 +433,68 @@ def test_empty_optional_context_is_a_valid_draft(monkeypatch):
     llm = analyzer(monkeypatch, completion(draft))
     assert llm.analyze(item())["why_it_matters"] == ""
     assert len(llm.client.requests) == 1
+
+
+def test_update_mode_sends_prior_context_narrows_schema_and_validates(monkeypatch):
+    from approval_helpers import update_analysis
+    from onionflash.analyze import UPDATE_PROMPT, UPDATE_SCHEMA, cache_key, tag_update
+
+    prior = {
+        "id": "a" * 24,
+        "title": "Distinct prior headline",
+        "summary": "Distinct prior summary that must never enter evidence choices.",
+        "why_it_matters": "Distinct prior consequence.",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": ["tor"],
+        "tags": ["release"],
+        "published_at": DATE,
+        "updated_at": DATE,
+        "added_at": DATE,
+        "sources": [{"url": "https://example.org/release", "title": "Release"}],
+        "updates": [{"at": f"2026-11-08T12:{n:02d}:00Z", "text": f"Update {n}.",
+                     "sources": [{"url": "https://example.org/release", "title": "Release"}]} for n in range(12)],
+    }
+    src_item = item(authority="community", kind="feed")
+    draft = update_analysis(update="Packages for Debian are now published.", confidence="confirmed",
+                            state="released", evidence=[src_item["title"]])
+    llm = analyzer(monkeypatch, completion(draft))
+    assert llm.analyze(src_item, prior=prior) == draft
+    _, body = llm.client.requests[0]
+    assert body["messages"][0]["content"] == UPDATE_PROMPT
+    assert body["response_format"]["json_schema"]["name"] == "onionflash_update"
+    schema = body["response_format"]["json_schema"]["schema"]
+    assert set(schema["properties"]) == {"publish", "update", "confidence", "state", "evidence"}
+    assert schema["properties"]["state"]["enum"] == ["released", "tagged"]
+    assert schema["properties"]["confidence"]["enum"] == ["confirmed"]
+    for choice in schema["properties"]["evidence"]["items"]["enum"]:
+        assert "Distinct prior" not in choice
+    sent = json.loads(body["messages"][1]["content"])
+    assert len(sent["prior_story"]["updates"]) == 10
+    assert sent["prior_story"]["updates"][0]["text"] == "Update 2."
+
+    for bad in (
+        {**draft, "title": "Forbidden"},
+        {**draft, "update": "   "},
+        {**draft, "update": "x" * 301},
+        {**draft, "update": "Truncated mid-word without punctuation"},
+        {**draft, "evidence": ["Distinct prior summary that must never enter evidence choices."]},
+    ):
+        with pytest.raises(AnalysisError):
+            validate_analysis(copy.deepcopy(bad), item(), UPDATE_SCHEMA)
+
+    tag = item(kind="tag", title="tor-0.4.9.16", content="")
+    tag_llm = analyzer(monkeypatch)
+    literal = tag_llm.analyze(tag, prior=prior)
+    assert literal == tag_update(tag, prior)
+    assert literal["update"] == "The upstream feed lists the tag “tor-0.4.9.16”."
+    assert (literal["confidence"], literal["state"]) == ("confirmed", "released")
+    assert tag_llm.client.requests == []
+
+    row = {"content_hash": "h1"}
+    base_key = cache_key(row, DEFAULTS["llm"], prior)
+    assert base_key != cache_key(row, DEFAULTS["llm"])
+    assert base_key != cache_key(row, DEFAULTS["llm"], {**prior, "state": "tagged"})
+    assert base_key != cache_key(row, DEFAULTS["llm"], {**prior, "updates": prior["updates"][:-1]})

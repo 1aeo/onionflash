@@ -7,9 +7,9 @@ import sqlite3
 
 import pytest
 
-from approval_helpers import approve, verdict
+from approval_helpers import approve, update_analysis, verdict
 from onionflash import decisions, editorial, rejection, review, review_gate
-from onionflash.analyze import AnalysisError, cache_key, tag_notice
+from onionflash.analyze import AnalysisError, cache_key, tag_notice, tag_update
 from onionflash.store import Store
 from onionflash.util import digest, item_cluster
 from test_core import DAMAGE, DATE, analysis, config, damaged, item
@@ -20,10 +20,21 @@ LATER = "2026-11-10T12:00:00Z"
 
 class Writer:
     def __init__(self, result=None):
+        self._explicit = result is not None
         self.result, self.calls = result or analysis(), []
 
-    def analyze(self, incoming):
+    def analyze(self, incoming, prior=None):
         self.calls.append(copy.deepcopy(incoming))
+        if prior is not None and "update" not in self.result:
+            if incoming.get("kind") == "tag":
+                return tag_update(incoming, prior)
+            if not self._explicit:
+                return update_analysis(confidence=prior["confidence"], state=prior["state"],
+                                       evidence=self.result["evidence"])
+            return update_analysis(update=(self.result.get("summary") or self.result.get("title"))[:300],
+                                   confidence=self.result.get("confidence", prior["confidence"]),
+                                   state=self.result.get("state", prior["state"]),
+                                   evidence=self.result["evidence"])
         return copy.deepcopy(self.result)
 
 
@@ -38,7 +49,7 @@ class Reviewer:
                 isinstance(responses[0], dict) and responses[0].get("verdict") == "approve"):
             self.responses.append(verdict())
 
-    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
+    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False):
         """Capture exact review inputs and validate or raise the next scripted response."""
         self.calls.append((copy.deepcopy(candidate), copy.deepcopy(packet), verification))
         self.coverages.append(copy.deepcopy(coverage))
@@ -46,7 +57,7 @@ class Reviewer:
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
-        return review.validate_review(response() if callable(response) else copy.deepcopy(response), packet)
+        return review.validate_review(response() if callable(response) else copy.deepcopy(response), packet, update=update)
 
 
 @pytest.fixture
@@ -540,21 +551,28 @@ def test_policy_change_reuses_writer_but_requires_a_new_review(context):
     assert result["writer_calls"] == 0 and result["review_calls"] == 2 and not result["cache_hit"]
 
 
-def test_final_merge_reviews_retained_old_bad_text_and_commits_only_the_verified_repair(context):
+def test_update_review_repairs_only_the_new_entry_and_commits_the_verified_repair(context):
     cfg, store = context
-    wrong = "Operators must update their configurations to exclude the node."
+    prior_why = "The report requests removal of the old directory-authority keys."
     original = item(content=item()["content"] * 3, updated_at="2026-11-09T12:00:00Z")
-    seed_legacy(store, original, analysis(why_it_matters=wrong))
+    seed_legacy(store, original, analysis(why_it_matters=prior_why))
     incoming = item(url="https://example.org/news/mirror", source_id="mirror", content=original["content"])
     row = pending(store, incoming)
-    checker = Reviewer(verdict("revise", repair={"why_it_matters": ""}), verdict())
-    result = run(cfg, store, row, Writer(analysis(why_it_matters="The report concerns old keys.")), checker)
+    checker = Reviewer(
+        verdict("revise", repair={"update": "A second mirror reported the key issue."}, update=True),
+        verdict(update=True),
+    )
+    draft = update_analysis(update="Operators must reconfigure now; a second mirror reported the key issue.")
+    result = run(cfg, store, row, Writer(draft), checker)
     reviewed, evidence, _ = checker.calls[0]
     passages = [p["text"] for source in evidence["sources"] for p in source["passages"]]
-    assert reviewed["why_it_matters"] == wrong and len(evidence["sources"]) == 2
-    # The evidence is collected source text, never the retained generated sentence.
-    assert original["content"] in passages and not any(wrong in text for text in passages)
-    assert result["status"] == "published" and store.stories()[0]["why_it_matters"] == ""
+    assert reviewed["why_it_matters"] == prior_why and len(evidence["sources"]) == 2
+    assert original["content"] in passages and not any(prior_why in text for text in passages)
+    assert result["status"] == "published"
+    story = store.stories()[0]
+    assert story["why_it_matters"] == prior_why
+    assert story["updates"] == [{"at": incoming["updated_at"], "text": "A second mirror reported the key issue.",
+                                 "sources": [{"url": incoming["url"], "title": incoming["title"]}]}]
     assert len(store.stories()) == 1
 
 
@@ -571,17 +589,17 @@ def test_human_lock_during_review_preserves_operator_text(context):
     assert store.stories()[0]["why_it_matters"] == "Operator-reviewed wording."
 
 
-def test_tag_update_still_reviews_the_existing_prose_it_retains(context):
-    """Review and repair inherited prose even when a locally drafted tag triggers the candidate."""
+def test_tag_update_holds_on_repair_and_keeps_prose_on_approval(context):
+    """Hold a repaired literal tag update rather than letting repair invent release prose."""
     cfg, store = context
     original = item(title="Tor 0.4.9.16 released", kind="feed", content="Tor 0.4.9.16 was released with an announced change.")
     seed_legacy(store, original, analysis(title="Tor release announcement", state="tagged"))
     tag = item(url="https://example.org/tags/tor-0.4.9.16", title="tor-0.4.9.16", kind="tag", content="")
     row = pending(store, tag)
-    checker = Reviewer(verdict("revise", repair={"title": "Tor 0.4.9.16 release announcement"}), verdict())
-    result = run(cfg, store, row, Writer(tag_notice(tag)), checker)
-    assert result["review_calls"] == 2 and checker.calls[0][0]["title"] == "Tor release announcement"
-    assert result["status"] == "published" and store.stories()[0]["title"] == "Tor 0.4.9.16 release announcement"
+    checker = Reviewer(verdict("revise", repair={"update": "Tor 0.4.9.16 was released."}, update=True))
+    result = run(cfg, store, row, Writer(), checker)
+    assert result["status"] == "held" and result["writer_calls"] == 0 and result["review_calls"] == 1
+    assert store.stories()[0]["title"] == "Tor release announcement" and "updates" not in store.stories()[0]
 
 
 def test_tag_draft_requires_final_review_and_waits_when_network_is_disabled(context):
@@ -937,3 +955,139 @@ def test_unusable_replies_and_drafts_take_strikes_and_the_run_still_builds(conte
     assert states == {"reply-1": ("pending", 1, "Review response fields do not match schema"),
                       "reply-2": ("pending", 1, "Review response fields do not match schema"),
                       "good": ("published", 0, None)}
+
+
+def test_own_item_newness_skips_unchanged_or_quoted_and_unlock_requeues_locked_updates(context):
+    from onionflash.comments import _compose
+
+    cfg, store = context
+    url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41499"
+    n1 = {"id": "gid://gitlab/Note/1", "url": url + "#note_1", "title": "Public comment by @alice",
+          "author": "alice", "created_at": DATE, "body": "Initial report details for the relay issue."}
+    issue = _compose(item(url=url, updated_at=DATE), [n1], DATE, source_key="k")
+    first_row = pending(store, issue)
+    assert run(cfg, store, first_row, Writer(analysis(evidence=["Initial report details for the relay issue."])),
+               Reviewer(verdict()))["status"] == "published"
+    story_id = store.stories()[0]["id"]
+
+    # A reply containing only >-quoted text after DATE has no new unquoted content -> 0 model calls.
+    n2 = {"id": "gid://gitlab/Note/2", "url": url + "#note_2", "title": "Public comment by @bob",
+          "author": "bob", "created_at": LATER, "body": "> Initial report details for the relay issue.\n> Agreed."}
+    assert store.ingest(_compose(issue, [n1, n2], LATER, source_key="k"), LATER)
+    w_quote, r_quote = Writer(), Reviewer()
+    res_quote = run(cfg, store, store.pending(1, LATER)[0], w_quote, r_quote)
+    assert res_quote == {"status": "ignored", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
+    assert store.db.execute("SELECT code FROM decision_log ORDER BY id DESC LIMIT 1").fetchone()[0] == "skipped.gate.no_new_content"
+
+    # A re-observed tag on its own tag notice also skips with 0 model calls.
+    tag = item(kind="tag", title="tor-0.4.9.99", url="https://example.org/tags/tor-0.4.9.99", content="")
+    store.ingest(tag, DATE)
+    tag_row = next(r for r in store.pending(5, DATE) if r["id"] == tag["id"])
+    assert run(cfg, store, tag_row, Writer(), Reviewer(verdict()))["status"] == "published"
+    assert store.ingest({**tag, "content": "new annotation", "updated_at": LATER}, LATER)
+    tag_row2 = next(r for r in store.pending(5, LATER) if r["id"] == tag["id"])
+    assert run(cfg, store, tag_row2, Writer(), Reviewer()) == {"status": "ignored", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
+
+    # Lock the issue story, hold a genuine new-note update while locked, then unlock -> item is requeued and publishes.
+    shown = editorial.show(store.db, story_id)
+    locked = editorial.correct(store.db, story_id, {"priority": "normal"}, reason="Lower priority.",
+                               expect_hash=shown["hash"], observed=LATER)
+    later2 = "2026-11-10T14:00:00Z"
+    n3 = {"id": "gid://gitlab/Note/3", "url": url + "#note_3", "title": "Public comment by @maint",
+          "author": "maint", "created_at": later2, "body": "Maintainers merged the fix into main."}
+    assert store.ingest(_compose(issue, [n1, n2, n3], later2, source_key="k"), later2)
+    locked_row = next(r for r in store.pending(5, later2) if r["id"] == issue["id"])
+    w_locked = Writer(update_analysis(update="Maintainers merged the fix.", state="merged",
+                                      evidence=["Maintainers merged the fix into main."]))
+    assert run(cfg, store, locked_row, w_locked, Reviewer())["status"] == "locked"
+    # Writer saw only the new unquoted note, with unchanged issue body cleared.
+    assert w_locked.calls[0]["content"] == ""
+    assert [n["url"] for n in w_locked.calls[0]["public_comments"]] == [url + "#note_3"]
+    assert store.pending(5, later2) == []
+
+    editorial.unlock(store.db, story_id, reason="Allow queued updates.", expect_hash=locked["hash"], observed="2026-11-10T15:00:00Z")
+    requeued = [r for r in store.pending(5, "2026-11-10T15:00:00Z") if r["id"] == issue["id"]]
+    assert len(requeued) == 1
+    w_after = Writer(update_analysis(update="Maintainers merged the fix.", state="merged",
+                                     evidence=["Maintainers merged the fix into main."]))
+    assert run(cfg, store, requeued[0], w_after, Reviewer(verdict(update=True)))["status"] == "published"
+    updated_story = next(s for s in store.stories(5) if s["id"] == story_id)
+    assert updated_story["updates"] == [{"at": later2, "text": "Maintainers merged the fix.",
+                                         "sources": [{"url": url + "#note_3", "title": n3["title"]}]}]
+
+    # Cross-item mailing-list replies in update scope strip >-quoted parent text and quote headers;
+    # a pure-quote reply skips with 0 model calls while an unquoted reply strips quoted history for the writer.
+    later3 = "2026-11-10T16:00:00Z"
+    list_base = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/"
+    opener = item(
+        kind="feed",
+        url=list_base + "MSG0/",
+        source_id="msg-0",
+        title="[tor-announce] Tor 0.4.9.15 released",
+        content="Initial report details for the relay issue.",
+        updated_at=DATE,
+    )
+    assert store.ingest(opener, DATE)
+    assert run(cfg, store, store.pending(1, DATE)[0],
+               Writer(analysis(evidence=["Initial report details for the relay issue."])),
+               Reviewer(verdict()))["status"] == "published"
+    pure_quote = item(
+        kind="feed",
+        url=list_base + "MSG1/",
+        source_id="msg-1",
+        title="[tor-relays] Re: Tor 0.4.9.15 released",
+        content="On Wed, Nov 10, 2026 at 09:00 AM, alice via tor-relays wrote:\n\n> Initial report details for the relay issue.\n>> Older nested quote with 53-day-old relay numbers.",
+        updated_at=later3,
+    )
+    assert store.ingest(pure_quote, later3)
+    assert run(cfg, store, store.pending(1, later3)[0], Writer(), Reviewer()) == {
+        "status": "ignored", "writer_calls": 0, "review_calls": 0, "cache_hit": False
+    }
+    assert store.db.execute("SELECT code FROM decision_log ORDER BY id DESC LIMIT 1").fetchone()[0] == "skipped.gate.no_new_content"
+
+    later4 = "2026-11-10T17:00:00Z"
+    reply_with_text = item(
+        kind="feed",
+        url=list_base + "MSG2/",
+        source_id="msg-2",
+        title="[tor-relays] Re: Tor 0.4.9.15 released",
+        content="Operator observed three dropped circuits.\n\nOn Wed, Nov 10, 2026 at 09:00 AM, alice via tor-relays wrote:\n\n> Quoted 53-day-old relay backstory.",
+        updated_at=later4,
+    )
+    assert store.ingest(reply_with_text, later4)
+    w_reply = Writer(update_analysis(update="An operator observed three dropped circuits.", state="developing",
+                                     evidence=["Operator observed three dropped circuits."]))
+    assert run(cfg, store, store.pending(1, later4)[0], w_reply, Reviewer(verdict(update=True)))["status"] == "published"
+    assert w_reply.calls[0]["content"].strip() == "Operator observed three dropped circuits."
+    assert "53-day-old" not in w_reply.calls[0]["content"]
+    assert "wrote:" not in w_reply.calls[0]["content"]
+
+
+def test_pending_update_draft_rewrites_when_another_update_commits_first(context):
+    cfg, store = context
+    original = item(title="Tor 0.4.9.16 released", kind="feed", authority="official",
+                    content="Tor 0.4.9.16 was released with fixes.")
+    seed_legacy(store, original, analysis(title="Tor 0.4.9.16 released", state="released", confidence="confirmed"))
+    m1 = item(title="Tor 0.4.9.16 released", kind="feed", url="https://example.org/m1", source_id="m1",
+              content="Debian packages for Tor 0.4.9.16 are live.", updated_at=LATER)
+    m2 = item(title="Tor 0.4.9.16 released", kind="feed", url="https://example.org/m2", source_id="m2",
+              content="RPM packages for Tor 0.4.9.16 are live.", updated_at="2026-11-10T13:00:00Z")
+    store.ingest(m1, LATER)
+    store.ingest(m2, LATER)
+    rows = {r["url"]: r for r in store.pending(5, LATER)}
+
+    # m1 drafts first and fails transiently in review; then m2 commits an update, changing prior_story.
+    w1 = Writer(update_analysis(update="Debian packages are live.", confidence="confirmed", state="released",
+                                evidence=["Debian packages for Tor 0.4.9.16 are live."]))
+    with pytest.raises(AnalysisError):
+        run(cfg, store, rows["https://example.org/m1"], w1, Reviewer(AnalysisError("timeout", retryable=True)))
+    assert len(w1.calls) == 1
+
+    w2 = Writer(update_analysis(update="RPM packages are live.", confidence="confirmed", state="released",
+                                evidence=["RPM packages for Tor 0.4.9.16 are live."]))
+    assert run(cfg, store, rows["https://example.org/m2"], w2, Reviewer(verdict(update=True)))["status"] == "published"
+
+    # Retrying m1 must call the writer again because cache_key(row, llm, prior) changed when m2 updated prior_story.
+    res = run(cfg, store, rows["https://example.org/m1"], w1, Reviewer(verdict(update=True)))
+    assert res["status"] == "published" and res["writer_calls"] == 1 and len(w1.calls) == 2
+    assert len(store.stories()[0]["updates"]) == 2
