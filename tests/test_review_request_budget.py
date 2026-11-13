@@ -98,7 +98,8 @@ def test_invalid_criteria_stay_outside_reviews_and_proposal_is_persisted_before_
     payloads = [json.loads(req["messages"][1]["content"]) for req in checker.client.requests]
     assert payloads[1]["candidate"]["summary"] == REPAIRED
     assert payloads[1]["packet"] == payloads[0]["packet"]
-    assert set(payloads[1]) == {"candidate", "packet", "coverage_background"}
+    assert set(payloads[1]) == {"candidate", "packet", "coverage_background", "label_bounds"}
+    assert payloads[1]["label_bounds"] == review.label_limits(payloads[1]["packet"]["sources"])
     assert checker.client.requests[1]["messages"][0]["content"] == review.VERIFY_PROMPT
     assert "UNTRUSTED_PREVIOUS_CRITERIA_SENTINEL" not in json.dumps(checker.client.requests)
     audit = saved_audit(store)

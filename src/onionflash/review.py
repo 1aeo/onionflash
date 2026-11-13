@@ -80,6 +80,15 @@ Evaluate every criterion separately; no average score and no majority approval.
 Judge title, summary, why_it_matters and confidence while scoring criteria, because
 verdict and repair follow criteria: any defect you plan to revise, hold or skip MUST
 fail its criterion below before you reach verdict.
+Compare each material claim with its evidence at the same actor, action, lifecycle
+stage and quantified scope. A changed role, wider affected population, stronger
+outcome or proposed action stated as completed fails the relevant criterion; an
+equivalent, appropriately qualified restatement does not fail for different words.
+The application supplies label_bounds as allowed values, not preferred labels.
+A candidate confidence outside those bounds fails uncertainty_attribution; a state
+outside them fails status. Membership is necessary, not proof that the source
+supports the label. Never upgrade a valid weaker confidence merely because a
+stronger value is allowed; all source-support and lifecycle checks still apply.
 source_support: every factual assertion is stated or directly entailed by the
 packet's own words, without outside knowledge. Judge meaning, not identical wording.
 For why_it_matters, compare each claimed consequence or requested reader action with
@@ -114,13 +123,15 @@ preserve each source's scope and timing instead of treating a checkbox as author
 Fail status if the headline or summary states an open issue's requested change as
 already completed (such as removed, fixed or resolved) without a merged MR or release
 proving completion; do not fail status merely because an issue's state is developing.
-uncertainty_attribution: keep plausible/suspected/reported qualifiers in the headline
-and body; a community report or public comment on an official host is not project
-confirmation. Do not turn observations, outages or load into confirmed attacks.
+uncertainty_attribution: keep each qualifier, precondition, prediction and attribution
+with the particular claim it limits, in the headline as well as the body. A hedge
+about another claim or elsewhere in the article does not qualify a stronger claim.
+Equivalent wording that already conveys the source's uncertainty needs no extra
+hedge or identical hedge token. A community report or public comment on an official
+host is not project confirmation. Do not turn observations, outages or load into confirmed attacks.
 Counters, missing responses or a silent mitigation counter do not establish an
 attack, compromise or defense bypass. Include material source-specific maintainer
 disagreement or qualification; do not present a disputed report as settled fact.
-why_it_matters keeps the hedges and scope of the source sentence it restates.
 Reserve confirmed for an official Tor Project announcement or a merged merge request's
 own change; use reported for issues, comments, maintainer statements, list posts and
 community claims.
@@ -228,9 +239,12 @@ The application has already chosen the publication action:
   story. If it merely repeats covered facts, skip. Distinct events can still be news.
 A shared authority name or topic alone does not establish the same event; a
 different release version is a distinct release event.
-Compare lifecycle states explicitly: prior coverage requesting a change does not
-already cover a later merge completing it. Source metadata marking a merge complete
-is material new information even if the description still discusses planned work.
+Before calling an update unchanged, compare its supported propositions with
+prior_story and identify the added or corrected fact, including lifecycle, scope or
+attribution. Prior coverage requesting a change does not cover its later completion,
+and an old event date does not erase a material update. Preserve that fact and its
+source qualification when repairing other wording; do not remove the update while
+polishing the older account.
 Whenever new_information fails (including when an update adds nothing material to
 prior_story), include the matching prior_story or recent story id verbatim in
 new_information's reason.
@@ -519,11 +533,12 @@ class Reviewer(CompletionClient):
             for check in schema["properties"]["criteria"]["properties"].values():
                 check["properties"]["source_refs"]["items"]["enum"] = sorted(refs)
         # A repair offers only the labels this packet allows.
-        for key, allowed in label_limits(packet["sources"]).items():
+        limits = label_limits(packet["sources"])
+        for key, allowed in limits.items():
             schema["properties"]["repair"]["anyOf"][1]["properties"][key]["anyOf"][0]["enum"] = allowed
         # Each call starts with the rubric, exact candidate and bounded context.
         # A prior model response, critique or approval is never part of its history.
-        payload = {"candidate": candidate_public, "packet": packet}
+        payload = {"candidate": candidate_public, "packet": packet, "label_bounds": limits}
         if coverage is not None:
             payload["coverage_background"] = coverage
         if issue is not None:

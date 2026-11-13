@@ -41,7 +41,7 @@ def reviewer(monkeypatch, *responses, settings=None):
     return result
 
 
-def test_review_and_its_fresh_verification_send_only_the_exact_candidate_and_packet(monkeypatch):
+def test_review_and_its_fresh_verification_send_exact_candidate_packet_and_bounds(monkeypatch):
     public = candidate(why_it_matters="Operators must edit their configuration to exclude the compromised node.")
     checker = reviewer(monkeypatch, completion(verdict("revise", repair={"why_it_matters": ""})), completion(verdict()))
     result = checker.review(public, packet())
@@ -52,10 +52,12 @@ def test_review_and_its_fresh_verification_send_only_the_exact_candidate_and_pac
     for check in first["response_format"]["json_schema"]["schema"]["properties"]["criteria"]["properties"].values():
         assert check["properties"]["source_refs"]["items"]["enum"] == sorted(review._packet_refs(packet()))
     assert "enum" not in review.REFS["items"]  # A request cannot contaminate another packet's schema.
-    assert json.loads(first["messages"][1]["content"]) == {"candidate": public, "packet": packet()}
+    assert json.loads(first["messages"][1]["content"]) == {"candidate": public, "packet": packet(),
+                                                       "label_bounds": analyze.label_limits(packet()["sources"])}
     # Verification starts afresh: its own prompt and the repaired text, never the earlier reply.
     assert len(second["messages"]) == 2 and second["messages"][0]["content"] == review.VERIFY_PROMPT
-    assert json.loads(second["messages"][1]["content"]) == {"candidate": repaired, "packet": packet()}
+    assert json.loads(second["messages"][1]["content"]) == {"candidate": repaired, "packet": packet(),
+                                                        "label_bounds": analyze.label_limits(packet()["sources"])}
 
 
 @pytest.mark.parametrize("bad", ["source-ref", "issues", "model-verdict", "failed-criterion", "changed-text", "missing-criterion", "missing-refs", "score", "unknown-verdict"])
@@ -110,6 +112,7 @@ def test_release_labels_on_a_merged_change_are_left_to_the_gate_which_names_the_
     body = checker.client.requests[0][1]
     assert body["messages"][0]["content"] == review.SYSTEM_PROMPT
     assert json.loads(body["messages"][1]["content"]) == {"candidate": public, "packet": packet(),
+                                                          "label_bounds": analyze.label_limits(packet()["sources"]),
                                                           "application_issue": review.RELEASE_ISSUE}
 
 
@@ -208,6 +211,56 @@ def test_repair_schema_offers_only_labels_the_packet_allows(monkeypatch, source,
     assert review.FIELDS["confidence"]["enum"] == analyze.CONFIDENCES  # another packet keeps its own limits
 
 
+@pytest.mark.parametrize("sources, expected_confidence, expected_state, weaker_state", [
+    ([unit("gitlab_issue", "An attributed report", authority="development", state="opened")],
+     ["reported", "suspected", "observed-anomaly"], analyze.STATES, "developing"),
+    ([unit("gitlab_mr", "A completed change", authority="development", state="merged")],
+     analyze.CONFIDENCES, ["merged"], "merged"),
+    ([unit("feed", "An official attributed report", authority="official")],
+     analyze.CONFIDENCES, analyze.STATES, "developing"),
+    ([unit("tag", "An observed version tag", authority="official")],
+     ["reported", "suspected", "observed-anomaly"], analyze.STATES, "tagged"),
+    ([unit("feed", "A proposal for comment", authority="project-sender")],
+     ["reported", "suspected", "observed-anomaly"], analyze.STATES, "developing"),
+    ([unit("gitlab_mr", "A completed change", authority="development", state="merged"),
+      unit("gitlab_issue", "A related open report", authority="development", state="opened")],
+     analyze.CONFIDENCES, analyze.STATES, "developing"),
+])
+def test_review_payload_and_repair_schema_share_bounds_without_upgrading_weaker_labels(
+        monkeypatch, sources, expected_confidence, expected_state, weaker_state):
+    evidence = {"sources": [{**source, "id": f"S{index}",
+                            "passages": [{"id": f"S{index}:P1", **source["passages"][0]}]}
+                           for index, source in enumerate(sources, 1)],
+                "missing_sources": [], "truncated": False}
+    public = candidate(confidence="reported", state=weaker_state, why_it_matters="")
+    before = copy.deepcopy(public)
+    checker = reviewer(monkeypatch, completion(verdict()), completion(verdict()))
+    for verification in (False, True):
+        result = checker.review(public, evidence, verification=verification)
+        assert result["verdict"] == "approve" and result["repair"] is None
+    assert public == before and public["confidence"] == "reported"
+    expected = {"confidence": expected_confidence, "state": expected_state}
+    for _, request in checker.client.requests:
+        sent = json.loads(request["messages"][1]["content"])
+        assert sent == {"candidate": public, "packet": evidence, "label_bounds": expected}
+        repair = request["response_format"]["json_schema"]["schema"]["properties"]["repair"]["anyOf"][1]["properties"]
+        for label in ("confidence", "state"):
+            assert repair[label]["anyOf"][0]["enum"] == sent["label_bounds"][label]
+
+
+def test_supplying_label_bounds_keeps_existing_final_guard_for_a_bad_approval(monkeypatch):
+    source = unit("gitlab_issue", "An attributed report", authority="development", state="opened")
+    evidence = {"sources": [{**source, "id": "S1", "passages": [{"id": "S1:P1", "text": "An attributed report"}]}],
+                "missing_sources": [], "truncated": False}
+    public = candidate(title="An attributed report", summary="A source reports a possible issue.",
+                       confidence="confirmed", state="developing", category="security", tags=["security"], why_it_matters="")
+    checker = reviewer(monkeypatch, completion(verdict()))
+    assert checker.review(public, evidence)["verdict"] == "approve"  # the fake model ignores its input bounds
+    sent = json.loads(checker.client.requests[0][1]["messages"][1]["content"])
+    assert "confirmed" not in sent["label_bounds"]["confidence"]
+    assert "confirmed_source" in review.final_holds(public, {"packet": evidence, "payload": {"editorial_kind": "gitlab_issue"}})
+
+
 def test_inconsistent_release_metadata_does_not_prevent_editorial_skip(monkeypatch):
     """Non-news can still be skipped without repairing metadata that will not publish."""
     result = reviewer(monkeypatch, completion(verdict("skip", criterion="news_value"))).review(
@@ -237,7 +290,8 @@ def test_editorial_coverage_is_background_and_never_an_evidence_reference(monkey
     checker.review(public, packet(), coverage=background, verification=True)
     for _, request in checker.client.requests:
         assert json.loads(request["messages"][1]["content"]) == {
-            "candidate": public, "packet": packet(), "coverage_background": background}
+            "candidate": public, "packet": packet(), "coverage_background": background,
+            "label_bounds": analyze.label_limits(packet()["sources"])}
         fields = request["response_format"]["json_schema"]["schema"]["properties"]["criteria"]["properties"]
         assert set(fields) == set(review.CRITERIA)
         assert "news_value" in fields and "new_information" in fields
