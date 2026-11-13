@@ -141,6 +141,8 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
         body = item.get("source_content", item.get("content"))
         unit = {key: item.get(key) for key in ("kind", "authority", "product", "published_at", "updated_at", "upstream_state")}
         unit.update(labels=_labels(item.get("labels")), url=canonical_url(item["url"]), title=item["title"], snapshot=snapshot)
+        if item.get("closed_at"):
+            unit["closed_at"] = item["closed_at"]
         if captured:
             unit["captured_at"] = captured
         if source.get("source_item_id"):

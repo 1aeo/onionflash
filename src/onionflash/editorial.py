@@ -9,6 +9,7 @@ import json
 import hashlib
 import re
 
+from .config import DEFAULTS
 from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, PUBLIC_STATES, UPDATE_CHARS
 from .util import canonical_url, digest, format_utc, now_iso, parse_utc
 
@@ -375,7 +376,7 @@ def restore(db, story_id: str, revision: int, *, reason: str, expect_hash: str, 
 
 
 def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str | None = None,
-          base_url: str = "https://1aeo.com/onionflash/", observed: str | None = None,
+          base_url: str = DEFAULTS["site"]["base_url"], observed: str | None = None,
           automatic: bool = False) -> dict:
     """Permanently merge published duplicate `story_id` into `survivor_id` as a pointer."""
     from . import decisions

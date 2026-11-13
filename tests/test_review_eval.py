@@ -282,6 +282,20 @@ def test_authored_passages_match_build_packet():
         assert expanded["labels"] == built["sources"][0]["labels"] == expected_labels
         assert [list(passage.items()) for passage in expanded["passages"]] == [list(passage.items()) for passage in built["sources"][0]["passages"]]
         assert module.writer_item(expanded) == {key: item[key] for key in (*fields[1:], "labels", "content", "public_comments")}
+    closed_raw = copy.deepcopy(raw)
+    closed_raw["packets"]["tor-41412-cross-cancellation-edited"]["sources"][0]["closed_at"] = "2026-10-07T17:16:54Z"
+    closed_source = closed_raw["packets"]["tor-41412-cross-cancellation-edited"]["sources"][0]
+    closed_item = {"id": "a" * 24, **{key: closed_source[key] for key in fields},
+                   "closed_at": closed_source["closed_at"], "labels": list(closed_source["labels"]),
+                   "content": "\n\n".join(p for p in closed_source["passages"] if isinstance(p, str)),
+                   "public_comments": [{"author": n["author"], "created_at": n["created_at"], "url": n["url"], "body": n["text"]}
+                                       for n in closed_source["passages"] if isinstance(n, dict)]}
+    closed_built, _ = build_packet(None, closed_item, {"sources": [{"id": closed_item["id"], "url": closed_item["url"]}]},
+                                   {"sources": []}, closed_item["id"])
+    closed_expanded = next(c for c in module.expand(closed_raw)
+                           if c["packet"]["sources"][0]["url"] == closed_source["url"])["packet"]["sources"][0]
+    assert closed_expanded["closed_at"] == closed_built["sources"][0]["closed_at"] == "2026-10-07T17:16:54Z"
+    assert "closed_at" not in module.writer_item(closed_expanded)
 
 
 def test_draft_mode_drafts_each_packet_once_and_scores_draft_and_publication(evaluation, tmp_path, monkeypatch):

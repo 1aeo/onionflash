@@ -19,7 +19,7 @@ from .review import Reviewer
 from .review_gate import process_item, status as review_status
 from .collect import CollectionError, collect_source
 from .comments import RUN_BUDGET_SECONDS as COMMENTS_BUDGET, enrich_comments, merge_cached_comments, status as comments_status
-from .config import load_config
+from .config import DEFAULTS, load_config
 from .publication import build
 from .store import Store, source_due
 from .transport import HttpClient
@@ -103,7 +103,7 @@ def _operator_command(args, store: Store, config: dict | None = None) -> dict:
             return editorial.history(store.db, args.story)
         options = {"reason": args.reason, "expect_hash": args.expect_hash}
         if args.action == "merge":
-            base_url = (config or {}).get("site", {}).get("base_url", "https://1aeo.com/onionflash/")
+            base_url = (config or {}).get("site", {}).get("base_url", DEFAULTS["site"]["base_url"])
             result = editorial.merge(store.db, args.story, args.into_story, base_url=base_url, **options)
         elif args.action == "correct":
             result = editorial.correct(store.db, args.story, json.loads(args.patch.read_text(encoding="utf-8")), **options)

@@ -193,11 +193,19 @@ def test_final_holds_on_real_cases(writer, sources, fields, expected):
     assert review.final_holds(story, {"packet": {"sources": sources}, "payload": {"editorial_kind": writer}}) == expected
 
 
-@pytest.mark.parametrize("source,confidence,state", [
-    (ISSUE, ["reported", "suspected", "observed-anomaly"], analyze.STATES), (MERGED, analyze.CONFIDENCES, ["merged"]),
-    (FEED, analyze.CONFIDENCES, analyze.STATES)], ids=["issue", "merged-request", "official-feed"])
-def test_repair_schema_offers_only_labels_the_packet_allows(monkeypatch, source, confidence, state):
-    evidence = {"sources": [{**source, "id": "S1", "passages": [{"id": "S1:P1", **source["passages"][0]}]}],
+NON_TAG_STATES = [value for value in analyze.STATES if value != "tagged"]
+NON_RELEASE_CATEGORIES = [value for value in analyze.CATEGORIES if value != "release"]
+
+
+@pytest.mark.parametrize("sources,confidence,state,categories", [
+    ([ISSUE], ["reported", "suspected", "observed-anomaly"], NON_TAG_STATES, analyze.CATEGORIES),
+    ([MERGED], analyze.CONFIDENCES, ["merged"], NON_RELEASE_CATEGORIES),
+    ([FEED], analyze.CONFIDENCES, NON_TAG_STATES, analyze.CATEGORIES),
+    ([unit("tag", "tor-0.4.9.16", authority="official"), FEED], analyze.CONFIDENCES, analyze.STATES, analyze.CATEGORIES),
+], ids=["issue", "merged-request", "official-feed", "tagged-release"])
+def test_repair_schema_offers_only_labels_the_packet_allows(monkeypatch, sources, confidence, state, categories):
+    evidence = {"sources": [{**source, "id": f"S{index}", "passages": [{"id": f"S{index}:P1", **source["passages"][0]}]}
+                            for index, source in enumerate(sources, 1)],
                 "missing_sources": [], "truncated": False}
     checker = reviewer(monkeypatch, completion(verdict()), completion(verdict()))
     checker.review(candidate(), evidence)
@@ -205,7 +213,23 @@ def test_repair_schema_offers_only_labels_the_packet_allows(monkeypatch, source,
     for _, request in checker.client.requests:
         repair = request["response_format"]["json_schema"]["schema"]["properties"]["repair"]["anyOf"][1]["properties"]
         assert (repair["confidence"]["anyOf"][0]["enum"], repair["state"]["anyOf"][0]["enum"]) == (confidence, state)
+        assert repair["category"]["anyOf"][0]["enum"] == repair["tags"]["anyOf"][0]["items"]["enum"] == categories
     assert review.FIELDS["confidence"]["enum"] == analyze.CONFIDENCES  # another packet keeps its own limits
+    assert review.FIELDS["state"]["enum"] == analyze.STATES
+    assert review.FIELDS["category"]["enum"] == analyze.CATEGORIES
+    if "tagged" not in state:
+        bad_tagged = verdict("revise", repair={"state": "tagged"}, criterion="status")
+        with pytest.raises(review.ReviewError, match="limits"):
+            reviewer(monkeypatch, completion(bad_tagged)).review(candidate(), evidence)
+    if "release" not in categories:
+        bad_rel_tag = verdict("revise", repair={"tags": ["release"]}, criterion="status")
+        with pytest.raises(review.ReviewError, match="limits"):
+            reviewer(monkeypatch, completion(bad_rel_tag)).review(candidate(), evidence)
+
+
+def test_tordev_proposal_rule_distinguishes_project_senders_from_community_posts():
+    assert "unnumbered [Proposal]) whose packet source has authority=project-sender" in review.SYSTEM_PROMPT
+    assert "When\nauthority=community, posts without an explicit [RFC] tag" in review.SYSTEM_PROMPT
 
 
 def test_inconsistent_release_metadata_does_not_prevent_editorial_skip(monkeypatch):
@@ -502,3 +526,13 @@ def test_update_scope_schema_wire_payload_repairs_and_guards(monkeypatch):
     confirmed_checker.review(confirmed_prior, pkt, coverage=confirmed_cov, update=True)
     confirmed_props = confirmed_checker.client.requests[0][1]["response_format"]["json_schema"]["schema"]["properties"]["repair"]["anyOf"][1]["properties"]
     assert confirmed_props["confidence"]["anyOf"][0]["enum"] == ["confirmed"]
+
+    recent_cov = {"prior_story": None, "recent": [{"id": "a" * 24, "title": "Prior", "retracted": False}], "truncated": False}
+    route_checker = reviewer(monkeypatch, completion(verdict()), completion(verdict()))
+    route_checker.review(candidate(), packet(), coverage=recent_cov)
+    route_checker.review(candidate(), packet(), coverage=recent_cov, verification=True)
+    assert route_checker.client.requests[0][1]["messages"][0]["content"] == review.SYSTEM_PROMPT + review.ROUTING_PROMPT
+    assert route_checker.client.requests[1][1]["messages"][0]["content"] == review.VERIFY_PROMPT + review.ROUTING_PROMPT
+    base_hash = review.policy_hash(config())
+    monkeypatch.setattr(review, "ROUTING_PROMPT", review.ROUTING_PROMPT + "\n")
+    assert review.policy_hash(config()) != base_hash

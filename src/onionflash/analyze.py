@@ -191,15 +191,17 @@ class AnalysisError(Exception):
 
 
 def label_limits(sources: list[dict]) -> dict:
-    """The confidence and state labels a story told by these sources may carry: confirmed needs
-    an official source that is not a tag, or a merged merge request, and a story told only by
-    merge requests is merged."""
+    """The confidence, state and category labels a story told by these sources may carry: confirmed
+    needs an official source that is not a tag, or a merged merge request; tagged needs a tag
+    source; and a story told only by merge requests is merged and not a release."""
     confirmable = any((source.get("authority") == "official" and source.get("kind") != "tag")
                       or (source.get("kind") == "gitlab_mr" and source.get("upstream_state") == "merged")
                       for source in sources)
+    tagged = any(source.get("kind") == "tag" for source in sources)
     merges = bool(sources) and all(source.get("kind") == "gitlab_mr" for source in sources)
     return {"confidence": [value for value in CONFIDENCES if confirmable or value != "confirmed"],
-            "state": ["merged"] if merges else list(STATES)}
+            "state": ["merged"] if merges else [value for value in STATES if tagged or value != "tagged"],
+            "category": [value for value in CATEGORIES if not merges or value != "release"]}
 
 
 def prior_context(prior: dict) -> dict:
@@ -474,8 +476,10 @@ class Analyzer(CompletionClient):
         reply = self.complete(SYSTEM_PROMPT, bounded, schema, "onionflash_news")
         stated = reply.get("why_it_matters")
         result = validate_analysis(reply, source)
-        if any(result[key] not in schema["properties"][key]["enum"] for key in ("confidence", "state")):
+        if any(result[key] not in schema["properties"][key]["enum"] for key in ("confidence", "state", "category")):
             raise AnalysisError("Writer labels exceed this source's limits")
+        if result["state"] not in {"released", "tagged"} and result["category"] != "release":
+            result["tags"] = [tag for tag in result["tags"] if tag != "release"]
         self.clears = int(result["why_it_matters"] != stated.strip())
         return result
 
@@ -530,11 +534,15 @@ def _writer_schema(bounded: dict, base_schema: dict = SCHEMA, *, prior: dict | N
             limits["confidence"] = ["confirmed"]
         if not (prior.get("state") == "merged" and prior.get("sources")
                 and all("/-/merge_requests/" in s.get("url", "") for s in prior["sources"])):
-            limits["state"] = list(STATES)
+            has_tag = bounded.get("kind") == "tag" or prior.get("state") == "tagged"
+            limits["state"] = [s for s in STATES if has_tag or s != "tagged"]
         if prior.get("category") == "release":
             release_states = [s for s in limits["state"] if s in {"released", "tagged"}]
             if release_states:
                 limits["state"] = release_states
     for key, allowed in limits.items():
-        schema["properties"][key]["enum"] = allowed
+        if key in schema["properties"]:
+            schema["properties"][key]["enum"] = allowed
+    if "tags" in schema["properties"] and "category" in schema["properties"]:
+        schema["properties"]["tags"]["items"]["enum"] = list(schema["properties"]["category"]["enum"])
     return schema

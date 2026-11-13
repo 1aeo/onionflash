@@ -195,9 +195,10 @@ skips are not checked.
 - When a source hedges a compromise ("plausibly compromised", "may have been
   hacked"), a new headline or update entry about the compromise keeps a qualifier.
 
-The writer's request and every review's repair offer only the confidence and
-state labels that the first two checks allow, and a draft outside them is
-refused like any other invalid draft.
+The writer's request and every review's repair offer only the confidence,
+state and category labels that these checks allow (and `tagged` only when a
+source is a version tag), and a draft outside them is refused like any other
+invalid draft.
 
 ## Exact decisions and private state
 
