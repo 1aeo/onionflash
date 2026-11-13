@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 
 from . import editorial, render, source_packet
 from .analyze import MIN_EVIDENCE_CHARS, unquoted_text
 from .comments import analysis_context
-from .util import after, digest, gitlab_refs, normalize_evidence, release_mentions, saved_object, thread_subject
+from .util import after, canonical_url, digest, gitlab_refs, normalize_evidence, release_mentions, saved_object, thread_subject
 
 
 # Writer fields a review may repair; their order is part of the review policy hash.
@@ -176,10 +177,15 @@ def relation(previous: dict | None, item: dict, db=None) -> str:
     if previous.get("origin") == "network-health":
         return "citation" if item_kind == "tag" else "update"
     if item_kind == "tag":
-        return "own" if item.get("id") == writer else "citation"
-    prev_rank = ({"tag": 0, "metrics_timeline": 1}.get(kind, 2), 1 if authority == "official" and kind != "tag" else 0)
-    item_rank = ({"tag": 0, "metrics_timeline": 1}.get(item_kind, 2), 1 if item.get("authority") == "official" and item_kind != "tag" else 0)
-    if item_rank > prev_rank:
+        if item.get("id") == writer:
+            return "own"
+        return "citation" if previous.get("state") in {"tagged", "released"} else "update"
+    prev_tier = {"tag": 0, "metrics_timeline": 1}.get(kind, 2)
+    item_tier = {"tag": 0, "metrics_timeline": 1}.get(item_kind, 2)
+    if prev_tier < 2 and (
+        item_tier > prev_tier
+        or (item_tier == prev_tier and item.get("authority") == "official" and authority != "official")
+    ):
         return "upgrade"
     if kind == "metrics_timeline" and item_kind == "metrics_timeline" and item.get("id") == writer:
         return "own"
@@ -210,22 +216,75 @@ def _latest_published_source(db, item_id: str, analysis_key: str | None) -> dict
     return None
 
 
-def _source_cutoff(db, previous: dict, old_item: dict | None) -> str:
-    dates = [previous["published_at"],
-             *(s["published_at"] for s in previous.get("sources", []) if isinstance(s, dict) and s.get("published_at")),
-             *(u["at"] for u in previous.get("updates") or [] if isinstance(u, dict) and u.get("at"))]
+def _source_cutoff(db, previous: dict, old_item: dict | None, item: dict | None = None) -> str:
+    item_id = (item or old_item or {}).get("id") or previous.get("editorial_item")
+
+    def norm_url(raw: object) -> str | None:
+        if not isinstance(raw, str) or not raw:
+            return None
+        with contextlib.suppress(ValueError, TypeError, UnicodeError):
+            return canonical_url(raw)
+        return raw
+
+    own_urls = {u for u in (norm_url((item or {}).get("url")), norm_url((old_item or {}).get("url"))) if u}
+
+    def is_own_url(url: object) -> bool:
+        clean = norm_url(url)
+        return bool(clean and any(clean == base or clean.startswith(base + "#") for base in own_urls))
+
+    def is_own_source(entry: dict) -> bool:
+        return bool(
+            (item_id and (entry.get("id") == item_id or entry.get("source_item_id") == item_id))
+            or is_own_url(entry.get("url"))
+        )
+
+    initial_at = (
+        (old_item or {}).get("published_at")
+        or (item or {}).get("published_at")
+        or previous["published_at"]
+    )
+    dates = [
+        initial_at,
+        *(s["published_at"] for s in previous.get("sources", []) if isinstance(s, dict) and s.get("published_at") and is_own_source(s)),
+        *(
+            u["at"]
+            for u in previous.get("updates") or []
+            if isinstance(u, dict)
+            and u.get("at")
+            and any(isinstance(cs, dict) and is_own_url(cs.get("url")) for cs in (u.get("sources") or []))
+        ),
+    ]
     if old_item is not None:
         dates.append(old_item["updated_at"])
         dates += [n["created_at"] for n in old_item.get("public_comments") or []]
-    elif db.execute("SELECT 1 FROM editorial_controls WHERE story_id=?", (previous["id"],)).fetchone() is None:
+    elif (
+        db.execute("SELECT 1 FROM editorial_controls WHERE story_id=?", (previous["id"],)).fetchone() is None
+        and all(is_own_source(s) for s in previous.get("sources", []) if isinstance(s, dict))
+        and all(
+            any(isinstance(cs, dict) and is_own_url(cs.get("url")) for cs in (u.get("sources") or []))
+            for u in (previous.get("updates") or [])
+            if isinstance(u, dict)
+        )
+    ):
         dates.append(previous["updated_at"])
     return max(dates)
+
+
+def _changed_note_ids(old_item: dict | None, item: dict) -> set[str]:
+    seen_bodies = {n["id"]: n.get("body") for n in (old_item or {}).get("public_comments") or [] if "id" in n}
+    return {
+        note["id"]
+        for note in item.get("public_comments") or []
+        if "id" in note
+        and note["id"] in seen_bodies
+        and unquoted_text(str(seen_bodies[note["id"]] or "")).strip() != unquoted_text(note["body"]).strip()
+    }
 
 
 def _own_body_changed(db, previous: dict, item: dict) -> bool:
     old_item = _latest_published_source(db, item["id"], previous.get("editorial_analysis_key"))
     if old_item is None:
-        return not item.get("public_comments") and item["updated_at"] > _source_cutoff(db, previous, None)
+        return not item.get("public_comments") and item["updated_at"] > _source_cutoff(db, previous, None, item)
     return any(unquoted_text(str(item.get(key) or "")).strip() != unquoted_text(str(old_item.get(key) or "")).strip()
                for key in ("title", "content", "upstream_state"))
 
@@ -281,11 +340,12 @@ def own_update_input(db, row: dict, item: dict) -> tuple[str, dict]:
     if mode == "story":
         return "story", item
     old_item = _latest_published_source(db, item["id"], previous.get("editorial_analysis_key"))
-    cutoff = _source_cutoff(db, previous, old_item)
-    seen_ids = {n["id"] for n in (old_item or {}).get("public_comments") or [] if "id" in n}
+    cutoff = _source_cutoff(db, previous, old_item, item)
+    seen_bodies = {n["id"]: n.get("body") for n in (old_item or {}).get("public_comments") or [] if "id" in n}
+    changed_ids = _changed_note_ids(old_item, item)
     new_notes = []
     for note in item.get("public_comments") or []:
-        if note["created_at"] > cutoff and note.get("id") not in seen_ids:
+        if (note["created_at"] > cutoff and note.get("id") not in seen_bodies) or note.get("id") in changed_ids:
             stripped = unquoted_text(note["body"]).strip()
             if stripped:
                 new_notes.append({**note, "body": stripped})
@@ -317,7 +377,8 @@ def update_target(db, row: dict) -> dict | None:
     return render._prepare_story(previous, editorial=editorial.public_metadata(db, existing["id"]))
 
 
-def _comment_sources(item: dict, result: dict, *, after_at: str | None = None, include_body: bool = True) -> list[dict]:
+def _comment_sources(item: dict, result: dict, *, after_at: str | None = None, include_body: bool = True,
+                     changed_ids: set[str] | frozenset[str] = frozenset()) -> list[dict]:
     """Cite the earliest note stating each quote that the title and description do not.
 
     Only a verified fetch writes notes, so their fields need no checks here.
@@ -330,7 +391,7 @@ def _comment_sources(item: dict, result: dict, *, after_at: str | None = None, i
     quotes = {quote for quote in quotes if len(quote) >= MIN_EVIDENCE_CHARS and quote not in described}
     sources = []
     for note in sorted(item["public_comments"], key=lambda note: note["created_at"]):
-        if after_at is not None and note["created_at"] <= after_at:
+        if after_at is not None and note["created_at"] <= after_at and note.get("id") not in changed_ids:
             continue
         body = unquoted_text(note["body"]) if after_at is not None else note["body"]
         normalized = normalize_evidence(body)
@@ -600,10 +661,17 @@ def prepare(db, row: dict, result: dict, observed: str) -> dict:
             is_own = writer == item["id"]
             old_item = _latest_published_source(db, item["id"], previous.get("editorial_analysis_key")) if is_own else None
             state_changed = bool(old_item and item.get("upstream_state") != old_item.get("upstream_state"))
-            cutoff = _source_cutoff(db, previous, old_item) if is_own else None
+            cutoff = _source_cutoff(db, previous, old_item, item) if is_own else None
+            changed_ids = _changed_note_ids(old_item, item) if is_own else frozenset()
             body_changed = _own_body_changed(db, previous, item) if is_own else True
-            comments = _comment_sources(item, result, after_at=cutoff, include_body=body_changed)
-            dates = [*(comment["published_at"] for comment in comments), *([item["updated_at"]] if state_changed else [])]
+            comments = _comment_sources(item, result, after_at=cutoff, include_body=body_changed, changed_ids=changed_ids)
+            dates = [
+                *(
+                    item["updated_at"] if comment["id"].removeprefix(item["id"] + ":") in changed_ids else comment["published_at"]
+                    for comment in comments
+                ),
+                *([item["updated_at"]] if state_changed else []),
+            ]
             at = max(dates) if dates else item["updated_at"]
             comment_links = list({comment["url"]: {"url": comment["url"], "title": comment["title"]}
                                   for comment in comments if comment["url"] != source["url"]}.values())

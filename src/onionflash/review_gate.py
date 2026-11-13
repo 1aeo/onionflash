@@ -16,7 +16,7 @@ import re
 
 from . import candidate as candidate_mod, decisions, editorial, render, review
 from .analyze import AnalysisError, cache_key
-from .util import after, canonical_url, digest, now_iso, saved_object, thread_subject
+from .util import _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, now_iso, saved_object, thread_subject
 
 MAX_APPROVALS = 2000  # cached approvals kept besides those unfinished jobs pin
 # An item starts a new story only if its newest dated development is at most this many days older
@@ -113,7 +113,6 @@ def _prune(store, maximum):
         """, (maximum,))
 
 
-_REF_MARKER = re.compile(r"(?<![\w/#!])[#!]\d+\b")
 _VERSION_TOKEN = re.compile(r"\b\d+\.\d+(?:\.\d+)*(?:-[a-z0-9.]+)?\b", re.I)
 _PROPOSAL_TOKEN = re.compile(r"\bproposal\s+\d{3,4}\b|\bcve-\d{4}-\d+\b", re.I)
 _SPECIFIC_WORD = re.compile(r"[a-z0-9]{4,}")
@@ -148,11 +147,38 @@ def _story_urls(story: dict) -> set[str]:
     return urls
 
 
+def _story_gitlab_refs(story: dict) -> set[str]:
+    """Project-qualified GitLab issue and merge-request URLs derived from citation URLs."""
+    text = _story_text(story)
+    src_urls = [
+        src["url"]
+        for src in (
+            *(story.get("sources") or ()),
+            *(cs for u in (story.get("updates") or ()) if isinstance(u, dict) for cs in (u.get("sources") or ())),
+        )
+        if isinstance(src, dict) and isinstance(src.get("url"), str)
+    ]
+    refs = set()
+    for group in gitlab_refs({"url": "", "title": "", "content": "\n".join([*src_urls, text])}):
+        refs.update(group)
+    projects = {}
+    for raw_url in src_urls:
+        with contextlib.suppress(ValueError, TypeError, UnicodeError):
+            clean = canonical_url(raw_url)
+            if match := _GITLAB_OWN.match(clean):
+                projects[(match.group(1), match.group(2).lower())] = clean
+    if len(projects) == 1:
+        [context_url] = projects.values()
+        for group in gitlab_refs({"url": context_url, "title": "", "content": text}):
+            refs.update(group)
+    return refs
+
+
 def _specific_story_overlap(story_a: dict, story_b: dict) -> bool:
     """Require concrete shared identifiers before merging two published stories."""
     urls_a, urls_b = _story_urls(story_a), _story_urls(story_b)
     text_a, text_b = _story_text(story_a), _story_text(story_b)
-    refs_a, refs_b = set(_REF_MARKER.findall(text_a)), set(_REF_MARKER.findall(text_b))
+    refs_a, refs_b = _story_gitlab_refs(story_a), _story_gitlab_refs(story_b)
     prods_a = set(story_a.get("products") or ())
     prods_b = set(story_b.get("products") or ())
     if prods_a and prods_b and not (prods_a & prods_b) and not (urls_a & urls_b) and not (refs_a & refs_b):
@@ -198,6 +224,7 @@ def _can_auto_merge_review(candidate: dict, prepared: dict, result: dict) -> boo
         "title": prior.get("title") or candidate.get("title", ""),
         "summary": prior.get("summary") or candidate.get("summary", ""),
         "products": prior.get("products") or candidate.get("products", []),
+        "sources": candidate.get("sources") or prior.get("sources") or [],
     }
     return _specific_story_overlap(prior_view, target)
 
@@ -277,10 +304,10 @@ def _can_route(candidate: dict, prepared: dict, result: dict, target_id) -> bool
     target_products = set(target.get("products") or ())
     if cand_products & target_products or target.get("related"):
         return True
-    item_text = "\n".join([str(item.get("title") or ""), str(item.get("content") or ""),
-                           *(str(note.get("body") or "") for note in item.get("public_comments") or [])])
     target_text = f"{target.get('title') or ''}\n{target.get('summary') or ''}\n{target.get('latest_update') or ''}"
-    if set(_REF_MARKER.findall(item_text)) & set(_REF_MARKER.findall(target_text)):
+    item_refs = set(sum(gitlab_refs(item), []))
+    target_refs = set(sum(gitlab_refs({"url": "", "title": "", "content": target_text}), []))
+    if item_refs & target_refs:
         return True
     item_subj, _ = thread_subject(item)
     target_subj, _ = thread_subject({"url": item.get("url"), "title": target.get("title")})
@@ -788,11 +815,14 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
     if any(candidate[key] != original[key] for key in original if key not in editable_fields):
         return refuse("Saved review record cannot be read", editorial_failures, new_coverage)
     if is_update:
-        orig_updates, cand_updates = original.get("updates") or [], candidate.get("updates") or []
-        if (len(cand_updates) != len(orig_updates) or not orig_updates
+        orig_updates, cand_updates = original.get("updates"), candidate.get("updates")
+        if (not isinstance(orig_updates, list) or not isinstance(cand_updates, list)
+                or len(cand_updates) != len(orig_updates) or not orig_updates
                 or cand_updates[:-1] != orig_updates[:-1]
-                or cand_updates[-1]["at"] != orig_updates[-1]["at"]
-                or cand_updates[-1]["sources"] != orig_updates[-1]["sources"]):
+                or not isinstance(cand_updates[-1], dict) or not isinstance(orig_updates[-1], dict)
+                or "at" not in cand_updates[-1] or "sources" not in cand_updates[-1]
+                or cand_updates[-1]["at"] != orig_updates[-1].get("at")
+                or cand_updates[-1]["sources"] != orig_updates[-1].get("sources")):
             return refuse("Saved review record cannot be read", editorial_failures, new_coverage)
     try:
         if render._prepare_story(candidate, editorial=original.get("editorial")) != candidate:

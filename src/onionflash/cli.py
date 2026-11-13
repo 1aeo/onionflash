@@ -223,12 +223,14 @@ def run(config: dict, store: Store) -> dict:
     endpoint_failures = 0
     first = decisions.latest_id(store.db)
     consensus_sources = [s for s in config["sources"] if s.get("alert_format") == "consensus" and s["enabled"]]
+    if len(consensus_sources) > 1:
+        raise ValueError("At most one enabled consensus alert source is supported")
     with (
         Analyzer(config, deadline=run_deadline) as analyzer,
         Reviewer(config, deadline=run_deadline) as reviewer,
         doctor.LinkChecker(config, deadline=run_deadline) as linker,
     ):
-        for consensus_source in consensus_sources[:1]:
+        for consensus_source in consensus_sources:
             try:
                 evaluated = doctor.evaluate(
                     config,

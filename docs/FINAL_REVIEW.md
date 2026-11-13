@@ -94,14 +94,16 @@ most one live story in fixed order: `items.story_id`, retired/merged aliases,
 GitLab merge-request closing references (when unique), and same-source
 HyperKitty replies within 45 days sharing at least a three-word normalized
 subject (when unique); ambiguous matches stay unattached and surface as
-`related` entries. Relations compare source tier and official authority: a
-version tag joining an existing story is a `citation` (adding its collected
-source metadata with zero writer or review calls and leaving prose, labels and
-`updated_at` unchanged), a higher-ranked source or an official announcement
-replacing a tag, timeline row or non-official story runs in `story` scope as an
-`upgrade`, a timeline item revising its own timeline story runs as `own`, and
-every other follow-up on a prose story runs in `update` scope (`review_scope:
-"latest_update"`): the writer drafts one short dated `updates` entry grounded in
+`related` entries. Relations compare source tier: a version tag joining a story
+already in state `tagged` or `released` (or a fixed-text network-health alert)
+is a `citation` (adding its collected source metadata with zero writer or review
+calls and leaving prose, labels and `updated_at` unchanged), while a version tag
+on an earlier-stage story such as `merged` goes to `update` review so the story
+can gain its dated tag update and advance to `tagged`; a higher-tier source (or
+an official timeline entry) replacing a literal tag notice or timeline entry
+runs in `story` scope as an `upgrade`, a tag or timeline item revising its own
+notice runs as `own`, and every follow-up on a published prose story runs in
+`update` scope (`review_scope: "latest_update"`): the writer drafts one short dated `updates` entry grounded in
 the new source's unquoted contribution (or only in new unquoted comments/edits
 when the story's own item changes; if nothing new remains, the gate skips it as
 `skipped.gate.no_new_content` without a model call). With its dedicated

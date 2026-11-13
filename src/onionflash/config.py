@@ -371,5 +371,7 @@ def load_config(path: str | Path) -> dict:
                 or not low <= source[key] <= high
             ):
                 raise ValueError(f"Invalid source {key}")
+    if sum(1 for s in sources if s.get("alert_format") == "consensus" and s["enabled"]) > 1:
+        raise ValueError("At most one enabled consensus alert source is supported")
     config["_config_path"] = str(path)
     return config

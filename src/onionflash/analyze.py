@@ -325,7 +325,7 @@ def tag_update(item: dict, prior: dict) -> dict:
         "publish": True,
         "update": f"The upstream feed lists the tag “{name}”.",
         "confidence": prior["confidence"],
-        "state": prior["state"],
+        "state": "tagged" if prior["state"] == "merged" else prior["state"],
         "evidence": [name],
     }
 

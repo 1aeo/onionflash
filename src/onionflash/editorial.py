@@ -415,11 +415,45 @@ def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str 
         db.execute("DELETE FROM stories WHERE id=?", (story_id,))
         db.execute("UPDATE editorial_controls SET locked=0,held_updates=0 WHERE story_id=?", (story_id,))
         remapped = 0
+        has_item_tables = {
+            r[0]
+            for r in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('items','decision_log','review_jobs')"
+            )
+        } == {"items", "decision_log", "review_jobs"}
+        held_ids = (
+            [
+                r[0]
+                for r in db.execute(
+                    """SELECT id FROM items WHERE status='published'
+                       AND (story_id=? OR (story_id IS NULL AND cluster_key=?))
+                       AND EXISTS (SELECT 1 FROM decision_log d
+                           WHERE d.id=(SELECT MAX(id) FROM decision_log WHERE item_id=items.id)
+                           AND d.story_id=? AND d.code='held.gate.story_locked'
+                           AND d.content_hash=items.content_hash)""",
+                    (story_id, dup["record"]["cluster_key"], story_id),
+                ).fetchall()
+            ]
+            if has_item_tables
+            else []
+        )
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='items'").fetchone():
             remapped = db.execute(
                 "UPDATE items SET story_id=? WHERE story_id=? OR (story_id IS NULL AND cluster_key=?)",
                 (survivor_id, story_id, dup["record"]["cluster_key"]),
             ).rowcount
+        if held_ids:
+            marks = ",".join("?" * len(held_ids))
+            db.execute(f"DELETE FROM review_jobs WHERE item_id IN ({marks})", held_ids)
+            if surv["control"] and surv["control"]["locked"]:
+                for hid in held_ids:
+                    record_held(db, survivor_id)
+                    decisions.record(db, hid, "held.gate.story_locked", stamp, merged_from=story_id)
+            else:
+                db.execute(
+                    f"UPDATE items SET status='pending',attempts=0,rejections=0,next_attempt_at=NULL,last_error=NULL WHERE id IN ({marks})",
+                    held_ids,
+                )
         has_topics = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_story_topics'").fetchone())
         has_queue = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_render_queue'").fetchone())
         for (aid,) in db.execute(

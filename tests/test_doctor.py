@@ -819,3 +819,139 @@ def test_unexpected_exception_in_evaluate_does_not_stop_run(tmp_path, monkeypatc
         report = cli.run(cfg, store)
         assert "Unexpected RuntimeError at" in report["network"]["error"]
         assert report["no_browser_js_ready"] is True
+
+
+def test_multiple_enabled_consensus_sources_rejected_and_rule_c_counts_distinct_hours(tmp_path):
+    path, cfg = make_config(tmp_path, publish=True, enabled=True)
+    second_disabled = {**cfg["sources"][0], "id": "consensus-mirror", "url": "https://example.org/consensus.xml", "enabled": False}
+    extra_toml = (
+        '\n[[sources]]\nid = "consensus-mirror"\nname = "Mirror"\n'
+        f'website_url = "{LIST_URL}"\nurl = "https://example.org/consensus.xml"\n'
+        'kind = "feed"\nproduct = "network"\nauthority = "telemetry"\n'
+        'alert_format = "consensus"\npublish = false\nenabled = false\n'
+    )
+    path.write_text(path.read_text(encoding="utf-8") + extra_toml, encoding="utf-8")
+    loaded_ok = load_config(path)
+    assert len(loaded_ok["sources"]) == 2
+
+    path.write_text(path.read_text(encoding="utf-8").replace("enabled = false", "enabled = true"), encoding="utf-8")
+    with pytest.raises(ValueError, match="At most one enabled consensus alert source is supported"):
+        load_config(path)
+
+    cfg_two = {**cfg, "sources": [cfg["sources"][0], {**second_disabled, "enabled": True}]}
+    with Store(cfg["storage"]["database"]) as store:
+        with pytest.raises(ValueError, match="At most one enabled consensus alert source is supported"):
+            cli.run(cfg_two, store)
+
+    # Six SRV reports in the same UTC hour (00:05..00:10) count as one reporting hour, not six.
+    srv_line = "NOTICE: Consensus is missing a current shared random value"
+    same_hour = [
+        report_item(f"srv-same-{i}", f"2024-01-20T00:{5 + i:02d}:00Z", [srv_line])
+        for i in range(6)
+    ]
+    with Store(tmp_path / "srv_same.sqlite3") as store:
+        doctor.ingest(store.db, cfg["sources"][0], same_hour, "2024-01-20T01:00:00Z")
+        res = doctor.evaluate(cfg, store, cfg["sources"][0], FakeLinker(), "2024-01-20T01:00:00Z")
+        assert res["stories_written"] == 0
+
+    six_hours = [
+        report_item(f"srv-hr-{i}", f"2024-01-20T{i:02d}:05:00Z", [srv_line])
+        for i in range(6)
+    ]
+    with Store(tmp_path / "srv_hours.sqlite3") as store:
+        doctor.ingest(store.db, cfg["sources"][0], six_hours, "2024-01-20T06:00:00Z")
+        res_open = doctor.evaluate(cfg, store, cfg["sources"][0], FakeLinker(), "2024-01-20T06:00:00Z")
+        assert res_open["stories_written"] == 1
+
+
+def test_host_updates_drive_matching_invalidate_negative_cache_and_guards_hold(tmp_path):
+    # 1) Host story with generic opening prose that names the authority only in a later update:
+    #    first run has no authority mention so standalone is avoided only once update arrives;
+    #    we also seed a negative cache row before the update to prove _host_hash invalidates it.
+    _, cfg = make_config(tmp_path / "host_upd", publish=True)
+    with Store(cfg["storage"]["database"]) as store:
+        host_id = seed_host(
+            store,
+            url="https://gitlab.torproject.org/tpo/network-health/analysis/-/issues/990",
+            title="Directory consensus voting instability under investigation",
+            summary="Operators are investigating intermittent voting instability across the directory.",
+            published_at="2024-01-15T06:00:00Z",
+        )
+        raw_before = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (host_id,)).fetchone()[0])
+        pub_before = render._prepare_story(raw_before)
+
+        doctor.ingest(store.db, cfg["sources"][0], bastet_incident_items(close=False), "2024-01-17T12:00:00Z")
+        # Before the host story mentions bastet, candidate_hosts is empty.
+        replayed = doctor._replay(doctor.load_reports(store.db))[0][0]
+        assert doctor.candidate_hosts(store.db, replayed, log_locked=False) == []
+        old_hash = doctor._host_hash(pub_before, replayed)
+        with store.db:
+            store.db.execute(
+                "INSERT INTO network_links(incident_key,host_id,host_hash,version,same_incident,decided_at) VALUES(?,?,?,?,0,?)",
+                (replayed["key"], host_id, old_hash, doctor.DOCTOR_LINK_VERSION, "2024-01-17T11:30:00Z"),
+            )
+
+        # Append an update naming bastet within the incident window: _matches_host matches,
+        # _host_hash changes (bypassing the cached 0), and LinkChecker sees updates!
+        raw_after = {
+            **raw_before,
+            "updated_at": "2024-01-16T18:00:00Z",
+            "updates": [{
+                "at": "2024-01-16T18:00:00Z",
+                "text": "Operators traced the missing votes to directory authority bastet.",
+                "sources": raw_before["sources"],
+            }],
+        }
+        with store.db:
+            store.db.execute(
+                "UPDATE stories SET updated_at=?,payload=? WHERE id=?",
+                ("2024-01-16T18:00:00Z", json.dumps(raw_after), host_id),
+            )
+        seen_payloads = []
+
+        class InspectingLinker(doctor.LinkChecker):
+            def __init__(self):
+                self.calls = 0
+
+            def complete(self, prompt, payload, schema, name):
+                self.calls += 1
+                seen_payloads.append(payload)
+                return {"reason": "Same bastet outage.", "same_incident": True}
+
+        linker = InspectingLinker()
+        res_attach = doctor.evaluate(cfg, store, cfg["sources"][0], linker, "2024-01-17T12:00:00Z")
+        assert linker.calls == 1 and res_attach["updates_written"] == 1 and res_attach["stories_written"] == 0
+        assert seen_payloads[0]["existing_story"]["updates"] == [
+            {"at": "2024-01-16T18:00:00Z", "text": "Operators traced the missing votes to directory authority bastet."}
+        ]
+
+    # 2) Existing site with early general publish_since (Jan 1) excludes incidents that closed
+    #    during dry-run (Jan 4) when network publication is first enabled on Jan 15.
+    _, cfg_dry = make_config(tmp_path / "cut", publish=False)
+    cfg_pub = {**cfg_dry, "sources": [{**cfg_dry["sources"][0], "publish": True}]}
+    with Store(cfg_dry["storage"]["database"]) as store:
+        store.set_meta(publish_since="2024-01-01T00:00:00Z")
+        closed_dry = bastet_incident_items(start_iso="2024-01-01T06:05:00Z", close=True)
+        doctor.ingest(store.db, cfg_dry["sources"][0], closed_dry, "2024-01-05T06:00:00Z")
+        assert doctor.evaluate(cfg_dry, store, cfg_dry["sources"][0], FakeLinker(), "2024-01-05T06:00:00Z")["stories_written"] == 0
+
+        res_enable = doctor.evaluate(cfg_pub, store, cfg_pub["sources"][0], FakeLinker(), "2024-01-15T06:30:00Z")
+        assert res_enable["stories_written"] == 0
+        assert any(r["code"] == "skipped.network.before_enable" for r in decision_rows(store))
+
+    # 3) Standalone write respects a locked editorial_controls row even if the stories row was deleted.
+    _, cfg_lock = make_config(tmp_path / "standalone_lock", publish=True)
+    with Store(cfg_lock["storage"]["database"]) as store:
+        open_items = bastet_incident_items(start_iso="2024-01-19T00:05:00Z", close=False)
+        doctor.ingest(store.db, cfg_lock["sources"][0], open_items, "2024-01-22T00:00:00Z")
+        assert doctor.evaluate(cfg_lock, store, cfg_lock["sources"][0], FakeLinker(), "2024-01-22T00:00:00Z")["stories_written"] == 1
+        standalone_id = store.stories()[0]["id"]
+        editorial.correct(
+            store.db, standalone_id, {"why_it_matters": "Operator-pinned alert context."},
+            reason="Pin alert context", expect_hash=editorial.show(store.db, standalone_id)["hash"], observed="2024-01-22T00:05:00Z",
+        )
+        with store.db:
+            store.db.execute("DELETE FROM stories WHERE id=?", (standalone_id,))
+        res_locked = doctor.evaluate(cfg_lock, store, cfg_lock["sources"][0], FakeLinker(), "2024-01-22T00:10:00Z")
+        assert res_locked["stories_written"] == 0
+        assert store.db.execute("SELECT COUNT(*) FROM stories WHERE id=?", (standalone_id,)).fetchone()[0] == 0

@@ -68,8 +68,10 @@ def test_controlled_corpus_is_blinded_and_covers_rubric():
     assert len({c["id"] for c in cases}) == len(cases)
     assert set(CRITERIA) <= {criterion for c in cases for criterion in c["coverage"]}
     assert any(c["expected"] == "approve" and "operational_advice" in c["coverage"] for c in cases)
-    assert any(c["scope"] == "latest_update" and c["expected"] == outcome for outcome in ("approve", "skip", "not_approve", "hold")
-               for c in cases)
+    assert all(
+        any(c["scope"] == "latest_update" and c["expected"] == outcome for c in cases)
+        for outcome in ("approve", "skip", "not_approve", "hold")
+    )
     assert any(c.get("expected_same_story") for c in cases)
     assert any("expected_same_story" in c and c["expected_same_story"] is None for c in cases)
     raw = json.loads((ROOT / "tools/review_cases.json").read_text())

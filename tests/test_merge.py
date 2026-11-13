@@ -733,3 +733,170 @@ def test_auto_merge_when_update_arrives_on_newer_duplicate_requeues_onto_origina
         assert res_final["status"] == "published"
         older_payload = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (older["id"],)).fetchone()[0])
         assert older_payload["updates"][-1]["text"] == "The stall only occurs when DirCache is disabled."
+
+
+def test_merge_transfers_or_requeues_story_locked_held_updates(tmp_path):
+    cfg = config(tmp_path)
+    with Store(cfg["storage"]["database"]) as store:
+        # Case A: locked duplicate with a held update merged into an UNLOCKED survivor -> requeued & stale review_job cleared.
+        surv_a = _publish(store, item(
+            url="https://example.org/surv-a",
+            title="Primary guard selection report",
+            content="Primary report covering guard selection anomaly in Tor 0.4.9.90.",
+        ), observed=EARLY)
+        dup_a_item = item(
+            url="https://example.org/dup-a",
+            title="Secondary guard selection report",
+            content="Secondary report covering guard selection anomaly in Tor 0.4.9.90.",
+            updated_at=EARLY,
+        )
+        dup_a = _publish(store, dup_a_item, observed=EARLY)
+        cli.build(cfg, store)
+        dup_a_rev = {**dup_a_item, "content": dup_a_item["content"] + " Follow-up confirmation.", "updated_at": LATER}
+        row_held_a = pending(store, dup_a_rev, LATER)
+        from onionflash.analyze import AnalysisError
+        with pytest.raises(AnalysisError):
+            run(
+                cfg,
+                store,
+                row_held_a,
+                Writer(update_analysis(update="Follow-up confirmation.", evidence=["Follow-up confirmation."])),
+                Reviewer(AnalysisError("timeout", retryable=True)),
+                observed=LATER,
+            )
+        assert store.db.execute("SELECT 1 FROM review_jobs WHERE item_id=?", (row_held_a["id"],)).fetchone() is not None
+        editorial.correct(
+            store.db, dup_a["id"], {"why_it_matters": "Operator-pinned context."},
+            reason="Pin context", expect_hash=editorial.show(store.db, dup_a["id"])["hash"], observed=MID,
+        )
+        assert run(cfg, store, row_held_a, Writer(), Reviewer(), observed=LATER)["status"] == "locked"
+        assert editorial.show(store.db, dup_a["id"])["held_updates"] == 1
+
+        editorial.merge(
+            store.db, dup_a["id"], surv_a["id"],
+            reason="Consolidate duplicate report", expect_hash=editorial.show(store.db, dup_a["id"])["hash"], observed=LATER,
+        )
+        item_after_a = store.db.execute("SELECT status,story_id FROM items WHERE id=?", (row_held_a["id"],)).fetchone()
+        assert tuple(item_after_a) == ("pending", surv_a["id"])
+        assert store.db.execute("SELECT 1 FROM review_jobs WHERE item_id=?", (row_held_a["id"],)).fetchone() is None
+
+        # Case B: locked duplicate with a held update merged into a LOCKED survivor -> hold transferred to survivor so unlock finds it.
+        surv_b = _publish(store, item(
+            url="https://example.org/surv-b",
+            title="Primary bridge reachability report",
+            content="Primary report covering bridge reachability issue in Tor 0.4.9.91.",
+        ), observed=EARLY)
+        dup_b_item = item(
+            url="https://example.org/dup-b",
+            title="Secondary bridge reachability report",
+            content="Secondary report covering bridge reachability issue in Tor 0.4.9.91.",
+            updated_at=EARLY,
+        )
+        dup_b = _publish(store, dup_b_item, observed=EARLY)
+        cli.build(cfg, store)
+        editorial.correct(
+            store.db, surv_b["id"], {"why_it_matters": "Survivor operator note."},
+            reason="Lock survivor", expect_hash=editorial.show(store.db, surv_b["id"])["hash"], observed=MID,
+        )
+        editorial.correct(
+            store.db, dup_b["id"], {"why_it_matters": "Duplicate operator note."},
+            reason="Lock duplicate", expect_hash=editorial.show(store.db, dup_b["id"])["hash"], observed=MID,
+        )
+        dup_b_rev = {**dup_b_item, "content": dup_b_item["content"] + " Additional bridge telemetry.", "updated_at": LATER}
+        row_held_b = pending(store, dup_b_rev, LATER)
+        assert run(cfg, store, row_held_b, Writer(), Reviewer(), observed=LATER)["status"] == "locked"
+
+        editorial.merge(
+            store.db, dup_b["id"], surv_b["id"],
+            reason="Consolidate into locked survivor", expect_hash=editorial.show(store.db, dup_b["id"])["hash"], observed=LATER,
+        )
+        surv_b_shown = editorial.show(store.db, surv_b["id"])
+        assert surv_b_shown["held_updates"] == 1
+        unlocked = editorial.unlock(
+            store.db, surv_b["id"],
+            reason="Resume automated updates", expect_hash=surv_b_shown["hash"], observed="2026-11-09T12:00:00Z",
+        )
+        assert unlocked["locked"] is False
+        item_after_b = store.db.execute("SELECT status,story_id FROM items WHERE id=?", (row_held_b["id"],)).fetchone()
+        assert tuple(item_after_b) == ("pending", surv_b["id"])
+
+
+def test_gitlab_refs_are_project_qualified_in_auto_merge_and_routing(tmp_path):
+    cfg = config(tmp_path)
+    with Store(cfg["storage"]["database"]) as store:
+        tor_story = _publish(
+            store,
+            item(
+                kind="gitlab_mr",
+                product="tor",
+                url="https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/123",
+                title="Backport circuit padding cleanup",
+                content="Backport !123 cleanup for C Tor relays.",
+            ),
+            draft=analysis(
+                title="C Tor backports circuit padding cleanup in !123",
+                summary="Merge request !123 cleans up circuit padding timers.",
+                products=["tor"],
+                evidence=["Backport !123 cleanup for C Tor relays."],
+            ),
+            observed=EARLY,
+        )
+        arti_story = _publish(
+            store,
+            item(
+                kind="gitlab_mr",
+                product="arti",
+                url="https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/123",
+                title="Refactor channel handshake state",
+                content="Refactor !123 channel handshake state in Arti.",
+            ),
+            draft=analysis(
+                title="Arti refactors channel handshake state in !123",
+                summary="Merge request !123 refactors channel handshake state.",
+                products=["arti"],
+                evidence=["Refactor !123 channel handshake state in Arti."],
+            ),
+            observed=MID,
+        )
+        cli.build(cfg, store)
+
+        # Bare "!123" from two different GitLab projects (tpo/core/tor vs tpo/core/arti) must NOT overlap or auto-merge!
+        assert review_gate._auto_merge_pair(store, tor_story["id"], arti_story["id"]) is None
+
+        # Same-project reference (#49200 on tpo/core/tor) DOES overlap and allow auto-merge.
+        same_issue = _publish(
+            store,
+            item(
+                kind="gitlab_issue",
+                product="tor",
+                url="https://gitlab.torproject.org/tpo/core/tor/-/issues/49200",
+                title="Guard sample persistence glitch",
+                content="Guard sample file fails atomic rename under load.",
+            ),
+            draft=analysis(
+                title="Guard sample persistence glitch under load",
+                summary="Guard sample file fails atomic rename under load.",
+                products=["tor"],
+                evidence=["Guard sample file fails atomic rename under load."],
+            ),
+            observed=EARLY,
+        )
+        same_mr = _publish(
+            store,
+            item(
+                kind="gitlab_mr",
+                product="tor",
+                url="https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/1090",
+                title="Fix atomic rename for #49200",
+                content="Fixes #49200 atomic rename handling.",
+            ),
+            draft=analysis(
+                title="Merge request fixes #49200 guard persistence",
+                summary="Fixes #49200 atomic rename handling.",
+                products=["tor"],
+                evidence=["Fixes #49200 atomic rename handling."],
+            ),
+            observed=MID,
+        )
+        cli.build(cfg, store)
+        assert review_gate._auto_merge_pair(store, same_issue["id"], same_mr["id"]) == (same_mr["id"], same_issue["id"])

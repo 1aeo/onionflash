@@ -219,15 +219,18 @@ _RELEASE_EOL = re.compile(r"\b(?:end[- ]of[- ]life|eol|out of support|no longer 
 _GITLAB_OWN = re.compile(r"^(https://[^/?#]+)/(.+?)/-/(?:issues|work_items|merge_requests|tags|blob)/\S+")
 _GITLAB_URL_REF = re.compile(r"^(https://[^/?#]+)/(.+?)/-/(issues|work_items|merge_requests)/(\d+)(?:/|$)")
 _GITLAB_SHORT_REF = re.compile(r"^(?:([a-z0-9_.-]+(?:/[a-z0-9_.-]+)+))?([#!])(\d+)$", re.I)
-_REF_TOKEN = r"(?:https://[^\s<>()\[\]\"']+|(?<![\w/#!])(?:[a-z0-9_.-]+(?:/[a-z0-9_.-]+)+)?[#!]\d+\b)"
 _CLOSING_SPAN = re.compile(
     r"\b(?:clos(?:e|es|ed|ing)|fix(?:|es|ed|ing)|resolv(?:e|es|ed|ing))\s*:?\s+("
-    + _REF_TOKEN + r"(?:\s*(?:,|and)\s*" + _REF_TOKEN + r")*)",
+    r"(?:https://[^\s<>()\[\]\"']+|(?<![\w/#!])(?:[a-z0-9_.-]+(?:/[a-z0-9_.-]+)+)?[#!]\d+\b)"
+    r"(?:\s*(?:,|and)\s*(?:https://[^\s<>()\[\]\"']+|(?<![\w/#!])(?:[a-z0-9_.-]+(?:/[a-z0-9_.-]+)+)?[#!]\d+\b))*)",
     re.I,
 )
-_ANY_REF = re.compile(_REF_TOKEN, re.I)
+_ANY_REF = re.compile(
+    r"(?:https://[^\s<>()\[\]\"']+|(?<![\w/#!])(?:[a-z0-9_.-]+(?:/[a-z0-9_.-]+)+)?[#!]\d+\b)",
+    re.I,
+)
 _RELEASE_MENTION = re.compile(
-    r"\b(tor[- ]browser|arti|tor)[- ](?:v|" + _RELEASE_QUALIFIERS + r")?(\d+\.\d+(?:[\w.-]*\w)?)(?![\w.])",
+    r"\b(tor[- ]browser|arti|tor)[- ](?:v|(?:(?:new|stable|alpha|beta|security|bugfix|release|version)\s+)*)?(\d+\.\d+(?:[\w.-]*\w)?)(?!(?:\w|\.\w))",
     re.I,
 )
 

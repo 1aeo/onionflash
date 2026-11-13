@@ -595,7 +595,7 @@ def test_human_lock_during_review_preserves_operator_text(context):
 
 
 def test_tag_update_holds_on_repair_and_keeps_prose_on_approval(context):
-    """A tag joining an existing prose story records a citation with zero model calls and unchanged prose."""
+    """A tag cites tagged/released stories directly, and updates merged stories without allowing tag_repair."""
     cfg, store = context
     original = item(title="Tor 0.4.9.16 released", kind="feed", content="Tor 0.4.9.16 was released with an announced change.")
     seed_legacy(store, original, analysis(title="Tor release announcement", state="tagged"))
@@ -605,6 +605,43 @@ def test_tag_update_holds_on_repair_and_keeps_prose_on_approval(context):
     assert result["status"] == "cited" and result["writer_calls"] == 0 and result["review_calls"] == 0
     story = store.stories()[0]
     assert story["title"] == "Tor release announcement" and "updates" not in story and len(story["sources"]) == 2
+
+    merged_item = item(
+        url="https://example.org/mr/0.4.9.17",
+        title="Tor 0.4.9.17 release branch merged",
+        kind="feed",
+        content="Release preparation branch for Tor 0.4.9.17 merged.",
+    )
+    seed_legacy(store, merged_item, analysis(title="Tor 0.4.9.17 branch merged", state="merged", category="release", tags=["tor", "release"]))
+    merged_story = next(s for s in store.stories() if "0.4.9.17" in s["title"])
+    tag17 = item(url="https://example.org/tags/tor-0.4.9.17", title="tor-0.4.9.17", kind="tag", content="", updated_at=LATER)
+    row17 = pending(store, tag17)
+    lit17 = update_analysis(
+        update="The upstream feed lists the tag “tor-0.4.9.17”.",
+        state="tagged",
+        confidence=merged_story["confidence"],
+        evidence=["tor-0.4.9.17"],
+    )
+    held17 = run(
+        cfg,
+        store,
+        row17,
+        Writer(lit17),
+        Reviewer(verdict("revise", update=True, repair={"state": "released"})),
+    )
+    assert held17["status"] == "held" and held17["review_calls"] == 1
+    assert store.db.execute("SELECT last_error FROM items WHERE id=?", (row17["id"],)).fetchone()[0] == (
+        "Final review held: review proposed editing a literal tag notice"
+    )
+
+    tag17b = item(url="https://example.org/tags/tor-0.4.9.17-mirror", title="tor-0.4.9.17", kind="tag", content="", updated_at=LATER)
+    row17b = pending(store, tag17b)
+    ok17 = run(cfg, store, row17b, Writer(lit17), Reviewer(verdict(update=True), verdict(update=True)))
+    assert ok17["status"] == "published"
+    updated17 = next(s for s in store.stories() if s["id"] == merged_story["id"])
+    assert updated17["title"] == "Tor 0.4.9.17 branch merged"
+    assert updated17["state"] == "tagged"
+    assert updated17["updates"][-1]["text"] == "The upstream feed lists the tag “tor-0.4.9.17”."
 
 
 def test_tag_draft_requires_final_review_and_waits_when_network_is_disabled(context):
@@ -1096,3 +1133,110 @@ def test_pending_update_draft_rewrites_when_another_update_commits_first(context
     res = run(cfg, store, rows["https://example.org/m1"], w1, Reviewer(verdict(update=True)))
     assert res["status"] == "published" and res["writer_calls"] == 1 and len(w1.calls) == 2
     assert len(store.stories()[0]["updates"]) == 2
+
+
+def test_own_comment_cutoff_ignores_other_sources_and_admits_edited_notes(context):
+    cfg, store = context
+    issue_url = "https://gitlab.torproject.org/tpo/core/tor/-/issues/49500"
+    canonical_issue_url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/49500"
+    issue_a = item(
+        id="gitlab:49500",
+        kind="gitlab_issue",
+        url=issue_url,
+        title="Tor 0.4.9.30 relay descriptor stall",
+        content="Initial report of descriptor stall in Tor 0.4.9.30.",
+        published_at="2026-11-08T10:00:00Z",
+        updated_at="2026-11-08T10:00:00Z",
+        public_comments=[],
+    )
+    row_a = pending(store, issue_a)
+    assert review_gate.process_item(
+        cfg,
+        store,
+        row_a,
+        Writer(analysis(
+            title="Descriptor stall reported in Tor 0.4.9.30",
+            summary="Initial report of descriptor stall in Tor 0.4.9.30.",
+            state="developing",
+            evidence=["Initial report of descriptor stall in Tor 0.4.9.30."],
+        )),
+        Reviewer(verdict(), verdict()),
+        "2026-11-08T10:05:00Z",
+    )["status"] == "published"
+    story_id = store.stories()[0]["id"]
+
+    # Another source adds an update dated Nov 10, advancing story["updated_at"] to Nov 10.
+    other_src = item(
+        kind="gitlab_mr",
+        url="https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/1950",
+        title="Investigate descriptor stall (closes #49500)",
+        content="Closes #49500 with diagnostic logging.",
+        upstream_state="merged",
+        published_at="2026-11-10T12:00:00Z",
+        updated_at="2026-11-10T12:00:00Z",
+    )
+    row_b = pending(store, other_src)
+    assert review_gate.process_item(
+        cfg,
+        store,
+        row_b,
+        Writer(update_analysis(
+            update="A merge request added diagnostic logging for the stall.",
+            state="merged",
+            evidence=["Closes #49500 with diagnostic logging."],
+        )),
+        Reviewer(verdict(update=True), verdict(update=True)),
+        "2026-11-10T12:05:00Z",
+    )["status"] == "published"
+    assert store.stories()[0]["updated_at"] == "2026-11-10T12:00:00Z"
+
+    # Issue A is re-polled on Nov 11 with a comment created on Nov 9 (after A's Nov 8 checkpoint, before B's Nov 10 update).
+    note_v1 = {
+        "id": "501",
+        "author": "maintainer",
+        "title": "Comment by maintainer",
+        "created_at": "2026-11-09T09:00:00Z",
+        "url": issue_url + "#note_501",
+        "body": "Root cause narrowed to malformed extra-info lines.",
+    }
+    issue_a_nov9 = {**issue_a, "updated_at": "2026-11-09T09:00:00Z", "public_comments": [note_v1]}
+    assert store.ingest(issue_a_nov9, "2026-11-11T08:00:00Z")
+    row_nov9 = store.pending(1, "2026-11-11T08:00:00Z")[0]
+    w_nov9 = Writer(update_analysis(
+        update="Maintainers narrowed the root cause to malformed extra-info lines.",
+        state="merged",
+        evidence=["Root cause narrowed to malformed extra-info lines."],
+    ))
+    res_nov9 = review_gate.process_item(cfg, store, row_nov9, w_nov9, Reviewer(verdict(update=True), verdict(update=True)), "2026-11-11T08:00:00Z")
+    assert res_nov9["status"] == "published" and len(w_nov9.calls) == 1
+    story_after_nov9 = next(s for s in store.stories() if s["id"] == story_id)
+    assert story_after_nov9["updates"][-1]["sources"] == [{"url": canonical_issue_url + "#note_501", "title": "Comment by maintainer"}]
+
+    # Later, the author edits note 501 in place (same id "501", same created_at Nov 9 <= cutoff, updated body at Nov 12).
+    note_v2 = {**note_v1, "body": "Correction: extra-info parsing was unaffected; bug is in routerstatus retry."}
+    issue_a_edited = {**issue_a, "updated_at": "2026-11-12T14:00:00Z", "public_comments": [note_v2]}
+    assert store.ingest(issue_a_edited, "2026-11-12T14:05:00Z")
+    row_edit = store.pending(1, "2026-11-12T14:05:00Z")[0]
+    w_edit = Writer(update_analysis(
+        update="A corrected maintainer note places the bug in routerstatus retry rather than extra-info parsing.",
+        state="merged",
+        evidence=["Correction: extra-info parsing was unaffected; bug is in routerstatus retry."],
+    ))
+    res_edit = review_gate.process_item(cfg, store, row_edit, w_edit, Reviewer(verdict(update=True), verdict(update=True)), "2026-11-12T14:05:00Z")
+    assert res_edit["status"] == "published" and len(w_edit.calls) == 1
+    story_after_edit = next(s for s in store.stories() if s["id"] == story_id)
+    assert story_after_edit["updates"][-1]["at"] == "2026-11-12T14:00:00Z"
+    assert story_after_edit["updates"][-1]["sources"] == [{"url": canonical_issue_url + "#note_501", "title": "Comment by maintainer"}]
+
+    # Re-polling when only quoted text is appended to note 501 (unquoted body unchanged) skips with 0 model calls.
+    note_v2_quoted = {**note_v2, "body": note_v2["body"] + "\n\n> Earlier quoted context."}
+    issue_a_same = {**issue_a, "updated_at": "2026-11-12T15:00:00Z", "public_comments": [note_v2_quoted]}
+    assert store.ingest(issue_a_same, "2026-11-12T15:05:00Z")
+    row_same = store.pending(1, "2026-11-12T15:05:00Z")[0]
+    res_same = review_gate.process_item(cfg, store, row_same, Writer(), Reviewer(), "2026-11-12T15:05:00Z")
+    assert res_same["status"] == "ignored" and res_same["writer_calls"] == 0 and res_same["review_calls"] == 0
+    assert store.db.execute("SELECT code FROM decision_log ORDER BY id DESC LIMIT 1").fetchone()[0] == "skipped.gate.no_new_content"
+    # Even when old_item=None (legacy story without an analyses snapshot) and item["url"] uses /-/issues/,
+    # _source_cutoff matches canonical /-/work_items/#note_501 in updates while ignoring other_src's date.
+    legacy_story = next(s for s in store.stories() if s["id"] == story_id)
+    assert review_gate.candidate_mod._source_cutoff(store.db, legacy_story, None, issue_a_edited) == "2026-11-12T14:00:00Z"

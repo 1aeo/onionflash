@@ -526,6 +526,7 @@ def test_update_mode_sends_prior_context_narrows_schema_and_validates(monkeypatc
     assert literal == tag_update(tag, prior)
     assert literal["update"] == "The upstream feed lists the tag “tor-0.4.9.16”."
     assert (literal["confidence"], literal["state"]) == ("confirmed", "released")
+    assert tag_update(tag, {**prior, "state": "merged"})["state"] == "tagged"
     assert tag_llm.client.requests == []
 
     row = {"content_hash": "h1"}

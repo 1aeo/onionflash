@@ -518,9 +518,12 @@ def _replay(reports: list[dict], authorities: tuple[str, ...] = AUTHORITIES) -> 
                 add_below("C", "network", ep["first"], ep["last"], ep["n"])
                 ep = None
             if ep is None:
-                ep = {"first": rep, "last": rep, "n": 0, "story": None, "members": [], "ep_record": None}
+                ep = {"first": rep, "last": rep, "n": 0, "hours": set(), "story": None, "members": [], "ep_record": None}
+            hour = rep["t"].replace(minute=0, second=0, microsecond=0)
             ep["last"] = rep
-            ep["n"] += 1
+            if hour not in ep["hours"]:
+                ep["hours"].add(hour)
+                ep["n"] += 1
             ep["members"].append(rep)
             if ep["story"] is None and ep["n"] >= C_COUNT:
                 vars_c = {"n": ep["n"], "first": ep["first"]["stamp"], "opened": rep["stamp"]}
@@ -714,6 +717,22 @@ def _event_text(event: dict) -> str:
     raise ValueError(f"Unknown event kind: {kind}")
 
 
+def _host_updates(incident: dict | None, public_host: dict) -> list[dict]:
+    low = high = None
+    if incident is not None:
+        low = parse_utc(incident["first"]["stamp"]) - HOST_LOOKBACK
+        high = parse_utc((incident["closed"] or incident["last"])["stamp"]) + HOST_LOOKAHEAD
+    relevant = [
+        {"at": u["at"], "text": u["text"]}
+        for u in (public_host.get("updates") or ())
+        if isinstance(u, dict)
+        and isinstance(u.get("at"), str)
+        and isinstance(u.get("text"), str)
+        and (low is None or low <= parse_utc(u["at"]) <= high)
+    ]
+    return relevant[-10:]
+
+
 class LinkChecker(CompletionClient):
     """Tiny one-bit yes/no model check for attaching a DocTor incident to an existing host story."""
 
@@ -722,6 +741,15 @@ class LinkChecker(CompletionClient):
     def confirm(self, incident: dict, host: dict) -> bool:
         title = _story_title(incident["rule"], incident["subject"])
         summary = _story_summary(incident["rule"], incident["open_vars"])
+        existing_story = {
+            "title": host["title"],
+            "summary": host["summary"],
+            "why_it_matters": host["why_it_matters"],
+            "category": host["category"],
+            "published_at": host["published_at"],
+        }
+        if updates := _host_updates(incident, host):
+            existing_story["updates"] = updates
         payload = {
             "doctor_incident": {
                 "rule": incident["rule"],
@@ -731,13 +759,7 @@ class LinkChecker(CompletionClient):
                 "first_report_at": incident["first"]["stamp"],
                 "opened_at": incident["opened"]["stamp"],
             },
-            "existing_story": {
-                "title": host["title"],
-                "summary": host["summary"],
-                "why_it_matters": host["why_it_matters"],
-                "category": host["category"],
-                "published_at": host["published_at"],
-            },
+            "existing_story": existing_story,
         }
         reply = self.complete(DOCTOR_LINK_PROMPT, payload, DOCTOR_LINK_SCHEMA, "onionflash_doctor_link")
         if (
@@ -751,8 +773,11 @@ class LinkChecker(CompletionClient):
         return reply["same_incident"]
 
 
-def _host_hash(public_host: dict) -> str:
-    return digest({key: public_host[key] for key in ("title", "summary", "why_it_matters", "category", "published_at")})
+def _host_hash(public_host: dict, incident: dict | None = None) -> str:
+    base = {key: public_host[key] for key in ("title", "summary", "why_it_matters", "category", "published_at")}
+    if updates := _host_updates(incident, public_host):
+        base["updates"] = updates
+    return digest(base)
 
 
 def _matches_host(incident: dict, public_host: dict) -> bool:
@@ -762,7 +787,8 @@ def _matches_host(incident: dict, public_host: dict) -> bool:
     host_upd = parse_utc(public_host["updated_at"])
     if host_upd < inc_start - HOST_LOOKBACK or host_pub > inc_end + HOST_LOOKAHEAD:
         return False
-    haystack = f"{public_host['title']}\n{public_host['summary']}"
+    updates = _host_updates(incident, public_host)
+    haystack = "\n".join([public_host["title"], public_host["summary"], *(u["text"] for u in updates)])
     rule = incident["rule"]
     if rule == "A":
         return re.search(rf"\b{re.escape(incident['subject'])}\b", haystack, re.IGNORECASE) is not None
@@ -815,7 +841,7 @@ def candidate_hosts(db, incident: dict, *, source_id: str | None = None, observe
             "id": row["id"],
             "raw": raw,
             "public": public,
-            "hash": _host_hash(public),
+            "hash": _host_hash(public, incident),
         })
         if len(candidates) >= MAX_HOST_CANDIDATES:
             break
@@ -927,7 +953,7 @@ def _story_sources(existing_sources: list[dict], network_key: str, opening_ref: 
     return kept
 
 
-def _write_story_tx(db, story_id: str, cluster_key: str, payload: dict, *, must_be_unlocked: bool = True) -> bool:
+def _write_story_tx(db, story_id: str, cluster_key: str, payload: dict) -> bool:
     """Write a validated story inside BEGIN IMMEDIATE; return False if locked mid-run."""
     public = render._prepare_story(payload, editorial=editorial.public_metadata(db, story_id))
     stored = dict(payload)
@@ -940,7 +966,7 @@ def _write_story_tx(db, story_id: str, cluster_key: str, payload: dict, *, must_
     text.encode("utf-8")
     db.execute("BEGIN IMMEDIATE")
     try:
-        if must_be_unlocked and editorial.is_locked(db, story_id):
+        if editorial.is_locked(db, story_id):
             db.execute("ROLLBACK")
             return False
         if editorial.retired(db, story_id=story_id, cluster_key=cluster_key) is not None:
@@ -972,20 +998,25 @@ def evaluate(
     db = store.db
     publish_enabled = bool(source.get("publish", False))
     with db:
-        publish_since = _get_meta(db, "network_publish_since") or _get_meta(db, "publish_since")
+        network_since = _get_meta(db, "network_publish_since")
+        site_since = _get_meta(db, "publish_since")
         was_active = _get_meta(db, "network_publish_active")
         ever_enabled = _get_meta(db, "network_ever_enabled")
         if publish_enabled:
             if was_active != "1":
                 if ever_enabled == "1":
-                    publish_since = max(publish_since, observed) if publish_since else observed
+                    publish_since = max(filter(None, (network_since, site_since, observed)))
                 else:
-                    publish_since = publish_since or observed
+                    publish_since = network_since or (max(site_since, observed) if site_since else observed)
                 _set_meta(db, "network_publish_since", publish_since)
                 _set_meta(db, "network_ever_enabled", "1")
                 _set_meta(db, "network_publish_active", "1")
-        elif was_active != "0":
-            _set_meta(db, "network_publish_active", "0")
+            else:
+                publish_since = network_since or site_since
+        else:
+            publish_since = network_since if ever_enabled == "1" else (site_since if site_since and site_since > observed else None)
+            if was_active != "0":
+                _set_meta(db, "network_publish_active", "0")
 
     pinned = _pinned_records(db)
     active_authorities = tuple(
@@ -1244,7 +1275,7 @@ def evaluate(
                 }
                 if due:
                     payload["updates"] = [{"at": u["at"], "text": u["text"], "sources": u["sources"]} for u in due]
-                if _write_story_tx(db, standalone_id, standalone_cluster, payload, must_be_unlocked=False):
+                if _write_story_tx(db, standalone_id, standalone_cluster, payload):
                     with db:
                         decisions.record_subject(
                             db,
@@ -1370,7 +1401,9 @@ def status(db, sources: list[dict]) -> dict:
         mode = "publish"
     else:
         mode = "dry_run"
-    publish_since = _get_meta(db, "network_publish_since") or _get_meta(db, "publish_since")
+    network_since = _get_meta(db, "network_publish_since")
+    site_since = _get_meta(db, "publish_since")
+    publish_since = network_since if _get_meta(db, "network_ever_enabled") == "1" else network_since or (site_since if mode == "publish" else None)
     count, last_report_at = db.execute("SELECT COUNT(*), MAX(stamp) FROM network_reports").fetchone()
     if not active_sources and not count:
         return {

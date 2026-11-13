@@ -28,7 +28,7 @@ def test_plain_text_flushes_incomplete_html_and_normalizes_line_endings():
 
 
 
-@pytest.mark.parametrize("state", ["developing", "fixed", "resolved", "mitigation-available", "merged", "released"])
+@pytest.mark.parametrize("state", ["tagged", "released"])
 def test_tag_never_replaces_richer_story_in_same_release_cluster(tmp_path, state):
     from onionflash import review_gate
 
@@ -39,7 +39,7 @@ def test_tag_never_replaces_richer_story_in_same_release_cluster(tmp_path, state
         def review(self, *args, **kwargs):
             raise AssertionError("tag citation must not call reviewer")
 
-    cfg = load_config(tmp_path / "missing.toml") if False else {"storage": {"database": str(tmp_path / "state.db")}, "review": {"model": "test"}}
+    cfg = {"storage": {"database": str(tmp_path / "state.db")}, "review": {"model": "test"}}
     existing_item = item(
         kind="feed", product="tor", title="Tor 0.4.9.16 release update",
         url="https://example.org/release-update",
@@ -57,6 +57,42 @@ def test_tag_never_replaces_richer_story_in_same_release_cluster(tmp_path, state
     assert story["title"] == existing_result["title"]
     assert story["summary"] == existing_result["summary"]
     assert story["state"] == state and story["updated_at"] == before_updated and len(story["sources"]) == 2
+
+
+@pytest.mark.parametrize("state", ["developing", "fixed", "resolved", "mitigation-available", "merged"])
+def test_tag_on_pre_release_story_runs_update_review_without_replacing_prose(tmp_path, monkeypatch, state):
+    from onionflash import analyze as analyze_mod, review_gate
+    from test_core import config as make_cfg
+
+    class FailTransport:
+        def complete(self, *args, **kwargs):
+            raise AssertionError("literal tag update must not call writer model")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(analyze_mod, "CompletionClient", lambda *a, **kw: FailTransport())
+    cfg = make_cfg(tmp_path)
+    existing_item = item(
+        kind="feed", product="tor", title="Tor 0.4.9.16 release preparation",
+        url="https://example.org/release-prep",
+    )
+    existing_result = analysis(title="Detailed pre-release progress note", state=state)
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest(existing_item, DATE)
+        finish_reviewed(store, store.pending(1, DATE)[0], existing_result, "detailed", DATE)
+        later = tag(updated_at="2026-11-09T16:00:00Z")
+        store.ingest(later, DATE)
+        with analyze_mod.Analyzer(cfg) as writer:
+            outcome = review_gate.process_item(
+                cfg, store, store.pending(1, DATE)[0], writer, ApprovingReviewer(cfg), "2026-11-09T16:05:00Z"
+            )
+        story = store.stories(1)[0]
+    assert outcome["status"] == "published" and outcome["writer_calls"] == 0 and outcome["review_calls"] == 2
+    assert story["title"] == existing_result["title"]
+    assert story["summary"] == existing_result["summary"]
+    assert story["state"] == ("tagged" if state == "merged" else state)
+    assert story["updates"][-1]["text"] == "The upstream feed lists the tag “tor-0.4.9.16”."
 
 
 def test_oversized_feed_keeps_bounded_items_and_uses_normal_catchup_interval(tmp_path):

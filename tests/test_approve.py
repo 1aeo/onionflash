@@ -691,3 +691,40 @@ def test_single_field_record_and_binding_tampering_refuses(tmp_path, tamper, exp
         info = review_gate.approval(cfg, store, row["id"])
         assert info["eligible"] is False
         assert expected_reason in info["reason"]
+
+
+@pytest.mark.parametrize("bad_updates", [[{}], ["malformed"], "not-a-list", [{"at": LATER}]])
+def test_malformed_saved_update_entries_refuse_without_raising(tmp_path, bad_updates):
+    cfg = config(tmp_path)
+    with Store(cfg["storage"]["database"]) as store:
+        first = item(
+            url="https://example.org/orig",
+            title="Initial relay report",
+            content="Initial relay report on directory fetch behavior.",
+        )
+        store.ingest(first, DATE)
+        finish_reviewed(store, store.pending(1, DATE)[0], analysis(), "seed-orig", DATE)
+
+        follow = item(
+            url="https://example.org/orig",
+            title="Initial relay report",
+            content="Initial relay report on directory fetch behavior. Later maintainer confirmation.",
+            updated_at=LATER,
+        )
+        row = hold_news_dispute(
+            cfg,
+            store,
+            incoming=follow,
+            draft=update_analysis(
+                update="Maintainers confirmed the directory fetch behavior.",
+                evidence=["Later maintainer confirmation."],
+            ),
+        )
+        saved = store.db.execute("SELECT record_json FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
+        record = json.loads(saved["record_json"])
+        record["candidate"]["updates"] = bad_updates
+        with store.db:
+            store.db.execute("UPDATE review_jobs SET record_json=? WHERE item_id=?", (json.dumps(record), row["id"]))
+        info = review_gate.approval(cfg, store, row["id"])
+        assert info["eligible"] is False
+        assert info["reason"] == "Saved review record cannot be read"

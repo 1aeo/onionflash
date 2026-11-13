@@ -116,7 +116,7 @@ is a deployment configuration choice; see the deployment repository's guide.
 ## Network-health alerts
 
 A feed source with `alert_format = "consensus"` and a configured `website_url`
-collects machine-formatted DocTor reports from `tor-consensus-health` into a
+(at most one consensus alert source may be enabled) collects machine-formatted DocTor reports from `tor-consensus-health` into a
 separate `network_reports` table. These entries never enter `items` or reach the
 model writer queue; human replies and non-report summaries on the list are
 skipped and logged once as `skipped.network.not_report`, and undated feed entries

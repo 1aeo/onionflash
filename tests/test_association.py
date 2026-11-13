@@ -73,6 +73,13 @@ def test_pure_reference_release_mention_and_thread_helpers():
         "release:tor-browser:16.0",
         "release:arti:2.8.0",
     ]
+    assert release_mentions(item(title="", content="Operators upgraded to Tor 0.4.9.16.")) == [
+        "release:tor:0.4.9.16"
+    ]
+    assert release_mentions(item(title="", content="Operators upgraded to Tor Browser 16.0.1.")) == [
+        "release:tor-browser:16.0.1"
+    ]
+    assert release_mentions(item(title="", content="Malformed build Tor 0.4.9.16.1.")) == []
 
     assert thread_subject(item(url=LIST_BASE + "ABC/", title="[tor-relays] Re: re. Guard flag drop across relays")) == (
         "guard flag drop across relays",
@@ -267,8 +274,9 @@ def test_mr_closing_and_list_reply_association_boundaries(tmp_path):
 def test_relations_tag_citation_locked_hold_upgrade_and_update(tmp_path):
     cfg = config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
-        # Tag first -> community post upgrades tag -> official announcement upgrades community post ->
-        # reported follow-up becomes update -> late tag on locked story records held update.
+        # Tag first -> community post upgrades tag in story scope -> official announcement updates
+        # published prose in update scope without replacing title/summary -> reported follow-up
+        # appends another update -> late tag on locked story records held update.
         tag_first = item(kind="tag", authority="official", title="tor-0.4.9.20", content="",
                          url="https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-0.4.9.20")
         row = pending(store, tag_first)
@@ -280,6 +288,7 @@ def test_relations_tag_citation_locked_hold_upgrade_and_update(tmp_path):
                               content="Community summary of Tor 0.4.9.20 changes.")
         row = pending(store, community_post)
         comm_draft = analysis(title="Community note on Tor 0.4.9.20", summary="Community summary of Tor 0.4.9.20 changes.",
+                              why_it_matters="Operators can review the reported Tor 0.4.9.20 changes.",
                               confidence="reported", state="released", category="release", tags=["tor", "release"],
                               evidence=["Community summary of Tor 0.4.9.20 changes."])
         assert run(cfg, store, row, Writer(comm_draft), Reviewer(verdict()))["status"] == "published"
@@ -289,14 +298,16 @@ def test_relations_tag_citation_locked_hold_upgrade_and_update(tmp_path):
                             url="https://lists.torproject.org/tor-announce/0.4.9.20",
                             content="Official Tor 0.4.9.20 release announcement with security fixes.")
         row = pending(store, official_ann)
-        ann_draft = analysis(title="Tor 0.4.9.20 released with security fixes",
-                             summary="Official Tor 0.4.9.20 release announcement with security fixes.",
-                             confidence="confirmed", state="released", category="release", tags=["tor", "release"],
-                             evidence=["Official Tor 0.4.9.20 release announcement"])
-        assert run(cfg, store, row, Writer(ann_draft), Reviewer(verdict()))["status"] == "published"
-        upgraded = store.stories()[0]
-        assert upgraded["title"] == "Tor 0.4.9.20 released with security fixes"
-        assert upgraded["confidence"] == "confirmed"
+        ann_upd = update_analysis(update="Official announcement confirms Tor 0.4.9.20 with security fixes.",
+                                  confidence="confirmed", state="released",
+                                  evidence=["Official Tor 0.4.9.20 release announcement with security fixes."])
+        assert run(cfg, store, row, Writer(ann_upd), Reviewer(verdict(update=True)))["status"] == "published"
+        after_ann = store.stories()[0]
+        assert after_ann["title"] == "Community note on Tor 0.4.9.20"
+        assert after_ann["summary"] == "Community summary of Tor 0.4.9.20 changes."
+        assert after_ann["why_it_matters"] == "Operators can review the reported Tor 0.4.9.20 changes."
+        assert after_ann["confidence"] == "confirmed"
+        assert after_ann["updates"][-1]["text"] == "Official announcement confirms Tor 0.4.9.20 with security fixes."
 
         followup = item(kind="feed", authority="community", title="Tor 0.4.9.20 released: operator notes",
                         url="https://lists.torproject.org/tor-relays/0.4.9.20-notes",
@@ -307,7 +318,8 @@ def test_relations_tag_citation_locked_hold_upgrade_and_update(tmp_path):
                                     evidence=["Relay operators report clean upgrades on Debian bookworm."])
         assert run(cfg, store, row, Writer(upd_draft), Reviewer(verdict(update=True)))["status"] == "published"
         after_upd = store.stories()[0]
-        assert after_upd["title"] == "Tor 0.4.9.20 released with security fixes"
+        assert after_upd["title"] == "Community note on Tor 0.4.9.20"
+        assert len(after_upd["updates"]) == 2
         assert after_upd["updates"][-1]["text"] == "Relay operators report clean upgrades on Debian bookworm."
 
         # Lock the story: a second tag holds as held.gate.story_locked rather than mutating sources.
@@ -320,6 +332,28 @@ def test_relations_tag_citation_locked_hold_upgrade_and_update(tmp_path):
         locked_out = run(cfg, store, row, Writer(), Reviewer())
         assert locked_out["status"] == "locked" and locked_out["writer_calls"] == 0 and locked_out["review_calls"] == 0
         assert editorial.show(store.db, after_upd["id"])["held_updates"] == 1
+
+        # A metrics_timeline entry (tier 1) IS upgraded in story scope by a prose release post (tier 2).
+        timeline_item = item(kind="metrics_timeline", authority="official", title="Tor 0.4.9.21 released",
+                             source_entry_id="tl-0.4.9.21",
+                             url="https://gitlab.torproject.org/tpo/network-health/metrics/timeline/-/blob/main/README.md#21",
+                             content="Timeline entry noting Tor 0.4.9.21.")
+        row_tl = pending(store, timeline_item)
+        tl_draft = analysis(title="Timeline entry for Tor 0.4.9.21", summary="Timeline entry noting Tor 0.4.9.21.",
+                            confidence="confirmed", state="released", category="release", tags=["tor", "release"],
+                            evidence=["Timeline entry noting Tor 0.4.9.21."])
+        assert run(cfg, store, row_tl, Writer(tl_draft), Reviewer(verdict()))["status"] == "published"
+        prose_after_tl = item(kind="feed", authority="community", title="Tor 0.4.9.21 released",
+                              url="https://forum.example.org/tor-0-4-9-21",
+                              content="Full release prose covering Tor 0.4.9.21 relay changes.")
+        row_prose = pending(store, prose_after_tl)
+        prose_draft = analysis(title="Tor 0.4.9.21 brings relay changes",
+                               summary="Full release prose covering Tor 0.4.9.21 relay changes.",
+                               confidence="confirmed", state="released", category="release", tags=["tor", "release"],
+                               evidence=["Full release prose covering Tor 0.4.9.21 relay changes."])
+        assert run(cfg, store, row_prose, Writer(prose_draft), Reviewer(verdict()))["status"] == "published"
+        tl_story = next(s for s in store.stories() if "0.4.9.21" in s["title"])
+        assert tl_story["title"] == "Tor 0.4.9.21 brings relay changes"
 
 
 def test_coverage_activity_order_retracted_markers_truncation_and_reconsideration(tmp_path):
