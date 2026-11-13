@@ -38,8 +38,10 @@ class Reviewer:
                 isinstance(responses[0], dict) and responses[0].get("verdict") == "approve"):
             self.responses.append(verdict())
 
-    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
+    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, on_request=None):
         """Capture exact review inputs and validate or raise the next scripted response."""
+        if on_request is not None:
+            on_request(1)
         self.calls.append((copy.deepcopy(candidate), copy.deepcopy(packet), verification))
         self.coverages.append(copy.deepcopy(coverage))
         self.issues.append(issue)
@@ -201,7 +203,7 @@ def test_verification_refusal_that_cannot_be_repaired_holds(context, case):
     assert audit(store)["verified_facts"] is False  # the verification failed a factual criterion
 
 
-def test_verification_repairs_stop_after_five_and_the_count_survives_interruption(context):
+def test_request_limit_includes_failed_attempts_and_survives_interruption(context):
     cfg, store = context
     row = pending(store)
     repairs = [verdict("revise", repair={"summary": f"Repair number {n}."}) for n in range(7)]
@@ -210,17 +212,19 @@ def test_verification_repairs_stop_after_five_and_the_count_survives_interruptio
         run(cfg, store, row, Writer(), Reviewer(*repairs[:4], AnalysisError("timeout", retryable=True)))
     assert job(store)["stage"] == "verify"
     writer, checker = Writer(), Reviewer(*repairs[4:])
-    result = run(cfg, store, row, writer, checker)
-    assert result["status"] == "held" and result["writer_calls"] == 0 and result["review_calls"] == 3
-    assert writer.calls == [] and [call[2] for call in checker.calls] == [True, True, True]
-    assert codes(store, row) == ["held.verification.repairs_exhausted"] and store.stories() == []
-    # Seven reviews: the critique and six verifications. The sixth verification's repair is never applied.
+    with pytest.raises(review.ReviewLimitReached):
+        run(cfg, store, row, writer, checker)
+    assert writer.calls == [] and [call[2] for call in checker.calls] == [True, True]
+    assert codes(store, row) == ["failed.review.request_limit"] and store.stories() == []
+    assert json.loads(job(store)["record_json"])["request_budget"]["reserved"] == 7
+    # Six validated reviews plus the failed transport attempt spend all seven
+    # requests. The last repair cannot publish without another verification.
     shown = rejection.show_item(store, row["id"])["final_review"]
-    assert shown["hold_code"] == "repairs_exhausted" and shown["candidate"]["summary"] == "Repair number 5."
+    assert shown["candidate"]["summary"] == "Repair number 5."
     assert shown["base_candidate"]["summary"] == analysis()["summary"]
-    assert [(entry["phase"], entry["verdict"]) for entry in shown["reviews"]] == [("review", "revise")] + [("verification", "revise")] * 6
+    assert [(entry["phase"], entry["verdict"]) for entry in shown["reviews"]] == [("review", "revise")] + [("verification", "revise")] * 5
     assert all(entry["failed"] == {"operational_advice": "fail: The source does not support this claim."} for entry in shown["reviews"])
-    assert [entry["repair"]["summary"] for entry in shown["reviews"]] == [f"Repair number {n}." for n in range(7)]
+    assert [entry["repair"]["summary"] for entry in shown["reviews"]] == [f"Repair number {n}." for n in range(6)]
 
 
 @pytest.mark.parametrize("replies,status", [
@@ -916,8 +920,10 @@ def test_unusable_replies_and_drafts_take_strikes_and_the_run_still_builds(conte
 
     class Replies:
         calls = 0
-        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, on_request=None):
             """Return malformed replies only for the designated failure fixtures."""
+            if on_request is not None:
+                on_request(1)
             return review.validate_review({} if "/reply" in packet["sources"][0]["url"] else verdict(), packet)
 
     built = []

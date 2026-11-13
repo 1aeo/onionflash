@@ -12,7 +12,7 @@ from .util import digest, normalize_evidence as _plain
 from .comments import analysis_context
 from .schema import CATEGORIES, PRIORITIES, CONFIDENCES, STATES, PRODUCTS
 
-PROMPT_VERSION = "onionflash-15"
+PROMPT_VERSION = "onionflash-16"
 MIN_EVIDENCE_CHARS = 8
 MAX_EVIDENCE_CHOICES = 128
 SCHEMA = {
@@ -299,7 +299,7 @@ class CompletionClient:
         if self.client is not None:
             self.client.close()
 
-    def complete(self, prompt: str, payload: dict, schema: dict, name: str) -> dict:
+    def complete(self, prompt: str, payload: dict, schema: dict, name: str, *, on_request=None) -> dict:
         """One fresh request; both drafting and review share transport policy."""
         if not self.llm["base_url"]:
             raise AnalysisError("LLM endpoint is not configured", retryable=True)
@@ -325,12 +325,14 @@ class CompletionClient:
         }
         if self.llm["send_chat_template_kwargs"]:
             request["chat_template_kwargs"] = {"enable_thinking": self.llm["enable_thinking"]}
-        return self._complete(request, key)
+        return self._complete(request, key, **({"on_request": on_request} if on_request is not None else {}))
 
-    def _complete(self, request: dict, key: str) -> dict:
+    def _complete(self, request: dict, key: str, *, on_request=None) -> dict:
         """POST one chat completion; only transport failures move on to a fallback."""
         failure = AnalysisError("All LLM endpoints failed", retryable=True)
         for base_url in [self.llm["base_url"], *self.llm["fallback_base_urls"]]:
+            if on_request is not None:
+                on_request(1)  # Reserve durably before any endpoint attempt.
             self.calls += 1
             try:
                 response = self.client.request(
@@ -348,6 +350,8 @@ class CompletionClient:
                 )
                 if isinstance(exc, DeadlineReached):  # refused unsent, as every later endpoint would be
                     self.calls -= 1
+                    if on_request is not None:
+                        on_request(-1)
                     raise failure from None
         else:
             raise failure

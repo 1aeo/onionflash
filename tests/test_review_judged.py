@@ -238,7 +238,9 @@ def test_judged_corpus_is_public_and_labeled(tmp_path, monkeypatch, capsys):
             return self
         def __exit__(self, *args):
             pass
-        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, on_request=None):
+            if on_request is not None:
+                on_request(1)
             return approved_result(packet)
 
     config = copy.deepcopy(DEFAULTS)

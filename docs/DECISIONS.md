@@ -83,6 +83,7 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `failed.review.invalid_input` | The review request could not be encoded as UTF-8 JSON. |
 | `failed.review.truncated` | A review reply was cut off or refused. |
 | `failed.review.invalid_json` | A review reply was not a JSON object. |
+| `failed.review.request_limit` | The item's durable review request budget is exhausted; no further request was sent. |
 | `failed.app.invalid_tag_name` | A collected tag has an empty or overlong name. |
 | `failed.app.unexpected` | Processing failed unexpectedly. |
 | `failed.app.damaged_item` | The item's saved copy is damaged. |

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import re
 
 from .analyze import AnalysisError, CompletionClient, SCHEMA as DRAFT_SCHEMA, label_limits
@@ -10,7 +11,7 @@ from .candidate import SEMANTIC_FIELDS as EDITABLE
 from .render import _prepare_story
 from .util import digest, normalize_evidence
 
-REVIEW_VERSION = "onionflash-review-10"
+REVIEW_VERSION = "onionflash-review-11"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details", "news_value", "new_information")
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
@@ -288,6 +289,23 @@ class ReviewError(AnalysisError):
     code = "review.invalid_reply"
 
 
+INCONSISTENT_VERDICT = "Review refusal requires an explicit failed criterion"
+
+
+class InconsistentReview(ReviewError):
+    """An invalid verdict may carry a structurally checked, untrusted edit only."""
+
+    def __init__(self, proposal=None):
+        super().__init__(INCONSISTENT_VERDICT)
+        self.proposal = copy.deepcopy(proposal)
+
+
+class ReviewLimitReached(ReviewError):
+    """No further endpoint request fits the item's durable review budget."""
+
+    code = "review.request_limit"
+
+
 OUTPUT_TOKENS = 2200  # room for every criterion and a repair
 
 
@@ -301,7 +319,7 @@ def policy_hash(config: dict) -> str:
     llm = _llm(config)
     identity = {key: llm[key] for key in ("model", "base_url", "fallback_base_urls", "max_output_tokens",
                                          "enable_thinking", "send_chat_template_kwargs")}
-    return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, RELEASE_ISSUE, SCHEMA, identity])
+    return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, RELEASE_ISSUE, INCONSISTENT_VERDICT, SCHEMA, identity])
 
 
 def _text(value, maximum: int, *, empty: bool = False) -> None:
@@ -316,8 +334,8 @@ def _packet_refs(packet: dict) -> set[str]:
     return {source["id"] for source in sources} | {passage["id"] for source in sources for passage in source["passages"]}
 
 
-def apply_repair(candidate: dict, repair: dict) -> dict:
-    """Normalize a minimal semantic repair BEFORE its independent verification."""
+def _repair_fields(repair: dict) -> None:
+    """Check editable field shapes and values without granting factual approval."""
     if not isinstance(repair, dict) or not repair or set(repair) - set(EDITABLE):
         raise ReviewError("Repair contains unsupported or immutable fields")
     for key, value in repair.items():
@@ -331,6 +349,27 @@ def apply_repair(candidate: dict, repair: dict) -> dict:
         elif (not isinstance(value, list) or len(value) > rule["maxItems"]
               or any(not isinstance(entry, str) or entry not in rule["items"]["enum"] for entry in value)):
             raise ReviewError("Invalid repair labels")
+    try:
+        json.dumps(repair, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (ValueError, TypeError, UnicodeError):
+        raise ReviewError("Repair is not valid UTF-8 JSON") from None
+
+
+def untrusted_repair(verdict, repair):
+    """Extract only a complete valid edit; the inconsistent reply still fails validation."""
+    if verdict != "revise" or not isinstance(repair, dict) or set(repair) != set(EDITABLE):
+        return None
+    edits = {key: value for key, value in repair.items() if value is not None}
+    try:
+        _repair_fields(edits)
+    except ReviewError:
+        return None
+    return edits
+
+
+def apply_repair(candidate: dict, repair: dict) -> dict:
+    """Normalize a minimal semantic repair BEFORE its independent verification."""
+    _repair_fields(repair)
     updated = {**copy.deepcopy(candidate), **copy.deepcopy(repair)}
     try:
         normalized = _prepare_story(updated, editorial=updated.get("editorial"))
@@ -370,7 +409,7 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False) -> dict:
         if failed or repair is not None or not result["criteria"]["source_support"]["source_refs"]:
             raise ReviewError("Review approval requires all criteria to pass without edits")
     elif not failed:
-        raise ReviewError("Review refusal requires an explicit failed criterion")
+        raise InconsistentReview(untrusted_repair(verdict, repair))
     if not wire and verdict == "skip" and not any(result["criteria"][name]["outcome"] == "fail" for name in EDITORIAL_CRITERIA):
         # Reviewer.review holds a reply's skip like this, so a saved one is damaged.
         raise ReviewError("Review skip requires a failed editorial criterion")
@@ -463,7 +502,7 @@ class Reviewer(CompletionClient):
         super().__init__({**config, "llm": _llm(config)}, deadline=deadline)
 
     def review(self, candidate_public: dict, packet: dict, *, coverage: dict | None = None, verification: bool = False,
-               issue: str | None = None) -> dict:
+               issue: str | None = None, on_request=None) -> dict:
         """Review one exact candidate without carrying forward earlier model replies; `issue` names a
         problem the application found in it."""
         refs = _packet_refs(packet)
@@ -484,7 +523,8 @@ class Reviewer(CompletionClient):
         if issue is not None:
             payload["application_issue"] = issue
         result = self.complete(VERIFY_PROMPT if verification else SYSTEM_PROMPT,
-                               payload, schema, "onionflash_review")
+                               payload, schema, "onionflash_review",
+                               **({"on_request": on_request} if on_request is not None else {}))
         result = _validate(result, refs, wire=True)
         if result["verdict"] == "skip" and not _skip_stands(result["criteria"], coverage):
             # The record keeps the verdict that this fixed rule replaced.

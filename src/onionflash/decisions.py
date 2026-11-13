@@ -25,7 +25,7 @@ CODES = frozenset({
     *(f"held.final_check.{reason}" for reason in ("completed_action", "compromise_headline", "confirmed_source", "merge_state")),
     *(f"failed.writer.{reason}" for reason in ("invalid_output", "evidence_too_short", "evidence_not_exact",
                                                "no_literal_evidence", "invalid_input", "truncated", "invalid_json")),
-    *(f"failed.review.{reason}" for reason in ("invalid_reply", "invalid_input", "truncated", "invalid_json")),
+    *(f"failed.review.{reason}" for reason in ("invalid_reply", "invalid_input", "truncated", "invalid_json", "request_limit")),
     "failed.app.invalid_tag_name", "failed.app.unexpected", "failed.app.damaged_item", "failed.app.damaged_job",
     "operator.retried", "operator.reconsidered", "operator.dismissed", "operator.approved",
 })
