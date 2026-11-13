@@ -5,7 +5,7 @@ import json
 import pytest
 
 from helpers import update_analysis, verdict
-from onionflash import cli, editorial, review, review_gate
+from onionflash import candidate, cli, doctor, editorial, review, review_gate
 from onionflash.analyze import AnalysisError
 from onionflash.transport import FetchError
 from onionflash.util import digest
@@ -243,3 +243,98 @@ def test_untrusted_route_waits_for_fresh_reply_and_carries_journal_into_update(c
     assert audit["untrusted_proposals"][0]["mode"] == "story"
     assert audit["untrusted_proposals"][0]["disposition"] == "discarded_context"
     assert len(audit["reviews"]) == 2 and audit["reviews"][0]["request"] == 3
+
+
+def prepared_alert_update(context, tmp_path):
+    from test_doctor import FakeLinker, bastet_incident_items, make_config
+
+    cfg, store = context
+    _, alert_config = make_config(tmp_path / "alert-source")
+    cfg["sources"] = alert_config["sources"]
+    stamp = "2024-01-18T01:00:00Z"
+    doctor.ingest(store.db, cfg["sources"][0], bastet_incident_items(), stamp)
+    doctor.evaluate(cfg, store, cfg["sources"][0], FakeLinker(False), stamp)
+    prior = store.stories()[0]
+    incoming = item(kind="gitlab_mr", authority="development", upstream_state="merged",
+                    url="https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/91999",
+                    title="Record a directory authority measurement", content="The merge records the operator measurement.",
+                    published_at=stamp, updated_at=stamp)
+    store.ingest(incoming, stamp)
+    with store.db:
+        store.db.execute("UPDATE items SET story_id=? WHERE id=?", (prior["id"], incoming["id"]))
+    row = next(r for r in store.pending(10, stamp) if r["id"] == incoming["id"])
+    draft = update_analysis(update="The merge records a measurement.", evidence=[incoming["content"]])
+    prepared = candidate.prepare(store.db, row, draft, stamp)
+    assert prepared["mode"] == "update" and prepared["candidate"]["origin"] == "network-health"
+    assert review.label_limits(prepared["packet"]["sources"])["state"] == ["merged"]
+    assert prepared["candidate"]["state"] == prior["state"] != "merged"
+    return cfg, store, prior, incoming, prepared
+
+
+def test_text_only_alert_update_recovery_preserves_fixed_labels_outside_incoming_limits(context, tmp_path):
+    cfg, store, prior, incoming, prepared = prepared_alert_update(context, tmp_path)
+    # Exercise recovery on the actual prepared packet; this does not bypass the
+    # pipeline's separate missing-source gate or assert that an alert publishes.
+    expected = review.apply_repair(prepared["candidate"], {"update": incoming["content"]}, update=True)
+    assert review.final_holds(expected, prepared) == []
+    audit = {"candidate": prepared["candidate"], "reviews": [], "policy_hash": review.policy_hash(cfg),
+             **review_gate.initial_review_state()}
+    requests = review_gate.ReviewRequests(audit)
+    checker = reviewer(cfg, untrusted_update({"update": incoming["content"]}), verdict(update=True))
+    stage, after = review_gate.advance_review(checker, "review", prepared["candidate"], prepared, audit, requests)
+    assert stage == "verify" and after == expected
+    action, after = review_gate.advance_review(checker, stage, after, prepared, audit, requests)
+    assert action == "approve" and checker.calls == 2
+    assert after["updates"][-1]["text"] == incoming["content"]
+    assert all(after[field] == prior[field] for field in candidate.SEMANTIC_FIELDS)
+
+
+def test_untrusted_alert_label_change_is_rejected_and_cannot_poison_later_proof(context, tmp_path):
+    cfg, _, prior, incoming, prepared = prepared_alert_update(context, tmp_path)
+    original = copy.deepcopy(prepared["candidate"])
+    audit = {"candidate": original, "reviews": [], "policy_hash": review.policy_hash(cfg),
+             **review_gate.initial_review_state()}
+    requests = review_gate.ReviewRequests(audit)
+    checker = reviewer(cfg, untrusted_update({"update": incoming["content"], "state": "merged"}),
+                       verdict(update=True), verdict(update=True))
+    with pytest.raises(review.InconsistentReview):
+        review_gate.advance_review(checker, "review", original, prepared, audit, requests)
+    assert checker.calls == 1 and audit["reviews"] == [] and review_gate.pending_proposal(audit) is None
+    assert audit["untrusted_proposals"][0]["accepted"] is False
+    assert audit["candidate"] == original and original["state"] == prior["state"]
+    assert review_gate.proposal_needs_check(audit)
+    stage, unchanged = review_gate.advance_review(checker, "review", original, prepared, audit, requests)
+    assert stage == "verify" and unchanged == original
+    action, unchanged = review_gate.advance_review(checker, stage, unchanged, prepared, audit, requests)
+    assert action == "approve" and unchanged == original and checker.calls == 3
+    assert not review_gate.proposal_needs_check(audit)
+    audit.update(outcome="approved", approval_key=review_gate._approval_key(original, prepared, audit["policy_hash"]))
+    review_gate.validate_review_state(audit, "approved", original, prepared)
+
+
+def test_locked_citation_transition_retains_existing_budget_until_deterministic_commit(context):
+    cfg, store = context
+    target = _publish(store, item(kind="gitlab_mr", upstream_state="merged", title="Add a guard scheduling option"),
+                      draft=analysis(state="merged"))
+    tag = item(kind="tag", authority="official", url="https://example.org/tags/tor-0.4.9.99",
+               title="tor-0.4.9.99", content="")
+    row = pending(store, tag)
+    with store.db:
+        store.db.execute("UPDATE items SET story_id=? WHERE id=?", (target["id"], row["id"]))
+    row = next(r for r in store.pending(10, LATER) if r["id"] == row["id"])
+    with pytest.raises(AnalysisError):
+        run(cfg, store, row, Writer(), reviewer(cfg, FetchError("unavailable", status=500)))
+    assert record(store)["request_budget"]["reserved"] == 1
+    shown = editorial.show(store.db, target["id"])
+    editorial.correct(store.db, target["id"], {"state": "released", "category": "release", "tags": ["release"]},
+                      reason="Record the release status.", expect_hash=shown["hash"], observed=LATER)
+    before = record(store)
+    assert run(cfg, store, row, Writer(), reviewer(cfg))["status"] == "locked"
+    assert record(store) == before
+    editorial.unlock(store.db, target["id"], reason="Allow citation updates.",
+                     expect_hash=editorial.show(store.db, target["id"])["hash"], observed=LATER)
+    assert record(store) == before
+    resumed = next(r for r in store.pending(10, LATER) if r["id"] == row["id"])
+    checker = reviewer(cfg)
+    assert run(cfg, store, resumed, Writer(), checker)["status"] == "cited"
+    assert checker.calls == 0 and job(store) is None

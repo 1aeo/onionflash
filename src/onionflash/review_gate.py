@@ -571,7 +571,7 @@ def _validate_candidate_path(record, stage, candidate, prepared, *, allow_cached
                     raise ValueError()
             if entry["accepted"]:
                 if (_literal_tag(prepared) or digest(after) in seen
-                        or not _allowed_proposal(current, after, prepared)):
+                        or not _allowed_proposal(current, after, prepared, entry["repair"])):
                     raise ValueError()
                 current, expected_stage = after, "verify"
                 seen.add(digest(current))
@@ -635,14 +635,18 @@ def _literal_tag(prepared):
             else prepared["payload"]["editorial_kind"]) == "tag"
 
 
-def _allowed_proposal(before, after, prepared):
+def _allowed_proposal(before, after, prepared, repair):
+    """Check proposed labels without reclassifying read-only update context."""
     update = prepared.get("mode") == "update"
     limits = review.repair_limits(prepared["packet"], prepared.get("coverage"), update=update)
     editable = candidate_mod.UPDATE_FIELDS if update else review.EDITABLE
     if (set(after) != set(before)
             or any(after[key] != before[key] for key in before if key not in editable)
-            or any(after[field] not in allowed for field, allowed in limits.items())
-            or any(tag not in limits["category"] for tag in after["tags"])):
+            or any(repair[field] not in allowed for field, allowed in limits.items() if field in repair)
+            or ("tags" in repair and any(tag not in limits["category"] for tag in repair["tags"]))):
+        return False
+    if not update and (any(after[field] not in allowed for field, allowed in limits.items())
+                       or any(tag not in limits["category"] for tag in after["tags"])):
         return False
     if update:
         old, new = before.get("updates"), after.get("updates")
@@ -711,7 +715,7 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
             event["repair"] = {key: repaired[key] for key in event["changed_fields"] if key != "updates"}
             if "updates" in event["changed_fields"]:
                 event["repair"]["update"] = repaired["updates"][-1]["text"]
-            if not _allowed_proposal(candidate, repaired, prepared):
+            if not _allowed_proposal(candidate, repaired, prepared, error.proposal):
                 event["disposition"] = "labels"
                 raise review.ReviewError("Untrusted edit exceeds packet label limits")
             if event["candidate_after_hash"] in seen:

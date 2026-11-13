@@ -631,7 +631,8 @@ class Store:
                 "UPDATE items SET status='published',story_id=?,next_attempt_at=NULL,last_error=NULL WHERE id=?",
                 (story_id, row["id"]),
             )
-            self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
+            if not locked:
+                self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
             decisions.record(self.db, row["id"], code, observed, review=review_record)
         return {"story_id": story_id, "status": "locked" if locked else "cited", "analysis_key": analysis_key}
 
