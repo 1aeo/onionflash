@@ -33,7 +33,7 @@ monitor_id="old-monitor"
     return path
 
 
-@pytest.mark.parametrize("alert_format", ["consensus", "censorship", "unknown-alert-format"])
+@pytest.mark.parametrize("alert_format", ["censorship", "unknown-alert-format"])
 def test_retired_source_is_disabled_before_fetch(tmp_path, monkeypatch, caplog, capsys, alert_format):
     """Legacy alert configuration loads disabled, so it is never fetched or published."""
     path = legacy_config(tmp_path, alert_format)
@@ -54,6 +54,40 @@ def test_retired_source_is_disabled_before_fetch(tmp_path, monkeypatch, caplog, 
 def test_unused_monitor_identity_does_not_disable_an_ordinary_source(tmp_path):
     path = legacy_config(tmp_path, "")
     assert load_config(path)["sources"][0]["enabled"] is True
+
+
+def test_consensus_alert_source_loads_enabled_in_dry_run_and_validates_keys(tmp_path, caplog):
+    path = tmp_path / "config.toml"
+    base = '''[storage]
+database="state.sqlite3"
+output_dir="public"
+[[sources]]
+id="consensus-health-alerts"
+url="https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/feed/"
+website_url="https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/"
+kind="feed"
+authority="telemetry"
+enabled=true
+alert_format="consensus"
+monitor_id="tor-doctor"
+'''
+    path.write_text(base)
+    cfg = load_config(path)
+    source = cfg["sources"][0]
+    assert source["enabled"] is True and source["publish"] is False
+    assert "monitoring alert collection is retired" not in caplog.text
+
+    for invalid in (
+        base + 'publish="yes"\n',
+        base.replace('alert_format="consensus"\n', "") + "publish=false\n",
+        base.replace('website_url="https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/"\n', ""),
+        base.replace('website_url="https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/"',
+                     'website_url="https://lists.torproject.org/mailman3/hyperkitty/?page=1"'),
+        base.replace('kind="feed"', 'kind="tag"'),
+    ):
+        path.write_text(invalid)
+        with pytest.raises(ValueError):
+            load_config(path)
 
 
 def test_old_databases_keep_the_unused_monitoring_tables(tmp_path):

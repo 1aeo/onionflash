@@ -36,13 +36,13 @@ def corpus():
     return [case for name in module.CASE_FILES for case in module.expand(json.loads((ROOT / "tools" / name).read_text()))]
 
 
-def full(reply, packet):
+def full(reply, packet, *, update=False):
     """A reply validated as the reviewer validates one. Shorthand such as {"verdict": "skip"} becomes a complete
     verdict, in which a skip fails news value and any other refusal operational advice."""
     if "criteria" not in reply:
-        reply = verdict(reply["verdict"], repair=reply.get("repair"),
+        reply = verdict(reply["verdict"], repair=reply.get("repair"), update=update,
                         criterion="news_value" if reply["verdict"] == "skip" else "operational_advice")
-    return validate_review(reply, packet)
+    return validate_review(reply, packet, update=update)
 
 
 def scripted(reply):
@@ -55,8 +55,8 @@ def scripted(reply):
             return self
         def __exit__(self, *args):
             pass
-        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
-            return full(reply(verification), packet)
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False):
+            return full(reply(verification), packet, update=update)
     return Reviewer
 
 
@@ -68,9 +68,19 @@ def test_controlled_corpus_is_blinded_and_covers_rubric():
     assert len({c["id"] for c in cases}) == len(cases)
     assert set(CRITERIA) <= {criterion for c in cases for criterion in c["coverage"]}
     assert any(c["expected"] == "approve" and "operational_advice" in c["coverage"] for c in cases)
+    assert all(
+        any(c["scope"] == "latest_update" and c["expected"] == outcome for c in cases)
+        for outcome in ("approve", "skip", "not_approve", "hold")
+    )
+    assert any(c.get("expected_same_story") for c in cases)
+    assert any("expected_same_story" in c and c["expected_same_story"] is None for c in cases)
     raw = json.loads((ROOT / "tools/review_cases.json").read_text())
+    assert any(row.get("retracted") for row in raw["coverage_sets"]["busy"]["recent"])
+    assert any(row.get("related") for row in raw["coverage_sets"]["busy"]["recent"])
     with pytest.raises(KeyError):  # an unknown coverage set fails to load
         evaluator().expand({**raw, "cases": [{**raw["cases"][0], "coverage_set": "missing"}]})
+    compact_required = {"id", "title", "summary", "category", "state", "updated_at", "summary_truncated"}
+    compact_optional = {"latest_update", "products", "related"}
     for case in cases:
         payload = {"candidate": case["candidate"], "packet": case["packet"], "existing_coverage": case["existing_coverage"]}
         assert not [label for label in (case["id"], case.get("audit"), case.get("flaw")) if label and label in json.dumps(payload)]
@@ -79,8 +89,9 @@ def test_controlled_corpus_is_blinded_and_covers_rubric():
         for source in case["packet"]["sources"]:
             authored = ["author" in passage for passage in source["passages"][1:]]
             assert authored == sorted(authored, reverse=True), case["id"]
-        # Recent rows have the compact keys that coverage_background sends.
-        assert all(set(row) == {"id", "title", "summary", "category", "state", "updated_at", "summary_truncated"}
+        # Recent rows have the compact keys that coverage_background sends, or a retracted marker.
+        assert all((set(row) == {"id", "title", "retracted"} and row["retracted"] is True)
+                   or (compact_required <= set(row) <= compact_required | compact_optional)
                    for row in case["existing_coverage"]["recent"]), case["id"]
         # A flawed draft flags wording or labels that it contains and its faithful twins do not,
         # or omits required wording that its approved twins contain.
@@ -273,6 +284,20 @@ def test_authored_passages_match_build_packet():
         assert expanded["labels"] == built["sources"][0]["labels"] == expected_labels
         assert [list(passage.items()) for passage in expanded["passages"]] == [list(passage.items()) for passage in built["sources"][0]["passages"]]
         assert module.writer_item(expanded) == {key: item[key] for key in (*fields[1:], "labels", "content", "public_comments")}
+    closed_raw = copy.deepcopy(raw)
+    closed_raw["packets"]["tor-41412-cross-cancellation-edited"]["sources"][0]["closed_at"] = "2026-10-07T17:16:54Z"
+    closed_source = closed_raw["packets"]["tor-41412-cross-cancellation-edited"]["sources"][0]
+    closed_item = {"id": "a" * 24, **{key: closed_source[key] for key in fields},
+                   "closed_at": closed_source["closed_at"], "labels": list(closed_source["labels"]),
+                   "content": "\n\n".join(p for p in closed_source["passages"] if isinstance(p, str)),
+                   "public_comments": [{"author": n["author"], "created_at": n["created_at"], "url": n["url"], "body": n["text"]}
+                                       for n in closed_source["passages"] if isinstance(n, dict)]}
+    closed_built, _ = build_packet(None, closed_item, {"sources": [{"id": closed_item["id"], "url": closed_item["url"]}]},
+                                   {"sources": []}, closed_item["id"])
+    closed_expanded = next(c for c in module.expand(closed_raw)
+                           if c["packet"]["sources"][0]["url"] == closed_source["url"])["packet"]["sources"][0]
+    assert closed_expanded["closed_at"] == closed_built["sources"][0]["closed_at"] == "2026-10-07T17:16:54Z"
+    assert "closed_at" not in module.writer_item(closed_expanded)
 
 
 def test_draft_mode_drafts_each_packet_once_and_scores_draft_and_publication(evaluation, tmp_path, monkeypatch):
@@ -283,8 +308,14 @@ def test_draft_mode_drafts_each_packet_once_and_scores_draft_and_publication(eva
               "draft:refactor-with-disclosure"}
     cases = [case for case in module.draft_cases(raw) if case["id"] in groups]
     assert len(cases) == len(groups)
-    # Each group has an approved draft, so each expects approval, even where it also has flawed ones.
-    assert {case["expected"] for case in cases} == {"approve"}
+    # Groups with an approved story expect approval; the unmapped follow-up group expects a routed skip.
+    assert {case["id"]: case["expected"] for case in cases} == {
+        "draft:bastet": "approve",
+        "draft:issue-update/prior-issue": "approve",
+        "draft:issue-update/related-issue": "skip",
+        "draft:new-version-tag": "approve",
+        "draft:refactor-with-disclosure": "approve",
+    }
     requests = []
 
     class Writer(module.Analyzer):
@@ -305,9 +336,9 @@ def test_draft_mode_drafts_each_packet_once_and_scores_draft_and_publication(eva
     note = next(payload for payload in requests if "public_comments" in payload)["public_comments"]
     assert note == [{key: passage[key] for key in ("author", "created_at")} | {"body": passage["text"]}
                     for passage in raw["packets"]["refactor-with-disclosure"]["sources"][0]["passages"] if isinstance(passage, dict)]
-    # A flagged draft publishes as a false approval, also where its group's own candidate is clean, and each
-    # case scores the draft against its own flags; the draft that omits the disclosure is an omission.
-    assert (result["draft_unsupported"], result["false_approvals"], result["omissions"], result["matched"]) == (4, 4, 2, 4)
+    # A flagged draft or a published skip is a false approval, and the draft that omits the disclosure is an omission.
+    assert (result["draft_unsupported"], result["false_approvals"], result["omissions"], result["missed_routes"],
+            result["matched"]) == (4, 6, 2, 2, 2)
     records = [json.loads(line) for line in output.read_text().splitlines()[:-1]]
     assert all(record["candidate"]["summary"] == record["draft"]["summary"] for record in records)
     flagged = {"draft:bastet": ["update their configurations"], "draft:issue-update/prior-issue": ["fix is proposed"]}
@@ -450,9 +481,9 @@ def test_judged_scoring_counts_catches_and_false_alarms(evaluation, tmp_path, mo
     cases = judged_cases(json.loads((ROOT / "tools/review_cases.json").read_text()))
 
     class Discerning(scripted(None)):
-        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False):
             flawed = "update their configurations" in candidate["why_it_matters"] or candidate["confidence"] == "confirmed"
-            return full({"verdict": "hold" if flawed else "approve"}, packet)
+            return full({"verdict": "hold" if flawed else "approve"}, packet, update=update)
 
     def rows(sentence, badge, stale, clean, rounds=1):
         return {"invented_impact": dict(zip(("ok", "paired"), sentence), cases=rounds, unique=1),
@@ -519,6 +550,178 @@ def test_main_reads_repeated_case_files(evaluation, tmp_path, monkeypatch):
         with pytest.raises(SystemExit):
             module.main([*base, *options])
     assert len(calls) == 4
-    for failure in ({"target_missed": ["catch"]}, {"controlled_mismatches": 1}, {"errors": 1}, {"incomplete": True}):
+    for failure in ({"target_missed": ["catch"]}, {"controlled_mismatches": 1}, {"false_routes": 1},
+                    {"errors": 1}, {"incomplete": True}):
         monkeypatch.setattr(module, "evaluate", lambda config, cases, output, **options: passed | failure)
         assert module.main(base) == 1, failure
+
+
+def test_latest_update_scope_scans_only_new_entry_and_excludes_draft_mode(evaluation, tmp_path, monkeypatch):
+    """Update-scope cases scan only updates[-1].text for wording flags, keep label flags, and stay out of draft mode."""
+    module, config = evaluation
+    raw = json.loads((ROOT / "tools/review_cases.json").read_text())
+    by_id = {case["id"]: case for case in module.expand(raw)}
+    wrong_state = copy.deepcopy(by_id["update-wrong-state"])
+    # Earlier text and earlier update entries are context, not under review; only updates[-1].text and story labels count.
+    story_with_prior_words = {
+        **wrong_state["candidate"],
+        "title": "Earlier headline shipped in a stable release",
+        "summary": "Earlier summary shipped in a stable release.",
+        "why_it_matters": "Earlier note shipped in a stable release.",
+        "state": "merged",
+        "updates": [
+            {"at": "2026-11-09T10:00:00Z", "text": "Earlier update shipped in a stable release.",
+             "sources": wrong_state["candidate"]["updates"][-1]["sources"]},
+            {"at": "2026-11-10T11:00:00Z", "text": "Maintainers merged !91901 into main; required qualifier kept.",
+             "sources": wrong_state["candidate"]["updates"][-1]["sources"]},
+        ],
+    }
+    assert module.kept_unsupported(wrong_state, story_with_prior_words) == []
+    assert module.kept_unsupported(wrong_state, {**story_with_prior_words, "state": "released"}) == ["state:released"]
+    assert module.kept_unsupported(
+        wrong_state,
+        {**story_with_prior_words, "updates": [story_with_prior_words["updates"][0], {
+            **story_with_prior_words["updates"][1], "text": "Maintainers shipped in a stable release."}]},
+    ) == ["shipped in a stable release"]
+
+    req_case = {**wrong_state, "required": ["required qualifier"]}
+    assert module.omitted(req_case, story_with_prior_words) == []
+    assert module.omitted(req_case, {
+        **story_with_prior_words,
+        "summary": "Summary has required qualifier.",
+        "updates": [story_with_prior_words["updates"][0], {
+            **story_with_prior_words["updates"][1], "text": "Maintainers merged !91901 into main."}],
+    }) == ["required qualifier"]
+
+    # Update-scope cases never enter draft_cases or leak flags into a story-scope group sharing the same packet.
+    mixed = {
+        **raw,
+        "cases": [
+            next(c for c in raw["cases"] if c["id"] == "bastet-corrected"),
+            {
+                **next(c for c in raw["cases"] if c["id"] == "update-speculative-cause"),
+                "id": "update-on-story-packet",
+                "packet": "bastet",
+                "coverage_set": None,
+                "unsupported": ["phrase-only-in-update-case"],
+                "required": ["required-only-in-update-case"],
+                "forbidden_classifications": {"priority": ["normal"]},
+            },
+        ],
+    }
+    mixed["cases"][1].pop("coverage_set")
+    drafted = module.draft_cases(mixed)
+    assert [c["id"] for c in drafted] == ["draft:bastet"]
+    assert drafted[0]["unsupported"] == [] and drafted[0]["required"] == []
+    assert drafted[0]["forbidden_classifications"] == {} and drafted[0]["expected"] == "approve"
+    assert not [c["id"] for c in module.draft_cases(raw) if c["scope"] == "latest_update"]
+
+    # Validation refuses unknown scopes, missing or dropped updates, and draft mode on latest_update cases.
+    base_raw = next(c for c in raw["cases"] if c["id"] == "update-fix-merged")
+    for bad in ({**base_raw, "scope": "paragraph"},
+                {**base_raw, "candidate": {k: v for k, v in base_raw["candidate"].items() if k != "updates"}},
+                {**base_raw, "candidate": {**base_raw["candidate"], "updates": [{"at": "bad", "text": "", "sources": []}]}}):
+        with pytest.raises(ValueError):
+            module.expand({**raw, "cases": [bad]})
+    with pytest.raises(ValueError, match="Invalid or duplicate evaluation case"):
+        module.evaluate(config, [by_id["update-fix-merged"]], tmp_path / "draft-upd.jsonl", draft=True)
+    with pytest.raises(ValueError, match="Invalid or duplicate evaluation case"):
+        no_updates = {**by_id["update-fix-merged"], "candidate": {**by_id["update-fix-merged"]["candidate"]}}
+        no_updates["candidate"].pop("updates", None)
+        module.evaluate(config, [no_updates], tmp_path / "empty-upd.jsonl")
+
+    # Evaluation passes review_scope and update mode on prepared so update-scope gates know the scope.
+    seen_scopes = []
+    orig_call = module.call_review
+    monkeypatch.setattr(module, "call_review", lambda reviewer, stage, text, prepared: (
+        seen_scopes.append((prepared["review_scope"], prepared["mode"])) or orig_call(reviewer, stage, text, prepared)))
+    monkeypatch.setattr(module, "EvaluationReviewer", scripted(lambda verification: {"verdict": "approve"}))
+    res = module.evaluate(config, [by_id["update-fix-merged"], by_id["bastet-corrected"]], tmp_path / "scopes.jsonl")
+    assert res["matched"] == 2
+    assert seen_scopes == [("latest_update", "update"), ("latest_update", "update"),
+                           ("story", "story"), ("story", "story")]
+
+
+def test_expected_same_story_scores_matched_missed_wrong_and_false_routes(evaluation, tmp_path, monkeypatch):
+    """Score positive and null expected_same_story routes, treating false routes as hard failures."""
+    module, config = evaluation
+    by_id = {case["id"]: case for case in corpus()}
+    pos = by_id["same-story-issue-mentions-covered-release"]
+    neg = by_id["same-story-neg-different-tor-version"]
+    hold_neg = by_id["retracted-report-mirror"]
+    target_id = pos["expected_same_story"]
+    other_id = next(r["id"] for r in pos["existing_coverage"]["recent"]
+                    if r["id"] != target_id and not r.get("retracted"))
+    retracted_id = next(r["id"] for r in pos["existing_coverage"]["recent"] if r.get("retracted"))
+
+    def routed_reviewer(reply_fn):
+        class RoutedReviewer:
+            last_decoded = None
+            def __init__(self, *args, **kwargs):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False):
+                verdict_name, same_story = reply_fn(candidate, verification)
+                base = verdict(verdict_name, update=update, criterion="new_information" if verdict_name == "skip" else "operational_advice")
+                if verdict_name == "skip":
+                    base["criteria"]["new_information"]["reason"] = f"Same event as {same_story or target_id}."
+                validated = validate_review(base, packet, update=update)
+                return {**validated, "same_story": same_story}
+        return RoutedReviewer
+
+    # 1. Exact match on positive skip + clean null on negative approve + clean null on hold.
+    monkeypatch.setattr(module, "EvaluationReviewer", routed_reviewer(
+        lambda cand, ver: ("skip", target_id) if cand["id"] == pos["candidate"]["id"]
+        else ("hold", None) if cand["id"] == hold_neg["candidate"]["id"]
+        else ("approve", None)))
+    out_ok = tmp_path / "routes-ok.jsonl"
+    res_ok = module.evaluate(config, [pos, neg, hold_neg], out_ok)
+    assert (res_ok["route_cases"], res_ok["matched_routes"], res_ok["missed_routes"],
+            res_ok["false_routes"], res_ok["wrong_routes"], res_ok["matched"],
+            res_ok["controlled_mismatches"]) == (3, 1, 0, 0, 0, 3, 0)
+    records_ok = {r["case"]: r for r in map(json.loads, out_ok.read_text().splitlines()[:-1])}
+    assert records_ok[pos["id"]]["same_story"] == target_id
+    assert records_ok[neg["id"]]["same_story"] is None
+
+    # 2. Missed route (same_story=None on a positive case) fails matched and increments missed_routes.
+    monkeypatch.setattr(module, "EvaluationReviewer", routed_reviewer(lambda cand, ver: ("skip", None)))
+    res_miss = module.evaluate(config, [pos], tmp_path / "routes-miss.jsonl")
+    assert (res_miss["route_cases"], res_miss["matched_routes"], res_miss["missed_routes"],
+            res_miss["matched"], res_miss["controlled_mismatches"]) == (1, 0, 1, 0, 1)
+
+    # 3. Wrong route (different story ID on a positive case) increments wrong_routes.
+    monkeypatch.setattr(module, "EvaluationReviewer", routed_reviewer(lambda cand, ver: ("skip", other_id)))
+    res_wrong = module.evaluate(config, [pos], tmp_path / "routes-wrong.jsonl")
+    assert (res_wrong["route_cases"], res_wrong["matched_routes"], res_wrong["wrong_routes"],
+            res_wrong["matched"], res_wrong["controlled_mismatches"]) == (1, 0, 1, 0, 1)
+
+    # 4. False route (non-null same_story on expected_same_story=None) is a hard failure.
+    monkeypatch.setattr(module, "EvaluationReviewer", routed_reviewer(lambda cand, ver: ("skip", target_id)))
+    res_false = module.evaluate(config, [neg], tmp_path / "routes-false.jsonl")
+    assert (res_false["route_cases"], res_false["false_routes"], res_false["matched_routes"],
+            res_false["matched"], res_false["controlled_mismatches"]) == (1, 1, 0, 0, 1)
+
+    # 5. Gate "route" action on an approve verdict naming same_story also scores as a matched route without publishing.
+    monkeypatch.setattr(module, "EvaluationReviewer", routed_reviewer(lambda cand, ver: ("approve", target_id)))
+    monkeypatch.setattr(module, "next_step", lambda reviews, text, prepared: ("route", target_id))
+    out_gate = tmp_path / "routes-gate.jsonl"
+    res_gate = module.evaluate(config, [pos], out_gate)
+    rec_gate = json.loads(out_gate.read_text().splitlines()[0])
+    assert (res_gate["matched_routes"], res_gate["matched"], res_gate["false_approvals"]) == (1, 1, 0)
+    assert rec_gate["final_verdict"] == "route" and rec_gate["published_candidate"] is None
+
+    # 6. Validation rejects invalid, unlisted, retracted, non-skip, or prior_story expected_same_story values.
+    for bad_case in (
+        {**pos, "expected_same_story": "f" * 24},
+        {**pos, "expected_same_story": retracted_id},
+        {**pos, "expected_same_story": "not-24-hex"},
+        {**pos, "expected_same_story": False},
+        {**pos, "expected": "approve"},
+        {**by_id["material-existing-update"], "expected": "skip", "expected_same_story": target_id},
+        {**by_id["update-rephrases-opening"], "expected_same_story": target_id},
+    ):
+        with pytest.raises(ValueError, match="Invalid or duplicate evaluation case"):
+            module.evaluate(config, [bad_case], tmp_path / "bad-route.jsonl")

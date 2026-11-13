@@ -213,3 +213,15 @@ url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torpr
 product = "network"
 authority = "community"
 enabled = true
+
+# Fixed-text consensus-health alerts from DocTor; publish = false starts in dry-run mode.
+[[sources]]
+id = "tor-consensus-health"
+name = "Tor Project Consensus Health Alerts"
+website_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/"
+kind = "feed"
+url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/feed/"
+product = "network"
+authority = "telemetry"
+alert_format = "consensus"
+publish = false

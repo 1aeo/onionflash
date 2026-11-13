@@ -217,8 +217,11 @@ def load_config(path: str | Path) -> dict:
     ):
         raise ValueError("LLM fallback_base_urls and allowed_networks must be arrays")
     llm["fallback_base_urls"] = [
-        _expand(u).rstrip("/") for u in llm["fallback_base_urls"]
+        _expand(u).rstrip("/") if isinstance(u, str) else ""
+        for u in llm["fallback_base_urls"]
     ]
+    if any(not u.strip() for u in llm["fallback_base_urls"]):
+        raise ValueError("Each LLM fallback base URL must be a nonempty URL")
     for network in llm["allowed_networks"]:
         parsed_network = ipaddress.ip_network(network, strict=True)
         if parsed_network.prefixlen == 0:
@@ -269,6 +272,7 @@ def load_config(path: str | Path) -> dict:
             "max_items",
             "interval_seconds",
             "alert_format",
+            "publish",
             "monitor_id",
             "gitlab_project",
             "comments_graphql_url",
@@ -289,7 +293,18 @@ def load_config(path: str | Path) -> dict:
         source.setdefault("authority", "community")
         source.setdefault("enabled", True)
         source.setdefault("interval_seconds", 300)
-        if source.get("alert_format"):
+        alert_format = source.get("alert_format", "")
+        if not isinstance(alert_format, str):
+            raise ValueError("Invalid source alert_format")
+        if "publish" in source and alert_format != "consensus":
+            raise ValueError("source.publish requires alert_format = 'consensus'")
+        if alert_format == "consensus":
+            source.setdefault("publish", False)
+            if not isinstance(source["publish"], bool):
+                raise ValueError("source.publish must be a boolean")
+            if source["kind"] != "feed":
+                raise ValueError("Consensus alert sources require kind = 'feed'")
+        elif alert_format:
             # Preserve old source entries without reclassifying them as news.
             logging.getLogger(__name__).warning(
                 "Ignoring source %s: monitoring alert collection is retired; remove this source", source["id"])
@@ -321,10 +336,16 @@ def load_config(path: str | Path) -> dict:
             source["website_url"] = canonical_url(source["website_url"])
         elif source["kind"] == "metrics_timeline":
             raise ValueError("Timeline sources need website_url (the repository URL)")
+        elif alert_format == "consensus":
+            raise ValueError("Consensus alert sources need website_url (the list archive URL)")
         if source["kind"] == "metrics_timeline":
             website = urlsplit(source["website_url"])
             if website.query or website.fragment or not website.path.strip("/"):
                 raise ValueError("Timeline website_url must be a clean repository URL")
+        elif alert_format == "consensus":
+            website = urlsplit(source["website_url"])
+            if website.query or website.fragment or not website.path.strip("/"):
+                raise ValueError("Consensus website_url must be a clean list archive URL")
         source["fallback_urls"] = [canonical_url(u) for u in source["fallback_urls"]]
         # comments_graphql_url and comments_enabled are retired source keys that still load.
         # An old comments_enabled = false keeps the source out, as leaving out gitlab_project does.
@@ -350,5 +371,7 @@ def load_config(path: str | Path) -> dict:
                 or not low <= source[key] <= high
             ):
                 raise ValueError(f"Invalid source {key}")
+    if sum(1 for s in sources if s.get("alert_format") == "consensus" and s["enabled"]) > 1:
+        raise ValueError("At most one enabled consensus alert source is supported")
     config["_config_path"] = str(path)
     return config

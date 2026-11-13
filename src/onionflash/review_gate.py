@@ -10,11 +10,13 @@ reads, because earlier releases read it after a code rollback.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import re
 
-from . import candidate as candidate_mod, decisions, render, review
+from . import candidate as candidate_mod, decisions, editorial, render, review
 from .analyze import AnalysisError, cache_key
-from .util import after, digest, now_iso, saved_object
+from .util import _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, now_iso, saved_object, thread_subject
 
 MAX_APPROVALS = 2000  # cached approvals kept besides those unfinished jobs pin
 # An item starts a new story only if its newest dated development is at most this many days older
@@ -111,19 +113,219 @@ def _prune(store, maximum):
         """, (maximum,))
 
 
+_VERSION_TOKEN = re.compile(r"\b\d+\.\d+(?:\.\d+)*(?:-[a-z0-9.]+)?\b", re.I)
+_PROPOSAL_TOKEN = re.compile(r"\bproposal\s+\d{3,4}\b|\bcve-\d{4}-\d+\b", re.I)
+_SPECIFIC_WORD = re.compile(r"[a-z0-9]{4,}")
+_GENERIC_WORDS = frozenset({
+    "tor", "arti", "tails", "browser", "onion", "flash", "project", "release", "released",
+    "update", "updated", "issue", "merge", "request", "report", "reported", "network",
+    "relay", "relays", "service", "services", "version", "versions", "security",
+    "fix", "fixes", "fixed", "change", "changes", "support", "default", "with", "from",
+    "that", "this", "after", "when", "into", "over", "under", "their", "have", "were",
+})
+
+
+def _story_text(story: dict) -> str:
+    updates = " ".join(
+        str(entry.get("text") or "")
+        for entry in (story.get("updates") or ())
+        if isinstance(entry, dict)
+    )
+    return "\n".join(
+        str(part or "")
+        for part in (story.get("title"), story.get("summary"), story.get("latest_update"), updates)
+        if part
+    )
+
+
+def _story_urls(story: dict) -> set[str]:
+    urls = set()
+    for src in (story.get("sources") or ()):
+        if isinstance(src, dict) and isinstance(src.get("url"), str):
+            with contextlib.suppress(ValueError, TypeError, UnicodeError):
+                urls.add(canonical_url(src["url"]))
+    return urls
+
+
+def _story_gitlab_refs(story: dict) -> set[str]:
+    """Project-qualified GitLab issue and merge-request URLs derived from citation URLs."""
+    text = _story_text(story)
+    src_urls = [
+        src["url"]
+        for src in (
+            *(story.get("sources") or ()),
+            *(cs for u in (story.get("updates") or ()) if isinstance(u, dict) for cs in (u.get("sources") or ())),
+        )
+        if isinstance(src, dict) and isinstance(src.get("url"), str)
+    ]
+    refs = set()
+    for group in gitlab_refs({"url": "", "title": "", "content": "\n".join([*src_urls, text])}):
+        refs.update(group)
+    projects = {}
+    for raw_url in src_urls:
+        with contextlib.suppress(ValueError, TypeError, UnicodeError):
+            clean = canonical_url(raw_url)
+            if match := _GITLAB_OWN.match(clean):
+                projects[(match.group(1), match.group(2).lower())] = clean
+    if len(projects) == 1:
+        [context_url] = projects.values()
+        for group in gitlab_refs({"url": context_url, "title": "", "content": text}):
+            refs.update(group)
+    return refs
+
+
+def _specific_story_overlap(story_a: dict, story_b: dict) -> bool:
+    """Require concrete shared identifiers before merging two published stories."""
+    urls_a, urls_b = _story_urls(story_a), _story_urls(story_b)
+    text_a, text_b = _story_text(story_a), _story_text(story_b)
+    refs_a, refs_b = _story_gitlab_refs(story_a), _story_gitlab_refs(story_b)
+    prods_a = set(story_a.get("products") or ())
+    prods_b = set(story_b.get("products") or ())
+    if prods_a and prods_b and not (prods_a & prods_b) and not (urls_a & urls_b) and not (refs_a & refs_b):
+        return False
+    if story_b.get("related") or (urls_a & urls_b) or (refs_a & refs_b):
+        return True
+    if ({m.casefold() for m in _PROPOSAL_TOKEN.findall(text_a)}
+            & {m.casefold() for m in _PROPOSAL_TOKEN.findall(text_b)}):
+        return True
+    vers_a = {m.casefold() for m in _VERSION_TOKEN.findall(text_a)}
+    vers_b = {m.casefold() for m in _VERSION_TOKEN.findall(text_b)}
+    if vers_a & vers_b:
+        return True
+    if vers_a and vers_b:
+        return False
+    subj_a, _ = thread_subject({"title": story_a.get("title") or ""})
+    subj_b, _ = thread_subject({"title": story_b.get("title") or ""})
+    if subj_a and subj_a == subj_b:
+        return True
+    words_a = {w for w in _SPECIFIC_WORD.findall(text_a.casefold()) if w not in _GENERIC_WORDS}
+    words_b = {w for w in _SPECIFIC_WORD.findall(text_b.casefold()) if w not in _GENERIC_WORDS}
+    return len(words_a & words_b) >= 2
+
+
+def _can_auto_merge_review(candidate: dict, prepared: dict, result: dict) -> bool:
+    coverage = prepared.get("coverage") or {}
+    prior = coverage.get("prior_story")
+    target_id = result.get("same_story")
+    if (not isinstance(prior, dict) or not isinstance(target_id, str)
+            or not target_id or target_id == prior.get("id")):
+        return False
+    if result["verdict"] not in {"approve", "revise", "skip"}:
+        return False
+    target = next(
+        (row for row in (coverage.get("recent") or ())
+         if isinstance(row, dict) and row.get("id") == target_id and not row.get("retracted")),
+        None,
+    )
+    if target is None:
+        return False
+    prior_view = {
+        **prior,
+        "title": prior.get("title") or candidate.get("title", ""),
+        "summary": prior.get("summary") or candidate.get("summary", ""),
+        "products": prior.get("products") or candidate.get("products", []),
+        "sources": candidate.get("sources") or prior.get("sources") or [],
+    }
+    return _specific_story_overlap(prior_view, target)
+
+
+def _auto_merge_pair(store, a_id: str, b_id: str) -> tuple[str, str] | None:
+    """Return (newer_duplicate_id, earlier_survivor_id) when both published stories can auto-merge."""
+    if not isinstance(a_id, str) or not isinstance(b_id, str) or not a_id or not b_id or a_id == b_id:
+        return None
+    if not store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_catalog'").fetchone():
+        return None
+    rows = {}
+    for sid in (a_id, b_id):
+        if editorial.retired(store.db, story_id=sid) is not None or editorial.is_locked(store.db, sid):
+            return None
+        if (store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_render_queue'").fetchone()
+                and store.db.execute("SELECT 1 FROM public_render_queue WHERE story_id=? AND last_error IS NOT NULL",
+                                     (sid,)).fetchone()):
+            return None
+        row = store.db.execute(
+            """SELECT s.id,s.cluster_key,s.published_at,CAST(s.payload AS BLOB) AS payload,COALESCE(e.retracted,0) AS retracted,c.added_at
+               FROM stories s JOIN public_catalog c ON c.story_id=s.id
+               LEFT JOIN editorial_controls e ON e.story_id=s.id WHERE s.id=?""",
+            (sid,),
+        ).fetchone()
+        if row is None or row["retracted"]:
+            return None
+        rows[sid] = row
+    pa, pb = saved_object(rows[a_id]["payload"]), saved_object(rows[b_id]["payload"])
+    if not isinstance(pa, dict) or not isinstance(pb, dict):
+        return None
+    cka, ckb = rows[a_id]["cluster_key"], rows[b_id]["cluster_key"]
+    if (pa.get("origin") == "network-health" or pb.get("origin") == "network-health"
+            or cka.startswith("network:") or ckb.startswith("network:")):
+        return None
+    if cka.startswith("release:") and ckb.startswith("release:") and cka != ckb:
+        return None
+    if not _specific_story_overlap(pa, pb):
+        return None
+    key_a = (pa.get("added_at") or rows[a_id]["added_at"] or rows[a_id]["published_at"], rows[a_id]["published_at"], a_id)
+    key_b = (pb.get("added_at") or rows[b_id]["added_at"] or rows[b_id]["published_at"], rows[b_id]["published_at"], b_id)
+    return (b_id, a_id) if key_a < key_b else (a_id, b_id)
+
+
 def _news(result) -> bool:
     return all(result["criteria"][name]["outcome"] == "pass" for name in review.EDITORIAL_CRITERIA)
+
+
+def _can_route(candidate: dict, prepared: dict, result: dict, target_id) -> bool:
+    """Only route new non-tag, non-release candidates when deterministic context overlaps."""
+    if not isinstance(target_id, str) or not target_id:
+        return False
+    if prepared.get("mode", "story") != "story" or prepared["row"].get("story_id"):
+        return False
+    coverage = prepared.get("coverage") or {}
+    if coverage.get("prior_story") is not None:
+        return False
+    verdict = result["verdict"]
+    if verdict not in {"approve", "revise", "skip"}:
+        return False
+    if verdict == "skip" and result["criteria"]["new_information"]["outcome"] != "fail":
+        return False
+    item = json.loads(prepared["row"]["payload"])
+    cluster_key = prepared.get("cluster_key") or prepared["row"].get("cluster_key") or ""
+    if (item.get("kind") == "tag" or item.get("origin") == "network-health"
+            or cluster_key.startswith(("release:", "network:"))):
+        return False
+    target = next(
+        (row for row in (coverage.get("recent") or ())
+         if isinstance(row, dict) and row.get("id") == target_id and not row.get("retracted")),
+        None,
+    )
+    if target is None:
+        return False
+    cand_products = set(candidate.get("products") or ())
+    if isinstance(item.get("product"), str) and item["product"]:
+        cand_products.add(item["product"])
+    target_products = set(target.get("products") or ())
+    if cand_products & target_products or target.get("related"):
+        return True
+    target_text = f"{target.get('title') or ''}\n{target.get('summary') or ''}\n{target.get('latest_update') or ''}"
+    item_refs = set(sum(gitlab_refs(item), []))
+    target_refs = set(sum(gitlab_refs({"url": "", "title": "", "content": target_text}), []))
+    if item_refs & target_refs:
+        return True
+    item_subj, _ = thread_subject(item)
+    target_subj, _ = thread_subject({"url": item.get("url"), "title": target.get("title")})
+    return bool(item_subj and item_subj == target_subj)
 
 
 def next_step(reviews, candidate, prepared):
     """What follows the latest review of `candidate`, decided from the chain of reviews alone.
 
-    ("verify", text) sends text to a fresh verification, ("repair", text) asks a review to repair
-    its release labels, ("approve" | "skip", candidate) commits, and ("hold", (stage, reason))
-    holds. The evaluation follows the same steps.
+    ("route", story_id) attaches an unmapped item to an existing story, ("verify", text) sends text
+    to a fresh verification, ("repair", text) asks a review to repair its release labels,
+    ("approve" | "skip", candidate) commits, and ("hold", (stage, reason)) holds.
+    The evaluation follows the same steps.
     """
     latest = reviews[-1]
     result, stage, later = latest["result"], latest["stage"], len(reviews) > 1
+    if _can_route(candidate, prepared, result, result.get("same_story")):
+        return "route", result["same_story"]
     verdict = result["verdict"]
     failed = {name for name, check in result["criteria"].items() if check["outcome"] != "pass"}
     item = json.loads(prepared["row"]["payload"])
@@ -139,6 +341,8 @@ def next_step(reviews, candidate, prepared):
         if verdict != "revise":
             return ("hold", (stage, "model_hold")) if later else ("verify", candidate)
     elif verdict == "skip" and (not official or result["criteria"]["new_information"]["outcome"] == "fail"):
+        if stage == "review" and not later and _can_auto_merge_review(candidate, prepared, result):
+            return "verify", candidate
         return "skip", candidate
     if verdict == "approve":
         if stage == "verification" and (held := review.final_holds(candidate, prepared)):
@@ -151,12 +355,13 @@ def next_step(reviews, candidate, prepared):
         return ("verify" if stage == "review" else "approve"), candidate
     if verdict != "revise" or (later and failed & review.EDITORIAL_CRITERIA and not disputed):
         return "hold", (stage, "release_labels" if latest.get("issue") else "model_hold")
-    if prepared["payload"]["editorial_kind"] == "tag":
+    is_update = prepared.get("mode") == "update"
+    if (item.get("kind") == "tag") if is_update else (prepared["payload"]["editorial_kind"] == "tag"):
         return "hold", (stage, "tag_repair")
     if len(reviews) > MAX_VERIFY_REPAIRS + 1:
         return "hold", (stage, "repairs_exhausted")
     try:
-        repaired = review.apply_repair(candidate, result["repair"])
+        repaired = review.apply_repair(candidate, result["repair"], update=is_update)
     except review.ReviewError:
         # After a disputed official item's first review, the unchanged text goes to its fresh verification.
         return ("verify", candidate) if disputed and not later else ("hold", (stage, "unusable_repair"))
@@ -169,8 +374,9 @@ def next_step(reviews, candidate, prepared):
 
 def call_review(reviewer, stage, candidate, prepared) -> dict:
     """Ask for the review that `stage` names and return the chain entry that records its reply."""
+    extra = {"update": True} if prepared.get("mode") == "update" else {}
     result = reviewer.review(candidate, prepared["packet"], coverage=prepared["coverage"], verification=stage == "verify",
-                             issue=review.RELEASE_ISSUE if stage == "repair" else None)
+                             issue=review.RELEASE_ISSUE if stage == "repair" else None, **extra)
     return {"stage": "verification" if stage == "verify" else "review", **({"issue": "release_labels"} if stage == "repair" else {}),
             "candidate_hash": digest(candidate), "result": result}
 
@@ -193,6 +399,46 @@ def _hold(store, row, draft, writer_key, record, observed, stage, reason):
         store.db.execute("""UPDATE review_jobs SET stage='held',record_json=?,approval_key=NULL,
             updated_at=? WHERE item_id=?""", (_json(record), observed, row["id"]))
         decisions.record(store.db, row["id"], f"held.{stage}.{reason}", observed, review=record)
+
+
+def _route(store, row, draft, writer_key, record, observed, target, stage) -> str:
+    """Attach an unmapped item to `target` once and clear its standalone draft for update review."""
+    from .candidate import StaleCandidate
+    from .editorial import retired
+
+    live = store.db.execute(
+        """SELECT 1 FROM stories s LEFT JOIN editorial_controls e ON e.story_id=s.id
+           WHERE s.id=? AND COALESCE(e.retracted,0)=0""",
+        (target,),
+    ).fetchone()
+    if live is None or retired(store.db, story_id=target) is not None:
+        _hold(store, row, draft, writer_key, record, observed, stage, "model_hold")
+        return "held"
+    record.update(outcome="routed", routed_to=target)
+    with store.db:
+        live_now = store.db.execute(
+            """SELECT 1 FROM stories s LEFT JOIN editorial_controls e ON e.story_id=s.id
+               WHERE s.id=? AND COALESCE(e.retracted,0)=0""",
+            (target,),
+        ).fetchone()
+        if live_now is None or retired(store.db, story_id=target) is not None:
+            can_route_now = False
+        else:
+            can_route_now = True
+            updated = store.db.execute(
+                """UPDATE items SET status='pending',story_id=?,attempts=0,rejections=0,
+                   next_attempt_at=NULL,last_error='Attached to an existing story for update review'
+                   WHERE id=? AND content_hash=? AND status='pending' AND story_id IS NULL""",
+                (target, row["id"], row["content_hash"]),
+            ).rowcount
+            if not updated:
+                raise StaleCandidate("Source item changed before routing")
+            store.record_analysis(row, draft, writer_key, observed, review_record=record)
+            store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
+    if not can_route_now:
+        _hold(store, row, draft, writer_key, record, observed, stage, "model_hold")
+        return "held"
+    return "routed"
 
 
 def developed_at(item: dict) -> str:
@@ -258,14 +504,13 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
     marks the item rejected immediately.
     """
     from .candidate import ReviewRequired, StaleCandidate
-    from .editorial import RetiredStory, retired
+    from .editorial import RetiredStory, is_locked, retired
 
     observed = observed or now_iso()
-    policy = review.policy_hash(config)
-    writer_key = cache_key(row, config["llm"])
     report = {"status": "pending", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
     try:
-        if candidate_mod.existing_story(store.db, row) is None and retired(
+        existing = candidate_mod.existing_story(store.db, row)
+        if existing is None and retired(
                 store.db, story_id=digest(row["cluster_key"])[:24], cluster_key=row["cluster_key"]) is not None:
             raise RetiredStory("Story is retired")
     except RetiredStory:
@@ -277,13 +522,46 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
             decisions.record(store.db, row["id"], "skipped.gate.retired_story", observed)
         return {**report, "status": "ignored"}
-    skipped = _not_recent(config, store, row, json.loads(row["payload"]), observed)  # needs no network
+    item_payload = json.loads(row["payload"])
+    skipped = _not_recent(config, store, row, item_payload, observed)  # needs no network
     if skipped:
         return {**report, "status": skipped}
+    if existing is not None and candidate_mod.relation(json.loads(existing["payload"]), item_payload, store.db) == "citation":
+        try:
+            cited = store.add_citation(row, existing["id"], observed)
+        except RetiredStory:
+            with store.db:
+                if not store.db.execute("""UPDATE items SET status='ignored',story_id=NULL,next_attempt_at=NULL,
+                        last_error='Retired story; never recreated' WHERE id=? AND content_hash=? AND status='pending'""",
+                        (row["id"], row["content_hash"])).rowcount:
+                    return {**report, "status": "stale"}
+                store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
+                decisions.record(store.db, row["id"], "skipped.gate.retired_story", observed)
+            return {**report, "status": "ignored"}
+        except StaleCandidate:
+            return {**report, "status": "stale"}
+        return {**report, "status": cited["status"]}
+    own_state, writer_item = candidate_mod.own_update_input(store.db, row, item_payload)
+    if own_state == "skip":
+        with store.db:
+            if not store.db.execute("""UPDATE items SET status='ignored',next_attempt_at=NULL,
+                    last_error='No new content after story update' WHERE id=? AND content_hash=? AND status='pending'""",
+                    (row["id"], row["content_hash"])).rowcount:
+                return {**report, "status": "stale"}
+            store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
+            decisions.record(store.db, row["id"], "skipped.gate.no_new_content", observed)
+        return {**report, "status": "ignored"}
+    policy = review.policy_hash(config)
+    prior = candidate_mod.update_target(store.db, row)
+    writer_key = cache_key(row, config["llm"], prior)
     job = store.db.execute("""SELECT writer_key,policy_hash,stage,approval_key,prepared_at,CAST(draft_json AS BLOB) AS draft,
         CAST(envelope_json AS BLOB) AS envelope,CAST(record_json AS BLOB) AS record FROM review_jobs WHERE item_id=?""",
         (row["id"],)).fetchone()
-    if job is not None and job["writer_key"] == writer_key:
+    locked_reuse = (job is not None and existing is not None and is_locked(store.db, existing["id"])
+                    and (saved_object(job["record"]) or {}).get("input_row", {}).get("content_hash") == row["content_hash"]
+                    and saved_object(job["draft"]) is not None)
+    if job is not None and (job["writer_key"] == writer_key or locked_reuse):
+        writer_key = job["writer_key"]
         draft, old, record = (saved_object(job[key]) for key in ("draft", "envelope", "record"))
         # A job whose JSON cannot be read fails the item; reviewing it afresh could pass over its hold.
         # The other columns hold only the ASCII keys, stages and times that the application writes.
@@ -295,10 +573,10 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         record = {"schema_version": 1, "writer": None, "input_row": row, "reviews": []}
         prepared_at = observed
     if draft is None:
-        if not allow_network and json.loads(row["payload"])["kind"] != "tag":
+        if not allow_network and item_payload["kind"] != "tag":
             return {**report, "status": "deferred"}
-        report["writer_calls"] += json.loads(row["payload"])["kind"] != "tag"
-        draft = writer.analyze(json.loads(row["payload"]))
+        report["writer_calls"] += item_payload["kind"] != "tag"
+        draft = writer.analyze(writer_item) if prior is None else writer.analyze(writer_item, prior=prior)
         record["writer"] = {"key": writer_key}  # The draft itself is saved in the job, then in analyses.
         if getattr(writer, "clears", 0):  # writer validation cleared the draft's impact sentence
             record["writer"]["clears"] = writer.clears  # kept until an operator retry resets the record
@@ -308,7 +586,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         same = old is not None and job["policy_hash"] == policy and _identity(old) == _identity(prepared)
         stage = job["stage"] if same else "review"
         fresh = {"schema_version": 1, "writer": record["writer"], "input_row": row, "reviews": [], "policy_hash": policy,
-                 "prepared": {key: prepared[key] for key in ("candidate", "packet", "coverage", "candidate_hash", "source_hash", "coverage_hash", "binding_hash")}}
+                 "prepared": {key: prepared[key] for key in ("mode", "candidate", "packet", "coverage", "candidate_hash", "source_hash", "coverage_hash", "binding_hash")}}
         record = record if same else fresh
         candidate = record.get("candidate", prepared["candidate"])
         _save(store, row["id"], writer_key, policy, stage, draft, prepared, record, observed, prepared_at=prepared_at,
@@ -329,9 +607,10 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         cached = store.db.execute("SELECT * FROM review_approvals WHERE key=?", (key,)).fetchone()
         if cached is not None:
             try:
-                verdict = review.validate_review(json.loads(cached["result_json"]), prepared["packet"])
+                verdict = review.validate_review(json.loads(cached["result_json"]), prepared["packet"],
+                                                 update=prepared.get("mode") == "update", coverage=prepared["coverage"])
                 proof = json.loads(cached["review_record_json"])
-                valid = verdict["verdict"] in {"approve", "skip"}
+                valid = verdict["verdict"] in {"approve", "skip"} and verdict.get("same_story") is None
             except (AnalysisError, ValueError, TypeError, KeyError):
                 valid = False
             if valid:
@@ -358,10 +637,47 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             record["reviews"].append({**call_review(reviewer, stage, candidate, prepared), "source_hash": prepared["source_hash"],
                                       "coverage_hash": prepared["coverage_hash"], "policy_hash": policy})
             action, value = next_step(record["reviews"], candidate, prepared)
+            if action == "route":
+                status_out = _route(store, row, draft, writer_key, record, observed, value, record["reviews"][-1]["stage"])
+                return {**report, "status": status_out}
             if action == "hold":
                 _hold(store, row, draft, writer_key, record, observed, *value)
                 return {**report, "status": "held"}
             if action in {"approve", "skip"}:
+                agreed_dup = None
+                if (prepared["coverage"].get("prior_story") is not None
+                        and len(record["reviews"]) >= 2
+                        and record["reviews"][-1]["stage"] == "verification"):
+                    first_same = record["reviews"][0]["result"].get("same_story")
+                    final_same = record["reviews"][-1]["result"].get("same_story")
+                    if isinstance(first_same, str) and first_same and first_same == final_same:
+                        agreed_dup = _auto_merge_pair(store, prepared["story_id"], first_same)
+                if agreed_dup is not None and agreed_dup[0] == prepared["story_id"]:
+                    dup_id, survivor_id = agreed_dup
+                    merged_prior = False
+                    with contextlib.suppress(ValueError):
+                        editorial.merge(
+                            store.db,
+                            dup_id,
+                            survivor_id,
+                            reason="Combined duplicate coverage of the same event",
+                            base_url=config["site"]["base_url"],
+                            observed=now_iso(),
+                            automatic=True,
+                        )
+                        merged_prior = True
+                    if merged_prior:
+                        record.update(outcome="routed", routed_to=survivor_id, merged_duplicate=dup_id)
+                        with store.db:
+                            store.record_analysis(row, draft, writer_key, observed, review_record=record)
+                            store.db.execute(
+                                """UPDATE items SET status='pending',story_id=?,attempts=0,rejections=0,
+                                   next_attempt_at=NULL,last_error='Attached to survivor story after duplicate merge'
+                                   WHERE id=? AND content_hash=?""",
+                                (survivor_id, row["id"], row["content_hash"]),
+                            )
+                            store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
+                        return {**report, "status": "routed"}
                 key = _approval_key(candidate, prepared, policy)
                 record.update(candidate=candidate, approval_key=key, outcome="skipped" if action == "skip" else "approved")
                 receipt = (key, digest(candidate), prepared["source_hash"], policy, prepared["binding_hash"],
@@ -370,6 +686,17 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                       prepared_at=prepared_at, approval_key=key, approval_receipt=receipt)
                 committed = store.commit_candidate(prepared, candidate, writer_key, now_iso(), approval_key=key,
                                                    policy_hash=policy, review_record=record, decision=action)
+                if agreed_dup is not None and agreed_dup[1] == prepared["story_id"]:
+                    with contextlib.suppress(ValueError):
+                        editorial.merge(
+                            store.db,
+                            agreed_dup[0],
+                            agreed_dup[1],
+                            reason="Combined duplicate coverage of the same event",
+                            base_url=config["site"]["base_url"],
+                            observed=now_iso(),
+                            automatic=True,
+                        )
                 return {**report, "status": committed["status"]}
             stage, candidate = action, value  # the next review: a verification or a release-label repair
             record["candidate"] = candidate
@@ -466,12 +793,16 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
             or prepared["source_hash"] != held_prepared.get("source_hash")
             or prepared["source_hash"] != saved_env.get("source_hash")
             or any(prepared["binding"][key] != saved_binding.get(key)
-                   for key in ("prior_story", "lock", "sources", "payload_hash"))):
+                   for key in ("prior_story", "lock", "sources", "payload_hash",
+                               *(["mode"] if "mode" in saved_binding else [])))):
         return refuse("Its story or sources changed since the review; retry it", editorial_failures, new_coverage)
     if any(entry.get("source_hash") != prepared["source_hash"] for entry in reviews):
         return refuse("An earlier review policy or packet reviewed it; retry it", editorial_failures, new_coverage)
+    is_update = prepared.get("mode") == "update"
     try:
-        validated = [review.validate_review(entry["result"], prepared["packet"]) for entry in reviews]
+        validated = [review.validate_review(entry["result"], prepared["packet"],
+                                            update=is_update, coverage=held_prepared.get("coverage"))
+                     for entry in reviews]
     except (AnalysisError, ValueError, TypeError, KeyError):
         return refuse("Saved review record cannot be read", editorial_failures, new_coverage)
     if any(result["criteria"]["new_information"]["outcome"] != "pass" for result in validated):
@@ -480,8 +811,19 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
     original = prepared["candidate"]
     if not isinstance(candidate, dict) or set(candidate) != set(original):
         return refuse("No fresh verification reviewed this exact text", editorial_failures, new_coverage)
-    if any(candidate[key] != original[key] for key in original if key not in candidate_mod.SEMANTIC_FIELDS):
+    editable_fields = candidate_mod.UPDATE_FIELDS if is_update else candidate_mod.SEMANTIC_FIELDS
+    if any(candidate[key] != original[key] for key in original if key not in editable_fields):
         return refuse("Saved review record cannot be read", editorial_failures, new_coverage)
+    if is_update:
+        orig_updates, cand_updates = original.get("updates"), candidate.get("updates")
+        if (not isinstance(orig_updates, list) or not isinstance(cand_updates, list)
+                or len(cand_updates) != len(orig_updates) or not orig_updates
+                or cand_updates[:-1] != orig_updates[:-1]
+                or not isinstance(cand_updates[-1], dict) or not isinstance(orig_updates[-1], dict)
+                or "at" not in cand_updates[-1] or "sources" not in cand_updates[-1]
+                or cand_updates[-1]["at"] != orig_updates[-1].get("at")
+                or cand_updates[-1]["sources"] != orig_updates[-1].get("sources")):
+            return refuse("Saved review record cannot be read", editorial_failures, new_coverage)
     try:
         if render._prepare_story(candidate, editorial=original.get("editorial")) != candidate:
             return refuse("Saved review record cannot be read", editorial_failures, new_coverage)

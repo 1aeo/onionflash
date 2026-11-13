@@ -88,9 +88,8 @@ there, and the new attempt adds its own record. Accepted stories are unchanged.
 When inspection shows that a review skipped worthwhile news, retry the item as
 above. The writer and review requests run again; with unchanged sources, models
 and review policy they normally return the same decision, and the item may be
-ignored again. The new review compares the item with the newest stories at
-retry time, which may no longer include a story that the earlier decision
-compared it with, so check that decision's coverage in `show` first.
+ignored again. See [publication review](FINAL_REVIEW.md) for how coverage
+background includes the earlier skipped decision's stories.
 
 ## Dismiss one failed revision
 

@@ -1,4 +1,4 @@
-from approval_helpers import ApprovingReviewer, finish_reviewed
+from approval_helpers import ApprovingReviewer, finish_reviewed, update_analysis
 import copy
 import json
 import sqlite3
@@ -698,6 +698,23 @@ def test_example_config_resolves_paths_and_rejects_dangerous_settings(
     p.write_text(text.replace('output_dir = "build/public"', 'output_dir = "."'))
     with pytest.raises(ValueError):
         load_config(p)
+    assert cfg["llm"]["fallback_base_urls"] == []
+    # Empty, whitespace-only, non-string or invalid fallback endpoints must be rejected.
+    monkeypatch.setenv("ONIONFLASH_LLM_FALLBACK_URL", "   ")
+    for fallback in ('[""]', '["   "]', '["/"]', '[123]', '["${ONIONFLASH_LLM_FALLBACK_URL}"]'):
+        p.write_text(text.replace("fallback_base_urls = []", "fallback_base_urls = " + fallback))
+        with pytest.raises(ValueError, match="fallback"):
+            load_config(p)
+    monkeypatch.setenv("ONIONFLASH_LLM_FALLBACK_URL", "")
+    p.write_text(text.replace("fallback_base_urls = []", 'fallback_base_urls = ["${ONIONFLASH_LLM_FALLBACK_URL}"]'))
+    with pytest.raises(ValueError, match="fallback"):
+        load_config(p)
+    for fallback in ('["http://backup.example/v1"]', '["ftp://backup.example/v1"]'):
+        p.write_text(text.replace("fallback_base_urls = []", "fallback_base_urls = " + fallback))
+        with pytest.raises(ValueError, match="Invalid LLM base URL"):
+            load_config(p)
+    p.write_text(text.replace("fallback_base_urls = []", 'fallback_base_urls = ["https://backup.example/v1/"]'))
+    assert load_config(p)["llm"]["fallback_base_urls"] == ["https://backup.example/v1"]
 
 
 def test_skipped_story_count_is_reported_on_every_build(tmp_path):
@@ -714,28 +731,32 @@ def test_skipped_story_count_is_reported_on_every_build(tmp_path):
 
 
 def test_story_precedence_keeps_confirmed_account_but_follows_its_own_updates(tmp_path):
-    def publish(store, url, updated, content=item()["content"], **result):
+    def publish(store, url, updated, draft, content=item()["content"]):
         store.ingest(item(url=url, title="Arti 2.8.0 released", updated_at=updated, kind="feed", content=content,
                           product="arti"), updated)
         row = next(r for r in store.pending(10, updated) if r["url"] == url)
-        finish_reviewed(store, row, analysis(**result), "key-" + url + updated, updated)
+        finish_reviewed(store, row, draft, "key-" + url + updated, updated)
         return store.stories(10)
 
     later = "2026-11-08T13:00:00Z"
     latest = "2026-11-08T14:00:00Z"
     with Store(tmp_path / "state.db") as store:
-        official = dict(title="Arti 2.8.0 released", confidence="confirmed", state="released")
-        publish(store, "https://blog.example/arti", DATE, **official)
-        # A later, unconfirmed item in the same release cluster adds a source but not its text.
+        official = analysis(title="Arti 2.8.0 released", confidence="confirmed", state="released")
+        publish(store, "https://blog.example/arti", DATE, official)
+        # A follow-up in the same release cluster adds a dated update without rewriting the main headline.
         stories = publish(store, "https://gitlab.example/arti/1", later,
-                          title="Arti 2.8.0 release checklist completed", confidence="reported")
+                          update_analysis(update="Arti 2.8.0 release checklist completed.", confidence="confirmed", state="released"))
         assert len(stories) == 1 and len(stories[0]["sources"]) == 2
         assert (stories[0]["title"], stories[0]["confidence"]) == ("Arti 2.8.0 released", "confirmed")
-        # The item that wrote the story can still update it, even to an unconfirmed account.
-        stories = publish(store, "https://blog.example/arti", latest, content="Update: the release was withdrawn.",
-                          title="Arti 2.8.0 release withdrawn",
-                          confidence="reported", state="developing")
-        assert (stories[0]["title"], stories[0]["confidence"]) == ("Arti 2.8.0 release withdrawn", "reported")
+        assert stories[0]["updates"][-1]["text"] == "Arti 2.8.0 release checklist completed."
+        # The item that wrote the story also appends a dated update and updates labels while keeping the original title.
+        stories = publish(store, "https://blog.example/arti", latest,
+                          update_analysis(update="Update: the release was withdrawn.", confidence="reported",
+                                          state="developing", evidence=["Update: the release was withdrawn."]),
+                          content="Update: the release was withdrawn.")
+        assert (stories[0]["title"], stories[0]["confidence"], stories[0]["state"]) == ("Arti 2.8.0 released", "reported", "developing")
+        assert [entry["text"] for entry in stories[0]["updates"]] == [
+            "Arti 2.8.0 release checklist completed.", "Update: the release was withdrawn."]
 
 
 def test_release_clusters_include_two_part_versions_and_alpha_suffixes():
@@ -754,6 +775,7 @@ def test_release_clusters_include_two_part_versions_and_alpha_suffixes():
     assert key("[tor-announce] [RELEASE] Tor release 0.4.9.17") == key("tor-0.4.9.17", kind="tag") == "release:tor:0.4.9.17"
     assert key("Tor stable release 1.2.3") == "release:tor:1.2.3"
     assert key("New Tor stable release 0.4.8.19") == "release:tor:0.4.8.19"
+    assert key("Arti 1.7.0 is now available") == "release:arti:1.7.0"
     for q in ("new", "stable", "alpha", "beta", "security", "bugfix", "release", "version"):
         assert key(f"Tor {q} 1.2.3 released") == "release:tor:1.2.3", q
     # A title that says "released" stays a release even when it says "postponed", and so does
@@ -769,24 +791,26 @@ def test_release_clusters_include_two_part_versions_and_alpha_suffixes():
 
 
 def test_precedence_compares_with_the_writing_item_not_later_losers(tmp_path):
-    def publish(store, url, updated, **result):
+    def publish(store, url, updated, draft):
         store.ingest(item(url=url, title="Tor 0.4.9.17 released", updated_at=updated, kind="feed", content=url), updated)
         row = next(r for r in store.pending(10, updated) if r["url"] == url)
-        finish_reviewed(store, row, analysis(title=result.pop("title"), **result), "k" + url, updated)
+        finish_reviewed(store, row, draft, "k" + url, updated)
         return store.stories(10)[0]
 
     with Store(tmp_path / "state.db") as store:
-        publish(store, "https://a.example/1", "2026-11-08T12:00:00Z", title="A", confidence="confirmed")
-        # A lower-ranked (unconfirmed) item advances the story's updated_at but not its text.
-        story = publish(store, "https://b.example/1", "2026-11-08T15:00:00Z", title="B", confidence="reported")
-        assert (story["title"], story["updated_at"]) == ("A", "2026-11-08T15:00:00Z")
-        # A newer confirmed item than the writer still replaces the text.
-        story = publish(store, "https://c.example/1", "2026-11-08T13:00:00Z", title="C", confidence="confirmed")
-        assert story["title"] == "C"
+        first = publish(store, "https://a.example/1", "2026-11-08T12:00:00Z", analysis(title="A", confidence="confirmed", state="released"))
+        writer_id = first["editorial_item"]
+        # Follow-ups keep the original prose and writer provenance while appending dated updates.
+        story = publish(store, "https://b.example/1", "2026-11-08T15:00:00Z",
+                        update_analysis(update="Follow-up B.", confidence="confirmed", state="released", evidence=["https://b.example/1"]))
+        assert (story["title"], story["updated_at"], story["editorial_item"]) == ("A", "2026-11-08T15:00:00Z", writer_id)
+        story = publish(store, "https://c.example/1", "2026-11-08T13:00:00Z",
+                        update_analysis(update="Follow-up C.", confidence="confirmed", state="released", evidence=["https://c.example/1"]))
+        assert (story["title"], story["updated_at"], story["editorial_item"]) == ("A", "2026-11-08T15:00:00Z", writer_id)
+        assert [entry["text"] for entry in story["updates"]] == ["Follow-up B.", "Follow-up C."]
 
 
 def test_legacy_story_without_editorial_fields_survives_successive_items(tmp_path):
-    # Same tier and confidence, so the timestamps decide (and must be comparable).
     legacy = {**analysis(title="Tor 0.4.9.18 released"),
               "id": "legacy000000000000000000", "published_at": DATE, "updated_at": "2026-11-08T15:00:00Z",
               "sources": [{"id": "old", "url": "https://old.example/1", "title": "Old", "published_at": DATE}]}
@@ -803,11 +827,12 @@ def test_legacy_story_without_editorial_fields_survives_successive_items(tmp_pat
         store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (legacy["id"], key, json.dumps(legacy), DATE, legacy["updated_at"]))
         for index, stamp in enumerate(["2026-11-08T13:00:00Z", "2026-11-08T14:00:00Z"]):
             store.ingest(item(url=f"https://new.example/{index}", title="Tor 0.4.9.18 released", kind="feed",
-                              content=str(index), updated_at=stamp), stamp)
+                              content=f"Follow-up {index} notes.", updated_at=stamp), stamp)
             row = next(r for r in store.pending(10, stamp) if r["url"].endswith(str(index)))
-            finish_reviewed(store, row, analysis(title=f"Item {index}"), f"k{index}", stamp)
+            finish_reviewed(store, row, update_analysis(update=f"Item {index}.", evidence=[f"Follow-up {index} notes."]), f"k{index}", stamp)
         story = store.stories(10)[0]
     assert story["title"] == "Tor 0.4.9.18 released" and len(story["sources"]) == 3
+    assert [entry["text"] for entry in story["updates"]] == ["Item 0.", "Item 1."]
 
 
 def test_an_older_single_source_story_can_still_be_updated_by_its_source(tmp_path):
@@ -821,10 +846,13 @@ def test_an_older_single_source_story_can_still_be_updated_by_its_source(tmp_pat
         legacy.pop("evidence")
         store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (legacy["id"], row["cluster_key"], json.dumps(legacy), DATE, DATE))
         later = "2026-11-08T13:00:00Z"
-        store.ingest(item(url=url, title="Tor 0.4.9.19 released", kind="feed", content="Withdrawn.", updated_at=later), later)
-        finish_reviewed(store, store.pending(1, later)[0], analysis(title="Tor 0.4.9.19 release withdrawn"), "k", later)
+        store.ingest(item(url=url, title="Tor 0.4.9.19 released", kind="feed", content="The release was withdrawn.", updated_at=later), later)
+        finish_reviewed(store, store.pending(1, later)[0],
+                        update_analysis(update="The release was withdrawn.", confidence="confirmed",
+                                        state="developing", evidence=["The release was withdrawn."]), "k", later)
         story = store.stories(1)[0]
-    assert story["title"] == "Tor 0.4.9.19 release withdrawn" and story["editorial_item"] == row["id"]
+    assert story["title"] == "Tor 0.4.9.19 released" and story["editorial_item"] == row["id"]
+    assert story["updates"] == [{"at": later, "text": "The release was withdrawn.", "sources": [{"url": url, "title": "Tor 0.4.9.19 released"}]}]
 
 
 def test_new_story_records_when_onion_flash_added_it(tmp_path):
@@ -1054,7 +1082,7 @@ def test_a_torproject_org_sender_on_the_list_archive_is_project_sender():
     # review_gate treats project-sender as official for news-value holds, while Confirmed still refuses it.
     criteria = {name: {"reason": "Supported.", "source_refs": ["S1P1"], "outcome": "pass"} for name in review.CRITERIA}
     criteria["news_value"] = {"reason": "Routine reply.", "source_refs": ["S1P1"], "outcome": "fail"}
-    first = {"stage": "review", "candidate_hash": "h", "result": {"verdict": "skip", "criteria": criteria, "repair": None}}
+    first = {"stage": "review", "candidate_hash": "h", "result": {"verdict": "skip", "criteria": criteria, "same_story": None, "repair": None}}
     prepared = {"row": {"payload": json.dumps(items[0])}, "payload": {"editorial_kind": "feed"},
                 "packet": {"sources": [{**items[0], "passages": [{"ref": "S1P1", "text": "Body"}]}]}, "coverage": {}}
     assert review_gate.next_step([first], analysis(), prepared)[0] == "verify"

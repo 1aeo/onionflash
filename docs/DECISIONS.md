@@ -21,10 +21,11 @@ failures), or the operator's reason and the item's previous status and error. It
 never keeps the draft, the full review reply or the source's content. If a saved
 record cannot be read, the row keeps the title and URL, or no detail; logging
 never prevents the outcome.
-Rows of publications, skips and holds also keep `writer_clears` when writer
-validation cleared the draft's impact sentence, so a repeat hold counts the
-clear again. Failure and operator rows do not keep it, and neither do the rows
-of the new review that an operator retry starts with a kept draft.
+Rows of publications, skips and holds also keep `scope` (`story` or `update`),
+and keep `writer_clears` when writer validation cleared the draft's impact
+sentence, so a repeat hold counts the clear again. Failure and operator rows do
+not keep `writer_clears`, and neither do the rows of the new review that an
+operator retry starts with a kept draft.
 
 The log starts empty: decisions made before it existed, or by an older release
 after a rollback, are not in it.
@@ -32,10 +33,12 @@ after a rollback, are not in it.
 ## Codes
 
 A code is `<outcome>.<stage>.<reason>` or `<outcome>.<reason>`. The outcome is
-`published`, `skipped`, `held`, `failed` or `operator`. The stage names where the
-decision was made: `gate` (the application's checks around the review), `review`
-(the first review, or a request to repair release labels; in `failed` codes, any
-request to the reviewer), `verification` (a fresh verification), `final_check` (the
+`published`, `skipped`, `held`, `failed`, `merged` or `operator`. The stage names where the
+decision was made: `gate` (the application's checks around the review), `network`
+(fixed-text consensus-health alerts, whose rows carry no `item_id` and use the
+report URL or incident key as `subject`), `review` (the first review, or a request
+to repair release labels; in `failed` codes, any request to the reviewer),
+`verification` (a fresh verification), `final_check` (the
 [final checks](FINAL_REVIEW.md#final-checks) of a verified approval), `writer`,
 or `app`. Codes are stable, so counts can be compared over time.
 
@@ -43,6 +46,8 @@ or `app`. Codes are stable, so counts can be compared over time.
 | --- | --- |
 | `published.new` | The item became a new story. |
 | `published.update` | The item updated an existing story. |
+| `published.network.new` | A consensus-health incident became a new fixed-text story. |
+| `published.network.update` | A consensus-health incident added fixed-text updates to a story. |
 | `skipped.review.news_value` | The first review found no news value. |
 | `skipped.review.new_information` | The first review found nothing new beyond existing coverage. |
 | `skipped.review.new_information_and_news_value` | The first review failed both editorial criteria. |
@@ -51,9 +56,17 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `skipped.verification.new_information_and_news_value` | The verification failed both editorial criteria. |
 | `skipped.gate.not_recent` | The item would start a new story, but its newest dated development is more than 14 days older than its collection. No model was asked. |
 | `skipped.gate.retired_story` | The item maps to a retired story identity or cluster key, which is never recreated. No model was asked. |
+| `skipped.gate.no_new_content` | A re-observed item for its own published story adds no new unquoted comment or body text (or re-observes its own tag notice). No model was asked. |
+| `skipped.network.not_report` | A consensus-health feed entry was not a machine-formatted DocTor report (for example, a human reply or summary). |
+| `skipped.network.below_threshold` | A consensus-health episode ended before reaching its publication threshold. |
+| `skipped.network.before_enable` | A consensus-health incident had already closed before publication was enabled. |
+| `skipped.network.host_locked` | A matching host story was locked or retracted, so it was excluded as an attachment target. |
 | `held.gate.missing_sources` | Source material the candidate cites is unavailable. |
 | `held.gate.repeat_hold` | The candidate was held before, for example after a source reverted. |
 | `held.gate.story_locked` | The item updates a story that an editorial correction locked. |
+| `held.network.dry_run` | A consensus-health story or update met its threshold while `publish = false`. |
+| `held.network.link_pending` | Checking whether a consensus-health incident belongs on an existing story failed transiently and will retry next run. |
+| `held.network.story_locked` | A consensus-health update targets a story that an editorial action locked. |
 | `held.review.model_hold` | The first review held the candidate, or could not confirm whether an official item was already covered. |
 | `held.verification.model_hold` | A verification held the candidate, or refused it on news value or new information (a repair it proposes for an official item's facts is applied and verified instead). |
 | `held.review.tag_repair` | The review proposed editing a literal tag notice. |
@@ -87,15 +100,18 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `failed.app.unexpected` | Processing failed unexpectedly. |
 | `failed.app.damaged_item` | The item's saved copy is damaged. |
 | `failed.app.damaged_job` | The item's saved review job is damaged. |
+| `merged.auto.same_event` | Both review and fresh verification confirmed two published stories report the same event, and the newer story merged into the earlier one. |
 | `operator.retried` | An operator retried a rejected, dismissed or failed item. |
 | `operator.reconsidered` | An operator retried an ignored (skipped) item. |
 | `operator.dismissed` | An operator dismissed an item. |
 | `operator.approved` | An operator approved a held candidate whose facts passed fresh verification. |
+| `operator.merged` | An operator merged a published duplicate story into a survivor story. |
 
 A held update of a locked story leaves the item `published`: it maps to that
-story and the story's held-update count grows. Unlocking the story does not apply
-the update, so the summary lists the story under `awaiting_operator` until an
-update of it is published after its latest hold.
+story and the story's held-update count grows. Unlocking the story re-queues
+items whose latest decision is `held.gate.story_locked` at their current
+revision; the summary lists the story under `awaiting_operator` until an update
+of it is published after its latest hold.
 
 ## Commands
 
@@ -136,6 +152,7 @@ its history when collecting a new revision clears its rejection reason.
 
 ## Run report and status
 
-The run report's `decisions` counts the run's decisions by code. Holds count
+The run report's `decisions` counts the run's decisions by code, and
+`review_routed` counts items attached to an existing story for update review. Holds count
 there, not in `analysis_failed`, which counts failures and damaged items. `status`
 reports `decisions_24h`, the decisions of the last 24 hours by outcome.

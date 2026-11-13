@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from approval_helpers import approve, verdict
+from approval_helpers import approve, update_analysis, verdict
 from onionflash import candidate, review_gate
 from onionflash.analyze import Analyzer, AnalysisError, tag_notice
 from onionflash.store import ReviewRequired
@@ -66,12 +66,14 @@ def test_material_known_issue_followup_updates_same_article_after_review(context
     before = store.stories()[0]
     add_coverage(store)
     row = pending(store, {**original, "content": original["content"] + " A substantive later result.", "updated_at": LATER})
-    checker = Reviewer(verdict())
-    result = run(cfg, store, row, Writer(analysis(summary="The source reports a substantive later result.")), checker)
+    checker = Reviewer(verdict(update=True))
+    result = run(cfg, store, row, Writer(update_analysis(update="The source reports a substantive later result.",
+                                                         evidence=["A substantive later result."])), checker)
     assert result["status"] == "published" and len(store.stories()) == 2
     after = store.stories()[0]
     assert after["id"] == story_id and after["published_at"] == before["published_at"]
-    assert after["summary"] == "The source reports a substantive later result."
+    assert after["summary"] == before["summary"]
+    assert after["updates"][-1]["text"] == "The source reports a substantive later result."
     assert checker.coverages[0]["prior_story"]["summary"] == before["summary"]
     assert story_id not in {entry["id"] for entry in checker.coverages[0]["recent"]} and checker.coverages[1] == checker.coverages[0]
 
@@ -111,7 +113,7 @@ def test_coverage_is_bounded_but_keeps_exact_prior_visible_text(context):
     for number in range(40):
         add_coverage(store, f"background-{number:02d}", summary="Background detail. " * 80)
     row = pending(store, {**original, "content": original["content"] + " A current change.", "updated_at": LATER})
-    prepared = store.prepare_candidate(row, analysis(), LATER)
+    prepared = store.prepare_candidate(row, update_analysis(evidence=["A current change."]), LATER)
     background = prepared["coverage"]
     assert background["prior_story"]["id"] == prior_id
     assert background["prior_story"]["summary"] == previous["summary"]
@@ -133,7 +135,8 @@ def test_recent_query_does_not_scan_unbounded_history_to_replace_retracted_rows(
                     (story_id,revision,locked,retracted,notice_action,notice_reason,notice_at)
                     VALUES(?,1,1,1,'retract','Withdrawn',?)""", (f"background-{number:02d}", LATER))
     background = candidate.coverage_background(store.db, None)
-    assert background["recent"] == [] and background["truncated"]
+    assert len(background["recent"]) == candidate.COVERAGE_ROWS and background["truncated"]
+    assert all(row.get("retracted") is True and "summary" not in row for row in background["recent"])
 
 
 @pytest.mark.parametrize("final", ["hold", "skip"])

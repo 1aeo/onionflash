@@ -14,11 +14,13 @@ from collections import Counter, defaultdict
 from .util import after, format_utc, parse_utc, saved_object
 
 CODES = frozenset({
-    "published.new", "published.update",
+    "published.new", "published.update", "published.network.new", "published.network.update",
     *(f"skipped.{stage}.{reason}" for stage in ("review", "verification")
       for reason in ("news_value", "new_information", "new_information_and_news_value")),
-    "skipped.gate.not_recent", "skipped.gate.retired_story",
+    "skipped.gate.not_recent", "skipped.gate.retired_story", "skipped.gate.no_new_content",
+    *(f"skipped.network.{reason}" for reason in ("not_report", "below_threshold", "before_enable", "host_locked")),
     "held.gate.missing_sources", "held.gate.repeat_hold", "held.gate.story_locked",
+    *(f"held.network.{reason}" for reason in ("dry_run", "link_pending", "story_locked")),
     *(f"held.{stage}.{reason}" for stage in ("review", "verification")
       for reason in ("model_hold", "tag_repair", "unusable_repair", "repeated_repair", "disagreed_news", "release_labels")),
     "held.verification.official_not_news", "held.verification.repairs_exhausted",
@@ -27,7 +29,8 @@ CODES = frozenset({
                                                "no_literal_evidence", "invalid_input", "truncated", "invalid_json")),
     *(f"failed.review.{reason}" for reason in ("invalid_reply", "invalid_input", "truncated", "invalid_json")),
     "failed.app.invalid_tag_name", "failed.app.unexpected", "failed.app.damaged_item", "failed.app.damaged_job",
-    "operator.retried", "operator.reconsidered", "operator.dismissed", "operator.approved",
+    "merged.auto.same_event",
+    "operator.retried", "operator.reconsidered", "operator.dismissed", "operator.approved", "operator.merged",
 })
 EDITORIAL = ("new_information", "news_value")
 EXAMPLES = 3  # newest examples per code in the summary
@@ -82,6 +85,9 @@ def _detail(row, code, review, extra) -> dict:
     writer = review.get("writer") if isinstance(review, dict) else None
     if isinstance(writer, dict) and writer.get("clears") and code.startswith(("published.", "skipped.", "held.")):
         detail["writer_clears"] = writer["clears"]
+    prepared = review.get("prepared") if isinstance(review, dict) else None
+    if isinstance(prepared, dict) and prepared.get("mode") in {"story", "update"}:
+        detail["scope"] = prepared["mode"]
     detail.update((key, value[:300] if isinstance(value, str) else value) for key, value in extra.items() if value is not None)
     return detail
 
@@ -101,6 +107,23 @@ def record(db, item_id: str, code: str, observed: str, *, review: dict | None = 
     columns = (row["content_hash"], row["source_id"], row["story_id"]) if row else (None, None, None)
     db.execute("""INSERT INTO decision_log(decided_at,subject,item_id,content_hash,source_id,story_id,code,detail_json)
         VALUES(?,?,?,?,?,?,?,?)""", (observed, item_id, item_id, *columns, code, detail))
+
+
+def record_subject(db, subject: str, code: str, observed: str, *, source_id: str | None = None,
+                   story_id: str | None = None, once: bool = True, **extra) -> bool:
+    """Append one non-item decision keyed by `subject`; skip when `once` and already recorded."""
+    if once and db.execute("SELECT 1 FROM decision_log WHERE subject=? AND code=? LIMIT 1", (subject, code)).fetchone():
+        return False
+    try:
+        clean = {key: (value[:300] if isinstance(value, str) else value)
+                 for key, value in extra.items() if value is not None}
+        detail = json.dumps(clean, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        detail.encode("utf-8")
+    except Exception:
+        detail = "{}"
+    db.execute("""INSERT INTO decision_log(decided_at,subject,item_id,content_hash,source_id,story_id,code,detail_json)
+        VALUES(?,?,NULL,NULL,?,?,?,?)""", (observed, subject, source_id, story_id, code, detail))
+    return True
 
 
 def latest_id(db) -> int:
@@ -175,7 +198,8 @@ def summary(db, since: str) -> dict:
         outcome = code.split(".", 1)[0]
         outcomes[outcome] += 1
         codes[code] += 1
-        sources[row["source_id"]][outcome] += 1
+        if row["source_id"] is not None:
+            sources[row["source_id"]][outcome] += 1
         if len(examples[code]) < EXAMPLES:
             examples[code].append({"item_id": row["item_id"], "decided_at": row["decided_at"], **detail})
         clears += detail.get("writer_clears", 0)

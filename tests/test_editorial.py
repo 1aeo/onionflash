@@ -1,6 +1,6 @@
 """Editorial decisions survive late inputs, retries, backup and publication."""
 
-from approval_helpers import finish_reviewed
+from approval_helpers import finish_reviewed, update_analysis
 import copy
 import hashlib
 import json
@@ -131,6 +131,44 @@ def test_story_guards_left_by_an_earlier_release_cannot_stop_other_writers(seede
         assert raw.execute("DELETE FROM stories WHERE id='other'").rowcount == 1
 
 
+def test_published_stories_and_editorial_history_are_permanent(seeded):
+    cfg, store, story_id = seeded
+    edit(store, story_id)
+    build(cfg, store)
+    # Plain triggers: a direct sqlite3 session, which registers no application function, is held to them.
+    with sqlite3.connect(cfg["storage"]["database"]) as raw:
+        for statement, params in (
+            ("DELETE FROM public_catalog", ()),
+            ("DELETE FROM editorial_revisions", ()),
+            ("UPDATE editorial_revisions SET reason=''", ()),
+            ("""INSERT OR REPLACE INTO editorial_revisions(story_id,revision,action,reason,created_at,
+                before_story_json,before_public_json,after_story_json,after_public_json,before_hash,after_hash)
+                SELECT story_id,revision,action,'rewritten',created_at,before_story_json,before_public_json,
+                after_story_json,after_public_json,before_hash,after_hash
+                FROM editorial_revisions WHERE story_id=? AND revision=1""", (story_id,)),
+            ("DELETE FROM editorial_controls", ()),
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="permanent"):
+                raw.execute(statement, params)
+    assert editorial.history(store.db, story_id)["revisions"][0]["reason"] == "Removed unsupported operator advice."
+    # Appending new revisions and updating controls and catalog snapshots remain allowed.
+    act(editorial.retract, store, story_id, reason="The source withdrew this report.")
+    act(editorial.restore, store, story_id, 1, reason="Restored the verified correction.")
+    act(editorial.unlock, store, story_id, reason="Resumed tracking.")
+    build(cfg, store)
+    with sqlite3.connect(cfg["storage"]["database"]) as raw:
+        assert raw.execute("UPDATE editorial_controls SET held_updates=held_updates+1").rowcount == 1
+        assert raw.execute("UPDATE public_catalog SET template_hash='earlier'").rowcount == 1
+        # Removing a private source row leaves the article to its catalog entry,
+        # while editing requires restoring the stored record first.
+        assert raw.execute("DELETE FROM stories WHERE id=?", (story_id,)).rowcount == 1
+    with pytest.raises(ValueError, match="restore its stored record"):
+        edit(store, story_id, observed=LATER)
+    assert build(cfg, store, force=True)["published_stories"] == 1
+    assert "Editorial history (4)" in current_files(cfg, story_id)["article"]
+    assert len(editorial.history(store.db, story_id)["revisions"]) == 4
+
+
 def test_failed_operator_write_rolls_back_revision(seeded):
     cfg, store, story_id = seeded
     before = edit(store, story_id)
@@ -175,13 +213,15 @@ def test_retraction_tombstone_restore_and_explicit_unlock(seeded):
     reviewed = editorial.show(store.db, story_id)
     assert not reviewed["locked"]
     store.ingest(item(content="An updated source report after explicit review.", updated_at=LATER), LATER)
-    finish_reviewed(store, store.pending(1, LATER)[0], analysis(summary="New source-supported text."), "after-unlock", LATER)
+    finish_reviewed(store, store.pending(1, LATER)[0],
+                    update_analysis(update="New source-supported text.", evidence=["An updated source report after explicit review."]),
+                    "after-unlock", LATER)
     # The rewrite keeps the row's update time; only its payload invalidates the reviewed hash.
     with pytest.raises(ValueError, match="changed since it was reviewed"):
         editorial.correct(store.db, story_id, {"why_it_matters": FIX}, reason="Reviewed.", expect_hash=reviewed["hash"], observed=LATER)
     build(cfg, store)
     files = current_files(cfg, story_id)
-    assert files["json"]["summary"] == "New source-supported text."
+    assert files["json"]["updates"][-1]["text"] == "New source-supported text."
     assert files["json"]["editorial"]["revision"] == 4
     assert files["json"]["editorial"]["history"][0]["action"] == "unlock"
     assert "Restored" in files["article"] and "Superseded public text" in files["article"]
@@ -400,7 +440,7 @@ def test_only_cited_notes_add_citations_and_date_the_story(tmp_path, evidence, c
         story = store.stories()[0]
         assert len(story["sources"]) == (2 if cited else 1)
         # A cited note dates the story by when it was written; a note review only saw does not.
-        assert story["updated_at"] == story["editorial_updated_at"] == (EDIT if cited else DATE)
+        assert story["updated_at"] == (EDIT if cited else DATE)
         assert story["published_at"] == DATE and story["added_at"] == LATER
         assert json.loads(store.db.execute("SELECT payload FROM items").fetchone()[0])["updated_at"] == DATE
 
@@ -419,7 +459,7 @@ def test_a_quote_cites_only_its_earliest_note_and_never_a_reply_repeating_the_de
         assert story["updated_at"] == EDIT
 
 
-def test_note_edits_keep_the_story_date_and_removed_citations_are_refreshed(tmp_path):
+def test_note_updates_keep_cumulative_citations_and_date_from_new_notes(tmp_path):
     cfg = config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         incoming = note_item()
@@ -428,13 +468,23 @@ def test_note_edits_keep_the_story_date_and_removed_citations_are_refreshed(tmp_
         finish_reviewed(store, store.pending(1, EDIT)[0], analysis(evidence=evidence), "first", EDIT)
         first = copy.deepcopy(store.stories()[0])
         assert first["updated_at"] == EDIT and len(first["sources"]) == 2
-        incoming["public_comments"][0]["body"] = "The report’s old keys remain untrusted. Added a detail."
-        assert store.ingest(_compose(incoming, incoming["public_comments"], LATER, source_key="k"), LATER)
-        finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=evidence), "edit", LATER)
+        later_note = note(456, LATER, "Maintainers merged the key-removal patch.")
+        assert store.ingest(_compose(incoming, [*incoming["public_comments"], later_note], LATER, source_key="k"), LATER)
+        finish_reviewed(store, store.pending(1, LATER)[0],
+                        update_analysis(update="Maintainers merged the key-removal patch.", state="merged",
+                                        evidence=["Maintainers merged the key-removal patch."]), "followup", LATER)
         current = store.stories()[0]
-        assert current["updated_at"] == EDIT  # an edit is not a newer note
+        assert current["updated_at"] == LATER
         assert current["added_at"] == first["added_at"] and current["published_at"] == first["published_at"]
-        assert len(current["sources"]) == 2
-        store.ingest(_compose(incoming, [], LATER, source_key="k"), LATER)
-        finish_reviewed(store, store.pending(1, LATER)[0], analysis(), "removed", LATER)
-        assert len(store.stories()[0]["sources"]) == 1 and store.stories()[0]["updated_at"] == EDIT
+        assert [s["url"] for s in current["sources"]] == [URL, URL + "#note_123", URL + "#note_456"]
+        assert current["updates"] == [{"at": LATER, "text": "Maintainers merged the key-removal patch.",
+                                       "sources": [{"url": URL + "#note_456", "title": later_note["title"]}]}]
+        later2 = "2026-11-11T12:00:00Z"
+        updated_body = _compose(item(url=URL, content=incoming["content"] + " Upstream closed the tracking issue.", updated_at=later2),
+                                [], later2, source_key="k")
+        assert store.ingest(updated_body, later2)
+        finish_reviewed(store, store.pending(1, later2)[0],
+                        update_analysis(update="Upstream closed the tracking issue.", state="resolved",
+                                        evidence=["Upstream closed the tracking issue."]), "closed", later2)
+        final = store.stories()[0]
+        assert [s["url"] for s in final["sources"]] == [URL, URL + "#note_123", URL + "#note_456"] and final["updated_at"] == later2

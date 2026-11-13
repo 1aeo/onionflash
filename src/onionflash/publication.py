@@ -30,6 +30,7 @@ _PATH = re.compile(r"(?:" + _ARTICLE + r"|page/[1-9][0-9]*/index\.html|topics/" 
 
 
 def initialize(db) -> None:
+    editorial.initialize(db)
     db.executescript("""
         CREATE TABLE IF NOT EXISTS public_artifacts (
             path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL,
@@ -42,6 +43,24 @@ def initialize(db) -> None:
             template_hash TEXT NOT NULL, json_sha256 TEXT NOT NULL,
             public_json TEXT NOT NULL
         );
+        -- Published stories and editorial history are permanent; plain triggers hold
+        -- direct sqlite3 sessions and earlier releases to the same rule.
+        CREATE TRIGGER IF NOT EXISTS public_catalog_permanent BEFORE DELETE ON public_catalog BEGIN
+            SELECT RAISE(ABORT, 'Published stories are permanent; correct or retract them instead');
+        END;
+        CREATE TRIGGER IF NOT EXISTS editorial_revisions_permanent BEFORE DELETE ON editorial_revisions BEGIN
+            SELECT RAISE(ABORT, 'Editorial history is permanent');
+        END;
+        CREATE TRIGGER IF NOT EXISTS editorial_revisions_unchanged BEFORE UPDATE ON editorial_revisions BEGIN
+            SELECT RAISE(ABORT, 'Editorial history is permanent');
+        END;
+        CREATE TRIGGER IF NOT EXISTS editorial_revisions_append_only BEFORE INSERT ON editorial_revisions
+            WHEN EXISTS (SELECT 1 FROM editorial_revisions WHERE story_id=NEW.story_id AND revision=NEW.revision) BEGIN
+            SELECT RAISE(ABORT, 'Editorial history is permanent');
+        END;
+        CREATE TRIGGER IF NOT EXISTS editorial_controls_permanent BEFORE DELETE ON editorial_controls BEGIN
+            SELECT RAISE(ABORT, 'Editorial history is permanent');
+        END;
         -- No query uses this index, which earlier releases created.
         DROP INDEX IF EXISTS public_catalog_published;
         CREATE INDEX IF NOT EXISTS public_catalog_added ON public_catalog(added_at DESC,updated_at DESC,story_id DESC);
@@ -232,7 +251,8 @@ def _accepted(db, *, order: str = "added_at", batch_size: int = 100, topic: str 
     current = _meta(db, "publication_template")
     while True:
         if topic is None:
-            where = "" if cursor is None else f"WHERE ({order},{secondary},story_id) < (?,?,?)"
+            not_retired = "story_id NOT IN (SELECT story_id FROM story_aliases)"
+            where = f"WHERE {not_retired}" if cursor is None else f"WHERE {not_retired} AND ({order},{secondary},story_id) < (?,?,?)"
             parameters = (batch_size,) if cursor is None else (*cursor, batch_size)
             query = f"SELECT story_id,published_at,updated_at,added_at,template_hash,json_sha256,public_json FROM public_catalog {where} ORDER BY {order} DESC,{secondary} DESC,story_id DESC LIMIT ?"
         else:
@@ -263,7 +283,10 @@ def _backfill_topics(db) -> None:
         return
     cursor, current = "", _meta(db, "publication_template")
     while True:
-        rows = db.execute("SELECT * FROM public_catalog WHERE story_id>? ORDER BY story_id LIMIT 100", (cursor,)).fetchall()
+        rows = db.execute(
+            "SELECT * FROM public_catalog WHERE story_id>? AND story_id NOT IN (SELECT story_id FROM story_aliases) ORDER BY story_id LIMIT 100",
+            (cursor,),
+        ).fetchall()
         if not rows:
             break
         with db:
@@ -387,6 +410,27 @@ def _listing(artifacts: Artifacts, site: dict, base: str, health: list, *, count
         _remove_obsolete_pages(artifacts, pages, topic)
 
 
+def _pointer(artifacts: Artifacts, db, site: dict, base: str, identity: str, story_id: str, survivor_id: str) -> None:
+    accepted = db.execute("SELECT * FROM public_catalog WHERE story_id=?", (story_id,)).fetchone()
+    if accepted is None:
+        with db:
+            db.execute("DELETE FROM public_render_queue WHERE story_id=?", (story_id,))
+        return
+    article = render.pointer_html(site, base, survivor_id)
+    public_json = json.dumps(render.pointer_json(base, story_id, survivor_id), ensure_ascii=False, sort_keys=True) + "\n"
+    with db:
+        artifacts.text(f"news/{story_id}/index.html", article, "text/html; charset=utf-8")
+        checksum = artifacts.text(f"news/{story_id}/story.json", public_json, "application/json; charset=utf-8")
+        removed = db.execute("DELETE FROM public_story_topics WHERE story_id=?", (story_id,)).rowcount
+        if accepted["json_sha256"] != checksum or accepted["template_hash"] == "" or removed:
+            _set_meta(db, "publication_catalog_revision", str(int(_meta(db, "publication_catalog_revision") or 0) + 1))
+        db.execute(
+            "UPDATE public_catalog SET template_hash=?,json_sha256=?,public_json=? WHERE story_id=?",
+            (identity, checksum, public_json, story_id),
+        )
+        db.execute("DELETE FROM public_render_queue WHERE story_id=?", (story_id,))
+
+
 def build(config: dict, store, *, force: bool = False) -> dict:
     """Update changed artifacts; the caller holds the existing database lock."""
     db, site = store.db, config["site"]
@@ -417,6 +461,10 @@ def build(config: dict, store, *, force: bool = False) -> dict:
         LEFT JOIN stories ON stories.id=public_render_queue.story_id
         WHERE public_render_queue.last_error IS NULL ORDER BY public_render_queue.rowid LIMIT ?""", (limit,)).fetchall()
     for row in candidates:
+        alias = editorial.retired(db, story_id=row["id"])
+        if alias is not None and alias[1] is not None:
+            _pointer(artifacts, db, site, base, identity, row["id"], alias[1])
+            continue
         quarantined = False
         accepted = None
         if row["payload"] is None:
@@ -468,16 +516,17 @@ def build(config: dict, store, *, force: bool = False) -> dict:
     # A damaged catalog row later in the queue can then recover on a subsequent
     # run, while the incomplete-build marker keeps partial work unpublished.
     _backfill_topics(db)
-    count = db.execute("SELECT COUNT(*) FROM public_catalog").fetchone()[0]
+    total_catalog = db.execute("SELECT COUNT(*) FROM public_catalog").fetchone()[0]
+    count = db.execute("SELECT COUNT(*) FROM public_catalog WHERE story_id NOT IN (SELECT story_id FROM story_aliases)").fetchone()[0]
     pending = db.execute("SELECT COUNT(*) FROM public_render_queue WHERE last_error IS NULL").fetchone()[0]
     skipped = db.execute("SELECT COUNT(*) FROM public_render_queue WHERE last_error IS NOT NULL").fetchone()[0]
-    if not count and skipped and not pending:
+    if not total_catalog and skipped and not pending:
         raise ValueError("No stored story can be rendered")
-    if not count and not pending:
+    if not total_catalog and not pending:
         news = output / "news"
         if news.is_symlink() or next(news.glob("*/index.html"), None) is not None:
             raise ValueError("Refusing an empty catalog over existing published articles; restore publication history")
-    latest = db.execute("SELECT MAX(updated_at) FROM public_catalog").fetchone()[0]
+    latest = db.execute("SELECT MAX(updated_at) FROM public_catalog WHERE story_id NOT IN (SELECT story_id FROM story_aliases)").fetchone()[0]
     # Every listing and feed is a view of the catalog, refreshed when it, the site or the code changes.
     views = digest([site, identity, _meta(db, "publication_catalog_revision")])
     refresh = restart_rebuild or _meta(db, "publication_views") != views

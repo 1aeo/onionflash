@@ -23,7 +23,7 @@ QUERY = """query PublicIssueNotes($project: ID!, $iid: String!, $size: Int!) {
     id fullPath visibility webUrl
     issue(iid: $iid) {
       iid confidential webUrl
-      notes(last: $size) { nodes { id body createdAt internal system url author { username } } }
+      notes(last: $size) { nodes { id body createdAt lastEditedAt internal system url author { username } } }
     }
   }
 }"""
@@ -118,19 +118,36 @@ def fetch_comments(client, source, item):
         if not isinstance(note.get("body"), str):
             raise CommentError("Invalid public note body")
         author, created = plain_text(author["username"], 100, html=False), timestamp(note.get("createdAt"))
+        raw_edited = note.get("lastEditedAt")
+        if raw_edited is not None and not isinstance(raw_edited, str):
+            raise CommentError("Invalid public note timestamp")
+        edited = min(max(timestamp(raw_edited), created), received) if raw_edited is not None else created
         if not author:
             raise CommentError("Invalid public note attribution")
         body = plain_text(note["body"], COMMENT_CHARS, html=False)
         # Skip an empty note, and one dated after this response: it must not date or promote a story.
         if body and created <= received:
-            notes[match[1]] = {"id": ident, "url": url, "title": "Public comment by @" + author,
-                               "author": author, "created_at": created, "body": body}
+            entry = {"id": ident, "url": url, "title": "Public comment by @" + author,
+                     "author": author, "created_at": created, "body": body}
+            if edited > created:
+                entry["edited_at"] = edited
+            notes[match[1]] = entry
+    prior = {
+        n["id"]: n
+        for n in item.get("public_comments") or []
+        if isinstance(n, dict) and isinstance(n.get("id"), str)
+    }
     selected, remaining = [], TOTAL_CHARS
     for note in sorted(notes.values(), key=lambda n: (n["created_at"], n["id"]), reverse=True):
         if remaining <= 0 or len(selected) >= MAX_COMMENTS:
             break
         note["body"] = note["body"][:remaining]
         remaining -= len(note["body"])
+        old_note = prior.get(note["id"])
+        if old_note is not None and old_note.get("body") == note["body"]:
+            note.pop("edited_at", None)
+            if isinstance(old_note.get("edited_at"), str) and old_note["edited_at"] > note["created_at"]:
+                note["edited_at"] = old_note["edited_at"]
         selected.append(note)
     return selected
 
@@ -151,8 +168,22 @@ def _compose(item, notes, checked, *, source_key):
     content = result.pop("source_content", result.get("content"))
     if not isinstance(content, str):
         raise CommentError("Saved issue description is unavailable")
+    prior = {
+        n["id"]: n
+        for n in item.get("public_comments") or []
+        if isinstance(n, dict) and isinstance(n.get("id"), str)
+    }
+    composed_notes = []
+    for note in notes:
+        entry = dict(note)
+        old_note = prior.get(entry.get("id"))
+        if old_note is not None and old_note.get("body") != entry.get("body"):
+            prev_time = old_note.get("edited_at") or entry["created_at"]
+            if not isinstance(entry.get("edited_at"), str) or entry["edited_at"] <= prev_time:
+                entry["edited_at"] = max(checked, prev_time)
+        composed_notes.append(entry)
     # Callers pass a key only for a verified fetch or an already verified stored snapshot.
-    result.update(content=content, public_comments=notes, comments_checked_at=checked, comments_source_key=source_key)
+    result.update(content=content, public_comments=composed_notes, comments_checked_at=checked, comments_source_key=source_key)
     return result
 
 

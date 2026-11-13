@@ -109,18 +109,19 @@ def _shares(needs, floors, budget):
     return shares
 
 
-def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str | None):
+def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str | None, *, update: bool = False):
     missing, bindings, units, truncated = [], {}, [], False
     required_ids = {incoming["id"], writer_id}
     # Legacy grouped stories may predate writer provenance. Their complete
     # collected source set can still support a fresh review of the final prose;
     # every source then becomes required, within the same bounds.
-    require_all = writer_id is None
+    require_all = writer_id is None and payload.get("origin") != "network-health"
     # Required sources come first, so the max_sources cap below drops optional links before them.
     references = sorted(payload["sources"], key=lambda source: (
         source.get("source_item_id", source.get("id")) not in required_ids,
         source.get("source_item_id", source.get("id")) != writer_id, source["url"]))
     public_urls = {source["url"] for source in public["sources"]}
+    update_urls = {source["url"] for source in public["updates"][-1]["sources"]} if update and public.get("updates") else set()
     for source in references:
         source_id = source.get("source_item_id", source.get("id"))
         required = require_all or source_id in required_ids
@@ -140,13 +141,15 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
         body = item.get("source_content", item.get("content"))
         unit = {key: item.get(key) for key in ("kind", "authority", "product", "published_at", "updated_at", "upstream_state")}
         unit.update(labels=_labels(item.get("labels")), url=canonical_url(item["url"]), title=item["title"], snapshot=snapshot)
+        if item.get("closed_at"):
+            unit["closed_at"] = item["closed_at"]
         if captured:
             unit["captured_at"] = captured
         if source.get("source_item_id"):
             # A cited note is supplied with the text of its parent issue.
             if not any(note["url"] == source["url"] for note in item.get("public_comments", [])):
                 truncated = True
-                if required:
+                if required and (not update or require_all or source["url"] in update_urls):
                     missing.append(source["url"])
             continue
         if not isinstance(body, str) or not (body.strip() or item["title"].strip()):

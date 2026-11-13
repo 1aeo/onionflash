@@ -13,7 +13,7 @@ from onionflash.analyze import (AnalysisError, Analyzer, MAX_EVIDENCE_CHOICES, M
                                 validate_analysis)
 from onionflash.comments import INPUT_CHARS
 from onionflash.config import DEFAULTS
-from onionflash.schema import CONFIDENCES, STATES
+from onionflash.schema import CATEGORIES, CONFIDENCES, STATES
 from onionflash.store import Store
 from onionflash.transport import FetchError, Response
 from test_core import DATE, analysis, item
@@ -178,22 +178,33 @@ def test_writer_clears_on_repeat_hold_operator_retry_and_operator_approve(contex
     assert decisions.summary(store.db, DATE)["writer_clears"] == 4
 
 
-@pytest.mark.parametrize("source,confidence,state", [
-    (item(), ["reported", "suspected", "observed-anomaly"], STATES),
-    (item(kind="gitlab_mr", upstream_state="merged"), CONFIDENCES, ["merged"]),
-    (item(kind="feed", authority="official"), CONFIDENCES, STATES)], ids=["issue", "merged-request", "official-feed"])
-def test_writer_schema_limits_labels_by_source(monkeypatch, source, confidence, state):
+NON_TAG_STATES = [value for value in STATES if value != "tagged"]
+NON_RELEASE_CATEGORIES = [value for value in CATEGORIES if value != "release"]
+
+
+@pytest.mark.parametrize("source,confidence,state,categories", [
+    (item(), ["reported", "suspected", "observed-anomaly"], NON_TAG_STATES, CATEGORIES),
+    (item(kind="gitlab_mr", upstream_state="merged"), CONFIDENCES, ["merged"], NON_RELEASE_CATEGORIES),
+    (item(kind="feed", authority="official"), CONFIDENCES, NON_TAG_STATES, CATEGORIES)],
+    ids=["issue", "merged-request", "official-feed"])
+def test_writer_schema_limits_labels_by_source(monkeypatch, source, confidence, state, categories):
     llm = analyzer(monkeypatch, completion(analysis(why_it_matters="", state=state[0])))
     llm.analyze(source)
     fields = llm.client.requests[0][1]["response_format"]["json_schema"]["schema"]["properties"]
     assert (fields["confidence"]["enum"], fields["state"]["enum"]) == (confidence, state)
+    assert fields["category"]["enum"] == fields["tags"]["items"]["enum"] == categories
     assert SCHEMA["properties"]["confidence"]["enum"] == CONFIDENCES  # review repairs copy the full rules
+    assert SCHEMA["properties"]["state"]["enum"] == STATES
+    assert SCHEMA["properties"]["category"]["enum"] == CATEGORIES
 
 
 @pytest.mark.parametrize("use_fallback", [False, True])
-@pytest.mark.parametrize("source,labels", [(item(), {"confidence": "confirmed"}),
-                                           (item(kind="gitlab_mr", upstream_state="merged"), {"state": "released"})],
-                         ids=["confirmed-issue", "released-merge-request"])
+@pytest.mark.parametrize("source,labels", [
+    (item(), {"confidence": "confirmed"}),
+    (item(), {"state": "tagged"}),
+    (item(kind="gitlab_mr", upstream_state="merged"), {"state": "released"}),
+    (item(kind="gitlab_mr", upstream_state="merged"), {"state": "merged", "category": "release"})],
+    ids=["confirmed-issue", "tagged-issue", "released-merge-request", "release-category-merge-request"])
 def test_writer_rejects_labels_outside_the_source_limits_even_when_endpoint_ignores_schema(monkeypatch, use_fallback,
                                                                                          source, labels):
     responses = [FetchError("network request failed", retryable=True)] if use_fallback else []
@@ -203,6 +214,20 @@ def test_writer_rejects_labels_outside_the_source_limits_even_when_endpoint_igno
         llm.analyze(source)
     assert not caught.value.retryable
     assert len(llm.client.requests) == llm.calls == 1 + use_fallback
+
+
+def test_writer_strips_stray_release_tag_only_on_non_release_drafts(monkeypatch):
+    merged_mr = item(kind="gitlab_mr", upstream_state="merged")
+    draft = analysis(why_it_matters="", state="merged", category="feature", tags=["feature", "release"])
+    result = analyzer(monkeypatch, completion(draft)).analyze(merged_mr)
+    assert result["tags"] == ["feature"]
+    # Explicit release states or a release category draft keep the tag untouched, as does historical validation.
+    released = analysis(why_it_matters="", state="released", category="feature", tags=["feature", "release"])
+    assert analyzer(monkeypatch, completion(released)).analyze(item(kind="feed", authority="official"))["tags"] == [
+        "feature", "release"]
+    misclassified = analysis(why_it_matters="", state="developing", category="release", tags=["release"])
+    assert analyzer(monkeypatch, completion(misclassified)).analyze(item())["tags"] == ["release"]
+    assert validate_analysis(draft, merged_mr)["tags"] == ["feature", "release"]
 
 
 @pytest.mark.parametrize("sent", [0, 1])
@@ -433,3 +458,79 @@ def test_empty_optional_context_is_a_valid_draft(monkeypatch):
     llm = analyzer(monkeypatch, completion(draft))
     assert llm.analyze(item())["why_it_matters"] == ""
     assert len(llm.client.requests) == 1
+
+
+def test_update_mode_sends_prior_context_narrows_schema_and_validates(monkeypatch):
+    from approval_helpers import update_analysis
+    from onionflash.analyze import UPDATE_PROMPT, UPDATE_SCHEMA, cache_key, tag_update
+
+    prior = {
+        "id": "a" * 24,
+        "title": "Distinct prior headline",
+        "summary": "Distinct prior summary that must never enter evidence choices.",
+        "why_it_matters": "Distinct prior consequence.",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": ["tor"],
+        "tags": ["release"],
+        "published_at": DATE,
+        "updated_at": DATE,
+        "added_at": DATE,
+        "sources": [{"url": "https://example.org/release", "title": "Release"}],
+        "updates": [{"at": f"2026-11-08T12:{n:02d}:00Z", "text": f"Update {n}.",
+                     "sources": [{"url": "https://example.org/release", "title": "Release"}]} for n in range(12)],
+    }
+    src_item = item(authority="community", kind="feed")
+    draft = update_analysis(update="Packages for Debian are now published.", confidence="confirmed",
+                            state="released", evidence=[src_item["title"]])
+    llm = analyzer(monkeypatch, completion(draft))
+    assert llm.analyze(src_item, prior=prior) == draft
+    _, body = llm.client.requests[0]
+    assert body["messages"][0]["content"] == UPDATE_PROMPT
+    assert body["response_format"]["json_schema"]["name"] == "onionflash_update"
+    schema = body["response_format"]["json_schema"]["schema"]
+    assert set(schema["properties"]) == {"publish", "update", "confidence", "state", "evidence"}
+    assert schema["properties"]["state"]["enum"] == ["released"]
+    assert schema["properties"]["confidence"]["enum"] == ["confirmed"]
+    tagged_llm = analyzer(monkeypatch, completion(draft))
+    tagged_llm.analyze(src_item, prior={**prior, "state": "tagged"})
+    assert tagged_llm.client.requests[0][1]["response_format"]["json_schema"]["schema"]["properties"]["state"]["enum"] == [
+        "released", "tagged"]
+    dev_prior = {**prior, "category": "security", "confidence": "reported", "state": "developing", "tags": ["security"]}
+    dev_llm = analyzer(monkeypatch, completion({**draft, "confidence": "reported", "state": "developing"}))
+    dev_llm.analyze(src_item, prior=dev_prior)
+    assert dev_llm.client.requests[0][1]["response_format"]["json_schema"]["schema"]["properties"]["state"]["enum"] == NON_TAG_STATES
+    with pytest.raises(AnalysisError, match="limits"):
+        analyzer(monkeypatch, completion({**draft, "confidence": "reported", "state": "tagged"})).analyze(src_item, prior=dev_prior)
+    for choice in schema["properties"]["evidence"]["items"]["enum"]:
+        assert "Distinct prior" not in choice
+    sent = json.loads(body["messages"][1]["content"])
+    assert len(sent["prior_story"]["updates"]) == 10
+    assert sent["prior_story"]["updates"][0]["text"] == "Update 2."
+
+    for bad in (
+        {**draft, "title": "Forbidden"},
+        {**draft, "update": "   "},
+        {**draft, "update": "x" * 301},
+        {**draft, "update": "Truncated mid-word without punctuation"},
+        {**draft, "evidence": ["Distinct prior summary that must never enter evidence choices."]},
+    ):
+        with pytest.raises(AnalysisError):
+            validate_analysis(copy.deepcopy(bad), item(), UPDATE_SCHEMA)
+
+    tag = item(kind="tag", title="tor-0.4.9.16", content="")
+    tag_llm = analyzer(monkeypatch)
+    literal = tag_llm.analyze(tag, prior=prior)
+    assert literal == tag_update(tag, prior)
+    assert literal["update"] == "The upstream feed lists the tag “tor-0.4.9.16”."
+    assert (literal["confidence"], literal["state"]) == ("confirmed", "released")
+    assert tag_update(tag, {**prior, "state": "merged"})["state"] == "tagged"
+    assert tag_llm.client.requests == []
+
+    row = {"content_hash": "h1"}
+    base_key = cache_key(row, DEFAULTS["llm"], prior)
+    assert base_key != cache_key(row, DEFAULTS["llm"])
+    assert base_key != cache_key(row, DEFAULTS["llm"], {**prior, "state": "tagged"})
+    assert base_key != cache_key(row, DEFAULTS["llm"], {**prior, "updates": prior["updates"][:-1]})

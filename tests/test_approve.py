@@ -8,7 +8,7 @@ import sqlite3
 
 import pytest
 
-from approval_helpers import approve as seed_receipt, finish_reviewed, verdict
+from approval_helpers import approve as seed_receipt, finish_reviewed, update_analysis, verdict
 from onionflash import cli, decisions, editorial, rejection, review, review_gate
 from onionflash.analyze import AnalysisError, tag_notice
 from onionflash.candidate import ReviewRequired, StaleCandidate
@@ -22,7 +22,8 @@ AFTER_SHOW = "2026-11-10T15:30:00Z"
 
 def hold_news_dispute(cfg, store, incoming=None, draft=None):
     row = pending(store, incoming)
-    report = run(cfg, store, row, Writer(draft), Reviewer(verdict(), verdict("hold", criterion="news_value")))
+    is_update = isinstance(draft, dict) and "update" in draft
+    report = run(cfg, store, row, Writer(draft), Reviewer(verdict(update=is_update), verdict("hold", criterion="news_value", update=is_update)))
     assert report["status"] == "held"
     return row
 
@@ -312,16 +313,16 @@ def test_only_holds_whose_reviews_passed_every_factual_check_can_be_approved(tmp
             seeded, _ = seed_legacy(store, incoming=item(url="https://example.org/release", title="Tor 0.4.9.5 released"))
             with store.db:
                 store.db.execute("DELETE FROM items WHERE url=?", (seeded["url"],))
-            tag_follow = item(kind="tag", title="tor-0.4.9.5", content="", url="https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-0.4.9.5")
-            row = pending(store, tag_follow)
-            assert run(cfg, store, row, Writer(tag_notice(tag_follow)), Reviewer())["status"] == "held"
+            followup = item(url="https://example.org/followup", title="Tor 0.4.9.5 released", content="Follow-up details on Tor 0.4.9.5.")
+            row = pending(store, followup)
+            assert run(cfg, store, row, Writer(update_analysis(evidence=["Follow-up details on Tor 0.4.9.5."])), Reviewer())["status"] == "held"
         elif case == "missing_retained_source":
             seed = item(url="https://example.org/release", title="Tor 0.4.9.5 released")
             store.ingest(seed, DATE)
             seed_row = store.pending(1, LATER)[0]
             finish_reviewed(store, seed_row, analysis(title="Tor 0.4.9.5 released"), "seed", DATE)
-            tag_follow = item(kind="tag", title="tor-0.4.9.5", content="", url="https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-0.4.9.5")
-            row = hold_news_dispute(cfg, store, incoming=tag_follow, draft=tag_notice(tag_follow))
+            followup = item(url="https://example.org/followup", title="Tor 0.4.9.5 released", content="Follow-up details on Tor 0.4.9.5.")
+            row = hold_news_dispute(cfg, store, incoming=followup, draft=update_analysis(evidence=["Follow-up details on Tor 0.4.9.5."]))
             with store.db:
                 store.db.execute("DELETE FROM items WHERE id=?", (seed_row["id"],))
                 store.db.execute("UPDATE analyses SET source_payload=NULL WHERE source_item_id=?", (seed_row["id"],))
@@ -565,14 +566,15 @@ def test_later_source_change_reviews_normally_and_clears_held_updates_summary(tm
         editorial.unlock(store.db, story_id, reason="Resume updates", expect_hash=locked["hash"])
         rev3 = item(content="Third upstream revision disputed on news value. " * 4, updated_at="2026-11-10T14:00:00Z")
         assert store.ingest(rev3, "2026-11-10T14:00:00Z") is True
-        writer3 = Writer(analysis(title="Third revision headline", evidence=["Third upstream revision disputed on news value."]))
-        reviewer3 = Reviewer(verdict(), verdict("hold", criterion="news_value"))
+        writer3 = Writer(update_analysis(update="Third revision update.", evidence=["Third upstream revision disputed on news value."]))
+        reviewer3 = Reviewer(verdict(update=True), verdict("hold", criterion="news_value", update=True))
         assert run(cfg, store, store.pending(1, "2026-11-10T14:05:00Z")[0], writer3, reviewer3)["status"] == "held"
         assert len(writer3.calls) == 1 and len(reviewer3.calls) == 2
 
         upd_hash = rejection.show_item(store, row["id"], config=cfg)["final_review"]["approval"]["hash"]
         rejection.approve_item(cfg, store, row["id"], upd_hash, "Approve follow-up", observed=AFTER_SHOW)
-        assert store.stories()[0]["title"] == "Third revision headline"
+        assert store.stories()[0]["title"] == "Operator reports possible compromise"
+        assert store.stories()[0]["updates"][-1]["text"] == "Third revision update."
         assert decisions.summary(store.db, DATE)["awaiting_operator"]["held_updates"] == []
 
 
@@ -689,3 +691,40 @@ def test_single_field_record_and_binding_tampering_refuses(tmp_path, tamper, exp
         info = review_gate.approval(cfg, store, row["id"])
         assert info["eligible"] is False
         assert expected_reason in info["reason"]
+
+
+@pytest.mark.parametrize("bad_updates", [[{}], ["malformed"], "not-a-list", [{"at": LATER}]])
+def test_malformed_saved_update_entries_refuse_without_raising(tmp_path, bad_updates):
+    cfg = config(tmp_path)
+    with Store(cfg["storage"]["database"]) as store:
+        first = item(
+            url="https://example.org/orig",
+            title="Initial relay report",
+            content="Initial relay report on directory fetch behavior.",
+        )
+        store.ingest(first, DATE)
+        finish_reviewed(store, store.pending(1, DATE)[0], analysis(), "seed-orig", DATE)
+
+        follow = item(
+            url="https://example.org/orig",
+            title="Initial relay report",
+            content="Initial relay report on directory fetch behavior. Later maintainer confirmation.",
+            updated_at=LATER,
+        )
+        row = hold_news_dispute(
+            cfg,
+            store,
+            incoming=follow,
+            draft=update_analysis(
+                update="Maintainers confirmed the directory fetch behavior.",
+                evidence=["Later maintainer confirmation."],
+            ),
+        )
+        saved = store.db.execute("SELECT record_json FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
+        record = json.loads(saved["record_json"])
+        record["candidate"]["updates"] = bad_updates
+        with store.db:
+            store.db.execute("UPDATE review_jobs SET record_json=? WHERE item_id=?", (json.dumps(record), row["id"]))
+        info = review_gate.approval(cfg, store, row["id"])
+        assert info["eligible"] is False
+        assert info["reason"] == "Saved review record cannot be read"

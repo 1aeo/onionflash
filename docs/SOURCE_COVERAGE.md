@@ -16,6 +16,7 @@ protocol changes. The additional configured streams are:
 | [Anti-Censorship team issues](https://gitlab.torproject.org/api/v4/projects/549/issues) | `anti-censorship-team`, enabled | Human investigations of blocking and bridge/transport availability, including unlabeled reports. |
 | [Tor Metrics Timeline repository](https://gitlab.torproject.org/tpo/network-health/metrics/timeline) | `tor-metrics-news`, enabled | Curated event rows from the maintained README; validated repository snapshots replace the stale Atom feed. |
 | [Tor Project Development Mailing List](https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/) | `tor-dev`, enabled | An RFC on `tor-dev` (numbered Tor proposal, `[RFC]` subject, or IETF Internet-Draft or RFC posted for comment) is news from any sender, a formal proposal from a `project-sender` address is news, and other messages need a significant development. |
+| [Tor Project Consensus Health Alerts](https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/) | `tor-consensus-health`, enabled (`alert_format = "consensus"`, `publish = false`) | Sustained consensus-health anomalies from DocTor rendered with fixed templates, never sent to the model writer queue. |
 
 On `lists.torproject.org` archives whose RSS items carry HyperKitty's `local＠domain`
 `<author>` element, an entry from an exact `torproject.org` address is classified
@@ -47,9 +48,10 @@ error text are never saved or logged. Each check reads an issue's newest notes i
 one bounded request; checks repeat after 30 minutes and share fixed per-run
 limits, so older notes can be missing. A failed or unverifiable check keeps the
 last verified notes. Notes stay attributed, untrusted reports with their authors,
-creation dates and exact URLs. A new, edited or deleted note queues the issue for
-analysis again, and only a newly cited note moves the story's date, to the time
-the note was written. Once comments are turned off, or a source loses its
+creation dates (and edit timestamps when edited) and exact URLs. A new, edited or
+deleted note queues the issue for analysis again, and only a newly cited note
+moves the story's date, to the time the note was written (or edited, when an
+update cites a changed note). Once comments are turned off, or a source loses its
 `gitlab_project`, an issue's next revision is analyzed without its notes.
 
 ### Tor Metrics timeline
@@ -91,9 +93,8 @@ while unambiguous rows continue. They are never silently merged.
 Repository revision time orders corrections separately from event dates.
 Unchanged row content is not reanalyzed when another row changes. Timeline
 context can update its own story, but cannot replace a richer existing news
-summary merely because the repository was edited later. A row that
-release-version clustering groups with an existing release story is skipped if
-it adds no new information; the story keeps its text and existing citations.
+summary merely because the repository was edited later; corroborating source
+citations follow the [publication review](FINAL_REVIEW.md) update and tag rules.
 
 ## Important sources that need more handling first
 
@@ -113,11 +114,51 @@ it adds no new information; the story keeps its text and existing citations.
 Personal push/email alerts remain intentionally deferred. Storage-bucket isolation
 is a deployment configuration choice; see the deployment repository's guide.
 
-## Retired monitoring sources
+## Network-health alerts
 
-A source entry with a non-empty `alert_format` loads disabled, with a warning;
-remove it. The unused `monitor_id` key and the retired `[monitoring]` settings
-are accepted and ignored. Opening a database leaves any unused monitoring tables
-in place; nothing reads or writes them. Automated notice lists, such as
-tor-consensus-health and metrics-alerts, report checker or collector state
-rather than network news; do not add them as news feeds.
+A feed source with `alert_format = "consensus"` and a configured `website_url`
+(at most one consensus alert source may be enabled) collects machine-formatted DocTor reports from `tor-consensus-health` into a
+separate `network_reports` table. These entries never enter `items` or reach the
+model writer queue; human replies and non-report summaries on the list are
+skipped and logged once as `skipped.network.not_report`, and undated feed entries
+are skipped during collection rather than stamped with the poll time.
+
+Only three verbatim DocTor report lines are tracked, alongside whether checks ran
+beyond `Unable to retrieve` transport errors:
+
+- **Missing directory authority (`A`):** a known voting directory authority stays
+  listed in `The following authorities are missing from the consensus:` for at
+  least 48 hours, with no two checks-ran reports in a row omitting it and no gap
+  over 26 hours before opening. Weekly `still listed` updates follow.
+- **Missed hourly consensuses (`B`):** at least 6 distinct hours within 24 hours
+  carry the `ERROR:` stale-consensus line (more than three directory authorities
+  serving a consensus over an hour old). Updates follow every 6 further hours.
+- **Missing current shared random value (`C`):** `Consensus is missing a current shared random value`
+  appears in at least 6 consecutive hourly reports.
+
+An incident closes only on positive evidence from a report in which checks ran
+and the condition is absent (for `A`, after 24 hours without a listing). Closing
+updates state `No longer listed`, never `resolved`, and set the public state to
+`no-longer-listed`. A recurrence of the same rule and subject within 7 days of
+closing reopens the existing story as a dated update instead of starting a
+second story. Each story carries a fixed `About this alert` context note whose
+historical episode statistics can be recomputed periodically from archived
+DocTor reports.
+
+When a recent unlocked story already covers the same authority or consensus
+event, a single cached yes/no check decides whether the DocTor updates attach to
+that host story instead of opening a standalone alert. Attaching appends dated
+updates and the alert note without changing the host story's headline, summary or
+classification labels; locked or retracted stories are excluded as attachment
+targets.
+
+`publish` defaults to `false` (dry run): reports are stored, host checks are
+cached, and `onionflash status` previews active incidents under `network_health`
+without writing stories. When `publish = true` is enabled, incidents that had
+already closed beforehand are skipped (`skipped.network.before_enable`) with no
+backfill.
+
+Other non-empty `alert_format` values (such as `censorship`) remain retired and
+load disabled with a warning. The unused `monitor_id` key and retired
+`[monitoring]` settings are accepted and ignored, and any legacy monitoring
+tables in an existing database are left untouched.

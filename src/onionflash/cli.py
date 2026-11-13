@@ -13,13 +13,13 @@ import time
 import traceback
 from pathlib import Path
 
-from . import __version__, decisions, editorial, rejection
+from . import __version__, decisions, doctor, editorial, rejection
 from .analyze import AnalysisError, Analyzer
 from .review import Reviewer
 from .review_gate import process_item, status as review_status
 from .collect import CollectionError, collect_source
 from .comments import RUN_BUDGET_SECONDS as COMMENTS_BUDGET, enrich_comments, merge_cached_comments, status as comments_status
-from .config import load_config
+from .config import DEFAULTS, load_config
 from .publication import build
 from .store import Store, source_due
 from .transport import HttpClient
@@ -45,13 +45,17 @@ def run_lock(database: str):
 
 def _operator_parsers(commands) -> None:
     """Register explicit inspection and guarded editorial or retry commands."""
-    story = commands.add_parser("story", help="Inspect, correct, or retract a published story")
+    story = commands.add_parser("story", help="Inspect, correct, merge, or retract a published story")
     actions = story.add_subparsers(dest="action", required=True)
-    for name in ("show", "history", "correct", "retract", "restore", "unlock"):
+    for name in ("show", "history", "correct", "retract", "restore", "unlock", "merge"):
         action = actions.add_parser(name)
         action.add_argument("--config", required=True, type=Path)
         action.add_argument("--story", required=True, help="Stable story ID")
-        if name not in {"show", "history"}:
+        if name == "merge":
+            action.add_argument("--into", dest="into_story", required=True, help="Survivor story ID")
+            action.add_argument("--expect-hash", required=True, help="Current hash returned by story show")
+            action.add_argument("--reason", required=True, help="Private operator reason recorded with the merge")
+        elif name not in {"show", "history"}:
             action.add_argument("--expect-hash", required=True, help="Current hash returned by story show")
             action.add_argument("--reason", required=True, help="Public reason for this editorial action")
         if name == "correct":
@@ -98,7 +102,10 @@ def _operator_command(args, store: Store, config: dict | None = None) -> dict:
         if args.action == "history":
             return editorial.history(store.db, args.story)
         options = {"reason": args.reason, "expect_hash": args.expect_hash}
-        if args.action == "correct":
+        if args.action == "merge":
+            base_url = (config or {}).get("site", {}).get("base_url", DEFAULTS["site"]["base_url"])
+            result = editorial.merge(store.db, args.story, args.into_story, base_url=base_url, **options)
+        elif args.action == "correct":
             result = editorial.correct(store.db, args.story, json.loads(args.patch.read_text(encoding="utf-8")), **options)
         elif args.action == "restore":
             result = editorial.restore(store.db, args.story, revision=args.revision, **options)
@@ -121,6 +128,9 @@ def _operator_command(args, store: Store, config: dict | None = None) -> dict:
 
 def run(config: dict, store: Store) -> dict:
     """Collect and review pending items within one deadline, then build the site."""
+    consensus_sources = [s for s in config["sources"] if s.get("alert_format") == "consensus" and s["enabled"]]
+    if len(consensus_sources) > 1:
+        raise ValueError("At most one enabled consensus alert source is supported")
     observed = now_iso()
     report = {
         "sources_ok": 0,
@@ -132,6 +142,7 @@ def run(config: dict, store: Store) -> dict:
         "entries_skipped": 0,
         "review_cache_hits": 0,
         "review_stale": 0,
+        "review_routed": 0,
         "model_calls": 0,
     }
     started = time.monotonic()
@@ -142,9 +153,17 @@ def run(config: dict, store: Store) -> dict:
     # Keep at least half the collection window available for primary sources.
     comments_budget = min(COMMENTS_BUDGET, collection_window / 2) if comments_enabled else 0
     collection_deadline = started + collection_window - comments_budget
+    network_ingested = {"reports_new": 0, "rejected": 0}
 
     def record_items(source, items):
         received = now_iso()
+        if source.get("alert_format") == "consensus":
+            added, rejected = doctor.ingest(
+                store.db, source, list(items), received, config["collection"]["content_chars"]
+            )
+            network_ingested["reports_new"] += added
+            network_ingested["rejected"] += rejected
+            return received
         if comments_enabled:  # Once they are turned off, stored notes no longer reach new revisions.
             items = (merge_cached_comments(store, item, source, received) for item in items)
         report["items_changed"] += sum(store.ingest(item, received) for item in items)
@@ -206,7 +225,36 @@ def run(config: dict, store: Store) -> dict:
     run_deadline = started + budget
     endpoint_failures = 0
     first = decisions.latest_id(store.db)
-    with Analyzer(config, deadline=run_deadline) as analyzer, Reviewer(config, deadline=run_deadline) as reviewer:
+    with (
+        Analyzer(config, deadline=run_deadline) as analyzer,
+        Reviewer(config, deadline=run_deadline) as reviewer,
+        doctor.LinkChecker(config, deadline=run_deadline) as linker,
+    ):
+        for consensus_source in consensus_sources:
+            try:
+                evaluated = doctor.evaluate(
+                    config,
+                    store,
+                    consensus_source,
+                    linker,
+                    now_iso(),
+                    allow_network=endpoint_failures < 2,
+                )
+                endpoint_failures += evaluated.pop("endpoint_failures", 0)
+                report["network"] = {**network_ingested, **evaluated}
+            except sqlite3.Error:
+                raise
+            except Exception as exc:
+                frame = traceback.extract_tb(exc.__traceback__)[-1]
+                report["network"] = {
+                    **network_ingested,
+                    "incidents_open": 0,
+                    "stories_written": 0,
+                    "updates_written": 0,
+                    "held": 0,
+                    "dry_run": not consensus_source.get("publish", False),
+                    "error": f"Unexpected {type(exc).__name__} at {Path(frame.filename).name}:{frame.lineno}",
+                }
         for row in store.pending(config["llm"]["max_items_per_run"], now_iso()):
             if time.monotonic() >= run_deadline:
                 report["budget_reached"] = True
@@ -222,6 +270,7 @@ def run(config: dict, store: Store) -> dict:
                     report["analyzed"] += 1
                 report["review_cache_hits"] += bool(result["cache_hit"])
                 report["review_stale"] += result["status"] == "stale"
+                report["review_routed"] += result["status"] == "routed"
             except AnalysisError as exc:
                 # A request cut off by the run deadline is retryable: the item backs off.
                 store.defer(row["id"], str(exc), config["llm"], now_iso(), terminal=not exc.retryable, code=exc.code)
@@ -241,7 +290,7 @@ def run(config: dict, store: Store) -> dict:
                 store.defer(row["id"], f"Unexpected {type(exc).__name__} at {Path(frame.filename).name}:{frame.lineno}",
                             config["llm"], now_iso(), terminal=True)
                 report["analysis_failed"] += 1
-        report["model_calls"] = analyzer.calls + reviewer.calls
+        report["model_calls"] = analyzer.calls + reviewer.calls + linker.calls
     report["decisions"] = decisions.codes_after(store.db, first)
     report["pending_analysis"] = store.pending_count()
     report["rejected_analysis"] = store.rejected_count()
@@ -298,6 +347,7 @@ def main(argv: list[str] | None = None) -> int:
                     else int(store.get_meta("published_stories")),
                     "comments": {"enabled": config["comments"]["enabled"], **comments_status(store)},
                     "final_review": review_status(store),
+                    "network_health": doctor.status(store.db, config["sources"]),
                     "decisions_24h": decisions.recent(store.db, now_iso()),
                     "sources": store.health(
                         config["sources"], config["collection"]["stale_after_seconds"], now_iso()

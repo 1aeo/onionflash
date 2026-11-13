@@ -2,12 +2,12 @@
 
 These commands are for a trusted operator on the collector host and use the
 configured SQLite database. `show` and `history` take no lock, so they also work
-while collection or a build runs. `correct`, `retract`, `restore` and `unlock`
-take the same nonblocking process lock as collection: while a run or build holds
-it, they print `{"status": "already-running"}`, exit 75 and change nothing. No
-command calls the model or publishes the site. Run the normal build and
-deployment after reviewing the receipt. A scheduled build can also pick up the
-queued change.
+while collection or a build runs. `correct`, `retract`, `restore`, `unlock` and
+`merge` take the same nonblocking process lock as collection: while a run or
+build holds it, they print `{"status": "already-running"}`, exit 75 and change
+nothing. No command calls the model or publishes the site. Run the normal build
+and deployment after reviewing the receipt. A scheduled build can also pick up
+the queued change.
 
 Every change requires a reason and the hash of the version you reviewed. Reasons
 are **public**: write a concise explanation for readers, without credentials,
@@ -49,8 +49,13 @@ Editable fields are `title`, `summary`, `why_it_matters`, `category`, `priority`
 `confidence`, `state`, `products`, `tags`, `sources` and `updates`. Source
 replacements are lists of objects containing only a public HTTPS `url` and
 `title`. The regular classification vocabulary and public URL validation still
-apply; `state` also accepts `no-longer-listed`, which the writer never chooses.
-IDs, dates, private collection metadata and editorial history cannot be patched.
+apply; `state` also accepts `no-longer-listed`, which fixed-text consensus-health
+alerts set when DocTor stops listing an anomaly and which the model writer never
+chooses. Fixed-text consensus-health stories (`origin = "network-health"`) bypass
+the model writer and reviewer; operator corrections, retractions, restores and
+locks apply to them just like any other story, and a locked story is excluded
+from automated consensus-health updates until unlocked. IDs, dates, private
+collection metadata and editorial history cannot be patched.
 
 `updates` replaces the story's whole list of dated updates, so one patch can add,
 fix, re-cite or remove entries. Each entry contains only `at`, a timestamp with a
@@ -128,9 +133,42 @@ onionflash story unlock --config config.toml --story STORY_ID \
   --expect-hash CURRENT_HASH --reason 'The corrected source can now be followed automatically.'
 ```
 
-Unlocking is explicit and recorded. It does not replay held analyses or rerun the
-model; the next normal source update can change the story. The existing public
-correction notice and revision history remain available after automated updates.
+Unlocking is explicit and recorded. It re-queues items held during the lock at
+their current revision so the next run reviews them as updates without calling a
+model during `unlock`. The existing public correction notice and revision
+history remain available after automated updates.
+
+## Merge a duplicate story
+
+When two already-published stories cover the same concrete event, merge the
+duplicate into the survivor:
+
+```sh
+onionflash story merge --config config.toml --story DUPLICATE_ID \
+  --into SURVIVOR_ID --expect-hash REVIEWED_HASH \
+  --reason 'Same event as the surviving release story.'
+onionflash build --config config.toml
+```
+
+Unlike `correct` or `retract`, the merge `--reason` is private operator audit
+metadata recorded in `story_aliases` and the decision log. On the next build,
+`/news/<duplicate>/` renders fixed text (`This story has moved`) with its
+canonical link and an instant `<meta http-equiv="refresh">` pointing to
+`/news/<survivor>/` (without `noindex` and without story titles), and
+`/news/<duplicate>/story.json` becomes `{id, merged_into, url}`. Both permalink
+paths stay in `public_artifacts`, while the duplicate leaves listings, topic
+pages, RSS/JSON feeds, story counts and coverage background.
+
+In one transaction `merge` stores the duplicate's private `stories` payload in
+`story_aliases.story_json`, removes its private `stories` row, updates its
+`public_catalog` snapshot to the pointer JSON (so an older collector release
+after a rollback leaves it out of views without overwriting the pointer),
+remaps its items and unlinked same-cluster items to the survivor, and re-points
+any earlier aliases chained through it. Merges are permanent: `merge` refuses
+merging a story into itself, an unknown or unpublished duplicate or survivor, a
+quarantined survivor, a retracted duplicate or survivor, an already merged or
+retired ID, or a stale `--expect-hash`. `merge` does not fold prose; fold any
+missing facts or sources onto the survivor with `story correct`.
 
 ## What readers see and what stays private
 

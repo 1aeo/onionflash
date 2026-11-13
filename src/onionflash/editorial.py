@@ -9,6 +9,7 @@ import json
 import hashlib
 import re
 
+from .config import DEFAULTS
 from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, PUBLIC_STATES, UPDATE_CHARS
 from .util import canonical_url, digest, format_utc, now_iso, parse_utc
 
@@ -43,7 +44,8 @@ def initialize(db) -> None:
         );
         CREATE TABLE IF NOT EXISTS story_aliases (
             story_id TEXT PRIMARY KEY, cluster_key TEXT NOT NULL UNIQUE,
-            survivor_id TEXT, reason TEXT NOT NULL, created_at TEXT NOT NULL
+            survivor_id TEXT, reason TEXT NOT NULL, created_at TEXT NOT NULL,
+            story_json TEXT
         );
         CREATE TRIGGER IF NOT EXISTS story_aliases_no_replace BEFORE INSERT ON story_aliases
             WHEN EXISTS (SELECT 1 FROM story_aliases WHERE story_id=NEW.story_id OR cluster_key=NEW.cluster_key)
@@ -61,6 +63,8 @@ def initialize(db) -> None:
         DROP TRIGGER IF EXISTS editorial_story_update;
         DROP TRIGGER IF EXISTS editorial_story_delete;
     """)
+    if "story_json" not in {row[1] for row in db.execute("PRAGMA table_info(story_aliases)")}:
+        db.execute("ALTER TABLE story_aliases ADD COLUMN story_json TEXT")
 
 
 def retired(db, *, story_id: str | None = None, cluster_key: str | None = None) -> tuple[str, str | None] | None:
@@ -335,6 +339,19 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
             (story_id, next_revision, action, reason, stamp, current["record"]["payload"],
              _json(current["published"]) if current["published"] is not None else None,
              after_story, _json(public), current["hash"], after_hash))
+        if action == "unlock" and {r[0] for r in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('items','decision_log','review_jobs')")} == {
+                "items", "decision_log", "review_jobs"}:
+            requeued = [r[0] for r in db.execute("""
+                SELECT id FROM items WHERE status='published' AND story_id=?
+                AND EXISTS (SELECT 1 FROM decision_log d
+                    WHERE d.id=(SELECT MAX(id) FROM decision_log WHERE item_id=items.id)
+                    AND d.story_id=? AND d.code='held.gate.story_locked'
+                    AND d.content_hash=items.content_hash)""", (story_id, story_id)).fetchall()]
+            if requeued:
+                marks = ",".join("?" * len(requeued))
+                db.execute(f"UPDATE items SET status='pending',attempts=0,rejections=0,next_attempt_at=NULL,last_error=NULL WHERE id IN ({marks})", requeued)
+                db.execute(f"DELETE FROM review_jobs WHERE item_id IN ({marks})", requeued)
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_render_queue'").fetchone():
             # Like a changed story, an editorial action renders before any rebuild backlog.
             db.execute("INSERT OR REPLACE INTO public_render_queue(rowid,story_id) SELECT IFNULL(MIN(rowid),0)-1,? FROM public_render_queue", (story_id,))
@@ -356,3 +373,120 @@ def unlock(db, story_id: str, *, reason: str, expect_hash: str, observed: str | 
 
 def restore(db, story_id: str, revision: int, *, reason: str, expect_hash: str, observed: str | None = None) -> dict:
     return _apply(db, story_id, "restore", revision=revision, reason=reason, expect_hash=expect_hash, observed=observed)
+
+
+def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str | None = None,
+          base_url: str = DEFAULTS["site"]["base_url"], observed: str | None = None,
+          automatic: bool = False) -> dict:
+    """Permanently merge published duplicate `story_id` into `survivor_id` as a pointer."""
+    from . import decisions
+    from .render import pointer_json
+
+    _id(story_id)
+    _id(survivor_id)
+    if story_id == survivor_id:
+        raise ValueError("Cannot merge a story into itself")
+    reason = _text(reason, "merge reason", 1000)
+    if not automatic and (not isinstance(expect_hash, str) or not _HASH.fullmatch(expect_hash)):
+        raise ValueError("A current expected story hash is required")
+    base = canonical_url(base_url).rstrip("/") + "/"
+    stamp = format_utc(parse_utc(observed or now_iso()))
+    if db.in_transaction:
+        raise ValueError("Editorial action needs a fresh transaction")
+    db.execute("BEGIN IMMEDIATE")
+    with db:
+        dup = _snapshot(db, story_id)
+        surv = _snapshot(db, survivor_id)
+        if expect_hash is not None and dup["hash"] != expect_hash:
+            raise ValueError("Story changed since it was reviewed; refresh its hash before editing")
+        if (dup["control"] and dup["control"]["retracted"]) or (surv["control"] and surv["control"]["retracted"]):
+            raise ValueError("Cannot merge a retracted story")
+        if dup["published"] is None or surv["published"] is None:
+            raise ValueError("Both stories must already be published before merging")
+        _public(surv["published"])
+        if (db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_render_queue'").fetchone()
+                and db.execute("SELECT 1 FROM public_render_queue WHERE story_id=? AND last_error IS NOT NULL",
+                               (survivor_id,)).fetchone()):
+            raise ValueError("Survivor story has a quarantined render error")
+        db.execute(
+            "INSERT INTO story_aliases(story_id,cluster_key,survivor_id,reason,created_at,story_json) VALUES(?,?,?,?,?,?)",
+            (story_id, dup["record"]["cluster_key"], survivor_id, reason, stamp, dup["record"]["payload"]),
+        )
+        db.execute("DELETE FROM stories WHERE id=?", (story_id,))
+        db.execute("UPDATE editorial_controls SET locked=0,held_updates=0 WHERE story_id=?", (story_id,))
+        remapped = 0
+        has_item_tables = {
+            r[0]
+            for r in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('items','decision_log','review_jobs')"
+            )
+        } == {"items", "decision_log", "review_jobs"}
+        held_ids = (
+            [
+                r[0]
+                for r in db.execute(
+                    """SELECT id FROM items WHERE status='published'
+                       AND (story_id=? OR (story_id IS NULL AND cluster_key=?))
+                       AND EXISTS (SELECT 1 FROM decision_log d
+                           WHERE d.id=(SELECT MAX(id) FROM decision_log WHERE item_id=items.id)
+                           AND d.story_id=? AND d.code='held.gate.story_locked'
+                           AND d.content_hash=items.content_hash)""",
+                    (story_id, dup["record"]["cluster_key"], story_id),
+                ).fetchall()
+            ]
+            if has_item_tables
+            else []
+        )
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='items'").fetchone():
+            remapped = db.execute(
+                "UPDATE items SET story_id=? WHERE story_id=? OR (story_id IS NULL AND cluster_key=?)",
+                (survivor_id, story_id, dup["record"]["cluster_key"]),
+            ).rowcount
+        if held_ids:
+            marks = ",".join("?" * len(held_ids))
+            db.execute(f"DELETE FROM review_jobs WHERE item_id IN ({marks})", held_ids)
+            if surv["control"] and surv["control"]["locked"]:
+                for hid in held_ids:
+                    record_held(db, survivor_id)
+                    decisions.record(db, hid, "held.gate.story_locked", stamp, merged_from=story_id)
+            else:
+                db.execute(
+                    f"UPDATE items SET status='pending',attempts=0,rejections=0,next_attempt_at=NULL,last_error=NULL WHERE id IN ({marks})",
+                    held_ids,
+                )
+        has_topics = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_story_topics'").fetchone())
+        has_queue = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_render_queue'").fetchone())
+        for (aid,) in db.execute(
+            "SELECT a.story_id FROM story_aliases a JOIN public_catalog c ON c.story_id=a.story_id ORDER BY a.story_id"
+        ).fetchall():
+            resolved = retired(db, story_id=aid)
+            if resolved is None or resolved[1] != survivor_id:
+                continue
+            pjson = json.dumps(pointer_json(base, aid, survivor_id), ensure_ascii=False, sort_keys=True) + "\n"
+            psha = hashlib.sha256(pjson.encode("utf-8")).hexdigest()
+            db.execute(
+                "UPDATE public_catalog SET updated_at=?,template_hash='',json_sha256=?,public_json=? WHERE story_id=?",
+                (stamp, psha, pjson, aid),
+            )
+            if has_topics:
+                db.execute("DELETE FROM public_story_topics WHERE story_id=?", (aid,))
+            if has_queue:
+                db.execute("DELETE FROM public_render_queue WHERE story_id=?", (aid,))
+                db.execute(
+                    "INSERT INTO public_render_queue(rowid,story_id) SELECT IFNULL(MIN(rowid),0)-1,? FROM public_render_queue",
+                    (aid,),
+                )
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='decision_log'").fetchone():
+            decisions.record_subject(
+                db,
+                story_id,
+                "merged.auto.same_event" if automatic else "operator.merged",
+                stamp,
+                story_id=survivor_id,
+                once=False,
+                duplicate_id=story_id,
+                merged_into=survivor_id,
+                remapped_items=remapped,
+                reason=reason,
+            )
+    return {"story_id": story_id, "merged_into": survivor_id, "remapped_items": remapped, "updated_at": stamp}

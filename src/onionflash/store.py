@@ -10,7 +10,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .util import after, backoff_seconds, digest, item_cluster, item_identity, saved_object
-from . import candidate, decisions, editorial, render
+from . import candidate, decisions, doctor, editorial, render
 from .comments import analysis_context
 from .candidate import ReviewRequired
 
@@ -105,6 +105,7 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS items_pending ON items(status, next_attempt_at, priority_score);
             DROP INDEX IF EXISTS items_cluster;
+            CREATE INDEX IF NOT EXISTS items_cluster_story ON items(cluster_key) WHERE story_id IS NOT NULL;
             CREATE TABLE IF NOT EXISTS analyses (
                 cache_key TEXT PRIMARY KEY, result TEXT NOT NULL, created_at TEXT NOT NULL
             );
@@ -159,6 +160,7 @@ class Store:
             CREATE INDEX IF NOT EXISTS decision_log_item ON decision_log(item_id,id);
         """)
         editorial.initialize(self.db)
+        doctor.initialize(self.db)
         analysis_columns = {row[1] for row in self.db.execute("PRAGMA table_info(analyses)")}
         for name, kind in (("source_payload", "TEXT"), ("source_item_id", "TEXT"), ("review_record", "TEXT")):
             if name not in analysis_columns:
@@ -396,6 +398,53 @@ class Store:
     def prepare_candidate(self, row: dict, result: dict, observed: str) -> dict:
         return candidate.prepare(self.db, row, result, observed)
 
+    def add_citation(self, row: dict, story_id: str, observed: str) -> dict:
+        """Attach a corroborating tag source without model calls or moving updated_at."""
+        if self.db.in_transaction:
+            raise ValueError("Citation commit requires a fresh transaction")
+        self.db.execute("BEGIN IMMEDIATE")
+        with self.db:
+            current = self.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()
+            if current is None or candidate.item_fingerprint(dict(current)) != candidate.item_fingerprint(row):
+                raise candidate.StaleCandidate("Source item changed before citation committed")
+            story_row = self.db.execute("SELECT * FROM stories WHERE id=?", (story_id,)).fetchone()
+            if story_row is None:
+                if editorial.retired(self.db, story_id=story_id) is not None:
+                    raise editorial.RetiredStory("Story is retired")
+                raise candidate.StaleCandidate("Target story is no longer available")
+            if editorial.retired(self.db, story_id=story_id, cluster_key=story_row["cluster_key"]) is not None:
+                raise editorial.RetiredStory("Story is retired")
+            locked = editorial.is_locked(self.db, story_id)
+            item = json.loads(row["payload"])
+            source = {key: item[key] for key in ("id", "url", "title", "published_at")}
+            cache_key = digest(["citation", row["id"], row["content_hash"], story_id])
+            review_record = {"schema_version": 1, "writer": None, "input_row": row, "reviews": [],
+                             "outcome": "locked" if locked else "cited", "story_id": story_id}
+            analysis_key = self.record_analysis(row, {"citation": source["url"], "story_id": story_id},
+                                                cache_key, observed, review_record=review_record)
+            if locked:
+                editorial.record_held(self.db, story_id)
+                code = "held.gate.story_locked"
+            else:
+                payload = json.loads(story_row["payload"])
+                source_map = {entry["url"]: entry for entry in payload.get("sources", [])}
+                source_map[source["url"]] = source
+                payload["sources"] = sorted(source_map.values(), key=lambda entry: entry["url"])
+                cursor = self.db.execute(
+                    "UPDATE stories SET payload=? WHERE id=?",
+                    (json.dumps(payload, ensure_ascii=False, allow_nan=False), story_id),
+                )
+                if not cursor.rowcount:
+                    raise editorial.RetiredStory("Story is retired")
+                code = "published.update"
+            self.db.execute(
+                "UPDATE items SET status='published',story_id=?,next_attempt_at=NULL,last_error=NULL WHERE id=?",
+                (story_id, row["id"]),
+            )
+            self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
+            decisions.record(self.db, row["id"], code, observed, review=review_record)
+        return {"story_id": story_id, "status": "locked" if locked else "cited", "analysis_key": analysis_key}
+
     def commit_candidate(self, prepared: dict, approved_candidate: dict | None, cache_key: str, observed: str, *,
                          approval_key: str | None = None, policy_hash: str | None = None,
                          review_record: dict | None = None, decision: str = "approve",
@@ -412,10 +461,19 @@ class Store:
                 raise ReviewRequired("Its story is editorially locked")
             if not locked:
                 original = prepared["candidate"]
+                mode = prepared.get("mode", "story")
+                editable_fields = candidate.UPDATE_FIELDS if mode == "update" else candidate.SEMANTIC_FIELDS
                 if not isinstance(approved_candidate, dict) or set(approved_candidate) != set(original):
                     raise ReviewRequired("Approval must identify the complete public candidate")
-                if any(approved_candidate[key] != original[key] for key in original if key not in candidate.SEMANTIC_FIELDS):
+                if any(approved_candidate[key] != original[key] for key in original if key not in editable_fields):
                     raise ReviewRequired("Review cannot change story identity, sources, dates or editorial metadata")
+                if mode == "update":
+                    orig_updates, app_updates = original.get("updates") or [], approved_candidate.get("updates") or []
+                    if (len(app_updates) != len(orig_updates) or not orig_updates
+                            or app_updates[:-1] != orig_updates[:-1]
+                            or app_updates[-1]["at"] != orig_updates[-1]["at"]
+                            or app_updates[-1]["sources"] != orig_updates[-1]["sources"]):
+                        raise ReviewRequired("Update review cannot change earlier updates or the new update's date or citations")
                 normalized = render._prepare_story(approved_candidate, editorial=original.get("editorial"))
                 if normalized != approved_candidate:
                     raise ReviewRequired("The approved candidate must already be normalized")
@@ -442,26 +500,51 @@ class Store:
                             ("policy_hash", policy_hash), ("binding_hash", prepared["binding_hash"]))):
                         raise ReviewRequired("Review decision does not match this candidate and its context")
                     from .review import validate_review
-                    verdict = validate_review(json.loads(receipt["result_json"]), prepared["packet"])
+                    verdict = validate_review(json.loads(receipt["result_json"]), prepared["packet"],
+                                              update=mode == "update", coverage=prepared["coverage"])
                     if verdict["verdict"] != decision:
                         raise ReviewRequired("Final review did not authorize this decision")
                     if review_record is None:
                         review_record = json.loads(receipt["review_record_json"])
                     self.db.execute("DELETE FROM review_approvals WHERE key=?", (approval_key,))
+                cited_on_skip = False
                 if decision == "approve":
                     payload = json.loads(json.dumps(prepared["payload"]))
-                    payload.update({key: approved_candidate[key] for key in candidate.SEMANTIC_FIELDS})
-                    new = candidate.existing_story(self.db, row) is None
+                    payload.update({key: approved_candidate[key] for key in editable_fields})
+                    new = self.db.execute("SELECT 1 FROM stories WHERE id=?", (story_id,)).fetchone() is None
                     if new:  # Date publication, not the first draft.
                         payload["added_at"] = observed
                     code = "operator.approved" if operator else ("published.new" if new else "published.update")
                 else:
+                    failed_criteria = {name for name, check in verdict["criteria"].items() if check["outcome"] != "pass"}
                     skipped = ("Final review skipped: " + ", ".join(
                         name for name, check in verdict["criteria"].items() if check["outcome"] != "pass"))[:160]
                     code = decisions.skip_code(review_record, verdict)
+                    item_obj = json.loads(row["payload"])
+                    if (
+                        failed_criteria == {"new_information"}
+                        and ((row.get("cluster_key") or "").startswith("release:") or item_obj.get("kind") == "metrics_timeline")
+                        and story_id in verdict["criteria"]["new_information"]["reason"]
+                    ):
+                        existing_row = self.db.execute("SELECT payload FROM stories WHERE id=?", (story_id,)).fetchone()
+                        if existing_row is not None:
+                            story_payload = json.loads(existing_row[0])
+                            cite_source = {key: item_obj[key] for key in ("id", "url", "title", "published_at")}
+                            source_map = {entry["url"]: entry for entry in story_payload.get("sources", [])}
+                            source_map[cite_source["url"]] = cite_source
+                            story_payload["sources"] = sorted(source_map.values(), key=lambda entry: entry["url"])
+                            cursor = self.db.execute(
+                                "UPDATE stories SET payload=? WHERE id=?",
+                                (json.dumps(story_payload, ensure_ascii=False, allow_nan=False), story_id),
+                            )
+                            if not cursor.rowcount:
+                                raise editorial.RetiredStory("Story is retired")
+                            cited_on_skip = True
+            else:
+                cited_on_skip = False
             analysis_key = self.record_analysis(row, result, cache_key, observed, review_record=review_record)
             if payload is not None:
-                if payload.get("editorial_item") == row["id"]:
+                if prepared.get("mode", "story") == "story" and payload.get("editorial_item") == row["id"]:
                     payload["editorial_analysis_key"] = analysis_key
                 cursor = self.db.execute("""INSERT INTO stories(id,cluster_key,payload,published_at,updated_at)
                     VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at""",
@@ -473,7 +556,7 @@ class Store:
                     raise editorial.RetiredStory("Story is retired")
                 editorial.record_held(self.db, story_id)
             published = decision == "approve"
-            mapped_id = story_id if published else row.get("story_id")
+            mapped_id = story_id if (published or cited_on_skip) else row.get("story_id")
             self.db.execute("UPDATE items SET status=?,story_id=?,next_attempt_at=NULL,last_error=? WHERE id=?",
                             ("published" if published else "ignored", mapped_id, skipped, row["id"]))
             self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))

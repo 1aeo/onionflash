@@ -5,7 +5,7 @@ import sqlite3
 
 import pytest
 
-from approval_helpers import finish_reviewed, verdict
+from approval_helpers import finish_reviewed, update_analysis, verdict
 from onionflash import candidate, cli, editorial, rejection, review_gate
 from onionflash.analyze import cache_key
 from onionflash.config import DEFAULTS
@@ -43,7 +43,7 @@ def logged(store):
 def test_story_aliases_are_insert_only_and_permanent(context):
     _, store = context
     columns = {row[1] for row in store.db.execute("PRAGMA table_info(story_aliases)")}
-    assert columns == {"story_id", "cluster_key", "survivor_id", "reason", "created_at"}
+    assert columns == {"story_id", "cluster_key", "survivor_id", "reason", "created_at", "story_json"}
     add_alias(store.db, "retired-story-1", "url:retired-cluster-1")
     with pytest.raises(sqlite3.IntegrityError, match="Story aliases are permanent"):
         store.db.execute("UPDATE story_aliases SET reason='changed' WHERE story_id='retired-story-1'")
@@ -51,7 +51,10 @@ def test_story_aliases_are_insert_only_and_permanent(context):
         store.db.execute("DELETE FROM story_aliases WHERE story_id='retired-story-1'")
     for sid, ckey in (("retired-story-1", "url:other"), ("retired-story-2", "url:retired-cluster-1")):
         with pytest.raises(sqlite3.IntegrityError, match="Story aliases are permanent"):
-            store.db.execute("INSERT OR REPLACE INTO story_aliases VALUES(?,?,NULL,?,?)", (sid, ckey, "replace", DATE))
+            store.db.execute(
+                "INSERT OR REPLACE INTO story_aliases(story_id,cluster_key,survivor_id,reason,created_at) VALUES(?,?,NULL,?,?)",
+                (sid, ckey, "replace", DATE),
+            )
         with pytest.raises(sqlite3.IntegrityError):
             add_alias(store.db, sid, ckey)
 
@@ -262,7 +265,7 @@ def test_merged_alias_resolves_to_live_survivor_or_refuses_missing_survivor(cont
     by_id = dict(store.db.execute("SELECT * FROM items WHERE id=?", (f_row["id"],)).fetchone())
     by_id["payload"] = f_row["payload"]
     assert candidate.existing_story(store.db, by_id)["id"] == survivor["id"]
-    prepared = candidate.prepare(store.db, by_id, analysis(title="Followup"), after(60, DATE))
+    prepared = candidate.prepare(store.db, by_id, update_analysis(update="Followup"), after(60, DATE))
     assert (prepared["story_id"], prepared["cluster_key"]) == (survivor["id"], survivor_cluster)
 
     with store.db:

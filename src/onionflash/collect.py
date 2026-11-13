@@ -210,8 +210,13 @@ def _feed(
     identities, conflicts, skipped = {}, set(), 0
     for index, entry in enumerate(feed.entries):
         published = _entry_time(
-            entry, "published", _entry_time(entry, "updated", started)
+            entry, "published", _entry_time(entry, "updated", "")
         )
+        if not published:
+            if source.get("alert_format"):
+                skipped += 1
+                continue
+            published = started
         updated = _entry_time(entry, "updated", published)
         if updated < cutoff:
             continue

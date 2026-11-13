@@ -8,7 +8,7 @@ from approval_helpers import finish_reviewed, verdict
 from onionflash import analyze, comments, editorial, rejection, review_gate
 from onionflash.collect import collect_source
 from onionflash.config import DEFAULTS
-from onionflash.source_packet import source_fingerprint
+from onionflash.source_packet import build_packet, source_fingerprint
 from onionflash.store import Store, item_hash
 from test_analyze import FakeLLM, completion
 from test_core import FakeClient, analysis, config, item, response, source
@@ -310,3 +310,15 @@ def test_closed_issues_keep_their_closing_date_without_changing_hashes_or_writer
     writer.analyze(with_closed)
     sent = json.loads(writer.client.requests[0][1]["messages"][1]["content"])
     assert "closed_at" not in sent
+    # The review packet exposes closed_at on a closed issue and omits it when absent, while keeping bindings identical.
+    closed_item = {"id": "a" * 24, **with_closed}
+    unclosed_item = {"id": "a" * 24, **without_closed}
+    none_closed_item = {"id": "a" * 24, **without_closed, "closed_at": None}
+    refs = {"sources": [{"id": closed_item["id"], "url": closed_item["url"]}]}
+    closed_packet, closed_bindings = build_packet(None, closed_item, refs, {"sources": []}, closed_item["id"])
+    unclosed_packet, unclosed_bindings = build_packet(None, unclosed_item, refs, {"sources": []}, unclosed_item["id"])
+    none_packet, _ = build_packet(None, none_closed_item, refs, {"sources": []}, none_closed_item["id"])
+    assert closed_packet["sources"][0]["closed_at"] == "2026-10-07T17:16:54Z"
+    assert "closed_at" not in unclosed_packet["sources"][0]
+    assert "closed_at" not in none_packet["sources"][0]
+    assert closed_bindings == unclosed_bindings

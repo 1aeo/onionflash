@@ -823,3 +823,151 @@ def test_with_comments_off_a_changed_revision_of_a_damaged_issue_is_queued(tmp_p
         # With comments off, collection saves the issue as REST lists it.
         assert store.ingest(issue(title="A changed title", updated_at=later), later)
         assert store.db.execute("SELECT status FROM items").fetchone()[0] == "pending"
+
+
+def test_comment_rotation_dates_edited_note_and_advances_story_updated_at(tmp_path, monkeypatch):
+    from onionflash import review_gate, source_packet
+    from test_review_gate import Reviewer, Writer, update_analysis, verdict
+
+    limits(monkeypatch, INTERVAL_SECONDS=30)
+    cfg = comments_config(tmp_path)
+
+    for bad_edited in (123, "not-a-timestamp"):
+        with pytest.raises((CommentError, ValueError)):
+            fetch_comments(FakeClient([response(payload([note(lastEditedAt=bad_edited)]))]), issue_source(), issue())
+
+    monkeypatch.setattr(comments, "now_iso", lambda: "2026-11-12T16:00:00Z")
+    clamped = fetch_comments(
+        FakeClient([response(payload([
+            note("1", createdAt=DATE, lastEditedAt="2099-01-01T00:00:00Z"),
+            note("2", createdAt=DATE, lastEditedAt=None, updatedAt="2026-11-10T10:00:00Z"),
+        ]))]),
+        issue_source(),
+        issue(),
+    )
+    by_id = {n["id"]: n for n in clamped}
+    assert by_id["gid://gitlab/Note/1"]["edited_at"] == "2026-11-12T16:00:00Z"
+    assert "edited_at" not in by_id["gid://gitlab/Note/2"]
+
+    with Store(cfg["storage"]["database"]) as store:
+        assert store.ingest(issue(published_at=DATE, updated_at=DATE), DATE)
+        row0 = store.pending(1, DATE)[0]
+        w0 = Writer(analysis(
+            title="Relay directory keys under investigation",
+            summary="Operators reported that directory keys remain untrusted while maintainers investigate.",
+            state="developing",
+            confidence="reported",
+            evidence=[issue()["content"][:50]],
+        ))
+        assert review_gate.process_item(cfg, store, row0, w0, Reviewer(verdict(), verdict()), DATE)["status"] == "published"
+        story_id = store.stories()[0]["id"]
+
+        # Comment rotation adds Note 1 on Nov 9 without any REST refresh (saved issue updated_at stays Nov 8).
+        t1 = "2026-11-09T09:00:00Z"
+        monkeypatch.setattr(comments, "now_iso", lambda: "2026-11-09T09:05:00Z")
+        n1_initial = note("1", createdAt=t1, lastEditedAt=t1, updatedAt=t1,
+                          body="Maintainers reproduced the failure during consensus voting tests.")
+        assert enrich(cfg, store, "2026-11-09T09:05:00Z", FakeClient([response(payload([n1_initial]))]))["changed"] == 1
+        row1 = store.pending(1, "2026-11-09T09:05:00Z")[0]
+        fp_before_reaction = source_packet.source_fingerprint(json.loads(row1["payload"]))
+        w1 = Writer(update_analysis(
+            update="Maintainers reproduced the failure during consensus voting tests.",
+            state="developing",
+            confidence="reported",
+            evidence=["Maintainers reproduced the failure during consensus voting tests."],
+        ))
+        assert review_gate.process_item(cfg, store, row1, w1, Reviewer(verdict(update=True), verdict(update=True)), "2026-11-09T09:05:00Z")["status"] == "published"
+        assert store.stories()[0]["updated_at"] == t1
+
+        # Reaction or thread touch bumps timestamps without changing body: neither requeues nor alters source_fingerprint.
+        monkeypatch.setattr(comments, "now_iso", lambda: "2026-11-10T10:05:00Z")
+        n1_touched = note("1", createdAt=t1, lastEditedAt="2026-11-10T10:00:00Z", updatedAt="2026-11-10T10:00:00Z",
+                          body=n1_initial["body"])
+        assert enrich(cfg, store, "2026-11-10T10:05:00Z", FakeClient([response(payload([n1_touched]))]))["changed"] == 0
+        saved_after_touch = json.loads(store.db.execute("SELECT payload FROM items").fetchone()[0])
+        assert "edited_at" not in saved_after_touch["public_comments"][0]
+        assert source_packet.source_fingerprint(saved_after_touch) == fp_before_reaction
+
+        # Note 1 is edited at t_edit (while updatedAt is bumped later by a thread event, and issue updated_at is still Nov 8).
+        t_edit = "2026-11-12T15:27:35Z"
+        monkeypatch.setattr(comments, "now_iso", lambda: "2026-11-12T16:00:00Z")
+        n1_edited = note("1", createdAt=t1, lastEditedAt=t_edit, updatedAt="2026-11-12T15:40:00Z",
+                         body="Correction: the failure occurred in routerstatus retry, not consensus voting.")
+        assert enrich(cfg, store, "2026-11-12T16:00:00Z", FakeClient([response(payload([n1_edited]))]))["changed"] == 1
+        # A subsequent unchanged check before review completes preserves t_edit.
+        monkeypatch.setattr(comments, "now_iso", lambda: "2026-11-12T16:35:00Z")
+        assert enrich(cfg, store, "2026-11-12T16:35:00Z", FakeClient([response(payload([n1_edited]))]))["changed"] == 0
+        row2 = store.pending(1, "2026-11-12T16:35:00Z")[0]
+        assert json.loads(row2["payload"])["updated_at"] == DATE
+        w2 = Writer(update_analysis(
+            update="A corrected maintainer note places the failure in routerstatus retry.",
+            state="developing",
+            confidence="reported",
+            evidence=["Correction: the failure occurred in routerstatus retry, not consensus voting."],
+        ))
+        assert review_gate.process_item(cfg, store, row2, w2, Reviewer(verdict(update=True), verdict(update=True)), "2026-11-12T16:35:00Z")["status"] == "published"
+        story2 = next(s for s in store.stories() if s["id"] == story_id)
+        assert story2["updates"][-1]["at"] == t_edit
+        assert story2["updated_at"] == t_edit
+
+        # Fallback when lastEditedAt is absent/null on a further edit: records first-observed check time,
+        # preserves it across a later unchanged poll, and publishes end-to-end via process_item.
+        t_obs = "2026-11-12T17:00:00Z"
+        monkeypatch.setattr(comments, "now_iso", lambda: t_obs)
+        n1_no_ts = note("1", createdAt=t1, lastEditedAt=None, body="Patch under test now on staging authorities.")
+        assert enrich(cfg, store, t_obs, FakeClient([response(payload([n1_no_ts]))]))["changed"] == 1
+        monkeypatch.setattr(comments, "now_iso", lambda: "2026-11-12T17:35:00Z")
+        assert enrich(cfg, store, "2026-11-12T17:35:00Z", FakeClient([response(payload([n1_no_ts]))]))["changed"] == 0
+        row3 = store.pending(1, "2026-11-12T17:35:00Z")[0]
+        # Pre-upgrade pending snapshot without edited_at on the note falls back to comments_checked_at (> updated_at).
+        pre_upgrade_payload = json.loads(row3["payload"])
+        pre_upgrade_payload["public_comments"][0].pop("edited_at")
+        with store.db:
+            store.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps(pre_upgrade_payload), row3["id"]))
+        row3_legacy = store.pending(1, "2026-11-12T17:35:00Z")[0]
+        prep_legacy = store.prepare_candidate(
+            row3_legacy,
+            update_analysis(
+                update="A maintainer reports a patch is under test on staging authorities.",
+                state="developing",
+                confidence="reported",
+                evidence=["Patch under test now on staging authorities."],
+            ),
+            "2026-11-12T17:35:00Z",
+        )
+        assert prep_legacy["candidate"]["updates"][-1]["at"] == "2026-11-12T17:35:00Z"
+        assert prep_legacy["candidate"]["updated_at"] == "2026-11-12T17:35:00Z"
+        # Restore the composed payload (carrying first-observed t_obs) and run full process_item.
+        with store.db:
+            store.db.execute("UPDATE items SET payload=? WHERE id=?", (row3["payload"], row3["id"]))
+        row3_restored = store.pending(1, "2026-11-12T17:35:00Z")[0]
+        w3 = Writer(update_analysis(
+            update="A maintainer reports a patch is under test on staging authorities.",
+            state="developing",
+            confidence="reported",
+            evidence=["Patch under test now on staging authorities."],
+        ))
+        assert review_gate.process_item(cfg, store, row3_restored, w3, Reviewer(verdict(update=True), verdict(update=True)), "2026-11-12T17:35:00Z")["status"] == "published"
+        story3 = next(s for s in store.stories() if s["id"] == story_id)
+        assert story3["updates"][-1]["at"] == t_obs
+        assert story3["updated_at"] == t_obs
+
+        # Edited note shorter than MIN_EVIDENCE_CHARS (8 chars) without @author mention leaves _comment_sources empty,
+        # and candidate.prepare still dates the update from the changed note's edited_at rather than stale item["updated_at"].
+        t_tiny = "2026-11-12T18:10:00Z"
+        monkeypatch.setattr(comments, "now_iso", lambda: "2026-11-12T18:15:00Z")
+        n1_tiny = note("1", createdAt=t1, lastEditedAt=t_tiny, body="Fixed.")
+        assert enrich(cfg, store, "2026-11-12T18:15:00Z", FakeClient([response(payload([n1_tiny]))]))["changed"] == 1
+        row4 = store.pending(1, "2026-11-12T18:15:00Z")[0]
+        prep_tiny = store.prepare_candidate(
+            row4,
+            update_analysis(
+                update="The reported issue was marked fixed.",
+                state="developing",
+                confidence="reported",
+                evidence=["Fixed."],
+            ),
+            "2026-11-12T18:15:00Z",
+        )
+        assert prep_tiny["candidate"]["updates"][-1]["at"] == t_tiny
+        assert prep_tiny["candidate"]["updated_at"] == t_tiny
