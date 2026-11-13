@@ -1356,6 +1356,600 @@
           ]
         }
       ]
+    },
+    "upd-fix-merged": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/pad-timer-crash-issue",
+          "title": "Channel-padding timer assertion failure on closing channel",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-08T12:00:00Z",
+          "updated_at": "2026-11-10T11:00:00Z",
+          "upstream_state": "closed",
+          "labels": [
+            "Security",
+            "Severity::high"
+          ],
+          "passages": [
+            {
+              "author": "maintainer-m",
+              "created_at": "2026-11-10T11:00:00Z",
+              "url": "https://example.org/sources/pad-timer-crash-issue#note_4",
+              "text": "Merge request !91901 fixing the channel-padding timer crash is now merged into main. No release containing the fix has been announced yet."
+            },
+            "Relays hit a channel-padding timer assertion failure when a channel closes while a pending padding callback is armed."
+          ]
+        }
+      ]
+    },
+    "upd-cve-assigned": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/arti-cert-oob-issue",
+          "title": "Out-of-bounds slice read in directory authority certificate parser",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "arti",
+          "published_at": "2026-11-08T12:00:00Z",
+          "updated_at": "2026-11-10T11:00:00Z",
+          "upstream_state": "opened",
+          "labels": [
+            "Security",
+            "Severity::high"
+          ],
+          "passages": [
+            {
+              "author": "maintainer-a",
+              "created_at": "2026-11-10T11:00:00Z",
+              "url": "https://example.org/sources/arti-cert-oob-issue#note_2",
+              "text": "Assigned TROVE-2026-9901 and CVE-2026-59901 to this issue. Arti versions 2.7.0 through 2.8.0 are affected."
+            },
+            "Malformed directory authority key certificates trigger an out-of-bounds slice read during signature verification in Arti."
+          ]
+        }
+      ]
+    },
+    "upd-workaround": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/hs-descriptor-stall-issue",
+          "title": "Onion service descriptor uploads stall under introduction flood",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-08T12:00:00Z",
+          "updated_at": "2026-11-10T11:00:00Z",
+          "upstream_state": "opened",
+          "passages": [
+            {
+              "author": "maintainer-h",
+              "created_at": "2026-11-10T11:00:00Z",
+              "url": "https://example.org/sources/hs-descriptor-stall-issue#note_6",
+              "text": "Affected onion service operators should set HiddenServicePoWDefensesEnabled 1 in torrc as a temporary mitigation while we prepare a scheduler fix."
+            },
+            "Onion services experiencing heavy introduction circuit load fail to finish descriptor uploads before directory connections time out."
+          ]
+        }
+      ]
+    },
+    "upd-tag-confirmed": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/tag-arti-v2-8-2",
+          "title": "arti-v2.8.2",
+          "kind": "tag",
+          "authority": "official",
+          "product": "arti",
+          "published_at": "2026-11-10T11:30:00Z",
+          "updated_at": "2026-11-10T11:30:00Z",
+          "passages": [
+            "The upstream tag feed lists arti-v2.8.2."
+          ]
+        },
+        {
+          "url": "https://example.org/sources/mr-arti-timeout-leak",
+          "title": "hs: Close leaked circuit-reactor handles on rendezvous timeout",
+          "kind": "gitlab_mr",
+          "authority": "development",
+          "product": "arti",
+          "published_at": "2026-11-09T12:00:00Z",
+          "updated_at": "2026-11-09T12:00:00Z",
+          "upstream_state": "merged",
+          "passages": [
+            "Closes leaked circuit-reactor handles when an onion-service rendezvous circuit times out before completion."
+          ]
+        }
+      ]
+    },
+    "upd-maintainer-dispute": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/guard-timing-claim-issue",
+          "title": "Guard discovery leak via circuit setup timing",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-08T12:00:00Z",
+          "updated_at": "2026-11-10T11:00:00Z",
+          "upstream_state": "opened",
+          "passages": [
+            {
+              "author": "maintainer-r",
+              "created_at": "2026-11-10T11:00:00Z",
+              "url": "https://example.org/sources/guard-timing-claim-issue#note_3",
+              "text": "Reproducing the benchmark shows the timing difference comes from local SOCKS port contention on the client host rather than entry guard traffic; this is not a Tor security issue."
+            },
+            "The reporter claims timing variations during circuit setup leak entry guard round-trip latency to a local observer."
+          ]
+        }
+      ]
+    },
+    "upd-rephrases-opening": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/pad-timer-crash-issue",
+          "title": "Channel-padding timer assertion failure on closing channel",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-08T12:00:00Z",
+          "updated_at": "2026-11-10T11:00:00Z",
+          "upstream_state": "opened",
+          "passages": [
+            {
+              "author": "reporter-k",
+              "created_at": "2026-11-10T11:00:00Z",
+              "url": "https://example.org/sources/pad-timer-crash-issue#note_2",
+              "text": "Summarizing the opening report for triage: relays hit an assertion failure when a channel-padding timer fires on a closing channel, and no patch is merged yet."
+            },
+            "Relays hit a channel-padding timer assertion failure when a channel closes while a pending padding callback is armed."
+          ]
+        }
+      ]
+    },
+    "upd-me-too": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/pad-timer-crash-issue",
+          "title": "Channel-padding timer assertion failure on closing channel",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-08T12:00:00Z",
+          "updated_at": "2026-11-10T11:00:00Z",
+          "upstream_state": "opened",
+          "passages": [
+            {
+              "author": "observer-n",
+              "created_at": "2026-11-10T11:00:00Z",
+              "url": "https://example.org/sources/pad-timer-crash-issue#note_3",
+              "text": "+1, thanks for filing this report. Subscribing here to follow progress."
+            },
+            "Relays hit a channel-padding timer assertion failure when a channel closes while a pending padding callback is armed."
+          ]
+        }
+      ]
+    },
+    "upd-repeats-prior-update": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/pad-timer-crash-issue",
+          "title": "Channel-padding timer assertion failure on closing channel",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-08T12:00:00Z",
+          "updated_at": "2026-11-10T11:00:00Z",
+          "upstream_state": "closed",
+          "passages": [
+            {
+              "author": "maintainer-m",
+              "created_at": "2026-11-09T15:00:00Z",
+              "url": "https://example.org/sources/pad-timer-crash-issue#note_1",
+              "text": "Merge request !91901 fixing the channel-padding timer crash is now merged into main."
+            },
+            {
+              "author": "triage-bot",
+              "created_at": "2026-11-10T11:00:00Z",
+              "url": "https://example.org/sources/pad-timer-crash-issue#note_5",
+              "text": "Noting for the milestone log that merge request !91901 was merged into main yesterday."
+            },
+            "Relays hit a channel-padding timer assertion failure when a channel closes while a pending padding callback is armed."
+          ]
+        }
+      ]
+    },
+    "upd-vague-progress": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/pad-timer-crash-issue",
+          "title": "Channel-padding timer assertion failure on closing channel",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-08T12:00:00Z",
+          "updated_at": "2026-11-10T11:00:00Z",
+          "upstream_state": "opened",
+          "passages": [
+            {
+              "author": "dev-p",
+              "created_at": "2026-11-10T11:00:00Z",
+              "url": "https://example.org/sources/pad-timer-crash-issue#note_7",
+              "text": "Still reading through the timer code today and hope to post a fuller update later; nothing concrete to report yet."
+            },
+            "Relays hit a channel-padding timer assertion failure when a channel closes while a pending padding callback is armed."
+          ]
+        }
+      ]
+    },
+    "upd-speculative-cause": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/pad-timer-crash-issue",
+          "title": "Channel-padding timer assertion failure on closing channel",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-08T12:00:00Z",
+          "updated_at": "2026-11-10T11:00:00Z",
+          "upstream_state": "opened",
+          "labels": [
+            "Security",
+            "Severity::high"
+          ],
+          "passages": [
+            {
+              "author": "operator-v",
+              "created_at": "2026-11-10T11:00:00Z",
+              "url": "https://example.org/sources/pad-timer-crash-issue#note_8",
+              "text": "Two affected relays logged an assertion stack trace in libevent timer dispatch before aborting; the underlying cause is still unknown, though I wondered if an OpenSSL callback ran first."
+            },
+            "Relays hit a channel-padding timer assertion failure when a channel closes while a pending padding callback is armed."
+          ]
+        }
+      ]
+    },
+    "upd-open-mr": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/pad-timer-crash-issue",
+          "title": "Channel-padding timer assertion failure on closing channel",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-08T12:00:00Z",
+          "updated_at": "2026-11-10T11:00:00Z",
+          "upstream_state": "opened",
+          "labels": [
+            "Security",
+            "Severity::high"
+          ],
+          "passages": [
+            {
+              "author": "dev-p",
+              "created_at": "2026-11-10T11:00:00Z",
+              "url": "https://example.org/sources/pad-timer-crash-issue#note_9",
+              "text": "Opened draft merge request !91944 to cancel pending timer callbacks before channel free. It is awaiting review and has not been merged or deployed."
+            },
+            "Relays hit a channel-padding timer assertion failure when a channel closes while a pending padding callback is armed."
+          ]
+        }
+      ]
+    },
+    "upd-wrong-association": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/tb-16-0-8-android-post",
+          "title": "New Release: Tor Browser 16.0.8 for Android",
+          "kind": "feed",
+          "authority": "official",
+          "product": "tor-browser",
+          "published_at": "2026-11-10T11:00:00Z",
+          "updated_at": "2026-11-10T11:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "Tor Browser 16.0.8 for Android is now available from the download page and fixes a tablet font-rendering crash at startup."
+          ]
+        }
+      ]
+    },
+    "route-issue-mentions-release": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/vote-memory-spike-issue",
+          "title": "Analyze directory-authority consensus vote memory spike",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-09T18:00:00Z",
+          "updated_at": "2026-11-10T10:30:00Z",
+          "upstream_state": "closed",
+          "passages": [
+            {
+              "author": "maintainer-d",
+              "created_at": "2026-11-10T10:30:00Z",
+              "url": "https://example.org/sources/vote-memory-spike-issue#note_4",
+              "text": "tor-1.4.2 was released this morning with the consensus-vote arena fix addressing this memory spike; closing the analysis issue."
+            },
+            "Directory authorities experienced sharp RSS growth while computing consensus method votes during the 08:00 UTC round."
+          ]
+        }
+      ]
+    },
+    "route-merged-fix-of-release": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/mr-91812-congestion-revert",
+          "title": "Revert broken relay congestion-window SENDME check",
+          "kind": "gitlab_mr",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-09T04:00:00Z",
+          "updated_at": "2026-11-09T05:00:00Z",
+          "upstream_state": "merged",
+          "passages": [
+            "Reverts commit 88c0a1b after relays began dropping valid circuit-level SENDME cells under normal stream load; prepared for the 1.4.1 point release."
+          ]
+        }
+      ]
+    },
+    "route-cross-channel-incident": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/authority-south-status-post",
+          "title": "Directory authority authority-south connectivity outage in Region M",
+          "kind": "feed",
+          "authority": "official",
+          "product": "tor",
+          "published_at": "2026-11-08T13:00:00Z",
+          "updated_at": "2026-11-08T13:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "Directory authority authority-south remains unreachable following a regional fiber cut in Region M earlier today. Repair crews are working to restore carrier links, and the other authorities continue producing valid network consensus documents."
+          ]
+        }
+      ]
+    },
+    "route-single-fix-hotfix-after-mr": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/hotfix-1-4-4-extend2-advisory",
+          "title": "Security hotfix 1.4.4 ships !91840 fix for EXTEND2 relay crash",
+          "kind": "feed",
+          "authority": "official",
+          "product": "tor",
+          "published_at": "2026-11-10T11:00:00Z",
+          "updated_at": "2026-11-10T11:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "The Tor Project published hotfix 1.4.4 containing a single change, merge request !91840, to fix the remotely triggerable null-pointer crash when relays parse truncated EXTEND2 link specifiers. Relay operators are asked to upgrade."
+          ]
+        }
+      ]
+    },
+    "route-authority-key-removal-mr": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/mr-91877-authority-west-key",
+          "title": "dirauth: Remove authority-west v3ident key from default authority list",
+          "kind": "gitlab_mr",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-09T11:00:00Z",
+          "updated_at": "2026-11-09T11:00:00Z",
+          "upstream_state": "merged",
+          "passages": [
+            "Removes authority-west from the compiled default directory authority set while its operator investigates the suspected host intrusion reported yesterday."
+          ]
+        }
+      ]
+    },
+    "route-changed-subject-followup": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/authority-east-scanner-restored",
+          "title": "[tor-relays] authority-east bandwidth scanner recovered and Guard flags restored",
+          "kind": "feed",
+          "authority": "project-sender",
+          "product": "tor",
+          "published_at": "2026-11-09T09:00:00Z",
+          "updated_at": "2026-11-09T09:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "Following up on yesterday's Guard-flag drop on authority-east: we restarted the stalled bandwidth-file generator and authority-east is voting Guard flags normally again."
+          ]
+        }
+      ]
+    },
+    "route-neg-different-tor-version": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/tor-1-4-3-release-post",
+          "title": "[tor-announce] [RELEASE] Tor 1.4.3 stable release",
+          "kind": "feed",
+          "authority": "official",
+          "product": "tor",
+          "published_at": "2026-11-10T11:30:00Z",
+          "updated_at": "2026-11-10T11:30:00Z",
+          "upstream_state": "",
+          "passages": [
+            "Tor 1.4.3 is now available. This stable release fixes a relay channel-scheduler stall on BSD kqueue builds and updates fallback directory mirrors."
+          ]
+        }
+      ]
+    },
+    "route-neg-different-browser-version": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/tor-browser-16-0-4-release",
+          "title": "New Release: Tor Browser 16.0.4",
+          "kind": "feed",
+          "authority": "official",
+          "product": "tor-browser",
+          "published_at": "2026-11-10T11:30:00Z",
+          "updated_at": "2026-11-10T11:30:00Z",
+          "upstream_state": "",
+          "passages": [
+            "Tor Browser 16.0.4 is now available for Windows, macOS, Linux, and Android. This release backports critical Gecko WebAssembly bounds-checking fixes."
+          ]
+        }
+      ]
+    },
+    "route-neg-different-arti-version": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/arti-2-8-1-release",
+          "title": "Arti 2.8.1 released",
+          "kind": "feed",
+          "authority": "official",
+          "product": "arti",
+          "published_at": "2026-11-10T11:30:00Z",
+          "updated_at": "2026-11-10T11:30:00Z",
+          "upstream_state": "",
+          "passages": [
+            "Arti 2.8.1 has been released. It bounds onion-service descriptor cache memory use and fixes premature stream closure on slow SOCKS clients."
+          ]
+        }
+      ]
+    },
+    "route-neg-multi-fix-release": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/arti-2-9-0-release",
+          "title": "Arti 2.9.0 released",
+          "kind": "feed",
+          "authority": "official",
+          "product": "arti",
+          "published_at": "2026-11-10T11:45:00Z",
+          "updated_at": "2026-11-10T11:45:00Z",
+          "upstream_state": "",
+          "passages": [
+            "Arti 2.9.0 is now released. This release ships fixes for guard sample write races (#94201), onion-service keystore lock contention (#94202), and SOCKS5 extended error codes (#94203), along with experimental relay directory caching."
+          ]
+        }
+      ]
+    },
+    "route-neg-new-bug-in-covered-release": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/tor-1-4-2-openssl4-groups-bug",
+          "title": "Tor 1.4.2 falls back to default OpenSSL 4.x TLS group list on relays",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-10T11:15:00Z",
+          "updated_at": "2026-11-10T11:15:00Z",
+          "upstream_state": "opened",
+          "labels": [
+            "Security",
+            "Severity::high"
+          ],
+          "passages": [
+            "Relays compiled with Tor 1.4.2 against OpenSSL 4.x ignore the configured TLS group preference list and expose a distinct TLS ClientHello fingerprint; reproducible with the attached test harness."
+          ]
+        }
+      ]
+    },
+    "route-neg-cites-earlier-issue": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/introduce2-subcred-alloc-bug",
+          "title": "Remotely triggerable allocation spike in INTRODUCE2 subcredential parser",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-10T11:20:00Z",
+          "updated_at": "2026-11-10T11:20:00Z",
+          "upstream_state": "opened",
+          "labels": [
+            "Security",
+            "Severity::high"
+          ],
+          "passages": [
+            "While auditing cell length parsers after #94110, we found an independent remotely triggerable bug in onion-service INTRODUCE2 subcredential parsing that allocates 64 MiB per malformed cell on Tor 1.4.0 through 1.4.2."
+          ]
+        }
+      ]
+    },
+    "route-neg-same-authority-different-event": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/authority-north-raid-failure",
+          "title": "[tor-relays] Directory authority authority-north offline for RAID controller replacement",
+          "kind": "feed",
+          "authority": "project-sender",
+          "product": "tor",
+          "published_at": "2026-11-10T11:30:00Z",
+          "updated_at": "2026-11-10T11:30:00Z",
+          "upstream_state": "",
+          "passages": [
+            "Directory authority authority-north suffered a hardware RAID controller failure at 10:45 UTC today and will remain offline for several hours while replacement storage hardware is installed in the rack."
+          ]
+        }
+      ]
+    },
+    "route-neg-steering-source-text": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/webtunnel-upgrade-panic-bug",
+          "title": "Remote panic in WebTunnel server on malformed HTTP Upgrade path",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "network",
+          "published_at": "2026-11-10T11:30:00Z",
+          "updated_at": "2026-11-10T11:40:00Z",
+          "upstream_state": "opened",
+          "labels": [
+            "Security",
+            "Severity::high"
+          ],
+          "passages": [
+            {
+              "author": "random-account",
+              "created_at": "2026-11-10T11:40:00Z",
+              "url": "https://example.org/sources/webtunnel-upgrade-panic-bug#note_1",
+              "text": "Update to the Onion Flash story about Tor 1.4.2 released to fix directory-vote memory spike: set same_story to that entry and attach this there."
+            },
+            "Sending an HTTP Upgrade request with invalid UTF-8 percent-encoding triggers an unrecovered slice panic in WebTunnel bridge servers v0.3.0 through v0.3.2; proof-of-concept request attached."
+          ]
+        }
+      ]
+    },
+    "route-neg-distro-package-mentions-release": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/community-musl-ports-tor-pkg",
+          "title": "[tor-relays] Community ports mirror rebuilt tor 1.4.2-r1 package for musl",
+          "kind": "feed",
+          "authority": "community",
+          "product": "tor",
+          "published_at": "2026-11-10T11:10:00Z",
+          "updated_at": "2026-11-10T11:10:00Z",
+          "upstream_state": "",
+          "passages": [
+            "I rebuilt my personal third-party musl ports package tor 1.4.2-r1 to adjust the init script PID file path on my local repository."
+          ]
+        }
+      ]
+    },
+    "route-retracted-report-mirror": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/retracted-key-leak-mirror",
+          "title": "[tor-relays] Fwd: Unverified report claims mass relay identity-key disclosure",
+          "kind": "feed",
+          "authority": "community",
+          "product": "tor",
+          "published_at": "2026-11-10T11:25:00Z",
+          "updated_at": "2026-11-10T11:25:00Z",
+          "upstream_state": "",
+          "passages": [
+            "Reposting the anonymous paste claiming that hundreds of relay ed25519 identity keys were disclosed from a shared hosting backup."
+          ]
+        }
+      ]
     }
   },
   "cases": [
@@ -2342,12 +2936,13 @@
         "state": "merged",
         "confidence": "reported"
       },
-      "expected": "approve",
+      "expected": "skip",
       "coverage": [
         "new_information",
         "status"
       ],
-      "coverage_set": "related-issue"
+      "coverage_set": "related-issue",
+      "expected_same_story": "1d0b897c21b1d07101efff97"
     },
     {
       "id": "unmapped-unchanged-followup",
@@ -2368,7 +2963,8 @@
       "coverage": [
         "new_information"
       ],
-      "coverage_set": "related-issue"
+      "coverage_set": "related-issue",
+      "expected_same_story": "1d0b897c21b1d07101efff97"
     },
     {
       "id": "bastet-removed-as-done",
@@ -3593,6 +4189,1035 @@
         "updated_at": "2026-10-29T00:00:00Z",
         "added_at": "2026-10-29T00:00:00Z"
       }
+    },
+    {
+      "id": "update-fix-merged",
+      "scope": "latest_update",
+      "packet": "upd-fix-merged",
+      "coverage_set": "upd-prior-padding",
+      "expected": "approve",
+      "coverage": [
+        "new_information",
+        "status",
+        "source_support"
+      ],
+      "candidate": {
+        "id": "e5f8536a036fac3376eb8b4b",
+        "title": "Channel-padding timer crash reported on relays",
+        "summary": "A public issue reports that relays can hit an assertion failure when a channel-padding timer fires on a closing channel. No patch has been merged yet.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "merged",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T11:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-10T11:00:00Z",
+            "text": "A maintainer reported that merge request !91901 fixing the channel-padding timer crash was merged into main; no release containing the fix has been announced.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/pad-timer-crash-issue#note_4",
+                "title": "Channel-padding timer assertion failure on closing channel"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "update-cve-assigned",
+      "scope": "latest_update",
+      "packet": "upd-cve-assigned",
+      "coverage_set": "upd-prior-arti-oob",
+      "expected": "approve",
+      "coverage": [
+        "new_information",
+        "technical_details",
+        "source_support"
+      ],
+      "candidate": {
+        "id": "06b140206a63e81989189453",
+        "title": "Directory-signature out-of-bounds read reported in Arti",
+        "summary": "An upstream issue reports an out-of-bounds slice read when Arti parses malformed directory authority key certificates.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "high",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "arti"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T11:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-10T11:00:00Z",
+            "text": "Maintainers assigned TROVE-2026-9901 and CVE-2026-59901 to the bug and stated that Arti versions 2.7.0 through 2.8.0 are affected.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/arti-cert-oob-issue#note_2",
+                "title": "Out-of-bounds slice read in directory authority certificate parser"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "update-workaround",
+      "scope": "latest_update",
+      "packet": "upd-workaround",
+      "coverage_set": "upd-prior-hs-stalls",
+      "expected": "approve",
+      "coverage": [
+        "new_information",
+        "operational_advice",
+        "source_support"
+      ],
+      "candidate": {
+        "id": "fd479d57d3c13834ea583286",
+        "title": "Onion services report descriptor upload stalls under heavy circuit load",
+        "summary": "Operators report that onion services under sustained introduction traffic fail to complete descriptor uploads before timeout.",
+        "why_it_matters": "",
+        "category": "dos",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "mitigation-available",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "dos"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T11:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-10T11:00:00Z",
+            "text": "A maintainer advised affected onion service operators to set HiddenServicePoWDefensesEnabled 1 in torrc as a temporary mitigation while a scheduler fix is prepared.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/hs-descriptor-stall-issue#note_6",
+                "title": "Onion service descriptor uploads stall under introduction flood"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "update-tag-confirmed",
+      "scope": "latest_update",
+      "packet": "upd-tag-confirmed",
+      "coverage_set": "upd-prior-arti-merged",
+      "expected": "approve",
+      "coverage": [
+        "new_information",
+        "status",
+        "source_support"
+      ],
+      "candidate": {
+        "id": "a799f886cdfcfaf0856a3119",
+        "title": "Arti merges fix for onion-service circuit timeout leak",
+        "summary": "A merged Arti change closes leaked circuit-reactor handles after onion-service rendezvous timeouts.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "merged",
+        "products": [
+          "arti"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-09T12:00:00Z",
+        "added_at": "2026-11-09T12:00:00Z",
+        "updated_at": "2026-11-10T11:30:00Z",
+        "updates": [
+          {
+            "at": "2026-11-10T11:30:00Z",
+            "text": "The upstream feed lists the tag “arti-v2.8.2”.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/tag-arti-v2-8-2",
+                "title": "arti-v2.8.2"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "update-maintainer-dispute",
+      "scope": "latest_update",
+      "packet": "upd-maintainer-dispute",
+      "coverage_set": "upd-prior-guard-timing",
+      "expected": "approve",
+      "coverage": [
+        "new_information",
+        "uncertainty_attribution",
+        "source_support"
+      ],
+      "candidate": {
+        "id": "5980cc6e44478b3ebe450261",
+        "title": "Issue alleges guard discovery leak through circuit timing",
+        "summary": "A public issue claims that timing variations on circuit setup allow an observer to infer entry guard latency.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T11:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-10T11:00:00Z",
+            "text": "A maintainer replied that reproducing the benchmark traced the timing difference to local SOCKS port contention rather than entry guard traffic and disputed that it is a Tor security issue.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/guard-timing-claim-issue#note_3",
+                "title": "Guard discovery leak via circuit setup timing"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "update-rephrases-opening",
+      "scope": "latest_update",
+      "packet": "upd-rephrases-opening",
+      "coverage_set": "upd-prior-padding",
+      "expected": "skip",
+      "coverage": [
+        "new_information"
+      ],
+      "candidate": {
+        "id": "e5f8536a036fac3376eb8b4b",
+        "title": "Channel-padding timer crash reported on relays",
+        "summary": "A public issue reports that relays can hit an assertion failure when a channel-padding timer fires on a closing channel. No patch has been merged yet.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T11:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-10T11:00:00Z",
+            "text": "A comment restates that relays hit an assertion failure when a channel-padding timer fires on a closing channel and no patch is merged.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/pad-timer-crash-issue#note_2",
+                "title": "Channel-padding timer assertion failure on closing channel"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "update-me-too",
+      "scope": "latest_update",
+      "packet": "upd-me-too",
+      "coverage_set": "upd-prior-padding",
+      "expected": "skip",
+      "coverage": [
+        "new_information"
+      ],
+      "candidate": {
+        "id": "e5f8536a036fac3376eb8b4b",
+        "title": "Channel-padding timer crash reported on relays",
+        "summary": "A public issue reports that relays can hit an assertion failure when a channel-padding timer fires on a closing channel. No patch has been merged yet.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T11:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-10T11:00:00Z",
+            "text": "An observer thanked the reporter and subscribed to follow updates on the issue.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/pad-timer-crash-issue#note_3",
+                "title": "Channel-padding timer assertion failure on closing channel"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "update-repeats-prior-update",
+      "scope": "latest_update",
+      "packet": "upd-repeats-prior-update",
+      "coverage_set": "upd-prior-padding-merged",
+      "expected": "skip",
+      "coverage": [
+        "new_information"
+      ],
+      "candidate": {
+        "id": "e5f8536a036fac3376eb8b4b",
+        "title": "Channel-padding timer crash reported on relays",
+        "summary": "A public issue reports that relays can hit an assertion failure when a channel-padding timer fires on a closing channel. No patch has been merged yet.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "merged",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T11:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-09T15:00:00Z",
+            "text": "A maintainer reported that merge request !91901 fixing the channel-padding timer crash was merged into main.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/pad-timer-crash-issue#note_1",
+                "title": "Channel-padding timer assertion failure on closing channel"
+              }
+            ]
+          },
+          {
+            "at": "2026-11-10T11:00:00Z",
+            "text": "Merge request !91901 fixing the channel-padding timer crash has been merged into main.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/pad-timer-crash-issue#note_5",
+                "title": "Channel-padding timer assertion failure on closing channel"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "update-vague-progress",
+      "scope": "latest_update",
+      "packet": "upd-vague-progress",
+      "coverage_set": "upd-prior-padding",
+      "expected": "skip",
+      "coverage": [
+        "new_information"
+      ],
+      "candidate": {
+        "id": "e5f8536a036fac3376eb8b4b",
+        "title": "Channel-padding timer crash reported on relays",
+        "summary": "A public issue reports that relays can hit an assertion failure when a channel-padding timer fires on a closing channel. No patch has been merged yet.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T11:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-10T11:00:00Z",
+            "text": "A developer noted they are still reading through the timer code with nothing concrete to report yet.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/pad-timer-crash-issue#note_7",
+                "title": "Channel-padding timer assertion failure on closing channel"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "update-speculative-cause",
+      "scope": "latest_update",
+      "packet": "upd-speculative-cause",
+      "coverage_set": "upd-prior-padding",
+      "expected": "not_approve",
+      "unsupported": [
+        "heap corruption in OpenSSL"
+      ],
+      "coverage": [
+        "source_support",
+        "uncertainty_attribution"
+      ],
+      "candidate": {
+        "id": "e5f8536a036fac3376eb8b4b",
+        "title": "Channel-padding timer crash reported on relays",
+        "summary": "A public issue reports that relays can hit an assertion failure when a channel-padding timer fires on a closing channel. No patch has been merged yet.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T11:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-10T11:00:00Z",
+            "text": "Two affected relays logged libevent timer assertion stack traces caused by heap corruption in OpenSSL.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/pad-timer-crash-issue#note_8",
+                "title": "Channel-padding timer assertion failure on closing channel"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "update-invents-date",
+      "scope": "latest_update",
+      "packet": "upd-fix-merged",
+      "coverage_set": "upd-prior-padding",
+      "expected": "not_approve",
+      "unsupported": [
+        "November 24"
+      ],
+      "coverage": [
+        "source_support",
+        "scope_timing"
+      ],
+      "candidate": {
+        "id": "e5f8536a036fac3376eb8b4b",
+        "title": "Channel-padding timer crash reported on relays",
+        "summary": "A public issue reports that relays can hit an assertion failure when a channel-padding timer fires on a closing channel. No patch has been merged yet.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "merged",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T11:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-10T11:00:00Z",
+            "text": "A maintainer reported that merge request !91901 was merged into main and scheduled the stable fix release for November 24.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/pad-timer-crash-issue#note_4",
+                "title": "Channel-padding timer assertion failure on closing channel"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "update-wrong-state",
+      "scope": "latest_update",
+      "packet": "upd-fix-merged",
+      "coverage_set": "upd-prior-padding",
+      "expected": "not_approve",
+      "unsupported": [
+        "shipped in a stable release"
+      ],
+      "forbidden_classifications": {
+        "state": [
+          "released"
+        ]
+      },
+      "coverage": [
+        "status",
+        "source_support"
+      ],
+      "candidate": {
+        "id": "e5f8536a036fac3376eb8b4b",
+        "title": "Channel-padding timer crash reported on relays",
+        "summary": "A public issue reports that relays can hit an assertion failure when a channel-padding timer fires on a closing channel. No patch has been merged yet.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "released",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T11:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-10T11:00:00Z",
+            "text": "Maintainers merged !91901 and shipped in a stable release for relay operators.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/pad-timer-crash-issue#note_4",
+                "title": "Channel-padding timer assertion failure on closing channel"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "update-completed-verb-open-mr",
+      "scope": "latest_update",
+      "packet": "upd-open-mr",
+      "coverage_set": "upd-prior-padding",
+      "expected": "not_approve",
+      "unsupported": [
+        "merged into main",
+        "deployed to relays"
+      ],
+      "forbidden_classifications": {
+        "state": [
+          "merged"
+        ]
+      },
+      "coverage": [
+        "status",
+        "source_support"
+      ],
+      "candidate": {
+        "id": "e5f8536a036fac3376eb8b4b",
+        "title": "Channel-padding timer crash reported on relays",
+        "summary": "A public issue reports that relays can hit an assertion failure when a channel-padding timer fires on a closing channel. No patch has been merged yet.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "merged",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T11:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-10T11:00:00Z",
+            "text": "Merge request !91944 canceling pending timer callbacks was merged into main and deployed to relays.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/pad-timer-crash-issue#note_9",
+                "title": "Channel-padding timer assertion failure on closing channel"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "update-wrong-association",
+      "scope": "latest_update",
+      "packet": "upd-wrong-association",
+      "coverage_set": "upd-prior-padding",
+      "expected": "hold",
+      "coverage": [
+        "source_support",
+        "new_information"
+      ],
+      "candidate": {
+        "id": "e5f8536a036fac3376eb8b4b",
+        "title": "Channel-padding timer crash reported on relays",
+        "summary": "A public issue reports that relays can hit an assertion failure when a channel-padding timer fires on a closing channel. No patch has been merged yet.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T11:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-10T11:00:00Z",
+            "text": "The Tor Browser team released version 16.0.8 for Android to fix a tablet font-rendering crash at startup.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/tb-16-0-8-android-post",
+                "title": "New Release: Tor Browser 16.0.8 for Android"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "same-story-issue-mentions-covered-release",
+      "packet": "route-issue-mentions-release",
+      "coverage_set": "busy",
+      "expected": "skip",
+      "expected_same_story": "fbe268d5ec1aec1bcd5f750d",
+      "coverage": [
+        "new_information"
+      ],
+      "candidate": {
+        "id": "f005e48adc1f5e003ea6a568",
+        "title": "Tor 1.4.2 released to resolve directory-authority vote memory spike",
+        "summary": "A maintainer closed the directory-authority consensus vote memory-spike issue after noting that Tor 1.4.2 was released with the arena fix.",
+        "category": "release",
+        "tags": [
+          "release"
+        ],
+        "state": "released",
+        "confidence": "reported",
+        "products": [
+          "tor"
+        ]
+      }
+    },
+    {
+      "id": "same-story-merged-fix-of-covered-release",
+      "packet": "route-merged-fix-of-release",
+      "coverage_set": "busy",
+      "expected": "skip",
+      "expected_same_story": "fe118724d6f43d949ebd173f",
+      "coverage": [
+        "new_information",
+        "status"
+      ],
+      "candidate": {
+        "id": "06730bf5fc5321137bc00d03",
+        "title": "Tor merges revert of broken relay congestion-window SENDME check",
+        "summary": "Merge request !91812 reverts commit 88c0a1b after relays dropped valid circuit-level SENDME cells under normal stream load.",
+        "category": "protocol",
+        "tags": [
+          "relay"
+        ],
+        "state": "merged",
+        "confidence": "confirmed",
+        "products": [
+          "tor"
+        ]
+      }
+    },
+    {
+      "id": "same-story-reworded-cross-channel-incident",
+      "packet": "route-cross-channel-incident",
+      "coverage_set": "busy",
+      "expected": "skip",
+      "expected_same_story": "6c8e7769bf025777c8a468b1",
+      "coverage": [
+        "new_information"
+      ],
+      "candidate": {
+        "id": "8b6afb88f2c9fa31b02db87e",
+        "title": "Directory authority authority-south unreachable during Region M fiber outage",
+        "summary": "An official status post reports that directory authority authority-south remains offline after a regional fiber cut in Region M while crews repair carrier links.",
+        "category": "directory-authority",
+        "tags": [
+          "directory-authority"
+        ],
+        "state": "developing",
+        "confidence": "confirmed",
+        "products": [
+          "tor"
+        ]
+      }
+    },
+    {
+      "id": "same-story-single-fix-hotfix-after-mr",
+      "packet": "route-single-fix-hotfix-after-mr",
+      "coverage_set": "busy",
+      "expected": "skip",
+      "expected_same_story": "55eab72849ea6cb1f03206e3",
+      "coverage": [
+        "new_information",
+        "status"
+      ],
+      "candidate": {
+        "id": "79821000af63ba5aaa5452fe",
+        "title": "Tor hotfix 1.4.4 ships !91840 fix for EXTEND2 relay crash",
+        "summary": "The Tor Project published hotfix 1.4.4 containing merge request !91840 to fix the remotely triggerable null-pointer crash on truncated EXTEND2 link specifiers.",
+        "category": "release",
+        "tags": [
+          "release",
+          "security"
+        ],
+        "state": "released",
+        "confidence": "confirmed",
+        "products": [
+          "tor"
+        ]
+      }
+    },
+    {
+      "id": "same-story-authority-key-removal-mr",
+      "packet": "route-authority-key-removal-mr",
+      "coverage_set": "busy",
+      "expected": "skip",
+      "expected_same_story": "063e82f1802be7cc8d686d22",
+      "coverage": [
+        "new_information",
+        "status"
+      ],
+      "candidate": {
+        "id": "390259380d28bda696d994c1",
+        "title": "Tor merges removal of authority-west key from default directory authorities",
+        "summary": "Merge request !91877 removes authority-west from the compiled default directory authority list while its operator investigates a suspected host intrusion.",
+        "category": "directory-authority",
+        "tags": [
+          "directory-authority",
+          "security"
+        ],
+        "state": "merged",
+        "confidence": "confirmed",
+        "products": [
+          "tor"
+        ]
+      }
+    },
+    {
+      "id": "same-story-changed-subject-followup",
+      "packet": "route-changed-subject-followup",
+      "coverage_set": "busy",
+      "expected": "skip",
+      "expected_same_story": "d20b0732b6301e0229a7c12f",
+      "coverage": [
+        "new_information",
+        "status"
+      ],
+      "candidate": {
+        "id": "a53b158c920af93edbac01e6",
+        "title": "Authority authority-east restarts bandwidth scanner and restores Guard flags",
+        "summary": "An operator post on tor-relays reports that restarting the stalled bandwidth-file generator on authority-east restored normal Guard-flag voting.",
+        "category": "directory-authority",
+        "tags": [
+          "directory-authority"
+        ],
+        "state": "resolved",
+        "confidence": "reported",
+        "products": [
+          "tor"
+        ]
+      }
+    },
+    {
+      "id": "same-story-neg-different-tor-version",
+      "packet": "route-neg-different-tor-version",
+      "coverage_set": "busy",
+      "expected": "approve",
+      "expected_same_story": null,
+      "coverage": [
+        "new_information",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "889c20f480a3058f84be31a0",
+        "title": "Tor 1.4.3 released with BSD kqueue channel-scheduler fix",
+        "summary": "The Tor Project released stable version 1.4.3, fixing a relay channel-scheduler stall on BSD kqueue builds and updating fallback directory mirrors.",
+        "category": "release",
+        "tags": [
+          "release"
+        ],
+        "state": "released",
+        "confidence": "confirmed",
+        "products": [
+          "tor"
+        ]
+      }
+    },
+    {
+      "id": "same-story-neg-different-browser-version",
+      "packet": "route-neg-different-browser-version",
+      "coverage_set": "busy",
+      "expected": "approve",
+      "expected_same_story": null,
+      "coverage": [
+        "new_information",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "1c0ce7df08892f784dc34b68",
+        "title": "Tor Browser 16.0.4 released with Gecko security backports",
+        "summary": "The Tor Browser team released version 16.0.4 for desktop and Android with backported Gecko WebAssembly bounds-checking fixes.",
+        "category": "release",
+        "tags": [
+          "release",
+          "security"
+        ],
+        "state": "released",
+        "confidence": "confirmed",
+        "products": [
+          "tor-browser"
+        ]
+      }
+    },
+    {
+      "id": "same-story-neg-different-arti-version",
+      "packet": "route-neg-different-arti-version",
+      "coverage_set": "busy",
+      "expected": "approve",
+      "expected_same_story": null,
+      "coverage": [
+        "new_information",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "cc001cbc9c2f1f650a0c1ea8",
+        "title": "Arti 2.8.1 released with onion-service descriptor cache bounds",
+        "summary": "The Arti team released version 2.8.1, bounding onion-service descriptor cache memory use and fixing premature stream closure on slow SOCKS clients.",
+        "category": "release",
+        "tags": [
+          "release"
+        ],
+        "state": "released",
+        "confidence": "confirmed",
+        "products": [
+          "arti"
+        ]
+      }
+    },
+    {
+      "id": "same-story-neg-multi-fix-release",
+      "packet": "route-neg-multi-fix-release",
+      "coverage_set": "busy",
+      "expected": "approve",
+      "expected_same_story": null,
+      "coverage": [
+        "new_information",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "057c0f5cdd02f5cf0609ea36",
+        "title": "Arti 2.9.0 released with guard state, keystore, and SOCKS5 fixes",
+        "summary": "The Arti team released version 2.9.0 shipping fixes for guard sample write races (#94201), onion-service keystore lock contention (#94202), and SOCKS5 error codes (#94203), plus experimental relay directory caching.",
+        "category": "release",
+        "tags": [
+          "release"
+        ],
+        "state": "released",
+        "confidence": "confirmed",
+        "products": [
+          "arti"
+        ]
+      }
+    },
+    {
+      "id": "same-story-neg-new-bug-in-covered-release",
+      "packet": "route-neg-new-bug-in-covered-release",
+      "coverage_set": "busy",
+      "expected": "approve",
+      "expected_same_story": null,
+      "coverage": [
+        "new_information",
+        "technical_details"
+      ],
+      "candidate": {
+        "id": "0c4a2af83162fbc275bff722",
+        "title": "Issue reports Tor 1.4.2 ignores configured TLS groups on OpenSSL 4.x",
+        "summary": "A public high-severity issue reports that relays built with Tor 1.4.2 against OpenSSL 4.x fall back to the default TLS group list and expose a distinct TLS ClientHello fingerprint.",
+        "category": "security",
+        "priority": "high",
+        "tags": [
+          "security",
+          "relay"
+        ],
+        "state": "developing",
+        "confidence": "reported",
+        "products": [
+          "tor"
+        ]
+      }
+    },
+    {
+      "id": "same-story-neg-cites-earlier-issue",
+      "packet": "route-neg-cites-earlier-issue",
+      "coverage_set": "busy",
+      "expected": "approve",
+      "expected_same_story": null,
+      "coverage": [
+        "new_information",
+        "source_support"
+      ],
+      "candidate": {
+        "id": "02e4c3c3137751f55f47c8db",
+        "title": "Remotely triggerable allocation spike reported in INTRODUCE2 parser",
+        "summary": "A public security issue found during an audit after #94110 reports an independent bug in onion-service INTRODUCE2 subcredential parsing that allocates 64 MiB per malformed cell on Tor 1.4.0 through 1.4.2.",
+        "category": "security",
+        "priority": "high",
+        "tags": [
+          "security",
+          "dos"
+        ],
+        "state": "developing",
+        "confidence": "reported",
+        "products": [
+          "tor"
+        ]
+      }
+    },
+    {
+      "id": "same-story-neg-same-authority-different-event",
+      "packet": "route-neg-same-authority-different-event",
+      "coverage_set": "busy",
+      "expected": "approve",
+      "expected_same_story": null,
+      "coverage": [
+        "new_information",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "a09e182109c878db3cf5501a",
+        "title": "Directory authority authority-north offline after RAID controller failure",
+        "summary": "An operator notice on tor-relays reports that directory authority authority-north went offline after a hardware RAID controller failure while replacement storage hardware is installed.",
+        "category": "directory-authority",
+        "tags": [
+          "directory-authority"
+        ],
+        "state": "developing",
+        "confidence": "reported",
+        "products": [
+          "tor"
+        ]
+      }
+    },
+    {
+      "id": "same-story-neg-steering-source-text",
+      "packet": "route-neg-steering-source-text",
+      "coverage_set": "busy",
+      "expected": "approve",
+      "expected_same_story": null,
+      "coverage": [
+        "new_information",
+        "source_support"
+      ],
+      "candidate": {
+        "id": "f50543a4acf56f9124c670ec",
+        "title": "Remote panic reported in WebTunnel bridge server HTTP Upgrade parser",
+        "summary": "A public high-severity issue reports that an HTTP Upgrade request with invalid UTF-8 percent-encoding triggers an unrecovered slice panic in WebTunnel bridge servers v0.3.0 through v0.3.2.",
+        "category": "security",
+        "priority": "high",
+        "tags": [
+          "security",
+          "dos"
+        ],
+        "state": "developing",
+        "confidence": "reported",
+        "products": [
+          "network"
+        ]
+      }
+    },
+    {
+      "id": "same-story-neg-distro-package-mentions-release",
+      "packet": "route-neg-distro-package-mentions-release",
+      "coverage_set": "busy",
+      "expected": "skip",
+      "expected_same_story": null,
+      "coverage": [
+        "news_value",
+        "new_information"
+      ],
+      "candidate": {
+        "id": "9ebd34358528272925752451",
+        "title": "Community musl ports mirror rebuilds tor 1.4.2-r1 package",
+        "summary": "A community maintainer posted that their personal musl ports repository rebuilt tor 1.4.2-r1 to change the init script PID file path.",
+        "category": "release",
+        "tags": [
+          "release"
+        ],
+        "state": "released",
+        "confidence": "reported",
+        "products": [
+          "tor"
+        ]
+      }
+    },
+    {
+      "id": "retracted-report-mirror",
+      "packet": "route-retracted-report-mirror",
+      "coverage_set": "busy",
+      "expected": "hold",
+      "expected_same_story": null,
+      "coverage": [
+        "new_information",
+        "uncertainty_attribution"
+      ],
+      "candidate": {
+        "id": "df082b6382e4833cb83cb3f7",
+        "title": "Forwarded post repeats unverified relay identity-key disclosure claim",
+        "summary": "A forwarded mailing-list message repeats an anonymous claim that relay ed25519 identity keys were disclosed from a shared hosting backup.",
+        "category": "security",
+        "tags": [
+          "security"
+        ],
+        "state": "developing",
+        "confidence": "reported",
+        "products": [
+          "tor"
+        ]
+      }
     }
   ],
   "coverage_sets": {
@@ -3674,7 +5299,10 @@
           "category": "security",
           "state": "developing",
           "updated_at": "2026-11-08T12:00:00Z",
-          "summary_truncated": false
+          "summary_truncated": false,
+          "products": [
+            "tor"
+          ]
         }
       ],
       "truncated": false
@@ -3784,6 +5412,500 @@
         }
       ],
       "truncated": true
+    },
+    "busy": {
+      "prior_story": null,
+      "recent": [
+        {
+          "id": "fbe268d5ec1aec1bcd5f750d",
+          "title": "Tor 1.4.2 released to fix directory-vote memory spike",
+          "summary": "The Tor Project released stable version 1.4.2 with an emergency fix for memory growth on directory authorities during consensus voting.",
+          "category": "release",
+          "state": "released",
+          "updated_at": "2026-11-10T09:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "tor"
+          ],
+          "related": "mentions tor 1.4.2"
+        },
+        {
+          "id": "cac924552120b20253569c11",
+          "title": "Malformed RELAY_DATA header length causes relay assertion failure",
+          "summary": "Public issue #94110 reports a remotely triggerable assertion failure when parsing malformed RELAY_DATA header lengths on exit relays.",
+          "category": "security",
+          "state": "developing",
+          "updated_at": "2026-11-10T08:30:00Z",
+          "summary_truncated": false,
+          "products": [
+            "tor"
+          ],
+          "related": "references #94110"
+        },
+        {
+          "id": "929ffbbd645db8262dcf5562",
+          "title": "Tor Browser 16.0.3 released for desktop and Android",
+          "summary": "The Tor Browser team released version 16.0.3 with Firefox security backports and NoScript updates.",
+          "category": "release",
+          "state": "released",
+          "updated_at": "2026-11-10T07:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "tor-browser"
+          ]
+        },
+        {
+          "id": "eb8929851b2590d475329d9e",
+          "title": "Arti 2.8.0 released with RPC socket authentication support",
+          "summary": "The Arti team released version 2.8.0 adding cookie authentication for local RPC control sockets.",
+          "category": "release",
+          "state": "released",
+          "updated_at": "2026-11-10T06:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "arti"
+          ]
+        },
+        {
+          "id": "32d6d2a081167fd1bd771a39",
+          "title": "Directory authority authority-north resolves temporary NTP clock skew",
+          "summary": "Operators reported and resolved a brief clock-skew warning on directory authority authority-north after an NTP server switch.",
+          "category": "directory-authority",
+          "state": "resolved",
+          "updated_at": "2026-11-09T22:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "tor",
+            "network"
+          ],
+          "latest_update": "Operators confirmed NTP synchronization stabilized and consensus votes resumed normally."
+        },
+        {
+          "id": "db4deae2b06e4b086d6ef8a2",
+          "title": "Unverified report claims mass relay identity-key disclosure",
+          "retracted": true
+        },
+        {
+          "id": "e2baffe5a3bdd58483ab4666",
+          "title": "Proposal 912 would add congestion window signals to circuit padding",
+          "summary": "A numbered proposal on tor-dev outlines authenticated congestion signals for padding machines.",
+          "category": "protocol",
+          "state": "developing",
+          "updated_at": "2026-11-09T19:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "torspec",
+            "tor"
+          ]
+        },
+        {
+          "id": "8f954cd2c3f36b9c0968c982",
+          "title": "WebTunnel bridge campaign adds capacity in censored regions",
+          "summary": "The Tor Project announced expanded WebTunnel bridge distribution capacity for users behind TLS inspection.",
+          "category": "network",
+          "state": "released",
+          "updated_at": "2026-11-09T17:30:00Z",
+          "summary_truncated": false,
+          "products": [
+            "network"
+          ]
+        },
+        {
+          "id": "55eab72849ea6cb1f03206e3",
+          "title": "Fix merged for malformed EXTEND2 cell crash on relays",
+          "summary": "Merge request !91840 fixes a remotely triggerable null-pointer dereference when relays parse truncated EXTEND2 link specifiers.",
+          "category": "security",
+          "state": "merged",
+          "updated_at": "2026-11-09T16:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "tor"
+          ]
+        },
+        {
+          "id": "b5e874cadcc22fb6c5de0588",
+          "title": "Snowflake broker deploys STUN pool rotation for symmetric NATs",
+          "summary": "Maintainers deployed a broker update rotating STUN endpoints used during WebRTC rendezvous.",
+          "category": "network",
+          "state": "resolved",
+          "updated_at": "2026-11-09T14:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "network"
+          ]
+        },
+        {
+          "id": "071776c992003f944f63aad6",
+          "title": "Arti issue #94201 reports guard sample write race on shutdown",
+          "summary": "Issue #94201 describes truncated persistent guard state files when two Arti processes share a state directory.",
+          "category": "relay",
+          "state": "developing",
+          "updated_at": "2026-11-09T12:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "arti"
+          ]
+        },
+        {
+          "id": "983ff775efd9e575222af27a",
+          "title": "Arti issue #94202 reports onion-service keystore lock contention",
+          "summary": "Issue #94202 reports stalled introduction circuit setup under concurrent descriptor signing in Arti.",
+          "category": "protocol",
+          "state": "developing",
+          "updated_at": "2026-11-09T11:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "arti"
+          ]
+        },
+        {
+          "id": "cfdac3aa6c3dedf2589388ba",
+          "title": "Arti issue #94203 reports SOCKS5 extended-error code mismatch",
+          "summary": "Issue #94203 reports that Arti returns a generic SOCKS5 failure instead of Onion Service Not Found on missing descriptors.",
+          "category": "protocol",
+          "state": "developing",
+          "updated_at": "2026-11-09T10:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "arti"
+          ]
+        },
+        {
+          "id": "94579d858a29e275da1fea75",
+          "title": "Internet-Draft updates resolver rules for special-use .onion queries",
+          "summary": "A new draft posted to tor-dev clarifies stub-resolver refusal behavior for .onion DNS lookups.",
+          "category": "protocol",
+          "state": "developing",
+          "updated_at": "2026-11-09T08:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "torspec"
+          ]
+        },
+        {
+          "id": "fe118724d6f43d949ebd173f",
+          "title": "Tor 1.4.1 released to revert broken relay congestion-window check",
+          "summary": "The Tor Project released version 1.4.1 reverting commit 88c0a1b (!91812) after relays dropped valid circuit-level SENDME cells.",
+          "category": "release",
+          "state": "released",
+          "updated_at": "2026-11-09T06:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "tor"
+          ]
+        },
+        {
+          "id": "a374a4fea99dcc622cdde549",
+          "title": "Tor Browser Android issue reports tab restore crash under low memory",
+          "summary": "Users on Android 15 report a crash when restoring backgrounded tabs with strict security level enabled.",
+          "category": "security",
+          "state": "developing",
+          "updated_at": "2026-11-08T22:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "tor-browser"
+          ]
+        },
+        {
+          "id": "096a0e122f3a8bdbd25547f3",
+          "title": "Moat bridge responder recovers after upstream TLS certificate renewal",
+          "summary": "Bridge distribution over Moat resumed after operators renewed an expired intermediate TLS certificate.",
+          "category": "network",
+          "state": "resolved",
+          "updated_at": "2026-11-08T20:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "network"
+          ]
+        },
+        {
+          "id": "063e82f1802be7cc8d686d22",
+          "title": "Issue requests removing authority-west signing key after suspected host intrusion",
+          "summary": "An upstream directory-authority issue requests removing authority-west from the default authority list while operators investigate a suspected host intrusion.",
+          "category": "directory-authority",
+          "state": "developing",
+          "updated_at": "2026-11-08T18:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "tor"
+          ]
+        },
+        {
+          "id": "c44cf60ad12e8f683840ca13",
+          "title": "Tor merges Conflux RTT tie-breaker for multi-path exit selection",
+          "summary": "A merged change updates Conflux leg switching when two linked circuits report identical round-trip latency.",
+          "category": "feature",
+          "state": "merged",
+          "updated_at": "2026-11-08T16:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "tor"
+          ]
+        },
+        {
+          "id": "0af85491b2e19c7b172e316a",
+          "title": "Relay operators report elevated DNS timeouts on unbound resolvers",
+          "summary": "Several exit operators on tor-relays report intermittent SERVFAIL spikes with default unbound cache limits.",
+          "category": "relay",
+          "state": "developing",
+          "updated_at": "2026-11-08T14:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "tor",
+            "network"
+          ]
+        },
+        {
+          "id": "b525ec5604baea4c287d88da",
+          "title": "Arti merges full vanguards guard-layer selection for onion services",
+          "summary": "Merged support in Arti adds configurable vanguard-full circuit path selection for onion services.",
+          "category": "security",
+          "state": "merged",
+          "updated_at": "2026-11-08T12:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "arti"
+          ]
+        },
+        {
+          "id": "6c8e7769bf025777c8a468b1",
+          "title": "Directory authority authority-south offline after fiber cut in Region M",
+          "summary": "The operator of directory authority authority-south reported on tor-relays that a regional fiber cut in Region M took the authority offline.",
+          "category": "directory-authority",
+          "state": "developing",
+          "updated_at": "2026-11-08T10:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "tor",
+            "network"
+          ]
+        },
+        {
+          "id": "55f8b130aa2c172349ec8085",
+          "title": "Proposal 908 specifies Post-Quantum hybrid handshake extension for ntor-v3",
+          "summary": "A formal proposal on tor-dev defines key encapsulation framing alongside curve25519 in ntor-v3.",
+          "category": "protocol",
+          "state": "developing",
+          "updated_at": "2026-11-08T08:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "torspec",
+            "tor"
+          ]
+        },
+        {
+          "id": "d0e978654f29ca1cc555f48c",
+          "title": "Tor merges dynamic Equi-X effort decay under sustained rendezvous load",
+          "summary": "A merged change adjusts onion-service proof-of-work effort decay intervals after burst traffic subsides.",
+          "category": "dos",
+          "state": "merged",
+          "updated_at": "2026-11-08T06:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "tor"
+          ]
+        },
+        {
+          "id": "d20b0732b6301e0229a7c12f",
+          "title": "Guard-flag drop reported on authority-east after bandwidth-file stall",
+          "summary": "Relay operators on tor-relays noticed authority-east stopped voting Guard flags after its bandwidth scanner stalled.",
+          "category": "directory-authority",
+          "state": "developing",
+          "updated_at": "2026-11-08T04:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "tor",
+            "network"
+          ]
+        },
+        {
+          "id": "306db50a5ab519f9aaf84de3",
+          "title": "Tor Project introduces oniux Linux namespace isolation tool powered by Arti",
+          "summary": "An official blog post announces oniux, a kernel-namespace CLI tool routing Linux application traffic over Tor via Arti.",
+          "category": "feature",
+          "state": "released",
+          "updated_at": "2026-11-07T20:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "arti"
+          ]
+        },
+        {
+          "id": "ddcff3d26bad579bc9c0875f",
+          "title": "Tor 1.4.0 released with dual-stack relay address discovery",
+          "summary": "Stable release 1.4.0 adds automatic IPv6 ORPort reachability self-testing for relays.",
+          "category": "release",
+          "state": "released",
+          "updated_at": "2026-11-07T16:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "tor"
+          ]
+        },
+        {
+          "id": "480cc5fda8443367a21859f0",
+          "title": "Tor Browser 16.0.2 fixes letterboxing resize flicker on Wayland",
+          "summary": "Point release 16.0.2 resolves window-size rounding glitches on Linux Wayland compositors.",
+          "category": "release",
+          "state": "released",
+          "updated_at": "2026-11-07T12:00:00Z",
+          "summary_truncated": false,
+          "products": [
+            "tor-browser"
+          ]
+        }
+      ],
+      "truncated": true
+    },
+    "upd-prior-padding": {
+      "prior_story": {
+        "id": "e5f8536a036fac3376eb8b4b",
+        "title": "Channel-padding timer crash reported on relays",
+        "summary": "A public issue reports that relays can hit an assertion failure when a channel-padding timer fires on a closing channel. No patch has been merged yet.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z"
+      },
+      "recent": [],
+      "truncated": false
+    },
+    "upd-prior-padding-merged": {
+      "prior_story": {
+        "id": "e5f8536a036fac3376eb8b4b",
+        "title": "Channel-padding timer crash reported on relays",
+        "summary": "A public issue reports that relays can hit an assertion failure when a channel-padding timer fires on a closing channel. No patch has been merged yet.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "merged",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-09T15:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-09T15:00:00Z",
+            "text": "A maintainer reported that merge request !91901 fixing the channel-padding timer crash was merged into main.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/pad-timer-crash-issue#note_1",
+                "title": "Channel-padding timer assertion failure on closing channel"
+              }
+            ]
+          }
+        ]
+      },
+      "recent": [],
+      "truncated": false
+    },
+    "upd-prior-arti-oob": {
+      "prior_story": {
+        "id": "06b140206a63e81989189453",
+        "title": "Directory-signature out-of-bounds read reported in Arti",
+        "summary": "An upstream issue reports an out-of-bounds slice read when Arti parses malformed directory authority key certificates.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "high",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "arti"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z"
+      },
+      "recent": [],
+      "truncated": false
+    },
+    "upd-prior-hs-stalls": {
+      "prior_story": {
+        "id": "fd479d57d3c13834ea583286",
+        "title": "Onion services report descriptor upload stalls under heavy circuit load",
+        "summary": "Operators report that onion services under sustained introduction traffic fail to complete descriptor uploads before timeout.",
+        "why_it_matters": "",
+        "category": "dos",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "dos"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z"
+      },
+      "recent": [],
+      "truncated": false
+    },
+    "upd-prior-arti-merged": {
+      "prior_story": {
+        "id": "a799f886cdfcfaf0856a3119",
+        "title": "Arti merges fix for onion-service circuit timeout leak",
+        "summary": "A merged Arti change closes leaked circuit-reactor handles after onion-service rendezvous timeouts.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "merged",
+        "products": [
+          "arti"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-09T12:00:00Z",
+        "updated_at": "2026-11-09T12:00:00Z",
+        "added_at": "2026-11-09T12:00:00Z"
+      },
+      "recent": [],
+      "truncated": false
+    },
+    "upd-prior-guard-timing": {
+      "prior_story": {
+        "id": "5980cc6e44478b3ebe450261",
+        "title": "Issue alleges guard discovery leak through circuit timing",
+        "summary": "A public issue claims that timing variations on circuit setup allow an observer to infer entry guard latency.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z"
+      },
+      "recent": [],
+      "truncated": false
     }
   }
 }

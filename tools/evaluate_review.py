@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import time
 
 from onionflash.analyze import AnalysisError, Analyzer
@@ -18,8 +19,11 @@ from onionflash.render import _prepare_story
 from onionflash.review import EDITABLE, Reviewer, final_holds, policy_hash
 from onionflash.review_gate import call_review, next_step
 from onionflash.source_packet import _labels
+from onionflash.util import item_cluster
 
 CASE_FILES = ("review_cases.json", "review_cases_judged.json")
+SCOPES = ("story", "latest_update")
+STORY_ID = re.compile(r"[0-9a-f]{24}\Z")
 # A judged case names the flaw of its labeled wording or labels; one without a flaw is clean.
 FLAWS = ("invented_impact", "dropped_hedge", "overclaim", "filler", "badge_misuse", "stale_fact")
 CATCH_TARGET, FLAW_FLOOR, FLOOR_CASES, FALSE_ALARM_LIMIT = 0.90, 0.80, 10, 0.10
@@ -51,6 +55,9 @@ def expand(corpus: dict) -> list[dict]:
     """
     cases = []
     for case in corpus["cases"]:
+        scope = case.get("scope", "story")
+        if scope not in SCOPES:
+            raise ValueError("Invalid evaluation scope")
         packet, sources = corpus["packets"][case["packet"]], []
         for i, source in enumerate(packet["sources"], 1):
             texts = [source["title"], *source["passages"]]
@@ -58,7 +65,11 @@ def expand(corpus: dict) -> list[dict]:
                 {"id": f"S{i}:P{j}", **(text if isinstance(text, dict) else {"text": text})} for j, text in enumerate(texts, 1)]})
         story = {**corpus["defaults"], "sources": [{"url": s["url"], "title": s["title"]} for s in sources],
                  **case["candidate"]}
-        cases.append({**case, "candidate": _prepare_story(story, editorial=story.get("editorial")),
+        candidate = _prepare_story(story, editorial=story.get("editorial"))
+        if scope == "latest_update" and (not candidate.get("updates")
+                                         or len(candidate["updates"]) != len(story.get("updates") or ())):
+            raise ValueError("Update-scope case requires at least one valid update")
+        cases.append({**case, "scope": scope, "candidate": candidate,
                       "packet": {"sources": sources, "missing_sources": packet.get("missing_sources", []),
                                  "truncated": packet.get("truncated", False)},
                       "existing_coverage": corpus["coverage_sets"][case["coverage_set"]] if "coverage_set" in case
@@ -69,11 +80,13 @@ def expand(corpus: dict) -> list[dict]:
 def draft_cases(corpus: dict) -> list[dict]:
     """One case per packet and coverage set, for reviewing the writer's own draft.
 
-    It merges the labels of the cases it replaces and expects their common label,
-    else approve when any of them approves, else not_approve.
+    It merges the labels of the story-scope cases it replaces and expects their
+    common label, else approve when any of them approves, else not_approve.
     """
     groups = {}
     for case in corpus["cases"]:
+        if case.get("scope", "story") != "story":
+            continue
         groups.setdefault((case["packet"], case.get("coverage_set")), []).append(case)
     merged = []
     for (packet, coverage_set), group in groups.items():
@@ -81,11 +94,13 @@ def draft_cases(corpus: dict) -> list[dict]:
         for case in group:
             for field, values in case.get("forbidden_classifications", {}).items():
                 forbidden[field] = list(dict.fromkeys([*forbidden.get(field, []), *values]))
+        routes = {case["expected_same_story"] for case in group} if all("expected_same_story" in case for case in group) else set()
         merged.append({"id": "draft:" + "/".join(filter(None, (packet, coverage_set))), "packet": packet,
                        "candidate": group[0]["candidate"], "forbidden_classifications": forbidden,
                        "expected": expected.pop() if len(expected) == 1 else "approve" if "approve" in expected else "not_approve",
                        **{key: list(dict.fromkeys(phrase for case in group for phrase in case.get(key, [])))
                           for key in ("unsupported", "required")},
+                       **({"expected_same_story": next(iter(routes))} if len(routes) == 1 else {}),
                        **({"coverage_set": coverage_set} if coverage_set else {})})
     return expand({**corpus, "cases": merged})
 
@@ -101,13 +116,16 @@ def writer_item(source: dict) -> dict:
                              "body": passage["text"]} for passage in passages if "author" in passage]}
 
 
-def _wording(story: dict) -> str:
+def _wording(story: dict, scope: str = "story") -> str:
+    if scope == "latest_update":
+        updates = story.get("updates") or ()
+        return updates[-1]["text"].casefold() if updates else ""
     return "\n".join(story[key] for key in ("title", "summary", "why_it_matters")).casefold()
 
 
 def kept_unsupported(case: dict, story: dict) -> list[str]:
     """Find flagged wording or classifications still present in a proposed publication."""
-    text = _wording(story)
+    text = _wording(story, case.get("scope", "story"))
     kept = [phrase for phrase in case.get("unsupported", []) if phrase.casefold() in text]
     for field, forbidden in case.get("forbidden_classifications", {}).items():
         values = story.get(field, [])
@@ -118,7 +136,7 @@ def kept_unsupported(case: dict, story: dict) -> list[str]:
 
 def omitted(case: dict, story: dict) -> list[str]:
     """Find required wording that a proposed publication leaves out."""
-    text = _wording(story)
+    text = _wording(story, case.get("scope", "story"))
     return [phrase for phrase in case.get("required", []) if phrase.casefold() not in text]
 
 
@@ -156,8 +174,19 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
     for case in cases:
         # A negative case without the wording or labels its repair must remove would
         # score any verified repair as a correct refusal.
+        scope = case.get("scope", "story")
+        coverage = case.get("existing_coverage") or {}
+        recent_ids = {row["id"] for row in coverage.get("recent") or ()
+                      if isinstance(row, dict) and not row.get("retracted")}
+        expected_route = case.get("expected_same_story")
+        valid_route = ("expected_same_story" not in case or expected_route is None
+                       or (scope == "story" and coverage.get("prior_story") is None and case["expected"] == "skip"
+                           and isinstance(expected_route, str) and bool(STORY_ID.fullmatch(expected_route))
+                           and expected_route in recent_ids))
         flagged = case.get("unsupported") or case.get("forbidden_classifications") or case.get("required")
-        if (case["id"] in identities or case["expected"] not in {"approve", "not_approve", "skip", "hold"}
+        if (case["id"] in identities or scope not in SCOPES or not valid_route
+                or (scope == "latest_update" and (draft or not case["candidate"].get("updates")))
+                or case["expected"] not in {"approve", "not_approve", "skip", "hold"}
                 or (case["expected"] == "not_approve" and not flagged)
                 or ("flaw" in case and (case["flaw"] not in FLAWS or "audit" not in case))):
             raise ValueError("Invalid or duplicate evaluation case")
@@ -167,7 +196,8 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
     totals = {"cases": 0, "matched": 0, "false_approvals": 0, "positive_rejections": 0, "omissions": 0,
               "errors": 0, "editorial_misses": 0, "impact_cleared": 0, "draft_unsupported": 0, "repairs_verified": 0,
               "repairs_held": 0, "repairs_skipped": 0, "verification_repairs": 0, "holds": {}, "final_holds": 0,
-              "published_after_checks": 0, "controlled_mismatches": 0, "incomplete": False}
+              "published_after_checks": 0, "route_cases": 0, "matched_routes": 0, "missed_routes": 0,
+              "false_routes": 0, "wrong_routes": 0, "controlled_mismatches": 0, "incomplete": False}
     judged, outcomes, seen = {}, {}, set()
     identity = policy_hash(config)
     with (os.fdopen(descriptor, "w", encoding="utf-8") as report, EvaluationReviewer(config, deadline=deadline) as reviewer,
@@ -179,7 +209,9 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                     totals["incomplete"] = True
                     break
                 started = time.monotonic()
-                record = {"case": case["id"], "round": iteration, "expected": case["expected"],
+                scope = case.get("scope", "story")
+                record = {"case": case["id"], "round": iteration, "scope": scope, "expected": case["expected"],
+                          **({"expected_same_story": case["expected_same_story"]} if "expected_same_story" in case else {}),
                           "policy_hash": identity, "candidate": case["candidate"], "packet": case["packet"],
                           "existing_coverage": case.get("existing_coverage")}
                 totals["cases"] += 1
@@ -203,8 +235,16 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                     # The reviews follow the gate's steps. The first source is the item that wrote the candidate,
                     # as in draft mode.
                     source = case["packet"]["sources"][0]
+                    item = writer_item(source)
+                    prior = (case.get("existing_coverage") or {}).get("prior_story")
                     prepared = {"packet": case["packet"], "coverage": case.get("existing_coverage"),
-                                "payload": {"editorial_kind": source["kind"]}, "row": {"payload": json.dumps(writer_item(source))}}
+                                "review_scope": scope, "mode": "update" if scope == "latest_update" else "story",
+                                "story_id": prior["id"] if prior else None,
+                                "payload": {"editorial_kind": source["kind"]},
+                                "row": {"url": source["url"], "story_id": prior["id"] if prior else None,
+                                        "cluster_key": item_cluster({**item, "url": source["url"],
+                                                                     "source_entry_id": source.get("source_entry_id", source["url"])}),
+                                        "payload": json.dumps(item)}}
                     stage, text, record["reviews"] = "review", candidate, []
                     while True:
                         record["reviews"].append(call_review(reviewer, stage, text, prepared))
@@ -214,7 +254,11 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                         stage, text = action, value
                     first = record["reviews"][0]["result"]
                     last = next((entry["result"] for entry in reversed(record["reviews"]) if entry["stage"] == "verification"), None)
-                    record.update(result=first, kept_unsupported=kept_unsupported(case, text))
+                    actual_route = (value if action == "route" and isinstance(value, str) else
+                                    next((entry["result"].get("same_story") for entry in record["reviews"]
+                                          if entry["result"]["verdict"] in {"approve", "revise", "skip"}
+                                          and entry["result"].get("same_story")), None))
+                    record.update(result=first, same_story=actual_route, kept_unsupported=kept_unsupported(case, text))
                     if last:
                         record["verification"] = last
                     for field, reply in (("model_verdict", first), ("verification_model_verdict", last or {})):
@@ -235,14 +279,30 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                                                          for entry in record["reviews"][:-1])
                     totals["verification_repairs"] += record["verification_repairs"]
                     if record["result"]["verdict"] == "revise":
-                        totals["repairs_verified" if published else "repairs_skipped" if action == "skip" else "repairs_held"] += 1
+                        totals["repairs_verified" if published else "repairs_skipped" if action in {"skip", "route"} else "repairs_held"] += 1
                     final_verdict = "approve" if published else action
+                    route_ok = True
+                    if "expected_same_story" in case:
+                        totals["route_cases"] += 1
+                        expected_route = case["expected_same_story"]
+                        if expected_route is None:
+                            if actual_route is not None:
+                                totals["false_routes"] += 1
+                                route_ok = False
+                        elif actual_route == expected_route:
+                            totals["matched_routes"] += 1
+                        elif actual_route is None:
+                            totals["missed_routes"] += 1
+                            route_ok = False
+                        else:
+                            totals["wrong_routes"] += 1
+                            route_ok = False
                     unsafe = published and (case["expected"] in {"skip", "hold"} or bool(record["kept_unsupported"]))
                     published_candidate = text if published else None
                     missing = omitted(case, published_candidate) if published else []
                     # not_approve marks news with a flawed draft: hold or a clean repair, never a skip.
-                    missed = (final_verdict == "skip") != (case["expected"] == "skip") and case["expected"] != "approve"
-                    matched = (published if case["expected"] == "approve" else not missed) and not unsafe and not missing
+                    missed = (final_verdict in {"skip", "route"}) != (case["expected"] == "skip") and case["expected"] != "approve"
+                    matched = (published if case["expected"] == "approve" else not missed) and not unsafe and not missing and route_ok
                     record.update(final_verdict=final_verdict, published_candidate=published_candidate, matched=matched)
                     if missing:
                         record["omitted"] = missing
@@ -251,7 +311,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                     totals["omissions"] += bool(missing)
                     totals["positive_rejections"] += not published and case["expected"] == "approve"
                     totals["editorial_misses"] += missed
-                    totals["impact_cleared"] += bool(case["expected"] == "approve" and published
+                    totals["impact_cleared"] += bool(scope == "story" and case["expected"] == "approve" and published
                                                      and candidate["why_it_matters"] and not published_candidate["why_it_matters"])
                     if "audit" in case:
                         # A flagged case is caught when its flaw never publishes and the news is
@@ -335,7 +395,8 @@ def main(argv=None):
         cases = [case for case in cases if case["id"] in selected]
     result = evaluate(config, cases, args.output, rounds=args.rounds, deadline=time.monotonic() + args.max_seconds,
                       draft=args.draft)
-    return int(bool(result["controlled_mismatches"] or result["target_missed"] or result["errors"] or result["incomplete"]))
+    return int(bool(result["controlled_mismatches"] or result.get("false_routes") or result["target_missed"]
+                    or result["errors"] or result["incomplete"]))
 
 
 if __name__ == "__main__":
