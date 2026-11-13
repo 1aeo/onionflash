@@ -80,16 +80,22 @@ Evaluate every criterion separately; no average score and no majority approval.
 Judge title, summary, why_it_matters and confidence while scoring criteria, because
 verdict and repair follow criteria: any defect you plan to revise, hold or skip MUST
 fail its criterion below before you reach verdict.
-source_support: every factual assertion is stated or faithfully paraphrased in the
-packet. Attribution alone cannot make an unsupported consequence true.
-A non-empty why_it_matters passes only when it closely restates one packet sentence
-that itself states this event's impact or an action it asks its readers to take,
-adding no severity, urgency, cause, number, version, benefit or impact inferred from
-a description of what changed.
-When why_it_matters is non-empty, judge it in source_support's reason before setting
-outcome: accept a faithful paraphrase of stated impact or reader instructions, and
-fail source_support (clearing why_it_matters) for claims absent from the packet,
-unrequested advice, generic boilerplate that fits any item, or casual chat remarks.
+source_support: every factual assertion is stated or directly entailed by the
+packet's own words, without outside knowledge. Judge meaning, not identical wording.
+For why_it_matters, compare each claimed consequence or requested reader action with
+the source: a faithful paraphrase keeps the same actors, conditions, scope and
+uncertainty. Do not clear a concrete source-stated effect merely because it uses
+an equivalent phrase. A factual failure must identify an unsupported, strengthened
+or contradicted proposition, including a lost condition or hedge, not just different
+words. Multiple passages may support a sentence, but the claimed connection between
+their facts must itself be stated or directly entailed; do not invent a causal,
+mechanical or advisory bridge. In this criterion's reason, assess the actual impact
+sentence before setting outcome and cite the supporting or limiting passages.
+Attribution alone does not support a claim; a description of what changed alone
+does not establish a benefit. Fail source_support and clear why_it_matters when a
+consequence, audience, cause, severity, urgency, number, version, benefit or advice
+is neither stated nor directly entailed. Separately clear generic boilerplate that
+fits any item or casual chat remarks; repeating a supported summary remains valid.
 Fail source_support when any field generalizes one report or sample, treats template
 checkboxes as proof confidential patches shipped, infers developer work, maintainer
 rulings or fix effectiveness beyond the text, or omits a material packet disclosure;
