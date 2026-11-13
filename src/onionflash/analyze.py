@@ -111,13 +111,18 @@ itself states this event's impact or an action it asks its readers to take, such
 as an announcement saying "we encourage all relay operators to upgrade" or a
 report saying a malformed file "causes the daemon to exit at startup". Attribute
 that sentence to its source ("The announcement asks ...", "The report says ...")
-and keep its audience, hedges and scope. Add nothing it does not say: no severity,
+and keep its audience, hedges and scope. Attribution does not replace uncertainty:
+retain the source's belief, possibility or conditional language in the claim itself.
+Keep entity names and stated role terms; do not substitute an unstated role for a name.
+Read all supplied comments before selecting the sentence. If another passage disputes
+or materially narrows its impact, leave this field empty unless the selected sentence
+itself carries that qualification. Add nothing it does not say: no severity,
 urgency, cause, number, version or benefit, no second sentence, and no impact
 inferred from a description of what changed. If no single source sentence states
 an impact or a requested action, set why_it_matters to an empty string. Empty is
 the expected result for most merges, tags, checklists, questions and discussions.
 Do not infer generic benefits to stability, reliability, security or privacy from
-the existence of a fix, or urgency from an editorial label. No caveats, filler, inferred
+the existence of a fix, or urgency from an editorial label. No filler, inferred
 privacy impacts or extra advice. Source-host location alone does not establish
 confirmation. Reserve confirmed for an official Tor Project announcement or a merged
 merge request's own change; use reported for issues, comments, maintainer statements,
@@ -183,9 +188,13 @@ def _json_object(text: str, code: str = "writer.invalid_json") -> dict:
 # Spelled-out numbers count as digits, except "one", which is mostly a pronoun.
 _NUMBER_WORDS = {word: str(value) for value, word in
                  enumerate("two three four five six seven eight nine ten eleven twelve".split(), 2)}
-# A number or version keeps its letter suffixes, so 0.4.9 does not match 0.4.9.16, nor 15.0 match
-# 15.0a3. No repetition can consume a separator, so matching takes linear time.
-_NUMBER = re.compile(r"[0-9][0-9a-z]*(?:[.,][0-9][0-9a-z]*)*|\b(?:" + "|".join(_NUMBER_WORDS) + r")\b")
+# Keep standard prerelease suffixes attached to dotted versions; a release
+# candidate does not supply the corresponding final-version token.
+_PRERELEASE = (r"[0-9][0-9a-z]*(?:\.[0-9][0-9a-z]*)+-(?:alpha|beta|rc|pre|dev)"
+               r"(?:[0-9][0-9a-z]*)?(?:[.-][0-9a-z]+)*(?![0-9a-z])")
+# Numeric components never repeat over their separators, including in suffixes.
+# Thus 0.4.9 does not match 0.4.9.16, nor 15.0 match 15.0a3, with linear matching.
+_NUMBER = re.compile(_PRERELEASE + r"|[0-9][0-9a-z]*(?:[.,][0-9][0-9a-z]*)*|\b(?:" + "|".join(_NUMBER_WORDS) + r")\b")
 
 
 def _numbers(text: str) -> set[str]:
