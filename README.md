@@ -68,7 +68,8 @@ All settings are shown in [`config.example.toml`](config.example.toml). Settings
 were removed (such as `http.requests_per_minute`) still load; each is logged as
 ignored and can be deleted. Relative
 database and output paths resolve against the configuration file's directory.
-`${ENVIRONMENT_VARIABLE}` references are expanded for paths and LLM URLs.
+`${ENVIRONMENT_VARIABLE}` references are expanded for paths and LLM URLs; each
+entry in `llm.fallback_base_urls` must expand to a nonempty URL.
 The API key is read only from the `ONIONFLASH_LLM_API_KEY` environment variable.
 
 | Section | Settings |
@@ -241,8 +242,10 @@ outages longer than those windows can leave gaps. GitLab pagination and source
 health make incomplete scans visible, but upstream data can change while a scan
 is in progress. Treat this as a news aid, not an incident-detection guarantee.
 
-Published stories never expire: numbered homepage and topic pages
-(`site.page_size` stories each) cover the whole history. Builds render only changed
+Published stories and editorial history are permanent and never expire:
+numbered homepage and topic pages (`site.page_size` stories each) cover the
+whole history, and erroneous stories are corrected or retracted rather than
+deleted. Builds render only changed
 articles, in bounded batches. Keep the SQLite database, raw source content,
 analysis evidence and private publication metadata outside the webroot. See
 [permanent history and recovery](docs/PERMANENT_HISTORY.md).

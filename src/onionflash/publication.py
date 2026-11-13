@@ -42,6 +42,24 @@ def initialize(db) -> None:
             template_hash TEXT NOT NULL, json_sha256 TEXT NOT NULL,
             public_json TEXT NOT NULL
         );
+        -- Published stories and editorial history are permanent; plain triggers hold
+        -- direct sqlite3 sessions and earlier releases to the same rule.
+        CREATE TRIGGER IF NOT EXISTS public_catalog_permanent BEFORE DELETE ON public_catalog BEGIN
+            SELECT RAISE(ABORT, 'Published stories are permanent; correct or retract them instead');
+        END;
+        CREATE TRIGGER IF NOT EXISTS editorial_revisions_permanent BEFORE DELETE ON editorial_revisions BEGIN
+            SELECT RAISE(ABORT, 'Editorial history is permanent');
+        END;
+        CREATE TRIGGER IF NOT EXISTS editorial_revisions_unchanged BEFORE UPDATE ON editorial_revisions BEGIN
+            SELECT RAISE(ABORT, 'Editorial history is permanent');
+        END;
+        CREATE TRIGGER IF NOT EXISTS editorial_revisions_append_only BEFORE INSERT ON editorial_revisions
+            WHEN EXISTS (SELECT 1 FROM editorial_revisions WHERE story_id=NEW.story_id AND revision=NEW.revision) BEGIN
+            SELECT RAISE(ABORT, 'Editorial history is permanent');
+        END;
+        CREATE TRIGGER IF NOT EXISTS editorial_controls_permanent BEFORE DELETE ON editorial_controls BEGIN
+            SELECT RAISE(ABORT, 'Editorial history is permanent');
+        END;
         -- No query uses this index, which earlier releases created.
         DROP INDEX IF EXISTS public_catalog_published;
         CREATE INDEX IF NOT EXISTS public_catalog_added ON public_catalog(added_at DESC,updated_at DESC,story_id DESC);

@@ -131,6 +131,44 @@ def test_story_guards_left_by_an_earlier_release_cannot_stop_other_writers(seede
         assert raw.execute("DELETE FROM stories WHERE id='other'").rowcount == 1
 
 
+def test_published_stories_and_editorial_history_are_permanent(seeded):
+    cfg, store, story_id = seeded
+    edit(store, story_id)
+    build(cfg, store)
+    # Plain triggers: a direct sqlite3 session, which registers no application function, is held to them.
+    with sqlite3.connect(cfg["storage"]["database"]) as raw:
+        for statement, params in (
+            ("DELETE FROM public_catalog", ()),
+            ("DELETE FROM editorial_revisions", ()),
+            ("UPDATE editorial_revisions SET reason=''", ()),
+            ("""INSERT OR REPLACE INTO editorial_revisions(story_id,revision,action,reason,created_at,
+                before_story_json,before_public_json,after_story_json,after_public_json,before_hash,after_hash)
+                SELECT story_id,revision,action,'rewritten',created_at,before_story_json,before_public_json,
+                after_story_json,after_public_json,before_hash,after_hash
+                FROM editorial_revisions WHERE story_id=? AND revision=1""", (story_id,)),
+            ("DELETE FROM editorial_controls", ()),
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="permanent"):
+                raw.execute(statement, params)
+    assert editorial.history(store.db, story_id)["revisions"][0]["reason"] == "Removed unsupported operator advice."
+    # Appending new revisions and updating controls and catalog snapshots remain allowed.
+    act(editorial.retract, store, story_id, reason="The source withdrew this report.")
+    act(editorial.restore, store, story_id, 1, reason="Restored the verified correction.")
+    act(editorial.unlock, store, story_id, reason="Resumed tracking.")
+    build(cfg, store)
+    with sqlite3.connect(cfg["storage"]["database"]) as raw:
+        assert raw.execute("UPDATE editorial_controls SET held_updates=held_updates+1").rowcount == 1
+        assert raw.execute("UPDATE public_catalog SET template_hash='earlier'").rowcount == 1
+        # Removing a private source row leaves the article to its catalog entry,
+        # while editing requires restoring the stored record first.
+        assert raw.execute("DELETE FROM stories WHERE id=?", (story_id,)).rowcount == 1
+    with pytest.raises(ValueError, match="restore its stored record"):
+        edit(store, story_id, observed=LATER)
+    assert build(cfg, store, force=True)["published_stories"] == 1
+    assert "Editorial history (4)" in current_files(cfg, story_id)["article"]
+    assert len(editorial.history(store.db, story_id)["revisions"]) == 4
+
+
 def test_failed_operator_write_rolls_back_revision(seeded):
     cfg, store, story_id = seeded
     before = edit(store, story_id)

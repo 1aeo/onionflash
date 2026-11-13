@@ -47,6 +47,9 @@ ignore it, or existing files stop loading.
 - Make the smallest change that solves the problem, and delete code that loses
   its last caller.
 - Do not add migrations for a schema that no merged version created.
+- Never delete a published story, its catalog entry or its editorial history;
+  correct or retract it instead (see
+  [Published stories are permanent](docs/PERMANENT_HISTORY.md#published-stories-are-permanent)).
 - Keep each fact in one document and link to it instead of restating it.
 - Tests pin behavior, not implementation details. Run `python -m pytest -q`
   before every push; the deployment repository's tests must also keep passing,

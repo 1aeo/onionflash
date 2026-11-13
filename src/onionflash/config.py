@@ -217,8 +217,11 @@ def load_config(path: str | Path) -> dict:
     ):
         raise ValueError("LLM fallback_base_urls and allowed_networks must be arrays")
     llm["fallback_base_urls"] = [
-        _expand(u).rstrip("/") for u in llm["fallback_base_urls"]
+        _expand(u).rstrip("/") if isinstance(u, str) else ""
+        for u in llm["fallback_base_urls"]
     ]
+    if any(not u.strip() for u in llm["fallback_base_urls"]):
+        raise ValueError("Each LLM fallback base URL must be a nonempty URL")
     for network in llm["allowed_networks"]:
         parsed_network = ipaddress.ip_network(network, strict=True)
         if parsed_network.prefixlen == 0:

@@ -698,6 +698,23 @@ def test_example_config_resolves_paths_and_rejects_dangerous_settings(
     p.write_text(text.replace('output_dir = "build/public"', 'output_dir = "."'))
     with pytest.raises(ValueError):
         load_config(p)
+    assert cfg["llm"]["fallback_base_urls"] == []
+    # Empty, whitespace-only, non-string or invalid fallback endpoints must be rejected.
+    monkeypatch.setenv("ONIONFLASH_LLM_FALLBACK_URL", "   ")
+    for fallback in ('[""]', '["   "]', '["/"]', '[123]', '["${ONIONFLASH_LLM_FALLBACK_URL}"]'):
+        p.write_text(text.replace("fallback_base_urls = []", "fallback_base_urls = " + fallback))
+        with pytest.raises(ValueError, match="fallback"):
+            load_config(p)
+    monkeypatch.setenv("ONIONFLASH_LLM_FALLBACK_URL", "")
+    p.write_text(text.replace("fallback_base_urls = []", 'fallback_base_urls = ["${ONIONFLASH_LLM_FALLBACK_URL}"]'))
+    with pytest.raises(ValueError, match="fallback"):
+        load_config(p)
+    for fallback in ('["http://backup.example/v1"]', '["ftp://backup.example/v1"]'):
+        p.write_text(text.replace("fallback_base_urls = []", "fallback_base_urls = " + fallback))
+        with pytest.raises(ValueError, match="Invalid LLM base URL"):
+            load_config(p)
+    p.write_text(text.replace("fallback_base_urls = []", 'fallback_base_urls = ["https://backup.example/v1/"]'))
+    assert load_config(p)["llm"]["fallback_base_urls"] == ["https://backup.example/v1"]
 
 
 def test_skipped_story_count_is_reported_on_every_build(tmp_path):

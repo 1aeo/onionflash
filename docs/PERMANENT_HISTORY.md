@@ -23,6 +23,19 @@ A story can carry dated updates, each with its own sources. Its article lists
 them newest first and `story.json` includes them; homepage cards, RSS and JSON
 Feed show the latest one. A story without updates has no `updates` key.
 
+## Published stories are permanent
+
+A published story keeps `/news/<id>/` and `/news/<id>/story.json`: to fix or
+withdraw reporting, [correct or retract the story](EDITORIAL.md) instead of
+deleting it or resetting publication state. Plain SQLite triggers created during
+builds refuse deleting rows from `public_catalog` or `editorial_controls` and
+refuse deleting, updating or replacing rows in `editorial_revisions`. Because
+they call no application function, direct `sqlite3` sessions and earlier
+releases after a rollback obey them too. Deleting a private `stories` row stays
+allowed and the catalog keeps rendering the article, but after a private row is
+deleted, you can correct or retract the story only after restoring its stored
+record.
+
 ## Incremental work
 
 SQLite queues a story when its stored payload changes. One build renders at most
@@ -45,8 +58,7 @@ article pages are retained.
 The private catalog stores timestamps, hashes and one compact last-good public
 JSON snapshot per article. Raw source text and model evidence are not exported
 to public JSON. Render failures quarantine the new source revision; an existing
-accepted article remains available. Removing a private source row does not
-remove an accepted article. Indexes and feeds are built from these snapshots; one
+accepted article remains available. Indexes and feeds are built from these snapshots; one
 that a later release rejects is left out of them with a logged warning, and its
 article remains.
 
