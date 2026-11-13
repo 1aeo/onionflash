@@ -13,7 +13,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import __version__, decisions, editorial, rejection
+from . import __version__, decisions, doctor, editorial, rejection
 from .analyze import AnalysisError, Analyzer
 from .review import Reviewer
 from .review_gate import process_item, status as review_status
@@ -150,9 +150,17 @@ def run(config: dict, store: Store) -> dict:
     # Keep at least half the collection window available for primary sources.
     comments_budget = min(COMMENTS_BUDGET, collection_window / 2) if comments_enabled else 0
     collection_deadline = started + collection_window - comments_budget
+    network_ingested = {"reports_new": 0, "rejected": 0}
 
     def record_items(source, items):
         received = now_iso()
+        if source.get("alert_format") == "consensus":
+            added, rejected = doctor.ingest(
+                store.db, source, list(items), received, config["collection"]["content_chars"]
+            )
+            network_ingested["reports_new"] += added
+            network_ingested["rejected"] += rejected
+            return received
         if comments_enabled:  # Once they are turned off, stored notes no longer reach new revisions.
             items = (merge_cached_comments(store, item, source, received) for item in items)
         report["items_changed"] += sum(store.ingest(item, received) for item in items)
@@ -214,7 +222,37 @@ def run(config: dict, store: Store) -> dict:
     run_deadline = started + budget
     endpoint_failures = 0
     first = decisions.latest_id(store.db)
-    with Analyzer(config, deadline=run_deadline) as analyzer, Reviewer(config, deadline=run_deadline) as reviewer:
+    consensus_sources = [s for s in config["sources"] if s.get("alert_format") == "consensus" and s["enabled"]]
+    with (
+        Analyzer(config, deadline=run_deadline) as analyzer,
+        Reviewer(config, deadline=run_deadline) as reviewer,
+        doctor.LinkChecker(config, deadline=run_deadline) as linker,
+    ):
+        for consensus_source in consensus_sources[:1]:
+            try:
+                evaluated = doctor.evaluate(
+                    config,
+                    store,
+                    consensus_source,
+                    linker,
+                    now_iso(),
+                    allow_network=endpoint_failures < 2,
+                )
+                endpoint_failures += evaluated.pop("endpoint_failures", 0)
+                report["network"] = {**network_ingested, **evaluated}
+            except sqlite3.Error:
+                raise
+            except Exception as exc:
+                frame = traceback.extract_tb(exc.__traceback__)[-1]
+                report["network"] = {
+                    **network_ingested,
+                    "incidents_open": 0,
+                    "stories_written": 0,
+                    "updates_written": 0,
+                    "held": 0,
+                    "dry_run": not consensus_source.get("publish", False),
+                    "error": f"Unexpected {type(exc).__name__} at {Path(frame.filename).name}:{frame.lineno}",
+                }
         for row in store.pending(config["llm"]["max_items_per_run"], now_iso()):
             if time.monotonic() >= run_deadline:
                 report["budget_reached"] = True
@@ -250,7 +288,7 @@ def run(config: dict, store: Store) -> dict:
                 store.defer(row["id"], f"Unexpected {type(exc).__name__} at {Path(frame.filename).name}:{frame.lineno}",
                             config["llm"], now_iso(), terminal=True)
                 report["analysis_failed"] += 1
-        report["model_calls"] = analyzer.calls + reviewer.calls
+        report["model_calls"] = analyzer.calls + reviewer.calls + linker.calls
     report["decisions"] = decisions.codes_after(store.db, first)
     report["pending_analysis"] = store.pending_count()
     report["rejected_analysis"] = store.rejected_count()
@@ -307,6 +345,7 @@ def main(argv: list[str] | None = None) -> int:
                     else int(store.get_meta("published_stories")),
                     "comments": {"enabled": config["comments"]["enabled"], **comments_status(store)},
                     "final_review": review_status(store),
+                    "network_health": doctor.status(store.db, config["sources"]),
                     "decisions_24h": decisions.recent(store.db, now_iso()),
                     "sources": store.health(
                         config["sources"], config["collection"]["stale_after_seconds"], now_iso()

@@ -49,8 +49,13 @@ Editable fields are `title`, `summary`, `why_it_matters`, `category`, `priority`
 `confidence`, `state`, `products`, `tags`, `sources` and `updates`. Source
 replacements are lists of objects containing only a public HTTPS `url` and
 `title`. The regular classification vocabulary and public URL validation still
-apply; `state` also accepts `no-longer-listed`, which the writer never chooses.
-IDs, dates, private collection metadata and editorial history cannot be patched.
+apply; `state` also accepts `no-longer-listed`, which fixed-text consensus-health
+alerts set when DocTor stops listing an anomaly and which the model writer never
+chooses. Fixed-text consensus-health stories (`origin = "network-health"`) bypass
+the model writer and reviewer; operator corrections, retractions, restores and
+locks apply to them just like any other story, and a locked story is excluded
+from automated consensus-health updates until unlocked. IDs, dates, private
+collection metadata and editorial history cannot be patched.
 
 `updates` replaces the story's whole list of dated updates, so one patch can add,
 fix, re-cite or remove entries. Each entry contains only `at`, a timestamp with a

@@ -615,7 +615,9 @@ def prepare(db, row: dict, result: dict, observed: str) -> dict:
             source_map[source["url"]] = source
             source_map.update({comment["url"]: comment for comment in comments})
             data = {key: previous.get(key) for key in SEMANTIC_FIELDS}
-            data.update(confidence=result["confidence"], state=result["state"],
+            fixed_alert = previous.get("origin") == "network-health"
+            data.update(confidence=previous["confidence"] if fixed_alert else result["confidence"],
+                        state=previous["state"] if fixed_alert else result["state"],
                         editorial_kind=kind, editorial_item=writer)
             if authority:
                 data["editorial_authority"] = authority
@@ -623,8 +625,8 @@ def prepare(db, row: dict, result: dict, observed: str) -> dict:
                 data["tags"] = [tag for tag in data["tags"] if tag != "release"]
             if previous.get("editorial_analysis_key"):
                 data["editorial_analysis_key"] = previous["editorial_analysis_key"]
-            for extra in ("origin", "network"):
-                if extra in previous:
+            for extra in ("origin", "alert_notes", "network"):
+                if previous.get(extra):
                     data[extra] = previous[extra]
             data.update(id=story_id, sources=sorted(source_map.values(), key=lambda entry: entry["url"]),
                         published_at=previous["published_at"],
@@ -643,8 +645,8 @@ def prepare(db, row: dict, result: dict, observed: str) -> dict:
             data = {key: result[key] for key in SEMANTIC_FIELDS}
             data.update(editorial_kind=item["kind"], editorial_item=item["id"],
                         editorial_authority=item.get("authority") or "")
-            for extra in ("origin", "network"):
-                if previous and extra in previous:
+            for extra in ("origin", "alert_notes", "network"):
+                if previous and previous.get(extra):
                     data[extra] = previous[extra]
             data.update(id=story_id, sources=sorted(source_map.values(), key=lambda entry: entry["url"]),
                         published_at=previous["published_at"] if previous else item["published_at"],

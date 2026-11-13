@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+<channel>
+  <title>tor-consensus-health</title>
+  <link>https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/</link>
+  <description>auto: consensus problem system reports</description>
+  <atom:link href="https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/feed/" rel="self"/>
+  <language>en</language>
+  <lastBuildDate>Wed, 10 Jan 2024 06:05:00 +0000</lastBuildDate>
+  <item>
+    <title>[tor-consensus-health] Consensus issues</title>
+    <link>https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/message/JAN24FEED_REPORT_01/</link>
+    <description>WARNING: faravahar is missing the server descriptor of moria1
+WARNING: The consensuses published by the following directory authorities are more than one hour old and therefore not fresh anymore: dizum, faravahar
+WARNING: The following authorities are missing from the consensus: bastet, retiredtestauth
+ERROR: Consensus is missing a current shared random value (shared-rand-current-value)
+</description>
+    <pubDate>Wed, 10 Jan 2024 06:05:00 +0000</pubDate>
+    <guid>https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/message/JAN24FEED_REPORT_01/</guid>
+  </item>
+  <item>
+    <title>[tor-consensus-health] Consensus issues</title>
+    <link>https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/message/JAN24FEED_NORUN_01/</link>
+    <description>ERROR: Unable to retrieve the consensus from bastet (http://192.0.2.1:80/tor/status-vote/current/consensus): &lt;urlopen error timed out&gt;
+ERROR: Unable to retrieve the vote from bastet (http://192.0.2.1:80/tor/status-vote/current/authority): &lt;urlopen error timed out&gt;
+</description>
+    <pubDate>Wed, 10 Jan 2024 05:05:00 +0000</pubDate>
+    <guid>https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/message/JAN24FEED_NORUN_01/</guid>
+  </item>
+  <item>
+    <title>[tor-consensus-health] (FWD) Consensus issues</title>
+    <link>https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/message/JAN24FEED_FWD_01/</link>
+    <description>Forwarded summary of earlier consensus checks.</description>
+    <pubDate>Wed, 10 Jan 2024 04:05:00 +0000</pubDate>
+    <guid>https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/message/JAN24FEED_FWD_01/</guid>
+  </item>
+  <item>
+    <title>[tor-consensus-health] Possible Sybil Attack</title>
+    <link>https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/message/JAN24FEED_SYBIL_01/</link>
+    <description>NOTICE: Relay fingerprint summary from automated check.</description>
+    <pubDate>Wed, 10 Jan 2024 03:05:00 +0000</pubDate>
+    <guid>https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/message/JAN24FEED_SYBIL_01/</guid>
+  </item>
+  <item>
+    <title>[tor-consensus-health] Consensus issues</title>
+    <link>https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/message/JAN24FEED_UNDATED_01/</link>
+    <description>NOTICE: The following directory authorities are not reporting bandwidth scanner results: faravahar</description>
+    <guid>https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/message/JAN24FEED_UNDATED_01/</guid>
+  </item>
+</channel>
+</rss>

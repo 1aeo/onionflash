@@ -10,7 +10,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .util import after, backoff_seconds, digest, item_cluster, item_identity, saved_object
-from . import candidate, decisions, editorial, render
+from . import candidate, decisions, doctor, editorial, render
 from .comments import analysis_context
 from .candidate import ReviewRequired
 
@@ -160,6 +160,7 @@ class Store:
             CREATE INDEX IF NOT EXISTS decision_log_item ON decision_log(item_id,id);
         """)
         editorial.initialize(self.db)
+        doctor.initialize(self.db)
         analysis_columns = {row[1] for row in self.db.execute("PRAGMA table_info(analyses)")}
         for name, kind in (("source_payload", "TEXT"), ("source_item_id", "TEXT"), ("review_record", "TEXT")):
             if name not in analysis_columns:

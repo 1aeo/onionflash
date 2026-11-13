@@ -14,11 +14,13 @@ from collections import Counter, defaultdict
 from .util import after, format_utc, parse_utc, saved_object
 
 CODES = frozenset({
-    "published.new", "published.update",
+    "published.new", "published.update", "published.network.new", "published.network.update",
     *(f"skipped.{stage}.{reason}" for stage in ("review", "verification")
       for reason in ("news_value", "new_information", "new_information_and_news_value")),
     "skipped.gate.not_recent", "skipped.gate.retired_story", "skipped.gate.no_new_content",
+    *(f"skipped.network.{reason}" for reason in ("not_report", "below_threshold", "before_enable", "host_locked")),
     "held.gate.missing_sources", "held.gate.repeat_hold", "held.gate.story_locked",
+    *(f"held.network.{reason}" for reason in ("dry_run", "link_pending", "story_locked")),
     *(f"held.{stage}.{reason}" for stage in ("review", "verification")
       for reason in ("model_hold", "tag_repair", "unusable_repair", "repeated_repair", "disagreed_news", "release_labels")),
     "held.verification.official_not_news", "held.verification.repairs_exhausted",

@@ -117,8 +117,11 @@ archive or GitLab issue list; `url` remains the feed or API collection endpoint.
 Fallback URLs must represent the **same logical stream**. A changed primary URL
 resets that source's fetch cursor and conditional cache. Disabling a source stops
 collection without erasing already published news. GitLab merged changes are
-collected across branches, including maintenance branches. For older source
-files, see [retired source compatibility](docs/SOURCE_COVERAGE.md#retired-monitoring-sources).
+collected across branches, including maintenance branches. Consensus-health
+alert feeds (`alert_format = "consensus"`, requiring `website_url`) route DocTor
+reports into fixed-text incident rules with `publish = false` dry-run mode by
+default, while other legacy `alert_format` entries remain disabled; see
+[network-health alerts and retired formats](docs/SOURCE_COVERAGE.md#network-health-alerts).
 
 The Metrics Timeline source uses `kind = "metrics_timeline"` with the maintained
 repository's GitLab file JSON API URL and its repository root as `website_url`.

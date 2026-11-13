@@ -510,6 +510,8 @@ def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict
     if update:
         if not updated.get("updates"):
             raise ReviewError("Update repair requires a candidate update entry")
+        if updated.get("origin") == "network-health" and set(repair) - {"update"}:
+            raise ReviewError("Repair cannot change fixed-text alert labels")
         for key, value in copy.deepcopy(repair).items():
             if key == "update":
                 if value.strip()[-1] not in '.!?"\')”’':
@@ -666,8 +668,8 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
     return [reason for reason, held in (
         ("completed_action", any(not (_stated(proof, word) or _stated(merged, DONE[word])) for word in claimed)),
         ("compromise_headline", compromise_headline),
-        ("confirmed_source", candidate["confidence"] not in limits["confidence"]),
-        ("merge_state", limits["state"] == ["merged"] and candidate["state"] != "merged")) if held]
+        ("confirmed_source", candidate.get("origin") != "network-health" and candidate["confidence"] not in limits["confidence"]),
+        ("merge_state", candidate.get("origin") != "network-health" and limits["state"] == ["merged"] and candidate["state"] != "merged")) if held]
 
 
 def _skip_stands(criteria: dict, coverage: dict | None, same_story: str | None = None) -> bool:

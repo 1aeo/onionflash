@@ -115,6 +115,12 @@ def _prepare_story(story: dict, *, editorial: dict | None = None) -> dict:
     # Kept in stored order. A retracted story keeps them privately and shows none.
     if updates and (editorial or {}).get("status") != "retracted":
         public["updates"] = updates
+    raw_notes = story.get("alert_notes")
+    notes = [note for note in (_text(item, 600) for item in (raw_notes if isinstance(raw_notes, list) else [])[:3]) if note]
+    if notes and (editorial or {}).get("status") != "retracted":
+        public["alert_notes"] = list(dict.fromkeys(notes))
+    if story.get("origin") == "network-health":
+        public["origin"] = "network-health"
     if editorial:  # built only from the operator ledger, never from source or model output
         public["editorial"] = editorial
     return public
@@ -172,6 +178,14 @@ def _update_list(story: dict) -> str:
         + " · ".join(f'<a href="{_escape(source["url"])}" rel="noopener noreferrer">{_escape(source["title"])}</a>' for source in update["sources"])
         + "</span></li>" for update in _newest_updates(story))
     return f'<section class="article-updates"><h2>Updates</h2><ul class="update-list">{rows}</ul></section>'
+
+
+def _alert_notes(story: dict) -> str:
+    notes = story.get("alert_notes") or []
+    if not notes:
+        return ""
+    paragraphs = "".join(f"<p>{_escape(note)}</p>" for note in notes)
+    return f'<section class="article-context"><h2>About this alert</h2>{paragraphs}</section>'
 
 
 def _card(story: dict, base: str) -> str:
@@ -317,6 +331,8 @@ def _rss_item(story: dict, base: str) -> ET.Element:
     description = _editorial_notice(story) + f'<p>{_escape(story["summary"])}</p>' + _latest_update(story)
     if story["why_it_matters"]:
         description += f'<p><strong>Why it matters:</strong> {_escape(story["why_it_matters"])}</p>'
+    for note in story.get("alert_notes", []):
+        description += f'<p><strong>About this alert:</strong> {_escape(note)}</p>'
     if story.get("editorial", {}).get("status") != "retracted":
         description += f'<p>{_label(story["confidence"])} · {_label(story["priority"])} priority · {_label(story["state"])}</p>'
     description += _source_links(story, expanded=True)
@@ -338,6 +354,8 @@ def _json_feed_item(story: dict, base: str) -> dict:
         content += f'\n\nUpdate · {latest["at"]}: {latest["text"]}'
     if story["why_it_matters"]:
         content += "\n\nWhy it matters: " + story["why_it_matters"]
+    for note in story.get("alert_notes", []):
+        content += "\n\nAbout this alert: " + note
     content += "\n\nSources:\n" + "\n".join(source["url"] for source in story["sources"])
     return {"id": _permalink(base, story), "url": _permalink(base, story), "title": story["title"], "content_text": content, "date_published": story["published_at"], "date_modified": story["updated_at"], "tags": story["tags"]}
 
@@ -401,16 +419,22 @@ def index_html(site: dict, base: str, homepage: list[dict], source_health: list[
 
 
 def article_html(site: dict, base: str, story: dict) -> str:
+    note_text = (
+        "This alert uses fixed wording; only the names, times and counts come from the linked DocTor reports. "
+        "Consult the original reports for details."
+        if story.get("origin") == "network-health"
+        else "This is an AI-assisted summary of the linked public sources. Consult the original reports for details and operator guidance."
+    )
     body = f'''<main id="main" class="page article-page"><a class="back-link" href="{_escape(base)}">← All dispatches</a>
 <article class="full-story">{_badges(story)}<h1>{_escape(story['title'])}</h1>
 {_editorial_notice(story)}
 <div class="article-dates">First published {_time(story['added_at'], full=True)}{f' <span>·</span> Last updated {_time(story["updated_at"], full=True)}' if story['updated_at'] > story['added_at'] else ''}</div>
 <p class="article-summary">{_escape(story['summary'])}</p>
-{f'<section class="article-context"><h2>Why it matters</h2><p>{_escape(story["why_it_matters"])}</p></section>' if story['why_it_matters'] else ''}{_update_list(story)}
+{f'<section class="article-context"><h2>Why it matters</h2><p>{_escape(story["why_it_matters"])}</p></section>' if story['why_it_matters'] else ''}{_alert_notes(story)}{_update_list(story)}
 <p class="event-state"><span>Event status</span> {"Retracted" if story.get("editorial", {}).get("status") == "retracted" else _label(story['state'])}</p>
 <section class="article-sources"><h2>Read the sources</h2>{_source_links(story, expanded=True)}</section>
 {_editorial_history(story)}
-<p class="article-note">This is an AI-assisted summary of the linked public sources. Consult the original reports for details and operator guidance.</p></article></main>'''
+<p class="article-note">{note_text}</p></article></main>'''
     title = _text(site["title"], 80)
     return _shell(site, base, f"{story['title']} — {title}", story["summary"][:300], body, _permalink(base, story))
 
