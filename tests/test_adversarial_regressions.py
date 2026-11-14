@@ -337,8 +337,20 @@ def test_merge_host_story_transfers_doctor_network_pins_updates_and_citations(tm
                 )
                 prev_id = nxt_id
                 prev_ck = f"chain:{hop}"
+            store.db.execute(
+                "INSERT INTO story_aliases(story_id,cluster_key,survivor_id,reason,created_at,story_json) VALUES(?,?,?,?,?,?)",
+                (
+                    "malformed_alias",
+                    "chain:malformed",
+                    None,
+                    "Malformed URL fields.",
+                    "2024-02-03T00:00:00Z",
+                    json.dumps({"network": [{"key": "other-key", "rule": "A", "subject": "moria1", "first_url": [], "opened_url": {}}]}),
+                ),
+            )
         chain_res = doctor.evaluate(cfg_chain, store, cfg_chain["sources"][0], FakeLinker(), "2024-02-03T01:00:00Z")
         assert chain_res["stories_written"] == 1
+        assert len(doctor.status(store.db, cfg_chain["sources"])["incidents"]) == 1
         [healthy_story] = store.stories()
         assert "moria1" in healthy_story["title"]
         skipped_codes = [

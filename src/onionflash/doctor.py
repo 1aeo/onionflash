@@ -944,8 +944,8 @@ def _entry_matches(entry: dict, incident: dict) -> bool:
         entry.get("rule") == incident["rule"]
         and entry.get("subject") == incident["subject"]
         and (
-            entry.get("first_url") in incident["member_urls"]
-            or entry.get("opened_url") in incident["member_urls"]
+            (isinstance(entry.get("first_url"), str) and entry["first_url"] in incident["member_urls"])
+            or (isinstance(entry.get("opened_url"), str) and entry["opened_url"] in incident["member_urls"])
         )
     )
 
