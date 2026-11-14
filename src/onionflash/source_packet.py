@@ -36,6 +36,13 @@ def _lookup_fingerprint(row):
     return source_fingerprint(item) if item is not None else digest(row["payload"].hex())
 
 
+def _safe_canonical(url: str) -> str:
+    try:
+        return canonical_url(url)
+    except (ValueError, TypeError, UnicodeError):
+        return url
+
+
 def _matches_citation(item, source_id, url):
     if item is None or (source_id and item.get("id") != source_id):
         return False
@@ -50,7 +57,11 @@ def _load(db, source_id: str | None, url: str, analysis_key: str | None = None):
     query = "SELECT id,CAST(payload AS BLOB) AS payload FROM items WHERE "
     row = db.execute(query + "id=?", (source_id,)).fetchone() if source_id else None
     if row is None:
-        row = db.execute(query + "url=?", (url,)).fetchone()
+        alt = url.replace("/-/work_items/", "/-/issues/") if "/-/work_items/" in url else url.replace("/-/issues/", "/-/work_items/")
+        canon = _safe_canonical(url)
+        row = db.execute(query + "url IN (?,?,?)", (url, alt, canon)).fetchone()
+        if row is None and "gitlab.torproject.org" in canon:
+            row = db.execute(query + "LOWER(url) IN (?,?)", (canon.lower(), alt.lower())).fetchone()
     lookup = {"table": "item_lookup", "key": row["id"] if row else source_id or url,
               "by": "id" if row or source_id else "url", "hash": _lookup_fingerprint(row)}
     if row is not None:
@@ -120,12 +131,14 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
     references = sorted(payload["sources"], key=lambda source: (
         source.get("source_item_id", source.get("id")) not in required_ids,
         source.get("source_item_id", source.get("id")) != writer_id, source["url"]))
-    public_urls = {source["url"] for source in public["sources"]}
-    update_urls = {source["url"] for source in public["updates"][-1]["sources"]} if update and public.get("updates") else set()
+    public_urls = {_safe_canonical(source["url"]) for source in public["sources"]}
+    update_urls = {_safe_canonical(source["url"]) for source in public["updates"][-1]["sources"]} if update and public.get("updates") else set()
     for source in references:
+        if source.get("network_key"):
+            continue
         source_id = source.get("source_item_id", source.get("id"))
         required = require_all or source_id in required_ids
-        if not required and source["url"] not in public_urls:
+        if not required and _safe_canonical(source["url"]) not in public_urls:
             continue
         if source_id == incoming["id"]:
             loaded = (incoming, [{"table": "items", "key": incoming["id"], "hash": source_fingerprint(incoming)}], "current", None)
@@ -147,9 +160,10 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
             unit["captured_at"] = captured
         if source.get("source_item_id"):
             # A cited note is supplied with the text of its parent issue.
-            if not any(note["url"] == source["url"] for note in item.get("public_comments", [])):
+            source_canon = _safe_canonical(source["url"])
+            if not any(_safe_canonical(note["url"]) == source_canon for note in item.get("public_comments", [])):
                 truncated = True
-                if required and (not update or require_all or source["url"] in update_urls):
+                if required and (not update or require_all or source_canon in update_urls):
                     missing.append(source["url"])
             continue
         if not isinstance(body, str) or not (body.strip() or item["title"].strip()):

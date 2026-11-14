@@ -170,32 +170,34 @@ def canonical_url(value: str) -> str:
         or parsed.password is not None
     ):
         raise ValueError("Source URLs must be public HTTPS URLs without credentials")
-    if (
-        host == "localhost"
-        or host.endswith((".localhost", ".local", ".internal"))
-        or "." not in host
-    ):
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
         raise ValueError("Local source URL is not allowed")
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
+        if "." not in host:
+            raise ValueError("Local source URL is not allowed")
         if all(
             re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", part) for part in host.split(".")
         ):
             raise ValueError("Ambiguous numeric source host is not allowed")
     else:
-        if not address.is_global or address.is_multicast:
+        from .transport import AddressPolicy
+
+        if not AddressPolicy().permits(str(address)):
             raise ValueError("Private source URL is not allowed")
     try:
         port = parsed.port
     except ValueError as exc:
         raise ValueError("Invalid URL port") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("Invalid URL port")
     authority = f"[{host}]" if ":" in host else host
-    if port and port != 443:
+    if port is not None and port != 443:
         authority += f":{port}"
     path = parsed.path or "/"
     if host == "gitlab.torproject.org":
-        path = re.sub(r"/-/issues/(\d+)(?=/|$)", r"/-/work_items/\1", path)
+        path = re.sub(r"/-/issues/(\d+)/?\Z", r"/-/work_items/\1", path)
     query = urlencode(
         [
             (k, v)
@@ -211,7 +213,7 @@ def item_identity(item: dict) -> str:
     return "timeline:" + item["source_entry_id"] if item.get("kind") == "metrics_timeline" else item["url"]
 
 
-_PRODUCT_NAMES = {"tor": "tor", "arti": "arti", "tor-browser": "tor browser"}
+_PRODUCT_NAMES = {"tor": "tor", "arti": "arti", "tor-browser": r"tor[- ]browser"}
 _VERSION = re.compile(r"\d+\.\d+(?:\.\d+){0,2}(?:[-.]?(?:alpha|beta|rc|a)\.?\d*)?")
 _RELEASE_QUALIFIERS = r"(?:(?:new|stable|alpha|beta|security|bugfix|release|version)\s+)*"
 _RELEASE_AFTER = re.compile(r"\s+(?:is\s+)?(?:now\s+)?available\b")
@@ -243,7 +245,7 @@ def item_cluster(item: dict) -> str:
     title = item["title"].lower()
     product = item.get("product", "network")
     if product == "network":
-        if re.search(r"\btor browser\b", title):
+        if re.search(r"\btor[- ]browser\b", title):
             product = "tor-browser"
         elif re.search(r"\barti\b", title):
             product = "arti"
@@ -286,7 +288,7 @@ def gitlab_refs(item: dict) -> tuple[list[str], list[str]]:
     own_project = own_match.group(2) if own_match else None
 
     def normalize_ref(token: str) -> str | None:
-        cleaned = token.rstrip(".,;:!?)>]").split("#", 1)[0] if token.startswith("https://") else token
+        cleaned = token.rstrip(".,;:!?)>]").split("#", 1)[0].split("?", 1)[0] if token.startswith("https://") else token
         if cleaned.startswith("https://"):
             match = _GITLAB_URL_REF.match(cleaned)
             if not match:

@@ -289,7 +289,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                             if actual_route is not None:
                                 totals["false_routes"] += 1
                                 route_ok = False
-                        elif actual_route == expected_route:
+                        elif action == "route" and value == expected_route:
                             totals["matched_routes"] += 1
                         elif actual_route is None:
                             totals["missed_routes"] += 1

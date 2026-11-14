@@ -207,7 +207,7 @@ def _feed(
     )
     cutoff = after(-settings["lookback_days"] * 86400, started)
     items = []
-    identities, conflicts, skipped = {}, set(), 0
+    identities, conflicts, fallback_indices, skipped = {}, set(), set(), 0
     for index, entry in enumerate(feed.entries):
         published = _entry_time(
             entry, "published", _entry_time(entry, "updated", "")
@@ -256,15 +256,28 @@ def _feed(
             item["authority"] = "project-sender"
         # Some Atom archives omit alternate links and reuse an ID for distinct
         # events. Do not silently choose one event when that fallback is ambiguous.
-        if feed.version.startswith("atom") and not entry.get("links") and entry.get("id") == link:
+        has_alternate = any(
+            isinstance(link_obj, dict)
+            and link_obj.get("rel", "alternate") == "alternate"
+            and str(link_obj.get("type") if "type" in link_obj else "text/html").lower()
+            in {"text/html", "application/xhtml+xml", "html", "xhtml"}
+            and bool(link_obj.get("href"))
+            for link_obj in (entry.get("links") or ())
+        )
+        if feed.version.startswith("atom") and not has_alternate and entry.get("id"):
             identity = (item["url"], item["updated_at"])
             content = (item["title"], item["content"])
             if identity in identities and identities[identity] != content:
                 conflicts.add(identity)
             identities[identity] = content
+            fallback_indices.add(len(items))
         items.append(item)
     if conflicts:
-        unambiguous = [item for item in items if (item["url"], item["updated_at"]) not in conflicts]
+        unambiguous = [
+            item
+            for idx, item in enumerate(items)
+            if not (idx in fallback_indices and (item["url"], item["updated_at"]) in conflicts)
+        ]
         skipped += len(items) - len(unambiguous)
         items = unambiguous
     # An archive feed is bounded by its newest entries, whatever order it lists them in.

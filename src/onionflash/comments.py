@@ -14,7 +14,7 @@ import time
 from itertools import zip_longest
 from urllib.parse import unquote, urlsplit, urlunsplit
 
-from .transport import FetchError, HttpClient
+from .transport import DeadlineReached, FetchError, HttpClient
 from .util import after, backoff_seconds, canonical_url, digest, now_iso, plain_text, saved_object, timestamp
 
 
@@ -67,6 +67,15 @@ def _issue_identity(source, item):
     if not match or parsed.query or parsed.fragment or parsed.netloc != expected.netloc:
         raise CommentError("Issue URL is outside its configured project")
     return project, origin, endpoint, project_id, match[1]
+
+
+def note_key(ident: object) -> str:
+    """Normalize GitLab Note and DiscussionNote GIDs to their shared numeric note ID."""
+    if not isinstance(ident, str):
+        return ""
+    if ident.startswith(("gid://gitlab/Note/", "gid://gitlab/DiscussionNote/")):
+        return ident.rsplit("/", 1)[-1]
+    return ident
 
 
 def _source_key(source):
@@ -133,7 +142,7 @@ def fetch_comments(client, source, item):
                 entry["edited_at"] = edited
             notes[match[1]] = entry
     prior = {
-        n["id"]: n
+        note_key(n["id"]): n
         for n in item.get("public_comments") or []
         if isinstance(n, dict) and isinstance(n.get("id"), str)
     }
@@ -141,10 +150,19 @@ def fetch_comments(client, source, item):
     for note in sorted(notes.values(), key=lambda n: (n["created_at"], n["id"]), reverse=True):
         if remaining <= 0 or len(selected) >= MAX_COMMENTS:
             break
+        clipped = len(note["body"]) > remaining
         note["body"] = note["body"][:remaining]
         remaining -= len(note["body"])
-        old_note = prior.get(note["id"])
-        if old_note is not None and old_note.get("body") == note["body"]:
+        old_note = prior.get(note_key(note["id"]))
+        if old_note is not None and (
+            old_note.get("body") == note["body"]
+            or (
+                clipped
+                and note.get("edited_at") == old_note.get("edited_at")
+                and isinstance(old_note.get("body"), str)
+                and old_note["body"].startswith(note["body"])
+            )
+        ):
             note.pop("edited_at", None)
             if isinstance(old_note.get("edited_at"), str) and old_note["edited_at"] > note["created_at"]:
                 note["edited_at"] = old_note["edited_at"]
@@ -169,15 +187,26 @@ def _compose(item, notes, checked, *, source_key):
     if not isinstance(content, str):
         raise CommentError("Saved issue description is unavailable")
     prior = {
-        n["id"]: n
+        note_key(n["id"]): n
         for n in item.get("public_comments") or []
         if isinstance(n, dict) and isinstance(n.get("id"), str)
     }
+    total_len = sum(len(n.get("body") or "") for n in notes)
     composed_notes = []
-    for note in notes:
+    for index, note in enumerate(notes):
         entry = dict(note)
-        old_note = prior.get(entry.get("id"))
-        if old_note is not None and old_note.get("body") != entry.get("body"):
+        old_note = prior.get(note_key(entry.get("id")))
+        old_body = old_note.get("body") if old_note is not None else None
+        budget_clipped = (
+            index == len(notes) - 1
+            and total_len >= TOTAL_CHARS
+            and old_note is not None
+            and entry.get("edited_at") == old_note.get("edited_at")
+            and isinstance(old_body, str)
+            and len(entry["body"]) < len(old_body)
+            and old_body.startswith(entry["body"])
+        )
+        if old_note is not None and old_body != entry.get("body") and not budget_clipped:
             prev_time = old_note.get("edited_at") or entry["created_at"]
             if not isinstance(entry.get("edited_at"), str) or entry["edited_at"] <= prev_time:
                 entry["edited_at"] = max(checked, prev_time)
@@ -197,12 +226,25 @@ def merge_cached_comments(store, item, source, observed=None):
     """
     if item.get("kind") != "gitlab_issue" or not source.get("gitlab_project"):
         return item
-    row = store.db.execute("SELECT id,CAST(payload AS BLOB) AS payload FROM items WHERE url=?", (item["url"],)).fetchone()
+    row = store.db.execute(
+        "SELECT id,typeof(payload) AS payload_type,CAST(payload AS BLOB) AS payload FROM items WHERE url=?",
+        (item["url"],),
+    ).fetchone()
     if row is None:
         return item
     # A damaged saved copy has no snapshot: request a check, and Store.ingest replaces the copy.
-    old, key = saved_object(row["payload"]) or {}, _source_key(source)
-    current = old.get("comments_source_key") == key
+    old = (saved_object(row["payload"]) if row["payload_type"] == "text" else None) or {}
+    key = _source_key(source)
+    valid_notes = (
+        isinstance(old.get("comments_checked_at"), str)
+        and isinstance(old.get("public_comments"), list)
+        and all(
+            isinstance(n, dict)
+            and all(isinstance(n.get(f), str) for f in ("id", "url", "title", "author", "created_at", "body"))
+            for n in old["public_comments"]
+        )
+    )
+    current = valid_notes and old.get("comments_source_key") == key
     if observed and (not current or item["updated_at"] > old["comments_checked_at"]):
         with store.db:
             _request(store.db, row["id"], key, observed)
@@ -305,6 +347,10 @@ def enrich_comments(config, store, observed, *, deadline=None):
                     report["budget_reached"] = True
                     return report
                 store.set_meta(comments_source_cursor=source["id"])
+                prev_state = store.db.execute(
+                    "SELECT rotation_cursor,recent_first FROM comment_sources WHERE source_id=?",
+                    (source["id"],),
+                ).fetchone()
                 with store.db:
                     if row["_comments_history"]:
                         store.db.execute("UPDATE comment_sources SET rotation_cursor=?,recent_first=1 WHERE source_id=?",
@@ -342,6 +388,16 @@ def enrich_comments(config, store, observed, *, deadline=None):
                         store.db.execute("INSERT OR REPLACE INTO comment_cache VALUES(?,?,?,?,0,NULL)",
                                          (row["id"], key, observed, after(INTERVAL_SECONDS, observed)))
                         store.db.execute("UPDATE comment_sources SET failures=0,next_fetch_at=NULL,error=NULL WHERE source_id=?", (source["id"],))
+                except DeadlineReached:
+                    report["checked"] -= 1
+                    report["budget_reached"] = True
+                    if prev_state is not None:
+                        with store.db:
+                            store.db.execute(
+                                "UPDATE comment_sources SET rotation_cursor=?,recent_first=? WHERE source_id=?",
+                                (prev_state[0], prev_state[1], source["id"]),
+                            )
+                    return report
                 except (CommentError, FetchError, ValueError, TypeError, KeyError) as exc:
                     # No response or an unverifiable response is not evidence
                     # that old public notes disappeared. Keep the prior verified

@@ -179,6 +179,8 @@ def _act(store, item_id, expected_hash, reason, action, observed):
         if action == "retry":
             from .review_gate import reset_review_work
             reset_review_work(store, item_id)
+        else:
+            db.execute("UPDATE review_jobs SET approval_key=NULL WHERE item_id=?", (item_id,))
     return {"item_id": item_id, "content_hash": expected_hash, "action": action,
             "status": "pending" if action == "retry" else "dismissed", "action_id": event.lastrowid}
 

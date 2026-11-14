@@ -34,6 +34,18 @@ def backup_database(source: str | Path, destination: str | Path) -> None:
         raise
 
 
+def retained_analysis_keys(db) -> set[str]:
+    """Return analysis cache keys referenced by live stories and not safe to evict."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stories'").fetchone():
+        return set()
+    pinned: set[str] = set()
+    for (raw,) in db.execute("SELECT CAST(payload AS BLOB) FROM stories WHERE typeof(payload)='text'"):
+        payload = saved_object(raw)
+        if isinstance(payload, dict) and isinstance(payload.get("editorial_analysis_key"), str):
+            pinned.add(payload["editorial_analysis_key"])
+    return pinned
+
+
 TAG_PRIORITY = 5  # queue floor for deterministic tag notices
 POLL_TOLERANCE_SECONDS = 5  # absorbs scheduler start jitter after a successful poll
 
@@ -292,31 +304,45 @@ class Store:
             # The same revision as a copy restored above without its notes, listed again before a check
             # succeeded: the kept hash still holds the notes, so this is no change.
             return False
+        elif (
+            row
+            and row["status"] != "pending"
+            and "comments_source_key" not in item
+            and not check_requested
+            and old.get("public_comments")
+            and item_hash({k: v for k, v in old.items() if k != "public_comments"}) == content_hash
+        ):
+            # Disabling comment enrichment must not drop verified notes or requeue unchanged issues.
+            return False
         if row is not None:
             alias = editorial.retired(self.db, story_id=row["story_id"], cluster_key=row["cluster_key"])
             if alias is not None and alias[1] is None:
                 # Keep a retired item's original cluster key across body edits so process_item still ignores it.
                 cluster = self.db.execute("SELECT cluster_key FROM story_aliases WHERE story_id=?", (alias[0],)).fetchone()[0]
         score = item_priority(item)
-        with self.db:
-            self.db.execute(
-                """INSERT INTO items(id,url,source_id,payload,content_hash,cluster_key,first_seen,last_seen,priority_score)
-                VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
-                url=excluded.url,source_id=excluded.source_id,payload=excluded.payload,content_hash=excluded.content_hash,
-                cluster_key=excluded.cluster_key,last_seen=excluded.last_seen,status='pending',attempts=0,rejections=0,
-                next_attempt_at=NULL,last_error=NULL,priority_score=excluded.priority_score""",
-                (
-                    item_id,
-                    item["url"],
-                    item["source_id"],
-                    json.dumps(item, ensure_ascii=False),
-                    content_hash,
-                    cluster,
-                    observed,
-                    observed,
-                    score,
-                ),
-            )
+        try:
+            with self.db:
+                self.db.execute(
+                    """INSERT INTO items(id,url,source_id,payload,content_hash,cluster_key,first_seen,last_seen,priority_score)
+                    VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                    url=excluded.url,source_id=excluded.source_id,payload=excluded.payload,content_hash=excluded.content_hash,
+                    cluster_key=excluded.cluster_key,last_seen=excluded.last_seen,status='pending',attempts=0,rejections=0,
+                    next_attempt_at=NULL,last_error=NULL,priority_score=excluded.priority_score""",
+                    (
+                        item_id,
+                        item["url"],
+                        item["source_id"],
+                        json.dumps(item, ensure_ascii=False),
+                        content_hash,
+                        cluster,
+                        observed,
+                        observed,
+                        score,
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            logging.getLogger(__name__).warning("Skipping item %s with duplicate URL", item_id)
+            return False
         return True
 
     def pending(self, limit: int, observed: str) -> list[dict]:
@@ -405,7 +431,8 @@ class Store:
         self.db.execute("BEGIN IMMEDIATE")
         with self.db:
             current = self.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()
-            if current is None or candidate.item_fingerprint(dict(current)) != candidate.item_fingerprint(row):
+            if (current is None or current["status"] != "pending"
+                    or candidate.item_fingerprint(dict(current)) != candidate.item_fingerprint(row)):
                 raise candidate.StaleCandidate("Source item changed before citation committed")
             story_row = self.db.execute("SELECT * FROM stories WHERE id=?", (story_id,)).fetchone()
             if story_row is None:
@@ -427,6 +454,14 @@ class Store:
                 code = "held.gate.story_locked"
             else:
                 payload = json.loads(story_row["payload"])
+                if "editorial_item" not in payload:
+                    w_id, w_kind, w_auth = candidate._writer_info(payload, self.db)
+                    if w_id is not None:
+                        payload["editorial_item"] = w_id
+                        if w_kind and "editorial_kind" not in payload:
+                            payload["editorial_kind"] = w_kind
+                        if w_auth and "editorial_authority" not in payload:
+                            payload["editorial_authority"] = w_auth
                 source_map = {entry["url"]: entry for entry in payload.get("sources", [])}
                 source_map[source["url"]] = source
                 payload["sources"] = sorted(source_map.values(), key=lambda entry: entry["url"])
@@ -507,6 +542,23 @@ class Store:
                     if review_record is None:
                         review_record = json.loads(receipt["review_record_json"])
                     self.db.execute("DELETE FROM review_approvals WHERE key=?", (approval_key,))
+            if not operator:
+                if editorial.retired(self.db, story_id=story_id, cluster_key=prepared["cluster_key"]) is not None:
+                    raise editorial.RetiredStory("Story is retired")
+                current_item = self.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()
+                expected_fp = (prepared.get("binding") or {}).get("item") or candidate.item_fingerprint(row)
+                if (current_item is None or current_item["status"] != "pending"
+                        or candidate.item_fingerprint(dict(current_item)) != expected_fp):
+                    raise candidate.StaleCandidate("Source item changed before candidate committed")
+                if editorial.is_locked(self.db, story_id) != bool(locked):
+                    raise candidate.StaleCandidate("Editorial lock state changed before candidate committed")
+                expected_lock = (prepared.get("binding") or {}).get("lock")
+                if expected_lock is not None and candidate.control_fingerprint(self.db, story_id) != expected_lock:
+                    raise candidate.StaleCandidate("Editorial controls changed before candidate committed")
+                expected_prior = (prepared.get("binding") or {}).get("prior_story")
+                if expected_prior is not None and digest(candidate.existing_story(self.db, dict(current_item))) != expected_prior:
+                    raise candidate.StaleCandidate("Target story changed before candidate committed")
+            if not locked:
                 cited_on_skip = False
                 if decision == "approve":
                     payload = json.loads(json.dumps(prepared["payload"]))
@@ -525,10 +577,19 @@ class Store:
                         failed_criteria == {"new_information"}
                         and ((row.get("cluster_key") or "").startswith("release:") or item_obj.get("kind") == "metrics_timeline")
                         and story_id in verdict["criteria"]["new_information"]["reason"]
+                        and not editorial.is_locked(self.db, story_id)
                     ):
                         existing_row = self.db.execute("SELECT payload FROM stories WHERE id=?", (story_id,)).fetchone()
                         if existing_row is not None:
                             story_payload = json.loads(existing_row[0])
+                            if "editorial_item" not in story_payload:
+                                w_id, w_kind, w_auth = candidate._writer_info(story_payload, self.db)
+                                if w_id is not None:
+                                    story_payload["editorial_item"] = w_id
+                                    if w_kind and "editorial_kind" not in story_payload:
+                                        story_payload["editorial_kind"] = w_kind
+                                    if w_auth and "editorial_authority" not in story_payload:
+                                        story_payload["editorial_authority"] = w_auth
                             cite_source = {key: item_obj[key] for key in ("id", "url", "title", "published_at")}
                             source_map = {entry["url"]: entry for entry in story_payload.get("sources", [])}
                             source_map[cite_source["url"]] = cite_source
@@ -556,7 +617,34 @@ class Store:
                     raise editorial.RetiredStory("Story is retired")
                 editorial.record_held(self.db, story_id)
             published = decision == "approve"
-            mapped_id = story_id if (published or cited_on_skip) else row.get("story_id")
+            if published or cited_on_skip:
+                mapped_id = story_id
+            elif row.get("story_id"):
+                prior_story_id = row["story_id"]
+                keep_mapping = bool(
+                    self.db.execute(
+                        """SELECT 1 FROM decision_log
+                           WHERE item_id=? AND (code GLOB 'published.*' OR code IN ('operator.approved','held.gate.story_locked'))""",
+                        (row["id"],),
+                    ).fetchone()
+                )
+                if not keep_mapping:
+                    story_row = self.db.execute("SELECT CAST(payload AS BLOB) FROM stories WHERE id=?", (prior_story_id,)).fetchone()
+                    story_obj = saved_object(story_row[0]) if story_row is not None else None
+                    if isinstance(story_obj, dict):
+                        item_url = row.get("url")
+                        keep_mapping = any(
+                            isinstance(s, dict) and (s.get("id") == row["id"] or s.get("source_item_id") == row["id"] or s.get("url") == item_url)
+                            for s in (story_obj.get("sources") or ())
+                        ) or any(
+                            isinstance(cs, dict) and (cs.get("url") == item_url or str(cs.get("url") or "").startswith(str(item_url) + "#"))
+                            for u in (story_obj.get("updates") or ())
+                            if isinstance(u, dict)
+                            for cs in (u.get("sources") or ())
+                        )
+                mapped_id = prior_story_id if keep_mapping else None
+            else:
+                mapped_id = None
             self.db.execute("UPDATE items SET status=?,story_id=?,next_attempt_at=NULL,last_error=? WHERE id=?",
                             ("published" if published else "ignored", mapped_id, skipped, row["id"]))
             self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
