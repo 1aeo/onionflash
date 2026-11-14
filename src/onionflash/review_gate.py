@@ -4,8 +4,9 @@ The existing item queue owns scheduling and backoff. These private tables keep
 one unfinished job per item, overwritten when its inputs change or an operator
 retries the item, and the receipt of its recorded decision until that decision
 commits; they are not a cache of writer responses for arbitrary future items.
-Every job record binds the item's content_hash as input_hash so locked-story
-jobs resume only when the item's content is unchanged.
+New jobs bind input_hash to a validated source snapshot, kept in the draft
+record until the prepared envelope supplies it. Older representations must
+also prove their source before a mismatch can reset automatic review work.
 """
 
 from __future__ import annotations
@@ -135,6 +136,84 @@ def _save(store, row, writer_key, policy_hash, stage, draft, prepared, record, o
 
 def _identity(prepared):
     return tuple(prepared[key] for key in ("candidate_hash", "source_hash", "binding_hash"))
+
+
+def _saved_job(store, row, config):
+    """Validate saved identity before a mismatch can start a fresh automatic review."""
+    from .store import item_hash
+
+    job = store.db.execute("""SELECT writer_key,policy_hash,stage,approval_key,prepared_at,CAST(draft_json AS BLOB) AS draft,
+        CAST(envelope_json AS BLOB) AS envelope,CAST(record_json AS BLOB) AS record FROM review_jobs WHERE item_id=?""",
+        (row["id"],)).fetchone()
+    if job is None:
+        return None, None, None, None, False
+    draft, prepared, record = (saved_object(job[key]) for key in ("draft", "envelope", "record"))
+    try:
+        if (record is None or (draft is None) != (job["draft"] is None)
+                or (prepared is None) != (job["envelope"] is None)):
+            raise ValueError()
+
+        def source_identity(value):
+            if not isinstance(value, dict):
+                raise ValueError()
+            payload = saved_object(value["payload"].encode("utf-8"))
+            if (not isinstance(payload, dict) or value["id"] != row["id"] or payload.get("id") != value["id"]
+                    or payload.get("url") != value["url"] or payload.get("source_id") != value["source_id"]
+                    or not isinstance(value["content_hash"], str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", value["content_hash"])
+                    or item_hash(payload) != value["content_hash"]):
+                raise ValueError()
+            return value["content_hash"]
+
+        marker = record.get("input_proof")
+        if "input_proof" in record and (type(marker) is not int or marker != 1):
+            raise ValueError()
+        if "input_hash" in record and (not isinstance(record["input_hash"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", record["input_hash"])):
+            raise ValueError()
+        if marker == 1:
+            if "input_hash" not in record:
+                raise ValueError()
+            proof_row = record.get("input_row") if prepared is None else prepared["row"]
+        elif "input_row" in record:
+            # Older durable records carried their complete source in the record.
+            proof_row = record["input_row"]
+        elif ("input_hash" in record and not {"request_budget", "untrusted_proposals"} & set(record)
+                and job["policy_hash"] != review.policy_hash(config)):
+            # Compact legacy records can use their retained envelope as proof.
+            # A hash alone cannot distinguish an old source from damaged state.
+            if prepared is None:
+                raise AnalysisError("Saved source proof is unavailable; an explicit retry is required",
+                                    code="app.source_proof_unavailable")
+            proof_row = prepared["row"]
+        else:
+            raise ValueError()
+        source_hash = source_identity(proof_row)
+        if _record_input_hash(record) != source_hash:
+            raise ValueError()
+        if "input_row" in record and (source_identity(record["input_row"]) != source_hash
+                or candidate_mod.item_fingerprint(record["input_row"]) != candidate_mod.item_fingerprint(proof_row)):
+            raise ValueError()
+        current_hash = source_identity(row)
+        if (not isinstance(job["writer_key"], str) or not re.fullmatch(r"[0-9a-f]{64}", job["writer_key"])
+                or not isinstance(record.get("writer"), dict) or record["writer"].get("key") != job["writer_key"]):
+            raise ValueError()
+        if prepared is not None:
+            if (source_identity(prepared["row"]) != source_hash
+                    or candidate_mod.item_fingerprint(proof_row) != candidate_mod.item_fingerprint(prepared["row"])
+                    or prepared["binding"]["item"] != candidate_mod.item_fingerprint(prepared["row"])):
+                raise ValueError()
+        elif job["stage"] != "drafted":
+            raise ValueError()
+        if job["stage"] != "drafted" and record.get("policy_hash") != job["policy_hash"]:
+            raise ValueError()
+        if job["stage"] in {"approved", "skipped"} and job["approval_key"] != record.get("approval_key"):
+            raise ValueError()
+    except (ValueError, TypeError, KeyError, AttributeError, UnicodeError):
+        raise AnalysisError("Saved review job is damaged", code="app.damaged_job") from None
+    if job["policy_hash"] == review.policy_hash(config):
+        validate_review_state(record, job["stage"], record.get("candidate", (prepared or {}).get("candidate")), prepared)
+    return job, draft, prepared, record, source_hash == current_hash
 
 
 def _approval_key(candidate, prepared, policy):
@@ -948,6 +1027,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         if existing is None and retired(
                 store.db, story_id=digest(row["cluster_key"])[:24], cluster_key=row["cluster_key"]) is not None:
             raise RetiredStory("Story is retired")
+        job, saved_draft, saved_prepared, saved_record, same_source = _saved_job(store, row, config)
         item_payload = json.loads(row["payload"])
         skipped = _not_recent(config, store, row, item_payload, observed, existing=existing)
         if skipped:
@@ -968,28 +1048,15 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         return {**report, "status": "stale"}
 
     writer_key = cache_key(row, config["llm"], prior)
-    job = store.db.execute("""SELECT writer_key,policy_hash,stage,approval_key,prepared_at,CAST(draft_json AS BLOB) AS draft,
-        CAST(envelope_json AS BLOB) AS envelope,CAST(record_json AS BLOB) AS record FROM review_jobs WHERE item_id=?""",
-        (row["id"],)).fetchone()
     locked_reuse = (job is not None and existing is not None and is_locked(store.db, existing["id"])
-                    and _record_input_hash(saved_object(job["record"])) == row["content_hash"]
-                    and saved_object(job["draft"]) is not None)
-    saved_record = saved_object(job["record"]) if job is not None else None
+                    and same_source and saved_draft is not None)
     carry = None
-    if (job is not None and job["policy_hash"] == policy
-            and _record_input_hash(saved_record) == row["content_hash"]
+    if (job is not None and job["policy_hash"] == policy and same_source
             and (job["writer_key"] != writer_key or job["stage"] == "routed")):
-        saved_prepared = saved_object(job["envelope"])
-        validate_review_state(saved_record, job["stage"],
-                              saved_record.get("candidate", (saved_prepared or {}).get("candidate")), saved_prepared)
         carry = _carried_requests(saved_record)
-    if job is not None and job["stage"] != "routed" and (job["writer_key"] == writer_key or locked_reuse):
+    if job is not None and same_source and job["stage"] != "routed" and (job["writer_key"] == writer_key or locked_reuse):
         writer_key = job["writer_key"]
-        draft, old, record = (saved_object(job[key]) for key in ("draft", "envelope", "record"))
-        # A job whose JSON cannot be read fails the item; reviewing it afresh could pass over its hold.
-        # The other columns hold only the ASCII keys, stages and times that the application writes.
-        if record is None or (draft is None) != (job["draft"] is None) or (old is None) != (job["envelope"] is None):
-            raise AnalysisError("Saved review job is damaged", code="app.damaged_job")
+        draft, old, record = saved_draft, saved_prepared, saved_record
         prepared_at = job["prepared_at"]
     else:
         job, draft, old = None, None, None
@@ -998,12 +1065,6 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             record.update(carry)
         prepared_at = observed
     try:
-        if job is not None and job["policy_hash"] == policy:
-            if job["stage"] != "drafted" and record.get("policy_hash") != policy:
-                raise AnalysisError("Saved review policy is damaged", code="app.damaged_job")
-            if job["stage"] in {"approved", "skipped"} and job["approval_key"] != record.get("approval_key"):
-                raise AnalysisError("Saved approval key is damaged", code="app.damaged_job")
-            validate_review_state(record, job["stage"], record.get("candidate", (old or {}).get("candidate")), old)
         if draft is None:
             if not allow_network and item_payload["kind"] != "tag":
                 return {**report, "status": "deferred"}

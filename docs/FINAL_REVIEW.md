@@ -207,6 +207,14 @@ entry's text and allowed labels; earlier prose, update history, dates and citati
 remain immutable, including during recovery from an inconsistent reply.
 An update held behind an editorial lock also retains its ledger through unlock
 or transfer to a merge survivor. Its old context never authorizes new prose.
+Saved job identity is checked against its source payload and retained envelope
+before an automatic context change can discard proof or start a new budget.
+Missing or inconsistent identity fails closed; it is not a new source revision.
+A new draft keeps its source snapshot until the prepared envelope supplies that
+proof, without storing a second copy in the record. Older compact records can
+use a valid retained envelope; a hash-only draft without source proof requires
+an explicit operator retry. Format markers prevent damaged current records from
+being accepted as an older representation.
 
 ## Final checks
 
