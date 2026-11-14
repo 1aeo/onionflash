@@ -221,9 +221,11 @@ def run_with(monkeypatch, cfg, store, error=None):
 @pytest.mark.parametrize("error,code", [
     (AnalysisError("Model evidence quote 1 is not an exact excerpt", code="writer.evidence_not_exact"), "failed.writer.evidence_not_exact"),
     (review.ReviewError("Review response fields do not match schema"), "failed.review.invalid_reply"),
+    (AnalysisError("Saved draft source proof is unavailable", code="app.source_proof_unavailable"),
+     "failed.app.source_proof_unavailable"),
     (RuntimeError("boom"), "failed.app.unexpected"),
     (AnalysisError("LLM request failed", retryable=True), None),
-], ids=["writer", "review", "unexpected", "retryable"])
+], ids=["writer", "review", "source-proof", "unexpected", "retryable"])
 def test_only_the_third_terminal_failure_is_logged(context, monkeypatch, error, code):
     cfg, store = context
     cfg["sources"] = []
@@ -234,6 +236,7 @@ def test_only_the_third_terminal_failure_is_logged(context, monkeypatch, error, 
     assert logged(store) == []
     report = run_with(monkeypatch, cfg, store, error)
     assert [e["code"] for e in logged(store)] == ([code] if code else [])
+    assert code is None or code in decisions.CODES
     assert report["decisions"] == ({code: 1} if code else {}) and report["analysis_failed"] == 1
 
 

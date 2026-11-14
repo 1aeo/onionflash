@@ -101,6 +101,7 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `failed.app.unexpected` | Processing failed unexpectedly. |
 | `failed.app.damaged_item` | The item's saved copy is damaged. |
 | `failed.app.damaged_job` | The item's saved review job is damaged. |
+| `failed.app.source_proof_unavailable` | A saved draft has no verifiable source snapshot; processing requires an explicit retry. |
 | `merged.auto.same_event` | Both review and fresh verification confirmed two published stories report the same event, and the newer story merged into the earlier one. |
 | `operator.retried` | An operator retried a rejected, dismissed or failed item. |
 | `operator.reconsidered` | An operator retried an ignored (skipped) item. |
