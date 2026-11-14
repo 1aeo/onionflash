@@ -8,19 +8,17 @@ without it, only the generic public-text rules run.
 """
 import copy
 import hashlib
-import importlib.util
 import json
 import os
+from pathlib import Path
 import re
 import unicodedata
-from pathlib import Path
 from urllib.parse import urlsplit
 
-from approval_helpers import approved_result
+from helpers import ROOT, ApprovingReviewer, load_evaluator
 from onionflash.config import DEFAULTS
 from onionflash.review import CRITERIA, _packet_refs, release_labels_match_state
 
-ROOT = Path(__file__).resolve().parents[1]
 TOOLS = Path(os.environ.get("REVIEW_EVAL_TOOLS") or ROOT / "tools")
 JUDGED = Path(os.environ.get("REVIEW_CASES_JUDGED") or TOOLS / "review_cases_judged.json")
 
@@ -37,15 +35,7 @@ DATE_KEYS = ("published_at", "updated_at", "added_at")
 RUN_STATE = {"snapshot", "captured_at", "editorial"}
 
 
-def evaluator():
-    spec = importlib.util.spec_from_file_location("review_eval_judged", TOOLS / "evaluate_review.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def strings(value, *, skip_ids=False):
-    """Every string in a JSON value, keys included; id values are left out on request."""
     if isinstance(value, dict):
         for key, item in value.items():
             yield key
@@ -59,7 +49,6 @@ def strings(value, *, skip_ids=False):
 
 
 def denied(texts, words):
-    """The tokens of texts that are listed, matching whole words and their letter runs."""
     found = set()
     for text in texts:
         folded = unicodedata.normalize("NFKC", text).casefold()
@@ -77,13 +66,11 @@ def torproject_https(url):
 
 
 def numbers(text):
-    """Dot-separated numbers without leading zeros, so 2026-11-09 yields 9 and 0.4.9.13 stays whole."""
     return {".".join(str(int(part)) for part in match.split("."))
             for match in NUMBER.findall(unicodedata.normalize("NFKC", text))}
 
 
 def upstream_numbers(packet):
-    """Every number in a packet, with each dotted number's leading parts: 0.4.9.15 also yields 0.4.9."""
     found = set()
     for number in numbers(json.dumps(packet, ensure_ascii=False)):
         parts = number.split(".")
@@ -98,26 +85,20 @@ def unexplained_numbers(text, known):
 
 
 def test_judged_corpus_is_public_and_labeled(tmp_path, monkeypatch, capsys):
-    """The judged file holds only public upstream text and labels the evaluator can score."""
-    module = evaluator()
+    module = load_evaluator(TOOLS, "review_eval_judged")
     kept, omitted = module.kept_unsupported, module.omitted
     assert JUDGED.stat().st_size <= module.MAX_FILE_BYTES
     raw = json.loads(JUDGED.read_text(encoding="utf-8"))
     controlled = json.loads((TOOLS / "review_cases.json").read_text(encoding="utf-8"))
     problems = []
 
-    # The loader: the controlled file's format and defaults, and ids unique across both files.
     assert set(raw) == {"description", "defaults", "packets", "cases", "coverage_sets"}
     assert raw["defaults"] == controlled["defaults"]
     cases = module.expand(raw)
-    assert module.draft_cases(raw)
-    assert 0 < len(cases) <= module.MAX_CASES
+    assert module.draft_cases(raw) and 0 < len(cases) <= module.MAX_CASES
     ids = [case["id"] for case in cases]
-    assert len(set(ids)) == len(ids)
-    assert not set(ids) & {case["id"] for case in controlled["cases"]}
+    assert len(set(ids)) == len(ids) and not (set(ids) & {case["id"] for case in controlled["cases"]})
 
-    # Public text. Sources are https torproject.org pages, e-mail addresses are list addresses
-    # (full-width at signs included), and no run state is kept.
     everything = list(strings(raw))
     if found := denied(everything, DENIED_ANYWHERE):
         problems.append(f"deployment, owner or private names present: {sorted(found)}")
@@ -129,19 +110,17 @@ def test_judged_corpus_is_public_and_labeled(tmp_path, monkeypatch, capsys):
         for source in packet["sources"]:
             if not torproject_https(source["url"]):
                 problems.append(f"packet {name}: source is not https torproject.org: {source['url']}")
-            notes = [passage for passage in source["passages"] if isinstance(passage, dict)]
-            problems.extend(f"packet {name}: note is not https torproject.org: {note['url']}"
-                            for note in notes if not torproject_https(note["url"]))
+            notes = [p for p in source["passages"] if isinstance(p, dict)]
+            problems.extend(f"packet {name}: note is not https torproject.org: {n['url']}"
+                            for n in notes if not torproject_https(n["url"]))
             if RUN_STATE & set(source):
                 problems.append(f"packet {name}: run-state field kept")
-    # The corpus's own text (everything outside the quoted packets) names no tools or labelers,
-    # links nowhere but torproject.org, holds no paths or stray ids, and its numbers are upstream ones.
-    own = [*raw["packets"], *strings({key: value for key, value in raw.items() if key != "packets"}, skip_ids=True)]
+
+    own = [*raw["packets"], *strings({k: v for k, v in raw.items() if k != "packets"}, skip_ids=True)]
     if found := denied(own, DENIED_IN_OWN_TEXT | DENIED_ANYWHERE):
         problems.append(f"tool, model or labeling words in the corpus's own text: {sorted(found)}")
     for text in own:
-        problems.extend(f"link outside torproject.org in own text: {url}" for url in URL.findall(text)
-                        if not torproject_https(url))
+        problems.extend(f"link outside torproject.org in own text: {u}" for u in URL.findall(text) if not torproject_https(u))
         if ABSOLUTE_PATH.search(text):
             problems.append(f"filesystem path in own text: {text[:80]!r}")
         if HEX_ID.search(text):
@@ -149,12 +128,11 @@ def test_judged_corpus_is_public_and_labeled(tmp_path, monkeypatch, capsys):
     if re.search(r"\d", raw["description"]):
         problems.append("the description carries a count or date")
 
-    # Labels and pairing.
     audits = {}
     for raw_case, case in zip(raw["cases"], cases):
         cid, flaw, expected = case["id"], case.get("flaw"), case["expected"]
         candidate, coverage = case["candidate"], case["existing_coverage"]
-        unsupported, forbidden, required = (case.get(key) for key in ("unsupported", "forbidden_classifications", "required"))
+        unsupported, forbidden, required = (case.get(k) for k in ("unsupported", "forbidden_classifications", "required"))
         if case.get("audit") not in AUDITS:
             problems.append(f"{cid}: audit {case.get('audit')!r} is not a known set")
         if flaw is not None and flaw not in module.FLAWS:
@@ -186,64 +164,46 @@ def test_judged_corpus_is_public_and_labeled(tmp_path, monkeypatch, capsys):
         if omitted(case, candidate) != (required or []):
             problems.append(f"{cid}: its required wording is not in its own candidate")
         payload = json.dumps({"candidate": candidate, "packet": case["packet"], "existing_coverage": coverage})
-        problems.extend(f"{cid}: label {label!r} reaches the model payload"
-                        for label in (cid, case.get("audit"), flaw) if label and label in payload)
+        problems.extend(f"{cid}: label {lbl!r} reaches the model payload"
+                        for lbl in (cid, case.get("audit"), flaw) if lbl and lbl in payload)
         if not _packet_refs(case["packet"]):
             problems.append(f"{cid}: the packet has no references")
-        for source in case["packet"]["sources"]:
-            authored = ["author" in passage for passage in source["passages"][1:]]
+        for src in case["packet"]["sources"]:
+            authored = ["author" in p for p in src["passages"][1:]]
             if authored != sorted(authored, reverse=True):
                 problems.append(f"{cid}: notes do not precede the description")
-        if any(set(row) != {"id", "title", "summary", "category", "state", "updated_at", "summary_truncated"}
-               for row in coverage["recent"]):
+        if any(set(r) != {"id", "title", "summary", "category", "state", "updated_at", "summary_truncated"}
+               for r in coverage["recent"]):
             problems.append(f"{cid}: coverage rows lack the compact background keys")
-        # Dates are corpus defaults or upstream dates, never run times; numbers come from the packet.
-        known = {value for source in case["packet"]["sources"] for value in
-                 [source.get("published_at"), source.get("updated_at"),
-                  *(passage.get("created_at") for passage in source["passages"])] if value}
-        known |= {raw["defaults"][key] for key in DATE_KEYS}
+        known = {v for src in case["packet"]["sources"] for v in
+                 [src.get("published_at"), src.get("updated_at"), *(p.get("created_at") for p in src["passages"])] if v}
+        known |= {raw["defaults"][k] for k in DATE_KEYS}
         stories = [candidate, *([coverage["prior_story"]] if coverage["prior_story"] else [])]
-        problems.extend(f"{cid}: {key} {story[key]} is neither a default nor an upstream date"
-                        for story in stories for key in DATE_KEYS if story.get(key) not in known)
-        own_text = "\n".join(story[key] for story in stories for key in ("title", "summary", "why_it_matters"))
-        for phrase in unsupported or []:  # an invented detail may be the flaw itself
+        problems.extend(f"{cid}: {k} {st[k]} is neither a default nor an upstream date"
+                        for st in stories for k in DATE_KEYS if st.get(k) not in known)
+        own_text = "\n".join(st[k] for st in stories for k in ("title", "summary", "why_it_matters"))
+        for phrase in unsupported or []:
             own_text = re.sub(re.escape(phrase), " ", own_text, flags=re.I)
         if extra := unexplained_numbers(own_text, upstream_numbers(case["packet"])):
             problems.append(f"{cid}: numbers that the packet does not hold: {extra}")
         if coverage["prior_story"] and coverage["prior_story"]["id"] != candidate["id"]:
             problems.append(f"{cid}: the prior story is not the same article as the update")
-        # Every flagged case has a clean twin on the same packet (twins pair by packet content),
-        # and no clean twin carries its flagged wording or labels.
-        clean_twins = [twin for twin in cases if twin["packet"] == case["packet"] and "flaw" not in twin]
+        clean_twins = [t for t in cases if t["packet"] == case["packet"] and "flaw" not in t]
         if flaw and not clean_twins:
             problems.append(f"{cid}: no clean twin on its packet, so it can never be a paired catch")
-        problems.extend(f"{cid}: its flagged wording or labels also occur in clean twin {twin['id']}"
-                        for twin in clean_twins if twin["id"] != cid and kept(case, twin["candidate"]))
-        problems.extend(f"{cid}: approve twin {twin['id']} lacks its required wording"
-                        for twin in clean_twins if twin["expected"] == "approve" and omitted(case, twin["candidate"]))
+        problems.extend(f"{cid}: its flagged wording or labels also occur in clean twin {t['id']}"
+                        for t in clean_twins if t["id"] != cid and kept(case, t["candidate"]))
+        problems.extend(f"{cid}: approve twin {t['id']} lacks its required wording"
+                        for t in clean_twins if t["expected"] == "approve" and omitted(case, t["candidate"]))
         negated, confirms = re.subn(r"\bconfirms?\b", "does not confirm", candidate["summary"])
         if confirms and kept(case, {"title": "", "summary": negated, "why_it_matters": ""}):
             problems.append(f"{cid}: the smallest negating repair still keeps its flagged wording")
-    problems.extend(f"audit set {audit} lacks flagged or clean cases"
-                    for audit, kinds in audits.items() if kinds != {"flagged", "clean"})
+    problems.extend(f"audit set {a} lacks flagged or clean cases" for a, kinds in audits.items() if kinds != {"flagged", "clean"})
     assert not problems, "\n".join(problems)
-
-    # evaluate() accepts every case. With every review approving, each clean case and stale-fact
-    # update publishes unchanged, and every other flagged case publishes its flaw.
-    class ApproveAll:
-        last_decoded = None
-        def __init__(self, *args, **kwargs):
-            pass
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            pass
-        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
-            return approved_result(packet)
 
     config = copy.deepcopy(DEFAULTS)
     config["storage"]["output_dir"] = str(tmp_path / "public")
-    monkeypatch.setattr(module, "EvaluationReviewer", ApproveAll)
+    monkeypatch.setattr(module, "EvaluationReviewer", ApprovingReviewer)
     summary = module.evaluate(config, cases, tmp_path / "private/report.jsonl")
     capsys.readouterr()
     judged = summary["judged"]

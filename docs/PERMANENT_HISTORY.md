@@ -85,22 +85,3 @@ Repeat while `articles_pending` is nonzero. A rebuild in progress is resumed
 rather than restarted. The catalog's last-good public snapshots permit recovery
 even when a later raw story revision is invalid. This works offline and requires
 no LLM calls.
-
-## Upgrade from the browser-script version
-
-Upgrade the application and deployment repositories together, then build until
-`no_browser_js_ready` is true and `articles_pending` is absent. The normal
-scheduler can continue those bounded builds; the new deployer holds publication
-until the transition is complete. It never activates a mixture of older
-script-dependent articles and the new asset set.
-
-The builder verifies the accepted article catalog and owned artifact hashes
-before retiring the old `app.js`. A modified or untracked script, unsafe path or
-unrepresented article blocks retirement instead of deleting unfamiliar data.
-Restore or inspect the affected output before retrying. The private metadata
-flag `publication_no_browser_js_ready` records the completed transition.
-
-Later bounded rebuilds resume normally. Their
-existing pages are already script-free. The deployer validates new HTML and
-serves a script-blocking CSP; old immutable storage objects and prior deployment
-versions remain available for rollback.

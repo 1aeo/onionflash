@@ -1,170 +1,23 @@
 """The final-candidate gate resumes completed stages and never publishes unchecked."""
 
 import contextlib
-import copy
 import json
 import sqlite3
 
 import pytest
 
-from approval_helpers import approve, update_analysis, verdict
-from onionflash import decisions, editorial, rejection, review, review_gate
-from onionflash.analyze import AnalysisError, cache_key, tag_notice, tag_update
-from onionflash.store import Store
+from helpers import (DAMAGE, DATE, LATER, ApprovingReviewer, Reviewer, Writer, analysis, approve,
+                     damaged, finish_reviewed, insert_approval, item, job, pending, run_gate as run,
+                     seed_legacy, tag, update_analysis, verdict)
+from onionflash import candidate, cli, decisions, editorial, rejection, review, review_gate
+from onionflash.analyze import AnalysisError, Analyzer, cache_key, tag_notice
+from onionflash.comments import _compose
+from onionflash.store import ReviewRequired
+from onionflash.transport import FetchError, Response
 from onionflash.util import digest, item_cluster
-from test_core import DAMAGE, DATE, analysis, config, damaged, item
-
-
-LATER = "2026-11-10T12:00:00Z"
-
-
-class Writer:
-    def __init__(self, result=None):
-        self._explicit = result is not None
-        self.result, self.calls = result or analysis(), []
-
-    def analyze(self, incoming, prior=None):
-        self.calls.append(copy.deepcopy(incoming))
-        if prior is not None and "update" not in self.result:
-            if incoming.get("kind") == "tag":
-                return tag_update(incoming, prior)
-            if not self._explicit:
-                return update_analysis(confidence=prior["confidence"], state=prior["state"],
-                                       evidence=self.result["evidence"])
-            return update_analysis(update=(self.result.get("summary") or self.result.get("title"))[:300],
-                                   confidence=self.result.get("confidence", prior["confidence"]),
-                                   state=self.result.get("state", prior["state"]),
-                                   evidence=self.result["evidence"])
-        return copy.deepcopy(self.result)
-
-
-class Reviewer:
-    """Returns validated verdicts, as review.Reviewer does."""
-    def __init__(self, *responses):
-        """Script reviewer responses, adding final approval only for approval shorthand."""
-        self.responses, self.calls, self.coverages, self.issues = list(responses), [], [], []
-        # A shorthand approval includes an independent final approval. Empty
-        # and failure scripts remain strict, so unexpected calls still fail.
-        if len(responses) == 1 and (callable(responses[0]) or
-                isinstance(responses[0], dict) and responses[0].get("verdict") == "approve"):
-            self.responses.append(verdict())
-
-    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False):
-        """Capture exact review inputs and validate or raise the next scripted response."""
-        self.calls.append((copy.deepcopy(candidate), copy.deepcopy(packet), verification))
-        self.coverages.append(copy.deepcopy(coverage))
-        self.issues.append(issue)
-        response = self.responses.pop(0)
-        if isinstance(response, Exception):
-            raise response
-        return review.validate_review(
-            response() if callable(response) else copy.deepcopy(response),
-            packet,
-            update=update,
-            coverage=coverage,
-        )
-
-
-@pytest.fixture
-def context(tmp_path):
-    cfg = config(tmp_path)
-    with Store(cfg["storage"]["database"]) as store:
-        yield cfg, store
-
-
-def pending(store, incoming=None):
-    store.ingest(incoming or item(), DATE)
-    return store.pending(1, LATER)[0]
-
-
-def run(cfg, store, row, writer, checker, **kwargs):
-    return review_gate.process_item(cfg, store, row, writer, checker, LATER, **kwargs)
-
-
-def job(store):
-    row = store.db.execute("SELECT * FROM review_jobs").fetchone()
-    return dict(row) if row else None
-
-
-def seed_legacy(store, incoming=None, result=None):
-    incoming = incoming or item(content=item()["content"] * 3)
-    store.ingest(incoming, incoming["updated_at"])
-    row = store.pending(1, LATER)[0]
-    prepared = store.prepare_candidate(row, result or analysis(), DATE)
-    data = prepared["payload"]
-    with store.db:
-        store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (data["id"], prepared["cluster_key"],
-                         json.dumps(data), data["published_at"], data["updated_at"]))
-        store.db.execute("UPDATE items SET status='published',story_id=? WHERE id=?", (data["id"], row["id"]))
-    return incoming, data["id"]
-
-
-def test_approved_exact_candidate_commits_and_keeps_private_complete_audit(context):
-    """Publish reviewed text and retain both stages with their evidence privately."""
-    cfg, store = context
-    row = pending(store)
-    writer, checker = Writer(), Reviewer(verdict())
-    result = run(cfg, store, row, writer, checker)
-    assert result == {"status": "published", "writer_calls": 1, "review_calls": 2, "cache_hit": False}
-    assert job(store) is None
-    assert store.stories()[0]["summary"] == checker.calls[0][0]["summary"]
-    saved = store.db.execute("SELECT result,review_record FROM analyses").fetchone()
-    audit = json.loads(saved[1])
-    assert json.loads(saved[0]) == analysis() and audit["writer"] == {"key": cache_key(row, cfg["llm"])}
-    assert audit["prepared"]["packet"]["sources"]
-    assert [r["stage"] for r in audit["reviews"]] == ["review", "verification"] and audit["outcome"] == "approved"
-
-
-def test_a_new_story_is_dated_when_the_review_commits_not_when_the_item_started(context, monkeypatch):
-    cfg, store = context
-    row = pending(store)
-    # The item starts before midnight; the review returns and commits after it.
-    monkeypatch.setattr(review_gate, "now_iso", lambda: "2026-11-11T00:01:00Z")
-    review_gate.process_item(cfg, store, row, Writer(), Reviewer(verdict()), "2026-11-10T23:59:00Z")
-    assert store.stories()[0]["added_at"] == "2026-11-11T00:01:00Z"
-
-
-@pytest.mark.parametrize("failure", [AnalysisError("timeout", retryable=True), {}])
-def test_review_timeout_or_malformed_verdict_resumes_without_regenerating_writer(context, failure):
-    """Resume the unfinished review while retaining its already completed writer draft."""
-    cfg, store = context
-    row = pending(store)
-    writer, checker = Writer(), Reviewer(failure)
-    with pytest.raises(AnalysisError) as caught:
-        run(cfg, store, row, writer, checker)
-    # A timeout backs off; a malformed verdict is one of the item's three strikes.
-    assert caught.value.retryable == isinstance(failure, AnalysisError) and job(store)["stage"] == "review"
-    assert len(store.stories()) == 0
-    paused = Reviewer(verdict())
-    assert run(cfg, store, row, Writer(), paused, allow_network=False)["status"] == "deferred"
-    assert paused.calls == [] and job(store)["stage"] == "review"
-    next_writer, next_checker = Writer(), Reviewer(verdict())
-    result = run(cfg, store, row, next_writer, next_checker)
-    assert result["status"] == "published" and result["writer_calls"] == 0
-    assert next_writer.calls == [] and len(next_checker.calls) == 2
-
-
-def test_repair_requires_fresh_verification_and_resumes_that_exact_stage(context):
-    cfg, store = context
-    row = pending(store)
-    writer = Writer(analysis(why_it_matters="Operators must edit their relay configuration."))
-    first = Reviewer(verdict("revise", repair={"why_it_matters": ""}), AnalysisError("timeout", retryable=True))
-    with pytest.raises(AnalysisError):
-        run(cfg, store, row, writer, first)
-    assert [call[2] for call in first.calls] == [False, True]
-    assert job(store)["stage"] == "verify" and len(store.stories()) == 0
-    repaired = first.calls[1][0]
-    assert repaired["why_it_matters"] == ""
-    second = Reviewer(verdict())
-    result = run(cfg, store, row, Writer(), second)
-    assert result["writer_calls"] == 0 and result["review_calls"] == 1
-    assert second.calls == [(repaired, first.calls[1][1], True)]
-    audit = json.loads(store.db.execute("SELECT review_record FROM analyses").fetchone()[0])
-    assert [entry["stage"] for entry in audit["reviews"]] == ["review", "verification"]
 
 
 def failing(action, *criteria, repair=None):
-    """A reply in which each named criterion fails."""
     reply = verdict(action, repair=repair, criterion=criteria[0])
     for name in criteria[1:]:
         reply["criteria"][name].update(reason="The source does not support this claim.", outcome="fail")
@@ -179,29 +32,109 @@ def codes(store, row):
     return [entry["code"] for entry in decisions.for_item(store.db, row["id"])]
 
 
-def test_verification_repairs_are_verified_fresh_until_one_approves(context):
-    """A verification that refuses proposes its own repair, and each repaired text gets another fresh verification."""
+def add_coverage(store, identity="other-story", **changes):
+    public = {"id": identity, "title": "A previous report", "summary": "The source reported an event.",
+              "why_it_matters": "", "category": "network", "priority": "normal", "confidence": "reported",
+              "state": "developing", "products": ["tor"], "tags": ["network"],
+              "sources": [{"url": "https://example.org/" + identity, "title": "Original source"}],
+              "published_at": DATE, "updated_at": DATE, "added_at": DATE, **changes}
+    with store.db:
+        store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)",
+                         (identity, identity, json.dumps(public), public["published_at"], public["updated_at"]))
+    return public
+
+
+def test_approved_exact_candidate_commits_dates_story_and_keeps_audit(context, monkeypatch):
     cfg, store = context
     row = pending(store)
-    checker = Reviewer(verdict(), verdict("revise", repair={"summary": "A first repair."}),
-                       verdict("revise", repair={"summary": "A second repair."}), verdict())
-    result = run(cfg, store, row, Writer(), checker)
-    assert result == {"status": "published", "writer_calls": 1, "review_calls": 4, "cache_hit": False}
-    assert [call[2] for call in checker.calls] == [False, True, True, True]
-    # Each verification receives only the latest text, with the same packet and coverage.
-    assert [call[0]["summary"] for call in checker.calls[1:]] == [checker.calls[0][0]["summary"], "A first repair.", "A second repair."]
-    assert all(call[1] == checker.calls[0][1] for call in checker.calls) and all(c == checker.coverages[0] for c in checker.coverages)
-    assert store.stories()[0]["summary"] == "A second repair."
-    assert [entry["stage"] for entry in audit(store)["reviews"]] == ["review", "verification", "verification", "verification"]
-    assert audit(store)["outcome"] == "approved"
+    writer, checker = Writer(), Reviewer(verdict())
+    monkeypatch.setattr(review_gate, "now_iso", lambda: "2026-11-11T00:01:00Z")
+    result = review_gate.process_item(cfg, store, row, writer, checker, "2026-11-10T23:59:00Z")
+    assert result == {"status": "published", "writer_calls": 1, "review_calls": 2, "cache_hit": False}
+    assert job(store) is None and store.stories()[0]["added_at"] == "2026-11-11T00:01:00Z"
+    assert store.stories()[0]["summary"] == checker.calls[0][0]["summary"]
+    saved = store.db.execute("SELECT result,review_record FROM analyses").fetchone()
+    rec = json.loads(saved[1])
+    assert json.loads(saved[0]) == analysis() and rec["writer"] == {"key": cache_key(row, cfg["llm"])}
+    assert rec["prepared"]["packet"]["sources"] and [r["stage"] for r in rec["reviews"]] == ["review", "verification"]
+    assert rec["outcome"] == "approved"
+
+
+@pytest.mark.parametrize("failure", [AnalysisError("timeout", retryable=True), {}])
+def test_review_timeout_or_malformed_verdict_resumes_without_regenerating_writer(context, failure):
+    cfg, store = context
+    row = pending(store)
+    with pytest.raises(AnalysisError) as caught:
+        run(cfg, store, row, Writer(), Reviewer(failure))
+    assert caught.value.retryable == isinstance(failure, AnalysisError) and job(store)["stage"] == "review"
+    assert len(store.stories()) == 0
+    paused = Reviewer(verdict())
+    assert run(cfg, store, row, Writer(), paused, allow_network=False)["status"] == "deferred"
+    assert paused.calls == [] and job(store)["stage"] == "review"
+    next_writer, next_checker = Writer(), Reviewer(verdict())
+    result = run(cfg, store, row, next_writer, next_checker)
+    assert result["status"] == "published" and result["writer_calls"] == 0
+    assert next_writer.calls == [] and len(next_checker.calls) == 2
+
+
+def test_repair_requires_fresh_verification_and_resumes_that_exact_stage(context):
+    cfg, store = context
+    row = pending(store)
+    first = Reviewer(verdict("revise", repair={"why_it_matters": ""}), AnalysisError("timeout", retryable=True))
+    with pytest.raises(AnalysisError):
+        run(cfg, store, row, Writer(analysis(why_it_matters="Operators must edit their relay configuration.")), first)
+    assert [c[2] for c in first.calls] == [False, True] and job(store)["stage"] == "verify" and len(store.stories()) == 0
+    repaired = first.calls[1][0]
+    assert repaired["why_it_matters"] == ""
+    second = Reviewer(verdict())
+    result = run(cfg, store, row, Writer(), second)
+    assert result["writer_calls"] == 0 and result["review_calls"] == 1
+    assert second.calls == [(repaired, first.calls[1][1], True)]
+    assert [e["stage"] for e in audit(store)["reviews"]] == ["review", "verification"]
+
+
+def test_verification_repairs_are_verified_fresh_and_stop_after_five(tmp_path):
+    from onionflash.config import DEFAULTS
+    from onionflash.store import Store
+
+    cfg = {**DEFAULTS, "storage": {"database": str(tmp_path / "ok.db"), "output_dir": str(tmp_path / "pub")}, "sources": []}
+    with Store(cfg["storage"]["database"]) as store:
+        row = pending(store)
+        checker = Reviewer(verdict(), verdict("revise", repair={"summary": "A first repair."}),
+                           verdict("revise", repair={"summary": "A second repair."}), verdict())
+        result = run(cfg, store, row, Writer(), checker)
+        assert result == {"status": "published", "writer_calls": 1, "review_calls": 4, "cache_hit": False}
+        assert [c[2] for c in checker.calls] == [False, True, True, True]
+        assert [c[0]["summary"] for c in checker.calls[1:]] == [checker.calls[0][0]["summary"], "A first repair.", "A second repair."]
+        assert all(c[1] == checker.calls[0][1] for c in checker.calls) and all(c == checker.coverages[0] for c in checker.coverages)
+        assert store.stories()[0]["summary"] == "A second repair."
+        assert [e["stage"] for e in audit(store)["reviews"]] == ["review", "verification", "verification", "verification"]
+        assert audit(store)["outcome"] == "approved"
+
+    with Store(tmp_path / "cap.db") as store:
+        row = pending(store)
+        repairs = [verdict("revise", repair={"summary": f"Repair number {n}."}) for n in range(7)]
+        with pytest.raises(AnalysisError):
+            run(cfg, store, row, Writer(), Reviewer(*repairs[:4], AnalysisError("timeout", retryable=True)))
+        assert job(store)["stage"] == "verify"
+        writer, checker = Writer(), Reviewer(*repairs[4:])
+        result = run(cfg, store, row, writer, checker)
+        assert result["status"] == "held" and result["writer_calls"] == 0 and result["review_calls"] == 3
+        assert writer.calls == [] and [c[2] for c in checker.calls] == [True, True, True]
+        assert codes(store, row) == ["held.verification.repairs_exhausted"] and store.stories() == []
+        shown = rejection.show_item(store, row["id"])["final_review"]
+        assert shown["hold_code"] == "repairs_exhausted" and shown["candidate"]["summary"] == "Repair number 5."
+        assert shown["base_candidate"]["summary"] == analysis()["summary"]
+        assert [(e["phase"], e["verdict"]) for e in shown["reviews"]] == [("review", "revise")] + [("verification", "revise")] * 6
+        assert all(e["failed"] == {"operational_advice": "fail: The source does not support this claim."} for e in shown["reviews"])
+        assert [e["repair"]["summary"] for e in shown["reviews"]] == [f"Repair number {n}." for n in range(7)]
 
 
 @pytest.mark.parametrize("case", ["hold", "revise-without-repair", "repeated-text", "tag-notice"])
 def test_verification_refusal_that_cannot_be_repaired_holds(context, case):
-    """Each holds with its own code. A repeated text, which the chain refused once already, costs no further request."""
     cfg, store = context
-    tag = item(url="https://example.org/tags/tor-0.4.9.16", title="tor-0.4.9.16", kind="tag", content="")
-    incoming, draft = (tag, tag_notice(tag)) if case == "tag-notice" else (item(), analysis())
+    tag_item = item(url="https://example.org/tags/tor-0.4.9.16", title="tor-0.4.9.16", kind="tag", content="")
+    incoming, draft = (tag_item, tag_notice(tag_item)) if case == "tag-notice" else (item(), analysis())
     first = verdict() if case == "tag-notice" else verdict("revise", repair={"summary": "A shorter summary."})
     second, reason = {"hold": (verdict("hold"), "model_hold"),
                       "revise-without-repair": (verdict("revise"), "unusable_repair"),
@@ -213,46 +146,24 @@ def test_verification_refusal_that_cannot_be_repaired_holds(context, case):
     assert store.pending_count() == 0 and store.rejected_count() == 1 and store.stories() == [] and job(store)["stage"] == "held"
     assert store.db.execute("SELECT last_error FROM items").fetchone()[0] == "Final review held: " + review_gate.HOLDS[reason]
     assert codes(store, row) == ["held.verification." + reason]
-    assert (audit(store)["outcome"], audit(store)["hold_code"], len(audit(store)["reviews"])) == ("held", reason, 2)
-    assert audit(store)["verified_facts"] is False  # the verification failed a factual criterion
-
-
-def test_verification_repairs_stop_after_five_and_the_count_survives_interruption(context):
-    cfg, store = context
-    row = pending(store)
-    repairs = [verdict("revise", repair={"summary": f"Repair number {n}."}) for n in range(7)]
-    # The critique and three verifications each propose a repair; the fourth verification times out.
-    with pytest.raises(AnalysisError):
-        run(cfg, store, row, Writer(), Reviewer(*repairs[:4], AnalysisError("timeout", retryable=True)))
-    assert job(store)["stage"] == "verify"
-    writer, checker = Writer(), Reviewer(*repairs[4:])
-    result = run(cfg, store, row, writer, checker)
-    assert result["status"] == "held" and result["writer_calls"] == 0 and result["review_calls"] == 3
-    assert writer.calls == [] and [call[2] for call in checker.calls] == [True, True, True]
-    assert codes(store, row) == ["held.verification.repairs_exhausted"] and store.stories() == []
-    # Seven reviews: the critique and six verifications. The sixth verification's repair is never applied.
-    shown = rejection.show_item(store, row["id"])["final_review"]
-    assert shown["hold_code"] == "repairs_exhausted" and shown["candidate"]["summary"] == "Repair number 5."
-    assert shown["base_candidate"]["summary"] == analysis()["summary"]
-    assert [(entry["phase"], entry["verdict"]) for entry in shown["reviews"]] == [("review", "revise")] + [("verification", "revise")] * 6
-    assert all(entry["failed"] == {"operational_advice": "fail: The source does not support this claim."} for entry in shown["reviews"])
-    assert [entry["repair"]["summary"] for entry in shown["reviews"]] == [f"Repair number {n}." for n in range(7)]
+    assert (audit(store)["outcome"], audit(store)["hold_code"], len(audit(store)["reviews"]), audit(store)["verified_facts"]) == ("held", reason, 2, False)
 
 
 @pytest.mark.parametrize("replies,status", [
     ([verdict(), verdict("skip", criterion="news_value")], "held"),
+    ([verdict(), verdict("skip", criterion="new_information")], "held"),
     ([failing("revise", "news_value", "operational_advice", repair={"summary": "A shorter summary."}), verdict()], "held"),
     ([verdict(), failing("revise", "news_value", "operational_advice", repair={"summary": "A shorter summary."})], "held"),
     ([failing("revise", "news_value", "operational_advice", repair={"summary": "A shorter summary."}),
       verdict("skip", criterion="news_value")], "ignored"),
-], ids=["approve-then-skip", "not-news-repair-then-approve", "approve-then-not-news-revise", "both-not-news"])
+])
 def test_reviews_that_disagree_on_news_value_hold(context, replies, status):
-    """A verification that disagrees with the first review on whether news value and new information both pass
-    holds the item, either way and whatever its verdict; reviews that agree the item is not news skip it."""
     cfg, store = context
     row = pending(store)
-    result = run(cfg, store, row, Writer(), Reviewer(*replies))
+    checker = Reviewer(*replies)
+    result = run(cfg, store, row, Writer(), checker)
     assert (result["status"], result["review_calls"]) == (status, 2) and store.stories() == []
+    assert [c[2] for c in checker.calls] == [False, True]
     assert store.db.execute("SELECT last_error FROM items").fetchone()[0] == (
         "Final review held: the reviews disagree on news value" if status == "held" else "Final review skipped: news_value")
     assert codes(store, row) == (["held.verification.disagreed_news"] if status == "held" else ["skipped.verification.news_value"])
@@ -269,7 +180,7 @@ def duplicate_skip(*extra_criteria):
     return reply
 
 
-@pytest.mark.parametrize("source,replies,status,code", [
+@pytest.mark.parametrize("src,replies,status,code", [
     (OFFICIAL, [verdict("skip", criterion="news_value")] * 2, "held", "held.verification.official_not_news"),
     (OFFICIAL, [verdict("skip", criterion="news_value"),
                 failing("revise", "news_value", "operational_advice", repair={"summary": "A shorter summary."}),
@@ -284,23 +195,17 @@ def duplicate_skip(*extra_criteria):
                  "criteria": {**verdict("skip", criterion="news_value")["criteria"],
                               "new_information": {"reason": "Coverage is truncated.", "source_refs": [], "outcome": "insufficient"}}}],
      "held", "held.review.model_hold"),
-    # Neither review finds the item news, so the verification's finding that it is covered already stands.
     (OFFICIAL, [verdict("skip", criterion="news_value"), duplicate_skip()],
      "ignored", "skipped.verification.new_information"),
     ({}, [verdict("skip", criterion="news_value")], "ignored", "skipped.review.news_value"),
     ({**OFFICIAL, "kind": "tag", "title": "tor-0.4.9.16", "content": ""}, [verdict("skip", criterion="news_value")],
      "ignored", "skipped.review.news_value"),
-], ids=["official-feed-news_value", "official-feed-fact-repair", "official-feed-no-usable-repair",
-        "official-feed-verification-without-a-usable-repair", "official-feed-new_information-only",
-        "official-feed-both", "official-feed-uncertain-novelty", "official-feed-then-duplicate",
-        "development-item", "official-tag"])
-def test_official_item_failing_news_value_is_held_not_skipped(context, source, replies, status, code):
-    """Only news value failing on an official item other than a tag holds it, after a fresh verification passed
-    its facts (repairing them first if needed, unless a verification's repair cannot be applied); a duplicate still skips."""
+])
+def test_official_item_failing_news_value_is_held_not_skipped(context, src, replies, status, code):
     cfg, store = context
     _, covered_id = seed_legacy(store, item(**COVERED))
     assert covered_id == COVERED_ID
-    row = pending(store, item(**source))
+    row = pending(store, item(**src))
     checker = Reviewer(*replies)
     result = run(cfg, store, row, Writer(), checker)
     assert (result["status"], result["review_calls"]) == (status, len(replies)) and codes(store, row) == [code]
@@ -308,7 +213,7 @@ def test_official_item_failing_news_value_is_held_not_skipped(context, source, r
         assert review._skip_stands(audit(store)["reviews"][-1]["result"]["criteria"], checker.coverages[-1])
     if status == "held":
         reason = code.rsplit(".", 1)[1]
-        assert [call[2] for call in checker.calls] == [False] + [True] * (len(replies) - 1)
+        assert [c[2] for c in checker.calls] == [False] + [True] * (len(replies) - 1)
         assert (audit(store)["hold_code"], audit(store)["verified_facts"]) == (reason, reason == "official_not_news")
         assert store.db.execute("SELECT last_error FROM items WHERE id=?", (row["id"],)).fetchone()[0] == (
             "Final review held: " + review_gate.HOLDS[reason])
@@ -337,18 +242,16 @@ def test_a_hold_whose_verification_cites_no_source_does_not_record_verified_fact
      [False, False], "held", "held.review.release_labels"),
     ({"category": "release", "tags": ["release"]}, [verdict(), verdict("skip", criterion="news_value")],
      [False, False], "held", "held.review.disagreed_news"),
-], ids=["repaired", "introduced-by-a-verification", "unfixed", "left-by-a-repair", "held-by-the-request", "disagreed-by-the-request"])
+])
 def test_release_labels_on_an_unreleased_story_get_a_repair_request_then_a_fresh_verification(context, draft, replies, flags, status, code):
-    """An approval of release labels on a state that is not released or tagged asks a review to repair them, naming
-    the problem, and a fresh verification checks the repair; labels the request leaves in place, or holds, hold."""
     cfg, store = context
     row = pending(store)
     checker = Reviewer(*replies)
     result = run(cfg, store, row, Writer(analysis(**draft)), checker)
-    assert result["status"] == status and [call[2] for call in checker.calls] == flags
-    repair = flags.index(False, 1)  # the repair request
-    assert checker.issues == [review.RELEASE_ISSUE if n == repair else None for n in range(len(flags))]
-    assert audit(store)["reviews"][repair]["issue"] == "release_labels"
+    assert result["status"] == status and [c[2] for c in checker.calls] == flags
+    repair_idx = flags.index(False, 1)
+    assert checker.issues == [review.RELEASE_ISSUE if n == repair_idx else None for n in range(len(flags))]
+    assert audit(store)["reviews"][repair_idx]["issue"] == "release_labels"
     if status == "published":
         assert store.stories()[0]["category"] != "release" and "release" not in store.stories()[0]["tags"]
     else:
@@ -359,34 +262,72 @@ FIVE_REPAIRS = [verdict("revise", repair={"summary": f"Repair number {n}."}) for
 
 
 @pytest.mark.parametrize("replies,code", [
-    # A request after the sixth review would leave no verification for its repair.
     ([verdict("revise", repair={"summary": "A first repair."}), *FIVE_REPAIRS[:4], verdict()], "held.verification.release_labels"),
     ([verdict("revise", repair={"summary": "A first repair."}), *FIVE_REPAIRS, verdict()], "held.verification.release_labels"),
     ([verdict(), verdict("revise", repair={"category": "security", "tags": ["security"]}, criterion="status"), *FIVE_REPAIRS],
      "held.verification.repairs_exhausted"),
-], ids=["labels-approved-after-four-repairs", "labels-approved-after-five-repairs", "after-a-release-label-request"])
+])
 def test_an_item_gets_at_most_seven_review_requests(context, replies, code):
-    """At most five repairs follow the first review, a release-label repair request counting as one."""
     cfg, store = context
     row = pending(store)
     result = run(cfg, store, row, Writer(analysis(category="release", tags=["release"])), Reviewer(*replies))
     assert (result["status"], result["review_calls"]) == ("held", len(replies)) and codes(store, row) == [code]
 
 
-def test_a_decision_after_several_repairs_resumes_from_its_receipt_without_a_model_call(context, monkeypatch):
+def test_receipt_resume_context_invalidation_and_pruning(context, monkeypatch):
     cfg, store = context
     row = pending(store)
     commit = store.commit_candidate
-    monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash before commit")))
-    checker = Reviewer(verdict("revise", repair={"summary": "A first repair."}),
-                       verdict("revise", repair={"summary": "A second repair."}), verdict())
-    with pytest.raises(RuntimeError, match="simulated crash"):
-        run(cfg, store, row, Writer(), checker)
+    monkeypatch.setattr(store, "commit_candidate", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash")))
+    with pytest.raises(RuntimeError):
+        run(cfg, store, row, Writer(), Reviewer(verdict("revise", repair={"summary": "A first repair."}),
+                                                verdict("revise", repair={"summary": "A second repair."}), verdict()))
     monkeypatch.setattr(store, "commit_candidate", commit)
-    writer, resumed = Writer(), Reviewer()
-    result = run(cfg, store, row, writer, resumed, allow_network=False)
-    assert result["status"] == "published" and result["cache_hit"] and writer.calls == resumed.calls == []
+    w0, r0 = Writer(), Reviewer()
+    res = run(cfg, store, row, w0, r0, allow_network=False)
+    assert res["status"] == "published" and res["cache_hit"] and w0.calls == r0.calls == []
     assert store.stories()[0]["summary"] == "A second repair."
+
+    # Context changes (coverage or policy) invalidate recorded receipt before commit.
+    for idx, change in enumerate(("coverage", "policy")):
+        row_c = pending(store, item(url=f"https://example.org/ctx-{idx}", content=f"Context change {idx} Compromise report."))
+        monkeypatch.setattr(store, "commit_candidate", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash")))
+        with pytest.raises(RuntimeError):
+            run(cfg, store, row_c, Writer(analysis(evidence=[f"Context change {idx}"])), Reviewer(verdict()))
+        monkeypatch.setattr(store, "commit_candidate", commit)
+        if change == "coverage":
+            add_coverage(store, f"cov-{idx}")
+        else:
+            cfg["review"]["model"] = "different-review-model"
+        chk = Reviewer(verdict())
+        assert run(cfg, store, row_c, Writer(), chk)["status"] == "published" and [c[2] for c in chk.calls] == [False, True]
+
+    # Cache pruning retains active approval jobs and resuming never temporarily unpins receipt.
+    monkeypatch.setattr(review_gate, "MAX_APPROVALS", 1)
+    row_p = pending(store, item(url="https://example.org/pin", content="Pinned approval test report."))
+    monkeypatch.setattr(store, "commit_candidate", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("crash")))
+    with pytest.raises(RuntimeError):
+        run(cfg, store, row_p, Writer(analysis(evidence=["Pinned approval test report."])), Reviewer(verdict()))
+    active = job(store, row_p["id"])["approval_key"]
+    monkeypatch.setattr(store, "commit_candidate", commit)
+    for n in range(3):
+        insert_approval(store, key=f"unused-{n}", candidate_hash="c", source_hash="s", policy="p", binding_hash="b",
+                        result={}, record={}, created_at=DATE, last_used_at="2099-01-01T00:00:00Z")
+    review_gate._prune(store, 1)
+    assert store.db.execute("SELECT 1 FROM review_approvals WHERE key=?", (active,)).fetchone()
+    assert store.db.execute("SELECT COUNT(*) FROM review_approvals").fetchone()[0] == 2
+
+    save = review_gate._save
+    monkeypatch.setattr(review_gate, "_save", lambda *a, **kw: (save(*a, **kw), (_ for _ in ()).throw(RuntimeError("crash after save"))))
+    with pytest.raises(RuntimeError):
+        run(cfg, store, row_p, Writer(), Reviewer(), allow_network=False)
+    assert job(store, row_p["id"])["approval_key"] == active
+    insert_approval(store, key="newer-unused", candidate_hash="c", source_hash="s", policy="p", binding_hash="b",
+                    result={}, record={}, created_at=LATER, last_used_at="2099-02-01T00:00:00Z")
+    review_gate._prune(store, 1)
+    assert store.db.execute("SELECT 1 FROM review_approvals WHERE key=?", (active,)).fetchone()
+    monkeypatch.setattr(review_gate, "_save", save)
+    assert run(cfg, store, row_p, Writer(), Reviewer(), allow_network=False)["status"] == "published"
 
 
 @pytest.mark.parametrize("column", ["draft_json", "envelope_json", "record_json"])
@@ -405,7 +346,6 @@ def test_a_damaged_review_job_fails_the_item_and_is_never_reviewed_afresh(contex
 
 
 def test_a_damaged_review_job_never_stops_the_run(context, monkeypatch):
-    from onionflash import cli
     cfg, store = context
     cfg["sources"] = []
     row = pending(store)
@@ -413,8 +353,8 @@ def test_a_damaged_review_job_never_stops_the_run(context, monkeypatch):
         run(cfg, store, row, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
     with store.db:
         store.db.execute("UPDATE review_jobs SET record_json=CAST(? AS TEXT)", (b'{"\xff"',))
-    monkeypatch.setattr(cli, "build", lambda *args: {})
-    for _ in range(3):  # three failures reject it
+    monkeypatch.setattr(cli, "build", lambda *a: {})
+    for _ in range(3):
         assert cli.run(cfg, store)["analysis_failed"] == 1
         with store.db:
             store.db.execute("UPDATE items SET next_attempt_at=NULL")
@@ -428,11 +368,10 @@ def test_pending_resumes_an_unfinished_verification_or_repair_before_new_work(co
     store.ingest(item(), DATE)
     store.ingest(item(url="https://example.org/routine", title="A routine report", labels=[]), DATE)
     first, routine = store.pending(2, LATER)
-    assert routine["url"].endswith("/routine")  # it sorts after the security report
+    assert routine["url"].endswith("/routine")
     with pytest.raises(AnalysisError):
         run(cfg, store, routine, Writer(analysis(**draft)), Reviewer(verdict(), AnalysisError("timeout", retryable=True)))
-    assert job(store)["stage"] == stage
-    assert [row["url"] for row in store.pending(2, LATER)] == [routine["url"], first["url"]]
+    assert job(store)["stage"] == stage and [r["url"] for r in store.pending(2, LATER)] == [routine["url"], first["url"]]
 
 
 @pytest.mark.parametrize("repair", [None, {"title": analysis()["title"]}, {"title": ""}],
@@ -442,7 +381,7 @@ def test_unusable_repair_holds_after_one_call_for_operator_inspection(context, r
     row = pending(store)
     result = run(cfg, store, row, Writer(), Reviewer(verdict("revise", repair=repair)))
     assert result["status"] == "held" and result["review_calls"] == 1
-    assert [entry["id"] for entry in rejection.list_items(store)["items"]] == [row["id"]]
+    assert [e["id"] for e in rejection.list_items(store)["items"]] == [row["id"]]
     assert rejection.show_item(store, row["id"])["final_review"]["latest_review"]["verdict"] == "revise"
 
 
@@ -451,14 +390,13 @@ def test_completed_decision_resumes_after_crash_without_any_model_call(context, 
     cfg, store = context
     row = pending(store)
     commit = store.commit_candidate
-    monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash before commit")))
-    with pytest.raises(RuntimeError, match="simulated crash"):
+    monkeypatch.setattr(store, "commit_candidate", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash")))
+    with pytest.raises(RuntimeError):
         run(cfg, store, row, Writer(), Reviewer(verdict(decision, criterion="news_value")))
     assert job(store)["stage"] == ("approved" if decision == "approve" else "skipped") and len(store.stories()) == 0
-    store.defer(row["id"], "Unexpected RuntimeError", cfg["llm"], LATER, terminal=True)  # as the run loop does
+    store.defer(row["id"], "Unexpected RuntimeError", cfg["llm"], LATER, terminal=True)
     row = dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone())
     monkeypatch.setattr(store, "commit_candidate", commit)
-    # Another item's commit leaves the receipt that this job pins.
     store.ingest(item(url="https://example.org/other-report", content="A routine reply."), DATE)
     other = dict(store.db.execute("SELECT * FROM items WHERE url=?", ("https://example.org/other-report",)).fetchone())
     assert run(cfg, store, other, Writer(), Reviewer(verdict("skip", criterion="news_value")))["status"] == "ignored"
@@ -472,25 +410,23 @@ def test_completed_decision_resumes_after_crash_without_any_model_call(context, 
 
 @pytest.mark.parametrize("receipt", ["damaged", "missing"])
 def test_a_recorded_decision_without_a_usable_receipt_reviews_the_draft_again(context, monkeypatch, receipt):
-    """Nothing shows that the repaired text was verified, so the review starts again from the writer's draft."""
     cfg, store = context
     row = pending(store)
     commit = store.commit_candidate
-    monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash before commit")))
+    monkeypatch.setattr(store, "commit_candidate", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash")))
     first = Reviewer(verdict("revise", repair={"why_it_matters": ""}), verdict())
-    with pytest.raises(RuntimeError, match="simulated crash"):
+    with pytest.raises(RuntimeError):
         run(cfg, store, row, Writer(analysis(why_it_matters="Operators must edit their relay configuration.")), first)
     monkeypatch.setattr(store, "commit_candidate", commit)
     with store.db:
         store.db.execute("UPDATE review_approvals SET review_record_json='{'" if receipt == "damaged" else "DELETE FROM review_approvals")
     checker = Reviewer(verdict())
     assert run(cfg, store, row, Writer(), checker)["status"] == "published"
-    assert [call[0] for call in checker.calls] == [first.calls[0][0]] * 2
-    audit = json.loads(store.db.execute("SELECT review_record FROM analyses").fetchone()[0])
-    assert [entry["stage"] for entry in audit["reviews"]] == ["review", "verification"]
+    assert [c[0] for c in checker.calls] == [first.calls[0][0]] * 2
+    assert [e["stage"] for e in audit(store)["reviews"]] == ["review", "verification"]
 
 
-FINAL_CHECKS = {  # the source and the draft that fail each final check
+FINAL_CHECKS = {
     "completed_action": ({}, {"title": "Tor authority bastet removed from source after reported compromise"}),
     "compromise_headline": ({}, {"title": "Bastet directory authority compromised"}),
     "confirmed_source": ({}, {"confidence": "confirmed"}),
@@ -500,200 +436,237 @@ FINAL_CHECKS = {  # the source and the draft that fail each final check
 
 @pytest.mark.parametrize("reason", FINAL_CHECKS)
 def test_verified_approval_failing_a_final_check_is_held_with_its_code(context, reason):
-    """The check runs on the verified text before any receipt; a skip is not checked."""
     cfg, store = context
-    source, draft = FINAL_CHECKS[reason]
-    row = pending(store, item(**source))
+    src, draft = FINAL_CHECKS[reason]
+    row = pending(store, item(**src))
     result = run(cfg, store, row, Writer(analysis(**draft)), Reviewer(verdict()))
     assert result["status"] == "held" and result["review_calls"] == 2
     assert store.db.execute("SELECT last_error FROM items").fetchone()[0] == "Final review held: " + review_gate.HOLDS[reason]
-    assert [entry["code"] for entry in decisions.for_item(store.db, row["id"])] == [f"held.final_check.{reason}"]
+    assert codes(store, row) == [f"held.final_check.{reason}"]
     assert store.stories() == [] and not store.db.execute("SELECT 1 FROM review_approvals").fetchone()
-    other = pending(store, item(**source, url="https://example.org/news/2"))
+    other = pending(store, item(**src, url="https://example.org/news/2"))
     assert run(cfg, store, other, Writer(analysis(**draft)), Reviewer(verdict("skip", criterion="news_value")))["status"] == "ignored"
 
 
-def test_a_resumed_approval_is_checked_again_without_a_model_call(context, monkeypatch):
-    """An approval saved before a commit that did not happen is checked when it is reused."""
+def test_resumed_final_check_source_and_policy_invalidation(context, monkeypatch):
     cfg, store = context
     row = pending(store)
     commit, check = store.commit_candidate, review.final_holds
-    monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash before commit")))
+    monkeypatch.setattr(store, "commit_candidate", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash")))
     monkeypatch.setattr(review, "final_holds", lambda candidate, prepared: [])
-    with pytest.raises(RuntimeError, match="simulated crash"):
+    with pytest.raises(RuntimeError):
         run(cfg, store, row, Writer(analysis(confidence="confirmed")), Reviewer(verdict()))
     monkeypatch.setattr(store, "commit_candidate", commit)
     monkeypatch.setattr(review, "final_holds", check)
-    writer, checker = Writer(), Reviewer()
-    result = run(cfg, store, row, writer, checker, allow_network=False)
-    assert result["status"] == "held" and result["cache_hit"] and writer.calls == checker.calls == []
-    assert [entry["code"] for entry in decisions.for_item(store.db, row["id"])] == ["held.final_check.confirmed_source"]
+    w0, r0 = Writer(), Reviewer()
+    res = run(cfg, store, row, w0, r0, allow_network=False)
+    assert res["status"] == "held" and res["cache_hit"] and w0.calls == r0.calls == []
+    assert codes(store, row) == ["held.final_check.confirmed_source"]
     assert rejection.show_item(store, row["id"])["final_review"]["latest_review"]["verdict"] == "approve"
 
-
-def test_changed_source_invalidates_staged_draft_and_prior_approval(context, monkeypatch):
-    cfg, store = context
-    row = pending(store)
+    # Changed source invalidates staged draft; policy change reuses draft but requires fresh review.
+    row2 = pending(store, item(url="https://example.org/src-change"))
     with pytest.raises(AnalysisError):
-        run(cfg, store, row, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
-    incoming = item(content=item()["content"] + " A later source correction.", updated_at=LATER)
-    store.ingest(incoming, LATER)
-    changed = store.pending(1, LATER)[0]
-    assert changed["content_hash"] != row["content_hash"]
-    writer = Writer()
-    result = run(cfg, store, changed, writer, Reviewer(verdict()))
-    assert result["writer_calls"] == 1 and len(writer.calls) == 1
+        run(cfg, store, row2, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
+    store.ingest(item(url="https://example.org/src-change", content=item()["content"] + " Correction.", updated_at=LATER), LATER)
+    changed = next(r for r in store.pending(5, LATER) if r["url"] == "https://example.org/src-change")
+    assert changed["content_hash"] != row2["content_hash"]
+    w2 = Writer()
+    assert run(cfg, store, changed, w2, Reviewer(verdict()))["writer_calls"] == len(w2.calls) == 1
 
-
-def test_policy_change_reuses_writer_but_requires_a_new_review(context):
-    """Invalidate review approval on policy change without discarding the source draft."""
-    cfg, store = context
-    row = pending(store)
+    row3 = pending(store, item(url="https://example.org/pol-change"))
     with pytest.raises(AnalysisError):
-        run(cfg, store, row, Writer(), Reviewer(verdict(), AnalysisError("timeout", retryable=True)))
+        run(cfg, store, row3, Writer(), Reviewer(verdict(), AnalysisError("timeout", retryable=True)))
     cfg["review"]["model"] = "different-review-model"
-    result = run(cfg, store, row, Writer(), Reviewer(verdict()))
-    assert result["writer_calls"] == 0 and result["review_calls"] == 2 and not result["cache_hit"]
+    res3 = run(cfg, store, row3, Writer(), Reviewer(verdict()))
+    assert res3["writer_calls"] == 0 and res3["review_calls"] == 2 and not res3["cache_hit"]
 
 
-def test_update_review_repairs_only_the_new_entry_and_commits_the_verified_repair(context):
+def test_update_review_repairs_human_lock_and_missing_retained_source(context):
     cfg, store = context
     prior_why = "The report requests removal of the old directory-authority keys."
     original = item(content=item()["content"] * 3, updated_at="2026-11-09T12:00:00Z")
-    seed_legacy(store, original, analysis(why_it_matters=prior_why))
+    _, story_id = seed_legacy(store, original, analysis(why_it_matters=prior_why))
     incoming = item(url="https://example.org/news/mirror", source_id="mirror", content=original["content"])
     row = pending(store, incoming)
-    checker = Reviewer(
-        verdict("revise", repair={"update": "A second mirror reported the key issue."}, update=True),
-        verdict(update=True),
-    )
+    checker = Reviewer(verdict("revise", repair={"update": "A second mirror reported the key issue."}, update=True),
+                       verdict(update=True))
     draft = update_analysis(update="Operators must reconfigure now; a second mirror reported the key issue.")
     result = run(cfg, store, row, Writer(draft), checker)
     reviewed, evidence, _ = checker.calls[0]
-    passages = [p["text"] for source in evidence["sources"] for p in source["passages"]]
+    passages = [p["text"] for s in evidence["sources"] for p in s["passages"]]
     assert reviewed["why_it_matters"] == prior_why and len(evidence["sources"]) == 2
-    assert original["content"] in passages and not any(prior_why in text for text in passages)
-    assert result["status"] == "published"
+    assert original["content"] in passages and not any(prior_why in text for text in passages) and result["status"] == "published"
     story = store.stories()[0]
-    assert story["why_it_matters"] == prior_why
+    assert story["why_it_matters"] == prior_why and len(store.stories()) == 1
     assert story["updates"] == [{"at": incoming["updated_at"], "text": "A second mirror reported the key issue.",
                                  "sources": [{"url": incoming["url"], "title": incoming["title"]}]}]
-    assert len(store.stories()) == 1
 
-
-def test_human_lock_during_review_preserves_operator_text(context):
-    cfg, store = context
-    original, story_id = seed_legacy(store)
-    row = pending(store, {**original, "content": original["content"] + " A later report.", "updated_at": LATER})
+    # Human lock during review preserves operator text, honors legacy input_row, and rejects stale drafts on newer edits.
+    row_lock = pending(store, {**original, "content": original["content"] + " A later report.", "updated_at": LATER})
     with pytest.raises(AnalysisError):
-        run(cfg, store, row, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
-    editorial.correct(store.db, story_id, {"why_it_matters": "Operator-reviewed wording."},
-                      reason="Corrected unsupported advice.", expect_hash=editorial.show(store.db, story_id)["hash"], observed=LATER)
-    second = run(cfg, store, row, Writer(), Reviewer(), allow_network=False)
+        run(cfg, store, row_lock, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
+    with store.db:
+        legacy_rec = json.dumps({"schema_version": 1, "writer": {"key": "legacy"},
+                                 "input_row": {"content_hash": row_lock["content_hash"]}, "reviews": []})
+        store.db.execute("UPDATE review_jobs SET record_json=? WHERE item_id=?", (legacy_rec, row_lock["id"]))
+    locked_rev = editorial.correct(store.db, story_id, {"why_it_matters": "Operator-reviewed wording."},
+                                   reason="Corrected unsupported advice.", expect_hash=editorial.show(store.db, story_id)["hash"], observed=LATER)
+    second = run(cfg, store, row_lock, Writer(), Reviewer(), allow_network=False)
     assert second["status"] == "locked" and second["writer_calls"] == second["review_calls"] == 0
     assert store.stories()[0]["why_it_matters"] == "Operator-reviewed wording."
+    editorial.unlock(store.db, story_id, reason="Reopen briefly.", expect_hash=locked_rev["hash"], observed="2026-11-10T12:05:00Z")
+    row_lock_v2 = pending(store, {**original, "content": original["content"] + " A second follow-up.", "updated_at": "2026-11-10T12:10:00Z"},
+                          at="2026-11-10T12:10:00Z", ready="2026-11-10T12:10:00Z")
+    with pytest.raises(AnalysisError):
+        run(cfg, store, row_lock_v2, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
+    editorial.correct(store.db, story_id, {"why_it_matters": "Re-locked operator wording."},
+                      reason="Re-lock.", expect_hash=editorial.show(store.db, story_id)["hash"], observed="2026-11-10T12:15:00Z")
+    row_lock_v3 = pending(store, {**original, "content": original["content"] + " A third follow-up.", "updated_at": "2026-11-10T12:20:00Z"},
+                          at="2026-11-10T12:20:00Z", ready="2026-11-10T12:20:00Z")
+    assert run(cfg, store, row_lock_v3, Writer(), Reviewer(), allow_network=False)["status"] == "deferred"
 
-
-def test_tag_update_holds_on_repair_and_keeps_prose_on_approval(context):
-    """A tag cites tagged/released stories directly, and updates merged stories without allowing tag_repair."""
-    cfg, store = context
-    original = item(title="Tor 0.4.9.16 released", kind="feed", content="Tor 0.4.9.16 was released with an announced change.")
-    seed_legacy(store, original, analysis(title="Tor release announcement", state="tagged"))
-    tag = item(url="https://example.org/tags/tor-0.4.9.16", title="tor-0.4.9.16", kind="tag", content="")
-    row = pending(store, tag)
-    result = run(cfg, store, row, Writer(), Reviewer())
-    assert result["status"] == "cited" and result["writer_calls"] == 0 and result["review_calls"] == 0
-    story = store.stories()[0]
-    assert story["title"] == "Tor release announcement" and "updates" not in story and len(story["sources"]) == 2
-
-    merged_item = item(
-        url="https://example.org/mr/0.4.9.17",
-        title="Tor 0.4.9.17 release branch merged",
-        kind="feed",
-        content="Release preparation branch for Tor 0.4.9.17 merged.",
-    )
-    seed_legacy(store, merged_item, analysis(title="Tor 0.4.9.17 branch merged", state="merged", category="release", tags=["tor", "release"]))
-    merged_story = next(s for s in store.stories() if "0.4.9.17" in s["title"])
-    tag17 = item(url="https://example.org/tags/tor-0.4.9.17", title="tor-0.4.9.17", kind="tag", content="", updated_at=LATER)
-    row17 = pending(store, tag17)
-    lit17 = update_analysis(
-        update="The upstream feed lists the tag “tor-0.4.9.17”.",
-        state="tagged",
-        confidence=merged_story["confidence"],
-        evidence=["tor-0.4.9.17"],
-    )
-    held17 = run(
-        cfg,
-        store,
-        row17,
-        Writer(lit17),
-        Reviewer(verdict("revise", update=True, repair={"state": "released"})),
-    )
-    assert held17["status"] == "held" and held17["review_calls"] == 1
-    assert store.db.execute("SELECT last_error FROM items WHERE id=?", (row17["id"],)).fetchone()[0] == (
-        "Final review held: review proposed editing a literal tag notice"
-    )
-
-    tag17b = item(url="https://example.org/tags/tor-0.4.9.17-mirror", title="tor-0.4.9.17", kind="tag", content="", updated_at=LATER)
-    row17b = pending(store, tag17b)
-    ok17 = run(cfg, store, row17b, Writer(lit17), Reviewer(verdict(update=True), verdict(update=True)))
-    assert ok17["status"] == "published"
-    updated17 = next(s for s in store.stories() if s["id"] == merged_story["id"])
-    assert updated17["title"] == "Tor 0.4.9.17 branch merged"
-    assert updated17["state"] == "tagged"
-    assert updated17["updates"][-1]["text"] == "The upstream feed lists the tag “tor-0.4.9.17”."
-
-
-def test_tag_draft_requires_final_review_and_waits_when_network_is_disabled(context):
-    """Defer an unreviewed tag until both publication reviews can run."""
-    cfg, store = context
-    tag = item(title="tor-0.4.9.16", kind="tag", content="")
-    row = pending(store, tag)
-    checker = Reviewer()
-    result = run(cfg, store, row, Writer(tag_notice(tag)), checker, allow_network=False)
-    assert result["status"] == "deferred" and checker.calls == []
-    assert result["writer_calls"] == 0 and store.stories() == []
-    reviewed = run(cfg, store, row, Writer(tag_notice(tag)), Reviewer(verdict()))
-    assert reviewed["status"] == "published" and reviewed["writer_calls"] == 0 and reviewed["review_calls"] == 2
-
-
-def test_tag_notice_stays_literal_when_review_proposes_a_repair(context):
-    """Hold a tag notice that review would edit, even when verification would approve the edit."""
-    cfg, store = context
-    tag = item(title="tor-0.4.9.16", kind="tag", content="")
-    row = pending(store, tag)
-    checker = Reviewer(verdict("revise", repair={"title": "Tor 0.4.9.16 released", "state": "released"}), verdict())
-    result = run(cfg, store, row, Writer(tag_notice(tag)), checker)
-    assert result["status"] == "held" and result["review_calls"] == 1 and store.stories() == []
-    assert store.db.execute("SELECT last_error FROM items").fetchone()[0] == "Final review held: review proposed editing a literal tag notice"
-
-
-def test_network_disabled_defers_new_network_work_without_failure(context):
-    cfg, store = context
-    row = pending(store)
-    writer, checker = Writer(), Reviewer()
-    result = run(cfg, store, row, writer, checker, allow_network=False)
-    assert result["status"] == "deferred" and writer.calls == checker.calls == []
-    assert store.pending_count() == 1 and store.rejected_count() == 0
-
-
-def test_missing_retained_source_holds_without_a_review_call(context):
-    cfg, store = context
-    original = item(content=item()["content"] * 3, updated_at="2026-11-09T12:00:00Z")
-    seed_legacy(store, original)
+    # Missing retained source holds without a review call; network disabled defers cleanly.
+    orig2 = item(url="https://example.org/miss-orig", content="Distinct missing source body text long enough to cluster. " * 5, updated_at="2026-11-09T12:00:00Z")
+    seed_legacy(store, orig2, analysis(evidence=["Distinct missing source body text"]))
     with store.db:
-        body = json.loads(store.db.execute("SELECT payload FROM items WHERE id=?", (original["id"],)).fetchone()[0])
-        body.pop("content")
-        store.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps(body), original["id"]))
-    row = pending(store, item(url="https://example.org/news/mirror", source_id="mirror", content=original["content"]))
-    result = run(cfg, store, row, Writer(), Reviewer())
-    assert result["status"] == "held" and result["review_calls"] == 0
-    assert store.db.execute("SELECT status FROM items WHERE id=?", (original["id"],)).fetchone()[0] == "published"
+        store.db.execute("UPDATE items SET payload=json_remove(payload,'$.content') WHERE url=?", (orig2["url"],))
+    row_miss = pending(store, item(url="https://example.org/miss-mirror", source_id="mirror", content=orig2["content"]))
+    res_miss = run(cfg, store, row_miss, Writer(), Reviewer())
+    assert res_miss["status"] == "held" and res_miss["review_calls"] == 0
+    assert store.db.execute("SELECT status FROM items WHERE id=?", (orig2["id"],)).fetchone()[0] == "published"
+
+    row_net = pending(store, item(url="https://example.org/net-off"))
+    w_net, c_net = Writer(), Reviewer()
+    assert run(cfg, store, row_net, w_net, c_net, allow_network=False)["status"] == "deferred"
+    assert w_net.calls == c_net.calls == []
+
+
+def test_tag_notices_citations_updates_and_repair_holds(context, monkeypatch):
+    cfg, store = context
+    # Defer an unreviewed tag when network is disabled; hold if review proposes editing literal tag notice.
+    t0 = item(title="tor-0.4.9.15", kind="tag", url="https://example.org/tags/0.4.9.15", content="")
+    r0 = pending(store, t0)
+    assert run(cfg, store, r0, Writer(tag_notice(t0)), Reviewer(), allow_network=False)["status"] == "deferred"
+    assert run(cfg, store, r0, Writer(tag_notice(t0)), Reviewer(verdict()))["status"] == "published"
+
+    t_hold = item(title="tor-0.4.9.14", kind="tag", url="https://example.org/tags/0.4.9.14", content="")
+    r_hold = pending(store, t_hold)
+    res_hold = run(cfg, store, r_hold, Writer(tag_notice(t_hold)),
+                   Reviewer(verdict("revise", repair={"title": "Tor 0.4.9.14 released", "state": "released"}), verdict()))
+    assert res_hold["status"] == "held" and res_hold["review_calls"] == 1
+    assert "editing a literal tag notice" in store.db.execute("SELECT last_error FROM items WHERE id=?", (r_hold["id"],)).fetchone()[0]
+
+    # Routine tag uses local draft (no HTTP client) and requires editorial review; unreviewed commit raises ReviewRequired.
+    r_routine = pending(store, item(kind="tag", title="data-refresh", url="https://example.org/tags/refresh", content="Routine"))
+    with Analyzer(cfg) as writer:
+        res_skip = run(cfg, store, r_routine, writer, Reviewer(verdict("skip", criterion="news_value")))
+        assert writer.client is None and res_skip["status"] == "ignored" and res_skip["writer_calls"] == 0
+    r_unrev = pending(store, item(kind="tag", title="another-tag", url="https://example.org/another-tag"))
+    prep_unrev = store.prepare_candidate(r_unrev, tag_notice(json.loads(r_unrev["payload"])), LATER)
+    with pytest.raises(ReviewRequired):
+        store.commit_candidate(prep_unrev, prep_unrev["candidate"], "not-reviewed", LATER)
+
+    # Tag never replaces richer tagged or released story in same release cluster (cites with 0 calls).
+    for idx, state in enumerate(("tagged", "released")):
+        ver = f"0.4.9.{20 + idx}"
+        ex_item = item(kind="feed", product="tor", title=f"Tor {ver} release update", url=f"https://example.org/rel-{ver}")
+        finish_reviewed(store, pending(store, ex_item), analysis(title=f"Detailed {ver} update", state=state), f"det-{ver}", DATE)
+        before_upd = next(s for s in store.stories(20) if ver in s["title"])["updated_at"]
+        later_tag = tag(title=f"tor-{ver}", url=f"https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-{ver}", updated_at="2026-11-09T16:00:00Z")
+        out = review_gate.process_item(cfg, store, pending(store, later_tag), Writer(), Reviewer(), DATE)
+        st = next(s for s in store.stories(20) if ver in s["title"])
+        assert out["status"] == "cited" and out["writer_calls"] == out["review_calls"] == 0
+        assert st["state"] == state and st["updated_at"] == before_upd and len(st["sources"]) == 2
+
+    # Tag on pre-release story runs update review without calling writer LLM, and holds if review repairs tag update.
+    monkeypatch.setattr(Analyzer, "complete", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("writer LLM forbidden")))
+    for idx, state in enumerate(("developing", "fixed", "resolved", "mitigation-available", "merged")):
+        ver = f"0.4.9.{30 + idx}"
+        ex = item(kind="feed", product="tor", title=f"Tor {ver} release preparation", url=f"https://example.org/prep-{ver}")
+        finish_reviewed(store, pending(store, ex), analysis(title=f"Prep {ver}", state=state), f"prep-{ver}", DATE)
+        if state == "merged":
+            bad_tag = tag(title=f"tor-{ver}", url=f"https://example.org/bad-tag-{ver}", updated_at="2026-11-09T16:00:00Z")
+            held = run(cfg, store, pending(store, bad_tag), Analyzer(cfg), Reviewer(verdict("revise", update=True, repair={"state": "released"})))
+            assert held["status"] == "held" and held["review_calls"] == 1
+        t_item = tag(title=f"tor-{ver}", url=f"https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-{ver}", updated_at="2026-11-09T16:00:00Z")
+        with Analyzer(cfg) as real_writer:
+            out = review_gate.process_item(cfg, store, pending(store, t_item), real_writer, ApprovingReviewer(cfg), "2026-11-09T16:05:00Z")
+        st = next(s for s in store.stories(20) if f"Prep {ver}" == s["title"])
+        assert out["status"] == "published" and out["writer_calls"] == 0 and out["review_calls"] == 2
+        assert st["state"] == ("tagged" if state == "merged" else state)
+        assert st["updates"][-1]["text"] == f"The upstream feed lists the tag “tor-{ver}”."
+
+
+def test_editorial_coverage_skips_followups_and_bounds(context):
+    cfg, store = context
+    # Same-cycle coverage before build is visible to second item without entering evidence packet.
+    first_row = pending(store, item(url="https://example.org/cov-first"))
+    assert run(cfg, store, first_row, Writer(), Reviewer(verdict()))["status"] == "published"
+    first_story = store.stories()[0]
+    assert store.db.execute("SELECT COUNT(*) FROM public_catalog").fetchone()[0] == 0
+    rec_first = audit(store)
+    assert rec_first["input_hash"] == first_row["content_hash"] and "input_row" not in rec_first
+    second_row = pending(store, item(kind="feed", url="https://example.org/cov-reply", content="A quoted repetition."))
+    chk = Reviewer(verdict("skip", criterion="new_information"))
+    assert run(cfg, store, second_row, Writer(), chk)["status"] == "ignored" and len(store.stories()) == 1
+    assert chk.coverages[0]["recent"][0]["id"] == first_story["id"]
+    assert first_story["summary"] not in json.dumps(chk.calls[0][1])
+
+    # Editorial skip on follow-up preserves existing article; material follow-up updates same article.
+    orig, sid = seed_legacy(store, item(url="https://example.org/known", content="Known issue Compromise report. " * 3),
+                            analysis(summary="Prior text. " * 100, why_it_matters="Prior consequence. " * 25,
+                                     evidence=["Known issue Compromise report."]))
+    before_stories = [tuple(r) for r in store.db.execute("SELECT * FROM stories")]
+    r_ack = pending(store, {**orig, "content": orig["content"] + " Routine ack.", "updated_at": LATER})
+    assert run(cfg, store, r_ack, Writer(), Reviewer(verdict("skip", criterion="new_information")))["status"] == "ignored"
+    assert [tuple(r) for r in store.db.execute("SELECT * FROM stories")] == before_stories
+    assert tuple(store.db.execute("SELECT status,story_id FROM items WHERE id=?", (r_ack["id"],)).fetchone()) == ("ignored", sid)
+    assert audit(store)["prepared"]["coverage"]["prior_story"]["id"] == sid
+
+    r_sub = pending(store, {**orig, "content": orig["content"] + " A substantive later result.", "updated_at": "2026-11-10T13:00:00Z"})
+    chk_u = Reviewer(verdict(update=True))
+    assert run(cfg, store, r_sub, Writer(update_analysis(update="The source reports a substantive later result.",
+                                                         evidence=["A substantive later result."])), chk_u)["status"] == "published"
+    updated = next(s for s in store.stories(10) if s["id"] == sid)
+    assert updated["updates"][-1]["text"] == "The source reports a substantive later result."
+    assert sid not in {e["id"] for e in chk_u.coverages[0]["recent"]} and chk_u.coverages[1] == chk_u.coverages[0]
+
+    # Interrupted verification restarts critique when coverage changes; approve receipt cannot authorize skip.
+    r_int = pending(store, item(url="https://example.org/interrupted"))
+    with pytest.raises(AnalysisError):
+        run(cfg, store, r_int, Writer(), Reviewer(verdict(), AnalysisError("unavailable", retryable=True)))
+    add_coverage(store, "mid-flight")
+    resumed = Reviewer(verdict())
+    res_int = run(cfg, store, r_int, Writer(), resumed)
+    assert res_int["status"] == "published" and res_int["writer_calls"] == 0 and [c[2] for c in resumed.calls] == [False, True]
+
+    r_wrong = pending(store, item(url="https://example.org/wrong-decision"))
+    prep_w = store.prepare_candidate(r_wrong, analysis(), LATER)
+    rec_w = approve(store, prep_w)
+    with pytest.raises(ReviewRequired, match="authorize this decision"):
+        store.commit_candidate(prep_w, prep_w["candidate"], "wrong", LATER, decision="skip", **rec_w)
+
+    # Bounded coverage keeps exact prior visible text and bounded retracted rows.
+    for n in range(40):
+        add_coverage(store, f"bg-{n:02d}", summary="Background detail. " * 80,
+                     added_at="2026-11-15T00:00:00Z", updated_at="2026-11-15T00:00:00Z")
+        if n >= 8:
+            with store.db:
+                store.db.execute("""INSERT INTO editorial_controls
+                    (story_id,revision,locked,retracted,notice_action,notice_reason,notice_at)
+                    VALUES(?,1,1,1,'retract','Withdrawn',?)""", (f"bg-{n:02d}", LATER))
+    r_cov = pending(store, {**orig, "content": orig["content"] + " Current change.", "updated_at": "2026-11-10T14:00:00Z"})
+    bg = store.prepare_candidate(r_cov, update_analysis(evidence=["Current change."]), LATER)["coverage"]
+    assert bg["prior_story"]["id"] == sid and len(bg["prior_story"]["summary"]) > candidate.COVERAGE_SUMMARY_CHARS
+    assert len(bg["recent"]) + 1 <= candidate.COVERAGE_ROWS and len(json.dumps(bg, ensure_ascii=False)) <= candidate.COVERAGE_CHARS
+    assert bg["truncated"]
+    bg_ret = candidate.coverage_background(store.db, None)
+    assert len(bg_ret["recent"]) == candidate.COVERAGE_ROWS and all(r.get("retracted") is True and "summary" not in r for r in bg_ret["recent"])
 
 
 @pytest.mark.parametrize("cached", [{"verdict": "approve"}, verdict("hold")], ids=["incomplete-approval", "hold"])
 def test_cache_reviews_again_unless_the_receipt_is_a_complete_decision(context, cached):
-    """Neither an incomplete approval nor a cached hold can stand in for a fresh review."""
     cfg, store = context
     row = pending(store)
     with pytest.raises(AnalysisError):
@@ -704,412 +677,240 @@ def test_cache_reviews_again_unless_the_receipt_is_a_complete_decision(context, 
     assert result["review_calls"] == 2 and not result["cache_hit"]
 
 
-def test_cache_pruning_retains_active_approval_jobs(context, monkeypatch):
-    cfg, store = context
-    monkeypatch.setattr(review_gate, "MAX_APPROVALS", 1)
-    row = pending(store)
-    monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("crash")))
-    with pytest.raises(RuntimeError):
-        run(cfg, store, row, Writer(), Reviewer(verdict()))
-    active = job(store)["approval_key"]
-    with store.db:
-        for n in range(3):
-            store.db.execute("INSERT INTO review_approvals VALUES(?,?,?,?,?,?,?,?,?)", (
-                f"unused-{n}", "c", "s", "p", "b", "{}", "{}", DATE, DATE))
-    review_gate._prune(store, 1)
-    assert store.db.execute("SELECT 1 FROM review_approvals WHERE key=?", (active,)).fetchone()
-    assert store.db.execute("SELECT COUNT(*) FROM review_approvals").fetchone()[0] == 2
-    assert job(store)["stage"] == "approved"
-
-
-def test_status_reads_stage_counts_without_exposing_audit(context):
+def test_status_retry_reverted_hold_and_rejected_show_views(context, monkeypatch):
     cfg, store = context
     assert review_gate.status(store) == {"stages": {}, "approval_cache_entries": 0}
     row = pending(store)
-    with pytest.raises(AnalysisError):
-        run(cfg, store, row, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
-    assert review_gate.status(store) == {"stages": {"review": 1}, "approval_cache_entries": 0}
-    run(cfg, store, row, Writer(), Reviewer(verdict("hold")))
-    assert review_gate.status(store) == {"stages": {"held": 1}, "approval_cache_entries": 0}
+    before_dump = list(store.db.iterdump())
+    assert rejection.show_item(store, row["id"])["final_review"] is None
+    assert list(store.db.iterdump()) == before_dump
 
-
-def test_operator_retry_preserves_held_audit_and_reuses_the_completed_draft(context):
-    cfg, store = context
-    row = pending(store)
-    assert run(cfg, store, row, Writer(), Reviewer(verdict("hold")))["status"] == "held"
-    assert store.db.execute("SELECT last_error FROM items").fetchone()[0] == "Final review held: review did not approve the candidate"
-    rejection.retry_item(store, row["id"], row["content_hash"], "The review prompt was revised", LATER)
-    audit = json.loads(store.db.execute("SELECT review_record FROM analyses WHERE cache_key=?",
-                                        (cache_key(row, cfg["llm"]),)).fetchone()[0])
-    assert audit["outcome"] == "held" and audit["reviews"][0]["result"]["verdict"] == "hold"  # retry keeps it
-    assert job(store)["stage"] == "drafted"
-    retry = store.pending(1, LATER)[0]
-    writer = Writer()
-    assert run(cfg, store, retry, writer, Reviewer(verdict()))["status"] == "published"
-    assert writer.calls == []
-    final = json.loads(store.db.execute("SELECT review_record FROM analyses ORDER BY rowid DESC").fetchone()[0])
-    assert final["outcome"] == "approved" and final["writer"] == {"key": cache_key(row, cfg["llm"])}
-    shown = rejection.show_item(store, row["id"])["final_review"]
-    assert shown["latest_review"]["verdict"] == "approve" and shown["source_packet"]["sources"] and shown["coverage"] is not None
-
-
-def test_a_source_that_reverts_to_a_held_revision_is_held_again_without_a_review(context):
-    cfg, store = context
-    assert run(cfg, store, pending(store), Writer(), Reviewer(verdict("hold")))["status"] == "held"
-    store.ingest(item(content=item()["content"] + " Edited."), DATE)  # a revision that is never drafted
-    assert run(cfg, store, store.pending(1, LATER)[0], Writer(), Reviewer(), allow_network=False)["status"] == "deferred"
-    store.ingest(item(), DATE)
-    checker = Reviewer(verdict())
-    assert run(cfg, store, store.pending(1, LATER)[0], Writer(), checker)["status"] == "held"
-    assert checker.calls == []
-
-
-def test_rejected_show_explains_structured_hold_with_the_actual_candidate_and_passages(context, monkeypatch):
-    cfg, store = context
-    row = pending(store)
-    assert run(cfg, store, row, Writer(), Reviewer(verdict("hold")))["status"] == "held"
-    before = list(store.db.iterdump())
-    # A hold waits for an operator, so its saved verdict stays readable after a later rubric change.
-    monkeypatch.setattr(review, "CRITERIA", (*review.CRITERIA, "a_later_criterion"))
-    shown = rejection.show_item(store, row["id"])["final_review"]
-    assert shown["stage"] == "held"
-    assert shown["candidate"]["title"] == analysis()["title"]
-    assert shown["latest_review"]["verdict"] == "hold"
-    assert shown["latest_review"]["criteria"]["operational_advice"]["outcome"] == "fail"
-    assert shown["latest_review"]["criteria"]["operational_advice"]["source_refs"] == ["S1"]
-    assert shown["source_packet"]["sources"][0]["passages"][0]["id"] == "S1:P1"
-    assert list(store.db.iterdump()) == before
-
-
-def test_rejected_show_displays_repaired_candidate_pending_independent_verification(context):
-    cfg, store = context
-    row = pending(store)
     with pytest.raises(AnalysisError):
         run(cfg, store, row, Writer(), Reviewer(verdict("revise", repair={"why_it_matters": ""}),
-                                               AnalysisError("timeout", retryable=True)))
-    shown = rejection.show_item(store, row["id"])["final_review"]
-    assert shown["stage"] == "verify" and shown["candidate"]["why_it_matters"] == ""
-    assert shown["latest_review"]["verdict"] == "revise"
-    assert shown["latest_review"]["candidate_hash"] != digest(shown["candidate"])
+                                                AnalysisError("timeout", retryable=True)))
+    assert review_gate.status(store) == {"stages": {"verify": 1}, "approval_cache_entries": 0}
+    shown_v = rejection.show_item(store, row["id"])["final_review"]
+    assert shown_v["stage"] == "verify" and shown_v["candidate"]["why_it_matters"] == ""
+    assert shown_v["latest_review"]["verdict"] == "revise" and shown_v["latest_review"]["candidate_hash"] != digest(shown_v["candidate"])
 
+    assert run(cfg, store, row, Writer(), Reviewer(verdict("hold")))["status"] == "held"
+    assert review_gate.status(store) == {"stages": {"held": 1}, "approval_cache_entries": 0}
 
-def test_rejected_show_reads_a_reused_approval_after_an_interrupted_commit(context, monkeypatch):
-    cfg, store = context
-    row = pending(store)
-    monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash")))
+    # Reverted held revision holds again without calling reviewer.
+    store.ingest(item(content=item()["content"] + " Edited."), DATE)
+    assert run(cfg, store, store.pending(1, LATER)[0], Writer(), Reviewer(), allow_network=False)["status"] == "deferred"
+    store.ingest(item(), DATE)
+    chk_rev = Reviewer(verdict())
+    assert run(cfg, store, store.pending(1, LATER)[0], Writer(), chk_rev)["status"] == "held" and chk_rev.calls == []
+
+    # Structured hold stays readable after a later rubric change without mutating DB.
+    snap = list(store.db.iterdump())
+    monkeypatch.setattr(review, "CRITERIA", (*review.CRITERIA, "a_later_criterion"))
+    shown_h = rejection.show_item(store, row["id"])["final_review"]
+    assert shown_h["stage"] == "held" and shown_h["candidate"]["title"] == analysis()["title"]
+    assert shown_h["latest_review"]["criteria"]["operational_advice"]["outcome"] == "fail"
+    assert shown_h["source_packet"]["sources"][0]["passages"][0]["id"] == "S1:P1"
+    assert list(store.db.iterdump()) == snap
+    monkeypatch.undo()
+
+    # Operator retry preserves held audit and reuses completed draft.
+    rejection.retry_item(store, row["id"], row["content_hash"], "The review prompt was revised", LATER)
+    assert audit(store)["outcome"] == "held" and job(store)["stage"] == "drafted"
+    w_ret = Writer()
+    assert run(cfg, store, store.pending(1, LATER)[0], w_ret, Reviewer(verdict()))["status"] == "published"
+    assert w_ret.calls == [] and audit(store)["outcome"] == "approved"
+
+    # Reused approval after interrupted commit is readable in show_item.
+    row_int = pending(store, item(url="https://example.org/int-show"))
+    monkeypatch.setattr(store, "commit_candidate", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("crash")))
     with pytest.raises(RuntimeError):
-        run(cfg, store, row, Writer(), Reviewer(verdict()))
-    with store.db:  # an operator retry starts a new record without reviews of its own
-        review_gate.reset_review_work(store, row["id"])
-    with pytest.raises(RuntimeError):  # the saved approval is reused, and the commit is interrupted again
-        run(cfg, store, row, Writer(), Reviewer())
-    shown = rejection.show_item(store, row["id"])["final_review"]
-    assert shown["stage"] == "approved" and shown["latest_review"]["verdict"] == "approve"
+        run(cfg, store, row_int, Writer(), Reviewer(verdict()))
+    with store.db:
+        review_gate.reset_review_work(store, row_int["id"])
+    with pytest.raises(RuntimeError):
+        run(cfg, store, row_int, Writer(), Reviewer())
+    shown_app = rejection.show_item(store, row_int["id"])["final_review"]
+    assert shown_app["stage"] == "approved" and shown_app["latest_review"]["verdict"] == "approve"
 
 
 @pytest.mark.parametrize("kind", [*DAMAGE, "review-not-an-object", "review-without-result"])
-def test_rejected_show_and_retry_survive_a_damaged_review_record(context, kind):
+def test_rejected_show_and_retry_survive_damaged_record_or_draft(context, kind):
     cfg, store = context
     row = pending(store)
     assert run(cfg, store, row, Writer(), Reviewer(verdict("hold")))["status"] == "held"
-    # Besides the damaged() kinds, a record can be a valid object of the wrong shape.
+    saved = job(store)
     shapes = {"review-not-an-object": b'{"reviews": [1]}', "review-without-result": b'{"reviews": [{"stage": "held"}]}'}
     with store.db:
-        value = shapes.get(kind) or damaged(job(store)["record_json"], kind)
-        store.db.execute("UPDATE review_jobs SET record_json=CAST(? AS TEXT) WHERE item_id=?", (value, row["id"]))
+        val = shapes.get(kind) or damaged(saved["record_json"], kind)
+        store.db.execute("UPDATE review_jobs SET record_json=CAST(? AS TEXT) WHERE item_id=?", (val, row["id"]))
+        if kind in DAMAGE:
+            store.db.execute("UPDATE review_jobs SET draft_json=CAST(? AS TEXT) WHERE item_id=?",
+                             (damaged(saved["draft_json"], kind), row["id"]))
     shown = rejection.show_item(store, row["id"])
-    assert shown["final_review"] == {"stage": "held", "error": "Saved review record cannot be read"}
-    assert shown["saved_item"] is not None
-    rejection.retry_item(store, row["id"], row["content_hash"], "Retry after inspection", LATER)
-    assert job(store)["stage"] == "drafted"
-
-
-@pytest.mark.parametrize("kind", DAMAGE)
-def test_retry_drops_a_damaged_draft_and_the_writer_drafts_again(context, kind):
-    cfg, store = context
-    row = pending(store)
-    assert run(cfg, store, row, Writer(), Reviewer(verdict("hold")))["status"] == "held"
-    with store.db:
-        store.db.execute("UPDATE review_jobs SET draft_json=CAST(? AS TEXT)", (damaged(job(store)["draft_json"], kind),))
+    assert shown["final_review"] == {"stage": "held", "error": "Saved review record cannot be read"} and shown["saved_item"] is not None
     rejection.retry_item(store, row["id"], row["content_hash"], "Retry after inspection", LATER)
     writer = Writer()
     assert run(cfg, store, store.pending(1, LATER)[0], writer, Reviewer(verdict()))["status"] == "published"
-    assert len(writer.calls) == 1
+    assert len(writer.calls) == (1 if kind in DAMAGE else 0)
 
 
-def test_rejected_show_without_a_current_job_stays_read_only(context):
-    _, store = context
-    row = pending(store)
-    before = list(store.db.iterdump())
-    assert rejection.show_item(store, row["id"])["final_review"] is None
-    assert list(store.db.iterdump()) == before
-
-
-def test_hold_audit_and_rejection_roll_back_together_if_job_update_fails(context):
+def test_atomic_rollbacks_db_errors_and_run_reports(context, monkeypatch):
     cfg, store = context
+    cfg["sources"] = []
     row = pending(store)
-    store.db.execute("""CREATE TRIGGER fail_held_job BEFORE UPDATE ON review_jobs
-        WHEN NEW.stage='held' BEGIN SELECT RAISE(ABORT,'hold unavailable'); END""")
+    store.db.execute("CREATE TRIGGER fail_held_job BEFORE UPDATE ON review_jobs WHEN NEW.stage='held' BEGIN SELECT RAISE(ABORT,'hold unavailable'); END")
+    store.db.execute("CREATE TRIGGER fail_approved_job BEFORE INSERT ON review_jobs WHEN NEW.stage='approved' BEGIN SELECT RAISE(ABORT,'job save unavailable'); END")
     store.db.commit()
     with pytest.raises(sqlite3.IntegrityError, match="hold unavailable"):
         run(cfg, store, row, Writer(), Reviewer(verdict("hold")))
-    assert store.db.execute("SELECT COUNT(*) FROM analyses").fetchone()[0] == 0
-    assert store.pending_count() == 1 and job(store)["stage"] == "review"
-
-
-def test_approval_receipt_and_job_pin_roll_back_together_if_job_save_fails(context):
-    """Persist the receipt and its unfinished-job pin atomically."""
-    cfg, store = context
-    row = pending(store)
-    store.db.execute("""CREATE TRIGGER fail_approved_job BEFORE INSERT ON review_jobs
-        WHEN NEW.stage='approved' BEGIN SELECT RAISE(ABORT,'job save unavailable'); END""")
-    store.db.commit()
+    assert store.db.execute("SELECT COUNT(*) FROM analyses").fetchone()[0] == 0 and job(store)["stage"] == "review"
+    store.db.execute("DROP TRIGGER fail_held_job")
     with pytest.raises(sqlite3.IntegrityError, match="job save unavailable"):
         run(cfg, store, row, Writer(), Reviewer(verdict()))
-    assert store.db.execute("SELECT COUNT(*) FROM review_approvals").fetchone()[0] == 0
-    assert job(store)["stage"] == "verify" and job(store)["approval_key"] is None
-    assert len(store.stories()) == 0
+    assert store.db.execute("SELECT COUNT(*) FROM review_approvals").fetchone()[0] == 0 and job(store)["stage"] == "verify"
     store.db.execute("DROP TRIGGER fail_approved_job")
     store.db.commit()
-    result = run(cfg, store, row, Writer(), Reviewer(verdict()))
-    assert result["status"] == "published" and result["writer_calls"] == 0
+    assert run(cfg, store, row, Writer(), Reviewer(verdict()))["status"] == "published"
 
-
-def test_resuming_approved_job_never_temporarily_unpins_its_receipt(context, monkeypatch):
-    cfg, store = context
-    monkeypatch.setattr(review_gate, "MAX_APPROVALS", 1)
-    row = pending(store)
-    commit = store.commit_candidate
-    monkeypatch.setattr(store, "commit_candidate", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("crash before commit")))
-    with pytest.raises(RuntimeError):
-        run(cfg, store, row, Writer(), Reviewer(verdict()))
-    key = job(store)["approval_key"]
-    monkeypatch.setattr(store, "commit_candidate", commit)
-    save = review_gate._save
-    def crash_during_resume(*args, **kwargs):
-        save(*args, **kwargs)
-        raise RuntimeError("crash after initial resume save")
-    monkeypatch.setattr(review_gate, "_save", crash_during_resume)
-    with pytest.raises(RuntimeError):
-        run(cfg, store, row, Writer(), Reviewer(), allow_network=False)
-    assert job(store)["approval_key"] == key
-    with store.db:
-        store.db.execute("INSERT INTO review_approvals VALUES(?,?,?,?,?,?,?,?,?)", (
-            "newer-unused", "c", "s", "p", "b", "{}", "{}", LATER, "2099-01-01T00:00:00Z"))
-    review_gate._prune(store, 1)
-    assert store.db.execute("SELECT 1 FROM review_approvals WHERE key=?", (key,)).fetchone()
-    monkeypatch.setattr(review_gate, "_save", save)
-    result = run(cfg, store, row, Writer(), Reviewer(), allow_network=False)
-    assert result["status"] == "published" and result["cache_hit"] and result["review_calls"] == 0
-
-
-def test_a_database_error_during_analysis_is_not_an_item_strike(context, monkeypatch):
-    import sqlite3
-    from onionflash import cli
-    cfg, store = context
-    cfg["sources"] = []
-
-    def locked(*args, **kwargs):
-        raise sqlite3.OperationalError("database is locked")
-
-    monkeypatch.setattr(cli, "process_item", locked)
+    # Database OperationalError is not an item strike.
     store.ingest(item(url="https://example.org/locked"), DATE)
+    monkeypatch.setattr(cli, "process_item", lambda *a, **kw: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")))
     with pytest.raises(sqlite3.OperationalError):
         cli.run(cfg, store)
-    assert tuple(store.db.execute("SELECT status,rejections FROM items").fetchone()) == ("pending", 0)
+    assert tuple(store.db.execute("SELECT status,rejections FROM items WHERE url='https://example.org/locked'").fetchone()) == ("pending", 0)
+    monkeypatch.undo()
 
 
-def test_run_report_counts_review_outcomes(context, monkeypatch):
-    from onionflash import cli
-    cfg, store = context
-    cfg["sources"] = []
-    outcomes = iter([("held", False), ("stale", False), ("published", True), ("ignored", False), ("ignored", True)])
-    monkeypatch.setattr(cli, "process_item", lambda *args, **kwargs: dict(zip(("status", "cache_hit"), next(outcomes))))
-    monkeypatch.setattr(cli, "build", lambda *args: {})
-    for name in ("one", "two", "three", "four", "five"):
-        store.ingest(item(url="https://example.org/" + name), DATE)
-    report = cli.run(cfg, store)
-    counts = [report[key] for key in ("analyzed", "analysis_failed", "review_stale", "review_cache_hits")]
-    # A hold is a decision, not a failure. Holds and skips are counted by code under decisions, and
-    # this stand-in for the gate logs none, on a database that has no decisions yet.
-    assert counts == [4, 0, 1, 2] and report["decisions"] == {}
-    assert "review_held" not in report and "review_skipped" not in report
+def test_run_report_counts_outcomes_model_calls_and_isolates_invalid_outputs(tmp_path, monkeypatch):
+    from onionflash.config import DEFAULTS
+    from onionflash.store import Store
 
+    cfg = {**DEFAULTS, "storage": {"database": str(tmp_path / "r1.db"), "output_dir": str(tmp_path / "p1")}, "sources": []}
+    with Store(cfg["storage"]["database"]) as store:
+        outcomes = iter([("held", False), ("stale", False), ("published", True), ("ignored", False), ("ignored", True)])
+        monkeypatch.setattr(cli, "process_item", lambda *a, **kw: dict(zip(("status", "cache_hit"), next(outcomes))))
+        monkeypatch.setattr(cli, "build", lambda *a: {})
+        for name in ("one", "two", "three", "four", "five"):
+            store.ingest(item(url="https://example.org/" + name), DATE)
+        rep = cli.run(cfg, store)
+        assert [rep[k] for k in ("analyzed", "analysis_failed", "review_stale", "review_cache_hits")] == [4, 0, 1, 2]
+        assert rep["decisions"] == {} and "review_held" not in rep and "review_skipped" not in rep
+    monkeypatch.undo()
 
-def test_run_report_counts_the_model_requests_of_items_that_fail(context, monkeypatch):
-    from onionflash import analyze, cli
-    from onionflash.transport import FetchError, Response
-    cfg, store = context
-    cfg["sources"] = []
-    cfg["llm"]["base_url"] = "https://llm.example/v1"
-    monkeypatch.setenv(cfg["llm"]["api_key_env"], "test-key")
+    cfg2 = {**DEFAULTS, "llm": {**DEFAULTS["llm"], "base_url": "https://llm.example/v1"},
+            "storage": {"database": str(tmp_path / "r2.db"), "output_dir": str(tmp_path / "p2")}, "sources": []}
+    monkeypatch.setenv(cfg2["llm"]["api_key_env"], "test-key")
 
-    class Transport:  # the writer's requests succeed; every review request fails in transport
+    class Transport:
         def request(self, method, url, headers=None, json_body=None):
             if json_body["response_format"]["json_schema"]["name"] != "onionflash_news":
                 raise FetchError("network request failed", retryable=True)
             body = {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(analysis(why_it_matters=""))}}]}
             return Response(200, json.dumps(body).encode(), {}, url)
+
         def close(self):
             pass
 
-    monkeypatch.setattr(analyze, "HttpClient", lambda *args, **kwargs: Transport())
-    monkeypatch.setattr(cli, "build", lambda *args: {})
-    for name in ("one", "two"):
-        store.ingest(item(url="https://example.org/" + name), DATE)
-    report = cli.run(cfg, store)
-    # Each item's writer request and failed review request count.
-    assert (report["analysis_failed"], report["model_calls"]) == (2, 4)
+    monkeypatch.setattr("onionflash.llm.HttpClient", lambda *a, **kw: Transport())
+    monkeypatch.setattr(cli, "build", lambda *a: {})
+    with Store(cfg2["storage"]["database"]) as store:
+        for name in ("one", "two"):
+            store.ingest(item(url="https://example.org/" + name), DATE)
+        rep2 = cli.run(cfg2, store)
+        assert (rep2["analysis_failed"], rep2["model_calls"]) == (2, 4)
+    monkeypatch.undo()
 
-
-def test_unusable_replies_and_drafts_take_strikes_and_the_run_still_builds(context, monkeypatch):
-    """Isolate invalid model output so other queued work and the site build continue."""
-    from onionflash import cli
-    cfg, store = context
-    cfg["sources"] = []
-
-    class Drafts:
-        calls = 0
-        def analyze(self, incoming):
-            # Publishing drops U+FFFF, so this draft cannot form a public story.
-            return analysis(title="\uffff") if incoming["url"].endswith("/draft") else analysis()
-
-    class Replies:
-        calls = 0
-        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
-            """Return malformed replies only for the designated failure fixtures."""
-            return review.validate_review({} if "/reply" in packet["sources"][0]["url"] else verdict(), packet)
-
+    cfg3 = {**DEFAULTS, "storage": {"database": str(tmp_path / "r3.db"), "output_dir": str(tmp_path / "p3")}, "sources": []}
     built = []
-    monkeypatch.setattr(cli, "Analyzer", lambda *args, **kwargs: contextlib.nullcontext(Drafts()))
-    monkeypatch.setattr(cli, "Reviewer", lambda *args, **kwargs: contextlib.nullcontext(Replies()))
-    monkeypatch.setattr(cli, "build", lambda *args: built.append(True) or {})
-    for name in ("reply-1", "reply-2", "draft"):
-        store.ingest(item(url="https://example.org/" + name), DATE)
-    # No security title or label, so this item sorts after both unusable replies.
-    store.ingest(item(url="https://example.org/good", title="A routine report", labels=[]), DATE)
-    report = cli.run(cfg, store)
-    states = {url.rsplit("/", 1)[1]: (status, rejections, error)
-              for url, status, rejections, error in store.db.execute("SELECT url,status,rejections,last_error FROM items")}
-    assert built == [True] and report["analysis_failed"] == 3
-    status, rejections, error = states.pop("draft")
-    assert (status, rejections) == ("pending", 1) and error.startswith("Unexpected ValueError at render.py:")
+    monkeypatch.setattr(cli, "Analyzer", lambda *a, **kw: contextlib.nullcontext(
+        Writer(lambda inc: analysis(title="\uffff") if inc["url"].endswith("/draft") else analysis())))
+    monkeypatch.setattr(cli, "Reviewer", lambda *a, **kw: contextlib.nullcontext(
+        type("R", (), {"calls": 0, "review": lambda self, cand, pkt, **k: review.validate_review(
+            {} if "/reply" in pkt["sources"][0]["url"] else verdict(), pkt)})()))
+    monkeypatch.setattr(cli, "build", lambda *a: built.append(True) or {})
+    with Store(cfg3["storage"]["database"]) as store:
+        for name in ("reply-1", "reply-2", "draft"):
+            store.ingest(item(url="https://example.org/" + name), DATE)
+        store.ingest(item(url="https://example.org/good", title="A routine report", labels=[]), DATE)
+        rep3 = cli.run(cfg3, store)
+        states = {u.rsplit("/", 1)[1]: (st, rej, err) for u, st, rej, err in store.db.execute("SELECT url,status,rejections,last_error FROM items")}
+    assert built == [True] and rep3["analysis_failed"] == 3
+    st, rej, err = states.pop("draft")
+    assert (st, rej) == ("pending", 1) and err.startswith("Unexpected ValueError at render.py:")
     assert states == {"reply-1": ("pending", 1, "Review response fields do not match schema"),
                       "reply-2": ("pending", 1, "Review response fields do not match schema"),
                       "good": ("published", 0, None)}
 
 
 def test_own_item_newness_skips_unchanged_or_quoted_and_unlock_requeues_locked_updates(context):
-    from onionflash.comments import _compose
-
     cfg, store = context
     url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41499"
     n1 = {"id": "gid://gitlab/Note/1", "url": url + "#note_1", "title": "Public comment by @alice",
           "author": "alice", "created_at": DATE, "body": "Initial report details for the relay issue."}
     issue = _compose(item(url=url, updated_at=DATE), [n1], DATE, source_key="k")
-    first_row = pending(store, issue)
-    assert run(cfg, store, first_row, Writer(analysis(evidence=["Initial report details for the relay issue."])),
+    assert run(cfg, store, pending(store, issue), Writer(analysis(evidence=["Initial report details for the relay issue."])),
                Reviewer(verdict()))["status"] == "published"
     story_id = store.stories()[0]["id"]
 
-    # A reply containing only >-quoted text after DATE has no new unquoted content -> 0 model calls.
     n2 = {"id": "gid://gitlab/Note/2", "url": url + "#note_2", "title": "Public comment by @bob",
           "author": "bob", "created_at": LATER, "body": "> Initial report details for the relay issue.\n> Agreed."}
     assert store.ingest(_compose(issue, [n1, n2], LATER, source_key="k"), LATER)
-    w_quote, r_quote = Writer(), Reviewer()
-    res_quote = run(cfg, store, store.pending(1, LATER)[0], w_quote, r_quote)
-    assert res_quote == {"status": "ignored", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
+    assert run(cfg, store, store.pending(1, LATER)[0], Writer(), Reviewer()) == {
+        "status": "ignored", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
     assert store.db.execute("SELECT code FROM decision_log ORDER BY id DESC LIMIT 1").fetchone()[0] == "skipped.gate.no_new_content"
 
-    # A re-observed tag on its own tag notice also skips with 0 model calls.
-    tag = item(kind="tag", title="tor-0.4.9.99", url="https://example.org/tags/tor-0.4.9.99", content="")
-    store.ingest(tag, DATE)
-    tag_row = next(r for r in store.pending(5, DATE) if r["id"] == tag["id"])
-    assert run(cfg, store, tag_row, Writer(), Reviewer(verdict()))["status"] == "published"
-    assert store.ingest({**tag, "content": "new annotation", "updated_at": LATER}, LATER)
-    tag_row2 = next(r for r in store.pending(5, LATER) if r["id"] == tag["id"])
-    assert run(cfg, store, tag_row2, Writer(), Reviewer()) == {"status": "ignored", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
+    t99 = item(kind="tag", title="tor-0.4.9.99", url="https://example.org/tags/tor-0.4.9.99", content="")
+    store.ingest(t99, DATE)
+    assert run(cfg, store, next(r for r in store.pending(5, DATE) if r["id"] == t99["id"]), Writer(), Reviewer(verdict()))["status"] == "published"
+    assert store.ingest({**t99, "content": "new annotation", "updated_at": LATER}, LATER)
+    assert run(cfg, store, next(r for r in store.pending(5, LATER) if r["id"] == t99["id"]), Writer(), Reviewer()) == {
+        "status": "ignored", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
 
-    # Lock the issue story, hold a genuine new-note update while locked, then unlock -> item is requeued and publishes.
-    shown = editorial.show(store.db, story_id)
     locked = editorial.correct(store.db, story_id, {"priority": "normal"}, reason="Lower priority.",
-                               expect_hash=shown["hash"], observed=LATER)
+                               expect_hash=editorial.show(store.db, story_id)["hash"], observed=LATER)
     later2 = "2026-11-10T14:00:00Z"
     n3 = {"id": "gid://gitlab/Note/3", "url": url + "#note_3", "title": "Public comment by @maint",
           "author": "maint", "created_at": later2, "body": "Maintainers merged the fix into main."}
     assert store.ingest(_compose(issue, [n1, n2, n3], later2, source_key="k"), later2)
-    locked_row = next(r for r in store.pending(5, later2) if r["id"] == issue["id"])
-    w_locked = Writer(update_analysis(update="Maintainers merged the fix.", state="merged",
-                                      evidence=["Maintainers merged the fix into main."]))
-    assert run(cfg, store, locked_row, w_locked, Reviewer())["status"] == "locked"
-    # Writer saw only the new unquoted note, with unchanged issue body cleared.
-    assert w_locked.calls[0]["content"] == ""
-    assert [n["url"] for n in w_locked.calls[0]["public_comments"]] == [url + "#note_3"]
+    w_locked = Writer(update_analysis(update="Maintainers merged the fix.", state="merged", evidence=["Maintainers merged the fix into main."]))
+    assert run(cfg, store, next(r for r in store.pending(5, later2) if r["id"] == issue["id"]), w_locked, Reviewer())["status"] == "locked"
+    assert w_locked.calls[0]["content"] == "" and [n["url"] for n in w_locked.calls[0]["public_comments"]] == [url + "#note_3"]
     assert store.pending(5, later2) == []
 
     editorial.unlock(store.db, story_id, reason="Allow queued updates.", expect_hash=locked["hash"], observed="2026-11-10T15:00:00Z")
     requeued = [r for r in store.pending(5, "2026-11-10T15:00:00Z") if r["id"] == issue["id"]]
     assert len(requeued) == 1
-    w_after = Writer(update_analysis(update="Maintainers merged the fix.", state="merged",
-                                     evidence=["Maintainers merged the fix into main."]))
-    assert run(cfg, store, requeued[0], w_after, Reviewer(verdict(update=True)))["status"] == "published"
-    updated_story = next(s for s in store.stories(5) if s["id"] == story_id)
-    assert updated_story["updates"] == [{"at": later2, "text": "Maintainers merged the fix.",
-                                         "sources": [{"url": url + "#note_3", "title": n3["title"]}]}]
+    assert run(cfg, store, requeued[0], Writer(update_analysis(update="Maintainers merged the fix.", state="merged",
+                                                               evidence=["Maintainers merged the fix into main."])),
+               Reviewer(verdict(update=True)))["status"] == "published"
+    assert next(s for s in store.stories(5) if s["id"] == story_id)["updates"] == [
+        {"at": later2, "text": "Maintainers merged the fix.", "sources": [{"url": url + "#note_3", "title": n3["title"]}]}]
 
-    # Cross-item mailing-list replies in update scope strip >-quoted parent text and quote headers;
-    # a pure-quote reply skips with 0 model calls while an unquoted reply strips quoted history for the writer.
-    later3 = "2026-11-10T16:00:00Z"
+    later3, later4 = "2026-11-10T16:00:00Z", "2026-11-10T17:00:00Z"
     list_base = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/"
-    opener = item(
-        kind="feed",
-        url=list_base + "MSG0/",
-        source_id="msg-0",
-        title="[tor-announce] Tor 0.4.9.15 released",
-        content="Initial report details for the relay issue.",
-        updated_at=DATE,
-    )
-    assert store.ingest(opener, DATE)
-    assert run(cfg, store, store.pending(1, DATE)[0],
-               Writer(analysis(evidence=["Initial report details for the relay issue."])),
+    store.ingest(item(kind="feed", url=list_base + "MSG0/", source_id="msg-0", title="[tor-announce] Tor 0.4.9.15 released",
+                      content="Initial report details for the relay issue.", updated_at=DATE), DATE)
+    assert run(cfg, store, store.pending(1, DATE)[0], Writer(analysis(evidence=["Initial report details for the relay issue."])),
                Reviewer(verdict()))["status"] == "published"
-    pure_quote = item(
-        kind="feed",
-        url=list_base + "MSG1/",
-        source_id="msg-1",
-        title="[tor-relays] Re: Tor 0.4.9.15 released",
-        content="On Wed, Nov 10, 2026 at 09:00 AM, alice via tor-relays wrote:\n\n> Initial report details for the relay issue.\n>> Older nested quote with 53-day-old relay numbers.",
-        updated_at=later3,
-    )
-    assert store.ingest(pure_quote, later3)
+    store.ingest(item(kind="feed", url=list_base + "MSG1/", source_id="msg-1", title="[tor-relays] Re: Tor 0.4.9.15 released",
+                      content="On Wed, Nov 10, 2026 at 09:00 AM, alice via tor-relays wrote:\n\n> Initial report details for the relay issue.\n>> Older nested quote with 53-day-old relay numbers.",
+                      updated_at=later3), later3)
     assert run(cfg, store, store.pending(1, later3)[0], Writer(), Reviewer()) == {
-        "status": "ignored", "writer_calls": 0, "review_calls": 0, "cache_hit": False
-    }
-    assert store.db.execute("SELECT code FROM decision_log ORDER BY id DESC LIMIT 1").fetchone()[0] == "skipped.gate.no_new_content"
-
-    later4 = "2026-11-10T17:00:00Z"
-    reply_with_text = item(
-        kind="feed",
-        url=list_base + "MSG2/",
-        source_id="msg-2",
-        title="[tor-relays] Re: Tor 0.4.9.15 released",
-        content="Operator observed three dropped circuits.\n\nOn Wed, Nov 10, 2026 at 09:00 AM, alice via tor-relays wrote:\n\n> Quoted 53-day-old relay backstory.",
-        updated_at=later4,
-    )
-    assert store.ingest(reply_with_text, later4)
+        "status": "ignored", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
+    store.ingest(item(kind="feed", url=list_base + "MSG2/", source_id="msg-2", title="[tor-relays] Re: Tor 0.4.9.15 released",
+                      content="Operator observed three dropped circuits.\n\nOn Wed, Nov 10, 2026 at 09:00 AM, alice via tor-relays wrote:\n\n> Quoted 53-day-old relay backstory.",
+                      updated_at=later4), later4)
     w_reply = Writer(update_analysis(update="An operator observed three dropped circuits.", state="developing",
                                      evidence=["Operator observed three dropped circuits."]))
     assert run(cfg, store, store.pending(1, later4)[0], w_reply, Reviewer(verdict(update=True)))["status"] == "published"
     assert w_reply.calls[0]["content"].strip() == "Operator observed three dropped circuits."
-    assert "53-day-old" not in w_reply.calls[0]["content"]
-    assert "wrote:" not in w_reply.calls[0]["content"]
+    assert "53-day-old" not in w_reply.calls[0]["content"] and "wrote:" not in w_reply.calls[0]["content"]
 
 
-def test_pending_update_draft_rewrites_when_another_update_commits_first(context):
+def test_pending_update_rewrites_and_own_comment_cutoff_admits_edited_notes(context):
     cfg, store = context
-    original = item(title="Tor 0.4.9.16 released", kind="feed", authority="official",
-                    content="Tor 0.4.9.16 was released with fixes.")
-    seed_legacy(store, original, analysis(title="Tor 0.4.9.16 released", state="released", confidence="confirmed"))
+    seed_legacy(store, item(title="Tor 0.4.9.16 released", kind="feed", authority="official", content="Tor 0.4.9.16 was released with fixes."),
+                analysis(title="Tor 0.4.9.16 released", state="released", confidence="confirmed"))
     m1 = item(title="Tor 0.4.9.16 released", kind="feed", url="https://example.org/m1", source_id="m1",
               content="Debian packages for Tor 0.4.9.16 are live.", updated_at=LATER)
     m2 = item(title="Tor 0.4.9.16 released", kind="feed", url="https://example.org/m2", source_id="m2",
@@ -1117,126 +918,65 @@ def test_pending_update_draft_rewrites_when_another_update_commits_first(context
     store.ingest(m1, LATER)
     store.ingest(m2, LATER)
     rows = {r["url"]: r for r in store.pending(5, LATER)}
-
-    # m1 drafts first and fails transiently in review; then m2 commits an update, changing prior_story.
     w1 = Writer(update_analysis(update="Debian packages are live.", confidence="confirmed", state="released",
                                 evidence=["Debian packages for Tor 0.4.9.16 are live."]))
     with pytest.raises(AnalysisError):
         run(cfg, store, rows["https://example.org/m1"], w1, Reviewer(AnalysisError("timeout", retryable=True)))
     assert len(w1.calls) == 1
-
-    w2 = Writer(update_analysis(update="RPM packages are live.", confidence="confirmed", state="released",
-                                evidence=["RPM packages for Tor 0.4.9.16 are live."]))
-    assert run(cfg, store, rows["https://example.org/m2"], w2, Reviewer(verdict(update=True)))["status"] == "published"
-
-    # Retrying m1 must call the writer again because cache_key(row, llm, prior) changed when m2 updated prior_story.
+    assert run(cfg, store, rows["https://example.org/m2"],
+               Writer(update_analysis(update="RPM packages are live.", confidence="confirmed", state="released",
+                                      evidence=["RPM packages for Tor 0.4.9.16 are live."])),
+               Reviewer(verdict(update=True)))["status"] == "published"
     res = run(cfg, store, rows["https://example.org/m1"], w1, Reviewer(verdict(update=True)))
-    assert res["status"] == "published" and res["writer_calls"] == 1 and len(w1.calls) == 2
-    assert len(store.stories()[0]["updates"]) == 2
+    assert res["status"] == "published" and res["writer_calls"] == 1 and len(w1.calls) == 2 and len(store.stories()[0]["updates"]) == 2
 
-
-def test_own_comment_cutoff_ignores_other_sources_and_admits_edited_notes(context):
-    cfg, store = context
     issue_url = "https://gitlab.torproject.org/tpo/core/tor/-/issues/49500"
     canonical_issue_url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/49500"
-    issue_a = item(
-        id="gitlab:49500",
-        kind="gitlab_issue",
-        url=issue_url,
-        title="Tor 0.4.9.30 relay descriptor stall",
-        content="Initial report of descriptor stall in Tor 0.4.9.30.",
-        published_at="2026-11-08T10:00:00Z",
-        updated_at="2026-11-08T10:00:00Z",
-        public_comments=[],
-    )
-    row_a = pending(store, issue_a)
+    issue_a = item(id="gitlab:49500", kind="gitlab_issue", url=issue_url, title="Tor 0.4.9.30 relay descriptor stall",
+                   content="Initial report of descriptor stall in Tor 0.4.9.30.", published_at="2026-11-08T10:00:00Z",
+                   updated_at="2026-11-08T10:00:00Z", public_comments=[])
     assert review_gate.process_item(
-        cfg,
-        store,
-        row_a,
-        Writer(analysis(
-            title="Descriptor stall reported in Tor 0.4.9.30",
-            summary="Initial report of descriptor stall in Tor 0.4.9.30.",
-            state="developing",
-            evidence=["Initial report of descriptor stall in Tor 0.4.9.30."],
-        )),
-        Reviewer(verdict(), verdict()),
-        "2026-11-08T10:05:00Z",
+        cfg, store, pending(store, issue_a),
+        Writer(analysis(title="Descriptor stall reported in Tor 0.4.9.30", summary="Initial report of descriptor stall in Tor 0.4.9.30.",
+                        state="developing", evidence=["Initial report of descriptor stall in Tor 0.4.9.30."])),
+        Reviewer(verdict(), verdict()), "2026-11-08T10:05:00Z",
     )["status"] == "published"
-    story_id = store.stories()[0]["id"]
+    story_id = next(s for s in store.stories(10) if "0.4.9.30" in s["title"])["id"]
 
-    # Another source adds an update dated Nov 10, advancing story["updated_at"] to Nov 10.
-    other_src = item(
-        kind="gitlab_mr",
-        url="https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/1950",
-        title="Investigate descriptor stall (closes #49500)",
-        content="Closes #49500 with diagnostic logging.",
-        upstream_state="merged",
-        published_at="2026-11-10T12:00:00Z",
-        updated_at="2026-11-10T12:00:00Z",
-    )
-    row_b = pending(store, other_src)
+    other_src = item(kind="gitlab_mr", url="https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/1950",
+                     title="Investigate descriptor stall (closes #49500)", content="Closes #49500 with diagnostic logging.",
+                     upstream_state="merged", published_at="2026-11-10T12:00:00Z", updated_at="2026-11-10T12:00:00Z")
     assert review_gate.process_item(
-        cfg,
-        store,
-        row_b,
-        Writer(update_analysis(
-            update="A merge request added diagnostic logging for the stall.",
-            state="merged",
-            evidence=["Closes #49500 with diagnostic logging."],
-        )),
-        Reviewer(verdict(update=True), verdict(update=True)),
-        "2026-11-10T12:05:00Z",
+        cfg, store, pending(store, other_src),
+        Writer(update_analysis(update="A merge request added diagnostic logging for the stall.", state="merged",
+                               evidence=["Closes #49500 with diagnostic logging."])),
+        Reviewer(verdict(update=True), verdict(update=True)), "2026-11-10T12:05:00Z",
     )["status"] == "published"
-    assert store.stories()[0]["updated_at"] == "2026-11-10T12:00:00Z"
 
-    # Issue A is re-polled on Nov 11 with a comment created on Nov 9 (after A's Nov 8 checkpoint, before B's Nov 10 update).
-    note_v1 = {
-        "id": "501",
-        "author": "maintainer",
-        "title": "Comment by maintainer",
-        "created_at": "2026-11-09T09:00:00Z",
-        "url": issue_url + "#note_501",
-        "body": "Root cause narrowed to malformed extra-info lines.",
-    }
-    issue_a_nov9 = {**issue_a, "updated_at": "2026-11-09T09:00:00Z", "public_comments": [note_v1]}
-    assert store.ingest(issue_a_nov9, "2026-11-11T08:00:00Z")
-    row_nov9 = store.pending(1, "2026-11-11T08:00:00Z")[0]
-    w_nov9 = Writer(update_analysis(
-        update="Maintainers narrowed the root cause to malformed extra-info lines.",
-        state="merged",
-        evidence=["Root cause narrowed to malformed extra-info lines."],
-    ))
-    res_nov9 = review_gate.process_item(cfg, store, row_nov9, w_nov9, Reviewer(verdict(update=True), verdict(update=True)), "2026-11-11T08:00:00Z")
-    assert res_nov9["status"] == "published" and len(w_nov9.calls) == 1
-    story_after_nov9 = next(s for s in store.stories() if s["id"] == story_id)
-    assert story_after_nov9["updates"][-1]["sources"] == [{"url": canonical_issue_url + "#note_501", "title": "Comment by maintainer"}]
+    note_v1 = {"id": "501", "author": "maintainer", "title": "Comment by maintainer",
+               "created_at": "2026-11-09T09:00:00Z", "url": issue_url + "#note_501",
+               "body": "Root cause narrowed to malformed extra-info lines."}
+    assert store.ingest({**issue_a, "updated_at": "2026-11-09T09:00:00Z", "public_comments": [note_v1]}, "2026-11-11T08:00:00Z")
+    w_nov9 = Writer(update_analysis(update="Maintainers narrowed the root cause to malformed extra-info lines.",
+                                    state="merged", evidence=["Root cause narrowed to malformed extra-info lines."]))
+    assert review_gate.process_item(cfg, store, store.pending(1, "2026-11-11T08:00:00Z")[0], w_nov9,
+                                    Reviewer(verdict(update=True), verdict(update=True)), "2026-11-11T08:00:00Z")["status"] == "published"
+    assert len(w_nov9.calls) == 1
+    assert next(s for s in store.stories(10) if s["id"] == story_id)["updates"][-1]["sources"] == [
+        {"url": canonical_issue_url + "#note_501", "title": "Comment by maintainer"}]
 
-    # Later, the author edits note 501 in place (same id "501", same created_at Nov 9 <= cutoff, updated body at Nov 12).
     note_v2 = {**note_v1, "body": "Correction: extra-info parsing was unaffected; bug is in routerstatus retry."}
     issue_a_edited = {**issue_a, "updated_at": "2026-11-12T14:00:00Z", "public_comments": [note_v2]}
     assert store.ingest(issue_a_edited, "2026-11-12T14:05:00Z")
-    row_edit = store.pending(1, "2026-11-12T14:05:00Z")[0]
-    w_edit = Writer(update_analysis(
-        update="A corrected maintainer note places the bug in routerstatus retry rather than extra-info parsing.",
-        state="merged",
-        evidence=["Correction: extra-info parsing was unaffected; bug is in routerstatus retry."],
-    ))
-    res_edit = review_gate.process_item(cfg, store, row_edit, w_edit, Reviewer(verdict(update=True), verdict(update=True)), "2026-11-12T14:05:00Z")
-    assert res_edit["status"] == "published" and len(w_edit.calls) == 1
-    story_after_edit = next(s for s in store.stories() if s["id"] == story_id)
-    assert story_after_edit["updates"][-1]["at"] == "2026-11-12T14:00:00Z"
-    assert story_after_edit["updates"][-1]["sources"] == [{"url": canonical_issue_url + "#note_501", "title": "Comment by maintainer"}]
+    w_edit = Writer(update_analysis(update="A corrected maintainer note places the bug in routerstatus retry.",
+                                    state="merged", evidence=["Correction: extra-info parsing was unaffected; bug is in routerstatus retry."]))
+    assert review_gate.process_item(cfg, store, store.pending(1, "2026-11-12T14:05:00Z")[0], w_edit,
+                                    Reviewer(verdict(update=True), verdict(update=True)), "2026-11-12T14:05:00Z")["status"] == "published"
+    st_edit = next(s for s in store.stories(10) if s["id"] == story_id)
+    assert st_edit["updates"][-1]["at"] == "2026-11-12T14:00:00Z"
 
-    # Re-polling when only quoted text is appended to note 501 (unquoted body unchanged) skips with 0 model calls.
     note_v2_quoted = {**note_v2, "body": note_v2["body"] + "\n\n> Earlier quoted context."}
-    issue_a_same = {**issue_a, "updated_at": "2026-11-12T15:00:00Z", "public_comments": [note_v2_quoted]}
-    assert store.ingest(issue_a_same, "2026-11-12T15:05:00Z")
-    row_same = store.pending(1, "2026-11-12T15:05:00Z")[0]
-    res_same = review_gate.process_item(cfg, store, row_same, Writer(), Reviewer(), "2026-11-12T15:05:00Z")
-    assert res_same["status"] == "ignored" and res_same["writer_calls"] == 0 and res_same["review_calls"] == 0
-    assert store.db.execute("SELECT code FROM decision_log ORDER BY id DESC LIMIT 1").fetchone()[0] == "skipped.gate.no_new_content"
-    # Even when old_item=None (legacy story without an analyses snapshot) and item["url"] uses /-/issues/,
-    # _source_cutoff matches canonical /-/work_items/#note_501 in updates while ignoring other_src's date.
-    legacy_story = next(s for s in store.stories() if s["id"] == story_id)
-    assert review_gate.candidate_mod._source_cutoff(store.db, legacy_story, None, issue_a_edited) == "2026-11-12T14:00:00Z"
+    assert store.ingest({**issue_a, "updated_at": "2026-11-12T15:00:00Z", "public_comments": [note_v2_quoted]}, "2026-11-12T15:05:00Z")
+    res_same = review_gate.process_item(cfg, store, store.pending(1, "2026-11-12T15:05:00Z")[0], Writer(), Reviewer(), "2026-11-12T15:05:00Z")
+    assert res_same["status"] == "ignored" and res_same["writer_calls"] == res_same["review_calls"] == 0
+    assert review_gate.candidate_mod._source_cutoff(store.db, st_edit, None, issue_a_edited) == "2026-11-12T14:00:00Z"

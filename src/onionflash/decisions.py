@@ -11,6 +11,7 @@ import json
 import re
 from collections import Counter, defaultdict
 
+from .schema import FIELD_LIMITS
 from .util import after, format_utc, parse_utc, saved_object
 
 CODES = frozenset({
@@ -37,8 +38,6 @@ EXAMPLES = 3  # newest examples per code in the summary
 AWAITING = 20  # rejected items the summary lists, oldest decision first
 MAX_LIMIT = 200
 HISTORY_LIMIT = 20
-# The deployment refuses to upload a file over 10 MiB; feed.xml grows with the stories it carries,
-# so the summary asks for a split by year at half that.
 FEED_LIMIT_BYTES = 10 * 1024 * 1024
 FEED_SPLIT_BYTES = FEED_LIMIT_BYTES // 2
 _PREFIX = re.compile(r"[a-z_]+(?:\.[a-z_]+){0,2}\Z")
@@ -65,18 +64,24 @@ def skip_code(record, verdict: dict) -> str:
 
 def _title(payload) -> str | None:
     title = (saved_object(payload) or {}).get("title")
-    return title[:200] if isinstance(title, str) else None
+    return title[:FIELD_LIMITS["source_title"]] if isinstance(title, str) else None
 
 
-def _detail(row, code, review, extra) -> dict:
+def _clean_extra(extra: dict) -> dict:
+    return {k: (v[:300] if isinstance(v, str) else v) for k, v in extra.items() if v is not None}
+
+
+def _detail(row, code: str, review, extra: dict) -> dict:
     detail = {"title": _title(row["payload"]), "url": row["url"]} if row else {"title": None, "url": None}
     try:
         reviews = _reviews(review)
         verdicts = [f"{entry['stage']}:{entry['result']['verdict']}" for entry in reviews]
-        criteria = {name: f"{check['outcome']}: {check['reason']}"
-                    for name, check in reviews[-1]["result"]["criteria"].items() if check["outcome"] != "pass"
-                    } if reviews and code.startswith(("skipped.", "held.")) else None
-    except (TypeError, KeyError, AttributeError):  # a damaged record keeps the title and URL
+        criteria = {
+            name: f"{check['outcome']}: {check['reason']}"
+            for name, check in reviews[-1]["result"]["criteria"].items()
+            if check["outcome"] != "pass"
+        } if reviews and code.startswith(("skipped.", "held.")) else None
+    except (TypeError, KeyError, AttributeError):
         verdicts, criteria = [], None
     if verdicts:
         detail["verdicts"] = verdicts
@@ -88,25 +93,31 @@ def _detail(row, code, review, extra) -> dict:
     prepared = review.get("prepared") if isinstance(review, dict) else None
     if isinstance(prepared, dict) and prepared.get("mode") in {"story", "update"}:
         detail["scope"] = prepared["mode"]
-    detail.update((key, value[:300] if isinstance(value, str) else value) for key, value in extra.items() if value is not None)
+    detail.update(_clean_extra(extra))
     return detail
 
 
-def record(db, item_id: str, code: str, observed: str, *, review: dict | None = None, **extra) -> None:
-    """Append one decision about an item to the caller's transaction.
-
-    Only a database error raises: detail that cannot be read is left out, so an
-    unexpected record never undoes the outcome it describes."""
-    row = db.execute("SELECT content_hash,source_id,story_id,url,CAST(payload AS BLOB) AS payload FROM items WHERE id=?",
-                     (item_id,)).fetchone()
+def _write_decision(db, observed: str, subject: str, item_id: str | None, content_hash: str | None,
+                    source_id: str | None, story_id: str | None, code: str, detail_fn) -> None:
     try:
-        detail = json.dumps(_detail(row, code, review, extra), ensure_ascii=False, sort_keys=True, allow_nan=False)
+        detail = json.dumps(detail_fn(), ensure_ascii=False, sort_keys=True, allow_nan=False)
         detail.encode("utf-8")
     except Exception:  # never let the log's own detail stop the outcome
         detail = "{}"
+    db.execute(
+        "INSERT INTO decision_log(decided_at,subject,item_id,content_hash,source_id,story_id,code,detail_json) VALUES(?,?,?,?,?,?,?,?)",
+        (observed, subject, item_id, content_hash, source_id, story_id, code, detail),
+    )
+
+
+def record(db, item_id: str, code: str, observed: str, *, review: dict | None = None, **extra) -> None:
+    """Append one decision about an item to the caller's transaction."""
+    row = db.execute(
+        "SELECT content_hash,source_id,story_id,url,CAST(payload AS BLOB) AS payload FROM items WHERE id=?",
+        (item_id,),
+    ).fetchone()
     columns = (row["content_hash"], row["source_id"], row["story_id"]) if row else (None, None, None)
-    db.execute("""INSERT INTO decision_log(decided_at,subject,item_id,content_hash,source_id,story_id,code,detail_json)
-        VALUES(?,?,?,?,?,?,?,?)""", (observed, item_id, item_id, *columns, code, detail))
+    _write_decision(db, observed, item_id, item_id, *columns, code, lambda: _detail(row, code, review, extra))
 
 
 def record_subject(db, subject: str, code: str, observed: str, *, source_id: str | None = None,
@@ -114,15 +125,7 @@ def record_subject(db, subject: str, code: str, observed: str, *, source_id: str
     """Append one non-item decision keyed by `subject`; skip when `once` and already recorded."""
     if once and db.execute("SELECT 1 FROM decision_log WHERE subject=? AND code=? LIMIT 1", (subject, code)).fetchone():
         return False
-    try:
-        clean = {key: (value[:300] if isinstance(value, str) else value)
-                 for key, value in extra.items() if value is not None}
-        detail = json.dumps(clean, ensure_ascii=False, sort_keys=True, allow_nan=False)
-        detail.encode("utf-8")
-    except Exception:
-        detail = "{}"
-    db.execute("""INSERT INTO decision_log(decided_at,subject,item_id,content_hash,source_id,story_id,code,detail_json)
-        VALUES(?,?,NULL,NULL,?,?,?,?)""", (observed, subject, source_id, story_id, code, detail))
+    _write_decision(db, observed, subject, None, None, source_id, story_id, code, lambda: _clean_extra(extra))
     return True
 
 
@@ -182,10 +185,8 @@ def for_item(db, item_id: str) -> list[dict]:
 
 def feed_size(db) -> dict:
     """feed.xml's size in the publication ledger, against the deployment's per-file limit."""
-    size = None
-    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_artifacts'").fetchone():
-        row = db.execute("SELECT size FROM public_artifacts WHERE path='feed.xml'").fetchone()
-        size = row[0] if row else None
+    row = db.execute("SELECT size FROM public_artifacts WHERE path='feed.xml'").fetchone()
+    size = row[0] if row else None
     return {"path": "feed.xml", "bytes": size, "limit_bytes": FEED_LIMIT_BYTES,
             "action": "ACTION: split the feeds by year" if size is not None and size >= FEED_SPLIT_BYTES else None}
 
@@ -217,8 +218,6 @@ def summary(db, since: str) -> dict:
         "awaiting_operator": {
             "rejected": db.execute("SELECT COUNT(*) FROM items WHERE status='rejected'").fetchone()[0],
             "items": rejected,
-            # Updates held while a story was locked. Unlocking does not apply them, so a story waits until
-            # an update of it publishes after its latest hold; held_updates is the story's lifetime count.
             "held_updates": [{"story_id": story_id, "held_updates": held, "locked": bool(locked)} for story_id, held, locked
                              in db.execute("""SELECT story_id,held_updates,locked FROM editorial_controls c WHERE held_updates>0 AND c.retracted=0
                                  AND NOT EXISTS (SELECT 1 FROM decision_log WHERE story_id=c.story_id

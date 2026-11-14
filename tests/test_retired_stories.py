@@ -1,18 +1,17 @@
 """Retired story identities and cluster keys are permanent and never recreated."""
 
-import json
 import sqlite3
 
 import pytest
 
-from approval_helpers import finish_reviewed, update_analysis, verdict
+from helpers import (
+    Reviewer, Writer, analysis, finish_reviewed, insert_approval, item, seed_story,
+    source, update_analysis, verdict,
+)
 from onionflash import candidate, cli, editorial, rejection, review_gate
 from onionflash.analyze import cache_key
 from onionflash.config import DEFAULTS
-from onionflash.store import Store
 from onionflash.util import after, digest, item_cluster
-from test_core import analysis, config, item, source
-from test_review_gate import Reviewer, Writer
 
 DATE = "2026-11-11T15:00:00Z"
 SKIPPED = "skipped.gate.retired_story"
@@ -21,13 +20,6 @@ LONG_BODY = (
     "with reproducible measurements from a local test network and exact packet counts "
     "recorded over several minutes of testing."
 )
-
-
-@pytest.fixture
-def context(tmp_path):
-    cfg = config(tmp_path)
-    with Store(cfg["storage"]["database"]) as store:
-        yield cfg, store
 
 
 def add_alias(db, story_id: str, cluster_key: str, survivor_id: str | None = None, reason: str = "Retired fixture"):
@@ -61,10 +53,8 @@ def test_story_aliases_are_insert_only_and_permanent(context):
 
 def test_stories_never_recreated_trigger_and_commit_candidate_rowcount(context):
     _, store = context
-    store.ingest(item(url="https://example.org/live", title="Live story"), DATE)
-    live_row = store.pending(1, DATE)[0]
-    finish_reviewed(store, live_row, analysis(title="Live story"), cache_key(live_row, DEFAULTS["llm"]), DATE)
-    live_id = store.stories()[0]["id"]
+    live_id = seed_story(store, item(url="https://example.org/live", title="Live story"),
+                         analysis(title="Live story"), at=DATE)["id"]
     add_alias(store.db, "retired-id", "url:retired-key")
     add_alias(store.db, "merged-id", "url:merged-key", live_id)
 
@@ -72,36 +62,25 @@ def test_stories_never_recreated_trigger_and_commit_candidate_rowcount(context):
         VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at"""
     for sid, ckey in (("retired-id", "url:another-key"), ("another-id", "url:retired-key"),
                       ("merged-id", "url:another-merged"), ("another-merged-id", "url:merged-key")):
-        cursor = store.db.execute(upsert, (sid, ckey, "{}", DATE, DATE))
-        assert cursor.rowcount == 0
+        assert store.db.execute(upsert, (sid, ckey, "{}", DATE, DATE)).rowcount == 0
         assert store.db.execute("SELECT 1 FROM stories WHERE id=?", (sid,)).fetchone() is None
-    # Live story upserts and inserts remain unaffected.
     live_cluster = store.db.execute("SELECT cluster_key,payload FROM stories WHERE id=?", (live_id,)).fetchone()
     assert store.db.execute(upsert, (live_id, live_cluster[0], live_cluster[1], DATE, after(60, DATE))).rowcount == 1
     assert len(store.stories()) == 1
 
-    # If an alias retires the prepared story_id under another cluster key after preparation,
-    # existing_story sees None and commit_candidate refuses when the trigger ignores the upsert.
     store.ingest(item(url="https://example.org/raced", title="Raced story"), DATE)
     raced_row = store.pending(1, DATE)[0]
     draft = analysis(title="Raced story")
     prepared = store.prepare_candidate(raced_row, draft, DATE)
-    key = review_gate._approval_key(prepared["candidate"], prepared, "policy")
     record = {"schema_version": 1, "writer": {"key": "w"}, "input_row": raced_row, "reviews": []}
-    with store.db:
-        store.db.execute("""INSERT INTO review_approvals
-            (key,candidate_hash,source_hash,policy_hash,binding_hash,result_json,review_record_json,created_at,last_used_at)
-            VALUES(?,?,?,?,?,?,?,?,?)""",
-            (key, digest(prepared["candidate"]), prepared["source_hash"], "policy", prepared["binding_hash"],
-             json.dumps(verdict()), json.dumps(record), DATE, DATE))
+    receipt = insert_approval(store, prepared, policy="policy", result=verdict(), record=record, created_at=DATE)
     add_alias(store.db, prepared["story_id"], "url:unmatched-retired-cluster")
     with pytest.raises(editorial.RetiredStory, match="retired"):
-        store.commit_candidate(prepared, prepared["candidate"], "w", DATE, approval_key=key,
-                               policy_hash="policy", review_record=record, decision="approve")
+        store.commit_candidate(prepared, prepared["candidate"], "w", DATE, **receipt,
+                               review_record=record, decision="approve")
     assert store.db.execute("SELECT status,story_id FROM items WHERE id=?", (raced_row["id"],)).fetchone()[:] == ("pending", None)
     assert store.db.execute("SELECT 1 FROM stories WHERE id=?", (prepared["story_id"],)).fetchone() is None
 
-    # A locked story retired after preparation is also refused before recording held_updates.
     editorial.correct(store.db, live_id, {"why_it_matters": "Reviewed note."}, reason="Correction",
                       expect_hash=editorial.show(store.db, live_id)["hash"], observed=DATE)
     store.ingest(item(url="https://example.org/live", title="Live story", content="Updated body text for lock test.",
@@ -130,7 +109,6 @@ def test_retired_resolver_follows_chains_and_guards_loops_and_editorial_actions(
     assert editorial.retired(store.db, cluster_key="url:merged-a") == ("merged-a", "live-target")
     assert editorial.retired(store.db, story_id="to-dead") == ("to-dead", None)
 
-    # Exact hop boundary: MAX_ALIAS_HOPS succeeds, one hop further raises ValueError.
     for index in range(editorial.MAX_ALIAS_HOPS):
         add_alias(store.db, f"hop-{index}", f"url:hop-{index}",
                   "final-hop" if index + 1 == editorial.MAX_ALIAS_HOPS else f"hop-{index + 1}")
@@ -173,17 +151,13 @@ def test_retired_item_and_cluster_are_ignored_with_zero_model_calls_across_recol
     story_id = store.stories()[0]["id"]
     retired_cluster = row["cluster_key"]
 
-    # Retire the story as a tombstone and unlink its item.
     with store.db:
         store.db.execute("UPDATE items SET status='ignored',story_id=NULL WHERE id=?", (row["id"],))
         store.db.execute("DELETE FROM stories WHERE id=?", (story_id,))
         add_alias(store.db, story_id, retired_cluster)
     assert rejection.show_item(store, row["id"])["final_review"] is None
-
-    # Same content hash: not queued.
     assert store.ingest({**first_item, "updated_at": after(60, DATE)}, after(60, DATE)) is False
 
-    # Label edit: queued, then ignored at the gate before any model or comment check.
     label_edited = {**first_item, "labels": ["cleanup"], "updated_at": after(120, DATE)}
     assert store.ingest(label_edited, after(120, DATE)) is True
     pending_row = store.pending(1, after(120, DATE))[0]
@@ -199,7 +173,6 @@ def test_retired_item_and_cluster_are_ignored_with_zero_model_calls_across_recol
     assert store.db.execute("SELECT COUNT(*) FROM comment_cache").fetchone()[0] == 0
     assert logged(store)[-1] == SKIPPED
 
-    # Two successive body edits change item_cluster(edited), yet keep the retired cluster_key and make 0 model calls.
     for step in (1, 2):
         stamp = after(120 + step * 60, DATE)
         body_edited = {**label_edited, "content": f"{LONG_BODY} Revision {step}.", "updated_at": stamp}
@@ -210,7 +183,6 @@ def test_retired_item_and_cluster_are_ignored_with_zero_model_calls_across_recol
         res = review_gate.process_item(cfg, store, queued, Writer(), Reviewer(), stamp)
         assert res["status"] == "ignored" and res["writer_calls"] == res["review_calls"] == 0
 
-    # A new item at another URL sharing the retired body cluster is also ignored with 0 model calls.
     same_body_other_url = item(kind="gitlab_issue", url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/1000",
                                title="Routine test cleanup", content=LONG_BODY, updated_at=after(300, DATE))
     assert item_cluster(same_body_other_url) == retired_cluster
@@ -218,7 +190,6 @@ def test_retired_item_and_cluster_are_ignored_with_zero_model_calls_across_recol
     other_row = store.pending(1, after(300, DATE))[0]
     assert review_gate.process_item(cfg, store, other_row, Writer(), Reviewer(), after(300, DATE))["status"] == "ignored"
 
-    # An operator retry of a retired item repeats the gate skip at zero model cost.
     current = dict(store.db.execute("SELECT id,content_hash FROM items WHERE id=?", (other_row["id"],)).fetchone())
     rejection.retry_item(store, current["id"], current["content_hash"], "Attempt retry", after(360, DATE))
     retried = store.pending(1, after(360, DATE))[0]
@@ -228,15 +199,11 @@ def test_retired_item_and_cluster_are_ignored_with_zero_model_calls_across_recol
 
 def test_computed_retired_story_id_and_concurrent_change_are_refused(context):
     cfg, store = context
-    fresh = item(url="https://example.org/fresh-item", title="Fresh item")
-    store.ingest(fresh, DATE)
+    store.ingest(item(url="https://example.org/fresh-item", title="Fresh item"), DATE)
     row = store.pending(1, DATE)[0]
-    computed_id = digest(row["cluster_key"])[:24]
-    # Retire that story_id under a different cluster_key: both prepare and process_item still refuse it.
-    add_alias(store.db, computed_id, "url:different-cluster")
+    add_alias(store.db, digest(row["cluster_key"])[:24], "url:different-cluster")
     with pytest.raises(editorial.RetiredStory):
         candidate.prepare(store.db, row, analysis(), DATE)
-    # If the item row changes concurrently before process_item updates it, process_item returns "stale" cleanly.
     stale_copy = dict(row)
     with store.db:
         store.db.execute("UPDATE items SET content_hash='concurrently-changed' WHERE id=?", (row["id"],))
@@ -248,60 +215,64 @@ def test_computed_retired_story_id_and_concurrent_change_are_refused(context):
     assert logged(store) == [SKIPPED]
 
 
+def test_retired_story_raised_mid_gate_marks_item_ignored_and_logs_skip(context, monkeypatch):
+    cfg, store = context
+    store.ingest(item(url="https://example.org/retire-mid", title="Mid-run retired story",
+                      content="Mid-run retired story details."), DATE)
+    row = store.pending(1, DATE)[0]
+    draft = analysis(title="Mid-run retired story", summary="Mid-run retired story details.",
+                     evidence=["Mid-run retired story details."])
+    monkeypatch.setattr(store, "prepare_candidate",
+                        lambda *_a, **_kw: (_ for _ in ()).throw(editorial.RetiredStory("retired mid-run")))
+    res = review_gate.process_item(cfg, store, row, Writer(draft), Reviewer(), DATE)
+    assert res["status"] == "ignored"
+    assert store.db.execute("SELECT status FROM items WHERE id=?", (row["id"],)).fetchone()[0] == "ignored"
+    assert store.db.execute("SELECT code FROM decision_log WHERE item_id=?", (row["id"],)).fetchone()[0] == SKIPPED
+
+
 def test_merged_alias_resolves_to_live_survivor_or_refuses_missing_survivor(context):
     _, store = context
-    store.ingest(item(url="https://example.org/survivor", title="Survivor story"), DATE)
-    s_row = store.pending(1, DATE)[0]
-    finish_reviewed(store, s_row, analysis(title="Survivor story"), cache_key(s_row, DEFAULTS["llm"]), DATE)
-    survivor = store.stories()[0]
+    survivor = seed_story(store, item(url="https://example.org/survivor", title="Survivor story"),
+                          analysis(title="Survivor story"), at=DATE)
     survivor_cluster = store.db.execute("SELECT cluster_key FROM stories WHERE id=?", (survivor["id"],)).fetchone()[0]
     add_alias(store.db, "merged-dup", "url:merged-dup-cluster", survivor["id"])
 
-    # Both an item mapped to merged-dup and an item with url:merged-dup-cluster resolve to the survivor.
     store.ingest(item(url="https://example.org/followup", title="Followup"), DATE)
     f_row = store.pending(1, DATE)[0]
     with store.db:
         store.db.execute("UPDATE items SET story_id='merged-dup' WHERE id=?", (f_row["id"],))
-    by_id = dict(store.db.execute("SELECT * FROM items WHERE id=?", (f_row["id"],)).fetchone())
-    by_id["payload"] = f_row["payload"]
+    by_id = {**dict(store.db.execute("SELECT * FROM items WHERE id=?", (f_row["id"],)).fetchone()), "payload": f_row["payload"]}
     assert candidate.existing_story(store.db, by_id)["id"] == survivor["id"]
     prepared = candidate.prepare(store.db, by_id, update_analysis(update="Followup"), after(60, DATE))
     assert (prepared["story_id"], prepared["cluster_key"]) == (survivor["id"], survivor_cluster)
 
     with store.db:
         store.db.execute("UPDATE items SET story_id=NULL,cluster_key='url:merged-dup-cluster' WHERE id=?", (f_row["id"],))
-    by_cluster = dict(store.db.execute("SELECT * FROM items WHERE id=?", (f_row["id"],)).fetchone())
-    by_cluster["payload"] = f_row["payload"]
+    by_cluster = {**dict(store.db.execute("SELECT * FROM items WHERE id=?", (f_row["id"],)).fetchone()), "payload": f_row["payload"]}
     assert candidate.existing_story(store.db, by_cluster)["id"] == survivor["id"]
 
-    # If a survivor row is absent from stories, existing_story refuses rather than recreating the alias ID.
     add_alias(store.db, "dangling-dup", "url:dangling-cluster", "missing-survivor")
     with pytest.raises(editorial.RetiredStory):
         candidate.existing_story(store.db, {"story_id": None, "cluster_key": "url:dangling-cluster"})
 
-    # A stories row matched by cluster_key whose id was later tombstoned under another cluster,
-    # or matched by id whose cluster_key was later tombstoned under another id, is also refused.
     store.ingest(item(url="https://example.org/secondary-a", title="Secondary A"), DATE)
     row_a = [r for r in store.pending(5, DATE) if r["url"] == "https://example.org/secondary-a"][0]
     finish_reviewed(store, row_a, analysis(title="Secondary A"), cache_key(row_a, DEFAULTS["llm"]), DATE)
-    id_a = digest(row_a["cluster_key"])[:24]
-    add_alias(store.db, id_a, "url:retired-other-a")
+    add_alias(store.db, digest(row_a["cluster_key"])[:24], "url:retired-other-a")
     with pytest.raises(editorial.RetiredStory):
         candidate.existing_story(store.db, {"story_id": None, "cluster_key": row_a["cluster_key"]})
 
     store.ingest(item(url="https://example.org/secondary-b", title="Secondary B"), DATE)
     row_b = [r for r in store.pending(5, DATE) if r["url"] == "https://example.org/secondary-b"][0]
     finish_reviewed(store, row_b, analysis(title="Secondary B"), cache_key(row_b, DEFAULTS["llm"]), DATE)
-    id_b = digest(row_b["cluster_key"])[:24]
     add_alias(store.db, "retired-other-b", row_b["cluster_key"])
     with pytest.raises(editorial.RetiredStory):
-        candidate.existing_story(store.db, {"story_id": id_b, "cluster_key": "url:unrelated"})
+        candidate.existing_story(store.db, {"story_id": digest(row_b["cluster_key"])[:24], "cluster_key": "url:unrelated"})
 
 
 def test_held_candidate_cannot_be_approved_after_story_retirement(context):
     cfg, store = context
-    official = item(kind="feed", authority="official", url="https://example.org/official-held", title="Official post")
-    store.ingest(official, DATE)
+    store.ingest(item(kind="feed", authority="official", url="https://example.org/official-held", title="Official post"), DATE)
     row = store.pending(1, DATE)[0]
     checker = Reviewer(verdict("skip", criterion="news_value"), verdict("skip", criterion="news_value"))
     assert review_gate.process_item(cfg, store, row, Writer(), checker, DATE)["status"] == "held"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import math
 import re
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -57,37 +58,44 @@ def timestamp(value: str | None, fallback: str | None = None) -> str:
 
 
 MAX_SAVED_DEPTH = 64  # the app's own records nest a few levels; deeper is damage the CLI could not print
+_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 
 
 def _reject_constant(_: str):
     raise ValueError("Non-finite JSON constant")
 
 
-def saved_object(value):
+def saved_object(value, *, allow_surrogates: bool = False):
     """A saved JSON object read as bytes, or None when it is NULL or damaged, so one bad row cannot
     stop a run or hide the others. Decoding is strict UTF-8, as when the pipeline reads the row, not
     json.loads' lenient bytes mode, and non-finite numbers or an escaped lone surrogate, which no
     saved text can hold and the writer refuses, are damage too."""
     try:
         value = json.loads(str(value, "utf-8"), parse_constant=_reject_constant)
-        json.dumps(value, ensure_ascii=False, allow_nan=False).encode()
     except (TypeError, ValueError, RecursionError):
         return None
-    return value if isinstance(value, dict) and _within(value, MAX_SAVED_DEPTH) else None
+    return value if isinstance(value, dict) and _within(value, MAX_SAVED_DEPTH, allow_surrogates) else None
 
 
-def _within(value, depth):
-    if isinstance(value, (dict, list)):
-        return depth > 0 and all(_within(child, depth - 1) for child in (value.values() if isinstance(value, dict) else value))
-    return True
+def _within(value, depth: int, allow_surrogates: bool = False) -> bool:
+    if isinstance(value, dict):
+        return depth > 0 and all(
+            (allow_surrogates or not _SURROGATE_RE.search(k)) and _within(v, depth - 1, allow_surrogates)
+            for k, v in value.items()
+        )
+    if isinstance(value, list):
+        return depth > 0 and all(_within(v, depth - 1, allow_surrogates) for v in value)
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return allow_surrogates or not (isinstance(value, str) and _SURROGATE_RE.search(value))
+
+
+def canonical_json(value: object, *, sort_keys: bool = True) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=sort_keys, separators=(",", ":"), allow_nan=False)
 
 
 def digest(value: object) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value, sort_keys=True, ensure_ascii=False, separators=(",", ":")
-        ).encode()
-    ).hexdigest()
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
 _TYPOGRAPHY = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2013": "-", "\u2014": "-"})
@@ -128,21 +136,19 @@ def plain_text(value: object, limit: int, *, html: bool = True) -> str:
     """
     if not isinstance(value, str):
         return ""
-    if not html:
-        text = value[: limit * 4].replace("\r\n", "\n").replace("\r", "\n")
-        text = re.sub(r"[\ud800-\udfff]", "\ufffd", text)
-        text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
-        return re.sub(r"[ \t]+", " ", re.sub(r"\n{3,}", "\n\n", text)).strip()[:limit]
-    parser = _TextParser()
-    parser.feed(value[: limit * 4])
-    pending, parts, hidden = parser.rawdata, len(parser.parts), parser.hidden
-    parser.close()
-    # Some Python versions silently discard a final incomplete tag such as
-    # '<word', even on close(). Keep that literal text, not comments or scripts.
-    if not hidden and len(parser.parts) == parts and re.fullmatch(r"</?[A-Za-z][^>]*", pending):
-        parser.parts.append(pending)
-    text = "".join(parser.parts).replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"[\ud800-\udfff]", "\ufffd", text)
+    text = value[: limit * 4]
+    if html:
+        parser = _TextParser()
+        parser.feed(text)
+        pending, parts, hidden = parser.rawdata, len(parser.parts), parser.hidden
+        parser.close()
+        # Some Python versions silently discard a final incomplete tag such as
+        # '<word', even on close(). Keep that literal text, not comments or scripts.
+        if not hidden and len(parser.parts) == parts and re.fullmatch(r"</?[A-Za-z][^>]*", pending):
+            parser.parts.append(pending)
+        text = "".join(parser.parts)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = _SURROGATE_RE.sub("\ufffd", text)
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
     return re.sub(r"[ \t]+", " ", re.sub(r"\n{3,}", "\n\n", text)).strip()[:limit]
 
@@ -163,12 +169,7 @@ def canonical_url(value: str) -> str:
     value.encode("utf-8")  # Reject invalid Unicode URLs before persistence.
     parsed = urlsplit(value)
     host = (parsed.hostname or "").lower().rstrip(".")
-    if (
-        parsed.scheme != "https"
-        or not host
-        or parsed.username is not None
-        or parsed.password is not None
-    ):
+    if parsed.scheme != "https" or not host or parsed.username is not None or parsed.password is not None:
         raise ValueError("Source URLs must be public HTTPS URLs without credentials")
     if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
         raise ValueError("Local source URL is not allowed")
@@ -177,14 +178,13 @@ def canonical_url(value: str) -> str:
     except ValueError:
         if "." not in host:
             raise ValueError("Local source URL is not allowed")
-        if all(
-            re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", part) for part in host.split(".")
-        ):
+        if all(re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", part) for part in host.split(".")):
             raise ValueError("Ambiguous numeric source host is not allowed")
     else:
-        from .transport import AddressPolicy
+        from . import transport
 
-        if not AddressPolicy().permits(str(address)):
+        policy = getattr(transport, "PUBLIC_ADDRESS_POLICY", None) or transport.AddressPolicy()
+        if not policy.permits(str(address)):
             raise ValueError("Private source URL is not allowed")
     try:
         port = parsed.port
@@ -198,14 +198,30 @@ def canonical_url(value: str) -> str:
     path = parsed.path or "/"
     if host == "gitlab.torproject.org":
         path = re.sub(r"/-/issues/(\d+)/?\Z", r"/-/work_items/\1", path)
-    query = urlencode(
-        [
-            (k, v)
-            for k, v in parse_qsl(parsed.query, keep_blank_values=True)
-            if not k.lower().startswith("utm_")
-        ]
-    )
+    query = urlencode([(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if not k.lower().startswith("utm_")])
     return urlunsplit(("https", authority, path, query, parsed.fragment))
+
+
+def safe_canonical_url(url: object) -> str:
+    """Return canonical_url(url) for a valid public HTTPS URL string, or empty string otherwise."""
+    if not isinstance(url, str) or not url:
+        return ""
+    try:
+        return canonical_url(url)
+    except (TypeError, ValueError, UnicodeError):
+        return ""
+
+
+def gitlab_url_variants(url: object) -> set[str]:
+    """Return canonical URL plus its GitLab /issues/ <-> /work_items/ alias when applicable."""
+    canon = safe_canonical_url(url)
+    if not canon:
+        return set()
+    if "/-/work_items/" in canon:
+        return {canon, canon.replace("/-/work_items/", "/-/issues/")}
+    if "/-/issues/" in canon:
+        return {canon, canon.replace("/-/issues/", "/-/work_items/")}
+    return {canon}
 
 
 def item_identity(item: dict) -> str:
@@ -213,7 +229,7 @@ def item_identity(item: dict) -> str:
     return "timeline:" + item["source_entry_id"] if item.get("kind") == "metrics_timeline" else item["url"]
 
 
-_PRODUCT_NAMES = {"tor": "tor", "arti": "arti", "tor-browser": r"tor[- ]browser"}
+_PRODUCT_NAMES = {"tor-browser": r"tor[- ]browser", "arti": "arti", "tor": "tor"}
 _VERSION = re.compile(r"\d+\.\d+(?:\.\d+){0,2}(?:[-.]?(?:alpha|beta|rc|a)\.?\d*)?")
 _RELEASE_QUALIFIERS = r"(?:(?:new|stable|alpha|beta|security|bugfix|release|version)\s+)*"
 _RELEASE_AFTER = re.compile(r"\s+(?:is\s+)?(?:now\s+)?available\b")
@@ -221,16 +237,12 @@ _RELEASE_EOL = re.compile(r"\b(?:end[- ]of[- ]life|eol|out of support|no longer 
 _GITLAB_OWN = re.compile(r"^(https://[^/?#]+)/(.+?)/-/(?:issues|work_items|merge_requests|tags|blob)/\S+")
 _GITLAB_URL_REF = re.compile(r"^(https://[^/?#]+)/(.+?)/-/(issues|work_items|merge_requests)/(\d+)(?:/|$)")
 _GITLAB_SHORT_REF = re.compile(r"^(?:([a-z0-9_.-]+(?:/[a-z0-9_.-]+)+))?([#!])(\d+)$", re.I)
+_REF_TOKEN = r"(?:https://[^\s<>()\[\]\"']+|(?<![\w/#!])(?:[a-z0-9_.-]+(?:/[a-z0-9_.-]+)+)?[#!]\d+\b)"
 _CLOSING_SPAN = re.compile(
-    r"\b(?:clos(?:e|es|ed|ing)|fix(?:|es|ed|ing)|resolv(?:e|es|ed|ing))\s*:?\s+("
-    r"(?:https://[^\s<>()\[\]\"']+|(?<![\w/#!])(?:[a-z0-9_.-]+(?:/[a-z0-9_.-]+)+)?[#!]\d+\b)"
-    r"(?:\s*(?:,|and)\s*(?:https://[^\s<>()\[\]\"']+|(?<![\w/#!])(?:[a-z0-9_.-]+(?:/[a-z0-9_.-]+)+)?[#!]\d+\b))*)",
+    rf"\b(?:clos(?:e|es|ed|ing)|fix(?:|es|ed|ing)|resolv(?:e|es|ed|ing))\s*:?\s+({_REF_TOKEN}(?:\s*(?:,|and)\s*{_REF_TOKEN})*)",
     re.I,
 )
-_ANY_REF = re.compile(
-    r"(?:https://[^\s<>()\[\]\"']+|(?<![\w/#!])(?:[a-z0-9_.-]+(?:/[a-z0-9_.-]+)+)?[#!]\d+\b)",
-    re.I,
-)
+_ANY_REF = re.compile(_REF_TOKEN, re.I)
 _RELEASE_MENTION = re.compile(
     r"\b(tor[- ]browser|arti|tor)[- ](?:v|(?:(?:new|stable|alpha|beta|security|bugfix|release|version)\s+)*)?(\d+\.\d+(?:[\w.-]*\w)?)(?!(?:\w|\.\w))",
     re.I,
@@ -245,12 +257,7 @@ def item_cluster(item: dict) -> str:
     title = item["title"].lower()
     product = item.get("product", "network")
     if product == "network":
-        if re.search(r"\btor[- ]browser\b", title):
-            product = "tor-browser"
-        elif re.search(r"\barti\b", title):
-            product = "arti"
-        elif re.search(r"\btor\b", title):
-            product = "tor"
+        product = next((name for name, pat in _PRODUCT_NAMES.items() if re.search(rf"\b{pat}\b", title)), product)
     if product in _PRODUCT_NAMES:
         # Only the first version in the title, and only when it follows the product
         # name, directly or after release qualifiers ("Tor Browser 16.0", "arti-v2.8.0",
@@ -272,10 +279,7 @@ def item_cluster(item: dict) -> str:
             return f"release:{product}:{match.group(1)}"
     body = re.sub(r"\s+", " ", item["content"]).strip().lower()
     if len(body) >= 180 and item.get("kind") in {"gitlab_issue", "gitlab_mr"}:
-        clean_title = re.sub(r"\s+", " ", title).strip()
-        clean_title = re.sub(
-            r"^(?:dirauth|authority|security|tor|arti):\s*", "", clean_title
-        )
+        clean_title = re.sub(r"^(?:dirauth|authority|security|tor|arti):\s*", "", re.sub(r"\s+", " ", title).strip())
         return "body:" + digest([clean_title, body])
     return "url:" + digest(item_identity(item))
 
@@ -288,36 +292,22 @@ def gitlab_refs(item: dict) -> tuple[list[str], list[str]]:
     own_project = own_match.group(2) if own_match else None
 
     def normalize_ref(token: str) -> str | None:
-        cleaned = token.rstrip(".,;:!?)>]").split("#", 1)[0].split("?", 1)[0] if token.startswith("https://") else token
-        if cleaned.startswith("https://"):
-            match = _GITLAB_URL_REF.match(cleaned)
+        if token.startswith("https://"):
+            match = _GITLAB_URL_REF.match(token.rstrip(".,;:!?)>]").split("#", 1)[0].split("?", 1)[0])
             if not match:
                 return None
             ref_origin, project, kind_seg, number = match.groups()
             if ref_origin not in {"https://gitlab.torproject.org", origin}:
                 return None
             seg = "work_items" if kind_seg in {"issues", "work_items"} else "merge_requests"
-            raw = f"{ref_origin}/{project.lower()}/-/{seg}/{number}"
-            if ref_origin != "https://gitlab.torproject.org":
-                return raw
-            try:
-                return canonical_url(raw)
-            except ValueError:
+        else:
+            short = _GITLAB_SHORT_REF.match(token)
+            project = (short.group(1) or own_project or "") if short else ""
+            if not project:
                 return None
-        short = _GITLAB_SHORT_REF.match(token)
-        if not short:
-            return None
-        project = (short.group(1) or own_project or "").lower() or None
-        if not project:
-            return None
-        seg = "work_items" if short.group(2) == "#" else "merge_requests"
-        raw = f"{origin}/{project}/-/{seg}/{short.group(3)}"
-        if origin != "https://gitlab.torproject.org":
-            return raw
-        try:
-            return canonical_url(raw)
-        except ValueError:
-            return None
+            ref_origin, seg, number = origin, ("work_items" if short.group(2) == "#" else "merge_requests"), short.group(3)
+        raw = f"{ref_origin}/{project.lower()}/-/{seg}/{number}"
+        return (safe_canonical_url(raw) or None) if ref_origin == "https://gitlab.torproject.org" else raw
 
     own_canonical = normalize_ref(own_url) if own_url.startswith("https://") else None
     closing, mentioned = [], []

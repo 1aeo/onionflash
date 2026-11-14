@@ -24,19 +24,22 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 import httpcore
 import httpx
 
+from .util import backoff_seconds
+
 
 RETRY_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _SAFE_CROSS_ORIGIN_HEADERS = frozenset({"accept", "accept-encoding", "user-agent"})
+_RELAY_6TO4 = ipaddress.ip_network("192.88.99.0/24")
+_GLOBAL_UNICAST_V6 = ipaddress.ip_network("2000::/3")
 
 
 class FetchError(Exception):
     """A deliberately sanitized error suitable for persistent status records."""
 
-    def __init__(self, message: str, *, status: int | None = None, retryable: bool = False):
+    def __init__(self, message: str, *, status: int | None = None, retryable: bool = False, retry_after: str | None = None):
         super().__init__(message)
-        self.status = status
-        self.retryable = retryable
+        self.status, self.retryable, self.retry_after = status, retryable, retry_after
 
 
 class DeadlineReached(FetchError):
@@ -78,16 +81,14 @@ class AddressPolicy:
             return not (ip.is_multicast or ip.is_unspecified)
         if not ip.is_global or ip.is_multicast or ip.is_unspecified:
             return False
-        if isinstance(ip, ipaddress.IPv4Address) and ip in ipaddress.ip_network("192.88.99.0/24"):
-            return False
+        if isinstance(ip, ipaddress.IPv4Address):
+            return ip not in _RELAY_6TO4
         # Translation/tunneling prefixes can reach an embedded private IPv4
         # address even though the outer IPv6 address is classified as global.
-        if isinstance(ip, ipaddress.IPv6Address):
-            if ip not in ipaddress.ip_network("2000::/3") or ip.sixtofour or ip.teredo:
-                return False
-            if ((int(ip) >> 32) & 0xFDFFFFFF) == 0x00005EFE:
-                return self.permits(str(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)))
-            return True
+        if ip not in _GLOBAL_UNICAST_V6 or ip.sixtofour or ip.teredo:
+            return False
+        if ((int(ip) >> 32) & 0xFDFFFFFF) == 0x00005EFE:
+            return self.permits(str(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)))
         return True
 
     def addresses(self, host: str, port: int) -> list[str]:
@@ -105,9 +106,7 @@ class _CheckedBackend(httpcore.NetworkBackend):
     """Validate DNS at the connect boundary, then connect to a literal IP."""
 
     def __init__(self, policy: AddressPolicy, backend: Any = None, clock: Callable[[], float] = time.monotonic):
-        self.policy = policy
-        self.backend = backend or httpcore.SyncBackend()
-        self.clock = clock
+        self.policy, self.backend, self.clock = policy, backend or httpcore.SyncBackend(), clock
         self.deadline: float | None = None
 
     def budget(self, timeout: float | None) -> float | None:
@@ -180,25 +179,16 @@ class _CheckedTransport(httpx.BaseTransport):
 
     def __init__(self, policy: AddressPolicy, clock: Callable[[], float] = time.monotonic):
         self.backend = _CheckedBackend(policy, clock=clock)
-        self.pool = httpcore.ConnectionPool(
-            ssl_context=ssl.create_default_context(),
-            max_connections=4,
-            max_keepalive_connections=2,
-            keepalive_expiry=10.0,
-            network_backend=self.backend,
-            retries=0,
-        )
+        self.pool = httpcore.ConnectionPool(ssl_context=ssl.create_default_context(), max_connections=4,
+                                            max_keepalive_connections=2, keepalive_expiry=10.0,
+                                            network_backend=self.backend, retries=0)
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         self.backend.deadline = request.extensions.get("onionflash_deadline")
-        result = self.pool.handle_request(httpcore.Request(
-            method=request.method,
-            url=httpcore.URL(scheme=request.url.raw_scheme, host=request.url.raw_host,
-                             port=request.url.port, target=request.url.raw_path),
-            headers=request.headers.raw,
-            content=request.stream,
-            extensions=request.extensions,
-        ))
+        url = httpcore.URL(scheme=request.url.raw_scheme, host=request.url.raw_host,
+                           port=request.url.port, target=request.url.raw_path)
+        result = self.pool.handle_request(httpcore.Request(request.method, url, headers=request.headers.raw,
+                                                           content=request.stream, extensions=request.extensions))
         return httpx.Response(result.status, headers=result.headers,
                               stream=_ResponseStream(result.stream), extensions=result.extensions)
 
@@ -209,9 +199,8 @@ class _CheckedTransport(httpx.BaseTransport):
 def retry_delay(attempt: int, settings: dict, retry_after: str | None = None,
                 *, jitter: Callable[[], float] = random.random, now: datetime | None = None) -> float:
     """attempt=0 is the delay before the first retry; all waits have a cap."""
-    base = float(settings.get("backoff_base_seconds", 1.0))
     cap = float(settings.get("backoff_cap_seconds", 30.0))
-    delay = min(cap, base * 2 ** min(attempt, 30))
+    delay = backoff_seconds(attempt + 1, float(settings.get("backoff_base_seconds", 1.0)), cap)
     delay = min(cap, delay * (1 + float(settings.get("backoff_jitter", 0.25)) * jitter()))
     if retry_after:
         try:
@@ -235,24 +224,18 @@ class HttpClient:
     def __init__(self, settings: dict, *, allowed_networks: Iterable[str] = (), allow_http: bool = False,
                  transport: httpx.BaseTransport | None = None, resolver: Callable = socket.getaddrinfo,
                  sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic):
-        self.settings = settings
-        self.allow_http = allow_http
+        self.settings, self.allow_http = settings, allow_http
         self.policy = AddressPolicy(allowed_networks, resolver=resolver)
-        self.sleep = sleep
-        self.clock = clock
+        self.sleep, self.clock = sleep, clock
         # Absolute time.monotonic() deadline set by the caller (None: no limit).
         # Every attempt is capped by it and no retry sleeps past it; deadline_reached
         # records that the deadline, not the server, ended the latest request.
         self.deadline: float | None = None
-        self.deadline_reached = False
-        self._injected_transport = transport is not None
-        self._client = httpx.Client(
-            transport=transport or _CheckedTransport(self.policy, clock=self.clock),
-            timeout=httpx.Timeout(float(settings.get("timeout_seconds", 30.0)),
-                                  connect=float(settings.get("connect_timeout_seconds", 10.0))),
-            follow_redirects=False,
-            trust_env=False,
-        )
+        self.deadline_reached, self._injected_transport = False, transport is not None
+        timeout = httpx.Timeout(float(settings.get("timeout_seconds", 30.0)),
+                                connect=float(settings.get("connect_timeout_seconds", 10.0)))
+        self._client = httpx.Client(transport=transport or _CheckedTransport(self.policy, clock=self.clock),
+                                    timeout=timeout, follow_redirects=False, trust_env=False)
 
     def close(self) -> None:
         self._client.close()
@@ -268,24 +251,19 @@ class HttpClient:
             raise FetchError("invalid destination URL")
         try:
             parts = urlsplit(value)
-            host = parts.hostname
-            port = parts.port
-            if not host or parts.username is not None or parts.password is not None or "%" in host:
-                raise ValueError
-            if parts.scheme not in ({"http", "https"} if self.allow_http else {"https"}):
-                raise ValueError
-            if port is not None and not 1 <= port <= 65535:
+            host, port = parts.hostname, parts.port
+            allowed_schemes = {"http", "https"} if self.allow_http else {"https"}
+            if (not host or parts.username is not None or parts.password is not None or "%" in host
+                    or parts.scheme not in allowed_schemes or (port is not None and not 1 <= port <= 65535)):
                 raise ValueError
             # IDNA normalization is performed by HTTPX before the actual lookup.
             normalized = str(httpx.URL(urlunsplit((parts.scheme, parts.netloc, parts.path or "/", parts.query, ""))))
             actual = urlsplit(normalized)
-            literal = None
             try:
-                literal = ipaddress.ip_address(actual.hostname)
+                if not self.policy.permits(str(ipaddress.ip_address(actual.hostname))):
+                    raise FetchError("destination address is not permitted")
             except ValueError:
                 pass
-            if literal is not None and not self.policy.permits(str(literal)):
-                raise FetchError("destination address is not permitted")
             if self._injected_transport:
                 self.policy.addresses(actual.hostname, actual.port or (443 if actual.scheme == "https" else 80))
             return normalized
@@ -308,40 +286,34 @@ class HttpClient:
 
     def _body(self, response: httpx.Response) -> bytes:
         limit = int(self.settings.get("max_response_bytes", 4 * 1024 * 1024))
+
+        def check_size(size: int) -> None:
+            if size > limit:
+                raise FetchError("response exceeds configured byte limit")
+
         if self._injected_transport and response.is_stream_consumed:
             # MockTransport commonly constructs already-read responses. The
             # production transport always supplies an unread bounded stream.
-            if len(response.content) > limit:
-                raise FetchError("response exceeds configured byte limit")
+            check_size(len(response.content))
             return response.content
-        length = response.headers.get("content-length")
-        if length:
+        if length := response.headers.get("content-length"):
             try:
-                if int(length) < 0:
+                declared = int(length)
+                if declared < 0:
                     raise ValueError
-                if int(length) > limit:
-                    raise FetchError("response exceeds configured byte limit")
             except ValueError:
                 raise FetchError("invalid response length") from None
+            check_size(declared)
         encoding = response.headers.get("content-encoding", "identity").lower().strip()
-        decoder = None
-        if encoding in {"gzip", "x-gzip"}:
-            decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
-        elif encoding == "deflate":
-            decoder = zlib.decompressobj()
-        elif encoding not in {"", "identity"}:
+        wbits = {"gzip": 16 + zlib.MAX_WBITS, "x-gzip": 16 + zlib.MAX_WBITS, "deflate": zlib.MAX_WBITS}
+        if encoding not in {*wbits, "", "identity"}:
             raise FetchError("unsupported content encoding")
-        body = bytearray()
-        raw_size = 0
-        deflate_fallback = encoding == "deflate"
+        decoder = zlib.decompressobj(wbits[encoding]) if encoding in wbits else None
+        body, raw_size, deflate_fallback = bytearray(), 0, encoding == "deflate"
         try:
             for chunk in response.iter_raw(chunk_size=65536):
-                raw_size += len(chunk)
-                if raw_size > limit:
-                    raise FetchError("response exceeds configured byte limit")
+                check_size(raw_size := raw_size + len(chunk))
                 if not decoder:
-                    if len(body) + len(chunk) > limit:
-                        raise FetchError("response exceeds configured byte limit")
                     body.extend(chunk)
                     continue
                 pending = chunk
@@ -352,23 +324,19 @@ class HttpClient:
                     except zlib.error:
                         if not deflate_fallback or body:
                             raise
-                        deflate_fallback = False
-                        decoder = zlib.decompressobj(-zlib.MAX_WBITS)
+                        deflate_fallback, decoder = False, zlib.decompressobj(-zlib.MAX_WBITS)
                         decoded = decoder.decompress(pending, limit - len(body) + 1)
-                    if len(body) + len(decoded) > limit:
-                        raise FetchError("response exceeds configured byte limit")
+                    check_size(len(body) + len(decoded))
                     body.extend(decoded)
                     if decoder.unconsumed_tail:
                         pending = decoder.unconsumed_tail
                     elif decoder.eof and decoder.unused_data and encoding in {"gzip", "x-gzip"}:
-                        pending = decoder.unused_data
-                        decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                        pending, decoder = decoder.unused_data, zlib.decompressobj(16 + zlib.MAX_WBITS)
                     else:
                         pending = b""
             if decoder:
                 flushed = decoder.flush(limit - len(body) + 1)
-                if len(body) + len(flushed) > limit:
-                    raise FetchError("response exceeds configured byte limit")
+                check_size(len(body) + len(flushed))
                 body.extend(flushed)
                 if not decoder.eof or decoder.unused_data:
                     raise FetchError("invalid compressed response")
@@ -387,21 +355,23 @@ class HttpClient:
                          "accept-encoding": "gzip, deflate"}
         start_headers.update({str(k).lower(): str(v) for k, v in (headers or {}).items() if k.lower() != "host"})
         attempts = max(1, min(10, int(self.settings.get("retry_attempts", 3))))
+        max_redirects = int(self.settings.get("max_redirects", 4))
         for attempt in range(attempts):
             current, active_headers, active_method, payload = start_url, dict(start_headers), method, json_body
             deadline = self.clock() + float(self.settings.get("total_timeout_seconds", 90.0))
             if self.deadline is not None:
                 self._check_deadline()
                 deadline = min(deadline, self.deadline)
+            retry_after = None
             try:
-                for redirects in range(int(self.settings.get("max_redirects", 4)) + 1):
+                for redirects in range(max_redirects + 1):
                     # Cookies are unnecessary for source collection and must not
                     # make independently configured source requests stateful.
                     self._client.cookies.clear()
                     with self._client.stream(active_method, current, headers=active_headers, json=payload,
                                              extensions={"onionflash_deadline": deadline}) as response:
                         if response.status_code in REDIRECT_STATUSES:
-                            if redirects >= int(self.settings.get("max_redirects", 4)):
+                            if redirects >= max_redirects:
                                 raise FetchError("redirect limit exceeded")
                             location = response.headers.get("location")
                             if not location:
@@ -416,10 +386,8 @@ class HttpClient:
                             current = destination
                             continue
                         if response.status_code in RETRY_STATUSES:
-                            if attempt + 1 < attempts:
-                                self._pause(retry_delay(attempt, self.settings, response.headers.get("retry-after")))
-                                break
-                            raise FetchError(f"HTTP {response.status_code}", status=response.status_code, retryable=True)
+                            raise FetchError(f"HTTP {response.status_code}", status=response.status_code,
+                                             retryable=True, retry_after=response.headers.get("retry-after"))
                         if response.status_code >= 400:
                             raise FetchError(f"HTTP {response.status_code}", status=response.status_code)
                         body = b"" if response.status_code in {204, 205, 304} else self._body(response)
@@ -428,13 +396,13 @@ class HttpClient:
                 # A deadline stop must not fall back to a shorter wait than Retry-After.
                 if isinstance(exc, DeadlineReached) or not exc.retryable or attempt + 1 >= attempts:
                     raise
-                self._pause(retry_delay(attempt, self.settings))
+                retry_after = exc.retry_after
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError,
                     httpcore.TimeoutException, httpcore.NetworkError, httpcore.RemoteProtocolError, OSError):
                 self._check_deadline()
                 if attempt + 1 >= attempts:
                     raise FetchError("network request failed", retryable=True) from None
-                self._pause(retry_delay(attempt, self.settings))
             except (httpx.HTTPError, httpcore.ProtocolError, ValueError):
                 raise FetchError("invalid HTTP response") from None
+            self._pause(retry_delay(attempt, self.settings, retry_after))
         raise FetchError("request retries exhausted", retryable=True)

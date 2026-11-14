@@ -15,10 +15,10 @@ import time
 
 from onionflash.analyze import AnalysisError, Analyzer
 from onionflash.config import load_config
-from onionflash.render import _prepare_story
+from onionflash.render import prepare_story
 from onionflash.review import EDITABLE, Reviewer, final_holds, policy_hash
 from onionflash.review_gate import call_review, next_step
-from onionflash.source_packet import _labels
+from onionflash.source_packet import normalize_labels, number_sources
 from onionflash.util import item_cluster
 
 CASE_FILES = ("review_cases.json", "review_cases_judged.json")
@@ -58,14 +58,14 @@ def expand(corpus: dict) -> list[dict]:
         scope = case.get("scope", "story")
         if scope not in SCOPES:
             raise ValueError("Invalid evaluation scope")
-        packet, sources = corpus["packets"][case["packet"]], []
-        for i, source in enumerate(packet["sources"], 1):
-            texts = [source["title"], *source["passages"]]
-            sources.append({"id": f"S{i}", **source, "labels": _labels(source.get("labels")), "passages": [
-                {"id": f"S{i}:P{j}", **(text if isinstance(text, dict) else {"text": text})} for j, text in enumerate(texts, 1)]})
+        packet = corpus["packets"][case["packet"]]
+        sources = number_sources([
+            ({**src, "labels": normalize_labels(src.get("labels"))}, [src["title"], *src["passages"]])
+            for src in packet["sources"]
+        ])
         story = {**corpus["defaults"], "sources": [{"url": s["url"], "title": s["title"]} for s in sources],
                  **case["candidate"]}
-        candidate = _prepare_story(story, editorial=story.get("editorial"))
+        candidate = prepare_story(story, editorial=story.get("editorial"))
         if scope == "latest_update" and (not candidate.get("updates")
                                          or len(candidate["updates"]) != len(story.get("updates") or ())):
             raise ValueError("Update-scope case requires at least one valid update")
@@ -85,9 +85,8 @@ def draft_cases(corpus: dict) -> list[dict]:
     """
     groups = {}
     for case in corpus["cases"]:
-        if case.get("scope", "story") != "story":
-            continue
-        groups.setdefault((case["packet"], case.get("coverage_set")), []).append(case)
+        if case.get("scope", "story") == "story":
+            groups.setdefault((case["packet"], case.get("coverage_set")), []).append(case)
     merged = []
     for (packet, coverage_set), group in groups.items():
         expected, forbidden = {case["expected"] for case in group}, {}
@@ -110,7 +109,7 @@ def writer_item(source: dict) -> dict:
     passages = source["passages"][1:]
     return {key: source.get(key) for key in ("title", "kind", "authority", "product", "published_at", "updated_at",
                                              "upstream_state")} | {
-        "labels": _labels(source.get("labels")),
+        "labels": normalize_labels(source.get("labels")),
         "content": "\n\n".join(passage["text"] for passage in passages if "author" not in passage),
         "public_comments": [{"author": passage["author"], "created_at": passage["created_at"], "url": passage["url"],
                              "body": passage["text"]} for passage in passages if "author" in passage]}
@@ -158,18 +157,7 @@ def _rate(part: int, whole: int) -> float | None:
     return round(part / whole, 3) if whole else None
 
 
-def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
-    """Score final reviewed candidates and save bounded evaluation evidence privately.
-
-    In draft mode the writer drafts each packet once per round, and each case on
-    that packet reviews the draft in place of its own candidate.
-    """
-    output = Path(output).resolve()
-    public = Path(config["storage"]["output_dir"]).resolve()
-    if output == public or public in output.parents:
-        raise ValueError("Evaluation reports must stay outside public output")
-    if not 1 <= rounds <= 3 or not cases or len(cases) > MAX_CASES:
-        raise ValueError(f"Use 1–3 rounds and 1–{MAX_CASES} cases")
+def _validate_cases(cases: list[dict], *, draft: bool = False) -> None:
     identities = set()
     for case in cases:
         # A negative case without the wording or labels its repair must remove would
@@ -187,17 +175,33 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
         if (case["id"] in identities or scope not in SCOPES or not valid_route
                 or (scope == "latest_update" and (draft or not case["candidate"].get("updates")))
                 or case["expected"] not in {"approve", "not_approve", "skip", "hold"}
-                or (case["expected"] == "not_approve" and not flagged)
+                or (case["expected"] == "not_approve" and not flagged and not (draft and case["id"].startswith("draft:")))
                 or ("flaw" in case and (case["flaw"] not in FLAWS or "audit" not in case))):
             raise ValueError("Invalid or duplicate evaluation case")
         identities.add(case["id"])
+
+
+def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
+    """Score final reviewed candidates and save bounded evaluation evidence privately.
+
+    In draft mode the writer drafts each packet once per round, and each case on
+    that packet reviews the draft in place of its own candidate.
+    """
+    output = Path(output).resolve()
+    public = Path(config["storage"]["output_dir"]).resolve()
+    if output == public or public in output.parents:
+        raise ValueError("Evaluation reports must stay outside public output")
+    if not 1 <= rounds <= 3 or not cases or len(cases) > MAX_CASES:
+        raise ValueError(f"Use 1–3 rounds and 1–{MAX_CASES} cases")
+    _validate_cases(cases, draft=draft)
     output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    totals = {"cases": 0, "matched": 0, "false_approvals": 0, "positive_rejections": 0, "omissions": 0,
-              "errors": 0, "editorial_misses": 0, "impact_cleared": 0, "draft_unsupported": 0, "repairs_verified": 0,
-              "repairs_held": 0, "repairs_skipped": 0, "verification_repairs": 0, "holds": {}, "final_holds": 0,
-              "published_after_checks": 0, "route_cases": 0, "matched_routes": 0, "missed_routes": 0,
-              "false_routes": 0, "wrong_routes": 0, "controlled_mismatches": 0, "incomplete": False}
+    totals = {**dict.fromkeys(("cases", "matched", "false_approvals", "positive_rejections", "omissions", "errors",
+                               "editorial_misses", "impact_cleared", "draft_unsupported", "repairs_verified",
+                               "repairs_held", "repairs_skipped", "verification_repairs", "final_holds",
+                               "published_after_checks", "route_cases", "matched_routes", "missed_routes",
+                               "false_routes", "wrong_routes", "controlled_mismatches"), 0),
+              "holds": {}, "incomplete": False}
     judged, outcomes, seen = {}, {}, set()
     identity = policy_hash(config)
     with (os.fdopen(descriptor, "w", encoding="utf-8") as report, EvaluationReviewer(config, deadline=deadline) as reviewer,
@@ -218,24 +222,24 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                 reviewer.last_decoded = None
                 try:
                     candidate = case["candidate"]
+                    # The reviews follow the gate's steps. The first source is the item that wrote the candidate,
+                    # as in draft mode.
+                    source = case["packet"]["sources"][0]
+                    item = writer_item(source)
                     if draft:
                         key = json.dumps(case["packet"], sort_keys=True)
                         if key not in drafts:
                             try:
-                                drafts[key] = writer.analyze(writer_item(case["packet"]["sources"][0]))
+                                drafts[key] = writer.analyze(item)
                             except AnalysisError as exc:  # one failed draft fails every case on its packet
                                 drafts[key] = exc
                         if isinstance(drafts[key], AnalysisError):
                             raise drafts[key]
                         record["draft"] = drafts[key]
-                        candidate = record["candidate"] = _prepare_story(
+                        candidate = record["candidate"] = prepare_story(
                             {**candidate, **{field: drafts[key][field] for field in EDITABLE}}, editorial=candidate.get("editorial"))
                         record["draft_kept_unsupported"] = kept_unsupported(case, candidate)
                         totals["draft_unsupported"] += bool(record["draft_kept_unsupported"])
-                    # The reviews follow the gate's steps. The first source is the item that wrote the candidate,
-                    # as in draft mode.
-                    source = case["packet"]["sources"][0]
-                    item = writer_item(source)
                     prior = (case.get("existing_coverage") or {}).get("prior_story")
                     prepared = {"packet": case["packet"], "coverage": case.get("existing_coverage"),
                                 "review_scope": scope, "mode": "update" if scope == "latest_update" else "story",
@@ -386,8 +390,10 @@ def main(argv=None):
         parser.error("Invalid evaluation time or case-file size")
     config = load_config(args.config)
     cases = [case for path in files for case in (draft_cases if args.draft else expand)(json.loads(path.read_text()))]
-    if len({case["id"] for case in cases}) != len(cases):
-        parser.error("Duplicate evaluation case")
+    try:
+        _validate_cases(cases, draft=args.draft)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.case_id:
         selected = set(args.case_id)
         if selected - {case["id"] for case in cases}:

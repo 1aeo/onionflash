@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import copy
-import json
 import re
 
-from .analyze import AnalysisError, CompletionClient, SCHEMA as DRAFT_SCHEMA, label_limits
-from .candidate import LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE
-from .render import _prepare_story
-from .schema import UPDATE_CHARS
+from .analyze import SCHEMA as DRAFT_SCHEMA
+from .llm import (AnalysisError, CompletionClient, apply_label_limits,
+                  is_complete_sentence, label_limits, repair_schema, validate_text)
+from .render import prepare_story
+from .schema import LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STORY_ID_RE, UPDATE_CHARS
 from .util import canonical_url, digest, normalize_evidence
 
 REVIEW_VERSION = "onionflash-review-11"
@@ -24,9 +24,7 @@ FIELDS["why_it_matters"]["enum"] = [""]
 UPDATE_EDITABLE = ("update", *LABEL_FIELDS)
 UPDATE_FIELDS = {"update": {"type": "string", "maxLength": UPDATE_CHARS},
                  **{key: copy.deepcopy(FIELDS[key]) for key in LABEL_FIELDS}}
-UPDATE_REPAIR = {"anyOf": [{"type": "null"}, {"type": "object", "additionalProperties": False,
-    "properties": {key: {"anyOf": [rule, {"type": "null"}]} for key, rule in UPDATE_FIELDS.items()},
-    "required": list(UPDATE_EDITABLE)}]}
+UPDATE_REPAIR = repair_schema(UPDATE_FIELDS, UPDATE_EDITABLE)
 REFS = {"type": "array", "items": {"type": "string", "maxLength": 32}, "maxItems": 12}
 # The reply is generated in property order, so each check states its reason before
 # its outcome, and every criterion comes before the verdict.
@@ -41,11 +39,8 @@ SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
     "same_story": {"anyOf": [{"type": "null"}, {"type": "string", "maxLength": 64}]},
     # Strict endpoints require every object property. Null means no edit; the
     # validated application response exposes only the actual changed fields.
-    "repair": {"anyOf": [{"type": "null"}, {"type": "object", "additionalProperties": False,
-        "properties": {key: {"anyOf": [rule, {"type": "null"}]} for key, rule in FIELDS.items()},
-        "required": list(EDITABLE)}]},
+    "repair": repair_schema(FIELDS, EDITABLE),
 }, "required": ["criteria", "verdict", "same_story", "repair"]}
-STORY_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 
 SYSTEM_PROMPT = """You are the independent final publication reviewer for Onion Flash.
 Judge the EXACT candidate public story against the supplied numbered source packet.
@@ -481,15 +476,27 @@ def policy_hash(config: dict) -> str:
 
 
 def _text(value, maximum: int, *, empty: bool = False) -> None:
-    if (not isinstance(value, str) or len(value) > maximum or (not empty and not value.strip())
-            or any((ord(char) < 32 and char not in "\n\t") or char in "\ufffe\uffff" for char in value)):
-        raise ReviewError("Invalid review text")
+    validate_text(value, maximum, empty=empty, error=ReviewError, message="Invalid review text")
 
 
 def _packet_refs(packet: dict) -> set[str]:
     """The app builds the packet within its bounds (source_packet.build_packet)."""
     sources = packet["sources"]
     return {source["id"] for source in sources} | {passage["id"] for source in sources for passage in source["passages"]}
+
+
+def _coverage_ids(coverage: dict | None) -> tuple[str | None, list[str], set[str]]:
+    if not coverage:
+        return None, [], set()
+    prior = coverage.get("prior_story")
+    prior_id = (prior["id"] if isinstance(prior, dict) and not prior.get("retracted")
+                and isinstance(prior.get("id"), str) else None)
+    live, retracted = set(), set()
+    for row in coverage.get("recent") or ():
+        if isinstance(row, dict) and isinstance(row.get("id"), str):
+            (retracted if row.get("retracted") else live).add(row["id"])
+    live.discard(prior_id)
+    return prior_id, sorted(live), retracted
 
 
 def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict:
@@ -517,8 +524,7 @@ def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict
             raise ReviewError("Repair cannot change fixed-text alert labels")
         for key, value in copy.deepcopy(repair).items():
             if key == "update":
-                stripped = value.strip()
-                if stripped[-1] not in '.!?"\')”’' or not any(char.isalnum() for char in stripped):
+                if not is_complete_sentence(value):
                     raise ReviewError("Update repair must be a complete sentence")
                 updated["updates"][-1]["text"] = value
             else:
@@ -526,7 +532,7 @@ def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict
     else:
         updated.update(copy.deepcopy(repair))
     try:
-        normalized = _prepare_story(updated, editorial=updated.get("editorial"))
+        normalized = prepare_story(updated, editorial=updated.get("editorial"))
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
         raise ReviewError("Repair does not form a valid public story") from exc
     if normalized == candidate:
@@ -546,15 +552,11 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool 
     same_story = result["same_story"]
     if same_story is not None and (not isinstance(same_story, str) or not STORY_ID_RE.fullmatch(same_story)):
         raise ReviewError("Invalid same_story identifier")
-    prior_id = ((coverage or {}).get("prior_story") or {}).get("id")
-    if same_story is not None and prior_id is not None and same_story == prior_id:
+    prior_id, recent_ids, _ = _coverage_ids(coverage)
+    if same_story is not None and same_story == prior_id:
         same_story = None
-    elif same_story is not None and coverage is not None:
-        allowed_ids = {row["id"] for row in (coverage.get("recent") or ())
-                       if isinstance(row, dict) and not row.get("retracted")
-                       and isinstance(row.get("id"), str) and row["id"] != prior_id}
-        if same_story not in allowed_ids:
-            raise ReviewError("Review same_story is not listed in coverage")
+    elif same_story is not None and coverage is not None and same_story not in recent_ids:
+        raise ReviewError("Review same_story is not listed in coverage")
 
     def references(values):
         if (not isinstance(values, list) or len(values) > 12
@@ -631,6 +633,15 @@ def _stated(text: str, word: str) -> bool:
                for match in re.finditer(rf"\b{word}\b(?!-)", text))
 
 
+def _claimed_done(*texts: str) -> list[str]:
+    claimed = []
+    for raw in texts:
+        text = _plain(raw)
+        claimed += [match[1] for match in _DONE_WORD.finditer(text)
+                    if not _EXCUSED.search(text[max(0, match.start() - 90):match.start()])]
+    return claimed
+
+
 def final_holds(candidate: dict, prepared: dict) -> list[str]:
     """Why a verified approval may not publish, as review_gate.HOLDS reasons; empty when it may.
 
@@ -640,6 +651,7 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
     limits = label_limits(sources)
     merged = _plain("\n".join(source["title"] for source in sources
                               if source.get("kind") == "gitlab_mr" and source.get("upstream_state") == "merged"))
+    all_proof = _plain("\n".join(passage["text"] for source in sources for passage in source["passages"]))
     if prepared.get("mode") == "update":
         if (((prepared.get("coverage") or {}).get("prior_story") or {}).get("confidence") == "confirmed"
                 and "confirmed" not in limits["confidence"]):
@@ -647,36 +659,26 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
         entry = candidate["updates"][-1]
         exact_urls = {canonical_url(source["url"]) for source in entry["sources"]}
         cited_urls = {url.split("#", 1)[0] for url in exact_urls}
-        cited_sources = [source for source in sources if canonical_url(source["url"]).split("#", 1)[0] in cited_urls]
-        claimed = []
-        if any(source.get("kind") == "gitlab_issue" for source in cited_sources):
-            text = _plain(entry["text"])
-            claimed = [match[1] for match in _DONE_WORD.finditer(text)
-                       if not _EXCUSED.search(text[max(0, match.start() - 90):match.start()])]
-        passages = [
-            passage["text"]
-            for source in cited_sources
-            for passage in source["passages"]
-            if (canonical_url(passage["url"]) in exact_urls if "url" in passage else canonical_url(source["url"]) in exact_urls)
-        ]
-        proof = _plain("\n".join(passages))
-        all_proof = _plain("\n".join(passage["text"] for source in sources for passage in source["passages"]))
-        upd_text = _plain(entry["text"])
-        compromise_headline = bool(_HEDGED.search(all_proof) and _COMPROMISE.search(upd_text) and not _QUALIFIED.search(upd_text))
+        cited_sources = [(source, source_url) for source in sources
+                         if (source_url := canonical_url(source["url"])).split("#", 1)[0] in cited_urls]
+        claimed = (_claimed_done(entry["text"])
+                   if any(source.get("kind") == "gitlab_issue" for source, _ in cited_sources) else [])
+        proof = _plain("\n".join(
+            passage["text"] for source, source_url in cited_sources for passage in source["passages"]
+            if (canonical_url(passage["url"]) if "url" in passage else source_url) in exact_urls))
+        lead = _plain(entry["text"])
     else:
-        proof = _plain("\n".join(passage["text"] for source in sources for passage in source["passages"]))
-        claimed = []
-        if prepared["payload"]["editorial_kind"] == "gitlab_issue":  # text drafted from an issue, which requests work
-            for text in map(_plain, (candidate["title"], candidate["summary"], candidate["why_it_matters"])):
-                claimed += [match[1] for match in _DONE_WORD.finditer(text)
-                            if not _EXCUSED.search(text[max(0, match.start() - 90):match.start()])]
-        title = _plain(candidate["title"])
-        compromise_headline = bool(_HEDGED.search(proof) and _COMPROMISE.search(title) and not _QUALIFIED.search(title))
+        proof = all_proof
+        claimed = (_claimed_done(candidate["title"], candidate["summary"], candidate["why_it_matters"])
+                   if prepared["payload"]["editorial_kind"] == "gitlab_issue" else [])
+        lead = _plain(candidate["title"])
+    compromise_headline = bool(_HEDGED.search(all_proof) and _COMPROMISE.search(lead) and not _QUALIFIED.search(lead))
+    is_alert = candidate.get("origin") == "network-health"
     return [reason for reason, held in (
         ("completed_action", any(not (_stated(proof, word) or _stated(merged, DONE[word])) for word in claimed)),
         ("compromise_headline", compromise_headline),
-        ("confirmed_source", candidate.get("origin") != "network-health" and candidate["confidence"] not in limits["confidence"]),
-        ("merge_state", candidate.get("origin") != "network-health" and limits["state"] == ["merged"] and candidate["state"] != "merged")) if held]
+        ("confirmed_source", not is_alert and candidate["confidence"] not in limits["confidence"]),
+        ("merge_state", not is_alert and limits["state"] == ["merged"] and candidate["state"] != "merged")) if held]
 
 
 def _skip_stands(criteria: dict, coverage: dict | None, same_story: str | None = None) -> bool:
@@ -685,13 +687,11 @@ def _skip_stands(criteria: dict, coverage: dict | None, same_story: str | None =
     failed = {name for name in EDITORIAL_CRITERIA if criteria[name]["outcome"] == "fail"}
     if not failed:
         return False
-    stories = [row for row in ([coverage.get("prior_story"), *(coverage.get("recent") or ())] if coverage else ())
-               if isinstance(row, dict) and not row.get("retracted") and isinstance(row.get("id"), str)]
-    retracted = [row for row in ((coverage.get("recent") or ()) if coverage else ())
-                 if isinstance(row, dict) and row.get("retracted") and isinstance(row.get("id"), str)]
+    prior_id, recent_ids, retracted_ids = _coverage_ids(coverage)
+    live_ids = ([prior_id] if prior_id else []) + recent_ids
     reason = criteria["new_information"]["reason"]
-    names_live = any(story["id"] == same_story or story["id"] in reason for story in stories)
-    if "new_information" in failed and not names_live and any(row["id"] in reason for row in retracted):
+    names_live = any(sid == same_story or sid in reason for sid in live_ids)
+    if "new_information" in failed and not names_live and any(sid in reason for sid in retracted_ids):
         return False
     return True if failed != {"new_information"} else names_live
 
@@ -710,12 +710,7 @@ class Reviewer(CompletionClient):
         schema = copy.deepcopy(SCHEMA)
         if update:
             schema["properties"]["repair"] = copy.deepcopy(UPDATE_REPAIR)
-        prior_id = ((coverage or {}).get("prior_story") or {}).get("id")
-        recent_ids = sorted({
-            row["id"] for row in ((coverage or {}).get("recent") or ())
-            if isinstance(row, dict) and not row.get("retracted")
-            and isinstance(row.get("id"), str) and row["id"] != prior_id
-        })
+        prior_id, recent_ids, retracted_ids = _coverage_ids(coverage)
         schema["properties"]["same_story"] = (
             {"anyOf": [{"type": "null"}, {"type": "string", "enum": recent_ids}]}
             if recent_ids else {"type": "null", "enum": [None]}
@@ -730,9 +725,7 @@ class Reviewer(CompletionClient):
         repair_limits = label_limits(packet["sources"])
         if update and ((coverage or {}).get("prior_story") or {}).get("confidence") == "confirmed":
             repair_limits["confidence"] = ["confirmed"]
-        for key, allowed in repair_limits.items():
-            repair[key]["anyOf"][0]["enum"] = allowed
-        repair["tags"]["anyOf"][0]["items"]["enum"] = list(repair["category"]["anyOf"][0]["enum"])
+        apply_label_limits(repair, repair_limits, nullable=True)
         # Each call starts with the rubric, exact candidate and bounded context.
         # A prior model response, critique or approval is never part of its history.
         payload = {"candidate": candidate_public, "packet": packet}
@@ -765,11 +758,7 @@ class Reviewer(CompletionClient):
                 and result["criteria"]["new_information"]["outcome"] == "fail"):
             reason = result["criteria"]["new_information"]["reason"]
             named_live = [rid for rid in recent_ids if rid in reason]
-            named_retracted = any(
-                isinstance(row, dict) and row.get("retracted") and isinstance(row.get("id"), str) and row["id"] in reason
-                for row in ((coverage or {}).get("recent") or ())
-            )
-            if len(named_live) == 1 and not named_retracted:
+            if len(named_live) == 1 and not any(rid in reason for rid in retracted_ids):
                 result = {**result, "same_story": named_live[0]}
         if result["verdict"] == "skip" and not _skip_stands(result["criteria"], coverage, result.get("same_story")):
             # The record keeps the verdict that this fixed rule replaced.

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import calendar
-import json
 import re
 from datetime import datetime, timedelta
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -62,7 +61,7 @@ def _entry_time(entry: dict, name: str, fallback: str) -> str:
     return fallback
 
 
-def _item(
+def make_item(
     source: dict,
     url: str,
     title: str,
@@ -78,8 +77,7 @@ def _item(
     """Normalize one collected record and clamp future timestamps to observation time."""
     if observed:
         # A future date (a typo or a scheduled event) must not pin a story to the
-        # top or block later corrections.
-        # All three are format_utc strings, so string order is time order.
+        # top or block later corrections. format_utc strings sort chronologically.
         published, updated = min(published, observed), min(updated, observed)
     return {
         "source_id": source["id"],
@@ -92,13 +90,11 @@ def _item(
         "product": source["product"],
         "authority": source["authority"],
         "labels": [plain_text(str(x), 100, html=False) for x in (labels or [])[:30]],
-        "upstream_state": upstream_state
-        if upstream_state in {"opened", "closed", "merged"}
-        else "",
+        "upstream_state": upstream_state if upstream_state in {"opened", "closed", "merged"} else "",
     }
 
 
-def _get(client: HttpClient, url: str, state: dict):
+def fetch_cached(client: HttpClient, url: str, state: dict):
     """GET with the cache validators saved for this exact URL."""
     headers = {}
     if state.get("active_url") == url:
@@ -109,6 +105,65 @@ def _get(client: HttpClient, url: str, state: dict):
     return client.request("GET", url, headers=headers)
 
 
+_item = make_item
+_get = fetch_cached
+
+
+def _scan_feed_xml(body: bytes) -> list[str | None]:
+    """Reject DTDs/entities and unbounded xml:base growth via Expat, and extract raw RSS <author> values."""
+    parser = expat.ParserCreate(namespace_separator="\n")
+    stack: list[str] = []
+    rss_authors: list[str | None] = []
+    author_buf: list[str] = []
+    state = {"elements": 0, "base_chars": 0, "longest": 0, "item_authors": 0, "plain_author": False}
+
+    def reject_declaration(*_args):
+        raise CollectionError("Feed contains disallowed XML declarations")
+
+    def start_element(name, attributes):
+        state["elements"] += 1
+        stack.append(name)
+        for key, value in attributes.items():
+            if key.lower().rsplit("\n", 1)[-1].rpartition(":")[2] == "base":
+                # +16 covers the scheme that urljoin adds to "//host" values.
+                grown = len(value) + 16 if ABSOLUTE_BASE.match(value) else state["longest"] + len(value) + 1
+                state["longest"] = max(state["longest"], grown)
+        state["base_chars"] += state["longest"]
+        if state["elements"] > MAX_FEED_ELEMENTS:
+            raise CollectionError("Feed has too many XML elements")
+        if len(stack) > MAX_FEED_DEPTH:
+            raise CollectionError("Feed XML is nested too deeply")
+        if state["base_chars"] > MAX_FEED_BASE_CHARS:
+            raise CollectionError("Feed xml:base text exceeds the limit")
+        if stack == ["rss", "channel", "item"]:
+            state["item_authors"], state["plain_author"] = 0, True
+            author_buf.clear()
+        elif stack == ["rss", "channel", "item", "author"]:
+            state["item_authors"] += 1
+        elif stack[:4] == ["rss", "channel", "item", "author"]:
+            state["plain_author"] = False
+
+    def char_data(data):
+        if stack == ["rss", "channel", "item", "author"] and state["item_authors"] == 1 and sum(map(len, author_buf)) < 1000:
+            author_buf.append(data[:1000])
+
+    def end_element(_name):
+        if stack == ["rss", "channel", "item"]:
+            text = "".join(author_buf).strip()
+            rss_authors.append(text if state["item_authors"] == 1 and state["plain_author"] and len(text) < 1000 else None)
+        stack.pop()
+
+    parser.StartDoctypeDeclHandler = parser.EntityDeclHandler = parser.ExternalEntityRefHandler = reject_declaration
+    parser.StartElementHandler = start_element
+    parser.CharacterDataHandler = char_data
+    parser.EndElementHandler = end_element
+    try:
+        parser.Parse(body, True)
+    except expat.ExpatError as exc:
+        raise CollectionError("Invalid RSS/Atom XML") from exc
+    return rss_authors
+
+
 def _feed(
     client: HttpClient,
     source: dict,
@@ -117,79 +172,10 @@ def _feed(
     settings: dict,
     started: str,
 ) -> dict:
-    response = _get(client, url, state)
+    response = fetch_cached(client, url, state)
     if response.status == 304:
-        return {
-            "items": [],
-            "url": url,
-            "etag": state.get("etag"),
-            "last_modified": state.get("last_modified"),
-        }
-    # Expat recognizes the actual XML encoding (including UTF-16). A raw byte
-    # regexp misses encoded declarations and is not a security boundary.
-    parser = expat.ParserCreate(namespace_separator="\n")
-
-    def reject_declaration(*args):
-        raise CollectionError("Feed contains disallowed XML declarations")
-
-    # Without a DTD there are no entities to expand.
-    parser.StartDoctypeDeclHandler = reject_declaration
-    parser.EntityDeclHandler = reject_declaration
-    parser.ExternalEntityRefHandler = reject_declaration
-    # Bytes alone do not bound what feedparser builds: tiny elements are cheap to
-    # send, and every element gets its own copy of the current xml:base (or base),
-    # kept in the parse stack and in each detail object. A closed element's base can
-    # stay current for later siblings, and a new base does not always replace it
-    # (feedparser keeps the old one when the new scheme is not accepted), so the
-    # bound only grows: the longest base feedparser could hold by then is an absolute
-    # value, or the longest so far plus a relative one and a separator. Every element
-    # is charged that bound, and the sum bounds every copy.
-    elements = base_chars = longest = item_authors = 0
-    stack: list[str] = []
-    rss_authors: list[str | None] = []
-    plain_author = False
-    author_buf: list[str] = []
-
-    def start_element(name, attributes):
-        nonlocal elements, base_chars, longest, item_authors, plain_author, author_buf
-        elements += 1
-        stack.append(name)
-        for key, value in attributes.items():
-            if key.lower().rsplit("\n", 1)[-1].rpartition(":")[2] == "base":
-                # +16 covers the scheme that urljoin adds to "//host" values.
-                grown = len(value) + 16 if ABSOLUTE_BASE.match(value) else longest + len(value) + 1
-                longest = max(longest, grown)
-        base_chars += longest
-        if elements > MAX_FEED_ELEMENTS:
-            raise CollectionError("Feed has too many XML elements")
-        if len(stack) > MAX_FEED_DEPTH:
-            raise CollectionError("Feed XML is nested too deeply")
-        if base_chars > MAX_FEED_BASE_CHARS:
-            raise CollectionError("Feed xml:base text exceeds the limit")
-        if stack == ["rss", "channel", "item"]:
-            item_authors, plain_author, author_buf = 0, True, []
-        elif stack == ["rss", "channel", "item", "author"]:
-            item_authors += 1
-        elif stack[:4] == ["rss", "channel", "item", "author"]:
-            plain_author = False
-
-    def char_data(data):
-        if stack == ["rss", "channel", "item", "author"] and item_authors == 1 and sum(map(len, author_buf)) < 1000:
-            author_buf.append(data[:1000])
-
-    def end_element(name):
-        if stack == ["rss", "channel", "item"]:
-            text = "".join(author_buf).strip()
-            rss_authors.append(text if item_authors == 1 and plain_author and len(text) < 1000 else None)
-        stack.pop()
-
-    parser.StartElementHandler = start_element
-    parser.CharacterDataHandler = char_data
-    parser.EndElementHandler = end_element
-    try:
-        parser.Parse(response.body, True)
-    except expat.ExpatError as exc:
-        raise CollectionError("Invalid RSS/Atom XML") from exc
+        return {"items": [], "url": url, "etag": state.get("etag"), "last_modified": state.get("last_modified")}
+    rss_authors = _scan_feed_xml(response.body)
     feed = feedparser.parse(response.body, sanitize_html=False, resolve_relative_uris=False)
     if not feed.get("version") or feed.get("bozo"):
         raise CollectionError("Invalid RSS/Atom document")
@@ -206,12 +192,11 @@ def _feed(
         )
     )
     cutoff = after(-settings["lookback_days"] * 86400, started)
-    items = []
-    identities, conflicts, fallback_indices, skipped = {}, set(), set(), 0
+    staged: list[tuple[dict, tuple[str, str] | None]] = []
+    fallback_contents: dict[tuple[str, str], tuple[str, str] | None] = {}
+    skipped = 0
     for index, entry in enumerate(feed.entries):
-        published = _entry_time(
-            entry, "published", _entry_time(entry, "updated", "")
-        )
+        published = _entry_time(entry, "published", _entry_time(entry, "updated", ""))
         if not published:
             if source.get("alert_format"):
                 skipped += 1
@@ -225,8 +210,7 @@ def _feed(
             content_parts[0].get("value", "") if content_parts else entry.get("summary", ""),
             settings["content_chars"],
         )
-        # Only an explicit text/plain title keeps its angle brackets; HTML and
-        # XHTML titles are stripped.
+        # Only an explicit text/plain title keeps its angle brackets; HTML/XHTML titles are stripped.
         title_html = (entry.get("title_detail") or {}).get("type", "text/html") != "text/plain"
         # Some curated feeds put their complete description in an Atom title.
         title = entry.get("title", "")
@@ -236,17 +220,10 @@ def _feed(
                 text = (text + "\n" + full_title)[: settings["content_chars"]]
         # feedparser already uses an Atom entry's id as its link when no alternate
         # link exists; an RSS guid that is not a permalink is never a citation.
-        link = entry.get("link", "")
         try:
-            item = _item(
-                source,
-                link,
-                title,
-                text,
-                published,
-                updated,
-                title_html=title_html,
-                observed=started,
+            item = make_item(
+                source, entry.get("link", ""), title, text, published, updated,
+                title_html=title_html, observed=started,
             )
         except ValueError:
             continue
@@ -264,26 +241,17 @@ def _feed(
             and bool(link_obj.get("href"))
             for link_obj in (entry.get("links") or ())
         )
+        fallback_key = None
         if feed.version.startswith("atom") and not has_alternate and entry.get("id"):
-            identity = (item["url"], item["updated_at"])
+            fallback_key = (item["url"], item["updated_at"])
             content = (item["title"], item["content"])
-            if identity in identities and identities[identity] != content:
-                conflicts.add(identity)
-            identities[identity] = content
-            fallback_indices.add(len(items))
-        items.append(item)
-    if conflicts:
-        unambiguous = [
-            item
-            for idx, item in enumerate(items)
-            if not (idx in fallback_indices and (item["url"], item["updated_at"]) in conflicts)
-        ]
-        skipped += len(items) - len(unambiguous)
-        items = unambiguous
+            if fallback_contents.setdefault(fallback_key, content) != content:
+                fallback_contents[fallback_key] = None
+        staged.append((item, fallback_key))
+    items = [item for item, key in staged if key is None or fallback_contents[key] is not None]
+    skipped += len(staged) - len(items)
     # An archive feed is bounded by its newest entries, whatever order it lists them in.
     items = sorted(items, key=lambda item: item["updated_at"], reverse=True)[: source["max_items"]]
-    # Skipped entries are counted in the run report instead of leaving a healthy
-    # feed in a permanent error state that also discards its ETag.
     return {
         "items": items,
         "skipped": skipped,
@@ -329,11 +297,9 @@ def _gitlab(
         # A failed request keeps the rows already read, and a later run resumes where it began.
         resume = params["updated_after"] if params["updated_after"] != start else None
         try:
-            records = json.loads(client.request("GET", request_url).body)
-        except FetchError as exc:  # including a deadline cutoff
+            records = client.request("GET", request_url).json()
+        except FetchError as exc:  # including a deadline cutoff or invalid JSON
             raise CollectionError(str(exc), items, resume) from exc
-        except (ValueError, UnicodeError, RecursionError) as exc:
-            raise CollectionError("GitLab returned invalid JSON", items, resume) from exc
         if not isinstance(records, list) or any(not isinstance(r, dict) for r in records) or len(records) > page_size:
             raise CollectionError("GitLab returned an unexpected response", items, resume)
         for record in records:
@@ -344,7 +310,7 @@ def _gitlab(
                     record.get("merged_at") if source["kind"] == "gitlab_mr" else record.get("created_at"),
                     started,
                 )
-                item = _item(
+                item = make_item(
                     source,
                     record["web_url"],
                     record.get("title", ""),

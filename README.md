@@ -64,9 +64,8 @@ than the job runs; it cannot make the job run more often. A successful poll is
 rescheduled a few seconds early (at most a tenth of the interval) to absorb
 scheduler start jitter; failure and Retry-After cooldowns are never shortened.
 
-All settings are shown in [`config.example.toml`](config.example.toml). Settings that
-were removed (such as `http.requests_per_minute`) still load; each is logged as
-ignored and can be deleted. Relative
+All settings are shown in [`config.example.toml`](config.example.toml); unknown
+sections and keys are rejected. Relative
 database and output paths resolve against the configuration file's directory.
 `${ENVIRONMENT_VARIABLE}` references are expanded for paths and LLM URLs; each
 entry in `llm.fallback_base_urls` must expand to a nonempty URL.
@@ -83,8 +82,7 @@ The API key is read only from the `ONIONFLASH_LLM_API_KEY` environment variable.
 
 Collection, HTTP, model, comment, final-review and publication limits (lookback,
 budgets, retries, response sizes, backoff, source-packet bounds,
-render batch) are fixed in code; a file that still sets one loads, with each one
-logged as ignored.
+render batch) are fixed in code.
 
 Public sources must use HTTPS. Private inference endpoints require explicit
 `llm.allowed_networks` CIDRs and `llm.allow_http = true` when using HTTP. Prefer
@@ -120,8 +118,8 @@ collection without erasing already published news. GitLab merged changes are
 collected across branches, including maintenance branches. Consensus-health
 alert feeds (`alert_format = "consensus"`, requiring `website_url`) route DocTor
 reports into fixed-text incident rules with `publish = false` dry-run mode by
-default, while other legacy `alert_format` entries remain disabled; see
-[network-health alerts and retired formats](docs/SOURCE_COVERAGE.md#network-health-alerts).
+default; see
+[network-health alerts](docs/SOURCE_COVERAGE.md#network-health-alerts).
 
 The Metrics Timeline source uses `kind = "metrics_timeline"` with the maintained
 repository's GitLab file JSON API URL and its repository root as `website_url`.
