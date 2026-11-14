@@ -4,13 +4,14 @@ import json
 import pytest
 
 from helpers import update_analysis, verdict
-from onionflash import editorial, review_gate
+from onionflash import editorial, review, review_gate
 from onionflash.analyze import AnalysisError
 from onionflash.transport import FetchError
 from helpers import seed_source_story as _publish
 from helpers import analysis, make_item as item
 from helpers import LATER, Writer, job, pending, run_gate as run
-from test_review_request_budget import context, record, reviewer, saved_audit
+from test_review_request_budget import (context, inconsistent, pause_cached_after_reset, pause_proposal,
+                                        record, reviewer, saved_audit)
 
 
 def routed_with_spent_requests(cfg, store):
@@ -124,3 +125,51 @@ def test_corrupt_job_is_not_silently_erased_by_a_citation_transition(context):
     with pytest.raises(AnalysisError, match="damaged"):
         run(cfg, store, row, Writer(), checker)
     assert checker.calls == 0 and job(store) == before
+
+
+@pytest.mark.parametrize("retained", ["review", "proposal", "cached-header", "cached-review", "cached-proposal"])
+def test_outer_policy_spoof_cannot_hide_retained_policy_evidence(context, monkeypatch, retained):
+    cfg, store = context
+    if retained == "review":
+        _, _, row = routed_with_spent_requests(cfg, store)
+    else:
+        row = pending(store)
+        if retained == "proposal":
+            pause_proposal(cfg, store, row, monkeypatch)
+        else:
+            if retained == "cached-proposal":
+                with pytest.raises(review.InconsistentReview):
+                    run(cfg, store, row, Writer(), reviewer(cfg, inconsistent({})))
+            pause_cached_after_reset(cfg, store, row, monkeypatch)
+    audit = record(store)
+    authentic, spoofed = audit["policy_hash"], "e" * 64
+    assert authentic != spoofed
+    audit["policy_hash"] = spoofed
+    if retained in {"cached-review", "cached-proposal"}:
+        audit["approval"]["policy_hash"] = spoofed
+        if retained == "cached-proposal":
+            for entry in audit["approval"]["reviews"]:
+                entry["policy_hash"] = spoofed
+            assert audit["approval"]["untrusted_proposals"][0]["context"]["policy_hash"] == authentic
+    with store.db:
+        store.db.execute("UPDATE review_jobs SET policy_hash=?,record_json=? WHERE item_id=?",
+                         (spoofed, json.dumps(audit), row["id"]))
+    before = job(store)
+    current = next(r for r in store.pending(10, LATER) if r["id"] == row["id"])
+    writer, checker = Writer(update_analysis()), reviewer(cfg)
+    with pytest.raises(AnalysisError, match="damaged"):
+        run(cfg, store, current, writer, checker)
+    assert not writer.calls and checker.calls == 0 and job(store) == before
+
+
+def test_genuine_policy_change_accepts_coherent_nested_old_proof(context, monkeypatch):
+    cfg, store = context
+    row = pending(store)
+    with pytest.raises(review.InconsistentReview):
+        run(cfg, store, row, Writer(), reviewer(cfg, inconsistent({})))
+    pause_cached_after_reset(cfg, store, row, monkeypatch)
+    cfg["review"]["model"] = "another-review-policy"
+    writer, checker = Writer(), reviewer(cfg, verdict(), verdict())
+    assert run(cfg, store, row, writer, checker)["status"] == "published"
+    assert not writer.calls and checker.calls == 2
+    assert saved_audit(store)["request_budget"]["reserved"] == 2

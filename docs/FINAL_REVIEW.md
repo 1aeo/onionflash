@@ -215,6 +215,8 @@ proof, without storing a second copy in the record. Older compact records can
 use a valid retained envelope; a hash-only draft without source proof requires
 an explicit operator retry. Format markers prevent damaged current records from
 being accepted as an older representation.
+Retained review, proposal and cached-proof policy metadata must also agree before
+an older policy can justify a fresh budget; older verdict schemas remain readable.
 
 ## Final checks
 

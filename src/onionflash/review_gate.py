@@ -138,6 +138,32 @@ def _identity(prepared):
     return tuple(prepared[key] for key in ("candidate_hash", "source_hash", "binding_hash"))
 
 
+def _policy_copies(record, policy):
+    """Check retained policy metadata without interpreting older verdict schemas."""
+    if not isinstance(policy, str) or not re.fullmatch(r"[0-9a-f]{64}", policy):
+        raise ValueError()
+    pending = [record]
+    while pending:
+        proof = pending.pop()
+        if not isinstance(proof, dict) or ("policy_hash" in proof and proof["policy_hash"] != policy):
+            raise ValueError()
+        reviews, proposals = proof.get("reviews", []), proof.get("untrusted_proposals", [])
+        if not isinstance(reviews, list) or not isinstance(proposals, list):
+            raise ValueError()
+        for entry in reviews:
+            if not isinstance(entry, dict) or ("policy_hash" in entry and entry["policy_hash"] != policy):
+                raise ValueError()
+        for proposal in proposals:
+            if not isinstance(proposal, dict):
+                raise ValueError()
+            context = proposal.get("context")
+            if context is not None and (not isinstance(context, dict)
+                    or ("policy_hash" in context and context["policy_hash"] != policy)):
+                raise ValueError()
+        if proof.get("approval") is not None:
+            pending.append(proof["approval"])
+
+
 def _saved_job(store, row, config):
     """Validate saved identity before a mismatch can start a fresh automatic review."""
     from .store import item_hash
@@ -207,6 +233,7 @@ def _saved_job(store, row, config):
             raise ValueError()
         if job["stage"] != "drafted" and record.get("policy_hash") != job["policy_hash"]:
             raise ValueError()
+        _policy_copies(record, job["policy_hash"])
         if job["stage"] in {"approved", "skipped"} and job["approval_key"] != record.get("approval_key"):
             raise ValueError()
     except (ValueError, TypeError, KeyError, AttributeError, UnicodeError):
