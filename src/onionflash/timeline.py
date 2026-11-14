@@ -8,7 +8,7 @@ import re
 from datetime import datetime, timezone
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
-from .collect import CollectionError, _get, _item
+from .collect import CollectionError, fetch_cached, make_item
 from .util import after, digest, format_utc, parse_utc, plain_text
 
 
@@ -54,7 +54,7 @@ def collect_timeline(client, source: dict, url: str, state: dict, settings: dict
     A recent start or explicit end qualifies a row and dates its item. Neither an
     ongoing marker nor a repository commit/fetch timestamp makes a historical row new.
     """
-    response = _get(client, url, state)
+    response = fetch_cached(client, url, state)
     if response.status == 304:
         return {"items": [], "url": url, "etag": state.get("etag"), "last_modified": state.get("last_modified")}
     try:
@@ -104,8 +104,8 @@ def collect_timeline(client, source: dict, url: str, state: dict, settings: dict
                     f"Description: {description}\nReferences: {references or 'none listed'}"
                 )
                 citation = repository + "/-/blob/" + revision + "/" + quote(path, safe="/") + "?plain=1#L" + str(line)
-                item = _item(source, citation, description, plain_text(context, settings["content_chars"]),
-                             published if start_recent else updated, revision_time)
+                item = make_item(source, citation, description, plain_text(context, settings["content_chars"]),
+                                 published if start_recent else updated, revision_time)
                 if not item["title"]:
                     raise ValueError("Timeline event has no readable description")
                 item["source_entry_id"] = entry_id

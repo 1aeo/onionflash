@@ -141,9 +141,8 @@ and the condition is absent (for `A`, after 24 hours without a listing). Closing
 updates state `No longer listed`, never `resolved`, and set the public state to
 `no-longer-listed`. A recurrence of the same rule and subject within 7 days of
 closing reopens the existing story as a dated update instead of starting a
-second story. Each story carries a fixed `About this alert` context note whose
-historical episode statistics can be recomputed periodically from archived
-DocTor reports.
+second story. Each story carries a fixed `About this alert` context note with
+historical episode statistics from archived DocTor reports.
 
 When a recent unlocked story already covers the same authority or consensus
 event, a single cached yes/no check decides whether the DocTor updates attach to
@@ -156,9 +155,5 @@ targets.
 cached, and `onionflash status` previews active incidents under `network_health`
 without writing stories. When `publish = true` is enabled, incidents that had
 already closed beforehand are skipped (`skipped.network.before_enable`) with no
-backfill.
-
-Other non-empty `alert_format` values (such as `censorship`) remain retired and
-load disabled with a warning. The unused `monitor_id` key and retired
-`[monitoring]` settings are accepted and ignored, and any legacy monitoring
-tables in an existing database are left untouched.
+backfill. Any legacy monitoring tables in an existing database are left
+untouched.

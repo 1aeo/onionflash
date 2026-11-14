@@ -17,16 +17,18 @@ def source_fingerprint(item: dict) -> str:
     return digest({key: item.get(key) for key in SOURCE_FIELDS})
 
 
-def _decode(value):
-    item = saved_object(value)
+def _source_body(item: dict | None) -> str | None:
     if item is None or not isinstance(item.get("title"), str):
         return None
     body = item.get("source_content", item.get("content"))
     # An explicit empty body is a valid title-only source. An absent body
     # is a compacted/missing snapshot, not evidence of an empty document.
-    if not isinstance(body, str) or not (body.strip() or item["title"].strip()):
-        return None
-    return item
+    return body if isinstance(body, str) and (body.strip() or item["title"].strip()) else None
+
+
+def _decode(value):
+    item = saved_object(value)
+    return item if _source_body(item) is not None else None
 
 
 def _lookup_fingerprint(row):
@@ -68,6 +70,7 @@ def _load(db, source_id: str | None, url: str, analysis_key: str | None = None):
         item = _decode(row["payload"])
         if _matches_citation(item, source_id, url):
             return item, [lookup], "current", None
+
     # Stable repository-entry IDs can move to a different immutable commit URL.
     # Keep the retained citation tied to its actual bytes, never the newer entry.
     def snapshot(row):
@@ -78,27 +81,32 @@ def _load(db, source_id: str | None, url: str, analysis_key: str | None = None):
             return item, [lookup, {"table": "analyses", "key": row["cache_key"], "hash": source_fingerprint(item)}], "historical-analysis", row["created_at"]
         return None
 
-    if analysis_key:
-        saved = snapshot(db.execute("SELECT cache_key,CAST(source_payload AS BLOB) AS source_payload,created_at FROM analyses "
-                                    "WHERE cache_key=?", (analysis_key,)).fetchone())
-        if saved:
-            return saved
+    if analysis_key and (saved := snapshot(db.execute(
+            "SELECT cache_key,CAST(source_payload AS BLOB) AS source_payload,created_at FROM analyses WHERE cache_key=?",
+            (analysis_key,)).fetchone())):
+        return saved
     if source_id:
         # Stream this one source's indexed history; a later snapshot at a
         # different URL must not hide an older exact citation match.
         for row in db.execute("""SELECT cache_key,CAST(source_payload AS BLOB) AS source_payload,created_at FROM analyses
                 WHERE source_item_id=? AND source_payload IS NOT NULL
                 ORDER BY created_at DESC,cache_key DESC""", (source_id,)):
-            saved = snapshot(row)
-            if saved:
+            if saved := snapshot(row):
                 return saved
     return None
 
 
-def _labels(value) -> list[str]:
+def normalize_labels(value) -> list[str]:
     if not isinstance(value, list):
         return []
     return [text for label in value[:30] if isinstance(label, str) and (text := plain_text(label, 100, html=False))]
+
+
+def number_sources(entries: list[tuple[dict, list]]) -> list[dict]:
+    """Assign sequential `S<i>` and `S<i>:P<j>` identifiers to sources and passages."""
+    return [{"id": f"S{i}", **unit, "passages": [
+        {"id": f"S{i}:P{j}", **(p if isinstance(p, dict) else {"text": p})} for j, p in enumerate(passages, 1)]}
+        for i, (unit, passages) in enumerate(entries, 1)]
 
 
 def _passages(text, size, **note):
@@ -122,6 +130,7 @@ def _shares(needs, floors, budget):
 
 def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str | None, *, update: bool = False):
     missing, bindings, units, truncated = [], {}, [], False
+    loaded_cache: dict[tuple[str | None, str, str | None], tuple | None] = {}
     required_ids = {incoming["id"], writer_id}
     # Legacy grouped stories may predate writer provenance. Their complete
     # collected source set can still support a fresh review of the final prose;
@@ -143,21 +152,17 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
         if source_id == incoming["id"]:
             loaded = (incoming, [{"table": "items", "key": incoming["id"], "hash": source_fingerprint(incoming)}], "current", None)
         else:
-            loaded = _load(db, source_id, source["url"].split("#note_", 1)[0],
-                           payload.get("editorial_analysis_key") if source_id == writer_id else None)
+            load_key = (source_id, source["url"].split("#note_", 1)[0],
+                        payload.get("editorial_analysis_key") if source_id == writer_id else None)
+            if load_key not in loaded_cache:
+                loaded_cache[load_key] = _load(db, *load_key)
+            loaded = loaded_cache[load_key]
         if loaded is None:
             truncated = True
             if required:
                 missing.append(source["url"])
             continue
         item, source_bindings, snapshot, captured = loaded
-        body = item.get("source_content", item.get("content"))
-        unit = {key: item.get(key) for key in ("kind", "authority", "product", "published_at", "updated_at", "upstream_state")}
-        unit.update(labels=_labels(item.get("labels")), url=canonical_url(item["url"]), title=item["title"], snapshot=snapshot)
-        if item.get("closed_at"):
-            unit["closed_at"] = item["closed_at"]
-        if captured:
-            unit["captured_at"] = captured
         if source.get("source_item_id"):
             # A cited note is supplied with the text of its parent issue.
             source_canon = _safe_canonical(source["url"])
@@ -166,11 +171,18 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
                 if required and (not update or require_all or source_canon in update_urls):
                     missing.append(source["url"])
             continue
-        if not isinstance(body, str) or not (body.strip() or item["title"].strip()):
+        body = _source_body(item)
+        if body is None:
             truncated = True
             if required:
                 missing.append(source["url"])
             continue
+        unit = {key: item.get(key) for key in ("kind", "authority", "product", "published_at", "updated_at", "upstream_state")}
+        unit.update(labels=normalize_labels(item.get("labels")), url=canonical_url(item["url"]), title=item["title"], snapshot=snapshot)
+        if item.get("closed_at"):
+            unit["closed_at"] = item["closed_at"]
+        if captured:
+            unit["captured_at"] = captured
         # First the text a writer sees for this item: its title, every note and its
         # description window; then the rest of the description. A share too small
         # for the whole source cuts description text before any note.
@@ -197,7 +209,7 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
     counts = _shares([len(unit[1]) for unit in units], [len(unit[4]) for unit in units], LIMITS["max_passages"])
     chars = _shares([sum(len(passage["text"]) for passage in unit[1][:count]) for unit, count in zip(units, counts)],
                     [sum(len(passage["text"]) for passage in unit[4]) for unit in units], LIMITS["max_source_chars"])
-    sources = []
+    trimmed = []
     for index, (unit, evidence, _, source_bindings, _) in enumerate(units):
         for binding in source_bindings:
             bindings[(binding["table"], binding["key"])] = binding
@@ -208,7 +220,5 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
             passages.append({**passage, "text": passage["text"][:left]})
             left -= len(passages[-1]["text"])
         truncated |= passages != evidence
-        source_id = f"S{index + 1}"
-        sources.append({"id": source_id, **unit, "passages": [
-            {"id": f"{source_id}:P{number}", **passage} for number, passage in enumerate(passages, 1)]})
-    return {"sources": sources, "missing_sources": list(dict.fromkeys(missing)), "truncated": truncated}, list(bindings.values())
+        trimmed.append((unit, passages))
+    return {"sources": number_sources(trimmed), "missing_sources": list(dict.fromkeys(missing)), "truncated": truncated}, list(bindings.values())

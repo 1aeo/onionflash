@@ -36,11 +36,8 @@ network allowlist, timeout and items per run (see `OPERATOR_SETTINGS` and
 `config.example.toml`). Other budgets, limits, timeouts, retries, batch and cache
 sizes belong in code as constants.
 
-When a section setting is removed, add its key to `RETIRED` so existing files
-keep loading. A section that loses its last setting stays in `DEFAULTS` as an
-empty table, as `monitoring` does, so files that still contain it load. Source
-entries have no such list: keep a removed source key in the allowed set and
-ignore it, or existing files stop loading.
+Remove obsolete settings from configuration files before deleting them from
+code; unknown sections, section keys, and source keys are rejected.
 
 ## Code
 

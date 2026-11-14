@@ -7,23 +7,35 @@ import contextlib
 import fcntl
 import json
 import os
+from pathlib import Path
 import sqlite3
 import sys
 import time
 import traceback
-from pathlib import Path
 
 from . import __version__, decisions, doctor, editorial, rejection
 from .analyze import AnalysisError, Analyzer
-from .review import Reviewer
-from .review_gate import process_item, status as review_status
 from .collect import CollectionError, collect_source
 from .comments import RUN_BUDGET_SECONDS as COMMENTS_BUDGET, enrich_comments, merge_cached_comments, status as comments_status
 from .config import DEFAULTS, load_config
 from .publication import build
+from .review import Reviewer
+from .review_gate import process_item, status as review_status
 from .store import Store, source_due
 from .transport import HttpClient
 from .util import now_iso
+
+OPERATOR_ACTIONS = {
+    "story": {"show", "history", "correct", "retract", "restore", "unlock", "merge"},
+    "rejected": {"list", "show", "retry", "dismiss", "approve"},
+    "decisions": {"summary", "list"},
+}
+READ_ONLY_ACTIONS = {"show", "history", "list", "summary"}
+
+
+def _unexpected_error(exc: BaseException) -> str:
+    frame = traceback.extract_tb(exc.__traceback__)[-1]
+    return f"Unexpected {type(exc).__name__} at {Path(frame.filename).name}:{frame.lineno}"
 
 
 @contextlib.contextmanager
@@ -43,40 +55,36 @@ def run_lock(database: str):
         os.close(fd)
 
 
-def _operator_parsers(commands) -> None:
+def _operator_parsers(commands, cfg_parent: argparse.ArgumentParser) -> None:
     """Register explicit inspection and guarded editorial or retry commands."""
+    guarded = argparse.ArgumentParser(add_help=False)
+    guarded.add_argument("--expect-hash", required=True)
+    guarded.add_argument("--reason", required=True)
+
     story = commands.add_parser("story", help="Inspect, correct, merge, or retract a published story")
     actions = story.add_subparsers(dest="action", required=True)
     for name in ("show", "history", "correct", "retract", "restore", "unlock", "merge"):
-        action = actions.add_parser(name)
-        action.add_argument("--config", required=True, type=Path)
+        parents = [cfg_parent] if name in READ_ONLY_ACTIONS else [cfg_parent, guarded]
+        action = actions.add_parser(name, parents=parents)
         action.add_argument("--story", required=True, help="Stable story ID")
         if name == "merge":
             action.add_argument("--into", dest="into_story", required=True, help="Survivor story ID")
-            action.add_argument("--expect-hash", required=True, help="Current hash returned by story show")
-            action.add_argument("--reason", required=True, help="Private operator reason recorded with the merge")
-        elif name not in {"show", "history"}:
-            action.add_argument("--expect-hash", required=True, help="Current hash returned by story show")
-            action.add_argument("--reason", required=True, help="Public reason for this editorial action")
-        if name == "correct":
+        elif name == "correct":
             action.add_argument("--patch", required=True, type=Path, help="JSON object containing changed public fields")
-        if name == "restore":
+        elif name == "restore":
             action.add_argument("--revision", required=True, type=int, help="Revision to restore and lock")
 
     rejected = commands.add_parser("rejected", help="Inspect, retry, dismiss or approve held analyses")
     actions = rejected.add_subparsers(dest="action", required=True)
     for name in ("list", "show", "retry", "dismiss", "approve"):
-        action = actions.add_parser(name)
-        action.add_argument("--config", required=True, type=Path)
+        parents = [cfg_parent, guarded] if name in {"retry", "dismiss"} else [cfg_parent]
+        action = actions.add_parser(name, parents=parents)
         if name == "list":
             action.add_argument("--status", choices=("rejected", "dismissed", "ignored"), default="rejected")
             action.add_argument("--limit", type=int, default=50)
             action.add_argument("--after", help="Continuation cursor returned by the previous list")
         else:
             action.add_argument("--item", required=True, help="Collected item ID")
-        if name in {"retry", "dismiss"}:
-            action.add_argument("--expect-hash", required=True, help="Current content_hash returned by rejected show")
-            action.add_argument("--reason", required=True, help="Private operator reason for this action")
         if name == "approve":
             action.add_argument("--approval-hash", required=True, help="final_review.approval.hash returned by rejected show")
             action.add_argument("--reason", required=True, help="Private operator reason for this action")
@@ -84,8 +92,7 @@ def _operator_parsers(commands) -> None:
     log = commands.add_parser("decisions", help="Summarize or list recent private decisions")
     actions = log.add_subparsers(dest="action", required=True)
     for name in ("summary", "list"):
-        action = actions.add_parser(name)
-        action.add_argument("--config", required=True, type=Path)
+        action = actions.add_parser(name, parents=[cfg_parent])
         action.add_argument("--since", default="7d", help="Hours or days before now, such as 7d, or a timestamp")
         if name == "list":
             action.add_argument("--code", help="A decision code or its dotted prefix, such as held.review")
@@ -133,24 +140,14 @@ def run(config: dict, store: Store) -> dict:
         raise ValueError("At most one enabled consensus alert source is supported")
     observed = now_iso()
     report = {
-        "sources_ok": 0,
-        "sources_failed": 0,
-        "items_changed": 0,
-        "analyzed": 0,
-        "analysis_failed": 0,
-        "budget_reached": False,
-        "entries_skipped": 0,
-        "review_cache_hits": 0,
-        "review_stale": 0,
-        "review_routed": 0,
-        "model_calls": 0,
+        "sources_ok": 0, "sources_failed": 0, "items_changed": 0, "analyzed": 0,
+        "analysis_failed": 0, "budget_reached": False, "entries_skipped": 0,
+        "review_cache_hits": 0, "review_stale": 0, "review_routed": 0, "model_calls": 0,
     }
     started = time.monotonic()
     budget = config["collection"]["run_budget_seconds"]
     collection_window = budget * (1 - config["collection"]["analysis_reserve_fraction"])
     comments_enabled = bool(config.get("comments", {}).get("enabled"))
-    # Comments share collection time, preserving the existing analysis reserve.
-    # Keep at least half the collection window available for primary sources.
     comments_budget = min(COMMENTS_BUDGET, collection_window / 2) if comments_enabled else 0
     collection_deadline = started + collection_window - comments_budget
     network_ingested = {"reports_new": 0, "rejected": 0}
@@ -158,13 +155,11 @@ def run(config: dict, store: Store) -> dict:
     def record_items(source, items):
         received = now_iso()
         if source.get("alert_format") == "consensus":
-            added, rejected = doctor.ingest(
-                store.db, source, list(items), received, config["collection"]["content_chars"]
-            )
+            added, rejected = doctor.ingest(store.db, source, list(items), received, config["collection"]["content_chars"])
             network_ingested["reports_new"] += added
             network_ingested["rejected"] += rejected
             return received
-        if comments_enabled:  # Once they are turned off, stored notes no longer reach new revisions.
+        if comments_enabled:
             items = (merge_cached_comments(store, item, source, received) for item in items)
         report["items_changed"] += sum(store.ingest(item, received) for item in items)
         return received
@@ -180,8 +175,6 @@ def run(config: dict, store: Store) -> dict:
             if remaining < 1:
                 report["budget_reached"] = True
                 break
-            # Requests stop at this deadline; a source cut off only by the shared
-            # collection deadline is not penalized and resumes next run.
             shared = remaining <= config["collection"]["source_budget_seconds"]
             client.deadline = time.monotonic() + min(remaining, config["collection"]["source_budget_seconds"])
             client.deadline_reached = False
@@ -192,36 +185,27 @@ def run(config: dict, store: Store) -> dict:
                     report["entries_skipped"] += result.get("skipped", 0)
                     store.source_success(source, result, received, schedule_from=observed)
                     report["sources_ok"] += 1
-                except CollectionError as exc:  # saving its partial items is covered by the handler below too
+                except CollectionError as exc:
                     received = record_items(source, exc.items)
                     out_of_time = shared and (client.deadline_reached or time.monotonic() >= collection_deadline)
                     store.source_failure(
-                        source,
-                        str(exc),
-                        config["collection"],
-                        received,
-                        exc.watermark,
-                        exc.catching_up or out_of_time,
+                        source, str(exc), config["collection"], received,
+                        exc.watermark, exc.catching_up or out_of_time,
                     )
                     report["sources_failed"] += 1
                     if out_of_time:
                         report["budget_reached"] = True
                         break
-            except Exception as exc:  # untrusted input must not stop the other sources
-                # Record where it failed (file:line), never the exception text.
-                frame = traceback.extract_tb(exc.__traceback__)[-1]
-                where = f"{Path(frame.filename).name}:{frame.lineno}"
-                store.source_failure(source, f"Unexpected {type(exc).__name__} at {where}", config["collection"], now_iso())
+            except Exception as exc:
+                store.source_failure(source, _unexpected_error(exc), config["collection"], now_iso())
                 report["sources_failed"] += 1
     try:
         report["comments"] = enrich_comments(config, store, now_iso(), deadline=started + collection_window)
     except Exception as exc:
-        # Optional discussion enrichment must not stop primary sources or queued
-        # analysis. Keep diagnostics useful without printing source/API contents.
-        frame = traceback.extract_tb(exc.__traceback__)[-1]
-        report["comments"] = {"enabled": comments_enabled, "checked": 0, "changed": 0,
-                              "failed": 1, "skipped": 0, "budget_reached": False,
-                              "error": f"Unexpected {type(exc).__name__} at {Path(frame.filename).name}:{frame.lineno}"}
+        report["comments"] = {
+            "enabled": comments_enabled, "checked": 0, "changed": 0,
+            "failed": 1, "skipped": 0, "budget_reached": False, "error": _unexpected_error(exc),
+        }
     run_deadline = started + budget
     endpoint_failures = 0
     first = decisions.latest_id(store.db)
@@ -233,62 +217,42 @@ def run(config: dict, store: Store) -> dict:
         for consensus_source in consensus_sources:
             try:
                 evaluated = doctor.evaluate(
-                    config,
-                    store,
-                    consensus_source,
-                    linker,
-                    now_iso(),
-                    allow_network=endpoint_failures < 2,
+                    config, store, consensus_source, linker, now_iso(), allow_network=endpoint_failures < 2,
                 )
                 endpoint_failures += evaluated.pop("endpoint_failures", 0)
                 report["network"] = {**network_ingested, **evaluated}
             except sqlite3.Error:
                 raise
             except Exception as exc:
-                frame = traceback.extract_tb(exc.__traceback__)[-1]
                 report["network"] = {
-                    **network_ingested,
-                    "incidents_open": 0,
-                    "stories_written": 0,
-                    "updates_written": 0,
-                    "held": 0,
-                    "dry_run": not consensus_source.get("publish", False),
-                    "error": f"Unexpected {type(exc).__name__} at {Path(frame.filename).name}:{frame.lineno}",
+                    **network_ingested, "incidents_open": 0, "stories_written": 0,
+                    "updates_written": 0, "held": 0, "dry_run": not consensus_source.get("publish", False),
+                    "error": _unexpected_error(exc),
                 }
         for row in store.pending(config["llm"]["max_items_per_run"], now_iso()):
             if time.monotonic() >= run_deadline:
                 report["budget_reached"] = True
                 break
-            if row.get("damaged"):  # never sent to a model; collecting the item again restores its copy
+            if row.get("damaged"):
                 store.reject(row["id"], "Stored source item is damaged", "failed.app.damaged_item", now_iso())
                 report["analysis_failed"] += 1
                 continue
             try:
-                result = process_item(config, store, row, analyzer, reviewer, now_iso(),
-                                      allow_network=endpoint_failures < 2)
+                result = process_item(config, store, row, analyzer, reviewer, now_iso(), allow_network=endpoint_failures < 2)
                 if result["status"] not in {"stale", "deferred"}:
                     report["analyzed"] += 1
                 report["review_cache_hits"] += bool(result["cache_hit"])
                 report["review_stale"] += result["status"] == "stale"
                 report["review_routed"] += result["status"] == "routed"
             except AnalysisError as exc:
-                # A request cut off by the run deadline is retryable: the item backs off.
                 store.defer(row["id"], str(exc), config["llm"], now_iso(), terminal=not exc.retryable, code=exc.code)
                 report["analysis_failed"] += 1
                 if exc.retryable:
-                    # After a second endpoint failure, skip further network
-                    # analysis; one failing item alone does not stop the run.
-                    # Completed cached decisions can still finish; unfinished
-                    # stages, tag reviews included, resume next run.
                     endpoint_failures += 1
             except sqlite3.Error:
-                raise  # a database problem is not the item's fault and must not be a strike
-            except Exception as exc:  # e.g. a draft that cannot form a public story
-                # One item must not stop the run before build: count a strike and
-                # record where it failed (file:line), never the exception text.
-                frame = traceback.extract_tb(exc.__traceback__)[-1]
-                store.defer(row["id"], f"Unexpected {type(exc).__name__} at {Path(frame.filename).name}:{frame.lineno}",
-                            config["llm"], now_iso(), terminal=True)
+                raise
+            except Exception as exc:
+                store.defer(row["id"], _unexpected_error(exc), config["llm"], now_iso(), terminal=True)
                 report["analysis_failed"] += 1
         report["model_calls"] = analyzer.calls + reviewer.calls + linker.calls
     report["decisions"] = decisions.codes_after(store.db, first)
@@ -299,87 +263,73 @@ def run(config: dict, store: Store) -> dict:
     return report
 
 
+def _status_report(config: dict, store: Store) -> dict:
+    published = store.get_meta("published_stories")
+    return {
+        "pending_analysis": store.pending_count(),
+        "rejected_analysis": store.rejected_count(),
+        "published_stories": int(published) if published is not None else None,
+        "comments": {"enabled": config["comments"]["enabled"], **comments_status(store)},
+        "final_review": review_status(store),
+        "network_health": doctor.status(store.db, config["sources"]),
+        "decisions_24h": decisions.recent(store.db, now_iso()),
+        "sources": store.health(config["sources"], config["collection"]["stale_after_seconds"], now_iso()),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Collect, analyze, and build the Onion Flash static news feed."
-    )
+    parser = argparse.ArgumentParser(description="Collect, analyze, and build the Onion Flash static news feed.")
     parser.add_argument("--version", action="version", version=__version__)
+    cfg_parent = argparse.ArgumentParser(add_help=False)
+    cfg_parent.add_argument("--config", required=True, type=Path)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name, help_text in [
+    for name, help_text in (
         ("run", "Collect, analyze queued items, and build"),
         ("build", "Build from saved stories without network requests"),
         ("check", "Validate configuration without network requests"),
         ("status", "Show source and queue status"),
-    ]:
-        command = commands.add_parser(name, help=help_text)
-        command.add_argument("--config", required=True, type=Path)
+    ):
+        command = commands.add_parser(name, parents=[cfg_parent], help=help_text)
         if name == "build":
             command.add_argument("--force", action="store_true", help="Queue a bounded rebuild of all published articles")
-    _operator_parsers(commands)
+    _operator_parsers(commands, cfg_parent)
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
         if args.command == "check":
-            print(
-                json.dumps(
-                    {
-                        "configuration": "valid",
-                        "sources": sum(s["enabled"] for s in config["sources"]),
-                        "model": config["llm"]["model"],
-                        "review_model": config["review"]["model"] or config["llm"]["model"],
-                        "comments_enabled": config["comments"]["enabled"],
-                        "llm_endpoint_configured": bool(config["llm"]["base_url"]),
-                        "llm_credential_present": bool(
-                            os.environ.get(config["llm"]["api_key_env"])
-                        ),
-                    }
-                )
-            )
+            print(json.dumps({
+                "configuration": "valid",
+                "sources": sum(s["enabled"] for s in config["sources"]),
+                "model": config["llm"]["model"],
+                "review_model": config["review"]["model"] or config["llm"]["model"],
+                "comments_enabled": config["comments"]["enabled"],
+                "llm_endpoint_configured": bool(config["llm"]["base_url"]),
+                "llm_credential_present": bool(os.environ.get(config["llm"]["api_key_env"])),
+            }))
             return 0
-        if args.command == "status":
-            # Read-only, so it needs no lock and works while a run is in progress.
-            with Store(config["storage"]["database"]) as store:
-                print(json.dumps({
-                    "pending_analysis": store.pending_count(),
-                    "rejected_analysis": store.rejected_count(),
-                    # Recorded by the last successful build; None until one has run.
-                    "published_stories": None if store.get_meta("published_stories") is None
-                    else int(store.get_meta("published_stories")),
-                    "comments": {"enabled": config["comments"]["enabled"], **comments_status(store)},
-                    "final_review": review_status(store),
-                    "network_health": doctor.status(store.db, config["sources"]),
-                    "decisions_24h": decisions.recent(store.db, now_iso()),
-                    "sources": store.health(
-                        config["sources"], config["collection"]["stale_after_seconds"], now_iso()
-                    ),
-                }, ensure_ascii=False))
+        database = config["storage"]["database"]
+        operator = args.command in OPERATOR_ACTIONS
+        if args.command == "status" or (operator and args.action in READ_ONLY_ACTIONS):
+            with Store(database) as store:
+                payload = _status_report(config, store) if args.command == "status" else _operator_command(args, store, config)
+            print(json.dumps(payload, ensure_ascii=operator))
             return 0
-        operator = args.command in {"story", "rejected", "decisions"}
-        if operator and args.action in {"show", "history", "list", "summary"}:
-            with Store(config["storage"]["database"]) as store:
-                # Explicit source inspection can contain arbitrary Unicode. JSON
-                # escapes keep terminal control/bidi characters visibly inert.
-                print(json.dumps(_operator_command(args, store, config), ensure_ascii=True))
-            return 0
-        with run_lock(config["storage"]["database"]) as acquired:
+        with run_lock(database) as acquired:
             if not acquired:
                 print(json.dumps({"status": "already-running"}))
-                # An overlapping scheduled run is normal; a build that did not happen
-                # is reported as a temporary failure (EX_TEMPFAIL).
                 return 0 if args.command == "run" else 75
-            with Store(config["storage"]["database"]) as store:
+            with Store(database) as store:
                 if operator:
                     result = _operator_command(args, store, config)
                 elif args.command == "run":
                     result = run(config, store)
                 else:
                     result = build(config, store, force=args.force)
-                print(json.dumps(result, ensure_ascii=operator))
+            print(json.dumps(result, ensure_ascii=operator))
         return 0
     except (ValueError, OSError) as exc:
         print(f"onionflash: {exc}", file=sys.stderr)
         return 2
     except Exception as exc:
-        # Do not dump source text, credential headers, or provider responses into logs.
         print(f"onionflash: processing failed ({type(exc).__name__})", file=sys.stderr)
         return 1

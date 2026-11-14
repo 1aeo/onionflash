@@ -36,6 +36,7 @@ RUN_BUDGET_SECONDS = 30  # the phase's share of the collection window
 INTERVAL_SECONDS = 1800  # refresh after a verified check
 CACHE_DAYS = 30  # scheduling metadata expires, which also ends retries of an issue that never verifies
 BACKOFF_BASE_SECONDS, BACKOFF_CAP_SECONDS = 300, 21600  # failure backoff
+NOTE_GID_RE = re.compile(r"gid://gitlab/(?:Note|DiscussionNote)/([0-9]+)\Z")
 
 
 class CommentError(Exception):
@@ -73,9 +74,27 @@ def note_key(ident: object) -> str:
     """Normalize GitLab Note and DiscussionNote GIDs to their shared numeric note ID."""
     if not isinstance(ident, str):
         return ""
-    if ident.startswith(("gid://gitlab/Note/", "gid://gitlab/DiscussionNote/")):
-        return ident.rsplit("/", 1)[-1]
-    return ident
+    match = NOTE_GID_RE.fullmatch(ident)
+    return match[1] if match else ident
+
+
+def prior_notes(raw_comments: object) -> dict[str, dict]:
+    """Index saved public comments by normalized note key."""
+    items = raw_comments if isinstance(raw_comments, list) else ()
+    return {note_key(n["id"]): n for n in items if isinstance(n, dict) and isinstance(n.get("id"), str)}
+
+
+def is_budget_clipped_prefix(prev_notes: dict[str, dict] | list | None, curr_notes: list[dict]) -> bool:
+    """Return True when the oldest retained note is an unedited prefix clipped by TOTAL_CHARS."""
+    if not curr_notes or sum(len(n.get("body") or "") for n in curr_notes if isinstance(n, dict)) < TOTAL_CHARS:
+        return False
+    prior = prev_notes if isinstance(prev_notes, dict) else prior_notes(prev_notes)
+    tail = curr_notes[-1]
+    old = prior.get(note_key(tail.get("id"))) if isinstance(tail, dict) else None
+    old_body, new_body = (old.get("body") if old else None), (tail.get("body") if isinstance(tail, dict) else None)
+    return (old is not None and tail.get("edited_at") == old.get("edited_at")
+            and isinstance(old_body, str) and isinstance(new_body, str)
+            and len(new_body) < len(old_body) and old_body.startswith(new_body))
 
 
 def _source_key(source):
@@ -114,8 +133,7 @@ def fetch_comments(client, source, item):
         if note.get("internal") is not False or note.get("system") is not False:
             raise CommentError("Public note visibility is unknown")
         ident = note.get("id")
-        # Note and DiscussionNote GIDs of one note share its numeric identity.
-        match = re.fullmatch(r"gid://gitlab/(?:Note|DiscussionNote)/([0-9]+)", ident) if isinstance(ident, str) else None
+        match = NOTE_GID_RE.fullmatch(ident) if isinstance(ident, str) else None
         if match is None:
             raise CommentError("Invalid public note identity")
         url = canonical_url(note.get("url", ""))
@@ -141,32 +159,21 @@ def fetch_comments(client, source, item):
             if edited > created:
                 entry["edited_at"] = edited
             notes[match[1]] = entry
-    prior = {
-        note_key(n["id"]): n
-        for n in item.get("public_comments") or []
-        if isinstance(n, dict) and isinstance(n.get("id"), str)
-    }
+    prior = prior_notes(item.get("public_comments"))
     selected, remaining = [], TOTAL_CHARS
     for note in sorted(notes.values(), key=lambda n: (n["created_at"], n["id"]), reverse=True):
         if remaining <= 0 or len(selected) >= MAX_COMMENTS:
             break
-        clipped = len(note["body"]) > remaining
         note["body"] = note["body"][:remaining]
         remaining -= len(note["body"])
+        selected.append(note)
+    clipped_tail = is_budget_clipped_prefix(prior, selected)
+    for index, note in enumerate(selected):
         old_note = prior.get(note_key(note["id"]))
-        if old_note is not None and (
-            old_note.get("body") == note["body"]
-            or (
-                clipped
-                and note.get("edited_at") == old_note.get("edited_at")
-                and isinstance(old_note.get("body"), str)
-                and old_note["body"].startswith(note["body"])
-            )
-        ):
+        if old_note is not None and (old_note.get("body") == note["body"] or (clipped_tail and index == len(selected) - 1)):
             note.pop("edited_at", None)
             if isinstance(old_note.get("edited_at"), str) and old_note["edited_at"] > note["created_at"]:
                 note["edited_at"] = old_note["edited_at"]
-        selected.append(note)
     return selected
 
 
@@ -186,27 +193,13 @@ def _compose(item, notes, checked, *, source_key):
     content = result.pop("source_content", result.get("content"))
     if not isinstance(content, str):
         raise CommentError("Saved issue description is unavailable")
-    prior = {
-        note_key(n["id"]): n
-        for n in item.get("public_comments") or []
-        if isinstance(n, dict) and isinstance(n.get("id"), str)
-    }
-    total_len = sum(len(n.get("body") or "") for n in notes)
+    prior = prior_notes(item.get("public_comments"))
+    clipped_tail = is_budget_clipped_prefix(prior, notes)
     composed_notes = []
     for index, note in enumerate(notes):
         entry = dict(note)
         old_note = prior.get(note_key(entry.get("id")))
-        old_body = old_note.get("body") if old_note is not None else None
-        budget_clipped = (
-            index == len(notes) - 1
-            and total_len >= TOTAL_CHARS
-            and old_note is not None
-            and entry.get("edited_at") == old_note.get("edited_at")
-            and isinstance(old_body, str)
-            and len(entry["body"]) < len(old_body)
-            and old_body.startswith(entry["body"])
-        )
-        if old_note is not None and old_body != entry.get("body") and not budget_clipped:
+        if old_note is not None and old_note.get("body") != entry.get("body") and not (clipped_tail and index == len(notes) - 1):
             prev_time = old_note.get("edited_at") or entry["created_at"]
             if not isinstance(entry.get("edited_at"), str) or entry["edited_at"] <= prev_time:
                 entry["edited_at"] = max(checked, prev_time)
@@ -219,40 +212,26 @@ def _compose(item, notes, checked, *, source_key):
 def merge_cached_comments(store, item, source, observed=None):
     """Keep the verified snapshot on a REST refresh; Store.ingest rejects stale revisions.
 
-    Collection calls this only while comments are enabled. GitLab updates an issue
-    when a note is added, but the kept snapshot leaves the content hash unchanged.
-    So REST activity observed after the last check, or an issue without a snapshot,
-    requests a check whatever the issue's status.
+    REST activity after the last check, or a missing snapshot, requests a check at any status.
     """
     if item.get("kind") != "gitlab_issue" or not source.get("gitlab_project"):
         return item
-    row = store.db.execute(
-        "SELECT id,typeof(payload) AS payload_type,CAST(payload AS BLOB) AS payload FROM items WHERE url=?",
-        (item["url"],),
-    ).fetchone()
+    row = store.db.execute("SELECT id,typeof(payload) AS payload_type,CAST(payload AS BLOB) AS payload FROM items WHERE url=?",
+                           (item["url"],)).fetchone()
     if row is None:
         return item
-    # A damaged saved copy has no snapshot: request a check, and Store.ingest replaces the copy.
     old = (saved_object(row["payload"]) if row["payload_type"] == "text" else None) or {}
     key = _source_key(source)
-    valid_notes = (
-        isinstance(old.get("comments_checked_at"), str)
-        and isinstance(old.get("public_comments"), list)
-        and all(
-            isinstance(n, dict)
-            and all(isinstance(n.get(f), str) for f in ("id", "url", "title", "author", "created_at", "body"))
-            for n in old["public_comments"]
-        )
-    )
+    req_fields = ("id", "url", "title", "author", "created_at", "body")
+    valid_notes = (isinstance(old.get("comments_checked_at"), str) and isinstance(old.get("public_comments"), list)
+                   and all(isinstance(n, dict) and all(isinstance(n.get(f), str) for f in req_fields) for n in old["public_comments"]))
     current = valid_notes and old.get("comments_source_key") == key
     if observed and (not current or item["updated_at"] > old["comments_checked_at"]):
         with store.db:
             _request(store.db, row["id"], key, observed)
         if not current:
             store._comment_requests[row["id"]] = observed
-    if not current:
-        return item
-    return _compose(item, old["public_comments"], old["comments_checked_at"], source_key=key)
+    return _compose(item, old["public_comments"], old["comments_checked_at"], source_key=key) if current else item
 
 
 def _request(db, item_id, key, observed):
@@ -263,20 +242,14 @@ def _request(db, item_id, key, observed):
 
 
 def request_check(db, config, row, observed):
-    """Ask the next comments phase to check an issue whose notes were never verified, whatever its status.
-
-    Nothing happens for a source without comments. The caller owns the transaction.
-    """
+    """Ask the next comments phase to check an unverified issue (caller owns the transaction)."""
     source = next((s for s in config["sources"] if s["id"] == row["source_id"]), None)
     if config["comments"]["enabled"] and source and source["enabled"] and source.get("gitlab_project"):
         _request(db, row["id"], _source_key(source), observed)
 
 
 def _candidates(store, source, observed, key):
-    """Requested checks, then half recent candidates, half rotating published history.
-
-    No network scan. A locked story's issues wait for unlock.
-    """
+    """Requested checks, then half recent candidates, half rotating unlocked published history."""
     limit = MAX_ISSUES_PER_SOURCE
     state = store.db.execute("SELECT * FROM comment_sources WHERE source_id=?", (source["id"],)).fetchone()
     if state and state["source_key"] == key and state["next_fetch_at"] and state["next_fetch_at"] > observed:
@@ -288,13 +261,10 @@ def _candidates(store, source, observed, key):
     recent_first = bool(state["recent_first"]) if state and state["source_key"] == key else False
     due = "(c.item_id IS NULL OR c.source_key<>? OR c.next_fetch_at<=?)"
     unlocked = " AND NOT EXISTS(SELECT 1 FROM editorial_controls e WHERE e.story_id=i.story_id AND e.locked=1)"
-    # The payload is read as bytes, so a damaged one is skipped below instead of failing the query.
     columns = "i.id,i.content_hash,CAST(i.payload AS BLOB) AS payload"
     select = f"SELECT {columns} FROM items i LEFT JOIN comment_cache c ON c.item_id=i.id WHERE i.source_id=? AND " + due + unlocked
     args = (source["id"], key, observed)
-    # Whatever the status: requests from merge_cached_comments (next_fetch_at<=checked_at), and retries
-    # of failed checks of issues without a story, which the rotation below retries only while recent
-    # and pending. CROSS JOIN keeps the bounded cache as the outer loop.
+    # Serve explicit requests and unpublished retry backoffs; CROSS JOIN keeps comment_cache outer.
     requested = store.db.execute(
         f"SELECT {columns} FROM comment_cache c CROSS JOIN items i ON i.id=c.item_id WHERE c.next_fetch_at<=? AND i.source_id=?"
         " AND (c.next_fetch_at<=c.checked_at OR (c.failures>0 AND i.story_id IS NULL))" + unlocked +
@@ -314,6 +284,13 @@ def _candidates(store, source, observed, key):
     return list(selected.values())[:limit]
 
 
+def _advance_rotation(db, source_id: str, row: dict) -> None:
+    if row["_comments_history"]:
+        db.execute("UPDATE comment_sources SET rotation_cursor=?,recent_first=1 WHERE source_id=?", (row["id"], source_id))
+    elif row["_comments_history"] is not None:  # a requested check takes no rotation turn
+        db.execute("UPDATE comment_sources SET recent_first=0 WHERE source_id=?", (source_id,))
+
+
 def enrich_comments(config, store, observed, *, deadline=None):
     """Optional post-collection phase. Failures never block REST/feed processing."""
     report = {"enabled": bool(config.get("comments", {}).get("enabled")), "checked": 0, "changed": 0,
@@ -321,17 +298,12 @@ def enrich_comments(config, store, observed, *, deadline=None):
     if not report["enabled"]:
         return report
     deadline = min(deadline or float("inf"), time.monotonic() + RUN_BUDGET_SECONDS)
-    sources = [s for s in config["sources"] if s.get("enabled", True) and s.get("kind") == "gitlab_issue"
-               and s.get("gitlab_project")]
-    # Rotate source order as well as issue history: a busy first project cannot
-    # monopolize the global request budget indefinitely.
+    sources = [s for s in config["sources"] if s.get("enabled", True) and s.get("kind") == "gitlab_issue" and s.get("gitlab_project")]
     last_source = store.get_meta("comments_source_cursor") or ""
     sources.sort(key=lambda s: (s["id"] <= last_source, s["id"]))
     with store.db:
-        store.db.execute(f"DELETE FROM comment_sources WHERE source_id NOT IN ({','.join('?' * len(sources))})",
-                         [s["id"] for s in sources])
-    # A fresh client has no cookies, authorization, proxy or application session.
-    # It refuses every redirect, so a request cannot leave the verified endpoint.
+        store.db.execute(f"DELETE FROM comment_sources WHERE source_id NOT IN ({','.join('?' * len(sources))})", [s["id"] for s in sources])
+    # Fresh sessionless client refusing redirects so requests never leave the verified endpoint.
     client = HttpClient({**config["http"], "max_redirects": 0})
     client.deadline = deadline
     try:
@@ -347,76 +319,57 @@ def enrich_comments(config, store, observed, *, deadline=None):
                     report["budget_reached"] = True
                     return report
                 store.set_meta(comments_source_cursor=source["id"])
-                prev_state = store.db.execute(
-                    "SELECT rotation_cursor,recent_first FROM comment_sources WHERE source_id=?",
-                    (source["id"],),
-                ).fetchone()
-                with store.db:
-                    if row["_comments_history"]:
-                        store.db.execute("UPDATE comment_sources SET rotation_cursor=?,recent_first=1 WHERE source_id=?",
-                                         (row["id"], source["id"]))
-                    elif row["_comments_history"] is not None:  # a requested check takes no rotation turn
-                        store.db.execute("UPDATE comment_sources SET recent_first=0 WHERE source_id=?", (source["id"],))
                 try:
                     item = saved_object(row["payload"]) if len(row["payload"]) <= 1048576 else None
                     if (item is None or item.get("kind") != "gitlab_issue"
                             or not isinstance(item.get("title"), str)
                             or not isinstance(item.get("source_content", item.get("content")), str)):
                         raise ValueError
-                    json.dumps(item, ensure_ascii=False, allow_nan=False).encode("utf-8")
                     _issue_identity(source, item)
                 except (CommentError, ValueError, TypeError, KeyError, RecursionError):
-                    # A malformed/cold local item is not a provider outage and
-                    # must not block other candidates or invent a description.
                     report["skipped"] += 1
                     with store.db:
+                        _advance_rotation(store.db, source["id"], row)
                         store.db.execute("INSERT OR REPLACE INTO comment_cache VALUES(?,?,?,?,0,?)",
-                                         (row["id"], key, observed, after(INTERVAL_SECONDS, observed),
-                                          "Saved issue description unavailable"))
+                                         (row["id"], key, observed, after(INTERVAL_SECONDS, observed), "Saved issue description unavailable"))
                     continue
-                report["checked"] += 1
                 try:
                     enriched = _compose(item, fetch_comments(client, source, item), observed, source_key=key)
-                    changed = bool(store.ingest(enriched, observed))
-                    report["changed"] += changed
-                    with store.db:
-                        if not changed:
-                            # Refresh verified provenance without requeuing an
-                            # unchanged or operator-dismissed source revision.
-                            store.db.execute("UPDATE items SET payload=? WHERE id=? AND CAST(payload AS BLOB)=? AND content_hash=?",
-                                             (json.dumps(enriched, ensure_ascii=False), row["id"], row["payload"], row["content_hash"]))
-                        store.db.execute("INSERT OR REPLACE INTO comment_cache VALUES(?,?,?,?,0,NULL)",
-                                         (row["id"], key, observed, after(INTERVAL_SECONDS, observed)))
-                        store.db.execute("UPDATE comment_sources SET failures=0,next_fetch_at=NULL,error=NULL WHERE source_id=?", (source["id"],))
                 except DeadlineReached:
-                    report["checked"] -= 1
                     report["budget_reached"] = True
-                    if prev_state is not None:
-                        with store.db:
-                            store.db.execute(
-                                "UPDATE comment_sources SET rotation_cursor=?,recent_first=? WHERE source_id=?",
-                                (prev_state[0], prev_state[1], source["id"]),
-                            )
                     return report
                 except (CommentError, FetchError, ValueError, TypeError, KeyError) as exc:
-                    # No response or an unverifiable response is not evidence
-                    # that old public notes disappeared. Keep the prior verified
-                    # snapshot and its original verification time unchanged.
+                    # Keep the prior verified snapshot and its original verification time on failure.
+                    report["checked"] += 1
                     report["failed"] += 1
-                    state = store.db.execute("SELECT failures FROM comment_sources WHERE source_id=?", (source["id"],)).fetchone()
-                    failures = (state[0] if state else 0) + 1
-                    due = after(backoff_seconds(failures, BACKOFF_BASE_SECONDS, BACKOFF_CAP_SECONDS), observed)
-                    # Keeping checked_at lets CACHE_DAYS end retries of an issue that never verifies.
                     cached = store.db.execute("SELECT failures,checked_at FROM comment_cache WHERE item_id=? AND source_key=?",
                                               (row["id"], key)).fetchone() or (0, observed)
-                    item_failures = cached[0] + 1
-                    item_due = after(backoff_seconds(item_failures, BACKOFF_BASE_SECONDS, BACKOFF_CAP_SECONDS), observed)
+                    item_due = after(backoff_seconds(cached[0] + 1, BACKOFF_BASE_SECONDS, BACKOFF_CAP_SECONDS), observed)
+                    is_endpoint = isinstance(exc, (FetchError, EndpointError))
                     with store.db:
-                        store.db.execute("INSERT OR REPLACE INTO comment_cache VALUES(?,?,?,?,?,?)", (row["id"], key, cached[1], item_due, item_failures, "Public comments unavailable"))
-                        if not isinstance(exc, (FetchError, EndpointError)):
-                            continue  # The verified project answered; only this issue backs off.
-                        store.db.execute("UPDATE comment_sources SET failures=?,next_fetch_at=?,error=? WHERE source_id=?", (failures, due, "Public comments unavailable", source["id"]))
-                    break  # Do not multiply endpoint failures by issue count.
+                        _advance_rotation(store.db, source["id"], row)
+                        store.db.execute("INSERT OR REPLACE INTO comment_cache VALUES(?,?,?,?,?,?)",
+                                         (row["id"], key, cached[1], item_due, cached[0] + 1, "Public comments unavailable"))
+                        if is_endpoint:
+                            state = store.db.execute("SELECT failures FROM comment_sources WHERE source_id=?", (source["id"],)).fetchone()
+                            failures = (state[0] if state else 0) + 1
+                            due = after(backoff_seconds(failures, BACKOFF_BASE_SECONDS, BACKOFF_CAP_SECONDS), observed)
+                            store.db.execute("UPDATE comment_sources SET failures=?,next_fetch_at=?,error=? WHERE source_id=?",
+                                             (failures, due, "Public comments unavailable", source["id"]))
+                    if is_endpoint:
+                        break
+                    continue
+                report["checked"] += 1
+                changed = bool(store.ingest(enriched, observed))
+                report["changed"] += changed
+                with store.db:
+                    _advance_rotation(store.db, source["id"], row)
+                    if not changed:
+                        store.db.execute("UPDATE items SET payload=? WHERE id=? AND CAST(payload AS BLOB)=? AND content_hash=?",
+                                         (json.dumps(enriched, ensure_ascii=False), row["id"], row["payload"], row["content_hash"]))
+                    store.db.execute("INSERT OR REPLACE INTO comment_cache VALUES(?,?,?,?,0,NULL)",
+                                     (row["id"], key, observed, after(INTERVAL_SECONDS, observed)))
+                    store.db.execute("UPDATE comment_sources SET failures=0,next_fetch_at=NULL,error=NULL WHERE source_id=?", (source["id"],))
     finally:
         client.close()
         with store.db:

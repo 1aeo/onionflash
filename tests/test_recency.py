@@ -4,26 +4,17 @@ import json
 
 import pytest
 
-from approval_helpers import finish_reviewed, verdict
+from helpers import (FakeClient, FakeLLM, Reviewer, Writer, analysis, completion, finish_reviewed,
+                     item, response, source, verdict)
 from onionflash import analyze, comments, editorial, rejection, review_gate
 from onionflash.collect import collect_source
 from onionflash.config import DEFAULTS
 from onionflash.source_packet import build_packet, source_fingerprint
-from onionflash.store import Store, item_hash
-from test_analyze import FakeLLM, completion
-from test_core import FakeClient, analysis, config, item, response, source
-from test_review_gate import Reviewer, Writer
+from onionflash.store import item_hash
 
 ISSUES = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/"
 COLLECTED = "2026-11-11T15:00:00Z"
 SKIPPED = "skipped.gate.not_recent"
-
-
-@pytest.fixture
-def context(tmp_path):
-    cfg = config(tmp_path)
-    with Store(cfg["storage"]["database"]) as store:
-        yield cfg, store
 
 
 def note(issue, number, created, author, body):
@@ -32,12 +23,9 @@ def note(issue, number, created, author, body):
 
 
 def verified(**fields):
-    """An issue as a verified comment check saved it."""
     return item(comments_checked_at=COLLECTED, comments_source_key="key", **fields)
 
 
-# Two public Tor issues fixed in 0.4.9.14 on October 7, 2026, whose updated_at moved in November
-# without a new public comment.
 CROSS_CANCELLATION = verified(
     url=ISSUES + "41412", title="Circuit cross-cancellation can still blame channels",
     content="Our fix for #41360, #41365, and #41366 prevents remotely-induced Guard rotation cases.",
@@ -72,14 +60,12 @@ def test_an_issue_edited_weeks_after_its_last_note_cannot_start_a_story(context,
     cfg["comments"]["enabled"] = True
     cfg["sources"] = [source(kind="gitlab_issue", url="https://gitlab.torproject.org/api/v4/projects/426/issues",
                              gitlab_project="tpo/core/tor")]
-    # Even if an earlier revision left an analysis audit row, a pre-model recency skip shows no finished review.
-    earlier = {**json.loads(json.dumps(incoming)), "content": incoming["content"] + " Earlier text.",
-               "updated_at": developed}
+    earlier = {**json.loads(json.dumps(incoming)), "content": incoming["content"] + " Earlier text.", "updated_at": developed}
     store.ingest(earlier, developed)
     process(cfg, store, Writer(), Reviewer(verdict("hold")), developed)
     assert rejection.show_item(store, earlier["id"])["final_review"]["stage"] == "held"
     store.ingest(json.loads(json.dumps(incoming)), COLLECTED)
-    writer, checker = Writer(), Reviewer()  # a strict reviewer: any call fails the test
+    writer, checker = Writer(), Reviewer()
     result = process(cfg, store, writer, checker, "2026-11-11T15:05:00Z")
     assert result["status"] == "ignored" and result["writer_calls"] == result["review_calls"] == 0
     assert writer.calls == [] and checker.calls == []
@@ -95,10 +81,8 @@ def test_an_issue_edited_weeks_after_its_last_note_cannot_start_a_story(context,
 def test_a_fresh_public_comment_on_an_old_issue_reaches_review(context):
     cfg, store = context
     fresh = {"id": "gid://gitlab/Note/7", "url": "https://example.org/news/1#note_7", "author": "maintainer",
-             "title": "Public comment by @maintainer", "created_at": "2026-11-11T14:40:00Z",
-             "body": "The keys were rotated today."}
-    store.ingest(verified(published_at="2015-01-10T12:32:24Z", updated_at="2026-11-11T14:40:00Z",
-                          public_comments=[fresh]), COLLECTED)
+             "title": "Public comment by @maintainer", "created_at": "2026-11-11T14:40:00Z", "body": "The keys were rotated today."}
+    store.ingest(verified(published_at="2015-01-10T12:32:24Z", updated_at="2026-11-11T14:40:00Z", public_comments=[fresh]), COLLECTED)
     writer = Writer()
     assert process(cfg, store, writer, Reviewer(verdict()), COLLECTED)["status"] == "published"
     assert len(writer.calls) == 1 and [code for code, _ in logged(store)] == ["published.new"]
@@ -113,8 +97,7 @@ def test_an_unverified_old_issue_gets_a_comment_check_and_a_fresh_note_queues_it
     row = store.pending(1, COLLECTED)[0]
     assert process(cfg, store, Writer(), Reviewer(), COLLECTED)["status"] == "ignored"
     checked, due = store.db.execute("SELECT checked_at,next_fetch_at FROM comment_cache WHERE item_id=?", (row["id"],)).fetchone()
-    assert due <= checked  # a request, which the next comments phase serves whatever the item's status
-    # That check finds a public note written minutes ago: the new revision is queued and reviewed.
+    assert due <= checked
     later = "2026-11-11T15:10:00Z"
     fresh = [{"id": "gid://gitlab/Note/9", "url": ISSUES + "1#note_9", "author": "maintainer",
               "title": "Public comment by @maintainer", "created_at": "2026-11-11T14:45:00Z", "body": "Reopening: seen again."}]
@@ -123,7 +106,6 @@ def test_an_unverified_old_issue_gets_a_comment_check_and_a_fresh_note_queues_it
     writer = Writer()
     process(cfg, store, writer, Reviewer(verdict("skip", criterion="news_value")), later)
     assert len(writer.calls) == 1 and [code for code, _ in logged(store)] == [SKIPPED, "skipped.review.news_value"]
-    # When comments or the source are disabled, an unverified old issue adds no comment_cache request.
     for comments_on, source_on, suffix in ((False, True, "2"), (True, False, "3")):
         cfg["comments"]["enabled"] = comments_on
         cfg["sources"][0]["enabled"] = source_on
@@ -140,14 +122,12 @@ def test_a_closed_issue_is_dated_by_its_closing_only_while_closed(context):
     writer = Writer()
     process(cfg, store, writer, Reviewer(verdict("skip", criterion="news_value")), COLLECTED)
     assert len(writer.calls) == 1
-    # An opened issue cannot borrow an old or leftover closed_at field.
     store.ingest(item(url=ISSUES + "11", published_at="2015-01-10T12:32:24Z", updated_at=COLLECTED,
                       upstream_state="opened", closed_at="2026-11-11T14:30:00Z"), COLLECTED)
     assert process(cfg, store, Writer(), Reviewer(), COLLECTED)["status"] == "ignored"
 
 
-@pytest.mark.parametrize("merged,code", [("2026-11-11T14:50:00Z", "skipped.review.news_value"),
-                                         ("2026-10-20T14:32:27Z", SKIPPED)])
+@pytest.mark.parametrize("merged,code", [("2026-11-11T14:50:00Z", "skipped.review.news_value"), ("2026-10-20T14:32:27Z", SKIPPED)])
 def test_a_merge_is_dated_by_its_merge_not_its_last_edit(context, merged, code):
     cfg, store = context
     store.ingest(item(kind="gitlab_mr", upstream_state="merged", labels=[], published_at=merged,
@@ -156,8 +136,7 @@ def test_a_merge_is_dated_by_its_merge_not_its_last_edit(context, merged, code):
     assert [entry for entry, _ in logged(store)] == [code]
 
 
-@pytest.mark.parametrize("published,code", [("2026-11-04T19:53:47Z", "skipped.review.news_value"),
-                                            ("2026-09-01T00:00:00Z", SKIPPED)])
+@pytest.mark.parametrize("published,code", [("2026-11-04T19:53:47Z", "skipped.review.news_value"), ("2026-09-01T00:00:00Z", SKIPPED)])
 def test_a_post_is_dated_by_its_publication_not_its_edit(context, published, code):
     cfg, store = context
     store.ingest(item(kind="feed", title="Tor 0.4.9.16 is released", published_at=published,
@@ -168,34 +147,24 @@ def test_a_post_is_dated_by_its_publication_not_its_edit(context, published, cod
 
 def test_a_first_poll_of_a_new_source_skips_only_its_old_developments_and_pins_the_boundary(context):
     cfg, store = context
-    # Exactly 14 days before COLLECTED (2026-11-11T15:00:00Z) is 2026-10-28T15:00:00Z.
     batch = {
-        "recent": "2026-11-05T00:00:00Z",
-        "inside": "2026-10-28T15:00:01Z",
-        "exact": "2026-10-28T15:00:00Z",
-        "outside": "2026-10-28T14:59:59Z",
-        "ancient": "2016-01-27T17:17:19Z",
+        "recent": "2026-11-05T00:00:00Z", "inside": "2026-10-28T15:00:01Z", "exact": "2026-10-28T15:00:00Z",
+        "outside": "2026-10-28T14:59:59Z", "ancient": "2016-01-27T17:17:19Z",
     }
     for name, published in batch.items():
-        store.ingest(item(url="https://example.org/" + name, published_at=published, updated_at="2026-11-10T00:00:00Z"),
-                     COLLECTED)
+        store.ingest(item(url="https://example.org/" + name, published_at=published, updated_at="2026-11-10T00:00:00Z"), COLLECTED)
     writer = Writer()
     for _ in batch:
         process(cfg, store, writer, Reviewer(verdict("skip", criterion="news_value")), COLLECTED)
-    codes = {detail["url"].rsplit("/", 1)[1]: code for code, detail in logged(store)}
-    assert codes == {
-        "recent": "skipped.review.news_value",
-        "inside": "skipped.review.news_value",
-        "exact": "skipped.review.news_value",
-        "outside": SKIPPED,
-        "ancient": SKIPPED,
+    assert {detail["url"].rsplit("/", 1)[1]: code for code, detail in logged(store)} == {
+        "recent": "skipped.review.news_value", "inside": "skipped.review.news_value",
+        "exact": "skipped.review.news_value", "outside": SKIPPED, "ancient": SKIPPED,
     }
     assert len(writer.calls) == 3
 
 
 def test_the_window_runs_from_collection_not_from_a_late_run(context):
     cfg, store = context
-    # Collected 13 days after it was written, then delayed in the queue: still reviewed.
     store.ingest(item(published_at="2026-10-29T15:00:00Z", updated_at="2026-10-29T15:00:00Z"), COLLECTED)
     writer = Writer()
     process(cfg, store, writer, Reviewer(verdict("skip", criterion="news_value")), "2026-11-20T00:00:00Z")
@@ -207,7 +176,6 @@ def test_an_update_of_an_existing_story_still_reaches_review_and_a_locked_story_
     title = "Tor 0.4.9.16 is released"
     store.ingest(item(kind="feed", url="https://example.org/announce", title=title), COLLECTED)
     finish_reviewed(store, store.pending(1, COLLECTED)[0], analysis(), "key", COLLECTED)
-    # An old post in the same release cluster updates that story, so recency does not apply.
     store.ingest(item(kind="feed", url="https://example.org/old-post", title=title, content="Old post.",
                       published_at="2026-09-01T00:00:00Z", updated_at=COLLECTED), COLLECTED)
     writer = Writer()
@@ -232,7 +200,6 @@ def test_an_operator_retry_lets_that_exact_old_revision_reach_review(context):
     process(cfg, store, writer, Reviewer(verdict("skip", criterion="news_value")), COLLECTED)
     assert len(writer.calls) == 1
     assert [code for code, _ in logged(store)] == [SKIPPED, "operator.reconsidered", "skipped.review.news_value"]
-    # A later revision with a different content_hash does not inherit the earlier retry bypass.
     edited = {**json.loads(json.dumps(CROSS_CANCELLATION)), "content": CROSS_CANCELLATION["content"] + " Typo fix.",
               "updated_at": "2026-11-11T15:10:00Z"}
     assert store.ingest(edited, "2026-11-11T15:15:00Z")
@@ -256,12 +223,10 @@ def test_only_a_high_or_critical_security_issue_bypasses_the_recency_guard(conte
     writer = Writer()
     if reaches_review:
         result = process(cfg, store, writer, Reviewer(verdict("skip", criterion="news_value")), COLLECTED)
-        assert result["status"] == "ignored" and len(writer.calls) == 1
-        assert [code for code, _ in logged(store)] == ["skipped.review.news_value"]
+        assert result["status"] == "ignored" and len(writer.calls) == 1 and [code for code, _ in logged(store)] == ["skipped.review.news_value"]
     else:
         result = process(cfg, store, writer, Reviewer(), COLLECTED)
-        assert result["status"] == "ignored" and writer.calls == []
-        assert [code for code, _ in logged(store)] == [SKIPPED]
+        assert result["status"] == "ignored" and writer.calls == [] and [code for code, _ in logged(store)] == [SKIPPED]
 
 
 def test_concurrent_item_change_during_recency_check_returns_stale(context):
@@ -270,8 +235,8 @@ def test_concurrent_item_change_during_recency_check_returns_stale(context):
     stale_row = store.pending(1, COLLECTED)[0]
     with store.db:
         store.db.execute("UPDATE items SET content_hash='changed' WHERE id=?", (stale_row["id"],))
-    result = review_gate.process_item(cfg, store, stale_row, Writer(), Reviewer(), COLLECTED)
-    assert result == {"status": "stale", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
+    assert review_gate.process_item(cfg, store, stale_row, Writer(), Reviewer(), COLLECTED) == {
+        "status": "stale", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
     assert logged(store) == []
 
 
@@ -281,20 +246,14 @@ def test_closed_issues_keep_their_closing_date_without_changing_hashes_or_writer
                 "state": state, "created_at": "2026-09-23T15:01:31Z", "updated_at": "2026-11-08T11:00:00Z", "closed_at": closed}
                for n, (state, closed) in enumerate([("closed", "2026-10-07T17:16:54Z"), ("closed", "not a date"),
                                                     ("closed", "2099-01-01T00:00:00Z"), ("opened", "2026-10-07T17:16:54Z")])]
-    result = collect_source(FakeClient([response(json.dumps(records).encode())]), issues, {}, DEFAULTS["collection"],
-                            "2026-11-08T12:00:00Z")
-    assert [entry.get("closed_at") for entry in result["items"]] == [
-        "2026-10-07T17:16:54Z", None, "2026-11-08T12:00:00Z", None]
-    # Merge requests never store closed_at.
+    result = collect_source(FakeClient([response(json.dumps(records).encode())]), issues, {}, DEFAULTS["collection"], "2026-11-08T12:00:00Z")
+    assert [entry.get("closed_at") for entry in result["items"]] == ["2026-10-07T17:16:54Z", None, "2026-11-08T12:00:00Z", None]
     mrs = source(kind="gitlab_mr", url="https://gitlab.torproject.org/api/v4/projects/426/merge_requests")
     mr_record = [{"web_url": "https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/1", "title": "Merge 1",
                   "description": "Body", "state": "merged", "created_at": "2026-09-23T15:01:31Z",
-                  "merged_at": "2026-11-08T10:00:00Z", "updated_at": "2026-11-08T11:00:00Z",
-                  "closed_at": "2026-11-08T10:00:00Z"}]
-    mr_items = collect_source(FakeClient([response(json.dumps(mr_record).encode())]), mrs, {}, DEFAULTS["collection"],
-                              "2026-11-08T12:00:00Z")["items"]
+                  "merged_at": "2026-11-08T10:00:00Z", "updated_at": "2026-11-08T11:00:00Z", "closed_at": "2026-11-08T10:00:00Z"}]
+    mr_items = collect_source(FakeClient([response(json.dumps(mr_record).encode())]), mrs, {}, DEFAULTS["collection"], "2026-11-08T12:00:00Z")["items"]
     assert "closed_at" not in mr_items[0]
-    # closed_at never enters item_hash, source_fingerprint, cache_key, or the writer's bounded payload.
     with_closed = result["items"][0]
     without_closed = {key: value for key, value in with_closed.items() if key != "closed_at"}
     assert item_hash(with_closed) == item_hash(without_closed)
@@ -308,9 +267,7 @@ def test_closed_issues_keep_their_closing_date_without_changing_hashes_or_writer
         title="Report 0", summary="Body text long enough for literal evidence.", why_it_matters="",
         confidence="reported", state="developing", evidence=["Body text long enough for literal evidence."])))
     writer.analyze(with_closed)
-    sent = json.loads(writer.client.requests[0][1]["messages"][1]["content"])
-    assert "closed_at" not in sent
-    # The review packet exposes closed_at on a closed issue and omits it when absent, while keeping bindings identical.
+    assert "closed_at" not in json.loads(writer.client.requests[0][1]["messages"][1]["content"])
     closed_item = {"id": "a" * 24, **with_closed}
     unclosed_item = {"id": "a" * 24, **without_closed}
     none_closed_item = {"id": "a" * 24, **without_closed, "closed_at": None}
@@ -319,6 +276,5 @@ def test_closed_issues_keep_their_closing_date_without_changing_hashes_or_writer
     unclosed_packet, unclosed_bindings = build_packet(None, unclosed_item, refs, {"sources": []}, unclosed_item["id"])
     none_packet, _ = build_packet(None, none_closed_item, refs, {"sources": []}, none_closed_item["id"])
     assert closed_packet["sources"][0]["closed_at"] == "2026-10-07T17:16:54Z"
-    assert "closed_at" not in unclosed_packet["sources"][0]
-    assert "closed_at" not in none_packet["sources"][0]
+    assert "closed_at" not in unclosed_packet["sources"][0] and "closed_at" not in none_packet["sources"][0]
     assert closed_bindings == unclosed_bindings

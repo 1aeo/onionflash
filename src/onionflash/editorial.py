@@ -5,31 +5,43 @@ Public history contains accepted public snapshots only.
 
 from __future__ import annotations
 
-import json
 import hashlib
-import re
+import json
 
 from .config import DEFAULTS
-from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, PUBLIC_STATES, UPDATE_CHARS
-from .util import canonical_url, digest, format_utc, now_iso, parse_utc, saved_object
+from .schema import (
+    CATEGORIES,
+    CONFIDENCES,
+    FIELD_LIMITS,
+    PRIORITIES,
+    PRODUCTS,
+    PUBLIC_STATES,
+    SEMANTIC_FIELDS,
+    SHA256_RE,
+    STORY_ID_RE,
+    UPDATE_CHARS,
+)
+from .util import canonical_url, digest, format_utc, gitlab_url_variants, now_iso, parse_utc, saved_object
 
-
-FIELDS = frozenset({"title", "summary", "why_it_matters", "category", "priority", "confidence", "state", "products", "tags", "sources", "updates"})
+FIELDS = frozenset({*SEMANTIC_FIELDS, "sources", "updates"})
 PUBLIC_HISTORY_LIMIT = 20
 MAX_ALIAS_HOPS = 16
-_ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
-_HASH = re.compile(r"[a-f0-9]{64}\Z")
+RESET_PENDING_SQL = "status='pending',attempts=0,rejections=0,next_attempt_at=NULL,last_error=NULL"
+_ID = STORY_ID_RE
+_HASH = SHA256_RE
 
 
 class RetiredStory(ValueError):
     """A story ID or cluster key recorded as retired cannot be created or edited."""
 
 
-def _slot_kind(slot: str) -> str:
-    """Return the DocTor event kind for a slot, without a trailing numeric counter."""
-    kind = slot.split(":", 1)[1]
-    head, _, counter = kind.rpartition(":")
-    return head if counter.isdigit() else kind
+def retracted_fields(reason: str) -> dict:
+    return {
+        "title": "Retracted story",
+        "summary": "This story has been retracted by the publisher. " + reason,
+        "why_it_matters": "",
+        "priority": "low",
+    }
 
 
 def initialize(db) -> None:
@@ -83,8 +95,9 @@ def initialize(db) -> None:
         DROP TRIGGER IF EXISTS editorial_story_update;
         DROP TRIGGER IF EXISTS editorial_story_delete;
     """)
-    if "story_json" not in {row[1] for row in db.execute("PRAGMA table_info(story_aliases)")}:
-        db.execute("ALTER TABLE story_aliases ADD COLUMN story_json TEXT")
+    if db.execute("PRAGMA user_version").fetchone()[0] < 1:
+        if "story_json" not in {row[1] for row in db.execute("PRAGMA table_info(story_aliases)")}:
+            db.execute("ALTER TABLE story_aliases ADD COLUMN story_json TEXT")
 
 
 def retired(db, *, story_id: str | None = None, cluster_key: str | None = None) -> tuple[str, str | None] | None:
@@ -136,14 +149,48 @@ def _text(value, name: str, limit: int, *, empty: bool = False) -> str:
     return value
 
 
+def _begin_tx(db):
+    from .store import immediate_transaction
+
+    return immediate_transaction(db, "Editorial action needs a fresh transaction")
+
+
 def _public(value: dict) -> dict:
-    from .render import _prepare_story
-    return _prepare_story(value)
+    from .render import prepare_story
+
+    return prepare_story(value)
+
+
+def _enqueue_render(db, story_id: str) -> None:
+    db.execute("DELETE FROM public_render_queue WHERE story_id=?", (story_id,))
+    db.execute("INSERT INTO public_render_queue(rowid,story_id) SELECT IFNULL(MIN(rowid),0)-1,? FROM public_render_queue", (story_id,))
+
+
+def _held_item_ids(db, story_id: str, cluster_key: str | None = None) -> list[str]:
+    where = "story_id=?" if cluster_key is None else "(story_id=? OR (story_id IS NULL AND cluster_key=?))"
+    params = (story_id, story_id) if cluster_key is None else (story_id, cluster_key, story_id)
+    return [
+        r[0]
+        for r in db.execute(
+            f"""SELECT id FROM items WHERE status='published' AND {where}
+                AND EXISTS (SELECT 1 FROM decision_log d
+                    WHERE d.id=(SELECT MAX(id) FROM decision_log WHERE item_id=items.id)
+                    AND d.story_id=? AND d.code='held.gate.story_locked'
+                    AND d.content_hash=items.content_hash)""",
+            params,
+        ).fetchall()
+    ]
+
+
+def requeue_items(db, item_ids: list[str]) -> None:
+    if not item_ids:
+        return
+    marks = ",".join("?" * len(item_ids))
+    db.execute(f"UPDATE items SET {RESET_PENDING_SQL} WHERE id IN ({marks})", item_ids)
+    db.execute(f"DELETE FROM review_jobs WHERE item_id IN ({marks})", item_ids)
 
 
 def _published(db, story_id: str) -> dict | None:
-    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_catalog'").fetchone():
-        return None
     row = db.execute("SELECT public_json,json_sha256 FROM public_catalog WHERE story_id=?", (story_id,)).fetchone()
     if row is None:
         return None
@@ -184,10 +231,7 @@ def _snapshot(db, story_id: str) -> dict:
     published = _published(db, story_id)
     fallback = False
     try:
-        if row["payload_type"] != "text":
-            raise ValueError("Damaged story payload")
-        original = saved_object(row["payload_blob"])
-        if original is None:
+        if row["payload_type"] != "text" or (original := saved_object(row["payload_blob"])) is None:
             raise ValueError("Damaged story payload")
         public = _public(original)
         if public["id"] != story_id:
@@ -195,8 +239,7 @@ def _snapshot(db, story_id: str) -> dict:
     except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
         if published is None:
             raise ValueError("Story has no valid public snapshot to correct") from None
-        original = {}
-        public, fallback = _public(published), True
+        original, public, fallback = {}, _public(published), True
     revision = control["revision"] if control else 0
     fingerprint = digest([record, revision, bool(control and control["locked"]), bool(control and control["retracted"])])
     return {"record": record, "raw": original, "public": public, "published": published,
@@ -239,7 +282,10 @@ def public_metadata(db, story_id: str) -> dict | None:
     control = db.execute("SELECT * FROM editorial_controls WHERE story_id=?", (story_id,)).fetchone()
     if control is None:
         return None
-    rows = db.execute("SELECT revision,action,reason,created_at,before_public_json,after_public_json FROM editorial_revisions WHERE story_id=? ORDER BY revision DESC LIMIT ?", (story_id, PUBLIC_HISTORY_LIMIT)).fetchall()
+    rows = db.execute(
+        "SELECT revision,action,reason,created_at,before_public_json,after_public_json FROM editorial_revisions WHERE story_id=? ORDER BY revision DESC LIMIT ?",
+        (story_id, PUBLIC_HISTORY_LIMIT),
+    ).fetchall()
     entries = []
     for row in rows:
         entry = {key: row[key] for key in ("revision", "action", "reason", "created_at")}
@@ -248,12 +294,10 @@ def public_metadata(db, story_id: str) -> dict | None:
         if row["before_public_json"] is not None and row["action"] != "unlock" and not control["retracted"]:
             before = json.loads(row["before_public_json"])
             entry["superseded"] = {key: before.get(key, "") for key in ("title", "summary", "why_it_matters")}
-            # Of the dated updates, only those this revision removed or whose date or text it changed.
             kept = {(update["at"], update["text"]) for update in json.loads(row["after_public_json"]).get("updates", [])}
             if replaced := [{"at": update["at"], "text": update["text"]} for update in before.get("updates", []) if (update["at"], update["text"]) not in kept]:
                 entry["superseded"]["updates"] = replaced
         entries.append(entry)
-    # history_total repeats revision; earlier releases require it, so a rollback still builds.
     return {"status": "retracted" if control["retracted"] else "corrected", "revision": control["revision"],
             "action": control["notice_action"], "reason": control["notice_reason"], "at": control["notice_at"],
             "history": entries, "history_total": control["revision"]}
@@ -266,7 +310,7 @@ def _sources(value, limit: int) -> list[dict]:
     for source in value:
         if not isinstance(source, dict) or set(source) != {"url", "title"}:
             raise ValueError("Sources require only url and title")
-        sources.append({"url": canonical_url(source["url"]), "title": _text(source["title"], "source title", 200)})
+        sources.append({"url": canonical_url(source["url"]), "title": _text(source["title"], "source title", FIELD_LIMITS["source_title"])})
     if len({s["url"] for s in sources}) != len(sources):
         raise ValueError("Duplicate source URL")
     return sources
@@ -276,9 +320,9 @@ def _validated_patch(patch: dict) -> dict:
     if not isinstance(patch, dict) or not patch or set(patch) - FIELDS:
         raise ValueError("Patch must contain only editable story fields")
     clean = dict(patch)
-    for field, limit in (("title", 180), ("summary", 1600), ("why_it_matters", 800)):
+    for field in ("title", "summary", "why_it_matters"):
         if field in clean:
-            clean[field] = _text(clean[field], field, limit, empty=field == "why_it_matters")
+            clean[field] = _text(clean[field], field, FIELD_LIMITS[field], empty=field == "why_it_matters")
     for field, allowed in (("category", CATEGORIES), ("priority", PRIORITIES), ("confidence", CONFIDENCES), ("state", PUBLIC_STATES)):
         if field in clean and (not isinstance(clean[field], str) or clean[field] not in allowed):
             raise ValueError(f"Invalid {field}")
@@ -289,8 +333,8 @@ def _validated_patch(patch: dict) -> dict:
                 raise ValueError(f"Invalid {field}")
             clean[field] = list(dict.fromkeys(value))
     if "sources" in clean:
-        clean["sources"] = _sources(clean["sources"], 20)
-    if "updates" in clean:  # the whole list replaces the stored one
+        clean["sources"] = _sources(clean["sources"], FIELD_LIMITS["max_sources"])
+    if "updates" in clean:
         if not isinstance(clean["updates"], list):
             raise ValueError("Updates must be a list")
         updates = []
@@ -298,7 +342,7 @@ def _validated_patch(patch: dict) -> dict:
             if not isinstance(update, dict) or set(update) != {"at", "text", "sources"}:
                 raise ValueError("Updates require only at, text and sources")
             updates.append({"at": format_utc(parse_utc(update["at"])), "text": _text(update["text"], "update text", UPDATE_CHARS),
-                            "sources": _sources(update["sources"], 3)})
+                            "sources": _sources(update["sources"], FIELD_LIMITS["max_update_sources"])})
         clean["updates"] = updates
     return clean
 
@@ -310,10 +354,7 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
     if not isinstance(expect_hash, str) or not _HASH.fullmatch(expect_hash):
         raise ValueError("A current expected story hash is required")
     stamp = format_utc(parse_utc(observed or now_iso()))
-    if db.in_transaction:
-        raise ValueError("Editorial action needs a fresh transaction")
-    db.execute("BEGIN IMMEDIATE")
-    with db:
+    with _begin_tx(db):
         current = _snapshot(db, story_id)
         if current["hash"] != expect_hash:
             raise ValueError("Story changed since it was reviewed; refresh its hash before editing")
@@ -328,14 +369,12 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
                 raise ValueError("Restore a retracted story before correcting it")
             clean = _validated_patch(patch)
             if "category" in clean and "tags" not in clean and clean["category"] != current["public"]["category"]:
-                old_category = current["public"]["category"]
-                public["tags"] = [t for t in public.get("tags", []) if t != old_category]
+                public["tags"] = [t for t in public.get("tags", []) if t != current["public"]["category"]]
             public.update(clean)
             if _public(public) == current["public"]:
                 raise ValueError("Correction does not change any public field")
         elif action == "retract":
-            public.update(title="Retracted story", summary="This story has been retracted by the publisher. " + reason,
-                          why_it_matters="", priority="low")
+            public.update(retracted_fields(reason))
             retracted = True
         elif action == "restore":
             if type(revision) is not int or not 0 <= revision < current["revision"]:
@@ -354,7 +393,6 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
             if raw_prev is None:
                 raise ValueError("That revision has no accepted public text to restore")
             previous = _public(json.loads(raw_prev))
-            # Dated updates stay as they are: automated ones have no revision to restore.
             public.update({key: previous[key] for key in FIELDS - {"updates"}})
             retracted = False
         elif action == "unlock":
@@ -371,17 +409,13 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
         after_public = {k: v for k, v in public.items() if k not in ("updates", "alert_notes")} if retracted else public
         candidate = dict(current["raw"])
         candidate.pop("editorial", None)
-        candidate.pop("updates", None)  # public leaves out an empty list
+        candidate.pop("updates", None)
         candidate.update(public)
-        # Reuse collection identities only where an operator keeps that URL (raw or canonical).
         previous_sources: dict[str, dict] = {}
         for src in current["raw"].get("sources", []):
             if isinstance(src, dict) and isinstance(src.get("url"), str):
-                previous_sources.setdefault(src["url"], src)
-                try:
-                    previous_sources.setdefault(canonical_url(src["url"]), src)
-                except ValueError:
-                    pass
+                for variant in {src["url"], *gitlab_url_variants(src["url"])}:
+                    previous_sources.setdefault(variant, src)
         candidate["sources"] = [{**previous_sources.get(s["url"], {}), **s} for s in public["sources"]]
         next_revision = current["revision"] + 1
         after_story = _json(candidate)
@@ -398,22 +432,9 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
             (story_id, next_revision, action, reason, stamp, current["record"]["payload"],
              _json(current["published"]) if current["published"] is not None else None,
              after_story, _json(after_public), current["hash"], after_hash))
-        if action == "unlock" and {r[0] for r in db.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('items','decision_log','review_jobs')")} == {
-                "items", "decision_log", "review_jobs"}:
-            requeued = [r[0] for r in db.execute("""
-                SELECT id FROM items WHERE status='published' AND story_id=?
-                AND EXISTS (SELECT 1 FROM decision_log d
-                    WHERE d.id=(SELECT MAX(id) FROM decision_log WHERE item_id=items.id)
-                    AND d.story_id=? AND d.code='held.gate.story_locked'
-                    AND d.content_hash=items.content_hash)""", (story_id, story_id)).fetchall()]
-            if requeued:
-                marks = ",".join("?" * len(requeued))
-                db.execute(f"UPDATE items SET status='pending',attempts=0,rejections=0,next_attempt_at=NULL,last_error=NULL WHERE id IN ({marks})", requeued)
-                db.execute(f"DELETE FROM review_jobs WHERE item_id IN ({marks})", requeued)
-        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_render_queue'").fetchone():
-            # Like a changed story, an editorial action renders before any rebuild backlog.
-            db.execute("INSERT OR REPLACE INTO public_render_queue(rowid,story_id) SELECT IFNULL(MIN(rowid),0)-1,? FROM public_render_queue", (story_id,))
+        if action == "unlock":
+            requeue_items(db, _held_item_ids(db, story_id))
+        _enqueue_render(db, story_id)
     return {"story_id": story_id, "revision": next_revision, "hash": after_hash,
             "action": action, "locked": locked, "retracted": retracted, "updated_at": stamp}
 
@@ -438,7 +459,7 @@ def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str 
           base_url: str = DEFAULTS["site"]["base_url"], observed: str | None = None,
           automatic: bool = False, _guard=None, _complete=None) -> dict:
     """Permanently merge published duplicate `story_id` into `survivor_id` as a pointer."""
-    from . import decisions
+    from . import decisions, doctor
     from .render import pointer_json
 
     _id(story_id)
@@ -450,10 +471,7 @@ def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str 
         raise ValueError("A current expected story hash is required")
     base = canonical_url(base_url).rstrip("/") + "/"
     stamp = format_utc(parse_utc(observed or now_iso()))
-    if db.in_transaction:
-        raise ValueError("Editorial action needs a fresh transaction")
-    db.execute("BEGIN IMMEDIATE")
-    with db:
+    with _begin_tx(db):
         if _guard is not None:
             _guard(db)
         dup = _snapshot(db, story_id)
@@ -465,9 +483,7 @@ def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str 
         if dup["published"] is None or surv["published"] is None:
             raise ValueError("Both stories must already be published before merging")
         _public(surv["published"])
-        if (db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_render_queue'").fetchone()
-                and db.execute("SELECT 1 FROM public_render_queue WHERE story_id=? AND last_error IS NOT NULL",
-                               (survivor_id,)).fetchone()):
+        if db.execute("SELECT 1 FROM public_render_queue WHERE story_id=? AND last_error IS NOT NULL", (survivor_id,)).fetchone():
             raise ValueError("Survivor story has a quarantined render error")
         db.execute(
             "INSERT INTO story_aliases(story_id,cluster_key,survivor_id,reason,created_at,story_json) VALUES(?,?,?,?,?,?)",
@@ -475,138 +491,30 @@ def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str 
         )
         db.execute("DELETE FROM stories WHERE id=?", (story_id,))
         db.execute("UPDATE editorial_controls SET locked=0,held_updates=0 WHERE story_id=?", (story_id,))
-        dup_network = [e for e in (dup["raw"].get("network") or []) if isinstance(e, dict) and isinstance(e.get("key"), str)]
         surv_locked = bool(surv["control"] and (surv["control"]["locked"] or surv["control"]["retracted"]))
-        transferred_network = False
-        if dup_network and dup["raw"].get("origin") != "network-health" and not surv["fallback"] and not surv_locked:
-            surv_raw = json.loads(_json(surv["raw"]))
-            existing_net = [e for e in (surv_raw.get("network") or []) if isinstance(e, dict)]
-            seen_keys = {e.get("key") for e in existing_net}
-            for entry in dup_network:
-                if entry["key"] not in seen_keys:
-                    existing_net.append({**entry, "story_id": survivor_id})
-                    seen_keys.add(entry["key"])
-                    transferred_network = True
-            if transferred_network:
-                if surv_raw.get("editorial_item") is None:
-                    item_sources = [s for s in surv_raw.get("sources", []) if isinstance(s, dict) and s.get("id") and not s.get("network_key")]
-                    if len(item_sources) == 1:
-                        surv_raw["editorial_item"] = item_sources[0]["id"]
-                surv_raw["network"] = existing_net
-                dup_notes = [n for n in (dup["raw"].get("alert_notes") or []) if isinstance(n, str)]
-                if dup_notes:
-                    surv_notes = [n for n in (surv_raw.get("alert_notes") or []) if isinstance(n, str)]
-                    surv_raw["alert_notes"] = list(dict.fromkeys([*surv_notes, *dup_notes]))[:3]
-                dup_net_urls = {
-                    s.get("url")
-                    for s in (dup["raw"].get("sources") or ())
-                    if isinstance(s, dict) and s.get("network_key") and isinstance(s.get("url"), str)
-                }
-                for entry in dup_network:
-                    for url_key in ("first_url", "opened_url"):
-                        if isinstance(entry.get(url_key), str):
-                            dup_net_urls.add(entry[url_key])
-                candidate_urls = sorted({
-                    s["url"]
-                    for upd in (dup["raw"].get("updates") or ())
-                    if isinstance(upd, dict)
-                    for s in (upd.get("sources") or ())
-                    if isinstance(s, dict) and isinstance(s.get("url"), str) and s["url"]
-                } - dup_net_urls)
-                if candidate_urls and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='network_reports'").fetchone():
-                    placeholders = ",".join("?" for _ in candidate_urls)
-                    dup_net_urls.update(
-                        r[0] for r in db.execute(f"SELECT url FROM network_reports WHERE url IN ({placeholders})", candidate_urls)
-                    )
-                surv_updates = list(surv_raw.get("updates") or [])
-                seen_updates = {(u.get("at"), u.get("text")) for u in surv_updates if isinstance(u, dict)}
-                added_stamps = []
-                for upd in dup["raw"].get("updates") or []:
-                    if not isinstance(upd, dict) or (upd.get("at"), upd.get("text")) in seen_updates:
-                        continue
-                    upd_urls = [s.get("url", "") for s in (upd.get("sources") or ()) if isinstance(s, dict)]
-                    if not upd_urls or not all(u in dup_net_urls for u in upd_urls):
-                        continue
-                    matched_rekeys: list[tuple[dict, str]] = []
-                    for net_entry in existing_net:
-                        if net_entry.get("key") not in {e.get("key") for e in dup_network}:
-                            continue
-                        known_uids = set(net_entry.get("update_ids") or ())
-                        kinds = {
-                            _slot_kind(slot)
-                            for slot in (net_entry.get("slots") or ())
-                            if isinstance(slot, str) and ":" in slot
-                        }
-                        for kind in kinds:
-                            for u in upd_urls:
-                                if digest([story_id, kind, u])[:24] in known_uids:
-                                    matched_rekeys.append((net_entry, digest([survivor_id, kind, u])[:24]))
-                    if matched_rekeys:
-                        for net_entry, surv_uid in matched_rekeys:
-                            uids = list(net_entry.get("update_ids") or [])
-                            if surv_uid not in uids:
-                                net_entry["update_ids"] = [*uids, surv_uid]
-                        surv_updates.append(dict(upd))
-                        seen_updates.add((upd.get("at"), upd.get("text")))
-                        if isinstance(upd.get("at"), str):
-                            added_stamps.append(upd["at"])
-                if surv_updates:
-                    surv_raw["updates"] = surv_updates
-                surv_sources = list(surv_raw.get("sources") or [])
-                seen_urls = {s.get("url") for s in surv_sources if isinstance(s, dict)}
-                for src in dup["raw"].get("sources") or []:
-                    if isinstance(src, dict) and src.get("network_key") and src.get("url") not in seen_urls and len(surv_sources) < 20:
-                        surv_sources.append(dict(src))
-                        seen_urls.add(src.get("url"))
-                surv_raw["sources"] = surv_sources
-                if added_stamps:
-                    surv_raw["updated_at"] = max([surv_raw["updated_at"], *added_stamps])
-                db.execute(
-                    "UPDATE stories SET payload=?, updated_at=? WHERE id=?",
-                    (_json(surv_raw), surv_raw["updated_at"], survivor_id),
-                )
-        remapped = 0
-        has_item_tables = {
-            r[0]
-            for r in db.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('items','decision_log','review_jobs')"
-            )
-        } == {"items", "decision_log", "review_jobs"}
-        held_ids = (
-            [
-                r[0]
-                for r in db.execute(
-                    """SELECT id FROM items WHERE status='published'
-                       AND (story_id=? OR (story_id IS NULL AND cluster_key=?))
-                       AND EXISTS (SELECT 1 FROM decision_log d
-                           WHERE d.id=(SELECT MAX(id) FROM decision_log WHERE item_id=items.id)
-                           AND d.story_id=? AND d.code='held.gate.story_locked'
-                           AND d.content_hash=items.content_hash)""",
-                    (story_id, dup["record"]["cluster_key"], story_id),
-                ).fetchall()
-            ]
-            if has_item_tables
-            else []
+        transferred_network = bool(dup["raw"].get("network")) and doctor.transfer_attached(
+            db,
+            story_id=story_id,
+            dup_raw=dup["raw"],
+            survivor_id=survivor_id,
+            surv_raw=surv["raw"],
+            surv_fallback=surv["fallback"],
+            surv_locked=surv_locked,
         )
-        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='items'").fetchone():
-            remapped = db.execute(
-                "UPDATE items SET story_id=? WHERE story_id=? OR (story_id IS NULL AND cluster_key=?)",
-                (survivor_id, story_id, dup["record"]["cluster_key"]),
-            ).rowcount
+        held_ids = _held_item_ids(db, story_id, dup["record"]["cluster_key"])
+        remapped = db.execute(
+            "UPDATE items SET story_id=? WHERE story_id=? OR (story_id IS NULL AND cluster_key=?)",
+            (survivor_id, story_id, dup["record"]["cluster_key"]),
+        ).rowcount
         if held_ids:
-            marks = ",".join("?" * len(held_ids))
-            db.execute(f"DELETE FROM review_jobs WHERE item_id IN ({marks})", held_ids)
             if surv["control"] and surv["control"]["locked"]:
+                marks = ",".join("?" * len(held_ids))
+                db.execute(f"DELETE FROM review_jobs WHERE item_id IN ({marks})", held_ids)
                 for hid in held_ids:
                     record_held(db, survivor_id)
                     decisions.record(db, hid, "held.gate.story_locked", stamp, merged_from=story_id)
             else:
-                db.execute(
-                    f"UPDATE items SET status='pending',attempts=0,rejections=0,next_attempt_at=NULL,last_error=NULL WHERE id IN ({marks})",
-                    held_ids,
-                )
-        has_topics = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_story_topics'").fetchone())
-        has_queue = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_render_queue'").fetchone())
+                requeue_items(db, held_ids)
         for (aid,) in db.execute(
             "SELECT a.story_id FROM story_aliases a JOIN public_catalog c ON c.story_id=a.story_id ORDER BY a.story_id"
         ).fetchall():
@@ -619,33 +527,22 @@ def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str 
                 "UPDATE public_catalog SET updated_at=?,template_hash='',json_sha256=?,public_json=? WHERE story_id=?",
                 (stamp, psha, pjson, aid),
             )
-            if has_topics:
-                db.execute("DELETE FROM public_story_topics WHERE story_id=?", (aid,))
-            if has_queue:
-                db.execute("DELETE FROM public_render_queue WHERE story_id=?", (aid,))
-                db.execute(
-                    "INSERT INTO public_render_queue(rowid,story_id) SELECT IFNULL(MIN(rowid),0)-1,? FROM public_render_queue",
-                    (aid,),
-                )
-        if transferred_network and has_queue:
-            db.execute("DELETE FROM public_render_queue WHERE story_id=?", (survivor_id,))
-            db.execute(
-                "INSERT INTO public_render_queue(rowid,story_id) SELECT IFNULL(MIN(rowid),0)-1,? FROM public_render_queue",
-                (survivor_id,),
-            )
-        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='decision_log'").fetchone():
-            decisions.record_subject(
-                db,
-                story_id,
-                "merged.auto.same_event" if automatic else "operator.merged",
-                stamp,
-                story_id=survivor_id,
-                once=False,
-                duplicate_id=story_id,
-                merged_into=survivor_id,
-                remapped_items=remapped,
-                reason=reason,
-            )
+            db.execute("DELETE FROM public_story_topics WHERE story_id=?", (aid,))
+            _enqueue_render(db, aid)
+        if transferred_network:
+            _enqueue_render(db, survivor_id)
+        decisions.record_subject(
+            db,
+            story_id,
+            "merged.auto.same_event" if automatic else "operator.merged",
+            stamp,
+            story_id=survivor_id,
+            once=False,
+            duplicate_id=story_id,
+            merged_into=survivor_id,
+            remapped_items=remapped,
+            reason=reason,
+        )
         if _complete is not None:
             _complete(db)
     return {"story_id": story_id, "merged_into": survivor_id, "remapped_items": remapped, "updated_at": stamp}

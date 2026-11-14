@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import copy
-import json
-import os
 import re
 
-from .transport import DeadlineReached, FetchError, HttpClient
-from .util import digest, normalize_evidence as _plain
 from .comments import analysis_context
-from .schema import CATEGORIES, PRIORITIES, CONFIDENCES, STATES, PRODUCTS, UPDATE_CHARS
+from .llm import (
+    AnalysisError, CompletionClient, apply_label_limits, is_complete_sentence,
+    label_limits, strip_unreleased_tag, tag_name, validate_text,
+)
+from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, STATES, UPDATE_CHARS
+from .util import digest, normalize_evidence as _plain
 
 PROMPT_VERSION = "onionflash-16"
 MIN_EVIDENCE_CHARS = 8
@@ -180,30 +181,6 @@ prior_story's confidence. Evidence must support the update.
 UPDATE_PROMPT = SYSTEM_PROMPT + "\n" + UPDATE_RULES
 
 
-class AnalysisError(Exception):
-    code = "writer.invalid_output"  # logged as failed.<code> when it is the item's third failure
-
-    def __init__(self, message: str, retryable: bool = False, *, code: str | None = None):
-        super().__init__(message)
-        self.retryable = retryable
-        if code is not None:
-            self.code = code
-
-
-def label_limits(sources: list[dict]) -> dict:
-    """The confidence, state and category labels a story told by these sources may carry: confirmed
-    needs an official source that is not a tag, or a merged merge request; tagged needs a tag
-    source; and a story told only by merge requests is merged and not a release."""
-    confirmable = any((source.get("authority") == "official" and source.get("kind") != "tag")
-                      or (source.get("kind") == "gitlab_mr" and source.get("upstream_state") == "merged")
-                      for source in sources)
-    tagged = any(source.get("kind") == "tag" for source in sources)
-    merges = bool(sources) and all(source.get("kind") == "gitlab_mr" for source in sources)
-    return {"confidence": [value for value in CONFIDENCES if confirmable or value != "confirmed"],
-            "state": ["merged"] if merges else [value for value in STATES if tagged or value != "tagged"],
-            "category": [value for value in CATEGORIES if not merges or value != "release"]}
-
-
 def prior_context(prior: dict) -> dict:
     """Bounded published story context for writer update mode and its cache key."""
     updates = [{"at": entry["at"], "text": entry["text"]} for entry in (prior.get("updates") or [])[-10:]]
@@ -213,37 +190,11 @@ def prior_context(prior: dict) -> dict:
     return context
 
 
-def unquoted_text(text: str) -> str:
-    """Drop >-quoted reply lines so own-item updates use only unquoted prose."""
-    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith(">"))
-
-
 def cache_key(row: dict, llm: dict, prior: dict | None = None) -> str:
     """Identity of the write-only analysis record: source revision, model, prompt and update target."""
     if prior is None:
         return digest([row["content_hash"], llm["model"], PROMPT_VERSION])
     return digest([row["content_hash"], llm["model"], PROMPT_VERSION, prior_context(prior)])
-
-
-def _json_object(text: str, code: str = "writer.invalid_json") -> dict:
-    def unique(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("Duplicate JSON field")
-            result[key] = value
-        return result
-    try:
-        result = json.loads(text, object_pairs_hook=unique)
-        # Stored analyses must be standard UTF-8 JSON: reject unpaired surrogate
-        # escapes and non-finite numbers (NaN, Infinity, 1e999) before a malformed
-        # model response reaches the queue.
-        json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8")
-    except (ValueError, TypeError, RecursionError) as exc:
-        raise AnalysisError("Model returned invalid JSON", code=code) from exc
-    if not isinstance(result, dict):
-        raise AnalysisError("Model response is not an object", code=code)
-    return result
 
 
 # Spelled-out numbers count as digits, except "one", which is mostly a pronoun.
@@ -272,17 +223,11 @@ def validate_analysis(result: dict, item: dict, schema: dict = SCHEMA) -> dict:
         value = result[key]
         if rule["type"] == "string":
             allowed = rule.get("enum")
-            valid = isinstance(value, str) and (
-                value in allowed if allowed is not None else (
-                    len(value) <= rule["maxLength"]
-                    # Publishing drops these noncharacters; a field of them would render empty.
-                    and not any((ord(c) < 32 and c not in "\n\t") or c in "\ufffe\uffff" for c in value)
-                )
-            )
-            if not valid:
-                raise AnalysisError(f"Invalid model {key}")
-            if allowed is None:
-                result[key] = value.strip()
+            if allowed is not None:
+                if not isinstance(value, str) or value not in allowed:
+                    raise AnalysisError(f"Invalid model {key}")
+            else:
+                result[key] = validate_text(value, rule["maxLength"], empty=True, message=f"Invalid model {key}")
         elif rule["type"] == "array":
             if not isinstance(value, list) or len(value) > rule["maxItems"]:
                 raise AnalysisError(f"Invalid model {key}")
@@ -307,9 +252,7 @@ def validate_analysis(result: dict, item: dict, schema: dict = SCHEMA) -> dict:
     required_text = ("update",) if "update" in fields else ("title", "summary")
     if not all(result[k] for k in required_text) or not evidence:
         raise AnalysisError("Published story needs text and source evidence")
-    if "update" in fields and (
-        result["update"][-1] not in '.!?"\')”’' or not any(char.isalnum() for char in result["update"])
-    ):
+    if "update" in fields and not is_complete_sentence(result["update"]):
         raise AnalysisError("Invalid model update: must be a complete punctuated sentence")
     # The impact sentence may restate only numbers and versions from the title, content or comment
     # bodies the writer saw. It is cleared, not refused: a retry would return the same reply.
@@ -320,9 +263,7 @@ def validate_analysis(result: dict, item: dict, schema: dict = SCHEMA) -> dict:
 
 def tag_update(item: dict, prior: dict) -> dict:
     """Literal dated update for an observed tag joining an existing story."""
-    name = item["title"].strip()
-    if not name or len(name) > 500:
-        raise AnalysisError("Invalid tag name", code="app.invalid_tag_name")
+    name = tag_name(item)
     return {
         "publish": True,
         "update": f"The upstream feed lists the tag “{name}”.",
@@ -334,9 +275,7 @@ def tag_update(item: dict, prior: dict) -> dict:
 
 def tag_notice(item: dict) -> dict:
     """Report only the observed tag entry, without inferring a release."""
-    name = item["title"].strip()
-    if not name or len(name) > 500:
-        raise AnalysisError("Invalid tag name", code="app.invalid_tag_name")
+    name = tag_name(item)
     product = {
         "tor": "Tor",
         "arti": "Arti",
@@ -360,94 +299,6 @@ def tag_notice(item: dict) -> dict:
     }
 
 
-class CompletionClient:
-    def __init__(self, config: dict, deadline: float | None = None):
-        self.deadline = deadline  # absolute time.monotonic() limit for model requests
-        self.llm = config["llm"]
-        # One attempt per endpoint: the fallback endpoints are the retry, and a
-        # failed item backs off to a later run instead of stretching this one.
-        self.http_settings = {
-            **config["http"],
-            **{k: v for k, v in self.llm.items() if k in config["http"]},
-            # The fixed total must not cut short a longer configured response timeout.
-            "total_timeout_seconds": max(self.llm["total_timeout_seconds"],
-                                         self.llm["timeout_seconds"] + self.llm["connect_timeout_seconds"]),
-            "retry_attempts": 1,
-        }
-        self.client: HttpClient | None = None
-        self.calls = 0  # requests sent, for the run report
-
-    def __enter__(self) -> CompletionClient:
-        return self
-
-    def __exit__(self, *args) -> None:
-        if self.client is not None:
-            self.client.close()
-
-    def complete(self, prompt: str, payload: dict, schema: dict, name: str) -> dict:
-        """One fresh request; both drafting and review share transport policy."""
-        if not self.llm["base_url"]:
-            raise AnalysisError("LLM endpoint is not configured", retryable=True)
-        key = os.environ.get(self.llm["api_key_env"], "")
-        if not key:
-            raise AnalysisError("LLM credential environment variable is missing", retryable=True)
-        if self.client is None:
-            self.client = HttpClient(self.http_settings, allowed_networks=self.llm["allowed_networks"],
-                                     allow_http=self.llm["allow_http"])
-            self.client.deadline = self.deadline
-        try:
-            content = json.dumps(payload, ensure_ascii=False, allow_nan=False)
-            content.encode("utf-8")
-        except (ValueError, TypeError, RecursionError) as exc:
-            raise AnalysisError("Model input is not valid UTF-8 JSON", code=self.stage + ".invalid_input") from exc
-        request = {
-            "model": self.llm["model"],
-            "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": content}],
-            "temperature": 0,
-            "max_tokens": self.llm["max_output_tokens"],
-            "response_format": {"type": "json_schema", "json_schema": {
-                "name": name, "strict": True, "schema": schema}},
-        }
-        if self.llm["send_chat_template_kwargs"]:
-            request["chat_template_kwargs"] = {"enable_thinking": self.llm["enable_thinking"]}
-        return self._complete(request, key)
-
-    def _complete(self, request: dict, key: str) -> dict:
-        """POST one chat completion; only transport failures move on to a fallback."""
-        failure = AnalysisError("All LLM endpoints failed", retryable=True)
-        for base_url in [self.llm["base_url"], *self.llm["fallback_base_urls"]]:
-            self.calls += 1
-            try:
-                response = self.client.request(
-                    "POST",
-                    base_url + "/chat/completions",
-                    headers={"Authorization": "Bearer " + key},
-                    json_body=request,
-                )
-                break
-            except FetchError as exc:
-                # An endpoint or credential problem is not this item's fault.
-                failure = AnalysisError(
-                    "LLM request failed" + (f" (HTTP {exc.status})" if exc.status else ""),
-                    retryable=True,
-                )
-                if isinstance(exc, DeadlineReached):  # refused unsent, as every later endpoint would be
-                    self.calls -= 1
-                    raise failure from None
-        else:
-            raise failure
-        try:
-            choice = response.json()["choices"][0]
-            finished, content = choice["finish_reason"], choice["message"]["content"]
-        except (FetchError, KeyError, IndexError, TypeError):
-            raise AnalysisError("LLM returned an unexpected response", retryable=True) from None
-        if finished != "stop":
-            raise AnalysisError("Model completion was truncated or refused", code=self.stage + ".truncated")
-        if not isinstance(content, str):
-            raise AnalysisError("Model returned no textual completion", retryable=True)
-        return _json_object(content, self.stage + ".invalid_json")
-
-
 class Analyzer(CompletionClient):
     """Produce one structurally valid draft; final publication review is separate."""
 
@@ -457,8 +308,9 @@ class Analyzer(CompletionClient):
     def analyze(self, item: dict, prior: dict | None = None) -> dict:
         """Return a bounded draft with literal evidence, never a publication decision."""
         self.clears = 0
+        is_update = prior is not None
         if item["kind"] == "tag":
-            return tag_update(item, prior) if prior is not None else tag_notice(item)
+            return tag_update(item, prior) if is_update else tag_notice(item)
         bounded = {key: item.get(key) for key in (
             "title", "kind", "product", "authority", "published_at", "updated_at", "labels", "upstream_state")}
         bounded["content"], notes = analysis_context(item)
@@ -466,23 +318,21 @@ class Analyzer(CompletionClient):
             bounded["public_comments"] = notes
         # Evidence may quote the description window or any note body the writer saw.
         source = {**item, "content": "\n".join([bounded["content"], *(note["body"] for note in notes)])}
-        if prior is not None:
-            payload = {**bounded, "prior_story": prior_context(prior)}
-            schema = _writer_schema(bounded, UPDATE_SCHEMA, prior=prior)
-            reply = self.complete(UPDATE_PROMPT, payload, schema, "onionflash_update")
-            result = validate_analysis(reply, source, UPDATE_SCHEMA)
-            if any(result[key] not in schema["properties"][key]["enum"] for key in ("confidence", "state")):
-                raise AnalysisError("Writer labels exceed this source's limits")
-            return result
-        schema = _writer_schema(bounded)
-        reply = self.complete(SYSTEM_PROMPT, bounded, schema, "onionflash_news")
+        base_schema = UPDATE_SCHEMA if is_update else SCHEMA
+        payload = {**bounded, "prior_story": prior_context(prior)} if is_update else bounded
+        prompt, schema_name = (UPDATE_PROMPT, "onionflash_update") if is_update else (SYSTEM_PROMPT, "onionflash_news")
+        schema = _writer_schema(bounded, base_schema, prior=prior)
+        reply = self.complete(prompt, payload, schema, schema_name)
         stated = reply.get("why_it_matters")
-        result = validate_analysis(reply, source)
-        if any(result[key] not in schema["properties"][key]["enum"] for key in ("confidence", "state", "category")):
+        result = validate_analysis(reply, source, base_schema)
+        if any(
+            key in schema["properties"] and result[key] not in schema["properties"][key]["enum"]
+            for key in ("confidence", "state", "category")
+        ):
             raise AnalysisError("Writer labels exceed this source's limits")
-        if result["state"] not in {"released", "tagged"} and result["category"] != "release":
-            result["tags"] = [tag for tag in result["tags"] if tag != "release"]
-        self.clears = int(result["why_it_matters"] != stated.strip())
+        if not is_update:
+            strip_unreleased_tag(result)
+            self.clears = int(result["why_it_matters"] != stated.strip())
         return result
 
 
@@ -542,9 +392,5 @@ def _writer_schema(bounded: dict, base_schema: dict = SCHEMA, *, prior: dict | N
             release_states = [s for s in limits["state"] if s in {"released", "tagged"}]
             if release_states:
                 limits["state"] = release_states
-    for key, allowed in limits.items():
-        if key in schema["properties"]:
-            schema["properties"][key]["enum"] = allowed
-    if "tags" in schema["properties"] and "category" in schema["properties"]:
-        schema["properties"]["tags"]["items"]["enum"] = list(schema["properties"]["category"]["enum"])
+    apply_label_limits(schema["properties"], limits)
     return schema

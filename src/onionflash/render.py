@@ -9,39 +9,58 @@ from __future__ import annotations
 import email.utils
 import html
 import json
-import re
 import xml.etree.ElementTree as ET
 from urllib.parse import urlsplit
-from .schema import CATEGORY_LABELS as CATEGORIES, PRIORITIES, PRODUCTS, CONFIDENCES, PUBLIC_STATES, UPDATE_CHARS
-from .util import canonical_url, parse_utc as _date, format_utc as _iso
 
+from .schema import (
+    CATEGORY_LABELS as CATEGORIES,
+    CONFIDENCES,
+    FIELD_LIMITS,
+    PRIORITIES,
+    PRODUCTS,
+    PUBLIC_STATES,
+    STORY_ID_RE,
+    UPDATE_CHARS,
+)
+from .util import format_utc as _iso, parse_utc as _date, safe_canonical_url
 
-ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+ID_PATTERN = STORY_ID_RE
 ASSET_FILES = ("style.css", "mark.svg")
 ATOM_NS = "http://www.w3.org/2005/Atom"
 ET.register_namespace("atom", ATOM_NS)
+_NOTICE_LABELS = {"correct": "Correction", "retract": "Retraction", "restore": "Restored"}
+_public_url = safe_canonical_url
 
 
 def _escape(value: object) -> str:
     return html.escape(str(value), quote=True)
 
 
+def _story_id(value: object, label: str = "story ID") -> str:
+    if not isinstance(value, str) or not ID_PATTERN.fullmatch(value):
+        raise ValueError(f"Unsafe {label}")
+    return value
+
+
+def _retracted(story: dict | None) -> bool:
+    return bool(story and (story.get("editorial") or {}).get("status") == "retracted")
+
+
+def feed_path(topic: str | None = None) -> str:
+    return f"tags/{topic}.xml" if topic else "feed.xml"
+
+
 def _text(value: object, limit: int) -> str:
     """Constrain untrusted display fields while retaining ordinary Unicode."""
     if not isinstance(value, str):
         return ""
-    clean = "".join(char for char in value if char in "\t\n\r" or 0x20 <= ord(char) <= 0xD7FF or 0xE000 <= ord(char) <= 0xFFFD or 0x10000 <= ord(char) <= 0x10FFFF)
+    clean = "".join(
+        char for char in value
+        if char in "\t\n\r" or 0x20 <= ord(char) <= 0xD7FF or 0xE000 <= ord(char) <= 0xFFFD or 0x10000 <= ord(char) <= 0x10FFFF
+    )
     # Truncation may land on a space. Keep normalization idempotent so a final
     # candidate cannot change between review and its guarded commit.
     return " ".join(clean.split())[:limit].rstrip()
-
-
-def _public_url(value: object) -> str:
-    """The same citation rules as collection; an unsafe link is dropped, not published."""
-    try:
-        return canonical_url(value)
-    except (TypeError, ValueError, UnicodeError):
-        return ""
 
 
 def _time(value: str, *, full: bool = False) -> str:
@@ -61,7 +80,7 @@ def _sources(values: list, limit: int) -> list[dict]:
             continue
         url = _public_url(source.get("url"))
         if url and url not in sources:
-            sources[url] = {"url": url, "title": _text(source.get("title"), 200) or urlsplit(url).hostname}
+            sources[url] = {"url": url, "title": _text(source.get("title"), FIELD_LIMITS["source_title"]) or urlsplit(url).hostname}
     return list(sources.values())
 
 
@@ -73,36 +92,33 @@ def _update(value: object) -> dict | None:
         at = _iso(_date(value.get("at")))
     except ValueError:
         return None
-    text, sources = _text(value.get("text"), UPDATE_CHARS), _sources(value["sources"], 3)
+    text, sources = _text(value.get("text"), UPDATE_CHARS), _sources(value["sources"], FIELD_LIMITS["max_update_sources"])
     return {"at": at, "text": text, "sources": sources} if text and sources else None
 
 
-def _prepare_story(story: dict, *, editorial: dict | None = None) -> dict:
-    story_id = story.get("id", "")
-    if not isinstance(story_id, str) or not ID_PATTERN.fullmatch(story_id):
-        raise ValueError("Unsafe story ID")
+def prepare_story(story: dict, *, editorial: dict | None = None) -> dict:
+    story_id = _story_id(story.get("id", ""))
     category = story.get("category", "network")
     priority = story.get("priority", "normal")
     confidence = story.get("confidence", "reported")
     state = story.get("state", "developing")
     if category not in CATEGORIES or priority not in PRIORITIES or confidence not in CONFIDENCES or state not in PUBLIC_STATES:
         raise ValueError("Invalid public story classification")
-    title = _text(story.get("title"), 180)
-    summary = _text(story.get("summary"), 1600)
+    title = _text(story.get("title"), FIELD_LIMITS["title"])
+    summary = _text(story.get("summary"), FIELD_LIMITS["summary"])
     if not title or not summary:
         raise ValueError("Published stories require a title and summary")
-    sources = _sources(story["sources"], 20)
+    sources = _sources(story["sources"], FIELD_LIMITS["max_sources"])
     if not sources:
         raise ValueError("Published stories require at least one safe source URL")
     # Only schema values reach the page, so one malformed stored field cannot break a build.
     tags = list(dict.fromkeys(tag for tag in [category, *story.get("tags", [])] if isinstance(tag, str) and tag in CATEGORIES))
     published = _date(story.get("published_at"))
-    updated = _date(story.get("updated_at"))
-    if updated < published:
-        updated = published
+    updated = max(published, _date(story.get("updated_at")))
+    is_retracted = (editorial or {}).get("status") == "retracted"
     public = {
         "id": story_id, "title": title, "summary": summary,
-        "why_it_matters": _text(story.get("why_it_matters"), 800),
+        "why_it_matters": _text(story.get("why_it_matters"), FIELD_LIMITS["why_it_matters"]),
         "category": category, "priority": priority, "confidence": confidence,
         "state": state, "tags": tags, "sources": sources,
         "products": [product for product in story.get("products", []) if isinstance(product, str) and product in PRODUCTS],
@@ -112,12 +128,11 @@ def _prepare_story(story: dict, *, editorial: dict | None = None) -> dict:
     }
     updates = story.get("updates")
     updates = [entry for entry in map(_update, updates if isinstance(updates, list) else []) if entry]
-    # Kept in stored order. A retracted story keeps them privately and shows none.
-    if updates and (editorial or {}).get("status") != "retracted":
+    if updates and not is_retracted:
         public["updates"] = updates
     raw_notes = story.get("alert_notes")
-    notes = [note for note in (_text(item, 600) for item in (raw_notes if isinstance(raw_notes, list) else [])[:3]) if note]
-    if notes and (editorial or {}).get("status") != "retracted":
+    notes = [note for note in (_text(item, 600) for item in (raw_notes if isinstance(raw_notes, list) else [])[:FIELD_LIMITS["max_alert_notes"]]) if note]
+    if notes and not is_retracted:
         public["alert_notes"] = list(dict.fromkeys(notes))
     if story.get("origin") == "network-health":
         public["origin"] = "network-health"
@@ -126,16 +141,16 @@ def _prepare_story(story: dict, *, editorial: dict | None = None) -> dict:
     return public
 
 
-def _permalink(base: str, story: dict) -> str:
-    return f'{base}news/{story["id"]}/'
+def _permalink(base: str, story_or_id: dict | str) -> str:
+    sid = story_or_id["id"] if isinstance(story_or_id, dict) else story_or_id
+    return f'{base.rstrip("/")}/news/{sid}/'
 
 
 def _badges(story: dict) -> str:
     parts = [f'<span class="category-label">{CATEGORIES[story["category"]]}</span>']
-    notice = story.get("editorial")
-    if notice:
-        parts.append(f'<span class="editorial-badge">{"Retracted" if notice["status"] == "retracted" else "Corrected"}</span>')
-        if notice["status"] == "retracted":
+    if story.get("editorial"):
+        parts.append(f'<span class="editorial-badge">{"Retracted" if _retracted(story) else "Corrected"}</span>')
+        if _retracted(story):
             return '<div class="story-labels">' + "".join(parts) + "</div>"
     if story["priority"] in {"critical", "high"}:
         parts.append(f'<span class="priority priority-{story["priority"]}">{_label(story["priority"])} priority</span>')
@@ -208,9 +223,8 @@ def _editorial_notice(story: dict) -> str:
     notice = story.get("editorial")
     if not notice:
         return ""
-    label = {"correct": "Correction", "retract": "Retraction", "restore": "Restored"}[notice["action"]]
-    reason = "" if notice["status"] == "retracted" else " " + _escape(notice["reason"])
-    return f'<p class="editorial-notice"><strong>{label} · {_time(notice["at"], full=True)}</strong>{reason}</p>'
+    reason = "" if _retracted(story) else " " + _escape(notice["reason"])
+    return f'<p class="editorial-notice"><strong>{_NOTICE_LABELS[notice["action"]]} · {_time(notice["at"], full=True)}</strong>{reason}</p>'
 
 
 def _editorial_history(story: dict) -> str:
@@ -303,16 +317,17 @@ def _shell(site: dict, base: str, title: str, description: str, body: str, canon
 </body></html>'''
 
 
+def _article_shell(site: dict, base: str, heading: str, description: str, inner: str, canonical: str, *,
+                   redirect: str | None = None) -> str:
+    root = base.rstrip("/") + "/"
+    body = f'<main id="main" class="page article-page"><a class="back-link" href="{_escape(root)}">← All dispatches</a>\n<article class="full-story">{inner}</article></main>'
+    return _shell(site, root, f"{heading} — {_text(site['title'], 80)}", description, body, canonical, redirect=redirect)
+
+
 def _rss_channel(site: dict, base: str, path: str, latest: str | None, category: str | None = None) -> ET.Element:
     channel = ET.Element("channel")
-    title = _text(site["title"], 80)
-    if category:
-        title += " · " + CATEGORIES[category]
-    for key, value in {
-        "title": title, "link": base,
-        "description": _text(site["description"], 400),
-        "language": "en",
-    }.items():
+    title = _text(site["title"], 80) + (f" · {CATEGORIES[category]}" if category else "")
+    for key, value in {"title": title, "link": base, "description": _text(site["description"], 400), "language": "en"}.items():
         ET.SubElement(channel, key).text = value
     ET.SubElement(channel, f"{{{ATOM_NS}}}link", href=base + path, rel="self", type="application/rss+xml")
     if latest:
@@ -321,10 +336,10 @@ def _rss_channel(site: dict, base: str, path: str, latest: str | None, category:
 
 
 def _rss_item(story: dict, base: str) -> ET.Element:
-    item = ET.Element("item")
+    item, url = ET.Element("item"), _permalink(base, story)
     ET.SubElement(item, "title").text = story["title"]
-    ET.SubElement(item, "link").text = _permalink(base, story)
-    ET.SubElement(item, "guid", isPermaLink="true").text = _permalink(base, story)
+    ET.SubElement(item, "link").text = url
+    ET.SubElement(item, "guid", isPermaLink="true").text = url
     ET.SubElement(item, "pubDate").text = email.utils.format_datetime(_date(story["published_at"]), usegmt=True)
     for tag in story["tags"]:
         ET.SubElement(item, "category").text = tag
@@ -333,7 +348,7 @@ def _rss_item(story: dict, base: str) -> ET.Element:
         description += f'<p><strong>Why it matters:</strong> {_escape(story["why_it_matters"])}</p>'
     for note in story.get("alert_notes", []):
         description += f'<p><strong>About this alert:</strong> {_escape(note)}</p>'
-    if story.get("editorial", {}).get("status") != "retracted":
+    if not _retracted(story):
         description += f'<p>{_label(story["confidence"])} · {_label(story["priority"])} priority · {_label(story["state"])}</p>'
     description += _source_links(story, expanded=True)
     ET.SubElement(item, "description").text = description
@@ -346,9 +361,9 @@ def rss_header(site: dict, base: str, path: str, latest: str | None, category: s
 
 def _json_feed_item(story: dict, base: str) -> dict:
     content = story["summary"]
-    notice = story.get("editorial")
-    if notice:
-        content = f'{notice["action"].capitalize()} · {notice["at"]}: {notice["reason"]}\n\n' + content
+    if notice := story.get("editorial"):
+        suffix = "" if _retracted(story) else f': {notice["reason"]}'
+        content = f'{_NOTICE_LABELS[notice["action"]]} · {notice["at"]}{suffix}\n\n' + content
     if story.get("updates"):
         latest = _newest_updates(story)[0]
         content += f'\n\nUpdate · {latest["at"]}: {latest["text"]}'
@@ -357,7 +372,8 @@ def _json_feed_item(story: dict, base: str) -> dict:
     for note in story.get("alert_notes", []):
         content += "\n\nAbout this alert: " + note
     content += "\n\nSources:\n" + "\n".join(source["url"] for source in story["sources"])
-    return {"id": _permalink(base, story), "url": _permalink(base, story), "title": story["title"], "content_text": content, "date_published": story["published_at"], "date_modified": story["updated_at"], "tags": story["tags"]}
+    url = _permalink(base, story)
+    return {"id": url, "url": url, "title": story["title"], "content_text": content, "date_published": story["published_at"], "date_modified": story["updated_at"], "tags": story["tags"]}
 
 
 def json_feed_header(site: dict, base: str) -> bytes:
@@ -389,7 +405,6 @@ def index_html(site: dict, base: str, homepage: list[dict], source_health: list[
     )
     topic_label = CATEGORIES[topic] if topic else None
     heading = f"{topic_label} news" if topic else "Tor news, distilled."
-    feed_path = f"tags/{topic}.xml" if topic else "feed.xml"
     feed_label = f"{topic_label} RSS feed" if topic else "Subscribe via RSS"
     latest_label = f'Latest story update {_time(latest, full=True)}' if latest else 'No stories published yet'
     cards = "".join(_card(story, base) for story in homepage)
@@ -405,17 +420,15 @@ def index_html(site: dict, base: str, homepage: list[dict], source_health: list[
 {_pagination(base, page, pages, topic)}
 {f'<p class="archive-note">{total} stories in the complete {topic_label.lower() + " " if topic else ""}history.</p>' if pages > 1 else ''}
 </section><aside class="sidebar" aria-label="About this feed">
-<section class="subscribe-box"><span class="sidebar-kicker">Follow the feed</span><h2>Stay in the loop.</h2><p>Important Tor developments, delivered to your feed reader.</p><a class="subscribe-link" href="{_escape(base + feed_path)}">{feed_label}</a><a class="secondary-feed" href="{_escape(base)}feed.json">All news JSON Feed</a></section>
+<section class="subscribe-box"><span class="sidebar-kicker">Follow the feed</span><h2>Stay in the loop.</h2><p>Important Tor developments, delivered to your feed reader.</p><a class="subscribe-link" href="{_escape(base + feed_path(topic))}">{feed_label}</a><a class="secondary-feed" href="{_escape(base)}feed.json">All news JSON Feed</a></section>
 <section class="about-feed"><h2>Context comes first.</h2><p>Reports, fixes, and releases are grouped into concise stories. Every summary links to its sources.</p><p>Labels distinguish confirmed findings from reports and suspected incidents.</p></section>
 {_health_details(source_health)}
 <p class="sidebar-footnote">An independent project by <a href="https://1aeo.com/">1AEO</a>.</p>
 </aside></div></main>'''
-    title = _text(site["title"], 80)
-    title += " — " + (heading if topic else "Tor news, distilled")
+    title = _text(site["title"], 80) + " — " + (heading if topic else "Tor news, distilled")
     if page > 1:
         title += f", page {page}"
-    description = _text(site["description"], 400)
-    return _shell(site, base, title, description, body, canonical)
+    return _shell(site, base, title, _text(site["description"], 400), body, canonical)
 
 
 def article_html(site: dict, base: str, story: dict) -> str:
@@ -425,50 +438,34 @@ def article_html(site: dict, base: str, story: dict) -> str:
         if story.get("origin") == "network-health"
         else "This is an AI-assisted summary of the linked public sources. Consult the original reports for details and operator guidance."
     )
-    body = f'''<main id="main" class="page article-page"><a class="back-link" href="{_escape(base)}">← All dispatches</a>
-<article class="full-story">{_badges(story)}<h1>{_escape(story['title'])}</h1>
+    inner = f'''{_badges(story)}<h1>{_escape(story['title'])}</h1>
 {_editorial_notice(story)}
 <div class="article-dates">First published {_time(story['added_at'], full=True)}{f' <span>·</span> Last updated {_time(story["updated_at"], full=True)}' if story['updated_at'] > story['added_at'] else ''}</div>
 <p class="article-summary">{_escape(story['summary'])}</p>
 {f'<section class="article-context"><h2>Why it matters</h2><p>{_escape(story["why_it_matters"])}</p></section>' if story['why_it_matters'] else ''}{_alert_notes(story)}{_update_list(story)}
-<p class="event-state"><span>Event status</span> {"Retracted" if story.get("editorial", {}).get("status") == "retracted" else _label(story['state'])}</p>
+<p class="event-state"><span>Event status</span> {"Retracted" if _retracted(story) else _label(story['state'])}</p>
 <section class="article-sources"><h2>Read the sources</h2>{_source_links(story, expanded=True)}</section>
 {_editorial_history(story)}
-<p class="article-note">{note_text}</p></article></main>'''
-    title = _text(site["title"], 80)
-    return _shell(site, base, f"{story['title']} — {title}", story["summary"][:300], body, _permalink(base, story))
+<p class="article-note">{note_text}</p>'''
+    return _article_shell(site, base, story["title"], story["summary"][:300], inner, _permalink(base, story))
 
 
 def pointer_json(base: str, story_id: str, survivor_id: str) -> dict:
-    if not isinstance(story_id, str) or not ID_PATTERN.fullmatch(story_id):
-        raise ValueError("Unsafe story ID")
-    if not isinstance(survivor_id, str) or not ID_PATTERN.fullmatch(survivor_id):
-        raise ValueError("Unsafe survivor story ID")
-    root = base.rstrip("/") + "/"
-    return {"id": story_id, "merged_into": survivor_id, "url": f"{root}news/{survivor_id}/"}
+    _story_id(story_id)
+    _story_id(survivor_id, "survivor story ID")
+    return {"id": story_id, "merged_into": survivor_id, "url": _permalink(base, survivor_id)}
 
 
 def pointer_html(site: dict, base: str, survivor_id: str) -> str:
-    if not isinstance(survivor_id, str) or not ID_PATTERN.fullmatch(survivor_id):
-        raise ValueError("Unsafe survivor story ID")
-    root = base.rstrip("/") + "/"
-    target = f"{root}news/{survivor_id}/"
-    body = (
-        f'<main id="main" class="page article-page"><a class="back-link" href="{_escape(root)}">← All dispatches</a>'
-        '<article class="full-story"><h1>This story has moved</h1>'
-        '<p class="article-summary">Onion Flash combined this report with its coverage of the same event.</p>'
-        f'<p><a href="{_escape(target)}">Read the combined story</a></p></article></main>'
+    _story_id(survivor_id, "survivor story ID")
+    target = _permalink(base, survivor_id)
+    description = "Onion Flash combined this report with its coverage of the same event."
+    inner = (
+        "<h1>This story has moved</h1>"
+        f'<p class="article-summary">{description}</p>'
+        f'<p><a href="{_escape(target)}">Read the combined story</a></p>'
     )
-    title = _text(site["title"], 80)
-    return _shell(
-        site,
-        root,
-        f"This story has moved — {title}",
-        "Onion Flash combined this report with its coverage of the same event.",
-        body,
-        target,
-        redirect=target,
-    )
+    return _article_shell(site, base, "This story has moved", description, inner, target, redirect=target)
 
 
 def headers_text(base: str) -> str:
@@ -490,4 +487,3 @@ def headers_text(base: str) -> str:
   ! Content-Security-Policy
   Content-Security-Policy: {feed_policy}
 '''
-
