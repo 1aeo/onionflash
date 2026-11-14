@@ -375,7 +375,7 @@ def test_correction_ledger_damage_fails_before_models_or_cached_approval(context
     assert error.value.code == "app.damaged_job" and checker.calls == 0 and writer.calls == [] and not store.stories()
 
 
-def test_coherent_older_policy_resets_old_ledger_shape_without_redrafting(context):
+def test_new_record_cannot_reset_a_damaged_ledger_on_policy_change(context):
     cfg, store = context
     row = pending(store)
     with pytest.raises(AnalysisError):
@@ -389,10 +389,12 @@ def test_coherent_older_policy_resets_old_ledger_shape_without_redrafting(contex
         event.pop("reask_trigger"); event.pop("reask_response")
     with store.db:store.db.execute("UPDATE review_jobs SET policy_hash=?,record_json=? WHERE item_id=?",
                                   (old_policy, json.dumps(audit), row["id"]))
-    checker, writer = reviewer(cfg, verdict(), verdict()), Writer()
-    assert run(cfg, store, row, writer, checker)["status"] == "published"
-    assert writer.calls == [] and checker.calls == 2
-    assert correction(saved_audit(store)) is None and saved_audit(store)["untrusted_proposals"] == []
+    before = job(store)
+    checker, writer = reviewer(cfg), Writer()
+    with pytest.raises(AnalysisError) as error:
+        run(cfg, store, row, writer, checker)
+    assert error.value.code == "app.damaged_job"
+    assert writer.calls == [] and checker.calls == 0 and job(store) == before
 
 
 @pytest.mark.parametrize("damage", [False, True])
