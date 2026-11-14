@@ -311,6 +311,8 @@ class ScriptedReviewer:
                 raw = reply()
         else:
             raw = copy.deepcopy(reply)
+        if hasattr(on_request, "response_received"):
+            on_request.response_received()
         return review.validate_review(raw, packet, update=update, coverage=coverage)
 
     @classmethod
@@ -339,6 +341,8 @@ class ApprovingReviewer:
     def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False, on_request=None):
         if on_request is not None:
             on_request(1)
+        if hasattr(on_request, "response_received"):
+            on_request.response_received()
         return approved_result(packet, update=update, coverage=coverage)
 
 

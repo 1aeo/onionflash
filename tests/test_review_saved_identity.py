@@ -138,8 +138,8 @@ def test_outer_policy_spoof_cannot_hide_retained_policy_evidence(context, monkey
             pause_proposal(cfg, store, row, monkeypatch)
         else:
             if retained == "cached-proposal":
-                with pytest.raises(review.InconsistentReview):
-                    run(cfg, store, row, Writer(), reviewer(cfg, inconsistent({})))
+                with pytest.raises(AnalysisError):
+                    run(cfg, store, row, Writer(), reviewer(cfg, inconsistent({}), FetchError("temporary", status=500)))
             pause_cached_after_reset(cfg, store, row, monkeypatch)
     audit = record(store)
     authentic, spoofed = audit["policy_hash"], "e" * 64
@@ -165,8 +165,8 @@ def test_outer_policy_spoof_cannot_hide_retained_policy_evidence(context, monkey
 def test_genuine_policy_change_accepts_coherent_nested_old_proof(context, monkeypatch):
     cfg, store = context
     row = pending(store)
-    with pytest.raises(review.InconsistentReview):
-        run(cfg, store, row, Writer(), reviewer(cfg, inconsistent({})))
+    with pytest.raises(AnalysisError):
+        run(cfg, store, row, Writer(), reviewer(cfg, inconsistent({}), FetchError("temporary", status=500)))
     pause_cached_after_reset(cfg, store, row, monkeypatch)
     cfg["review"]["model"] = "another-review-policy"
     writer, checker = Writer(), reviewer(cfg, verdict(), verdict())

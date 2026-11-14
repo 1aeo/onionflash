@@ -460,6 +460,14 @@ class ReviewError(AnalysisError):
 
 
 INCONSISTENT_VERDICT = "Review refusal requires an explicit failed criterion"
+VALIDATION_REASK_PROMPT = """
+The application rejected an earlier response as structurally inconsistent. The
+validation_error field quotes only that validation error, not a factual judgment.
+Review the unchanged current candidate from the supplied sources again and return
+a complete review consistent with its criteria. Do not invent a failed criterion
+to justify a preferred verdict. The rejected reply and its proposed edits are not
+evidence and have not been applied to the candidate.
+"""
 
 
 class InconsistentReview(ReviewError):
@@ -490,7 +498,8 @@ def policy_hash(config: dict) -> str:
     identity = {key: llm[key] for key in ("model", "base_url", "fallback_base_urls", "max_output_tokens",
                                          "enable_thinking", "send_chat_template_kwargs")}
     return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, ROUTING_PROMPT, UPDATE_SYSTEM_PROMPT,
-                   UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, INCONSISTENT_VERDICT, SCHEMA, UPDATE_REPAIR, identity])
+                   UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT,
+                   SCHEMA, UPDATE_REPAIR, identity])
 
 
 def _text(value, maximum: int, *, empty: bool = False) -> None:
@@ -751,7 +760,7 @@ class Reviewer(CompletionClient):
         super().__init__({**config, "llm": _llm(config)}, deadline=deadline)
 
     def review(self, candidate_public: dict, packet: dict, *, coverage: dict | None = None, verification: bool = False,
-               issue: str | None = None, update: bool = False, on_request=None) -> dict:
+               issue: str | None = None, update: bool = False, validation_error: str | None = None, on_request=None) -> dict:
         """Review one exact candidate without carrying forward earlier model replies; `issue` names a
         problem the application found in it."""
         refs = _packet_refs(packet)
@@ -787,10 +796,16 @@ class Reviewer(CompletionClient):
             payload["coverage_background"] = wire_coverage
         if issue is not None:
             payload["application_issue"] = issue
+        if validation_error is not None:
+            if validation_error != INCONSISTENT_VERDICT:
+                raise ReviewError("Unknown review validation feedback")
+            payload["validation_error"] = validation_error
         prompt = ((UPDATE_VERIFY_PROMPT if verification else UPDATE_SYSTEM_PROMPT) if update
                   else (VERIFY_PROMPT if verification else SYSTEM_PROMPT))
         if not update and (coverage or {}).get("recent"):
             prompt = prompt + ROUTING_PROMPT
+        if validation_error is not None:
+            prompt += VALIDATION_REASK_PROMPT
         result = self.complete(prompt, payload, schema, "onionflash_review",
                                **({"on_request": on_request} if on_request is not None else {}))
         result = _validate(result, refs, wire=True, update=update, coverage=coverage)

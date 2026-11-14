@@ -128,7 +128,7 @@ def test_unsupported_proposal_rejected_by_fresh_verification_cannot_publish_or_b
 
 
 @pytest.mark.parametrize("kind", ["missing-field", "extra-field", "bad-type", "immutable", "null-only", "no-op", "hold", "skip"])
-def test_nonproposals_and_malformed_repairs_fail_without_a_followup(context, kind):
+def test_nonproposals_are_never_applied_and_a_second_invalid_reply_stops(context, kind):
     cfg, store = context
     row = pending(store)
     bad = inconsistent()
@@ -139,9 +139,11 @@ def test_nonproposals_and_malformed_repairs_fail_without_a_followup(context, kin
     elif kind == "null-only": bad["repair"] = {key: None for key in review.EDITABLE}
     elif kind == "no-op": bad = inconsistent({"summary": analysis()["summary"]})
     else: bad = inconsistent(action=kind)
-    checker = reviewer(cfg, bad)
+    checker = reviewer(cfg, bad, copy.deepcopy(bad))
     with pytest.raises(review.InconsistentReview): run(cfg, store, row, Writer(), checker)
-    assert checker.calls == 1 and store.stories() == [] and record(store)["reviews"] == []
+    assert checker.calls == 2 and store.stories() == [] and record(store)["reviews"] == []
+    payloads = [json.loads(request["messages"][1]["content"]) for request in checker.client.requests]
+    assert payloads[1] == {**payloads[0], "validation_error": review.INCONSISTENT_VERDICT}
     event = record(store)["untrusted_proposals"][0]
     assert not event["accepted"] and event["disposition"] == "unusable"
     assert review_gate.recovery_status(record(store))["unresolved_inconsistency"]
@@ -150,15 +152,15 @@ def test_nonproposals_and_malformed_repairs_fail_without_a_followup(context, kin
 def test_packet_disallowed_labels_and_literal_tag_edits_never_enter_recovery(context):
     cfg, store = context
     row = pending(store)
-    checker = reviewer(cfg, inconsistent({"confidence": "confirmed"}))
+    checker = reviewer(cfg, inconsistent({"confidence": "confirmed"}), inconsistent({"confidence": "confirmed"}))
     with pytest.raises(review.InconsistentReview): run(cfg, store, row, Writer(), checker)
-    assert record(store)["untrusted_proposals"][0]["disposition"] == "labels" and checker.calls == 1
+    assert record(store)["untrusted_proposals"][0]["disposition"] == "labels" and checker.calls == 2
     with store.db: store.db.execute("DELETE FROM review_jobs"); store.db.execute("DELETE FROM items")
     tag = item(kind="tag", title="tor-0.4.9.5", content="", url="https://example.org/tags/tor-0.4.9.5")
     row = pending(store, tag)
-    checker = reviewer(cfg, inconsistent({"title": "Changed literal tag"}))
+    checker = reviewer(cfg, inconsistent({"title": "Changed literal tag"}), inconsistent({"title": "Changed literal tag"}))
     with pytest.raises(review.InconsistentReview): run(cfg, store, row, Writer(tag_notice(tag)), checker)
-    assert checker.calls == 1 and record(store)["untrusted_proposals"][0]["disposition"] == "literal_tag"
+    assert checker.calls == 2 and record(store)["untrusted_proposals"][0]["disposition"] == "literal_tag"
     assert store.stories() == []
 
 
@@ -194,14 +196,14 @@ def test_second_changed_untrusted_proposal_still_needs_fresh_verification(contex
     audit = saved_audit(store)
     assert checker.calls == 3 and len(audit["reviews"]) == 1
     assert [p["disposition"] for p in audit["untrusted_proposals"]] == ["superseded_unverified", "checked_approve"]
-    assert audit["request_budget"] == {"reserved": 3, "inconsistent_requests": [1, 2]}
+    assert audit["request_budget"] == {"reserved": 3, "inconsistent_requests": [1, 2], "validation_reask": None}
 
 
 def test_untrusted_and_valid_repair_cycles_are_both_stopped(context):
     cfg, store = context
     row = pending(store)
-    checker = reviewer(cfg, inconsistent(), inconsistent({"summary": analysis()["summary"]}))
-    with pytest.raises(review.InconsistentReview): run(cfg, store, row, Writer(), checker)
+    checker = reviewer(cfg, inconsistent(), inconsistent({"summary": analysis()["summary"]}), FetchError("temporary", status=500))
+    with pytest.raises(AnalysisError): run(cfg, store, row, Writer(), checker)
     assert record(store)["untrusted_proposals"][-1]["disposition"] == "repeated"
     assert review_gate.pending_proposal(record(store)) and store.stories() == []
     # A genuinely validated repair back to the initial text is also a loop.
@@ -445,13 +447,13 @@ def test_local_failures_and_unsent_deadline_do_not_spend_requests(context, monke
     assert record(store)["reviews"] == [] and not record(store).get("untrusted_proposals")
 
 
-@pytest.mark.parametrize("replies,error,unresolved,expected", [
-    ([inconsistent(), verdict()], None, False, "approve"),
-    ([inconsistent({}),], "InconsistentReview", True, None),
-    ([inconsistent(), verdict("hold", criterion="source_support")], None, False, "hold"),
-    ([inconsistent(), verdict("revise", repair={"summary": "ORIGINAL"})], None, True, "hold"),
+@pytest.mark.parametrize("replies,error,unresolved,expected,raw_count", [
+    ([inconsistent(), verdict()], None, False, "approve", 1),
+    ([inconsistent({}), inconsistent({})], "InconsistentReview", True, None, 2),
+    ([inconsistent(), verdict("hold", criterion="source_support")], None, False, "hold", 1),
+    ([inconsistent(), verdict("revise", repair={"summary": "ORIGINAL"})], None, True, "hold", 1),
 ])
-def test_evaluator_uses_same_recovery_and_separates_raw_errors_from_terminal_outcomes(context, tmp_path, monkeypatch, replies, error, unresolved, expected):
+def test_evaluator_uses_same_recovery_and_separates_raw_errors_from_terminal_outcomes(context, tmp_path, monkeypatch, replies, error, unresolved, expected, raw_count):
     cfg, _ = context
     module = evaluator()
     raw = json.loads((module.Path(module.__file__).parent/'review_cases.json').read_text())
@@ -469,7 +471,7 @@ def test_evaluator_uses_same_recovery_and_separates_raw_errors_from_terminal_out
     found = json.loads(path.read_text().splitlines()[0])
     assert found['review_request_count'] == len(client.requests) == len(replies)
     assert found.get('error') == error and result['errors'] == bool(error)
-    assert found['raw_inconsistency_count'] == 1 and result['raw_inconsistencies'] == 1
+    assert found['raw_inconsistency_count'] == raw_count and result['raw_inconsistencies'] == raw_count
     assert found['unresolved_inconsistency'] is unresolved
     assert result['unresolved_inconsistencies'] == int(unresolved)
     assert found.get('final_verdict') == expected

@@ -101,14 +101,16 @@ def test_invalid_route_identity_never_enters_untrusted_recovery(context):
     assert record["request_budget"]["reserved"] == checker.calls == 1
 
 
-def test_untrusted_merge_request_release_tag_is_rejected_before_followup(context):
+def test_untrusted_merge_request_release_tag_is_not_applied_during_correction(context):
     cfg, store = context
     row = pending(store, item(kind="gitlab_mr", upstream_state="merged"))
-    checker = reviewer(cfg, inconsistent({"summary": "A revised merged change.", "tags": ["release"]}))
-    with pytest.raises(review.InconsistentReview):
-        run(cfg, store, row, Writer(analysis(state="merged")), checker)
+    checker = reviewer(cfg, inconsistent({"summary": "A revised merged change.", "tags": ["release"]}),
+                       verdict("hold", criterion="source_support"))
+    assert run(cfg, store, row, Writer(analysis(state="merged")), checker)["status"] == "held"
     assert record(store)["untrusted_proposals"][0]["disposition"] == "labels"
-    assert checker.calls == 1 and not store.stories()
+    assert checker.calls == 2 and not store.stories()
+    payloads = [json.loads(request["messages"][1]["content"]) for request in checker.client.requests]
+    assert payloads[1]["candidate"] == payloads[0]["candidate"]
 
 
 def test_route_update_fallbacks_share_one_budget_and_operator_retry_starts_new_review(context):
@@ -147,7 +149,8 @@ def test_route_update_fallbacks_share_one_budget_and_operator_retry_starts_new_r
 
 
 @pytest.mark.parametrize("transfer", ["unlock", "merge", "locked-survivor"])
-def test_routed_budget_survives_locked_commit_unlock_and_held_transfer(context, transfer):
+@pytest.mark.parametrize("with_correction", [False, True])
+def test_routed_budget_survives_locked_commit_unlock_and_held_transfer(context, transfer, with_correction):
     cfg, store = context
     target = _publish(store, item(url="https://example.org/locked-incident", title="Authority overload report",
                                   content="Operators report directory authority overload."))
@@ -168,12 +171,16 @@ def test_routed_budget_survives_locked_commit_unlock_and_held_transfer(context, 
     row = pending(store, incoming)
     draft = analysis(title=incoming["title"], summary=incoming["content"], why_it_matters="",
                      evidence=[incoming["content"]])
-    assert run(cfg, store, row, Writer(draft), reviewer(cfg, verdict(same_story=target["id"])))["status"] == "routed"
+    replies = ([inconsistent({})] if with_correction else []) + [verdict(same_story=target["id"])]
+    assert run(cfg, store, row, Writer(draft), reviewer(cfg, *replies))["status"] == "routed"
+    spent = 2 if with_correction else 1
     routed = next(r for r in store.pending(10, LATER) if r["id"] == row["id"])
     update = update_analysis(update=incoming["content"], evidence=[incoming["content"]])
     assert run(cfg, store, routed, Writer(update), reviewer(cfg))["status"] == "locked"
     held_record = record(store)
-    assert job(store)["stage"] == "locked" and held_record["request_budget"]["reserved"] == 1
+    assert job(store)["stage"] == "locked" and held_record["request_budget"]["reserved"] == spent
+    if with_correction:
+        assert held_record["request_budget"]["validation_reask"]["response"] == 2
     assert held_record["reviews"] == [] and not held_record.get("approval")
     destination = target
     if survivor is not None:
@@ -189,7 +196,8 @@ def test_routed_budget_survives_locked_commit_unlock_and_held_transfer(context, 
     resumed = next(r for r in store.pending(10, LATER) if r["id"] == row["id"])
     checker = reviewer(cfg, verdict(update=True), verdict(update=True))
     assert run(cfg, store, resumed, Writer(update), checker)["status"] == "published"
-    assert checker.calls == 2 and saved_audit(store)["request_budget"]["reserved"] == 3
+    assert checker.calls == 2 and saved_audit(store)["request_budget"]["reserved"] == spent + 2
+    assert saved_audit(store)["request_budget"]["validation_reask"] == held_record["request_budget"]["validation_reask"]
     assert not job(store)
     final = next(s for s in store.stories() if s["id"] == destination["id"])
     assert final["updates"][-1]["text"] == incoming["content"]
@@ -297,14 +305,12 @@ def test_untrusted_alert_label_change_is_rejected_and_cannot_poison_later_proof(
     requests = review_gate.ReviewRequests(audit)
     checker = reviewer(cfg, untrusted_update({"update": incoming["content"], "state": "merged"}),
                        verdict(update=True), verdict(update=True))
-    with pytest.raises(review.InconsistentReview):
-        review_gate.advance_review(checker, "review", original, prepared, audit, requests)
-    assert checker.calls == 1 and audit["reviews"] == [] and review_gate.pending_proposal(audit) is None
-    assert audit["untrusted_proposals"][0]["accepted"] is False
-    assert audit["candidate"] == original and original["state"] == prior["state"]
-    assert review_gate.proposal_needs_check(audit)
     stage, unchanged = review_gate.advance_review(checker, "review", original, prepared, audit, requests)
     assert stage == "verify" and unchanged == original
+    assert checker.calls == 2 and len(audit["reviews"]) == 1 and review_gate.pending_proposal(audit) is None
+    assert audit["untrusted_proposals"][0]["accepted"] is False
+    assert audit["candidate"] == original and original["state"] == prior["state"]
+    assert not review_gate.proposal_needs_check(audit)
     action, unchanged = review_gate.advance_review(checker, stage, unchanged, prepared, audit, requests)
     assert action == "approve" and unchanged == original and checker.calls == 3
     assert not review_gate.proposal_needs_check(audit)

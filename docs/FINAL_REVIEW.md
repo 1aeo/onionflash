@@ -184,13 +184,31 @@ from validated reviews, then requires a fresh verification of that exact text.
 The previous reply is never included in the verifier's input. Pending proposals
 bypass cached approvals and cannot borrow facts verified for an earlier text.
 
-When the initial reply was invalid, the first valid verification is the first
-trusted news decision. Later trusted decisions still obey the ordinary
+If that invalid reply has no usable edit, the ledger permits one logical
+validation-correction request. It reviews the same candidate, packet, scope and
+coverage, with only a fixed corrective instruction and the application's quoted
+validation error added. The rejected criteria and proposed edits are not input or
+approval evidence. A valid correction enters the ordinary review stage: an initial
+approval still needs its fresh verification, and an existing valid review remains
+the only possible disagreement anchor. Literal tags and fixed labels are not edited
+to make a rejected proposal usable.
+
+The correction's trigger and each physical attempt are durable. Confirmed
+transport failures may continue that same logical correction within the shared
+seven-request limit. A successful response is recorded before parsing, so an
+unusable answer or an interrupted validation cannot obtain a second semantic
+correction. An unknown in-flight reservation fails closed; a known unsent deadline
+can refund its physical reservation. Automatic context changes abandon stale
+feedback while retaining the correction slot and spent requests.
+
+For untrusted-edit recovery after an invalid initial reply, the first valid
+verification is the first trusted news decision. Later trusted decisions still obey the ordinary
 disagreement rule. A changed source context discards the pending proposal and
 starts again from a freshly assembled candidate. Raw inconsistencies, accepted
 proposals and unresolved recovery outcomes remain distinct in the private
 evaluation; a hold caused by an unusable or repeated repair is not a successful
-recovery. Malformed/no-op edits and damaged saved recovery state fail closed.
+recovery. Malformed or no-op edits are never applied. Damaged saved recovery state
+always fails closed.
 
 Every endpoint attempt, including invalid replies and fallback attempts, spends
 the same seven-request budget. Reservations are saved before sending, so an

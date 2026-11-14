@@ -19,6 +19,19 @@ class AnalysisError(Exception):
             self.code = code
 
 
+class RequestObserver:
+    """A reservation callback may also persist transport outcomes before parsing."""
+
+    def __call__(self, delta: int) -> None:
+        raise NotImplementedError
+
+    def response_received(self) -> None:
+        pass
+
+    def transport_failed(self) -> None:
+        pass
+
+
 def has_invalid_text_chars(value: str) -> bool:
     """Reject ASCII control characters (other than tab/newline) and XML noncharacters."""
     return any((ord(c) < 32 and c not in "\n\t") or c in "\ufffe\uffff" for c in value)
@@ -199,9 +212,15 @@ class CompletionClient:
                     self.calls -= 1
                     if on_request is not None:
                         on_request(-1)
+                    if isinstance(on_request, RequestObserver):
+                        on_request.transport_failed()
                     raise failure from None
+                if isinstance(on_request, RequestObserver):
+                    on_request.transport_failed()
         else:
             raise failure
+        if isinstance(on_request, RequestObserver):
+            on_request.response_received()
         try:
             choice = response.json()["choices"][0]
             finished, content = choice["finish_reason"], choice["message"]["content"]

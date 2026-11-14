@@ -17,7 +17,8 @@ import json
 import re
 
 from . import candidate as candidate_mod, decisions, editorial, review
-from .analyze import AnalysisError, cache_key
+from .analyze import cache_key
+from .llm import AnalysisError, RequestObserver
 from .util import _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, now_iso, saved_object, thread_subject
 
 MAX_APPROVALS = 2000  # cached approvals kept besides those unfinished jobs pin
@@ -68,7 +69,8 @@ def _record_input_hash(record: object) -> str | None:
 
 def initial_review_state():
     """Only newly created chains initialize these fields; saved chains require them."""
-    return {"request_budget": {"reserved": 0, "inconsistent_requests": []}, "untrusted_proposals": []}
+    return {"request_budget": {"reserved": 0, "inconsistent_requests": [], "validation_reask": None},
+            "untrusted_proposals": []}
 
 
 def _carried_requests(record):
@@ -516,33 +518,85 @@ class ReviewRequests:
         if "request_budget" not in record or not isinstance(record.get("untrusted_proposals"), list):
             raise AnalysisError("Saved review ledger is missing", code="app.damaged_job")
         state = record["request_budget"]
-        if (not isinstance(state, dict) or set(state) != {"reserved", "inconsistent_requests"}
+        if (not isinstance(state, dict) or set(state) != {"reserved", "inconsistent_requests", "validation_reask"}
                 or type(state.get("reserved")) is not int
                 or not len(record["reviews"]) <= state["reserved"] <= MAX_REVIEW_REQUESTS
                 or not isinstance(state.get("inconsistent_requests"), list)
                 or any(type(n) is not int or not 1 <= n <= state["reserved"] for n in state["inconsistent_requests"])
                 or state["inconsistent_requests"] != sorted(set(state["inconsistent_requests"]))):
             raise AnalysisError("Saved review request budget is damaged", code="app.damaged_job")
+        correction = state["validation_reask"]
+        if correction is not None:
+            if (not isinstance(correction, dict)
+                    or set(correction) != {"trigger", "attempts", "response", "transport_failed"}
+                    or type(correction.get("trigger")) is not int
+                    or not 1 <= correction["trigger"] < MAX_REVIEW_REQUESTS
+                    or correction["trigger"] > state["reserved"]
+                    or not isinstance(correction.get("attempts"), list)
+                    or any(type(n) is not int or not correction["trigger"] < n <= state["reserved"]
+                           for n in correction["attempts"])
+                    or correction["attempts"] != list(range(correction["trigger"] + 1,
+                                                           max(correction["attempts"], default=correction["trigger"]) + 1))
+                    or (correction.get("response") is not None
+                        and (type(correction["response"]) is not int or not correction["attempts"]
+                             or correction["response"] != correction["attempts"][-1]))
+                    or type(correction.get("transport_failed")) is not bool
+                    or (correction["response"] is not None and correction["transport_failed"])):
+                raise AnalysisError("Saved validation correction is damaged", code="app.damaged_job")
         self.state = state
 
-    def callback(self):
-        previous = None
+    def callback(self, *, correction=False):
+        requests = self
 
-        def count(delta):
-            nonlocal previous
-            if delta == 1:
-                if self.state["reserved"] >= MAX_REVIEW_REQUESTS:
-                    raise review.ReviewLimitReached("Review request budget exhausted")
-                previous = self.state["reserved"]
-                self.state["reserved"] += 1
-            elif delta == -1 and previous is not None:
-                self.state["reserved"] = previous
-                previous = None
-            else:
-                raise ValueError("Invalid review request accounting")
-            self.persist()
-            self.actual += delta
-        return count
+        class Counter(RequestObserver):
+            previous = None
+
+            def __call__(self, delta):
+                state = requests.state
+                reask = state["validation_reask"] if correction else None
+                if correction and (reask is None or reask["response"] is not None):
+                    raise AnalysisError("Validation correction is not pending", code="app.damaged_job")
+                if delta == 1:
+                    if state["reserved"] >= MAX_REVIEW_REQUESTS:
+                        raise review.ReviewLimitReached("Review request budget exhausted")
+                    if correction and reask["attempts"] and not reask["transport_failed"]:
+                        raise AnalysisError("Validation correction is already in flight", code="app.damaged_job")
+                    self.previous = (state["reserved"], copy.deepcopy(reask))
+                    state["reserved"] += 1
+                    if correction:
+                        reask["attempts"].append(state["reserved"])
+                        reask["transport_failed"] = False
+                elif delta == -1 and self.previous is not None:
+                    state["reserved"] = self.previous[0]
+                    if correction:
+                        state["validation_reask"] = self.previous[1]
+                    self.previous = None
+                else:
+                    raise ValueError("Invalid review request accounting")
+                requests.persist()
+                requests.actual += delta
+
+            def response_received(self):
+                if not correction:
+                    return
+                reask = requests.state["validation_reask"]
+                if (reask is None or reask["response"] is not None or not reask["attempts"]
+                        or reask["attempts"][-1] != requests.state["reserved"]):
+                    raise AnalysisError("Validation response is not reserved", code="app.damaged_job")
+                reask["response"] = requests.state["reserved"]
+                reask["transport_failed"] = False
+                requests.persist()
+
+            def transport_failed(self):
+                if not correction:
+                    return
+                reask = requests.state["validation_reask"]
+                if reask is None or reask["response"] is not None:
+                    raise AnalysisError("Validation response cannot be retried", code="app.damaged_job")
+                reask["transport_failed"] = True
+                requests.persist()
+
+        return Counter()
 
 
 def _context(prepared, policy):
@@ -567,6 +621,70 @@ def proposal_needs_check(record):
     return bool(pending_proposal(record)) or bool(active and latest <= active[-1]["request"])
 
 
+def _validate_reask(record, stage):
+    """Bind the one correction slot to its rejected reply and observed response."""
+    budget, proposals = record["request_budget"], record["untrusted_proposals"]
+    correction = budget["validation_reask"]
+    triggers = [proposal for proposal in proposals if proposal["reask_trigger"]]
+    responses = [(entry, False) for entry in record["reviews"]]
+    responses += [(proposal, True) for proposal in proposals]
+    if any(type(entry.get("reask_response", False)) is not bool for entry, _ in responses):
+        raise ValueError()
+    if correction is None:
+        if triggers or any(entry.get("reask_response", False) for entry, _ in responses):
+            raise ValueError()
+        if any(not p["accepted"] and p["request"] < MAX_REVIEW_REQUESTS for p in proposals):
+            raise ValueError()
+        return
+    if len(triggers) != 1 or triggers[0]["request"] != correction["trigger"] or triggers[0]["accepted"]:
+        raise ValueError()
+    trigger = triggers[0]
+    active = trigger["disposition"] != "discarded_context"
+    observed = correction["response"]
+    for entry, untrusted in responses:
+        marked = entry.get("reask_response", False)
+        if type(marked) is not bool or marked != (entry.get("request") == observed):
+            raise ValueError()
+        if entry.get("request") in correction["attempts"] and not marked:
+            raise ValueError()  # A transport retry cannot follow a received semantic reply.
+        if marked:
+            actual_context = entry["context"] if untrusted else {key: entry.get(key) for key in trigger["context"]}
+            actual_stage = (entry["stage"] if untrusted else "repair" if entry.get("issue") == "release_labels"
+                            else "verify" if entry["stage"] == "verification" else "review")
+            before_hash = entry["candidate_before_hash"] if untrusted else entry["candidate_hash"]
+            if (actual_context != trigger["context"] or actual_stage != trigger["stage"]
+                    or before_hash != trigger["candidate_before_hash"]
+                    or (untrusted and entry["mode"] != trigger["mode"])):
+                raise ValueError()
+    if active and observed is None and budget["reserved"] != (correction["attempts"][-1] if correction["attempts"] else correction["trigger"]):
+        raise ValueError()
+    if (active and observed is not None and not any(entry.get("request") == observed for entry, _ in responses)
+            and stage in {"approved", "skipped", "routed", "held", "locked"}):
+        raise ValueError()
+
+
+def _pending_reask(record, stage, candidate, prepared):
+    """Resume only confirmed transport failures; an unknown or invalid reply is terminal."""
+    events = [(entry["request"], None) for entry in record["reviews"]]
+    events += [(proposal["request"], proposal) for proposal in record["untrusted_proposals"]
+               if proposal["disposition"] != "discarded_context"]
+    latest = max(events, default=(0, None), key=lambda event: event[0])[1]
+    if latest is None or latest["accepted"]:
+        return False
+    correction = record["request_budget"]["validation_reask"]
+    if correction is None or correction["trigger"] != latest["request"]:
+        raise review.InconsistentReview()
+    if (latest["stage"] != stage or latest["mode"] != prepared.get("mode", "story")
+            or latest["candidate_before_hash"] != digest(candidate)
+            or latest["context"] != _context(prepared, record["policy_hash"])):
+        raise AnalysisError("Validation correction target changed", code="app.damaged_job")
+    if correction["response"] is not None:
+        raise review.ReviewError("Validation correction did not yield a usable review")
+    if correction["attempts"] and not correction["transport_failed"]:
+        raise review.ReviewError("Interrupted validation correction cannot be repeated")
+    return True
+
+
 def validate_review_state(record, stage, candidate, prepared, *, allow_cached=True):
     """Fail closed on damaged bookkeeping before it can reach a cached approval."""
     budget = ReviewRequests(record).state
@@ -574,7 +692,7 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
     dispositions = {"pending", "superseded_unverified", "discarded_context", "unusable", "literal_tag", "labels", "repeated",
                     "checked_approve", "checked_revise", "checked_hold", "checked_skip"}
     fields = {"error", "request", "stage", "mode", "candidate_before_hash", "candidate_after_hash", "context", "changed_fields", "repair",
-              "accepted", "disposition"}
+              "accepted", "disposition", "reask_trigger", "reask_response"}
     def hashed(value):
         return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
     try:
@@ -601,6 +719,7 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                     or not hashed(proposal["candidate_before_hash"])
                     or (proposal["candidate_after_hash"] is not None and not hashed(proposal["candidate_after_hash"]))
                     or type(proposal["accepted"]) is not bool or proposal["disposition"] not in dispositions
+                    or type(proposal["reask_trigger"]) is not bool or type(proposal["reask_response"]) is not bool
                     or not isinstance(proposal["context"], dict)
                     or set(proposal["context"]) != {"source_hash", "coverage_hash", "binding_hash", "policy_hash"}
                     or not all(hashed(value) for value in proposal["context"].values())
@@ -630,6 +749,7 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                     raise ValueError()
         if [p["request"] for p in proposals] != budget["inconsistent_requests"]:
             raise ValueError()
+        _validate_reask(record, stage)
         if stage == "drafted":
             return
         if stage == "locked":
@@ -780,35 +900,45 @@ def recovery_status(record):
             "unresolved_inconsistency": unresolved}
 
 
-def call_review(reviewer, stage, candidate, prepared, *, requests) -> dict:
+def call_review(reviewer, stage, candidate, prepared, *, requests, correction=False) -> dict:
     """Return only a genuinely validated reply; an invalid reply remains an exception."""
     result = reviewer.review(candidate, prepared["packet"], coverage=prepared["coverage"], verification=stage == "verify",
-                             issue=review.RELEASE_ISSUE if stage == "repair" else None, on_request=requests.callback(),
+                             issue=review.RELEASE_ISSUE if stage == "repair" else None,
+                             on_request=requests.callback(correction=correction),
+                             **({"validation_error": review.INCONSISTENT_VERDICT} if correction else {}),
                              **({"update": True} if prepared.get("mode") == "update" else {}))
+    if correction and requests.state["validation_reask"]["response"] != requests.state["reserved"]:
+        raise AnalysisError("Validation response was not observed", code="app.damaged_job")
     return {"stage": "verification" if stage == "verify" else "review", **({"issue": "release_labels"} if stage == "repair" else {}),
+            **({"reask_response": True} if correction else {}),
             "candidate_hash": digest(candidate), "request": requests.state["reserved"], "result": result}
 
 
 def advance_review(reviewer, stage, candidate, prepared, record, requests):
     """Runtime and evaluation share the same untrusted-proposal transition.
 
-    The first valid fresh verification after an invalid initial reply is the first
-    trusted news decision. Invalid criteria never become a disagreement anchor.
+    An untrusted edit still requires its fresh verification. A validation
+    correction keeps the current stage and candidate; invalid criteria never
+    become a disagreement anchor.
     """
     validate_review_state(record, stage, candidate, prepared)
+    correction = _pending_reask(record, stage, candidate, prepared)
     seen = _seen_candidates(record, candidate, prepared)
     waiting = pending_proposal(record)
     before = requests.actual
     try:
-        entry = call_review(reviewer, stage, candidate, prepared, requests=requests)
+        entry = call_review(reviewer, stage, candidate, prepared, requests=requests, correction=correction)
     except review.InconsistentReview as error:
         if requests.actual == before:
             raise
+        if correction and requests.state["validation_reask"]["response"] != requests.state["reserved"]:
+            raise AnalysisError("Validation response was not observed", code="app.damaged_job")
         event = {"error": review.INCONSISTENT_VERDICT, "request": requests.state["reserved"], "stage": stage,
                  "mode": prepared.get("mode", "story"),
                  "candidate_before_hash": digest(candidate), "candidate_after_hash": None,
                  "context": _context(prepared, record["policy_hash"]), "changed_fields": [],
-                 "repair": None, "accepted": False, "disposition": "unusable"}
+                 "repair": None, "accepted": False, "disposition": "unusable",
+                 "reask_trigger": False, "reask_response": correction}
         requests.state["inconsistent_requests"].append(event["request"])
         record.setdefault("untrusted_proposals", []).append(event)
         try:
@@ -828,6 +958,14 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
                 event["disposition"] = "repeated"
                 raise review.ReviewError("Untrusted edit repeats a reviewed candidate")
         except review.ReviewError:
+            if requests.state["validation_reask"] is None and requests.state["reserved"] < MAX_REVIEW_REQUESTS:
+                event["reask_trigger"] = True
+                requests.state["validation_reask"] = {"trigger": event["request"], "attempts": [],
+                                                       "response": None, "transport_failed": False}
+                requests.persist()
+                # The correction keeps this exact stage and candidate. Invalid
+                # criteria are still absent from the trusted review history.
+                return advance_review(reviewer, stage, candidate, prepared, record, requests)
             requests.persist()
             raise error
         if waiting is not None:
