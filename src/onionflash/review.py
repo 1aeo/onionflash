@@ -499,7 +499,7 @@ def policy_hash(config: dict) -> str:
                                          "enable_thinking", "send_chat_template_kwargs")}
     return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, ROUTING_PROMPT, UPDATE_SYSTEM_PROMPT,
                    UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT,
-                   SCHEMA, UPDATE_REPAIR, identity])
+                   SCHEMA, UPDATE_REPAIR, identity, CompletionClient.REQUEST_POLICY])
 
 
 def _text(value, maximum: int, *, empty: bool = False) -> None:

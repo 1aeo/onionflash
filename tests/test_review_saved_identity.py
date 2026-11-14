@@ -5,7 +5,7 @@ import pytest
 
 from helpers import update_analysis, verdict
 from onionflash import editorial, review, review_gate
-from onionflash.analyze import AnalysisError
+from onionflash.llm import AnalysisError, CompletionClient
 from onionflash.transport import FetchError
 from helpers import seed_source_story as _publish
 from helpers import analysis, make_item as item
@@ -87,21 +87,39 @@ def test_corrupt_handoff_identity_fails_before_drafting_or_spending(context, tra
     assert job(store) == before and not store.stories()[0].get("updates")
 
 
-@pytest.mark.parametrize("change", ["source", "policy"])
-def test_coherent_new_source_or_policy_still_starts_a_new_review(context, change):
+@pytest.mark.parametrize("change", ["source", "policy", "request-policy"])
+def test_coherent_new_source_or_policy_still_starts_a_new_review(context, monkeypatch, change):
     cfg, store = context
     _, incoming, row = routed_with_spent_requests(cfg, store)
     if change == "source":
         incoming = {**incoming, "content": incoming["content"] + " A later measurement is also available.", "updated_at": LATER}
         assert store.ingest(incoming, LATER)
-    else:
+    elif change == "policy":
         cfg["review"]["model"] = "another-review-model"
+    else:
+        monkeypatch.setitem(CompletionClient.REQUEST_POLICY, "deadline_refund", "another-contract")
     current = next(r for r in store.pending(10, LATER) if r["id"] == row["id"])
     writer = Writer(update_analysis(update=incoming["content"], evidence=[incoming["content"]]))
     checker = reviewer(cfg, verdict(update=True), verdict(update=True))
     assert run(cfg, store, current, writer, checker)["status"] == "published"
     assert len(writer.calls) == 1 and checker.calls == 2
     assert saved_audit(store)["request_budget"]["reserved"] == 2
+
+
+def test_new_transport_policy_does_not_erase_corrupt_old_policy_evidence(context, monkeypatch):
+    cfg, store = context
+    _, _, row = routed_with_spent_requests(cfg, store)
+    audit = record(store)
+    audit["reviews"][0]["policy_hash"] = "f" * 64
+    with store.db:
+        store.db.execute("UPDATE review_jobs SET record_json=? WHERE item_id=?", (json.dumps(audit), row["id"]))
+    before = job(store)
+    monkeypatch.setitem(CompletionClient.REQUEST_POLICY, "deadline_refund", "another-contract")
+    current = next(r for r in store.pending(10, LATER) if r["id"] == row["id"])
+    writer, checker = Writer(update_analysis()), reviewer(cfg)
+    with pytest.raises(AnalysisError, match="damaged"):
+        run(cfg, store, current, writer, checker)
+    assert not writer.calls and checker.calls == 0 and job(store) == before
 
 
 def test_corrupt_job_is_not_silently_erased_by_a_citation_transition(context):

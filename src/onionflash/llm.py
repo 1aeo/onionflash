@@ -125,6 +125,8 @@ def json_object(text: str, code: str = "writer.invalid_json") -> dict:
 
 class CompletionClient:
     stage = "writer"
+    REQUEST_POLICY = {"transport": {"retry_attempts": 1, "max_redirects": 0},
+                      "deadline_refund": "before_dispatch_only"}
 
     def __init__(self, config: dict, deadline: float | None = None):
         self.deadline = deadline  # absolute time.monotonic() limit for model requests
@@ -139,8 +141,7 @@ class CompletionClient:
                 self.llm["total_timeout_seconds"],
                 self.llm["timeout_seconds"] + self.llm["connect_timeout_seconds"],
             ),
-            "retry_attempts": 1,
-            "max_redirects": 0,
+            **self.REQUEST_POLICY["transport"],
         }
         self.client: HttpClient | None = None
         self.calls = 0  # requests sent, for the run report
@@ -209,10 +210,13 @@ class CompletionClient:
                     "LLM request failed" + (f" (HTTP {exc.status})" if exc.status else ""),
                     retryable=True,
                 )
-                if isinstance(exc, DeadlineReached):  # refused unsent, as every later endpoint would be
-                    self.calls -= 1
-                    if on_request is not None:
-                        on_request(-1)
+                if isinstance(exc, DeadlineReached):
+                    # Only refusal before dispatch proves the reservation unused.
+                    # A timed-out request may already have reached the endpoint.
+                    if not exc.request_started:
+                        self.calls -= 1
+                        if on_request is not None:
+                            on_request(-1)
                     if isinstance(on_request, RequestObserver):
                         on_request.transport_failed()
                     raise failure from None

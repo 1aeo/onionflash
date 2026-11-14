@@ -45,8 +45,10 @@ class FetchError(Exception):
 class DeadlineReached(FetchError):
     """The caller's deadline arrived, or a retry wait would pass it. Never retried here."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, request_started: bool = False) -> None:
         super().__init__("request deadline reached", retryable=True)
+        # Once dispatch starts, a deadline cannot prove that no request was sent.
+        self.request_started = request_started
 
 
 @dataclass(frozen=True)
@@ -232,6 +234,7 @@ class HttpClient:
         # records that the deadline, not the server, ended the latest request.
         self.deadline: float | None = None
         self.deadline_reached, self._injected_transport = False, transport is not None
+        self._request_started = False
         timeout = httpx.Timeout(float(settings.get("timeout_seconds", 30.0)),
                                 connect=float(settings.get("connect_timeout_seconds", 10.0)))
         self._client = httpx.Client(transport=transport or _CheckedTransport(self.policy, clock=self.clock),
@@ -278,7 +281,7 @@ class HttpClient:
     def _check_deadline(self, wait: float = 0.0) -> None:
         if self.deadline is not None and self.clock() + wait >= self.deadline:
             self.deadline_reached = True
-            raise DeadlineReached()
+            raise DeadlineReached(request_started=self._request_started)
 
     def _pause(self, seconds: float) -> None:
         self._check_deadline(seconds)
@@ -350,6 +353,7 @@ class HttpClient:
         if method not in {"GET", "POST"}:
             raise FetchError("unsupported request method")
         self.deadline_reached = False  # describes this request only, e.g. the last fallback
+        self._request_started = False
         start_url = self._url(url)
         start_headers = {"user-agent": self.settings.get("user_agent", "OnionFlash"),
                          "accept-encoding": "gzip, deflate"}
@@ -368,6 +372,7 @@ class HttpClient:
                     # Cookies are unnecessary for source collection and must not
                     # make independently configured source requests stateful.
                     self._client.cookies.clear()
+                    self._request_started = True
                     with self._client.stream(active_method, current, headers=active_headers, json=payload,
                                              extensions={"onionflash_deadline": deadline}) as response:
                         if response.status_code in REDIRECT_STATUSES:
@@ -393,6 +398,8 @@ class HttpClient:
                         body = b"" if response.status_code in {204, 205, 304} else self._body(response)
                         return Response(response.status_code, body, dict(response.headers), current)
             except FetchError as exc:
+                if isinstance(exc, DeadlineReached):
+                    exc.request_started = exc.request_started or self._request_started
                 # A deadline stop must not fall back to a shorter wait than Retry-After.
                 if isinstance(exc, DeadlineReached) or not exc.retryable or attempt + 1 >= attempts:
                     raise
