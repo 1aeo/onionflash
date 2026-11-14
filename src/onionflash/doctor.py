@@ -1085,6 +1085,19 @@ def _write_story_tx(db, story_id: str, cluster_key: str, payload: dict) -> bool:
         raise
 
 
+def _standalone_desired_state(network_entries: list, pinned: list[dict], inc_list: list[dict]) -> str:
+    open_keys = {inc["key"] for inc in inc_list if inc["closed"] is None}
+    for inc in inc_list:
+        if inc["closed"] is None:
+            matched_open = _find_pinned(pinned, inc)
+            if matched_open is not None and isinstance(matched_open["entry"].get("key"), str):
+                open_keys.add(matched_open["entry"]["key"])
+    for item in network_entries:
+        if isinstance(item, dict) and item.get("key") in open_keys:
+            return "developing"
+    return "no-longer-listed"
+
+
 def evaluate(
     config: dict,
     store,
@@ -1418,6 +1431,8 @@ def evaluate(
                     inc["last"],
                 )
                 updated_payload["network"] = [*list(updated_payload.get("network") or []), entry]
+                if host_raw.get("origin") == "network-health":
+                    updated_payload["state"] = _standalone_desired_state(updated_payload["network"], pinned, inc_list)
                 newest_at = max([updated_payload["updated_at"], inc["last"]["stamp"], *(u["at"] for u in due)])
                 updated_payload["updated_at"] = newest_at
                 if _write_story_tx(db, target_id, host_row["cluster_key"], updated_payload):
@@ -1488,7 +1503,7 @@ def evaluate(
         is_standalone = raw_story.get("origin") == "network-health"
         due = _build_updates(story_id, inc, entry, include_open=not is_standalone)
         desired_state = (
-            ("no-longer-listed" if inc["closed"] is not None else "developing")
+            _standalone_desired_state(raw_story.get("network") or [], pinned, inc_list)
             if is_standalone
             else raw_story["state"]
         )

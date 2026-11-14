@@ -34,6 +34,18 @@ def backup_database(source: str | Path, destination: str | Path) -> None:
         raise
 
 
+def retained_analysis_keys(db) -> set[str]:
+    """Return analysis cache keys referenced by live stories and not safe to evict."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stories'").fetchone():
+        return set()
+    pinned: set[str] = set()
+    for (raw,) in db.execute("SELECT CAST(payload AS BLOB) FROM stories WHERE typeof(payload)='text'"):
+        payload = saved_object(raw)
+        if isinstance(payload, dict) and isinstance(payload.get("editorial_analysis_key"), str):
+            pinned.add(payload["editorial_analysis_key"])
+    return pinned
+
+
 TAG_PRIORITY = 5  # queue floor for deterministic tag notices
 POLL_TOLERANCE_SECONDS = 5  # absorbs scheduler start jitter after a successful poll
 
@@ -285,11 +297,7 @@ class Store:
         elif row and row["content_hash"] == content_hash:
             # An upstream updated_at edit alone is not a new news event.
             return False
-        elif (
-            row
-            and item["updated_at"] < old["updated_at"]
-            and not (item.get("kind") == "metrics_timeline" and item.get("url") != old.get("url"))
-        ):
+        elif row and item["updated_at"] < old["updated_at"]:
             # A stale cache/fallback must not roll a newer incident back in time.
             return False
         elif row and row["status"] != "pending" and check_requested and item_hash(old) == content_hash:

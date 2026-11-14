@@ -257,7 +257,11 @@ def _feed(
         # Some Atom archives omit alternate links and reuse an ID for distinct
         # events. Do not silently choose one event when that fallback is ambiguous.
         has_alternate = any(
-            isinstance(link_obj, dict) and link_obj.get("rel", "alternate") == "alternate" and link_obj.get("href")
+            isinstance(link_obj, dict)
+            and link_obj.get("rel", "alternate") == "alternate"
+            and str(link_obj.get("type") if "type" in link_obj else "text/html").lower()
+            in {"text/html", "application/xhtml+xml", "html", "xhtml"}
+            and bool(link_obj.get("href"))
             for link_obj in (entry.get("links") or ())
         )
         if feed.version.startswith("atom") and not has_alternate and entry.get("id"):

@@ -429,7 +429,7 @@ def restore(db, story_id: str, revision: int, *, reason: str, expect_hash: str, 
 
 def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str | None = None,
           base_url: str = DEFAULTS["site"]["base_url"], observed: str | None = None,
-          automatic: bool = False) -> dict:
+          automatic: bool = False, _guard=None, _complete=None) -> dict:
     """Permanently merge published duplicate `story_id` into `survivor_id` as a pointer."""
     from . import decisions
     from .render import pointer_json
@@ -447,6 +447,8 @@ def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str 
         raise ValueError("Editorial action needs a fresh transaction")
     db.execute("BEGIN IMMEDIATE")
     with db:
+        if _guard is not None:
+            _guard(db)
         dup = _snapshot(db, story_id)
         surv = _snapshot(db, survivor_id)
         if expect_hash is not None and dup["hash"] != expect_hash:
@@ -607,4 +609,6 @@ def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str 
                 remapped_items=remapped,
                 reason=reason,
             )
+        if _complete is not None:
+            _complete(db)
     return {"story_id": story_id, "merged_into": survivor_id, "remapped_items": remapped, "updated_at": stamp}

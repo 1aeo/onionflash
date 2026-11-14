@@ -513,7 +513,7 @@ def _stories_for_urls(db, urls: list[str]) -> list[dict]:
         for (sid,) in db.execute(
             """SELECT story_id FROM items
                WHERE LOWER(url) IN (?,?) AND story_id IS NOT NULL
-                 AND NOT (status='pending' AND last_error=?)""",
+                 AND NOT (status IS 'pending' AND last_error IS ?)""",
             (u1.lower(), u2.lower(), _UNVERIFIED_ROUTE),
         ).fetchall():
             live = _live_story(db, sid)
@@ -529,7 +529,7 @@ def _thread_matches(db, row: dict, item: dict, subject: str) -> list[dict]:
     for sid, payload_blob in db.execute(
         """SELECT story_id,CAST(payload AS BLOB) FROM items
            WHERE source_id=? AND story_id IS NOT NULL AND id!=?
-             AND NOT (status='pending' AND last_error=?)""",
+             AND NOT (status IS 'pending' AND last_error IS ?)""",
         (row["source_id"], row.get("id") or "", _UNVERIFIED_ROUTE),
     ).fetchall():
         other = saved_object(payload_blob)
@@ -563,7 +563,7 @@ def associate(db, row: dict) -> tuple[dict | None, str | None]:
     for (sid,) in db.execute(
         """SELECT DISTINCT story_id FROM items
            WHERE story_id IS NOT NULL AND cluster_key=?
-             AND NOT (status='pending' AND last_error=?)""",
+             AND NOT (status IS 'pending' AND last_error IS ?)""",
         (row["cluster_key"], _UNVERIFIED_ROUTE),
     ).fetchall():
         live = _live_story(db, sid)
@@ -635,7 +635,7 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
         for (sid,) in db.execute(
             """SELECT DISTINCT story_id FROM items
                WHERE story_id IS NOT NULL AND cluster_key=?
-                 AND NOT (status='pending' AND last_error=?)""",
+                 AND NOT (status IS 'pending' AND last_error IS ?)""",
             (key, _UNVERIFIED_ROUTE),
         ).fetchall():
             add(sid, reason)

@@ -88,9 +88,15 @@ def reset_review_work(store, item_id):
         record_json=?,approval_key=NULL,updated_at=? WHERE item_id=?""", (keep, _json(record), now_iso(), item_id))
 
 
-def _save(store, item_id, writer_key, policy_hash, stage, draft, prepared, record, observed,
+def _save(store, row, writer_key, policy_hash, stage, draft, prepared, record, observed,
           *, prepared_at, approval_key=None, approval_receipt=None):
     with store.db:
+        if not store.db.execute(
+            "SELECT 1 FROM items WHERE id=? AND content_hash=? AND status='pending'",
+            (row["id"], row["content_hash"]),
+        ).fetchone():
+            from .candidate import StaleCandidate
+            raise StaleCandidate("Source item changed before saving review state")
         if approval_receipt is not None:
             # Receipt and the unfinished job's pin become durable together.
             store.db.execute("""INSERT OR REPLACE INTO review_approvals
@@ -103,7 +109,7 @@ def _save(store, item_id, writer_key, policy_hash, stage, draft, prepared, recor
             policy_hash=excluded.policy_hash,stage=excluded.stage,draft_json=excluded.draft_json,
             envelope_json=excluded.envelope_json,record_json=excluded.record_json,
             approval_key=excluded.approval_key,prepared_at=excluded.prepared_at,updated_at=excluded.updated_at""",
-            (item_id, writer_key, policy_hash, stage, _json(draft) if draft is not None else None,
+            (row["id"], writer_key, policy_hash, stage, _json(draft) if draft is not None else None,
              _json(prepared) if prepared is not None else None, _json(record), approval_key, prepared_at, observed))
 
 
@@ -413,12 +419,16 @@ def _verified(reviews) -> bool:
 
 def _hold(store, row, draft, writer_key, record, observed, stage, reason):
     """One semantic hold is terminal; only source change/operator retry requeues."""
+    from .candidate import StaleCandidate
+
     record.update(outcome="held", hold_code=reason, hold_reason=HOLDS[reason], verified_facts=_verified(record["reviews"]))
     with store.db:
+        if not store.db.execute("""UPDATE items SET status='rejected',attempts=attempts+1,
+            rejections=MAX(rejections,3),next_attempt_at=NULL,last_error=?
+            WHERE id=? AND content_hash=? AND status='pending'""",
+            ("Final review held: " + HOLDS[reason], row["id"], row["content_hash"])).rowcount:
+            raise StaleCandidate("Source item changed before hold completed")
         store.record_analysis(row, draft, writer_key, observed, review_record=record)
-        store.db.execute("""UPDATE items SET status='rejected',attempts=attempts+1,
-            rejections=MAX(rejections,3),next_attempt_at=NULL,last_error=? WHERE id=?""",
-            ("Final review held: " + HOLDS[reason], row["id"]))
         store.db.execute("""UPDATE review_jobs SET stage='held',record_json=?,approval_key=NULL,
             updated_at=? WHERE item_id=?""", (_json(record), observed, row["id"]))
         decisions.record(store.db, row["id"], f"held.{stage}.{reason}", observed, review=record)
@@ -602,16 +612,16 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         job, draft, old = None, None, None
         record = {"schema_version": 1, "writer": None, "input_row": row, "reviews": []}
         prepared_at = observed
-    if draft is None:
-        if not allow_network and item_payload["kind"] != "tag":
-            return {**report, "status": "deferred"}
-        report["writer_calls"] += item_payload["kind"] != "tag"
-        draft = writer.analyze(writer_item) if prior is None else writer.analyze(writer_item, prior=prior)
-        record["writer"] = {"key": writer_key}  # The draft itself is saved in the job, then in analyses.
-        if getattr(writer, "clears", 0):  # writer validation cleared the draft's impact sentence
-            record["writer"]["clears"] = writer.clears  # kept until an operator retry resets the record
-        _save(store, row["id"], writer_key, policy, "drafted", draft, None, record, observed, prepared_at=prepared_at)
     try:
+        if draft is None:
+            if not allow_network and item_payload["kind"] != "tag":
+                return {**report, "status": "deferred"}
+            report["writer_calls"] += item_payload["kind"] != "tag"
+            draft = writer.analyze(writer_item) if prior is None else writer.analyze(writer_item, prior=prior)
+            record["writer"] = {"key": writer_key}  # The draft itself is saved in the job, then in analyses.
+            if getattr(writer, "clears", 0):  # writer validation cleared the draft's impact sentence
+                record["writer"]["clears"] = writer.clears  # kept until an operator retry resets the record
+            _save(store, row, writer_key, policy, "drafted", draft, None, record, observed, prepared_at=prepared_at)
         prepared = store.prepare_candidate(row, draft, prepared_at)
         same = old is not None and job["policy_hash"] == policy and _identity(old) == _identity(prepared)
         stage = job["stage"] if same else "review"
@@ -619,7 +629,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                  "prepared": {key: prepared[key] for key in ("mode", "candidate", "packet", "coverage", "candidate_hash", "source_hash", "coverage_hash", "binding_hash")}}
         record = record if same else fresh
         candidate = record.get("candidate", prepared["candidate"])
-        _save(store, row["id"], writer_key, policy, stage, draft, prepared, record, observed, prepared_at=prepared_at,
+        _save(store, row, writer_key, policy, stage, draft, prepared, record, observed, prepared_at=prepared_at,
               approval_key=job["approval_key"] if same else None)
         if prepared.get("locked"):
             record["outcome"] = "locked"
@@ -650,7 +660,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                     _hold(store, row, draft, writer_key, record, observed, "final_check", held[0])
                     return {**report, "status": "held", "cache_hit": True}
                 record["outcome"] = "skipped" if verdict["verdict"] == "skip" else "approved"
-                _save(store, row["id"], writer_key, policy, record["outcome"], draft, prepared, record, observed,
+                _save(store, row, writer_key, policy, record["outcome"], draft, prepared, record, observed,
                       prepared_at=prepared_at, approval_key=key)
                 committed = store.commit_candidate(prepared, candidate, writer_key, now_iso(), approval_key=key,
                                                    policy_hash=policy, review_record=record, decision=verdict["verdict"])
@@ -684,8 +694,40 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                         agreed_dup = _auto_merge_pair(store, prepared["story_id"], first_same)
                 if agreed_dup is not None and agreed_dup[0] == prepared["story_id"]:
                     dup_id, survivor_id = agreed_dup
+                    expected_fp = (prepared.get("binding") or {}).get("item") or candidate_mod.item_fingerprint(row)
+                    expected_lock = (prepared.get("binding") or {}).get("lock")
+                    expected_prior = (prepared.get("binding") or {}).get("prior_story")
+
+                    def _validate_merge_source(db) -> None:
+                        current_item = db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()
+                        if (
+                            current_item is None
+                            or current_item["status"] != "pending"
+                            or candidate_mod.item_fingerprint(dict(current_item)) != expected_fp
+                        ):
+                            raise StaleCandidate("Source item changed before duplicate merge")
+                        if editorial.is_locked(db, prepared["story_id"]) != bool(prepared.get("locked")):
+                            raise StaleCandidate("Editorial lock state changed before duplicate merge")
+                        if expected_lock is not None and candidate_mod.control_fingerprint(db, prepared["story_id"]) != expected_lock:
+                            raise StaleCandidate("Editorial controls changed before duplicate merge")
+                        if expected_prior is not None and digest(candidate_mod.existing_story(db, dict(current_item))) != expected_prior:
+                            raise StaleCandidate("Target story changed before duplicate merge")
+
+                    def _complete_merge_route(db) -> None:
+                        updated = db.execute(
+                            """UPDATE items SET status='pending',story_id=?,attempts=0,rejections=0,
+                               next_attempt_at=NULL,last_error='Attached to survivor story after duplicate merge'
+                               WHERE id=? AND content_hash=? AND status='pending'""",
+                            (survivor_id, row["id"], row["content_hash"]),
+                        ).rowcount
+                        if updated != 1:
+                            raise StaleCandidate("Source item changed before duplicate merge completed")
+                        routed_record = {**record, "outcome": "routed", "routed_to": survivor_id, "merged_duplicate": dup_id}
+                        store.record_analysis(row, draft, writer_key, observed, review_record=routed_record)
+                        db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
+
                     merged_prior = False
-                    with contextlib.suppress(ValueError):
+                    try:
                         editorial.merge(
                             store.db,
                             dup_id,
@@ -694,25 +736,22 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                             base_url=config["site"]["base_url"],
                             observed=now_iso(),
                             automatic=True,
+                            _guard=_validate_merge_source,
+                            _complete=_complete_merge_route,
                         )
                         merged_prior = True
+                    except (StaleCandidate, RetiredStory):
+                        raise
+                    except ValueError:
+                        pass
                     if merged_prior:
                         record.update(outcome="routed", routed_to=survivor_id, merged_duplicate=dup_id)
-                        with store.db:
-                            store.record_analysis(row, draft, writer_key, observed, review_record=record)
-                            store.db.execute(
-                                """UPDATE items SET status='pending',story_id=?,attempts=0,rejections=0,
-                                   next_attempt_at=NULL,last_error='Attached to survivor story after duplicate merge'
-                                   WHERE id=? AND content_hash=? AND status='pending'""",
-                                (survivor_id, row["id"], row["content_hash"]),
-                            )
-                            store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
                         return {**report, "status": "routed"}
                 key = _approval_key(candidate, prepared, policy)
                 record.update(candidate=candidate, approval_key=key, outcome="skipped" if action == "skip" else "approved")
                 receipt = (key, digest(candidate), prepared["source_hash"], policy, prepared["binding_hash"],
                            _json(record["reviews"][-1]["result"]), _json(record), observed, observed)
-                _save(store, row["id"], writer_key, policy, record["outcome"], draft, prepared, record, observed,
+                _save(store, row, writer_key, policy, record["outcome"], draft, prepared, record, observed,
                       prepared_at=prepared_at, approval_key=key, approval_receipt=receipt)
                 committed = store.commit_candidate(prepared, candidate, writer_key, now_iso(), approval_key=key,
                                                    policy_hash=policy, review_record=record, decision=action)
@@ -730,7 +769,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                 return {**report, "status": committed["status"]}
             stage, candidate = action, value  # the next review: a verification or a release-label repair
             record["candidate"] = candidate
-            _save(store, row["id"], writer_key, policy, stage, draft, prepared, record, observed, prepared_at=prepared_at)
+            _save(store, row, writer_key, policy, stage, draft, prepared, record, observed, prepared_at=prepared_at)
     except RetiredStory:
         return _ignore_retired()
     except (StaleCandidate, ReviewRequired):

@@ -378,13 +378,16 @@ def _retire_script(artifacts: Artifacts) -> None:
 def _migration_ready(artifacts: Artifacts, identity: str, pending: int) -> bool:
     if _meta(artifacts.db, "publication_no_browser_js_ready") == "1":
         return True
-    if pending or artifacts.db.execute("SELECT 1 FROM public_catalog WHERE template_hash<>? LIMIT 1", (identity,)).fetchone():
+    if pending or artifacts.db.execute(
+        "SELECT 1 FROM public_catalog WHERE story_id NOT IN (SELECT story_id FROM story_aliases) AND template_hash<>? LIMIT 1",
+        (identity,),
+    ).fetchone():
         return False
     # An archived article may have no local HTML. Its ledger record still owns
     # a permanent URL and must have a current accepted catalog entry.
     orphan = artifacts.db.execute("""SELECT a.path FROM public_artifacts a LEFT JOIN public_catalog c
         ON c.story_id=substr(a.path,6,length(a.path)-16)
-        WHERE a.path GLOB 'news/*/index.html' AND c.story_id IS NULL LIMIT 1""").fetchone()
+        WHERE a.path GLOB 'news/*/index.html' AND (c.story_id IS NULL OR c.template_hash<>?) LIMIT 1""", (identity,)).fetchone()
     if orphan is not None:
         raise ValueError("Unverified article artifact; restore publication history before removing browser JavaScript")
     news = artifacts.output / "news"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import importlib.util
 import json
 import sqlite3
@@ -31,7 +32,7 @@ from onionflash import (
     source_packet,
 )
 from onionflash.analyze import AnalysisError
-from onionflash.store import Store
+from onionflash.store import Store, retained_analysis_keys
 from onionflash.transport import AddressPolicy, DeadlineReached, FetchError, HttpClient, Response
 from onionflash.util import canonical_url, digest, format_utc, gitlab_refs, item_cluster, parse_utc
 from test_core import DATE, analysis, config as make_core_config, item as make_item
@@ -104,6 +105,39 @@ def test_null_tombstone_story_alias_removes_story_and_handles_chained_merges(tmp
         for rel in ("index.html", "topics/release/index.html", "feed.xml", "feed.json"):
             rendered = (out / rel).read_text(encoding="utf-8")
             assert s1 not in rendered and s2 not in rendered
+
+        # Retire s1/s2 artifacts as in a hard-delete (leaving s1's alias catalog row with template_hash='')
+        # while a live story s3 and legacy app.js exist: build reaches migration readiness, while an
+        # unmigrated archived alias artifact still blocks retirement.
+        _, s3 = _seed_story(store, url="https://example.org/s3", title="Third active notice", summary="Active notice details.")
+        for gone in (s1, s2):
+            for suffix in ("index.html", "story.json"):
+                (out / "news" / gone / suffix).unlink(missing_ok=True)
+            with store.db:
+                store.db.execute("DELETE FROM public_artifacts WHERE path LIKE ?", (f"news/{gone}/%",))
+        script_bytes = b"legacy browser script"
+        (out / "app.js").write_bytes(script_bytes)
+        with store.db:
+            store.db.execute(
+                "INSERT INTO public_artifacts(path,sha256,size,content_type,updated_at) VALUES('app.js',?,?, 'text/javascript', ?)",
+                (hashlib.sha256(script_bytes).hexdigest(), len(script_bytes), DATE),
+            )
+            store.db.execute("DELETE FROM metadata WHERE key='publication_no_browser_js_ready'")
+            # Seed an archived alias artifact with stale template_hash='' -> must block script retirement:
+            store.db.execute(
+                "INSERT INTO public_artifacts(path,sha256,size,content_type,updated_at) VALUES(?,?,10,'text/html',?)",
+                (f"news/{s1}/index.html", "0" * 64, DATE),
+            )
+        with pytest.raises(ValueError, match="Unverified article artifact"):
+            publication.build(cfg, store)
+        assert (out / "app.js").exists()
+
+        # Once the retired alias has no rendered/archived artifact, its catalog row (template_hash='') does not block readiness:
+        with store.db:
+            store.db.execute("DELETE FROM public_artifacts WHERE path=?", (f"news/{s1}/index.html",))
+        ready_res = publication.build(cfg, store)
+        assert ready_res["published_stories"] == 1 and ready_res["no_browser_js_ready"] is True
+        assert not (out / "app.js").exists()
 
 
 def test_prebuild_retract_restores_cleanly_and_deleted_story_keeps_pending_retraction(tmp_path):
@@ -221,7 +255,9 @@ def test_merge_host_story_transfers_doctor_network_pins_updates_and_citations(tm
             expect_hash=editorial.show(store.db, host_dup)["hash"],
             observed="2024-01-17T13:00:00Z",
         )
-        res_next = doctor.evaluate(cfg, store, cfg["sources"][0], FakeLinker(pytest.fail), "2024-01-17T13:05:00Z")
+        guard_linker = FakeLinker(AssertionError("Unexpected linker call"))
+        res_next = doctor.evaluate(cfg, store, cfg["sources"][0], guard_linker, "2024-01-17T13:05:00Z")
+        assert guard_linker.calls == 0
         assert res_next["stories_written"] == 0 and res_next["updates_written"] == 0
         assert [s["id"] for s in store.stories()] == [host_surv]
         surv_story = store.stories()[0]
@@ -598,7 +634,7 @@ def test_source_packet_skips_doctor_citations_and_store_handles_timeline_clock_s
         )
         assert pkt["missing_sources"] == []
 
-        # Timeline entry with new commit URL and slightly older committer timestamp still ingests!
+        # Stale timeline fallback with older committed_date is rejected, while a rebase with >= committed_date ingests!
         tl_v1 = {
             **make_item(
                 url="https://gitlab.torproject.org/tpo/metrics/timeline/-/blob/aaa111/README.md?plain=1#L10",
@@ -610,14 +646,22 @@ def test_source_packet_skips_doctor_citations_and_store_handles_timeline_clock_s
             ),
             "source_entry_id": "entry-1",
         }
+        tl_stale_fallback = {
+            **tl_v1,
+            "url": "https://gitlab.torproject.org/tpo/metrics/timeline/-/blob/000999/README.md?plain=1#L9",
+            "content": "Superseded older fallback description.",
+            "updated_at": "2024-01-15T11:55:00Z",
+        }
         tl_v2 = {
             **tl_v1,
             "url": "https://gitlab.torproject.org/tpo/metrics/timeline/-/blob/bbb222/README.md?plain=1#L10",
             "content": "Corrected timeline description from rebased commit.",
-            "updated_at": "2024-01-15T11:55:00Z",
+            "updated_at": "2024-01-15T12:00:00Z",
         }
         assert store.ingest(tl_v1, "2024-01-15T12:05:00Z") is True
+        assert store.ingest(tl_stale_fallback, "2024-01-15T12:06:00Z") is False
         assert store.ingest(tl_v2, "2024-01-15T12:10:00Z") is True
+        assert retained_analysis_keys(store.db) != set()
 
         # Dismissing a rejected item clears approval_key and excludes it from active review_gate.status() stages.
         tl_row = [r for r in store.pending(10, "2024-01-15T12:10:00Z") if r["url"] == tl_v2["url"]][0]
@@ -715,6 +759,59 @@ def test_doctor_review_model_non_retryable_strikes_regroup_publish_since_and_ret
         st = doctor.status(store.db, cfg["sources"])
         assert st["incidents"][0]["target"] == f"retracted:{standalone['id']}"
 
+    # Multi-incident standalone network-health story stays "developing" while ANY held incident remains open,
+    # regardless of incident loop order, and becomes "no-longer-listed" only after all held incidents close.
+    _, cfg_multi = make_doc_config(tmp_path / "multi", publish=True)
+    with Store(cfg_multi["storage"]["database"]) as store:
+        t0 = parse_utc("2024-01-10T00:05:00Z")
+        gab_and_mor_open = [
+            report_item(
+                f"M_BOTH_{i}",
+                format_utc(t0 + timedelta(hours=i * 12)),
+                [
+                    "WARNING: The following authorities are missing from the consensus: gabelmoo",
+                    "WARNING: The following authorities are missing from the consensus: moria1",
+                ],
+            )
+            for i in range(5)
+        ]
+        doctor.ingest(store.db, cfg_multi["sources"][0], gab_and_mor_open, "2024-01-12T01:00:00Z")
+        doctor.evaluate(cfg_multi, store, cfg_multi["sources"][0], FakeLinker(), "2024-01-12T01:00:00Z")
+        publication.build(cfg_multi, store)
+        s_gab = [s for s in store.stories() if "gabelmoo" in s["title"]][0]["id"]
+        s_mor = [s for s in store.stories() if "moria1" in s["title"]][0]["id"]
+        # Merge s_mor into s_gab so one standalone network-health story holds both incidents:
+        editorial.merge(
+            store.db, s_mor, s_gab,
+            reason="Combine dual authority outage.",
+            expect_hash=editorial.show(store.db, s_mor)["hash"],
+            observed="2024-01-12T01:30:00Z",
+        )
+        # Now moria1 stays missing while gabelmoo recovers (>24h without gabelmoo missing):
+        mor_only = [
+            report_item(
+                f"M_MOR_ONLY_{i}",
+                format_utc(t0 + timedelta(hours=60 + i * 16)),
+                ["WARNING: The following authorities are missing from the consensus: moria1"],
+            )
+            for i in range(2)
+        ]
+        doctor.ingest(store.db, cfg_multi["sources"][0], mor_only, "2024-01-13T18:00:00Z")
+        doctor.evaluate(cfg_multi, store, cfg_multi["sources"][0], FakeLinker(), "2024-01-13T18:00:00Z")
+        [combined_open] = store.stories()
+        assert len(combined_open["network"]) == 2
+        assert combined_open["state"] == "developing"
+
+        # Now moria1 also recovers (>24h clean reports): combined standalone story transitions to "no-longer-listed".
+        all_clear = [
+            report_item(f"M_CLEAR_{i}", format_utc(t0 + timedelta(hours=92 + i * 16)), [ok_line])
+            for i in range(2)
+        ]
+        doctor.ingest(store.db, cfg_multi["sources"][0], all_clear, "2024-01-14T22:00:00Z")
+        doctor.evaluate(cfg_multi, store, cfg_multi["sources"][0], FakeLinker(), "2024-01-14T22:00:00Z")
+        [combined_closed] = store.stories()
+        assert combined_closed["state"] == "no-longer-listed"
+
 
 def test_collect_atom_related_links_transport_compression_deadline_and_url_config_guards(tmp_path):
     # 1. Atom duplicate-ID conflict detection works even when entries carry <link rel="related"/>!
@@ -744,6 +841,20 @@ def test_collect_atom_related_links_transport_compression_deadline_and_url_confi
     cfg = make_core_config(tmp_path)
     feed_res = collect.collect_source(AtomHttp(), cfg["sources"][0], {}, cfg["collection"], "2026-11-10T12:05:00Z")
     assert feed_res["items"] == [] and feed_res["skipped"] == 2
+
+    # Same conflict detection when entries only provide <link rel="alternate" type="application/pdf"/>,
+    # which feedparser 6.0.11 does not select as entry.link (falling back to the shared HTTPS entry ID)!
+    atom_pdf_xml = atom_xml.replace(
+        b'rel="related" href="https://example.org/ref-',
+        b'rel="alternate" type="application/pdf" href="https://example.org/doc-',
+    )
+
+    class AtomPdfHttp:
+        def request(self, method, url, headers=None):
+            return Response(200, atom_pdf_xml, {}, url)
+
+    pdf_res = collect.collect_source(AtomPdfHttp(), cfg["sources"][0], {}, cfg["collection"], "2026-11-10T12:05:00Z")
+    assert pdf_res["items"] == [] and pdf_res["skipped"] == 2
 
     # 2. AddressPolicy blocks 6to4 relay anycast and private ISATAP while allowing public IPv6.
     pol = AddressPolicy()
@@ -920,9 +1031,29 @@ def test_retired_story_mid_gate_commit_recheck_unverified_route_cleanup_and_eval
         store.ingest(unrel, LATER)
         unrel_row = [r for r in store.pending(10, LATER) if "999" in r["url"]][0]
         with store.db:
-            store.db.execute("UPDATE items SET story_id=? WHERE id=?", (host_id, unrel_row["id"]))
+            store.db.execute(
+                "UPDATE items SET story_id=?, last_error=? WHERE id=?",
+                (host_id, candidate._UNVERIFIED_ROUTE, unrel_row["id"]),
+            )
         # Pending unverified-routed item 999 must NOT associate other items mentioning #999 to host_id!
         assert candidate._stories_for_urls(store.db, [unrel_row["url"]]) == []
+        # Conversely, requeuing published issue #700 (status='pending', last_error=NULL, story_id=host_id)
+        # MUST preserve its association across _stories_for_urls!
+        requeued_700 = make_item(
+            url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/700",
+            kind="gitlab_issue",
+            title="Relay circuit timeout bug #700",
+            content="Operators reported relay circuit timeout bug with follow-up reproduction steps.",
+            published_at=DATE,
+            updated_at="2026-11-10T13:06:00Z",
+        )
+        assert store.ingest(requeued_700, "2026-11-10T13:06:00Z") is True
+        row_700 = store.db.execute(
+            "SELECT status, last_error, story_id FROM items WHERE url=?", (requeued_700["url"],)
+        ).fetchone()
+        assert tuple(row_700) == ("pending", None, host_id)
+        assert [s["id"] for s in candidate._stories_for_urls(store.db, [requeued_700["url"]])] == [host_id]
+
         # When unrel_row is skipped in update mode, its dangling story_id is cleared to NULL!
         unrel_row = [r for r in store.pending(10, LATER) if r["id"] == unrel_row["id"]][0]
         skip_prep = store.prepare_candidate(unrel_row, upd_draft, "2026-11-10T13:10:00Z")
@@ -1016,3 +1147,83 @@ def test_retired_story_mid_gate_commit_recheck_unverified_route_cleanup_and_eval
     assert eval_summary["matched_routes"] == 0
     assert eval_summary["wrong_routes"] == 1
     assert eval_summary["matched"] == 0
+
+    # 4. Stale duplicate-merge completion in review_gate.process_item aborts atomically when the source item
+    #    changed during verification, preserving both the newer held review_job and the unmerged story!
+    cfg3 = make_core_config(tmp_path / "c3")
+    with Store(cfg3["storage"]["database"]) as store:
+        _, surv_story_id = _seed_story(
+            store,
+            url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/810",
+            kind="gitlab_issue",
+            title="Relay onion-service circuit issue #810",
+            summary="Operators reported onion-service circuit issue #810.",
+            category="network",
+            confidence="reported",
+            state="developing",
+            published_at="2026-11-08T10:00:00Z",
+        )
+        dup_item_row, dup_story_id = _seed_story(
+            store,
+            url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/811",
+            kind="gitlab_issue",
+            title="Duplicate report of issue #810",
+            summary="Follow-up report referencing #810.",
+            category="network",
+            confidence="reported",
+            state="developing",
+            published_at="2026-11-08T11:00:00Z",
+        )
+        publication.build(cfg3, store)
+        # Requeue dup_item_row with a revision mentioning #810 so _auto_merge_pair(dup_story_id, surv_story_id) is eligible:
+        dup_update_item = make_item(
+            url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/811",
+            kind="gitlab_issue",
+            title="Duplicate report of issue #810",
+            content="Follow-up report referencing https://gitlab.torproject.org/tpo/core/tor/-/work_items/810 with details.",
+            published_at="2026-11-08T11:00:00Z",
+            updated_at=LATER,
+        )
+        assert store.ingest(dup_update_item, LATER) is True
+        dup_pending = [r for r in store.pending(10, LATER) if r["id"] == dup_item_row["id"]][0]
+
+        class DupWriter:
+            clears = 0
+
+            def analyze(self, _item, prior=None):
+                return {
+                    "publish": True,
+                    "update": "Follow-up report referencing work_items/810 with details.",
+                    "confidence": "reported",
+                    "state": "developing",
+                    "evidence": ["Follow-up report referencing"],
+                }
+
+        class RacingReviewer:
+            def __init__(self):
+                self.calls = 0
+
+            def review(self, _cand, _pkt, *, verification=False, issue=None, update=False, coverage=None):
+                self.calls += 1
+                res = make_verdict("approve", update=True)
+                res["same_story"] = surv_story_id
+                if verification:
+                    # Simulate a concurrent worker ingesting and holding a newer revision of dup_pending!
+                    with store.db:
+                        store.db.execute(
+                            "UPDATE items SET content_hash='newer-hash', status='rejected' WHERE id=?",
+                            (dup_pending["id"],),
+                        )
+                        store.db.execute(
+                            """INSERT OR REPLACE INTO review_jobs
+                               (item_id,writer_key,policy_hash,stage,record_json,approval_key,prepared_at,updated_at)
+                               VALUES(?,?,?,?,?,?,?,?)""",
+                            (dup_pending["id"], "newer-wk", "ph", "held", '{"held":true}', "held-ak", LATER, LATER),
+                        )
+                return res
+
+        race_out = review_gate.process_item(cfg3, store, dup_pending, DupWriter(), RacingReviewer(), LATER)
+        assert race_out["status"] == "stale"
+        assert editorial.retired(store.db, story_id=dup_story_id) is None
+        kept_job = store.db.execute("SELECT writer_key, stage FROM review_jobs WHERE item_id=?", (dup_pending["id"],)).fetchone()
+        assert tuple(kept_job) == ("newer-wk", "held")
