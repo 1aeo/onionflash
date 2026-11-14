@@ -129,8 +129,8 @@ class CompletionClient:
     def __init__(self, config: dict, deadline: float | None = None):
         self.deadline = deadline  # absolute time.monotonic() limit for model requests
         self.llm = config["llm"]
-        # One attempt per endpoint: the fallback endpoints are the retry, and a
-        # failed item backs off to a later run instead of stretching this one.
+        # Each endpoint gets one metered request. Redirect hops cannot bypass
+        # reservations; only explicitly configured fallbacks may send again.
         self.http_settings = {
             **config["http"],
             **{k: v for k, v in self.llm.items() if k in config["http"]},
@@ -140,6 +140,7 @@ class CompletionClient:
                 self.llm["timeout_seconds"] + self.llm["connect_timeout_seconds"],
             ),
             "retry_attempts": 1,
+            "max_redirects": 0,
         }
         self.client: HttpClient | None = None
         self.calls = 0  # requests sent, for the run report
