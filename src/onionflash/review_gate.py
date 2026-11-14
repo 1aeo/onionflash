@@ -113,11 +113,7 @@ def reset_review_work(store, item_id):
 def _save(store, row, writer_key, policy_hash, stage, draft, prepared, record, observed,
           *, prepared_at, approval_key=None, approval_receipt=None):
     with store.db:
-        if not store.db.execute(
-            "SELECT 1 FROM items WHERE id=? AND content_hash=? AND status='pending'",
-            (row["id"], row["content_hash"]),
-        ).fetchone():
-            raise candidate_mod.StaleCandidate("Source item changed before saving review state")
+        store.require_pending_item(row, "Source item changed before saving review state")
         if prepared is not None and record.get("input_proof") == 1:
             # The envelope already retains this source snapshot.
             record.pop("input_row", None)
@@ -1003,17 +999,21 @@ def _verified(reviews) -> bool:
 def _ignore_at_gate(store, row: dict, observed: str, error: str, code: str, *,
                     clear_story: bool = False, before_log=None, **details) -> str:
     story_clause = ",story_id=NULL" if clear_story else ""
-    with store.db:
-        if not store.db.execute(
-            f"""UPDATE items SET status='ignored'{story_clause},next_attempt_at=NULL,last_error=?
-                WHERE id=? AND content_hash=? AND status='pending'""",
-            (error, row["id"], row["content_hash"]),
-        ).rowcount:
-            return "stale"
-        store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
-        if before_log is not None:
-            before_log()
-        decisions.record(store.db, row["id"], code, observed, **details)
+    try:
+        with store.db:
+            store.require_pending_item(row, "Source item changed before gate skip")
+            if not store.db.execute(
+                f"""UPDATE items SET status='ignored'{story_clause},next_attempt_at=NULL,last_error=?
+                    WHERE id=? AND content_hash=? AND status='pending'""",
+                (error, row["id"], row["content_hash"]),
+            ).rowcount:
+                return "stale"
+            store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
+            if before_log is not None:
+                before_log()
+            decisions.record(store.db, row["id"], code, observed, **details)
+    except candidate_mod.StaleCandidate:
+        return "stale"
     return "ignored"
 
 
@@ -1037,6 +1037,7 @@ def _hold(store, row, draft, writer_key, record, observed, stage, reason):
 
     record.update(outcome="held", hold_code=reason, hold_reason=HOLDS[reason], verified_facts=not proposal_needs_check(record) and _verified(record["reviews"]))
     with store.db:
+        store.require_pending_item(row, "Source item changed before hold completed")
         if not store.db.execute("""UPDATE items SET status='rejected',attempts=attempts+1,
             rejections=MAX(rejections,3),next_attempt_at=NULL,last_error=?
             WHERE id=? AND content_hash=? AND status='pending'""",
@@ -1052,6 +1053,7 @@ def _route(store, row, draft, writer_key, record, observed, target, stage) -> st
     """Attach an unmapped item to `target` once and clear its standalone draft for update review."""
     routed = False
     with store.db:
+        store.require_pending_item(row, "Source item changed before routing")
         found = store.db.execute(
             """SELECT CAST(s.payload AS BLOB) AS payload
                FROM stories s LEFT JOIN editorial_controls e ON e.story_id=s.id
@@ -1164,15 +1166,33 @@ def _not_recent(config, store, row, item, observed, *, existing=candidate_mod._U
             or store.db.execute("SELECT 1 FROM rejection_actions WHERE item_id=? AND content_hash=? AND action='retry'",
                                 (row["id"], row["content_hash"])).fetchone()):
         return None
-    reason = f"Not recent: newest dated development {developed} is over {NEW_STORY_DAYS} days before collection"
-
     def maybe_check_comments() -> None:
         if item.get("kind") == "gitlab_issue" and "comments_source_key" not in item:
             from .comments import request_check
             request_check(store.db, config, row, observed)
 
-    return _ignore_at_gate(store, row, observed, reason, "skipped.gate.not_recent",
-                           before_log=maybe_check_comments, developed_at=developed, collected_at=row["last_seen"])
+    try:
+        with store.db:
+            current = store.require_pending_item(row, "Source item changed before recency skip")
+            # Collection and closing dates do not alter review evidence identity,
+            # but a fresh date or operator retry can change recency eligibility.
+            current_item = json.loads(current["payload"])
+            try:
+                current_developed = developed_at(current_item)
+                threshold = after(-NEW_STORY_DAYS * 86400, current["last_seen"])
+            except (ValueError, TypeError, KeyError):
+                return "stale"
+            if (current_developed >= threshold
+                    or candidate_mod.existing_story(store.db, current) is not None
+                    or store.db.execute("SELECT 1 FROM rejection_actions WHERE item_id=? AND content_hash=? AND action='retry'",
+                                        (row["id"], row["content_hash"])).fetchone()):
+                return "stale"
+            reason = f"Not recent: newest dated development {current_developed} is over {NEW_STORY_DAYS} days before collection"
+            return _ignore_at_gate(store, row, observed, reason, "skipped.gate.not_recent",
+                                   before_log=maybe_check_comments, developed_at=current_developed,
+                                   collected_at=current["last_seen"])
+    except candidate_mod.StaleCandidate:
+        return "stale"
 
 
 def process_item(config, store, row, writer, reviewer, observed=None, *, allow_network=True):
@@ -1311,7 +1331,9 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             try:
                 action, value = advance_review(reviewer, stage, candidate, prepared, record, requests)
             except review.ReviewLimitReached as exc:
-                store.reject(row["id"], str(exc), "failed." + exc.code, observed)
+                with store.db:
+                    store.require_pending_item(row, "Source item changed before review limit rejection")
+                    store.reject(row["id"], str(exc), "failed." + exc.code, observed)
                 raise
             finally:
                 report["review_calls"] = requests.actual

@@ -524,22 +524,52 @@ class Store:
     def pending_count(self) -> int:
         return self.db.execute("SELECT COUNT(*) FROM items WHERE status='pending'").fetchone()[0]
 
+    def require_pending_item(self, row: dict, message: str) -> dict:
+        """Read the complete source/association identity under the caller's write transaction."""
+        if not self.db.in_transaction:
+            self.db.execute("BEGIN IMMEDIATE")
+        current = self.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()
+        try:
+            same = (current is not None and current["status"] == "pending"
+                    and candidate.item_fingerprint(dict(current)) == candidate.item_fingerprint(row))
+        except (ValueError, TypeError, KeyError, AttributeError, UnicodeError, RecursionError):
+            same = False
+        if not same:
+            raise candidate.StaleCandidate(message)
+        return dict(current)
+
     def defer(self, item_id: str, error: str, llm: dict, observed: str, *, terminal: bool = False,
-              code: str = "app.unexpected") -> None:
-        """Retry later; after three failures caused by the item itself, stop retrying and log `failed.<code>`."""
-        row = self.db.execute("SELECT attempts, rejections FROM items WHERE id=? AND status='pending'", (item_id,)).fetchone()
-        if row is None:
-            return
-        attempts, rejections = row[0] + 1, row[1] + terminal
-        if rejections >= 3:
-            self.reject(item_id, error, "failed." + code, observed)
-            return
-        delay = backoff_seconds(attempts, llm["retry_base_seconds"], llm["retry_cap_seconds"])
+              code: str = "app.unexpected", expected_row: dict | None = None) -> bool:
+        """Retry later, or stop after three item failures; return false if the expected work is stale.
+
+        Callers with a captured source row must not apply its failure to a newer
+        revision or association. Callers without one retain item-ID semantics.
+        """
+        if expected_row is not None and (not isinstance(expected_row, dict) or expected_row.get("id") != item_id):
+            return False
         with self.db:
-            self.db.execute(
-                "UPDATE items SET attempts=?,rejections=?,last_error=?,next_attempt_at=? WHERE id=? AND status='pending'",
+            if not self.db.in_transaction:
+                self.db.execute("BEGIN IMMEDIATE")
+            if expected_row is not None:
+                try:
+                    row = self.require_pending_item(expected_row, "Source item changed before deferral")
+                except candidate.StaleCandidate:
+                    return False
+            else:
+                row = self.db.execute("SELECT attempts,rejections FROM items WHERE id=? AND status='pending'",
+                                      (item_id,)).fetchone()
+            if row is None:
+                return False
+            attempts, rejections = row["attempts"] + 1, row["rejections"] + terminal
+            if rejections >= 3:
+                self.reject(item_id, error, "failed." + code, observed)
+                return True
+            delay = backoff_seconds(attempts, llm["retry_base_seconds"], llm["retry_cap_seconds"])
+            return bool(self.db.execute(
+                "UPDATE items SET attempts=?,rejections=?,last_error=?,next_attempt_at=? "
+                "WHERE id=? AND status='pending'",
                 (attempts, rejections, error[:160], after(delay, observed), item_id),
-            )
+            ).rowcount)
 
     def reject(self, item_id: str, error: str, code: str, observed: str) -> None:
         """Stop retrying a pending item, after its third failure or because its saved copy is damaged."""
