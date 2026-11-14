@@ -387,9 +387,13 @@ def _migration_ready(artifacts: Artifacts, identity: str, pending: int) -> bool:
     # a permanent URL and must have a current accepted catalog entry.
     orphan = artifacts.db.execute("""SELECT a.path FROM public_artifacts a LEFT JOIN public_catalog c
         ON c.story_id=substr(a.path,6,length(a.path)-16)
-        WHERE a.path GLOB 'news/*/index.html' AND (c.story_id IS NULL OR c.template_hash<>?) LIMIT 1""", (identity,)).fetchone()
+        WHERE a.path GLOB 'news/*/index.html' AND c.story_id IS NULL LIMIT 1""").fetchone()
     if orphan is not None:
         raise ValueError("Unverified article artifact; restore publication history before removing browser JavaScript")
+    if artifacts.db.execute("""SELECT 1 FROM public_artifacts a JOIN public_catalog c
+        ON c.story_id=substr(a.path,6,length(a.path)-16)
+        WHERE a.path GLOB 'news/*/index.html' AND c.template_hash<>? LIMIT 1""", (identity,)).fetchone():
+        return False
     news = artifacts.output / "news"
     if news.is_symlink() or (news.exists() and not news.is_dir()):
         raise ValueError("Published article directory must be a real directory")

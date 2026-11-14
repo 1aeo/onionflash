@@ -1093,7 +1093,7 @@ def _standalone_desired_state(network_entries: list, pinned: list[dict], inc_lis
             if matched_open is not None and isinstance(matched_open["entry"].get("key"), str):
                 open_keys.add(matched_open["entry"]["key"])
     for item in network_entries:
-        if isinstance(item, dict) and item.get("key") in open_keys:
+        if isinstance(item, dict) and isinstance(item.get("key"), str) and item["key"] in open_keys:
             return "developing"
     return "no-longer-listed"
 

@@ -756,6 +756,10 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                 committed = store.commit_candidate(prepared, candidate, writer_key, now_iso(), approval_key=key,
                                                    policy_hash=policy, review_record=record, decision=action)
                 if agreed_dup is not None and agreed_dup[1] == prepared["story_id"]:
+                    def _recheck_post_commit_pair(_db) -> None:
+                        if _auto_merge_pair(store, agreed_dup[0], agreed_dup[1]) != agreed_dup:
+                            raise StaleCandidate("Duplicate story changed before automatic merge")
+
                     with contextlib.suppress(ValueError):
                         editorial.merge(
                             store.db,
@@ -765,6 +769,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                             base_url=config["site"]["base_url"],
                             observed=now_iso(),
                             automatic=True,
+                            _guard=_recheck_post_commit_pair,
                         )
                 return {**report, "status": committed["status"]}
             stage, candidate = action, value  # the next review: a verification or a release-label repair

@@ -499,8 +499,18 @@ def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str 
                     for url_key in ("first_url", "opened_url"):
                         if isinstance(entry.get(url_key), str):
                             dup_net_urls.add(entry[url_key])
-                if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='network_observations'").fetchone():
-                    dup_net_urls.update(r[0] for r in db.execute("SELECT DISTINCT url FROM network_observations WHERE url IS NOT NULL"))
+                candidate_urls = sorted({
+                    s["url"]
+                    for upd in (dup["raw"].get("updates") or ())
+                    if isinstance(upd, dict)
+                    for s in (upd.get("sources") or ())
+                    if isinstance(s, dict) and isinstance(s.get("url"), str) and s["url"]
+                } - dup_net_urls)
+                if candidate_urls and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='network_reports'").fetchone():
+                    placeholders = ",".join("?" for _ in candidate_urls)
+                    dup_net_urls.update(
+                        r[0] for r in db.execute(f"SELECT url FROM network_reports WHERE url IN ({placeholders})", candidate_urls)
+                    )
                 surv_updates = list(surv_raw.get("updates") or [])
                 seen_updates = {(u.get("at"), u.get("text")) for u in surv_updates if isinstance(u, dict)}
                 added_stamps = []
@@ -508,7 +518,27 @@ def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str 
                     if not isinstance(upd, dict) or (upd.get("at"), upd.get("text")) in seen_updates:
                         continue
                     upd_urls = [s.get("url", "") for s in (upd.get("sources") or ()) if isinstance(s, dict)]
-                    if upd_urls and all(u in dup_net_urls or "tor-consensus-health" in u for u in upd_urls):
+                    if not upd_urls or not all(u in dup_net_urls for u in upd_urls):
+                        continue
+                    matched_rekeys: list[tuple[dict, str]] = []
+                    for net_entry in existing_net:
+                        if net_entry.get("key") not in {e.get("key") for e in dup_network}:
+                            continue
+                        known_uids = set(net_entry.get("update_ids") or ())
+                        kinds = {
+                            slot.split(":", 1)[1]
+                            for slot in (net_entry.get("slots") or ())
+                            if isinstance(slot, str) and ":" in slot
+                        }
+                        for kind in kinds:
+                            for u in upd_urls:
+                                if digest([duplicate_id, kind, u])[:24] in known_uids:
+                                    matched_rekeys.append((net_entry, digest([survivor_id, kind, u])[:24]))
+                    if matched_rekeys:
+                        for net_entry, surv_uid in matched_rekeys:
+                            uids = list(net_entry.get("update_ids") or [])
+                            if surv_uid not in uids:
+                                net_entry["update_ids"] = [*uids, surv_uid]
                         surv_updates.append(dict(upd))
                         seen_updates.add((upd.get("at"), upd.get("text")))
                         if isinstance(upd.get("at"), str):

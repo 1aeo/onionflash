@@ -123,20 +123,31 @@ def test_null_tombstone_story_alias_removes_story_and_handles_chained_merges(tmp
                 (hashlib.sha256(script_bytes).hexdigest(), len(script_bytes), DATE),
             )
             store.db.execute("DELETE FROM metadata WHERE key='publication_no_browser_js_ready'")
-            # Seed an archived alias artifact with stale template_hash='' -> must block script retirement:
+            # Seed an archived alias artifact with stale template_hash='' -> defers script retirement without raising:
             store.db.execute(
                 "INSERT INTO public_artifacts(path,sha256,size,content_type,updated_at) VALUES(?,?,10,'text/html',?)",
                 (f"news/{s1}/index.html", "0" * 64, DATE),
+            )
+        deferred_res = publication.build(cfg, store)
+        assert deferred_res["no_browser_js_ready"] is False
+        assert (out / "app.js").exists()
+
+        # Whereas an uncatalogued orphan artifact still raises ValueError:
+        with store.db:
+            store.db.execute("DELETE FROM public_artifacts WHERE path=?", (f"news/{s1}/index.html",))
+            store.db.execute(
+                "INSERT INTO public_artifacts(path,sha256,size,content_type,updated_at) VALUES('news/orphan999999/index.html',?,10,'text/html',?)",
+                ("0" * 64, DATE),
             )
         with pytest.raises(ValueError, match="Unverified article artifact"):
             publication.build(cfg, store)
         assert (out / "app.js").exists()
 
-        # Once the retired alias has no rendered/archived artifact, its catalog row (template_hash='') does not block readiness:
+        # Once the retired alias has no rendered/archived artifact and no orphan exists, its catalog row (template_hash='') does not block readiness:
         with store.db:
-            store.db.execute("DELETE FROM public_artifacts WHERE path=?", (f"news/{s1}/index.html",))
+            store.db.execute("DELETE FROM public_artifacts WHERE path='news/orphan999999/index.html'")
         ready_res = publication.build(cfg, store)
-        assert ready_res["published_stories"] == 1 and ready_res["no_browser_js_ready"] is True
+        assert ready_res["no_browser_js_ready"] is True
         assert not (out / "app.js").exists()
 
 
@@ -247,6 +258,22 @@ def test_merge_host_story_transfers_doctor_network_pins_updates_and_citations(tm
         doctor.ingest(store.db, cfg["sources"][0], bastet_incident_items(close=False), "2024-01-17T12:00:00Z")
         doctor.evaluate(cfg, store, cfg["sources"][0], FakeLinker(True), "2024-01-17T12:00:00Z")
         publication.build(cfg, store)
+
+        # Seed an unrelated report in network_reports and inject an update on host_dup citing it:
+        # editorial.merge must transfer ONLY host_dup's genuine DocTor update, not the unrelated one!
+        unrelated_rep = report_item("UNRELATED_REP_01", "2024-01-10T00:05:00Z", ["NOTICE: unrelated line"])
+        doctor.ingest(store.db, cfg["sources"][0], [unrelated_rep], "2024-01-17T12:30:00Z")
+        dup_payload = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (host_dup,)).fetchone()[0])
+        dup_payload["updates"] = [
+            *list(dup_payload.get("updates") or []),
+            {
+                "at": "2024-01-17T12:30:00Z",
+                "text": "Unrelated report note that was not produced by host_dup's pinned incident.",
+                "sources": [{"url": unrelated_rep["url"], "title": "Unrelated report"}],
+            },
+        ]
+        with store.db:
+            store.db.execute("UPDATE stories SET payload=? WHERE id=?", (json.dumps(dup_payload), host_dup))
 
         # Merge host_dup into host_surv: network pin + DocTor update + alert_notes transfer, and next evaluate writes 0 duplicate stories!
         editorial.merge(
@@ -802,7 +829,12 @@ def test_doctor_review_model_non_retryable_strikes_regroup_publish_since_and_ret
         assert len(combined_open["network"]) == 2
         assert combined_open["state"] == "developing"
 
-        # Now moria1 also recovers (>24h clean reports): combined standalone story transitions to "no-longer-listed".
+        # Now moria1 also recovers (>24h clean reports): even if a malformed {"key": []} entry exists
+        # in the saved network list, evaluate skips it without raising TypeError and marks "no-longer-listed".
+        bad_net_payload = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (s_gab,)).fetchone()[0])
+        bad_net_payload["network"].append({"key": []})
+        with store.db:
+            store.db.execute("UPDATE stories SET payload=? WHERE id=?", (json.dumps(bad_net_payload), s_gab))
         all_clear = [
             report_item(f"M_CLEAR_{i}", format_utc(t0 + timedelta(hours=92 + i * 16)), [ok_line])
             for i in range(2)
@@ -855,6 +887,27 @@ def test_collect_atom_related_links_transport_compression_deadline_and_url_confi
 
     pdf_res = collect.collect_source(AtomPdfHttp(), cfg["sources"][0], {}, cfg["collection"], "2026-11-10T12:05:00Z")
     assert pdf_res["items"] == [] and pdf_res["skipped"] == 2
+
+    # Whereas an entry with a valid HTML <link rel="alternate"/> to that same URL and timestamp is preserved!
+    atom_mixed_xml = atom_xml.replace(
+        b"</feed>",
+        b"""  <entry>
+        <id>tag:example.org,2026:explicit</id>
+        <title>Explicit Alternate Event</title>
+        <updated>2026-11-10T12:00:00Z</updated>
+        <link rel="alternate" type="text/html" href="https://example.org/entry-1"/>
+        <summary>Explicitly linked body.</summary>
+      </entry>
+    </feed>""",
+    )
+
+    class AtomMixedHttp:
+        def request(self, method, url, headers=None):
+            return Response(200, atom_mixed_xml, {}, url)
+
+    mixed_res = collect.collect_source(AtomMixedHttp(), cfg["sources"][0], {}, cfg["collection"], "2026-11-10T12:05:00Z")
+    assert len(mixed_res["items"]) == 1 and mixed_res["items"][0]["title"] == "Explicit Alternate Event"
+    assert mixed_res["skipped"] == 2
 
     # 2. AddressPolicy blocks 6to4 relay anycast and private ISATAP while allowing public IPv6.
     pol = AddressPolicy()
@@ -1227,3 +1280,49 @@ def test_retired_story_mid_gate_commit_recheck_unverified_route_cleanup_and_eval
         assert editorial.retired(store.db, story_id=dup_story_id) is None
         kept_job = store.db.execute("SELECT writer_key, stage FROM review_jobs WHERE item_id=?", (dup_pending["id"],)).fetchone()
         assert tuple(kept_job) == ("newer-wk", "held")
+
+        # Post-commit automatic merge on the survivor story also rechecks _auto_merge_pair inside the merge
+        # transaction: if a concurrent writer adds a dated update to dup_story_id during verification, the
+        # survivor update still commits cleanly while the stale duplicate merge is skipped!
+        surv_update_item = make_item(
+            url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/810",
+            kind="gitlab_issue",
+            title="Relay onion-service circuit issue #810",
+            content="Operators reported onion-service circuit issue #810 with a follow-up reproduction.",
+            published_at="2026-11-08T10:00:00Z",
+            updated_at=LATER,
+        )
+        assert store.ingest(surv_update_item, LATER) is True
+        surv_pending = [r for r in store.pending(10, LATER) if "810" in r["url"]][0]
+
+        class SurvWriter:
+            clears = 0
+
+            def analyze(self, _item, prior=None):
+                return {
+                    "publish": True,
+                    "update": "Operators reported onion-service circuit issue with a follow-up reproduction.",
+                    "confidence": "reported",
+                    "state": "developing",
+                    "evidence": ["with a follow-up reproduction"],
+                }
+
+        class SurvRacingReviewer:
+            def review(self, _cand, _pkt, *, verification=False, issue=None, update=False, coverage=None):
+                res = make_verdict("approve", update=True)
+                res["same_story"] = dup_story_id
+                if verification:
+                    dup_raw = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (dup_story_id,)).fetchone()[0])
+                    dup_raw["updates"] = [{
+                        "at": LATER,
+                        "text": "Concurrent dated update on the duplicate story.",
+                        "sources": dup_raw["sources"],
+                    }]
+                    with store.db:
+                        store.db.execute("UPDATE stories SET payload=?, updated_at=? WHERE id=?", (json.dumps(dup_raw), LATER, dup_story_id))
+                return res
+
+        assert review_gate._auto_merge_pair(store, surv_story_id, dup_story_id) == (dup_story_id, surv_story_id)
+        surv_out = review_gate.process_item(cfg3, store, surv_pending, SurvWriter(), SurvRacingReviewer(), LATER)
+        assert surv_out["status"] == "published"
+        assert editorial.retired(store.db, story_id=dup_story_id) is None
