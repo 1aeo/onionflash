@@ -384,8 +384,11 @@ def finish_reviewed(store, row, result, key, observed, *, decision="approve"):
 def pending(store, incoming=None, *, at=DATE, ready=LATER):
     target = incoming or make_item()
     store.ingest(target, at)
-    rows = store.pending(50, ready)
-    return next((r for r in rows if r["id"] == target["id"]), rows[0])
+    rows = store.pending(500, ready)
+    found = next((r for r in rows if r["id"] == target["id"]), None)
+    if found is None:
+        raise AssertionError(f"Expected item {target['id']} is not pending")
+    return found
 
 
 def seed_story(store, incoming=None, draft=None, *, key=None, at=DATE, decision="approve"):

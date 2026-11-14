@@ -525,6 +525,17 @@ def test_concurrent_auto_merge_race_aborts_safely(context, retire_target):
         draft = update_analysis(update="Follow-up report referencing work_items/810 with new details.",
                                 evidence=["Follow-up report referencing"])
         same_target = surv["id"]
+        prepared_dup = store.prepare_candidate(row, draft, LATER)
+        editorial.correct(store.db, surv["id"], {"why_it_matters": "Operator-pinned context."},
+                          reason="Lock survivor before merge guard", expect_hash=editorial.show(store.db, surv["id"])["hash"],
+                          observed=MID)
+        assert not review_gate._try_auto_merge(
+            cfg, store, (dup["id"], surv["id"]), propagate=True, prepared=prepared_dup,
+            draft=draft, writer_key="wk", record={}, observed=LATER,
+        )
+        assert editorial.retired(store.db, story_id=dup["id"]) is None
+        editorial.unlock(store.db, surv["id"], reason="Restore auto-merge eligibility",
+                         expect_hash=editorial.show(store.db, surv["id"])["hash"], observed=MID)
 
         def race_on_verify(*_a, **_kw):
             with store.db:

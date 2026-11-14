@@ -475,6 +475,14 @@ def test_latest_update_scope_scans_only_new_entry_and_excludes_draft_mode(evalua
     assert [c["id"] for c in drafted] == ["draft:bastet"] and drafted[0]["unsupported"] == [] and drafted[0]["required"] == []
     assert drafted[0]["forbidden_classifications"] == {} and drafted[0]["expected"] == "approve"
     assert not [c["id"] for c in module.draft_cases(RAW_PUBLIC) if c["scope"] == "latest_update"]
+    disagreed = module.draft_cases({**RAW_PUBLIC, "cases": [
+        {"id": "s1", "packet": "bastet", "candidate": RAW_PUBLIC["cases"][0]["candidate"], "expected": "skip"},
+        {"id": "h1", "packet": "bastet", "candidate": RAW_PUBLIC["cases"][0]["candidate"], "expected": "hold"},
+    ]})
+    assert disagreed[0]["expected"] == "not_approve"
+    module._validate_cases(disagreed, draft=True)
+    with pytest.raises(ValueError, match="Invalid or duplicate evaluation case"):
+        module._validate_cases([{**disagreed[0], "id": "authored-flagless"}], draft=True)
 
     with pytest.raises(ValueError, match="Invalid or duplicate evaluation case"):
         module.evaluate(config, [by_id["update-fix-merged"]], tmp_path / "draft-upd.jsonl", draft=True)

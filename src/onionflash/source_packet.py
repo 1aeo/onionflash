@@ -104,8 +104,8 @@ def normalize_labels(value) -> list[str]:
 
 def number_sources(entries: list[tuple[dict, list]]) -> list[dict]:
     """Assign sequential `S<i>` and `S<i>:P<j>` identifiers to sources and passages."""
-    return [{"id": f"S{i}", **unit, "passages": [
-        {"id": f"S{i}:P{j}", **(p if isinstance(p, dict) else {"text": p})} for j, p in enumerate(passages, 1)]}
+    return [{**unit, "id": f"S{i}", "passages": [
+        {**(p if isinstance(p, dict) else {"text": p}), "id": f"S{i}:P{j}"} for j, p in enumerate(passages, 1)]}
         for i, (unit, passages) in enumerate(entries, 1)]
 
 

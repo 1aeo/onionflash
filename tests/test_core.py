@@ -795,11 +795,23 @@ def test_an_unexpected_source_error_is_recorded_and_other_sources_still_run(tmp_
     assert broken["error"].startswith("Unexpected " + where) and "parser crash" not in broken["error"] and broken["failures"] == 1
 
 
-@pytest.mark.parametrize("bad_raw", [damaged("{}", "nested"), b'{"x":"\\ud800"}', None, b'{"x":NaN}', b'{"x":Infinity}', b'{"x":-Infinity}'])
+@pytest.mark.parametrize("bad_raw", [
+    damaged("{}", "nested"), b'{"x":"\\ud800"}', None, b'{"x":NaN}', b'{"x":Infinity}', b'{"x":-Infinity}',
+    b'{"x":23456789012E666}', b'{"x":-23456789012E666}',
+])
 def test_a_saved_object_nests_at_most_the_cap_and_holds_no_lone_surrogate(bad_raw):
     within = b'{"x":' + b"[" * (MAX_SAVED_DEPTH - 1) + b"]" * (MAX_SAVED_DEPTH - 1) + b"}"
     assert saved_object(within) is not None and saved_object(b'{"x":"\\ud83d\\ude00"}') == {"x": "\U0001f600"}
     assert saved_object(bad_raw) is None
+    if bad_raw in (b'{"x":23456789012E666}', b'{"x":-23456789012E666}'):
+        assert saved_object(bad_raw, allow_surrogates=True) is None
+
+
+def test_number_sources_assigns_sequential_ids_over_caller_keys():
+    from onionflash.source_packet import number_sources
+
+    numbered = number_sources([({"id": "custom", "url": "https://example.org/a"}, [{"id": "P99", "text": "body"}])])
+    assert numbered[0]["id"] == "S1" and numbered[0]["passages"][0]["id"] == "S1:P1"
 
 
 @pytest.mark.parametrize("kind", [*DAMAGE, "blob", "undated"])

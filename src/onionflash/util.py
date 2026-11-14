@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import math
 import re
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -84,6 +85,8 @@ def _within(value, depth: int, allow_surrogates: bool = False) -> bool:
         )
     if isinstance(value, list):
         return depth > 0 and all(_within(v, depth - 1, allow_surrogates) for v in value)
+    if isinstance(value, float):
+        return math.isfinite(value)
     return allow_surrogates or not (isinstance(value, str) and _SURROGATE_RE.search(value))
 
 

@@ -226,7 +226,7 @@ def compact_retained_rows(
 ) -> dict:
     """Record private archive locators and compact/evict rows unchanged since selection."""
     counts = {"records_archived": 0, "items_compacted": 0, "analyses_evicted": 0, "changed_records_preserved": 0}
-    with db:
+    with immediate_transaction(db):
         pinned_keys = retained_analysis_keys(db)
         item_cols = [info[1] for info in db.execute("PRAGMA table_info(items)")]
         analysis_cols = [info[1] for info in db.execute("PRAGMA table_info(analyses)")]

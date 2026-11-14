@@ -175,7 +175,7 @@ def _validate_cases(cases: list[dict], *, draft: bool = False) -> None:
         if (case["id"] in identities or scope not in SCOPES or not valid_route
                 or (scope == "latest_update" and (draft or not case["candidate"].get("updates")))
                 or case["expected"] not in {"approve", "not_approve", "skip", "hold"}
-                or (case["expected"] == "not_approve" and not flagged)
+                or (case["expected"] == "not_approve" and not flagged and not (draft and case["id"].startswith("draft:")))
                 or ("flaw" in case and (case["flaw"] not in FLAWS or "audit" not in case))):
             raise ValueError("Invalid or duplicate evaluation case")
         identities.add(case["id"])

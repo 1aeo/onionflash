@@ -475,17 +475,20 @@ def _try_auto_merge(config, store, pair: tuple[str, str], *, propagate: bool,
                     writer_key: str | None = None, record: dict | None = None,
                     observed: str | None = None) -> bool:
     dup_id, survivor_id = pair
+
+    def guard(db) -> None:
+        if propagate:
+            candidate_mod.verify_prepared_binding(db, prepared)
+        if _auto_merge_pair(store, dup_id, survivor_id) != pair:
+            raise ValueError("Duplicate story changed before automatic merge")
+
     if propagate:
         routed_record = {**record, "outcome": "routed", "routed_to": survivor_id, "merged_duplicate": dup_id}
-        guard = lambda db: candidate_mod.verify_prepared_binding(db, prepared)
         complete = lambda db: _attach_item(
             store, db, prepared["row"], draft, writer_key, routed_record, observed,
             survivor_id, "Attached to survivor story after duplicate merge",
         )
     else:
-        def guard(_db) -> None:
-            if _auto_merge_pair(store, dup_id, survivor_id) != pair:
-                raise candidate_mod.StaleCandidate("Duplicate story changed before automatic merge")
         complete = None
     try:
         editorial.merge(
