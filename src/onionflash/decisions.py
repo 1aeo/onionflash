@@ -220,11 +220,11 @@ def summary(db, since: str) -> dict:
             # Updates held while a story was locked. Unlocking does not apply them, so a story waits until
             # an update of it publishes after its latest hold; held_updates is the story's lifetime count.
             "held_updates": [{"story_id": story_id, "held_updates": held, "locked": bool(locked)} for story_id, held, locked
-                             in db.execute("""SELECT story_id,held_updates,locked FROM editorial_controls c WHERE held_updates>0
+                             in db.execute("""SELECT story_id,held_updates,locked FROM editorial_controls c WHERE held_updates>0 AND c.retracted=0
                                  AND NOT EXISTS (SELECT 1 FROM decision_log WHERE story_id=c.story_id
                                  AND (code GLOB 'published.*' OR code='operator.approved')
                                  AND id>(SELECT COALESCE(MAX(id),0) FROM decision_log WHERE story_id=c.story_id
-                                         AND code='held.gate.story_locked')) ORDER BY story_id""")],
+                                         AND code IN ('held.gate.story_locked','held.network.story_locked'))) ORDER BY story_id""")],
         },
         "retrying": db.execute("SELECT COUNT(*) FROM items WHERE status='pending' AND attempts>0").fetchone()[0],
         "story_actions": dict(db.execute("SELECT action,COUNT(*) FROM editorial_revisions WHERE created_at>=? GROUP BY action ORDER BY action", (since,))),

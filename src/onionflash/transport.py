@@ -78,10 +78,16 @@ class AddressPolicy:
             return not (ip.is_multicast or ip.is_unspecified)
         if not ip.is_global or ip.is_multicast or ip.is_unspecified:
             return False
+        if isinstance(ip, ipaddress.IPv4Address) and ip in ipaddress.ip_network("192.88.99.0/24"):
+            return False
         # Translation/tunneling prefixes can reach an embedded private IPv4
         # address even though the outer IPv6 address is classified as global.
         if isinstance(ip, ipaddress.IPv6Address):
-            return ip in ipaddress.ip_network("2000::/3") and not (ip.sixtofour or ip.teredo)
+            if ip not in ipaddress.ip_network("2000::/3") or ip.sixtofour or ip.teredo:
+                return False
+            if ((int(ip) >> 32) & 0xFDFFFFFF) == 0x00005EFE:
+                return self.permits(str(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)))
+            return True
         return True
 
     def addresses(self, host: str, port: int) -> list[str]:
@@ -98,15 +104,16 @@ class AddressPolicy:
 class _CheckedBackend(httpcore.NetworkBackend):
     """Validate DNS at the connect boundary, then connect to a literal IP."""
 
-    def __init__(self, policy: AddressPolicy, backend: Any = None):
+    def __init__(self, policy: AddressPolicy, backend: Any = None, clock: Callable[[], float] = time.monotonic):
         self.policy = policy
         self.backend = backend or httpcore.SyncBackend()
+        self.clock = clock
         self.deadline: float | None = None
 
     def budget(self, timeout: float | None) -> float | None:
         if self.deadline is None:
             return timeout
-        remaining = self.deadline - time.monotonic()
+        remaining = self.deadline - self.clock()
         if remaining <= 0:
             raise httpcore.ReadTimeout("request deadline exceeded")
         return remaining if timeout is None else min(timeout, remaining)
@@ -115,9 +122,9 @@ class _CheckedBackend(httpcore.NetworkBackend):
                     local_address: str | None = None, socket_options: Any = None):
         addresses = self.policy.addresses(host, port)
         timeout = self.budget(timeout)
-        deadline = time.monotonic() + timeout if timeout is not None else None
+        deadline = self.clock() + timeout if timeout is not None else None
         for address in addresses:
-            remaining = max(0.0, deadline - time.monotonic()) if deadline is not None else None
+            remaining = max(0.0, deadline - self.clock()) if deadline is not None else None
             if remaining == 0.0:
                 break
             try:
@@ -171,8 +178,8 @@ class _ResponseStream(httpx.SyncByteStream):
 class _CheckedTransport(httpx.BaseTransport):
     """Small adapter using public httpcore APIs, without monkey-patching DNS."""
 
-    def __init__(self, policy: AddressPolicy):
-        self.backend = _CheckedBackend(policy)
+    def __init__(self, policy: AddressPolicy, clock: Callable[[], float] = time.monotonic):
+        self.backend = _CheckedBackend(policy, clock=clock)
         self.pool = httpcore.ConnectionPool(
             ssl_context=ssl.create_default_context(),
             max_connections=4,
@@ -240,7 +247,7 @@ class HttpClient:
         self.deadline_reached = False
         self._injected_transport = transport is not None
         self._client = httpx.Client(
-            transport=transport or _CheckedTransport(self.policy),
+            transport=transport or _CheckedTransport(self.policy, clock=self.clock),
             timeout=httpx.Timeout(float(settings.get("timeout_seconds", 30.0)),
                                   connect=float(settings.get("connect_timeout_seconds", 10.0))),
             follow_redirects=False,
@@ -326,17 +333,45 @@ class HttpClient:
             raise FetchError("unsupported content encoding")
         body = bytearray()
         raw_size = 0
+        deflate_fallback = encoding == "deflate"
         try:
             for chunk in response.iter_raw(chunk_size=65536):
                 raw_size += len(chunk)
                 if raw_size > limit:
                     raise FetchError("response exceeds configured byte limit")
-                decoded = decoder.decompress(chunk, limit - len(body) + 1) if decoder else chunk
-                if len(body) + len(decoded) > limit:
+                if not decoder:
+                    if len(body) + len(chunk) > limit:
+                        raise FetchError("response exceeds configured byte limit")
+                    body.extend(chunk)
+                    continue
+                pending = chunk
+                while pending:
+                    try:
+                        decoded = decoder.decompress(pending, limit - len(body) + 1)
+                        deflate_fallback = False
+                    except zlib.error:
+                        if not deflate_fallback or body:
+                            raise
+                        deflate_fallback = False
+                        decoder = zlib.decompressobj(-zlib.MAX_WBITS)
+                        decoded = decoder.decompress(pending, limit - len(body) + 1)
+                    if len(body) + len(decoded) > limit:
+                        raise FetchError("response exceeds configured byte limit")
+                    body.extend(decoded)
+                    if decoder.unconsumed_tail:
+                        pending = decoder.unconsumed_tail
+                    elif decoder.eof and decoder.unused_data and encoding in {"gzip", "x-gzip"}:
+                        pending = decoder.unused_data
+                        decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    else:
+                        pending = b""
+            if decoder:
+                flushed = decoder.flush(limit - len(body) + 1)
+                if len(body) + len(flushed) > limit:
                     raise FetchError("response exceeds configured byte limit")
-                body.extend(decoded)
-            if decoder and (not decoder.eof or decoder.unused_data):
-                raise FetchError("invalid compressed response")
+                body.extend(flushed)
+                if not decoder.eof or decoder.unused_data:
+                    raise FetchError("invalid compressed response")
         except zlib.error:
             raise FetchError("invalid compressed response") from None
         return bytes(body)
@@ -396,6 +431,7 @@ class HttpClient:
                 self._pause(retry_delay(attempt, self.settings))
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError,
                     httpcore.TimeoutException, httpcore.NetworkError, httpcore.RemoteProtocolError, OSError):
+                self._check_deadline()
                 if attempt + 1 >= attempts:
                     raise FetchError("network request failed", retryable=True) from None
                 self._pause(retry_delay(attempt, self.settings))

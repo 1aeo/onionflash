@@ -482,7 +482,7 @@ def policy_hash(config: dict) -> str:
 
 def _text(value, maximum: int, *, empty: bool = False) -> None:
     if (not isinstance(value, str) or len(value) > maximum or (not empty and not value.strip())
-            or any(ord(char) < 32 and char not in "\n\t" for char in value)):
+            or any((ord(char) < 32 and char not in "\n\t") or char in "\ufffe\uffff" for char in value)):
         raise ReviewError("Invalid review text")
 
 
@@ -517,7 +517,8 @@ def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict
             raise ReviewError("Repair cannot change fixed-text alert labels")
         for key, value in copy.deepcopy(repair).items():
             if key == "update":
-                if value.strip()[-1] not in '.!?"\')”’':
+                stripped = value.strip()
+                if stripped[-1] not in '.!?"\')”’' or not any(char.isalnum() for char in stripped):
                     raise ReviewError("Update repair must be a complete sentence")
                 updated["updates"][-1]["text"] = value
             else:
@@ -640,9 +641,12 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
     merged = _plain("\n".join(source["title"] for source in sources
                               if source.get("kind") == "gitlab_mr" and source.get("upstream_state") == "merged"))
     if prepared.get("mode") == "update":
+        if (((prepared.get("coverage") or {}).get("prior_story") or {}).get("confidence") == "confirmed"
+                and "confirmed" not in limits["confidence"]):
+            limits = {**limits, "confidence": [*limits["confidence"], "confirmed"]}
         entry = candidate["updates"][-1]
-        cited_urls = {canonical_url(source["url"]).split("#", 1)[0] for source in entry["sources"]}
-        cited_notes = {canonical_url(source["url"]) for source in entry["sources"] if "#" in source["url"]}
+        exact_urls = {canonical_url(source["url"]) for source in entry["sources"]}
+        cited_urls = {url.split("#", 1)[0] for url in exact_urls}
         cited_sources = [source for source in sources if canonical_url(source["url"]).split("#", 1)[0] in cited_urls]
         claimed = []
         if any(source.get("kind") == "gitlab_issue" for source in cited_sources):
@@ -653,7 +657,7 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
             passage["text"]
             for source in cited_sources
             for passage in source["passages"]
-            if not (cited_notes and "url" in passage and canonical_url(passage["url"]) not in cited_notes)
+            if (canonical_url(passage["url"]) in exact_urls if "url" in passage else canonical_url(source["url"]) in exact_urls)
         ]
         proof = _plain("\n".join(passages))
         all_proof = _plain("\n".join(passage["text"] for source in sources for passage in source["passages"]))
@@ -724,7 +728,7 @@ class Reviewer(CompletionClient):
         # A repair offers only the labels this packet allows.
         repair = schema["properties"]["repair"]["anyOf"][1]["properties"]
         repair_limits = label_limits(packet["sources"])
-        if update and (coverage or {}).get("prior_story", {}).get("confidence") == "confirmed":
+        if update and ((coverage or {}).get("prior_story") or {}).get("confidence") == "confirmed":
             repair_limits["confidence"] = ["confirmed"]
         for key, allowed in repair_limits.items():
             repair[key]["anyOf"][0]["enum"] = allowed

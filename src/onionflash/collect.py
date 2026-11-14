@@ -256,7 +256,11 @@ def _feed(
             item["authority"] = "project-sender"
         # Some Atom archives omit alternate links and reuse an ID for distinct
         # events. Do not silently choose one event when that fallback is ambiguous.
-        if feed.version.startswith("atom") and not entry.get("links") and entry.get("id") == link:
+        has_alternate = any(
+            isinstance(link_obj, dict) and link_obj.get("rel", "alternate") == "alternate" and link_obj.get("href")
+            for link_obj in (entry.get("links") or ())
+        )
+        if feed.version.startswith("atom") and not has_alternate and entry.get("id"):
             identity = (item["url"], item["updated_at"])
             content = (item["title"], item["content"])
             if identity in identities and identities[identity] != content:

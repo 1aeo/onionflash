@@ -8,7 +8,7 @@ import re
 
 from . import editorial, render, source_packet
 from .analyze import MIN_EVIDENCE_CHARS, unquoted_text
-from .comments import analysis_context
+from .comments import TOTAL_CHARS, analysis_context, note_key
 from .util import after, canonical_url, digest, gitlab_refs, normalize_evidence, release_mentions, saved_object, thread_subject
 
 
@@ -54,6 +54,8 @@ def coverage_background(db, prior: dict | None, *, related_rows: list[tuple[str,
         out = {key: public[key] for key in ("id", *SEMANTIC_FIELDS, "published_at", "updated_at", "added_at")}
         if "updates" in public:
             out["updates"] = public["updates"]
+        if "origin" in public:
+            out["origin"] = public["origin"]
         return out
 
     def compact_entry(row, *, summary_limit: int = COVERAGE_SUMMARY_CHARS, reason: str | None = None) -> dict | None:
@@ -66,6 +68,8 @@ def coverage_background(db, prior: dict | None, *, related_rows: list[tuple[str,
         compact["products"] = current["products"]
         if current.get("updates"):
             compact["latest_update"] = current["updates"][-1]["text"][:COVERAGE_SUMMARY_CHARS]
+        if "origin" in current:
+            compact["origin"] = current["origin"]
         if reason is not None:
             compact["related"] = reason
         return compact
@@ -153,8 +157,10 @@ def _writer_info(previous: dict | None, db=None) -> tuple[str | None, str, str]:
     if not previous:
         return None, "", ""
     writer = previous.get("editorial_item")
-    if writer is None and len(previous.get("sources", [])) == 1:
-        writer = previous["sources"][0].get("id")
+    if writer is None:
+        item_sources = [s for s in previous.get("sources", []) if isinstance(s, dict) and not s.get("network_key")]
+        if len(item_sources) == 1:
+            writer = item_sources[0].get("id")
     kind = previous.get("editorial_kind") or ("tag" if previous.get("state") == "tagged" else "")
     authority = previous.get("editorial_authority")
     if authority is None and db is not None and writer:
@@ -255,11 +261,16 @@ def _source_cutoff(db, previous: dict, old_item: dict | None, item: dict | None 
         ),
     ]
     if old_item is not None:
-        dates.append(old_item["updated_at"])
+        if old_item.get("kind") != "gitlab_issue":
+            dates.append(old_item["updated_at"])
         dates += [n["created_at"] for n in old_item.get("public_comments") or []]
     elif (
         db.execute("SELECT 1 FROM editorial_controls WHERE story_id=?", (previous["id"],)).fetchone() is None
-        and all(is_own_source(s) for s in previous.get("sources", []) if isinstance(s, dict))
+        and all(
+            is_own_source(s)
+            for s in previous.get("sources", [])
+            if isinstance(s, dict) and not s.get("network_key")
+        )
         and all(
             any(isinstance(cs, dict) and is_own_url(cs.get("url")) for cs in (u.get("sources") or []))
             for u in (previous.get("updates") or [])
@@ -271,20 +282,46 @@ def _source_cutoff(db, previous: dict, old_item: dict | None, item: dict | None 
 
 
 def _changed_note_ids(old_item: dict | None, item: dict) -> set[str]:
-    seen_bodies = {n["id"]: n.get("body") for n in (old_item or {}).get("public_comments") or [] if "id" in n}
-    return {
-        note["id"]
-        for note in item.get("public_comments") or []
-        if "id" in note
-        and note["id"] in seen_bodies
-        and unquoted_text(str(seen_bodies[note["id"]] or "")).strip() != unquoted_text(note["body"]).strip()
+    seen_notes = {
+        note_key(n["id"]): n
+        for n in (old_item or {}).get("public_comments") or []
+        if "id" in n
     }
+    notes = item.get("public_comments") or []
+    total_len = sum(len(n.get("body") or "") for n in notes if isinstance(n, dict))
+    changed = set()
+    for index, note in enumerate(notes):
+        if "id" not in note:
+            continue
+        nkey = note_key(note["id"])
+        old_note = seen_notes.get(nkey)
+        if old_note is None:
+            continue
+        old_raw = str(old_note.get("body") or "")
+        new_raw = note["body"]
+        if (
+            index == len(notes) - 1
+            and total_len >= TOTAL_CHARS
+            and note.get("edited_at") == old_note.get("edited_at")
+            and len(new_raw) < len(old_raw)
+            and old_raw.startswith(new_raw)
+        ):
+            continue
+        if unquoted_text(old_raw).strip() != unquoted_text(new_raw).strip():
+            changed.add(nkey)
+    return changed
 
 
-def _own_body_changed(db, previous: dict, item: dict) -> bool:
-    old_item = _latest_published_source(db, item["id"], previous.get("editorial_analysis_key"))
+def _own_body_changed(db, previous: dict, item: dict, old_item: dict | None = None) -> bool:
     if old_item is None:
-        return not item.get("public_comments") and item["updated_at"] > _source_cutoff(db, previous, None, item)
+        old_item = _latest_published_source(
+            db,
+            item["id"],
+            previous.get("editorial_analysis_key") if item["id"] == _writer_info(previous, db)[0] else None,
+        )
+    if old_item is None:
+        note_max = max((n.get("edited_at") or n["created_at"] for n in item.get("public_comments") or []), default="")
+        return item["updated_at"] > max(_source_cutoff(db, previous, None, item), note_max)
     return any(unquoted_text(str(item.get(key) or "")).strip() != unquoted_text(str(old_item.get(key) or "")).strip()
                for key in ("title", "content", "upstream_state"))
 
@@ -319,7 +356,11 @@ def own_update_input(db, row: dict, item: dict) -> tuple[str, dict]:
     previous = json.loads(existing["payload"])
     writer, _, _ = _writer_info(previous, db)
     mode = _mode(previous, item, db)
-    if row["id"] != writer:
+    old_item = _latest_published_source(
+        db, item["id"], previous.get("editorial_analysis_key") if row["id"] == writer else None
+    )
+    has_own_history = row["id"] == writer or (item.get("kind") == "gitlab_issue" and old_item is not None)
+    if not has_own_history:
         raw = item.get("content") or ""
         is_reply = bool(_REPLY_SUBJECT.search(item.get("title") or ""))
         if mode == "update" and (
@@ -339,17 +380,21 @@ def own_update_input(db, row: dict, item: dict) -> tuple[str, dict]:
         return "skip", item
     if mode == "story":
         return "story", item
-    old_item = _latest_published_source(db, item["id"], previous.get("editorial_analysis_key"))
     cutoff = _source_cutoff(db, previous, old_item, item)
-    seen_bodies = {n["id"]: n.get("body") for n in (old_item or {}).get("public_comments") or [] if "id" in n}
+    seen_bodies = {
+        note_key(n["id"]): n.get("body")
+        for n in (old_item or {}).get("public_comments") or []
+        if "id" in n
+    }
     changed_ids = _changed_note_ids(old_item, item)
     new_notes = []
     for note in item.get("public_comments") or []:
-        if (note["created_at"] > cutoff and note.get("id") not in seen_bodies) or note.get("id") in changed_ids:
+        nkey = note_key(note.get("id"))
+        if (note["created_at"] > cutoff and nkey not in seen_bodies) or nkey in changed_ids:
             stripped = unquoted_text(note["body"]).strip()
             if stripped:
                 new_notes.append({**note, "body": stripped})
-    body_changed = _own_body_changed(db, previous, item)
+    body_changed = _own_body_changed(db, previous, item, old_item)
     filtered = json.loads(json.dumps(item))
     filtered["public_comments"] = new_notes
     if body_changed:
@@ -391,7 +436,7 @@ def _comment_sources(item: dict, result: dict, *, after_at: str | None = None, i
     quotes = {quote for quote in quotes if len(quote) >= MIN_EVIDENCE_CHARS and quote not in described}
     sources = []
     for note in sorted(item["public_comments"], key=lambda note: note["created_at"]):
-        if after_at is not None and note["created_at"] <= after_at and note.get("id") not in changed_ids:
+        if after_at is not None and note["created_at"] <= after_at and note_key(note.get("id")) not in changed_ids:
             continue
         body = unquoted_text(note["body"]) if after_at is not None else note["body"]
         normalized = normalize_evidence(body)
@@ -424,6 +469,13 @@ def _resolve_alias(db, *, story_id: str | None = None, cluster_key: str | None =
     target = db.execute("SELECT * FROM stories WHERE id=?", (alias[1],)).fetchone()
     if target is None:
         raise editorial.RetiredStory("Story is retired")
+    cluster_alias = editorial.retired(db, cluster_key=target["cluster_key"])
+    if cluster_alias is not None:
+        if cluster_alias[1] is None:
+            raise editorial.RetiredStory("Story is retired")
+        target = db.execute("SELECT * FROM stories WHERE id=?", (cluster_alias[1],)).fetchone()
+        if target is None:
+            raise editorial.RetiredStory("Story is retired")
     return dict(target)
 
 
@@ -451,11 +503,19 @@ def _url_variants(url: str) -> tuple[str, str]:
     return url, alt
 
 
+_UNVERIFIED_ROUTE = "Attached to an existing story for update review"
+
+
 def _stories_for_urls(db, urls: list[str]) -> list[dict]:
     seen, found = set(), []
     for url in urls:
         u1, u2 = _url_variants(url)
-        for (sid,) in db.execute("SELECT story_id FROM items WHERE url IN (?,?) AND story_id IS NOT NULL", (u1, u2)).fetchall():
+        for (sid,) in db.execute(
+            """SELECT story_id FROM items
+               WHERE LOWER(url) IN (?,?) AND story_id IS NOT NULL
+                 AND NOT (status='pending' AND last_error=?)""",
+            (u1.lower(), u2.lower(), _UNVERIFIED_ROUTE),
+        ).fetchall():
             live = _live_story(db, sid)
             if live and live["id"] not in seen:
                 seen.add(live["id"])
@@ -467,8 +527,10 @@ def _thread_matches(db, row: dict, item: dict, subject: str) -> list[dict]:
     earliest = after(-THREAD_WINDOW_DAYS * 86400, item["published_at"])
     seen, found = set(), []
     for sid, payload_blob in db.execute(
-        "SELECT story_id,CAST(payload AS BLOB) FROM items WHERE source_id=? AND story_id IS NOT NULL AND id!=?",
-        (row["source_id"], row.get("id") or ""),
+        """SELECT story_id,CAST(payload AS BLOB) FROM items
+           WHERE source_id=? AND story_id IS NOT NULL AND id!=?
+             AND NOT (status='pending' AND last_error=?)""",
+        (row["source_id"], row.get("id") or "", _UNVERIFIED_ROUTE),
     ).fetchall():
         other = saved_object(payload_blob)
         if not isinstance(other, dict) or not isinstance(other.get("published_at"), str):
@@ -499,8 +561,10 @@ def associate(db, row: dict) -> tuple[dict | None, str | None]:
         return _resolve_alias(db, story_id=existing["id"]) or dict(existing), "cluster"
     cluster_matches, seen = [], set()
     for (sid,) in db.execute(
-        "SELECT DISTINCT story_id FROM items WHERE story_id IS NOT NULL AND cluster_key=?",
-        (row["cluster_key"],),
+        """SELECT DISTINCT story_id FROM items
+           WHERE story_id IS NOT NULL AND cluster_key=?
+             AND NOT (status='pending' AND last_error=?)""",
+        (row["cluster_key"], _UNVERIFIED_ROUTE),
     ).fetchall():
         live = _live_story(db, sid)
         if live and live["id"] not in seen:
@@ -568,7 +632,12 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
         alias = editorial.retired(db, cluster_key=key)
         if alias and alias[1]:
             add(alias[1], reason)
-        for (sid,) in db.execute("SELECT DISTINCT story_id FROM items WHERE story_id IS NOT NULL AND cluster_key=?", (key,)).fetchall():
+        for (sid,) in db.execute(
+            """SELECT DISTINCT story_id FROM items
+               WHERE story_id IS NOT NULL AND cluster_key=?
+                 AND NOT (status='pending' AND last_error=?)""",
+            (key, _UNVERIFIED_ROUTE),
+        ).fetchall():
             add(sid, reason)
     if row.get("source_id"):
         subject, is_reply = thread_subject(item)
@@ -658,15 +727,18 @@ def prepare(db, row: dict, result: dict, observed: str) -> dict:
         source = {key: item[key] for key in ("id", "url", "title", "published_at")}
         writer, kind, authority = _writer_info(previous, db)
         if mode == "update":
-            is_own = writer == item["id"]
-            old_item = _latest_published_source(db, item["id"], previous.get("editorial_analysis_key")) if is_own else None
+            prior_snap = _latest_published_source(
+                db, item["id"], previous.get("editorial_analysis_key") if writer == item["id"] else None
+            )
+            is_own = writer == item["id"] or (item.get("kind") == "gitlab_issue" and prior_snap is not None)
+            old_item = prior_snap if is_own else None
             state_changed = bool(old_item and item.get("upstream_state") != old_item.get("upstream_state"))
             cutoff = _source_cutoff(db, previous, old_item, item) if is_own else None
             changed_ids = _changed_note_ids(old_item, item) if is_own else frozenset()
-            body_changed = _own_body_changed(db, previous, item) if is_own else True
+            body_changed = _own_body_changed(db, previous, item, old_item) if is_own else True
             comments = _comment_sources(item, result, after_at=cutoff, include_body=body_changed, changed_ids=changed_ids)
             note_edits = {
-                note["id"]: note["edited_at"]
+                note_key(note["id"]): note["edited_at"]
                 for note in item.get("public_comments") or []
                 if isinstance(note.get("id"), str) and isinstance(note.get("edited_at"), str) and note["edited_at"]
             }
@@ -674,7 +746,7 @@ def prepare(db, row: dict, result: dict, observed: str) -> dict:
             dates = [
                 *(
                     note_edits.get(nid, max(fallback_edit_at, comment["published_at"]))
-                    if (nid := comment["id"].removeprefix(item["id"] + ":")) in changed_ids
+                    if (nid := note_key(comment["id"].removeprefix(item["id"] + ":"))) in changed_ids
                     else comment["published_at"]
                     for comment in comments
                 ),

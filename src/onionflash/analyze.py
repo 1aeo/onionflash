@@ -307,7 +307,9 @@ def validate_analysis(result: dict, item: dict, schema: dict = SCHEMA) -> dict:
     required_text = ("update",) if "update" in fields else ("title", "summary")
     if not all(result[k] for k in required_text) or not evidence:
         raise AnalysisError("Published story needs text and source evidence")
-    if "update" in fields and result["update"][-1] not in '.!?"\')”’':
+    if "update" in fields and (
+        result["update"][-1] not in '.!?"\')”’' or not any(char.isalnum() for char in result["update"])
+    ):
         raise AnalysisError("Invalid model update: must be a complete punctuated sentence")
     # The impact sentence may restate only numbers and versions from the title, content or comment
     # bodies the writer saw. It is cleared, not refused: a retry would return the same reply.

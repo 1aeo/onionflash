@@ -137,7 +137,7 @@ DOCTOR_LINK_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "reason": {"type": "string", "minLength": 1, "maxLength": 240},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 240, "pattern": r"\S"},
         "same_incident": {"type": "boolean"},
     },
     "required": ["reason", "same_incident"],
@@ -178,6 +178,15 @@ def initialize(db) -> None:
             decided_at TEXT NOT NULL,
             PRIMARY KEY(incident_key, host_id, host_hash, version)
         );
+        CREATE TABLE IF NOT EXISTS network_link_failures (
+            incident_key TEXT NOT NULL,
+            host_id TEXT NOT NULL,
+            host_hash TEXT NOT NULL,
+            version TEXT NOT NULL,
+            failures INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(incident_key, host_id, host_hash, version)
+        );
         CREATE INDEX IF NOT EXISTS decision_log_subject ON decision_log(subject, code);
     """)
 
@@ -215,8 +224,8 @@ def parse(item: dict, source: dict, limit: int = 20000, authorities: tuple[str, 
         return None
     truncated = limit > 0 and len(content) >= limit
     raw_lines = content.splitlines()
-    if truncated and len(raw_lines) > 1:
-        tail = raw_lines[-1]
+    if truncated:
+        tail = raw_lines[-1] if raw_lines else ""
         if not (tail.startswith(PREFIXES) or any(prefix_str.startswith(tail) for prefix_str in PREFIXES)):
             return None
         lines = [line for line in raw_lines[:-1] if line]
@@ -302,10 +311,19 @@ def load_reports(db) -> list[dict]:
     return reports
 
 
-def _replay(reports: list[dict], authorities: tuple[str, ...] = AUTHORITIES) -> tuple[list[dict], list[dict], list[dict]]:
+def _replay(
+    reports: list[dict],
+    authorities: tuple[str, ...] = AUTHORITIES,
+    *,
+    publish_since: str | None = None,
+    pinned_keys: set[str] | None = None,
+    pinned_urls: set[str] | None = None,
+) -> tuple[list[dict], list[dict], list[dict]]:
     """Pure, order-independent replay of rules A, B, and C with 7-day recurrence grouping."""
     known = tuple(dict.fromkeys(authorities))
     known_set = set(known)
+    keep_keys = pinned_keys or set()
+    keep_urls = pinned_urls or set()
     by_url: dict[str, dict] = {}
     for raw in reports:
         url = raw["url"]
@@ -343,6 +361,13 @@ def _replay(reports: list[dict], authorities: tuple[str, ...] = AUTHORITIES) -> 
                 and existing["subject"] == subject
                 and existing["closed"] is not None
                 and opened_rep["t"] - existing["_closed_t"] <= REGROUP
+                and (
+                    publish_since is None
+                    or existing["closed"]["stamp"] >= publish_since
+                    or existing["key"] in keep_keys
+                    or existing["first"]["url"] in keep_urls
+                    or existing["opened"]["url"] in keep_urls
+                )
             ):
                 existing["ep_count"] += 1
                 ep_idx = existing["ep_count"]
@@ -561,9 +586,22 @@ def _replay(reports: list[dict], authorities: tuple[str, ...] = AUTHORITIES) -> 
     return stories, below, opened_episodes
 
 
-def incidents(reports: list[dict], authorities: tuple[str, ...] = AUTHORITIES) -> tuple[list[dict], list[dict]]:
+def incidents(
+    reports: list[dict],
+    authorities: tuple[str, ...] = AUTHORITIES,
+    *,
+    publish_since: str | None = None,
+    pinned_keys: set[str] | None = None,
+    pinned_urls: set[str] | None = None,
+) -> tuple[list[dict], list[dict]]:
     """Return (qualifying_incidents, ended_below_threshold_episodes) from parsed DocTor reports."""
-    found, below, _ = _replay(reports, authorities)
+    found, below, _ = _replay(
+        reports,
+        authorities,
+        publish_since=publish_since,
+        pinned_keys=pinned_keys,
+        pinned_urls=pinned_urls,
+    )
     return found, below
 
 
@@ -680,6 +718,12 @@ def _event_text(event: dict) -> str:
     if kind.startswith("A:week-"):
         return f"Still listed as missing from the consensus after {info['days']} days, in DocTor's {_fmt(info['at'])} UTC report."
     if kind == "A:close":
+        if info["first_omit"] == info["decided"]:
+            return (
+                f"No longer listed as missing in DocTor's {_fmt(info['decided'])} UTC report,"
+                f" more than 24 hours after its last listing."
+                f" The reports do not say whether {info['authority']} returned or was retired."
+            )
         return (
             f"No longer listed as missing in DocTor's reports since {_fmt(info['first_omit'])} UTC"
             f" (24 hours without a listing by {_fmt(info['decided'])} UTC)."
@@ -737,6 +781,11 @@ class LinkChecker(CompletionClient):
     """Tiny one-bit yes/no model check for attaching a DocTor incident to an existing host story."""
 
     stage = "review"
+
+    def __init__(self, config: dict, deadline: float | None = None):
+        review_model = (config.get("review") or {}).get("model", "").strip()
+        llm = {**config["llm"], "model": review_model or config["llm"]["model"]}
+        super().__init__({**config, "llm": llm}, deadline=deadline)
 
     def confirm(self, incident: dict, host: dict) -> bool:
         title = _story_title(incident["rule"], incident["subject"])
@@ -881,27 +930,75 @@ def _pinned_records(db) -> list[dict]:
                     "story_id": row["id"],
                     "cluster_key": row["cluster_key"],
                     "raw": raw,
-                    "locked": bool(row["locked"] or row["retracted"]),
+                    "locked": bool(row["locked"]),
+                    "retracted": bool(row["retracted"]),
                     "entry": entry,
                 })
     return records
 
 
+def _entry_matches(entry: dict, incident: dict) -> bool:
+    if entry.get("key") == incident["key"]:
+        return True
+    return (
+        entry.get("rule") == incident["rule"]
+        and entry.get("subject") == incident["subject"]
+        and (
+            entry.get("first_url") in incident["member_urls"]
+            or entry.get("opened_url") in incident["member_urls"]
+        )
+    )
+
+
 def _find_pinned(pinned: list[dict], incident: dict) -> dict | None:
     for item in pinned:
-        entry = item["entry"]
-        if entry["key"] == incident["key"]:
-            return item
-        if (
-            entry.get("rule") == incident["rule"]
-            and entry.get("subject") == incident["subject"]
-            and (
-                entry.get("first_url") in incident["member_urls"]
-                or entry.get("opened_url") in incident["member_urls"]
-            )
-        ):
+        if _entry_matches(item["entry"], incident):
             return item
     return None
+
+
+def _alias_network_entries(db) -> list[tuple[str, dict]]:
+    entries: list[tuple[str, dict]] = []
+    rows = db.execute(
+        "SELECT story_id, CAST(story_json AS BLOB) AS story_json FROM story_aliases WHERE story_json IS NOT NULL ORDER BY created_at DESC, story_id"
+    ).fetchall()
+    for row in rows:
+        raw = saved_object(row["story_json"])
+        if not isinstance(raw, dict) or not isinstance(raw.get("network"), list):
+            continue
+        for entry in raw["network"]:
+            if isinstance(entry, dict) and isinstance(entry.get("key"), str):
+                entries.append((row["story_id"], entry))
+    return entries
+
+
+def _retired_incident(db, incident: dict) -> tuple[str, str | None] | None:
+    standalone_cluster = "network:" + incident["key"]
+    standalone_id = digest(standalone_cluster)[:24]
+    alias = editorial.retired(db, story_id=standalone_id, cluster_key=standalone_cluster)
+    if alias is not None:
+        return alias
+    for story_id, entry in _alias_network_entries(db):
+        if _entry_matches(entry, incident):
+            resolved = editorial.retired(db, story_id=story_id)
+            if resolved is not None:
+                return resolved
+    return None
+
+
+def _pinned_hints(pinned: list[dict], alias_entries: list[tuple[str, dict]]) -> tuple[set[str], set[str], list[str]]:
+    keys: set[str] = set()
+    urls: set[str] = set()
+    rule_a_subjects: list[str] = []
+    for entry in [*(rec["entry"] for rec in pinned), *(entry for _, entry in alias_entries)]:
+        if isinstance(entry.get("key"), str):
+            keys.add(entry["key"])
+        for field in ("first_url", "opened_url"):
+            if isinstance(entry.get(field), str):
+                urls.add(entry[field])
+        if entry.get("rule") == "A" and isinstance(entry.get("subject"), str):
+            rule_a_subjects.append(entry["subject"])
+    return keys, urls, rule_a_subjects
 
 
 def _update_id(story_id: str, kind: str, cite_url: str) -> str:
@@ -919,7 +1016,7 @@ def _build_updates(story_id: str, incident: dict, entry: dict, *, include_open: 
     if include_open:
         events.append(_open_update_event(incident["rule"], pinned_first, pinned_opened, pinned_vars))
     for ev in incident["events"]:
-        if ev["at"] < entry["opened"]:
+        if ev["at"] <= entry["opened"]:
             continue
         events.append(ev)
     due = []
@@ -972,11 +1069,14 @@ def _write_story_tx(db, story_id: str, cluster_key: str, payload: dict) -> bool:
         if editorial.retired(db, story_id=story_id, cluster_key=cluster_key) is not None:
             db.execute("ROLLBACK")
             return False
-        db.execute(
+        cursor = db.execute(
             """INSERT INTO stories(id,cluster_key,payload,published_at,updated_at) VALUES(?,?,?,?,?)
                ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at""",
             (story_id, cluster_key, text, public["published_at"], public["updated_at"]),
         )
+        if not cursor.rowcount:
+            db.execute("ROLLBACK")
+            return False
         db.execute("COMMIT")
         return True
     except BaseException:
@@ -1019,18 +1119,17 @@ def evaluate(
                 _set_meta(db, "network_publish_active", "0")
 
     pinned = _pinned_records(db)
-    active_authorities = tuple(
-        dict.fromkeys([
-            *AUTHORITIES,
-            *(
-                rec["entry"]["subject"]
-                for rec in pinned
-                if rec["entry"].get("rule") == "A" and isinstance(rec["entry"].get("subject"), str)
-            ),
-        ])
-    )
+    alias_entries = _alias_network_entries(db)
+    pinned_keys, pinned_urls, rule_a_subjects = _pinned_hints(pinned, alias_entries)
+    active_authorities = tuple(dict.fromkeys([*AUTHORITIES, *rule_a_subjects]))
     reports = load_reports(db)
-    inc_list, below_list = incidents(reports, authorities=active_authorities)
+    inc_list, below_list = incidents(
+        reports,
+        authorities=active_authorities,
+        publish_since=publish_since,
+        pinned_keys=pinned_keys,
+        pinned_urls=pinned_urls,
+    )
     with db:
         for ep in below_list:
             decisions.record_subject(
@@ -1047,131 +1146,216 @@ def evaluate(
 
     updates_written = stories_written = held = endpoint_failures = 0
     open_count = sum(1 for inc in inc_list if inc["closed"] is None)
+    max_attempts = max(1, int((config.get("llm") or {}).get("max_attempts", 3)))
 
     for inc in inc_list:
         pinned = _pinned_records(db)
         matched = _find_pinned(pinned, inc)
         if matched is None:
-            if inc["closed"] is not None and publish_since and inc["closed"]["stamp"] < publish_since:
-                with db:
-                    decisions.record_subject(
-                        db,
-                        inc["key"],
-                        "skipped.network.before_enable",
-                        observed,
-                        source_id=source["id"],
-                        once=True,
-                        rule=inc["rule"],
-                        incident_subject=inc["subject"],
-                        url=inc["opened"]["url"],
-                    )
-                continue
-            if publish_since and observed < publish_since:
-                continue
-
-            hosts = candidate_hosts(db, inc, source_id=source["id"], observed=observed, log_locked=True)
-            chosen_host = None
-            pending_link = False
-            for host in hosts:
-                cached = db.execute(
-                    """SELECT same_incident FROM network_links
-                       WHERE incident_key=? AND host_id=? AND host_hash=? AND version=?""",
-                    (inc["key"], host["id"], host["hash"], DOCTOR_LINK_VERSION),
-                ).fetchone()
-                if cached is not None:
-                    same = bool(cached["same_incident"])
-                else:
-                    if not allow_network or endpoint_failures >= 2 or linker is None:
-                        with db:
-                            decisions.record_subject(
-                                db,
-                                inc["key"],
-                                "held.network.link_pending",
-                                observed,
-                                source_id=source["id"],
-                                story_id=host["id"],
-                                once=True,
-                                rule=inc["rule"],
-                                incident_subject=inc["subject"],
-                            )
-                        held += 1
-                        pending_link = True
-                        break
-                    try:
-                        same = bool(
-                            linker.confirm(inc, host["public"])
-                            if hasattr(linker, "confirm")
-                            else linker(inc, host["public"])
-                        )
-                    except AnalysisError as exc:
-                        if exc.retryable:
-                            endpoint_failures += 1
-                        with db:
-                            decisions.record_subject(
-                                db,
-                                inc["key"],
-                                "held.network.link_pending",
-                                observed,
-                                source_id=source["id"],
-                                story_id=host["id"],
-                                once=True,
-                                error=str(exc),
-                                rule=inc["rule"],
-                                incident_subject=inc["subject"],
-                            )
-                        held += 1
-                        pending_link = True
-                        break
-                    with db:
-                        db.execute(
-                            """INSERT OR REPLACE INTO network_links(incident_key,host_id,host_hash,version,same_incident,decided_at)
-                               VALUES(?,?,?,?,?,?)""",
-                            (inc["key"], host["id"], host["hash"], DOCTOR_LINK_VERSION, int(same), observed),
-                        )
-                if same:
-                    chosen_host = host
-                    break
-            if pending_link:
-                continue
-
             standalone_cluster = "network:" + inc["key"]
             standalone_id = digest(standalone_cluster)[:24]
-            if chosen_host is None:
-                alias = editorial.retired(db, story_id=standalone_id, cluster_key=standalone_cluster)
-                if alias is not None:
-                    if alias[1] is None:
-                        with db:
-                            decisions.record_subject(
-                                db,
-                                inc["key"],
-                                "skipped.gate.retired_story",
-                                observed,
-                                source_id=source["id"],
-                                story_id=alias[0],
-                                once=True,
-                            )
-                        continue
-                    surv_row = db.execute(
-                        "SELECT id, cluster_key, CAST(payload AS BLOB) AS payload FROM stories WHERE id=?",
-                        (alias[1],),
+            chosen_host = None
+            alias = _retired_incident(db, inc)
+            if alias is not None:
+                if alias[1] is None:
+                    with db:
+                        decisions.record_subject(
+                            db,
+                            inc["key"],
+                            "skipped.gate.retired_story",
+                            observed,
+                            source_id=source["id"],
+                            story_id=alias[0],
+                            once=True,
+                        )
+                    continue
+                surv_row = db.execute(
+                    "SELECT id, cluster_key, CAST(payload AS BLOB) AS payload FROM stories WHERE id=?",
+                    (alias[1],),
+                ).fetchone()
+                if surv_row is None:
+                    continue
+                surv_ctrl = db.execute(
+                    "SELECT COALESCE(locked, 0) AS locked, COALESCE(retracted, 0) AS retracted FROM editorial_controls WHERE story_id=?",
+                    (alias[1],),
+                ).fetchone()
+                if surv_ctrl is not None and surv_ctrl["retracted"]:
+                    continue
+                surv_raw = saved_object(surv_row["payload"])
+                if not publish_enabled:
+                    with db:
+                        decisions.record_subject(
+                            db,
+                            inc["key"],
+                            "held.network.dry_run",
+                            observed,
+                            source_id=source["id"],
+                            story_id=alias[1],
+                            once=True,
+                            rule=inc["rule"],
+                            incident_subject=inc["subject"],
+                        )
+                    held += 1
+                    continue
+                if surv_raw is None or (surv_ctrl is not None and surv_ctrl["locked"]) or editorial.is_locked(db, surv_row["id"]):
+                    with db:
+                        if decisions.record_subject(
+                            db,
+                            f"{inc['key']}:{alias[1]}",
+                            "held.network.story_locked",
+                            observed,
+                            source_id=source["id"],
+                            story_id=alias[1],
+                            once=True,
+                        ):
+                            editorial.record_held(db, alias[1])
+                    held += 1
+                    continue
+                chosen_host = {"id": surv_row["id"], "cluster_key": surv_row["cluster_key"], "raw": surv_raw}
+            else:
+                if inc["closed"] is not None and publish_since and inc["closed"]["stamp"] < publish_since:
+                    with db:
+                        decisions.record_subject(
+                            db,
+                            inc["key"],
+                            "skipped.network.before_enable",
+                            observed,
+                            source_id=source["id"],
+                            once=True,
+                            rule=inc["rule"],
+                            incident_subject=inc["subject"],
+                            url=inc["opened"]["url"],
+                        )
+                    continue
+                if publish_since and observed < publish_since:
+                    continue
+
+                hosts = candidate_hosts(db, inc, source_id=source["id"], observed=observed, log_locked=True)
+                pending_link = False
+                for host in hosts:
+                    cached = db.execute(
+                        """SELECT same_incident FROM network_links
+                           WHERE incident_key=? AND host_id=? AND host_hash=? AND version=?""",
+                        (inc["key"], host["id"], host["hash"], DOCTOR_LINK_VERSION),
                     ).fetchone()
-                    if surv_row is None:
-                        continue
-                    surv_raw = saved_object(surv_row["payload"])
-                    if surv_raw is None or editorial.is_locked(db, surv_row["id"]):
-                        with db:
-                            decisions.record_subject(
-                                db,
-                                f"{inc['key']}:{alias[1]}",
-                                "held.network.story_locked",
-                                observed,
-                                source_id=source["id"],
-                                story_id=alias[1],
-                                once=True,
+                    if cached is not None:
+                        same = bool(cached["same_incident"])
+                    else:
+                        if not allow_network or endpoint_failures >= 2 or linker is None:
+                            with db:
+                                decisions.record_subject(
+                                    db,
+                                    inc["key"],
+                                    "held.network.link_pending",
+                                    observed,
+                                    source_id=source["id"],
+                                    story_id=host["id"],
+                                    once=True,
+                                    rule=inc["rule"],
+                                    incident_subject=inc["subject"],
+                                )
+                            held += 1
+                            pending_link = True
+                            break
+                        try:
+                            same = bool(
+                                linker.confirm(inc, host["public"])
+                                if hasattr(linker, "confirm")
+                                else linker(inc, host["public"])
                             )
-                        held += 1
-                        continue
-                    chosen_host = {"id": surv_row["id"], "cluster_key": surv_row["cluster_key"], "raw": surv_raw}
+                        except AnalysisError as exc:
+                            if exc.retryable:
+                                endpoint_failures += 1
+                                with db:
+                                    decisions.record_subject(
+                                        db,
+                                        inc["key"],
+                                        "held.network.link_pending",
+                                        observed,
+                                        source_id=source["id"],
+                                        story_id=host["id"],
+                                        once=True,
+                                        error=str(exc),
+                                        rule=inc["rule"],
+                                        incident_subject=inc["subject"],
+                                    )
+                                held += 1
+                                pending_link = True
+                                break
+                            prior_fail = db.execute(
+                                """SELECT failures FROM network_link_failures
+                                   WHERE incident_key=? AND host_id=? AND host_hash=? AND version=?""",
+                                (inc["key"], host["id"], host["hash"], DOCTOR_LINK_VERSION),
+                            ).fetchone()
+                            strikes = (prior_fail["failures"] if prior_fail else 0) + 1
+                            if strikes < max_attempts:
+                                with db:
+                                    db.execute(
+                                        """INSERT OR REPLACE INTO network_link_failures(incident_key,host_id,host_hash,version,failures,updated_at)
+                                           VALUES(?,?,?,?,?,?)""",
+                                        (inc["key"], host["id"], host["hash"], DOCTOR_LINK_VERSION, strikes, observed),
+                                    )
+                                    decisions.record_subject(
+                                        db,
+                                        inc["key"],
+                                        "held.network.link_pending",
+                                        observed,
+                                        source_id=source["id"],
+                                        story_id=host["id"],
+                                        once=True,
+                                        error=str(exc),
+                                        rule=inc["rule"],
+                                        incident_subject=inc["subject"],
+                                    )
+                                held += 1
+                                pending_link = True
+                                break
+                            fail_code = (
+                                f"failed.{exc.code}"
+                                if exc.code and f"failed.{exc.code}" in decisions.CODES
+                                else "failed.review.invalid_reply"
+                            )
+                            with db:
+                                db.execute(
+                                    """DELETE FROM network_link_failures
+                                       WHERE incident_key=? AND host_id=? AND host_hash=? AND version=?""",
+                                    (inc["key"], host["id"], host["hash"], DOCTOR_LINK_VERSION),
+                                )
+                                db.execute(
+                                    """INSERT OR REPLACE INTO network_links(incident_key,host_id,host_hash,version,same_incident,decided_at)
+                                       VALUES(?,?,?,?,0,?)""",
+                                    (inc["key"], host["id"], host["hash"], DOCTOR_LINK_VERSION, observed),
+                                )
+                                decisions.record_subject(
+                                    db,
+                                    f"{inc['key']}:{host['id']}:{host['hash'][:12]}",
+                                    fail_code,
+                                    observed,
+                                    source_id=source["id"],
+                                    story_id=host["id"],
+                                    once=True,
+                                    error=str(exc),
+                                    rule=inc["rule"],
+                                    incident_subject=inc["subject"],
+                                )
+                            same = False
+                        else:
+                            with db:
+                                db.execute(
+                                    """DELETE FROM network_link_failures
+                                       WHERE incident_key=? AND host_id=? AND host_hash=? AND version=?""",
+                                    (inc["key"], host["id"], host["hash"], DOCTOR_LINK_VERSION),
+                                )
+                                db.execute(
+                                    """INSERT OR REPLACE INTO network_links(incident_key,host_id,host_hash,version,same_incident,decided_at)
+                                       VALUES(?,?,?,?,?,?)""",
+                                    (inc["key"], host["id"], host["hash"], DOCTOR_LINK_VERSION, int(same), observed),
+                                )
+                    if same:
+                        chosen_host = host
+                        break
+                if pending_link:
+                    continue
 
             target_id = chosen_host["id"] if chosen_host else standalone_id
             if not publish_enabled:
@@ -1210,18 +1394,19 @@ def evaluate(
                 host_raw = saved_object(host_row["payload"])
                 if host_raw is None:
                     continue
-                due = _build_updates(target_id, inc, entry, include_open=True)
+                due = _build_updates(target_id, inc, entry, include_open=host_raw.get("origin") != "network-health")
                 entry["update_ids"] = [u["id"] for u in due]
                 entry["slots"] = [u["slot"] for u in due if u.get("slot")]
                 updated_payload = dict(host_raw)
                 # Preserve legacy single-source writer identity before appending report links.
                 if updated_payload.get("editorial_item") is None:
-                    item_sources = [s for s in updated_payload.get("sources", []) if isinstance(s, dict) and s.get("id")]
+                    item_sources = [s for s in updated_payload.get("sources", []) if isinstance(s, dict) and s.get("id") and not s.get("network_key")]
                     if len(item_sources) == 1:
                         updated_payload["editorial_item"] = item_sources[0]["id"]
-                existing_updates = list(updated_payload.get("updates") or [])
-                existing_updates.extend({"at": u["at"], "text": u["text"], "sources": u["sources"]} for u in due)
-                updated_payload["updates"] = existing_updates
+                if due:
+                    existing_updates = list(updated_payload.get("updates") or [])
+                    existing_updates.extend({"at": u["at"], "text": u["text"], "sources": u["sources"]} for u in due)
+                    updated_payload["updates"] = existing_updates
                 existing_notes = list(updated_payload.get("alert_notes") or [])
                 if NOTES[inc["rule"]] not in existing_notes:
                     existing_notes.append(NOTES[inc["rule"]])
@@ -1233,13 +1418,14 @@ def evaluate(
                     inc["last"],
                 )
                 updated_payload["network"] = [*list(updated_payload.get("network") or []), entry]
-                newest_at = max([updated_payload["updated_at"], *(u["at"] for u in due)])
+                newest_at = max([updated_payload["updated_at"], inc["last"]["stamp"], *(u["at"] for u in due)])
                 updated_payload["updated_at"] = newest_at
                 if _write_story_tx(db, target_id, host_row["cluster_key"], updated_payload):
+                    marker_id = entry["update_ids"][-1] if entry["update_ids"] else inc["key"]
                     with db:
                         decisions.record_subject(
                             db,
-                            f"{target_id}:{entry['update_ids'][-1]}",
+                            f"{target_id}:{marker_id}",
                             "published.network.update",
                             observed,
                             source_id=source["id"],
@@ -1293,6 +1479,8 @@ def evaluate(
             continue
 
         # Incident is already pinned to an existing story.
+        if matched["retracted"]:
+            continue
         story_id = matched["story_id"]
         cluster_key = matched["cluster_key"]
         raw_story = matched["raw"]
@@ -1325,7 +1513,7 @@ def evaluate(
             continue
         if matched["locked"] or editorial.is_locked(db, story_id):
             with db:
-                decisions.record_subject(
+                if decisions.record_subject(
                     db,
                     f"{story_id}:{marker}",
                     "held.network.story_locked",
@@ -1335,7 +1523,8 @@ def evaluate(
                     once=True,
                     rule=inc["rule"],
                     incident_subject=inc["subject"],
-                )
+                ):
+                    editorial.record_held(db, story_id)
             held += 1
             continue
 
@@ -1414,30 +1603,45 @@ def status(db, sources: list[dict]) -> dict:
             "incidents": [],
         }
     pinned = _pinned_records(db)
-    active_authorities = tuple(
-        dict.fromkeys([
-            *AUTHORITIES,
-            *(
-                rec["entry"]["subject"]
-                for rec in pinned
-                if rec["entry"].get("rule") == "A" and isinstance(rec["entry"].get("subject"), str)
-            ),
-        ])
+    alias_entries = _alias_network_entries(db)
+    pinned_keys, pinned_urls, rule_a_subjects = _pinned_hints(pinned, alias_entries)
+    active_authorities = tuple(dict.fromkeys([*AUTHORITIES, *rule_a_subjects]))
+    inc_list, _ = incidents(
+        load_reports(db),
+        authorities=active_authorities,
+        publish_since=publish_since,
+        pinned_keys=pinned_keys,
+        pinned_urls=pinned_urls,
     )
-    inc_list, _ = incidents(load_reports(db), authorities=active_authorities)
     listed = []
     for inc in inc_list:
         matched = _find_pinned(pinned, inc)
         if matched is not None:
             entry = matched["entry"]
             raw_story = matched["raw"]
+            if matched["retracted"]:
+                listed.append({
+                    "rule": inc["rule"],
+                    "subject": inc["subject"],
+                    "first": entry["first"],
+                    "opened": entry["opened"],
+                    "closed": inc["closed"]["stamp"] if inc["closed"] else None,
+                    "target": f"retracted:{matched['story_id']}",
+                    "title": _story_title(inc["rule"], inc["subject"]),
+                    "updates": [],
+                })
+                continue
             is_standalone = raw_story.get("origin") == "network-health"
             target = f"story:{matched['story_id']}" if is_standalone else f"attached:{matched['story_id']}"
             title = raw_story.get("title") or _story_title(inc["rule"], inc["subject"])
+            pinned_first = {"url": entry["first_url"], "stamp": entry["first"]}
+            pinned_opened = {"url": entry["opened_url"], "stamp": entry["opened"]}
+            pinned_vars = entry.get("open_vars") or inc["open_vars"]
+            events_after = [ev for ev in inc["events"] if ev["at"] > entry["opened"]]
             preview_events = (
-                [_open_update_event(inc["rule"], inc["first"], inc["opened"], inc["open_vars"]), *inc["events"]]
+                [_open_update_event(inc["rule"], pinned_first, pinned_opened, pinned_vars), *events_after]
                 if not is_standalone
-                else inc["events"]
+                else events_after
             )
             listed.append({
                 "rule": inc["rule"],
@@ -1447,7 +1651,45 @@ def status(db, sources: list[dict]) -> dict:
                 "closed": inc["closed"]["stamp"] if inc["closed"] else None,
                 "target": target,
                 "title": title,
-                "updates": [{"at": ev["at"], "text": _event_text(ev)} for ev in preview_events if ev["at"] >= entry["opened"]],
+                "updates": [{"at": ev["at"], "text": _event_text(ev)} for ev in preview_events],
+            })
+            continue
+        alias = _retired_incident(db, inc)
+        if alias is not None:
+            if alias[1] is None:
+                continue
+            surv_row = db.execute("SELECT CAST(payload AS BLOB) AS payload FROM stories WHERE id=?", (alias[1],)).fetchone()
+            if surv_row is None:
+                continue
+            surv_ctrl = db.execute("SELECT COALESCE(retracted, 0) AS retracted FROM editorial_controls WHERE story_id=?", (alias[1],)).fetchone()
+            if surv_ctrl is not None and surv_ctrl["retracted"]:
+                listed.append({
+                    "rule": inc["rule"],
+                    "subject": inc["subject"],
+                    "first": inc["first"]["stamp"],
+                    "opened": inc["opened"]["stamp"],
+                    "closed": inc["closed"]["stamp"] if inc["closed"] else None,
+                    "target": f"retracted:{alias[1]}",
+                    "title": _story_title(inc["rule"], inc["subject"]),
+                    "updates": [],
+                })
+                continue
+            surv_raw = saved_object(surv_row["payload"]) or {}
+            include_open = surv_raw.get("origin") != "network-health"
+            preview_events = (
+                [_open_update_event(inc["rule"], inc["first"], inc["opened"], inc["open_vars"]), *inc["events"]]
+                if include_open
+                else inc["events"]
+            )
+            listed.append({
+                "rule": inc["rule"],
+                "subject": inc["subject"],
+                "first": inc["first"]["stamp"],
+                "opened": inc["opened"]["stamp"],
+                "closed": inc["closed"]["stamp"] if inc["closed"] else None,
+                "target": f"attached:{alias[1]}",
+                "title": surv_raw.get("title") or _story_title(inc["rule"], inc["subject"]),
+                "updates": [{"at": ev["at"], "text": _event_text(ev)} for ev in preview_events],
             })
             continue
         if inc["closed"] is not None and publish_since and inc["closed"]["stamp"] < publish_since:

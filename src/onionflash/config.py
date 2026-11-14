@@ -122,6 +122,9 @@ RETIRED = {
 
 
 def _expand(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Configuration value must be a string")
+
     def sub(match: re.Match) -> str:
         name = match.group(1)
         if name not in os.environ:
@@ -187,7 +190,8 @@ def load_config(path: str | Path) -> dict:
         or any(p in {".", ".."} for p in unquote(parsed_site.path).split("/"))
     ):
         raise ValueError("site.base_url must be a clean absolute HTTP(S) URL")
-    _ = parsed_site.port
+    if parsed_site.port == 0:
+        raise ValueError("site.base_url must have a valid port")
     # Rebuilt from its parts, so an empty trailing "?" or "#" cannot swallow the file names.
     config["site"]["base_url"] = urlunsplit(
         (parsed_site.scheme, parsed_site.netloc, parsed_site.path.rstrip("/") + "/", "", ""))
@@ -223,6 +227,8 @@ def load_config(path: str | Path) -> dict:
     if any(not u.strip() for u in llm["fallback_base_urls"]):
         raise ValueError("Each LLM fallback base URL must be a nonempty URL")
     for network in llm["allowed_networks"]:
+        if not isinstance(network, str):
+            raise ValueError("Each allowed_networks entry must be a CIDR string")
         parsed_network = ipaddress.ip_network(network, strict=True)
         if parsed_network.prefixlen == 0:
             raise ValueError(
@@ -235,10 +241,13 @@ def load_config(path: str | Path) -> dict:
         if (
             parsed.scheme not in ({"https", "http"} if llm["allow_http"] else {"https"})
             or not parsed.hostname
+            or parsed.port == 0
             or parsed.username is not None
             or parsed.password is not None
             or parsed.query
             or parsed.fragment
+            or "\\" in url
+            or any(ord(c) < 33 or ord(c) == 127 for c in url)
         ):
             raise ValueError(
                 "Invalid LLM base URL; credentials belong in its environment variable"
