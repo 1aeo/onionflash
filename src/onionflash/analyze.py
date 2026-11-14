@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import re
 
 from .comments import analysis_context
@@ -196,10 +197,17 @@ def prior_context(prior: dict) -> dict:
 
 
 def cache_key(row: dict, llm: dict, prior: dict | None = None) -> str:
-    """Identity of the write-only analysis record: source revision, model, prompt and update target."""
-    if prior is None:
-        return digest([row["content_hash"], llm["model"], PROMPT_VERSION])
-    return digest([row["content_hash"], llm["model"], PROMPT_VERSION, prior_context(prior)])
+    """Bind cached drafts to the active writer contract and update context."""
+    prompt = SYSTEM_PROMPT if prior is None else UPDATE_PROMPT
+    schema = SCHEMA if prior is None else UPDATE_SCHEMA
+    identity = [row["content_hash"], llm["model"], PROMPT_VERSION, prompt,
+                json.dumps(schema, ensure_ascii=False, allow_nan=False)]
+    if prior is not None:
+        # Category and this source predicate also shape the update grammar.
+        sources = prior.get("sources")
+        all_merges = bool(sources) and all("/-/merge_requests/" in source.get("url", "") for source in sources)
+        identity.extend([prior_context(prior), prior.get("category"), all_merges])
+    return digest(identity)
 
 
 # Spelled-out numbers count as digits, except "one", which is mostly a pronoun.
