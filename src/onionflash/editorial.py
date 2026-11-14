@@ -25,6 +25,13 @@ class RetiredStory(ValueError):
     """A story ID or cluster key recorded as retired cannot be created or edited."""
 
 
+def _slot_kind(slot: str) -> str:
+    """Return the DocTor event kind for a slot, without a trailing numeric counter."""
+    kind = slot.split(":", 1)[1]
+    head, _, counter = kind.rpartition(":")
+    return head if counter.isdigit() else kind
+
+
 def initialize(db) -> None:
     db.executescript("""
         CREATE TABLE IF NOT EXISTS editorial_controls (
@@ -526,13 +533,13 @@ def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str 
                             continue
                         known_uids = set(net_entry.get("update_ids") or ())
                         kinds = {
-                            slot.split(":", 1)[1]
+                            _slot_kind(slot)
                             for slot in (net_entry.get("slots") or ())
                             if isinstance(slot, str) and ":" in slot
                         }
                         for kind in kinds:
                             for u in upd_urls:
-                                if digest([duplicate_id, kind, u])[:24] in known_uids:
+                                if digest([story_id, kind, u])[:24] in known_uids:
                                     matched_rekeys.append((net_entry, digest([survivor_id, kind, u])[:24]))
                     if matched_rekeys:
                         for net_entry, surv_uid in matched_rekeys:

@@ -242,12 +242,6 @@ def test_editorial_triggers_damaged_story_fallback_category_tags_and_empty_outpu
 def test_merge_host_story_transfers_doctor_network_pins_updates_and_citations(tmp_path):
     _, cfg = make_doc_config(tmp_path, publish=True)
     with Store(cfg["storage"]["database"]) as store:
-        host_dup = seed_host(
-            store,
-            url="https://example.org/bastet-dup",
-            title="Directory authority bastet maintenance outage",
-            summary="Operators reported directory authority bastet is offline for maintenance.",
-        )
         host_surv = seed_host(
             store,
             url="https://example.org/bastet-main",
@@ -255,17 +249,37 @@ def test_merge_host_story_transfers_doctor_network_pins_updates_and_citations(tm
             summary="Primary tracking story for the directory authority bastet outage.",
             published_at="2024-01-14T13:00:00Z",
         )
+        host_dup = seed_host(
+            store,
+            url="https://example.org/bastet-dup",
+            title="Directory authority bastet maintenance outage",
+            summary="Operators reported directory authority bastet is offline for maintenance.",
+            published_at="2024-01-14T14:00:00Z",
+        )
         doctor.ingest(store.db, cfg["sources"][0], bastet_incident_items(close=False), "2024-01-17T12:00:00Z")
         doctor.evaluate(cfg, store, cfg["sources"][0], FakeLinker(True), "2024-01-17T12:00:00Z")
         publication.build(cfg, store)
 
-        # Seed an unrelated report in network_reports and inject an update on host_dup citing it:
-        # editorial.merge must transfer ONLY host_dup's genuine DocTor update, not the unrelated one!
-        unrelated_rep = report_item("UNRELATED_REP_01", "2024-01-10T00:05:00Z", ["NOTICE: unrelated line"])
-        doctor.ingest(store.db, cfg["sources"][0], [unrelated_rep], "2024-01-17T12:30:00Z")
+        # Verify host_dup is the story that holds the pinned DocTor network entry and opening update:
         dup_payload = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (host_dup,)).fetchone()[0])
+        assert len(dup_payload.get("network") or []) == 1
+        assert len(dup_payload.get("updates") or []) == 1
+
+        # Seed a B:more update + ep1:B:more:12 slot on host_dup AND an unrelated report update:
+        # editorial.merge must transfer BOTH genuine DocTor updates (A:open and B:more) while skipping the unrelated one!
+        b_more_rep = report_item("BMORE_REP_12", "2024-01-17T12:15:00Z", ["ERROR: The consensus is not fresh!"])
+        unrelated_rep = report_item("UNRELATED_REP_01", "2024-01-10T00:05:00Z", ["NOTICE: unrelated line"])
+        doctor.ingest(store.db, cfg["sources"][0], [b_more_rep, unrelated_rep], "2024-01-17T12:30:00Z")
+        b_more_uid = digest([host_dup, "B:more", b_more_rep["url"]])[:24]
+        dup_payload["network"][0]["slots"] = [*dup_payload["network"][0]["slots"], "ep1:B:more:12"]
+        dup_payload["network"][0]["update_ids"] = [*dup_payload["network"][0]["update_ids"], b_more_uid]
         dup_payload["updates"] = [
             *list(dup_payload.get("updates") or []),
+            {
+                "at": "2024-01-17T12:15:00Z",
+                "text": "Stale-consensus errors reached 12 hourly reports.",
+                "sources": [{"url": b_more_rep["url"], "title": "DocTor consensus-health report"}],
+            },
             {
                 "at": "2024-01-17T12:30:00Z",
                 "text": "Unrelated report note that was not produced by host_dup's pinned incident.",
@@ -275,7 +289,8 @@ def test_merge_host_story_transfers_doctor_network_pins_updates_and_citations(tm
         with store.db:
             store.db.execute("UPDATE stories SET payload=? WHERE id=?", (json.dumps(dup_payload), host_dup))
 
-        # Merge host_dup into host_surv: network pin + DocTor update + alert_notes transfer, and next evaluate writes 0 duplicate stories!
+        # Merge host_dup into host_surv: network pin + both DocTor updates (A:open & B:more) + alert_notes transfer,
+        # while the unrelated update is excluded and next evaluate writes 0 duplicate stories!
         editorial.merge(
             store.db, host_dup, host_surv,
             reason="Merge duplicate host story.",
@@ -288,8 +303,48 @@ def test_merge_host_story_transfers_doctor_network_pins_updates_and_citations(tm
         assert res_next["stories_written"] == 0 and res_next["updates_written"] == 0
         assert [s["id"] for s in store.stories()] == [host_surv]
         surv_story = store.stories()[0]
-        assert len(surv_story["updates"]) == 1
+        assert len(surv_story["updates"]) == 2
+        assert any("12 hourly reports" in u["text"] for u in surv_story["updates"])
         assert surv_story["alert_notes"] == [doctor.NOTES["A"]]
+
+    # Over-length alias chain in _retired_incident skips ONLY that incident without aborting evaluate for healthy incidents!
+    _, cfg_chain = make_doc_config(tmp_path / "chain", publish=True)
+    with Store(cfg_chain["storage"]["database"]) as store:
+        t0 = parse_utc("2024-02-01T00:05:00Z")
+        dual_items = [
+            report_item(
+                f"CHAIN_DUAL_{i}",
+                format_utc(t0 + timedelta(hours=i * 12)),
+                [
+                    "WARNING: The following authorities are missing from the consensus: bastet",
+                    "WARNING: The following authorities are missing from the consensus: moria1",
+                ],
+            )
+            for i in range(5)
+        ]
+        doctor.ingest(store.db, cfg_chain["sources"][0], dual_items, "2024-02-03T01:00:00Z")
+        inc_bastet = [inc for inc in doctor.incidents(doctor.load_reports(store.db))[0] if inc["subject"] == "bastet"][0]
+        bastet_cluster = "network:" + inc_bastet["key"]
+        bastet_id = digest(bastet_cluster)[:24]
+        with store.db:
+            prev_id = bastet_id
+            prev_ck = bastet_cluster
+            for hop in range(editorial.MAX_ALIAS_HOPS + 2):
+                nxt_id = f"hop{hop:03d}"
+                store.db.execute(
+                    "INSERT INTO story_aliases(story_id,cluster_key,survivor_id,reason,created_at,story_json) VALUES(?,?,?,?,?,NULL)",
+                    (prev_id, prev_ck, nxt_id, "Chain hop.", "2024-02-03T00:00:00Z"),
+                )
+                prev_id = nxt_id
+                prev_ck = f"chain:{hop}"
+        chain_res = doctor.evaluate(cfg_chain, store, cfg_chain["sources"][0], FakeLinker(), "2024-02-03T01:00:00Z")
+        assert chain_res["stories_written"] == 1
+        [healthy_story] = store.stories()
+        assert "moria1" in healthy_story["title"]
+        skipped_codes = [
+            r[0] for r in store.db.execute("SELECT code FROM decision_log WHERE subject=?", (inc_bastet["key"],))
+        ]
+        assert skipped_codes == ["skipped.gate.retired_story"]
 
 
 def test_auto_merge_blocks_lossy_merges_and_official_unroutable_skip_verifies(tmp_path):

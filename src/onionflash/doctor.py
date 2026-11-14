@@ -860,7 +860,7 @@ def candidate_hosts(db, incident: dict, *, source_id: str | None = None, observe
     """).fetchall()
     candidates = []
     for row in rows:
-        if editorial.retired(db, story_id=row["id"], cluster_key=row["cluster_key"]) is not None:
+        if _safe_retired(db, story_id=row["id"], cluster_key=row["cluster_key"]) is not None:
             continue
         raw = saved_object(row["payload"])
         if raw is None or raw.get("origin") == "network-health":
@@ -919,7 +919,7 @@ def _pinned_records(db) -> list[dict]:
     """).fetchall()
     records = []
     for row in rows:
-        if editorial.retired(db, story_id=row["id"], cluster_key=row["cluster_key"]) is not None:
+        if _safe_retired(db, story_id=row["id"], cluster_key=row["cluster_key"]) is not None:
             continue
         raw = saved_object(row["payload"])
         if raw is None or not isinstance(raw.get("network"), list):
@@ -972,15 +972,22 @@ def _alias_network_entries(db) -> list[tuple[str, dict]]:
     return entries
 
 
+def _safe_retired(db, *, story_id: str | None = None, cluster_key: str | None = None) -> tuple[str, str | None] | None:
+    try:
+        return editorial.retired(db, story_id=story_id, cluster_key=cluster_key)
+    except ValueError:
+        return (story_id or cluster_key or "", None)
+
+
 def _retired_incident(db, incident: dict) -> tuple[str, str | None] | None:
     standalone_cluster = "network:" + incident["key"]
     standalone_id = digest(standalone_cluster)[:24]
-    alias = editorial.retired(db, story_id=standalone_id, cluster_key=standalone_cluster)
+    alias = _safe_retired(db, story_id=standalone_id, cluster_key=standalone_cluster)
     if alias is not None:
         return alias
     for story_id, entry in _alias_network_entries(db):
         if _entry_matches(entry, incident):
-            resolved = editorial.retired(db, story_id=story_id)
+            resolved = _safe_retired(db, story_id=story_id)
             if resolved is not None:
                 return resolved
     return None
@@ -1066,7 +1073,7 @@ def _write_story_tx(db, story_id: str, cluster_key: str, payload: dict) -> bool:
         if editorial.is_locked(db, story_id):
             db.execute("ROLLBACK")
             return False
-        if editorial.retired(db, story_id=story_id, cluster_key=cluster_key) is not None:
+        if _safe_retired(db, story_id=story_id, cluster_key=cluster_key) is not None:
             db.execute("ROLLBACK")
             return False
         cursor = db.execute(
