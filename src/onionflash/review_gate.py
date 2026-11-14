@@ -1085,7 +1085,7 @@ def _try_auto_merge(config, store, pair: tuple[str, str], *, propagate: bool,
         if propagate:
             candidate_mod.verify_prepared_binding(db, prepared)
         if _auto_merge_pair(store, dup_id, survivor_id) != pair:
-            raise ValueError("Duplicate story changed before automatic merge")
+            raise candidate_mod.StaleCandidate("Duplicate stories changed before automatic merge")
 
     if propagate:
         routed_record = {**record, "candidate": record.get("candidate", prepared["candidate"]), "outcome": "routed", "routed_to": survivor_id, "merged_duplicate": dup_id}
