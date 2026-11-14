@@ -512,6 +512,7 @@ def test_update_review_repairs_human_lock_and_missing_retained_source(context):
         legacy = json.loads(saved["record_json"])
         for field in ("request_budget", "untrusted_proposals", "input_proof", "input_row"):
             legacy.pop(field, None)
+        legacy["schema_version"] = 1
         legacy["policy_hash"] = "a" * 64
         store.db.execute("UPDATE review_jobs SET policy_hash=?,record_json=? WHERE item_id=?",
                          (legacy["policy_hash"], json.dumps(legacy), row_lock["id"]))

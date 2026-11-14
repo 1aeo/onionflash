@@ -28,6 +28,7 @@ def test_new_jobs_keep_one_source_snapshot_in_the_active_owner(context, monkeypa
     drafted = pause_before_prepare(cfg, store, row, monkeypatch)
     draft_record = json.loads(drafted["record_json"])
     assert drafted["envelope_json"] is None
+    assert draft_record["schema_version"] == review_gate.REVIEW_STATE_VERSION == 2
     assert draft_record["input_proof"] == 1 and draft_record["input_row"] == row
     assert draft_record["input_hash"] == row["content_hash"]
     with pytest.raises(AnalysisError):
@@ -50,6 +51,7 @@ def test_legacy_source_proof_is_validated_before_policy_reset(context, legacy):
     if legacy == "full":
         old["input_row"] = json.loads(job(store)["envelope_json"])["row"]
         old.pop("input_hash")
+    old["schema_version"] = 1
     old["policy_hash"] = digest(["legacy review policy"])
     with store.db:
         store.db.execute("UPDATE review_jobs SET policy_hash=?,record_json=? WHERE item_id=?",
@@ -69,6 +71,7 @@ def test_compact_draft_without_source_proof_requires_explicit_retry(context, mon
     old = record(store)
     for field in ("input_proof", "input_row", "request_budget", "untrusted_proposals"):
         old.pop(field)
+    old["schema_version"] = 1
     old_policy = digest(["legacy draft policy"])
     with store.db:
         store.db.execute("UPDATE review_jobs SET policy_hash=?,record_json=? WHERE item_id=?",
@@ -85,7 +88,8 @@ def test_compact_draft_without_source_proof_requires_explicit_retry(context, mon
     assert run(cfg, store, row, Writer(), reviewer(cfg, verdict(), verdict()))["status"] == "published"
 
 
-def test_removing_new_format_markers_cannot_downgrade_to_compact_legacy(context):
+@pytest.mark.parametrize("policy_change", [False, True])
+def test_removing_new_format_markers_cannot_downgrade_to_compact_legacy(context, policy_change):
     cfg, store = context
     row = pending(store)
     with pytest.raises(AnalysisError):
@@ -96,8 +100,55 @@ def test_removing_new_format_markers_cannot_downgrade_to_compact_legacy(context)
     with store.db:
         store.db.execute("UPDATE review_jobs SET record_json=? WHERE item_id=?", (json.dumps(damaged), row["id"]))
     before = job(store)
+    if policy_change:
+        cfg["review"]["model"] = "changed-review-policy"
     writer, checker = Writer(), reviewer(cfg)
     with pytest.raises(AnalysisError, match="damaged") as error:
+        run(cfg, store, row, writer, checker)
+    assert error.value.code == "app.damaged_job"
+    assert not writer.calls and checker.calls == 0 and job(store) == before
+
+
+@pytest.mark.parametrize("policy_change", [False, True])
+def test_new_draft_missing_marker_is_not_a_full_legacy_record(context, monkeypatch, policy_change):
+    cfg, store = context
+    row = pending(store)
+    pause_before_prepare(cfg, store, row, monkeypatch)
+    damaged = record(store)
+    damaged.pop("input_proof")
+    with store.db:
+        store.db.execute("UPDATE review_jobs SET record_json=? WHERE item_id=?", (json.dumps(damaged), row["id"]))
+    before = job(store)
+    if policy_change:
+        cfg["review"]["model"] = "changed-review-policy"
+    writer, checker = Writer(), reviewer(cfg)
+    with pytest.raises(AnalysisError, match="damaged") as error:
+        run(cfg, store, row, writer, checker)
+    assert error.value.code == "app.damaged_job"
+    assert not writer.calls and checker.calls == 0 and job(store) == before
+
+
+@pytest.mark.parametrize("damage", ["missing-version", "boolean-version", "unknown-version", "request_budget", "untrusted_proposals"])
+def test_new_record_identity_and_ledgers_are_required_across_policy_changes(context, damage):
+    cfg, store = context
+    row = pending(store)
+    with pytest.raises(AnalysisError):
+        run(cfg, store, row, Writer(), reviewer(cfg, FetchError("Temporary error", status=500)))
+    damaged = record(store)
+    if damage == "missing-version":
+        damaged.pop("schema_version")
+    elif damage == "boolean-version":
+        damaged["schema_version"] = True
+    elif damage == "unknown-version":
+        damaged["schema_version"] = 99
+    else:
+        damaged.pop(damage)
+    with store.db:
+        store.db.execute("UPDATE review_jobs SET record_json=? WHERE item_id=?", (json.dumps(damaged), row["id"]))
+    before = job(store)
+    cfg["review"]["model"] = "changed-review-policy"
+    writer, checker = Writer(), reviewer(cfg)
+    with pytest.raises(AnalysisError) as error:
         run(cfg, store, row, writer, checker)
     assert error.value.code == "app.damaged_job"
     assert not writer.calls and checker.calls == 0 and job(store) == before

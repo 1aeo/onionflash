@@ -231,8 +231,10 @@ Missing or inconsistent identity fails closed; it is not a new source revision.
 A new draft keeps its source snapshot until the prepared envelope supplies that
 proof, without storing a second copy in the record. Older compact records can
 use a valid retained envelope; a hash-only draft without source proof requires
-an explicit operator retry. Format markers prevent damaged current records from
-being accepted as an older representation.
+an explicit operator retry. New durable jobs use record format version two and
+require their source-proof marker; the version-one reader accepts only the
+shapes emitted by earlier releases. Missing new fields cannot make a current
+record look older, even after a policy change.
 Retained review, proposal and cached-proof policy metadata must also agree before
 an older policy can justify a fresh budget; older verdict schemas remain readable.
 

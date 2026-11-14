@@ -21,6 +21,7 @@ from .analyze import cache_key
 from .llm import AnalysisError, RequestObserver
 from .util import _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, now_iso, saved_object, thread_subject
 
+REVIEW_STATE_VERSION = 2
 MAX_APPROVALS = 2000  # cached approvals kept besides those unfinished jobs pin
 # An item starts a new story only if its newest dated development is at most this many days older
 # than the collection of its current revision: the same window the collector's lookback uses.
@@ -102,7 +103,7 @@ def reset_review_work(store, item_id):
     if row is None:
         return
     item = dict(store.db.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone())
-    record = {"schema_version": 1, "writer": {"key": row["writer_key"]}, "input_hash": item["content_hash"], "input_proof": 1, "input_row": item, "reviews": [], **initial_review_state()}
+    record = {"schema_version": REVIEW_STATE_VERSION, "writer": {"key": row["writer_key"]}, "input_hash": item["content_hash"], "input_proof": 1, "input_row": item, "reviews": [], **initial_review_state()}
     # A damaged draft is dropped, so the writer drafts again.
     keep = saved_object(row["draft"]) is not None
     store.db.execute("""UPDATE review_jobs SET stage='drafted',draft_json=CASE WHEN ? THEN draft_json END,envelope_json=NULL,
@@ -193,20 +194,27 @@ def _saved_job(store, row, config):
                 raise ValueError()
             return value["content_hash"]
 
-        marker = record.get("input_proof")
-        if "input_proof" in record and (type(marker) is not int or marker != 1):
+        version, marker = record.get("schema_version"), record.get("input_proof")
+        if type(version) is not int or version not in {1, REVIEW_STATE_VERSION}:
+            raise ValueError()
+        if version == REVIEW_STATE_VERSION:
+            if type(marker) is not int or marker != 1:
+                raise ValueError()
+            ReviewRequests(record)
+        elif {"input_proof", "request_budget", "untrusted_proposals"} & set(record):
+            # These fields were never emitted by a merged version-one producer.
             raise ValueError()
         if "input_hash" in record and (not isinstance(record["input_hash"], str)
                 or not re.fullmatch(r"[0-9a-f]{64}", record["input_hash"])):
             raise ValueError()
-        if marker == 1:
+        if version == REVIEW_STATE_VERSION:
             if "input_hash" not in record:
                 raise ValueError()
             proof_row = record.get("input_row") if prepared is None else prepared["row"]
-        elif "input_row" in record:
-            # Older durable records carried their complete source in the record.
+        elif "input_row" in record and "input_hash" not in record:
+            # Older records carried their complete source in the record.
             proof_row = record["input_row"]
-        elif ("input_hash" in record and not {"request_budget", "untrusted_proposals"} & set(record)
+        elif ("input_hash" in record and "input_row" not in record
                 and job["policy_hash"] != review.policy_hash(config)):
             # Compact legacy records can use their retained envelope as proof.
             # A hash alone cannot distinguish an old source from damaged state.
@@ -1225,7 +1233,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         prepared_at = job["prepared_at"]
     else:
         job, draft, old = None, None, None
-        record = {"schema_version": 1, "writer": None, "input_hash": row["content_hash"], "input_proof": 1, "input_row": row, "reviews": [], **initial_review_state()}
+        record = {"schema_version": REVIEW_STATE_VERSION, "writer": None, "input_hash": row["content_hash"], "input_proof": 1, "input_row": row, "reviews": [], **initial_review_state()}
         if carry is not None:
             record.update(carry)
         prepared_at = observed
@@ -1242,7 +1250,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         prepared = store.prepare_candidate(row, draft, prepared_at)
         same = old is not None and job["policy_hash"] == policy and _identity(old) == _identity(prepared)
         stage = job["stage"] if same else "review"
-        fresh = {"schema_version": 1, "writer": record["writer"], "input_hash": row["content_hash"], "input_proof": 1, "input_row": row, "reviews": [], "policy_hash": policy, **initial_review_state(),
+        fresh = {"schema_version": REVIEW_STATE_VERSION, "writer": record["writer"], "input_hash": row["content_hash"], "input_proof": 1, "input_row": row, "reviews": [], "policy_hash": policy, **initial_review_state(),
                  "prepared": {key: prepared[key] for key in ("mode", "candidate", "packet", "coverage", "candidate_hash", "source_hash", "coverage_hash", "binding_hash")}}
         # A coverage change invalidates old reviews, not the request budget of
         # this source revision and policy. Explicit operator retry starts afresh.
