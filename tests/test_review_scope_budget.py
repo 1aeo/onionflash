@@ -16,6 +16,45 @@ from helpers import LATER, Writer, job, pending, run_gate as run
 from test_review_request_budget import context, inconsistent, record, reviewer, saved_audit
 
 
+@pytest.mark.parametrize("changed_during", ["writer", "reservation"])
+def test_stale_review_work_preserves_newer_job_before_any_request(context, changed_during):
+    cfg, store = context
+    row = pending(store, item())
+
+    def replace_with_newer_work():
+        with store.db:
+            store.db.execute("UPDATE items SET content_hash='newer-source',status='rejected' WHERE id=?", (row["id"],))
+            store.db.execute(
+                """INSERT OR REPLACE INTO review_jobs
+                   (item_id,writer_key,policy_hash,stage,record_json,approval_key,prepared_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (row["id"], "newer-writer", "newer-policy", "held", '{"newer":true}', "newer-approval", LATER, LATER),
+            )
+
+    class RacingWriter(Writer):
+        def analyze(self, incoming, prior=None):
+            if changed_during == "writer":
+                replace_with_newer_work()
+            return super().analyze(incoming)
+
+    class RacingReviewer:
+        calls = 0
+
+        def review(self, *_args, on_request=None, **_kwargs):
+            if changed_during == "reservation" and not self.calls:
+                replace_with_newer_work()
+            on_request(1)
+            self.calls += 1
+            return verdict()
+
+    checker = RacingReviewer()
+    result = run(cfg, store, row, RacingWriter(), checker)
+    assert result["status"] == "stale" and checker.calls == 0
+    saved = store.db.execute("SELECT writer_key,stage,record_json,approval_key FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
+    assert tuple(saved) == ("newer-writer", "held", '{"newer":true}', "newer-approval")
+    assert not store.stories()
+
+
 def update_case():
     module = evaluator()
     case = next(c for c in module.expand(json.loads((ROOT / "tools/review_cases.json").read_text()))

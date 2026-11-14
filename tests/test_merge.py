@@ -578,7 +578,8 @@ def test_concurrent_auto_merge_race_aborts_safely(context, retire_target):
         assert out["status"] == "published"
 
 
-def test_auto_merge_when_update_arrives_on_newer_duplicate_requeues_onto_original(context):
+@pytest.mark.parametrize("fail_handoff", [False, True])
+def test_auto_merge_when_update_arrives_on_newer_duplicate_requeues_onto_original(context, monkeypatch, fail_handoff):
     """When the incoming update is attached to the newer duplicate, merge newer -> older and re-queue the item onto older."""
     cfg, store = context
     older = _publish(store, item(
@@ -616,7 +617,28 @@ def test_auto_merge_when_update_arrives_on_newer_duplicate_requeues_onto_origina
     skip_same["criteria"]["new_information"]["reason"] = f"Same event as {older['id']}."
     draft_upd = update_analysis(update="The stall only occurs when DirCache is disabled.",
                                 evidence=["Confirmed the stall only occurs when DirCache is disabled"])
-    res_routed = run(cfg, store, row_upd, Writer(draft_upd), Reviewer(skip_same, skip_same), observed=LATER)
+    writer, checker = Writer(draft_upd), Reviewer(skip_same, skip_same)
+    if fail_handoff:
+        def cannot_save_handoff(*_args):
+            raise sqlite3.OperationalError("Review handoff could not be persisted")
+
+        monkeypatch.setattr(review_gate, "_save_handoff", cannot_save_handoff)
+        before_stories = list(store.db.execute("SELECT id,payload FROM stories ORDER BY id"))
+        before_analyses = store.db.execute("SELECT COUNT(*) FROM analyses").fetchone()[0]
+        with pytest.raises(sqlite3.OperationalError, match="handoff"):
+            run(cfg, store, row_upd, writer, checker, observed=LATER)
+        # The merge and association must roll back together if the durable
+        # budget cannot be handed to the survivor. Physical calls stay spent.
+        assert list(store.db.execute("SELECT id,payload FROM stories ORDER BY id")) == before_stories
+        assert editorial.retired(store.db, story_id=newer["id"]) is None
+        unchanged = store.db.execute("SELECT status,story_id FROM items WHERE id=?", (row_upd["id"],)).fetchone()
+        assert tuple(unchanged) == ("pending", newer["id"])
+        assert store.db.execute("SELECT COUNT(*) FROM analyses").fetchone()[0] == before_analyses
+        saved = store.db.execute("SELECT stage,record_json FROM review_jobs WHERE item_id=?", (row_upd["id"],)).fetchone()
+        assert saved["stage"] == "verify"
+        assert json.loads(saved["record_json"])["request_budget"]["reserved"] == len(checker.calls) == 2
+        return
+    res_routed = run(cfg, store, row_upd, writer, checker, observed=LATER)
     assert res_routed["status"] == "routed" and res_routed["review_calls"] == 2
     saved = store.db.execute("SELECT stage,record_json FROM review_jobs WHERE item_id=?", (row_upd["id"],)).fetchone()
     assert saved["stage"] == "routed" and json.loads(saved["record_json"])["request_budget"]["reserved"] == 2
