@@ -96,10 +96,12 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `failed.review.invalid_input` | The review request could not be encoded as UTF-8 JSON. |
 | `failed.review.truncated` | A review reply was cut off or refused. |
 | `failed.review.invalid_json` | A review reply was not a JSON object. |
+| `failed.review.request_limit` | The item's durable review request budget is exhausted; no further request was sent. |
 | `failed.app.invalid_tag_name` | A collected tag has an empty or overlong name. |
 | `failed.app.unexpected` | Processing failed unexpectedly. |
 | `failed.app.damaged_item` | The item's saved copy is damaged. |
 | `failed.app.damaged_job` | The item's saved review job is damaged. |
+| `failed.app.source_proof_unavailable` | A saved draft has no verifiable source snapshot; processing requires an explicit retry. |
 | `merged.auto.same_event` | Both review and fresh verification confirmed two published stories report the same event, and the newer story merged into the earlier one. |
 | `operator.retried` | An operator retried a rejected, dismissed or failed item. |
 | `operator.reconsidered` | An operator retried an ignored (skipped) item. |

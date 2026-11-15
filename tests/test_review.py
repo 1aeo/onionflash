@@ -347,8 +347,9 @@ def test_prompts_coverage_isolation_repairs_and_transport_settings(monkeypatch):
     fake = FakeLLM(completion(verdict()))
     monkeypatch.setattr("onionflash.llm.HttpClient", lambda *a, **kw: fake)
     with review.Reviewer(cfg_llm(), deadline=123.5) as dl_chk:
+        dl_chk.clock = lambda: 100.0
         dl_chk.review(candidate(), packet())
-        assert fake.deadline == 123.5
+        assert dl_chk.deadline == 123.5 and getattr(fake, "deadline", None) is None
 
 
 @pytest.mark.parametrize("criterion,outcome,expected", [

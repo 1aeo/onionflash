@@ -7,7 +7,8 @@ import stat
 
 import pytest
 
-from helpers import DATE, ROOT, load_evaluator, verdict
+from helpers import DATE, ROOT, load_evaluator, scripted_completion, verdict
+from onionflash import review_gate
 from onionflash.config import DEFAULTS
 from onionflash.review import CRITERIA, RELEASE_ISSUE, _packet_refs, final_holds, validate_review
 from onionflash.source_packet import build_packet
@@ -46,7 +47,9 @@ def scripted(reply):
         def __init__(self, *args, **kwargs): pass
         def __enter__(self): return self
         def __exit__(self, *args): pass
-        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False):
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False, on_request=None):
+            if on_request is not None:
+                on_request(1)
             return full(reply(verification), packet, update=update)
     return Reviewer
 
@@ -166,7 +169,9 @@ def test_editorial_skips_misses_coverage_verification_and_final_checks(evaluatio
     cov_case = next(c for c in corpus() if c.get("existing_coverage", {}).get("recent"))
     seen = []
     class Inspector(scripted(lambda _: {"verdict": "skip"})):
-        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, on_request=None):
+            if on_request is not None:
+                on_request(1)
             seen.append(coverage)
             return full({"verdict": "skip"} if verification else {"verdict": "revise", "repair": {"summary": "A source-supported statement."}}, packet)
     monkeypatch.setattr(module, "EvaluationReviewer", Inspector)
@@ -278,7 +283,7 @@ def test_draft_mode_drafts_once_and_isolates_writer_diagnostics(evaluation, tmp_
     replies = iter([{"invalid": True}, verdict("approve"), verdict("approve")])
     monkeypatch.setattr(module, "EvaluationReviewer", orig_eval_reviewer)
     monkeypatch.setattr(module, "Analyzer", FlakyWriter)
-    monkeypatch.setattr(module.Reviewer, "complete", lambda self, *a: next(replies))
+    monkeypatch.setattr(module.Reviewer, "complete", scripted_completion(lambda *a: next(replies)))
     with module.EvaluationReviewer(config) as fresh_reviewer:
         assert fresh_reviewer.last_decoded is None
     err_out = tmp_path / "draft-errors.jsonl"
@@ -326,7 +331,7 @@ def test_omissions_holds_model_verdict_release_repairs_and_fix_loop(evaluation, 
     assert rec_loop["published_candidate"]["why_it_matters"] == "" and rec_loop["final_verdict"] == "approve"
 
     monkeypatch.undo()
-    monkeypatch.setattr(module.Reviewer, "complete", lambda self, *a: verdict("skip", criterion="source_support"))
+    monkeypatch.setattr(module.Reviewer, "complete", scripted_completion(lambda *a: verdict("skip", criterion="source_support")))
     conv_out = tmp_path / "converted.jsonl"
     assert module.evaluate(config, [by_id["bastet-original"]], conv_out)["matched"] == 1
     rec_conv = json.loads(conv_out.read_text().splitlines()[0])
@@ -334,7 +339,7 @@ def test_omissions_holds_model_verdict_release_repairs_and_fix_loop(evaluation, 
     assert rec_conv["reviews"][0]["result"]["model_verdict"] == "skip" and "verification" not in rec_conv
 
     payloads = []
-    monkeypatch.setattr(module.Reviewer, "complete", lambda self, prompt, payload, *a: (payloads.append(payload), next(rel_replies))[1])
+    monkeypatch.setattr(module.Reviewer, "complete", scripted_completion(lambda prompt, payload, *a: (payloads.append(payload), next(rel_replies))[1]))
     fixed = verdict("revise", repair={"title": "Opt-in exit proxying merged", "category": "feature", "tags": ["feature"]}, criterion="status")
     for name, rel_replies, holds, pub in (("unfixed", iter([verdict(), verdict()]), {"held.review.release_labels": 1}, None),
                                           ("fixed", iter([verdict(), fixed, verdict()]), {}, "Opt-in exit proxying merged")):
@@ -388,7 +393,9 @@ def test_judged_scoring_thresholds_and_cli_main(evaluation, tmp_path, monkeypatc
     ]})
 
     class Discerning(scripted(None)):
-        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False):
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False, on_request=None):
+            if on_request is not None:
+                on_request(1)
             flawed = "update their configurations" in candidate["why_it_matters"] or candidate["confidence"] == "confirmed"
             return full({"verdict": "hold" if flawed else "approve"}, packet, update=update)
 
@@ -490,9 +497,9 @@ def test_latest_update_scope_scans_only_new_entry_and_excludes_draft_mode(evalua
         no_updates = {**by_id["update-fix-merged"], "candidate": {k: v for k, v in by_id["update-fix-merged"]["candidate"].items() if k != "updates"}}
         module.evaluate(config, [no_updates], tmp_path / "empty-upd.jsonl")
 
-    seen_scopes, orig_call = [], module.call_review
-    monkeypatch.setattr(module, "call_review", lambda rev, stage, text, prep: (
-        seen_scopes.append((prep["review_scope"], prep["mode"])) or orig_call(rev, stage, text, prep)))
+    seen_scopes, orig_call = [], module.advance_review
+    monkeypatch.setattr(module, "advance_review", lambda rev, stage, text, prep, state, requests: (
+        seen_scopes.append((prep["review_scope"], prep["mode"])) or orig_call(rev, stage, text, prep, state, requests)))
     monkeypatch.setattr(module, "EvaluationReviewer", scripted(lambda _: {"verdict": "approve"}))
     assert module.evaluate(config, [by_id["update-fix-merged"], by_id["bastet-corrected"]], tmp_path / "scopes.jsonl")["matched"] == 2
     assert seen_scopes == [("latest_update", "update"), ("latest_update", "update"), ("story", "story"), ("story", "story")]
@@ -529,7 +536,9 @@ def test_expected_same_story_scores_matched_missed_wrong_unroutable_and_false_ro
             def __init__(self, *args, **kwargs): pass
             def __enter__(self): return self
             def __exit__(self, *args): pass
-            def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False):
+            def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False, on_request=None):
+                if on_request is not None:
+                    on_request(1)
                 v_name, same = reply_fn(candidate, verification)
                 base = verdict(v_name, update=update, criterion="new_information" if v_name == "skip" else "operational_advice")
                 if v_name == "skip":
@@ -575,7 +584,7 @@ def test_expected_same_story_scores_matched_missed_wrong_unroutable_and_false_ro
 
     with monkeypatch.context() as mp:
         mp.setattr(module, "EvaluationReviewer", routed_reviewer(lambda *_: ("approve", target_id)))
-        mp.setattr(module, "next_step", lambda reviews, text, prepared: ("route", target_id))
+        mp.setattr(review_gate, "next_step", lambda reviews, text, prepared: ("route", target_id))
         out_gate = tmp_path / "routes-gate.jsonl"
         res_gate = module.evaluate(config, [pos], out_gate)
         rec_gate = json.loads(out_gate.read_text().splitlines()[0])

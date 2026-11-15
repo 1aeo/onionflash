@@ -15,11 +15,12 @@ import traceback
 
 from . import __version__, decisions, doctor, editorial, rejection
 from .analyze import AnalysisError, Analyzer
+from .llm import CompletionDeferred
 from .collect import CollectionError, collect_source
 from .comments import RUN_BUDGET_SECONDS as COMMENTS_BUDGET, enrich_comments, merge_cached_comments, status as comments_status
 from .config import DEFAULTS, load_config
 from .publication import build
-from .review import Reviewer
+from .review import Reviewer, ReviewLimitReached
 from .review_gate import process_item, status as review_status
 from .store import Store, source_due
 from .transport import HttpClient
@@ -244,16 +245,30 @@ def run(config: dict, store: Store) -> dict:
                 report["review_cache_hits"] += bool(result["cache_hit"])
                 report["review_stale"] += result["status"] == "stale"
                 report["review_routed"] += result["status"] == "routed"
-            except AnalysisError as exc:
-                store.defer(row["id"], str(exc), config["llm"], now_iso(), terminal=not exc.retryable, code=exc.code)
+                if result.get("budget_reached"):
+                    report["budget_reached"] = True
+                    break
+            except ReviewLimitReached:
+                # The gate already checked the exact source and recorded this
+                # terminal rejection; it must not become a second queue strike.
                 report["analysis_failed"] += 1
+            except CompletionDeferred:
+                report["budget_reached"] = True
+                break
+            except AnalysisError as exc:
+                deferred = store.defer(row["id"], str(exc), config["llm"], now_iso(), terminal=not exc.retryable,
+                                       code=exc.code, expected_row=row)
+                report["analysis_failed"] += deferred
+                report["review_stale"] += not deferred
                 if exc.retryable:
                     endpoint_failures += 1
             except sqlite3.Error:
                 raise
             except Exception as exc:
-                store.defer(row["id"], _unexpected_error(exc), config["llm"], now_iso(), terminal=True)
-                report["analysis_failed"] += 1
+                deferred = store.defer(row["id"], _unexpected_error(exc), config["llm"], now_iso(),
+                                       terminal=True, expected_row=row)
+                report["analysis_failed"] += deferred
+                report["review_stale"] += not deferred
         report["model_calls"] = analyzer.calls + reviewer.calls + linker.calls
     report["decisions"] = decisions.codes_after(store.db, first)
     report["pending_analysis"] = store.pending_count()

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
+from .config import completion_budget_seconds
 from .schema import CATEGORIES, CONFIDENCES, STATES
 from .transport import DeadlineReached, FetchError, HttpClient
 
@@ -17,6 +19,23 @@ class AnalysisError(Exception):
         self.retryable = retryable
         if code is not None:
             self.code = code
+
+
+class CompletionDeferred(Exception):
+    """No request was sent because the run no longer admits completions."""
+
+
+class RequestObserver:
+    """A reservation callback may also persist transport outcomes before parsing."""
+
+    def __call__(self, delta: int) -> None:
+        raise NotImplementedError
+
+    def response_received(self) -> None:
+        pass
+
+    def transport_failed(self) -> None:
+        pass
 
 
 def has_invalid_text_chars(value: str) -> bool:
@@ -110,23 +129,35 @@ def json_object(text: str, code: str = "writer.invalid_json") -> dict:
     return result
 
 
+def generation_options(settings: dict) -> dict:
+    """The declared generation fields sent to the completion endpoint, without credentials."""
+    options = {"temperature": settings.get("temperature", 0), "max_tokens": settings["max_output_tokens"]}
+    for key in ("top_p", "top_k", "min_p", "presence_penalty", "repetition_penalty", "reasoning_effort"):
+        if key in settings:
+            options[key] = settings[key]
+    if settings["send_chat_template_kwargs"]:
+        options["chat_template_kwargs"] = {"enable_thinking": settings["enable_thinking"]}
+    return options
+
+
 class CompletionClient:
     stage = "writer"
+    REQUEST_POLICY = {"transport": {"retry_attempts": 1, "max_redirects": 0},
+                      "deadline_refund": "before_dispatch_only",
+                      "run_deadline": "admission_before_and_after_reservation"}
 
     def __init__(self, config: dict, deadline: float | None = None):
-        self.deadline = deadline  # absolute time.monotonic() limit for model requests
+        self.deadline = deadline  # absolute monotonic admission boundary, not a transport cutoff
+        self.clock = time.monotonic
         self.llm = config["llm"]
-        # One attempt per endpoint: the fallback endpoints are the retry, and a
-        # failed item backs off to a later run instead of stretching this one.
+        # Each endpoint gets one metered request. Redirect hops cannot bypass
+        # reservations; only explicitly configured fallbacks may send again.
         self.http_settings = {
             **config["http"],
             **{k: v for k, v in self.llm.items() if k in config["http"]},
             # The fixed total must not cut short a longer configured response timeout.
-            "total_timeout_seconds": max(
-                self.llm["total_timeout_seconds"],
-                self.llm["timeout_seconds"] + self.llm["connect_timeout_seconds"],
-            ),
-            "retry_attempts": 1,
+            "total_timeout_seconds": completion_budget_seconds(self.llm),
+            **self.REQUEST_POLICY["transport"],
         }
         self.client: HttpClient | None = None
         self.calls = 0  # requests sent, for the run report
@@ -144,8 +175,15 @@ class CompletionClient:
     def _fail_retryable(self, message: str) -> AnalysisError:
         return AnalysisError(message, retryable=True)
 
-    def complete(self, prompt: str, payload: dict, schema: dict, name: str) -> dict:
+    def _admit(self, failure: AnalysisError | None = None) -> None:
+        if self.deadline is not None and self.clock() >= self.deadline:
+            if failure is not None:
+                raise failure
+            raise CompletionDeferred("Run completion admission window has ended")
+
+    def complete(self, prompt: str, payload: dict, schema: dict, name: str, *, on_request=None) -> dict:
         """One fresh request; drafting, review and link checks share transport policy."""
+        self._admit()
         if not self.llm["base_url"]:
             raise self._fail_retryable("LLM endpoint is not configured")
         key = os.environ.get(self.llm["api_key_env"], "")
@@ -156,28 +194,37 @@ class CompletionClient:
                 self.http_settings,
                 allowed_networks=self.llm["allowed_networks"],
                 allow_http=self.llm["allow_http"],
+                clock=self.clock,
             )
-            self.client.deadline = self.deadline
         try:
             content = json.dumps(payload, ensure_ascii=False, allow_nan=False)
             content.encode("utf-8")
         except (ValueError, TypeError, RecursionError) as exc:
             raise AnalysisError("Model input is not valid UTF-8 JSON", code=self.stage + ".invalid_input") from exc
+        options = generation_options(self.llm)
         request = {
             "model": self.llm["model"],
             "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": content}],
-            "temperature": 0,
-            "max_tokens": self.llm["max_output_tokens"],
+            "temperature": options.pop("temperature"),
+            "max_tokens": options.pop("max_tokens"),
             "response_format": {"type": "json_schema", "json_schema": {"name": name, "strict": True, "schema": schema}},
         }
-        if self.llm["send_chat_template_kwargs"]:
-            request["chat_template_kwargs"] = {"enable_thinking": self.llm["enable_thinking"]}
-        return self._complete(request, key)
+        request.update(options)
+        return self._complete(request, key, **({"on_request": on_request} if on_request is not None else {}))
 
-    def _complete(self, request: dict, key: str) -> dict:
+    def _complete(self, request: dict, key: str, *, on_request=None) -> dict:
         """POST one chat completion; only transport failures move on to a fallback."""
-        failure = AnalysisError("All LLM endpoints failed", retryable=True)
+        failure = None
         for base_url in [self.llm["base_url"], *self.llm["fallback_base_urls"]]:
+            self._admit(failure)
+            if on_request is not None:
+                on_request(1)  # Reserve durably before any endpoint attempt.
+            try:
+                self._admit(failure)
+            except (CompletionDeferred, AnalysisError):
+                if on_request is not None:
+                    on_request(-1)
+                raise
             self.calls += 1
             try:
                 response = self.client.request(
@@ -189,15 +236,27 @@ class CompletionClient:
                 break
             except FetchError as exc:
                 # An endpoint or credential problem is not this item's fault.
-                failure = AnalysisError(
+                current_failure = AnalysisError(
                     "LLM request failed" + (f" (HTTP {exc.status})" if exc.status else ""),
                     retryable=True,
                 )
-                if isinstance(exc, DeadlineReached):  # refused unsent, as every later endpoint would be
-                    self.calls -= 1
-                    raise failure from None
+                if isinstance(exc, DeadlineReached):
+                    # Only refusal before dispatch proves the reservation unused.
+                    # A timed-out request may already have reached the endpoint.
+                    if not exc.request_started:
+                        self.calls -= 1
+                        if on_request is not None:
+                            on_request(-1)
+                    if isinstance(on_request, RequestObserver):
+                        on_request.transport_failed()
+                    raise failure or current_failure from None
+                if isinstance(on_request, RequestObserver):
+                    on_request.transport_failed()
+                failure = current_failure
         else:
             raise failure
+        if isinstance(on_request, RequestObserver):
+            on_request.response_received()
         try:
             choice = response.json()["choices"][0]
             finished, content = choice["finish_reason"], choice["message"]["content"]

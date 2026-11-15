@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 
 from . import decisions, editorial, render
 from .analyze import AnalysisError, CompletionClient
+from .llm import CompletionDeferred
 from .util import canonical_url, digest, format_utc, parse_utc, saved_object
 
 # Append-only voting directory authority nicknames; keeping retired names lets open incidents close.
@@ -799,6 +800,9 @@ def _resolve_host_link(
             return "pending_link", None, endpoint_failures
         try:
             same = bool(linker.confirm(inc, host["public"]) if hasattr(linker, "confirm") else linker(inc, host["public"]))
+        except CompletionDeferred:
+            _log_incident(db, inc["key"], "held.network.link_pending", observed, source_id, inc, story_id=host["id"])
+            return "pending_link", None, endpoint_failures
         except AnalysisError as exc:
             if exc.retryable:
                 endpoint_failures += 1

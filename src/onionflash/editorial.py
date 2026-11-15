@@ -183,11 +183,11 @@ def _held_item_ids(db, story_id: str, cluster_key: str | None = None) -> list[st
 
 
 def requeue_items(db, item_ids: list[str]) -> None:
+    """Requeue held work while retaining its durable review budget."""
     if not item_ids:
         return
     marks = ",".join("?" * len(item_ids))
     db.execute(f"UPDATE items SET {RESET_PENDING_SQL} WHERE id IN ({marks})", item_ids)
-    db.execute(f"DELETE FROM review_jobs WHERE item_id IN ({marks})", item_ids)
 
 
 def _published(db, story_id: str) -> dict | None:
@@ -508,8 +508,6 @@ def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str 
         ).rowcount
         if held_ids:
             if surv["control"] and surv["control"]["locked"]:
-                marks = ",".join("?" * len(held_ids))
-                db.execute(f"DELETE FROM review_jobs WHERE item_id IN ({marks})", held_ids)
                 for hid in held_ids:
                     record_held(db, survivor_id)
                     decisions.record(db, hid, "held.gate.story_locked", stamp, merged_from=story_id)

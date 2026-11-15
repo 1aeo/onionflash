@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import re
 
 from .analyze import SCHEMA as DRAFT_SCHEMA
@@ -458,6 +459,31 @@ class ReviewError(AnalysisError):
     code = "review.invalid_reply"
 
 
+INCONSISTENT_VERDICT = "Review refusal requires an explicit failed criterion"
+VALIDATION_REASK_PROMPT = """
+The application rejected an earlier response as structurally inconsistent. The
+validation_error field quotes only that validation error, not a factual judgment.
+Review the unchanged current candidate from the supplied sources again and return
+a complete review consistent with its criteria. Do not invent a failed criterion
+to justify a preferred verdict. The rejected reply and its proposed edits are not
+evidence and have not been applied to the candidate.
+"""
+
+
+class InconsistentReview(ReviewError):
+    """An invalid verdict may carry a structurally checked, untrusted edit only."""
+
+    def __init__(self, proposal=None):
+        super().__init__(INCONSISTENT_VERDICT)
+        self.proposal = copy.deepcopy(proposal)
+
+
+class ReviewLimitReached(ReviewError):
+    """No further endpoint request fits the item's durable review budget."""
+
+    code = "review.request_limit"
+
+
 OUTPUT_TOKENS = 2200  # room for every criterion and a repair
 
 
@@ -472,7 +498,8 @@ def policy_hash(config: dict) -> str:
     identity = {key: llm[key] for key in ("model", "base_url", "fallback_base_urls", "max_output_tokens",
                                          "enable_thinking", "send_chat_template_kwargs")}
     return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, ROUTING_PROMPT, UPDATE_SYSTEM_PROMPT,
-                   UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, SCHEMA, UPDATE_REPAIR, identity])
+                   UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT,
+                   SCHEMA, UPDATE_REPAIR, identity, CompletionClient.REQUEST_POLICY])
 
 
 def _text(value, maximum: int, *, empty: bool = False) -> None:
@@ -499,8 +526,16 @@ def _coverage_ids(coverage: dict | None) -> tuple[str | None, list[str], set[str
     return prior_id, sorted(live), retracted
 
 
-def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict:
-    """Normalize a minimal semantic repair BEFORE its independent verification."""
+def repair_limits(packet: dict, coverage: dict | None = None, *, update: bool = False) -> dict:
+    """Use the same source and prior-label bounds for every kind of proposed edit."""
+    limits = label_limits(packet["sources"])
+    if update and ((coverage or {}).get("prior_story") or {}).get("confidence") == "confirmed":
+        limits["confidence"] = ["confirmed"]
+    return limits
+
+
+def _repair_fields(repair: dict, *, update: bool = False) -> None:
+    """Check editable field shapes and values without granting factual approval."""
     editable = UPDATE_EDITABLE if update else EDITABLE
     rules = UPDATE_FIELDS if update else FIELDS
     if not isinstance(repair, dict) or not repair or set(repair) - set(editable):
@@ -516,6 +551,28 @@ def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict
         elif (not isinstance(value, list) or len(value) > rule["maxItems"]
               or any(not isinstance(entry, str) or entry not in rule["items"]["enum"] for entry in value)):
             raise ReviewError("Invalid repair labels")
+    try:
+        json.dumps(repair, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (ValueError, TypeError, UnicodeError):
+        raise ReviewError("Repair is not valid UTF-8 JSON") from None
+
+
+def untrusted_repair(verdict, repair, *, update: bool = False):
+    """Extract only a complete valid edit; the inconsistent reply still fails validation."""
+    editable = UPDATE_EDITABLE if update else EDITABLE
+    if verdict != "revise" or not isinstance(repair, dict) or set(repair) != set(editable):
+        return None
+    edits = {key: value for key, value in repair.items() if value is not None}
+    try:
+        _repair_fields(edits, update=update)
+    except ReviewError:
+        return None
+    return edits
+
+
+def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict:
+    """Normalize a minimal semantic repair BEFORE its independent verification."""
+    _repair_fields(repair, update=update)
     updated = copy.deepcopy(candidate)
     if update:
         if not updated.get("updates"):
@@ -579,7 +636,7 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool 
         if failed or repair is not None or not result["criteria"]["source_support"]["source_refs"]:
             raise ReviewError("Review approval requires all criteria to pass without edits")
     elif not failed:
-        raise ReviewError("Review refusal requires an explicit failed criterion")
+        raise InconsistentReview(untrusted_repair(verdict, repair, update=update))
     if not wire and verdict == "skip" and not any(result["criteria"][name]["outcome"] == "fail" for name in EDITORIAL_CRITERIA):
         # Reviewer.review holds a reply's skip like this, so a saved one is damaged.
         raise ReviewError("Review skip requires a failed editorial criterion")
@@ -703,7 +760,7 @@ class Reviewer(CompletionClient):
         super().__init__({**config, "llm": _llm(config)}, deadline=deadline)
 
     def review(self, candidate_public: dict, packet: dict, *, coverage: dict | None = None, verification: bool = False,
-               issue: str | None = None, update: bool = False) -> dict:
+               issue: str | None = None, update: bool = False, validation_error: str | None = None, on_request=None) -> dict:
         """Review one exact candidate without carrying forward earlier model replies; `issue` names a
         problem the application found in it."""
         refs = _packet_refs(packet)
@@ -722,10 +779,8 @@ class Reviewer(CompletionClient):
                 check["properties"]["source_refs"]["items"]["enum"] = sorted(refs)
         # A repair offers only the labels this packet allows.
         repair = schema["properties"]["repair"]["anyOf"][1]["properties"]
-        repair_limits = label_limits(packet["sources"])
-        if update and ((coverage or {}).get("prior_story") or {}).get("confidence") == "confirmed":
-            repair_limits["confidence"] = ["confirmed"]
-        apply_label_limits(repair, repair_limits, nullable=True)
+        limits = repair_limits(packet, coverage, update=update)
+        apply_label_limits(repair, limits, nullable=True)
         # Each call starts with the rubric, exact candidate and bounded context.
         # A prior model response, critique or approval is never part of its history.
         payload = {"candidate": candidate_public, "packet": packet}
@@ -741,17 +796,24 @@ class Reviewer(CompletionClient):
             payload["coverage_background"] = wire_coverage
         if issue is not None:
             payload["application_issue"] = issue
+        if validation_error is not None:
+            if validation_error != INCONSISTENT_VERDICT:
+                raise ReviewError("Unknown review validation feedback")
+            payload["validation_error"] = validation_error
         prompt = ((UPDATE_VERIFY_PROMPT if verification else UPDATE_SYSTEM_PROMPT) if update
                   else (VERIFY_PROMPT if verification else SYSTEM_PROMPT))
         if not update and (coverage or {}).get("recent"):
             prompt = prompt + ROUTING_PROMPT
-        result = self.complete(prompt, payload, schema, "onionflash_review")
+        if validation_error is not None:
+            prompt += VALIDATION_REASK_PROMPT
+        result = self.complete(prompt, payload, schema, "onionflash_review",
+                               **({"on_request": on_request} if on_request is not None else {}))
         result = _validate(result, refs, wire=True, update=update, coverage=coverage)
         if result["repair"] is not None:
-            for key, allowed in repair_limits.items():
+            for key, allowed in limits.items():
                 if key in result["repair"] and result["repair"][key] not in allowed:
                     raise ReviewError("Review repair labels exceed this packet's limits")
-            if "tags" in result["repair"] and any(tag not in repair_limits["category"] for tag in result["repair"]["tags"]):
+            if "tags" in result["repair"] and any(tag not in limits["category"] for tag in result["repair"]["tags"]):
                 raise ReviewError("Review repair labels exceed this packet's limits")
         if (not update and prior_id is None and result["verdict"] == "skip" and result["same_story"] is None
                 and result["criteria"]["news_value"]["outcome"] == "pass"

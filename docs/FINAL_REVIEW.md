@@ -175,6 +175,69 @@ and an update-scope skip that names an overlapping published duplicate in
 `same_story`. A run resumes items waiting for a verification or a repair before
 it starts others.
 
+A refusal whose criteria all pass remains an invalid reply, never an approval.
+Only a complete, structurally valid `revise` edit may become an **untrusted
+proposal**. It must change the text, obey the packet's label limits, avoid a
+previously reviewed candidate, and leave literal tag notices untouched. The
+application saves its error, edits, candidate hashes and disposition separately
+from validated reviews, then requires a fresh verification of that exact text.
+The previous reply is never included in the verifier's input. Pending proposals
+bypass cached approvals and cannot borrow facts verified for an earlier text.
+
+If that invalid reply has no usable edit, the ledger permits one logical
+validation-correction request. It reviews the same candidate, packet, scope and
+coverage, with only a fixed corrective instruction and the application's quoted
+validation error added. The rejected criteria and proposed edits are not input or
+approval evidence. A valid correction enters the ordinary review stage: an initial
+approval still needs its fresh verification, and an existing valid review remains
+the only possible disagreement anchor. Literal tags and fixed labels are not edited
+to make a rejected proposal usable.
+
+The correction's trigger and each physical attempt are durable. Confirmed
+transport failures may continue that same logical correction within the shared
+seven-request limit. A successful response is recorded before parsing, so an
+unusable answer or an interrupted validation cannot obtain a second semantic
+correction. An unknown in-flight reservation fails closed; a known unsent deadline
+can refund its physical reservation. Automatic context changes abandon stale
+feedback while retaining the correction slot and spent requests.
+
+For untrusted-edit recovery after an invalid initial reply, the first valid
+verification is the first trusted news decision. Later trusted decisions still obey the ordinary
+disagreement rule. A changed source context discards the pending proposal and
+starts again from a freshly assembled candidate. Raw inconsistencies, accepted
+proposals and unresolved recovery outcomes remain distinct in the private
+evaluation; a hold caused by an unusable or repeated repair is not a successful
+recovery. Malformed or no-op edits are never applied. Damaged saved recovery state
+always fails closed.
+
+Every endpoint attempt, including invalid replies and fallback attempts, spends
+the same seven-request budget. Reservations are saved before sending, so an
+interruption or coverage change cannot replenish them. An unsent deadline
+refusal is refunded; a crash can conservatively retain an uncertain reservation.
+Exhaustion rejects the item with `failed.review.request_limit`. A changed source
+revision/policy or explicit operator retry starts a new budget. The evaluator
+reports observed endpoint attempts in `review_request_count`.
+Automatic routing and duplicate-merge handoffs retain their exact review proof and
+spent requests until the item is drafted for its new target. Switching from a
+whole story to its latest update, or refreshing a draft after prior coverage
+changes, does not replenish that budget. Update repairs may change only the new
+entry's text and allowed labels; earlier prose, update history, dates and citations
+remain immutable, including during recovery from an inconsistent reply.
+An update held behind an editorial lock also retains its ledger through unlock
+or transfer to a merge survivor. Its old context never authorizes new prose.
+Saved job identity is checked against its source payload and retained envelope
+before an automatic context change can discard proof or start a new budget.
+Missing or inconsistent identity fails closed; it is not a new source revision.
+A new draft keeps its source snapshot until the prepared envelope supplies that
+proof, without storing a second copy in the record. Older compact records can
+use a valid retained envelope; a hash-only draft without source proof requires
+an explicit operator retry. New durable jobs use record format version two and
+require their source-proof marker; the version-one reader accepts only the
+shapes emitted by earlier releases. Missing new fields cannot make a current
+record look older, even after a policy change.
+Retained review, proposal and cached-proof policy metadata must also agree before
+an older policy can justify a fresh budget; older verdict schemas remain readable.
+
 ## Final checks
 
 A verified approval publishes only if four fixed checks also pass. They read the

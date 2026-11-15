@@ -289,7 +289,10 @@ def _own_diff(db, previous: dict, item: dict, writer: str | None, *, item_id: st
     else:
         body_changed = any(
             unquoted_text(str(item.get(k) or "")).strip() != unquoted_text(str(prior_snap.get(k) or "")).strip()
-            for k in ("title", "content", "upstream_state")
+            for k in ("title", "upstream_state")
+        ) or (
+            unquoted_text(str(item.get("source_content", item.get("content")) or "")).strip()
+            != unquoted_text(str(prior_snap.get("source_content", prior_snap.get("content")) or "")).strip()
         )
     return True, prior_snap, cutoff, changed_ids, body_changed
 
@@ -331,7 +334,7 @@ def own_update_input(db, row: dict, item: dict, *, existing=_UNSET) -> tuple[str
         return "story", item
     is_own, old_item, cutoff, changed_ids, body_changed = _own_diff(db, previous, item, writer, item_id=row["id"])
     if not is_own:
-        raw = item.get("content") or ""
+        raw = item.get("source_content", item.get("content")) or ""
         is_reply = bool(_REPLY_SUBJECT.search(item.get("title") or ""))
         if (
             "/hyperkitty/list/" in (item.get("url") or "")
@@ -341,6 +344,7 @@ def own_update_input(db, row: dict, item: dict, *, existing=_UNSET) -> tuple[str
             stripped = _unquoted_reply(raw)
             if stripped != raw:
                 filtered = json.loads(json.dumps(item))
+                filtered.pop("source_content", None)
                 filtered["content"] = stripped
                 if (is_reply or not normalize_evidence(item.get("title") or "")) and len(normalize_evidence(stripped)) < MIN_EVIDENCE_CHARS:
                     return "skip", filtered
@@ -357,7 +361,8 @@ def own_update_input(db, row: dict, item: dict, *, existing=_UNSET) -> tuple[str
     filtered = json.loads(json.dumps(item))
     filtered["public_comments"] = new_notes
     filtered["title"] = (unquoted_text(item["title"]).strip() or item["title"]) if body_changed else ""
-    filtered["content"] = unquoted_text(item["content"]) if body_changed else ""
+    description = filtered.pop("source_content", filtered.get("content", ""))
+    filtered["content"] = unquoted_text(description) if body_changed else ""
     desc, kept_notes = analysis_context(filtered)
     texts = [filtered["title"], desc, *(note["body"] for note in kept_notes)] if body_changed else [note["body"] for note in kept_notes]
     if not any(len(normalize_evidence(text)) >= MIN_EVIDENCE_CHARS for text in texts):

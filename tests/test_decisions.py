@@ -200,7 +200,9 @@ def run_with(monkeypatch, cfg, store, error=None):
     class Replies:
         calls = 0
 
-        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None):
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, on_request=None):
+            if on_request is not None:
+                on_request(1)
             url = packet["sources"][0]["url"]
             if url.endswith("/fail"):
                 raise error
@@ -219,9 +221,11 @@ def run_with(monkeypatch, cfg, store, error=None):
 @pytest.mark.parametrize("error,code", [
     (AnalysisError("Model evidence quote 1 is not an exact excerpt", code="writer.evidence_not_exact"), "failed.writer.evidence_not_exact"),
     (review.ReviewError("Review response fields do not match schema"), "failed.review.invalid_reply"),
+    (AnalysisError("Saved draft source proof is unavailable", code="app.source_proof_unavailable"),
+     "failed.app.source_proof_unavailable"),
     (RuntimeError("boom"), "failed.app.unexpected"),
     (AnalysisError("LLM request failed", retryable=True), None),
-], ids=["writer", "review", "unexpected", "retryable"])
+], ids=["writer", "review", "source-proof", "unexpected", "retryable"])
 def test_only_the_third_terminal_failure_is_logged(context, monkeypatch, error, code):
     cfg, store = context
     cfg["sources"] = []
@@ -232,6 +236,7 @@ def test_only_the_third_terminal_failure_is_logged(context, monkeypatch, error, 
     assert logged(store) == []
     report = run_with(monkeypatch, cfg, store, error)
     assert [e["code"] for e in logged(store)] == ([code] if code else [])
+    assert code is None or code in decisions.CODES
     assert report["decisions"] == ({code: 1} if code else {}) and report["analysis_failed"] == 1
 
 
@@ -316,7 +321,7 @@ def test_operator_actions_and_rejected_show_history(context):
     with pytest.raises(ValueError):
         rejection.retry_item(store, other["id"], "0" * 64, "A stale hash is refused", LATER)
     entries = logged(store)
-    assert [e["code"] for e in entries[:3]] == ["failed.app.unexpected", "skipped.verification.news_value", "failed.app.unexpected"]
+    assert [e["code"] for e in entries[:3]] == ["failed.app.unexpected", "skipped.review.news_value", "failed.app.unexpected"]
     assert [(e["code"], e["item_id"], e["decided_at"], e["detail"]["reason"], e["detail"]["before_status"]) for e in entries[3:]] == [
         ("operator.retried", failed["id"], LATER, "The grounding rule was fixed", "rejected"),
         ("operator.reconsidered", skipped["id"], LATER, "Worth another look", "ignored"),

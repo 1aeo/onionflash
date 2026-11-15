@@ -529,10 +529,11 @@ def test_concurrent_auto_merge_race_aborts_safely(context, retire_target):
         editorial.correct(store.db, surv["id"], {"why_it_matters": "Operator-pinned context."},
                           reason="Lock survivor before merge guard", expect_hash=editorial.show(store.db, surv["id"])["hash"],
                           observed=MID)
-        assert not review_gate._try_auto_merge(
-            cfg, store, (dup["id"], surv["id"]), propagate=True, prepared=prepared_dup,
-            draft=draft, writer_key="wk", record={}, observed=LATER,
-        )
+        with pytest.raises(candidate.StaleCandidate):
+            review_gate._try_auto_merge(
+                cfg, store, (dup["id"], surv["id"]), propagate=True, prepared=prepared_dup,
+                draft=draft, writer_key="wk", record={}, observed=LATER,
+            )
         assert editorial.retired(store.db, story_id=dup["id"]) is None
         editorial.unlock(store.db, surv["id"], reason="Restore auto-merge eligibility",
                          expect_hash=editorial.show(store.db, surv["id"])["hash"], observed=MID)
@@ -578,7 +579,8 @@ def test_concurrent_auto_merge_race_aborts_safely(context, retire_target):
         assert out["status"] == "published"
 
 
-def test_auto_merge_when_update_arrives_on_newer_duplicate_requeues_onto_original(context):
+@pytest.mark.parametrize("fail_handoff", [False, True])
+def test_auto_merge_when_update_arrives_on_newer_duplicate_requeues_onto_original(context, monkeypatch, fail_handoff):
     """When the incoming update is attached to the newer duplicate, merge newer -> older and re-queue the item onto older."""
     cfg, store = context
     older = _publish(store, item(
@@ -616,8 +618,31 @@ def test_auto_merge_when_update_arrives_on_newer_duplicate_requeues_onto_origina
     skip_same["criteria"]["new_information"]["reason"] = f"Same event as {older['id']}."
     draft_upd = update_analysis(update="The stall only occurs when DirCache is disabled.",
                                 evidence=["Confirmed the stall only occurs when DirCache is disabled"])
-    res_routed = run(cfg, store, row_upd, Writer(draft_upd), Reviewer(skip_same, skip_same), observed=LATER)
+    writer, checker = Writer(draft_upd), Reviewer(skip_same, skip_same)
+    if fail_handoff:
+        def cannot_save_handoff(*_args):
+            raise sqlite3.OperationalError("Review handoff could not be persisted")
+
+        monkeypatch.setattr(review_gate, "_save_handoff", cannot_save_handoff)
+        before_stories = list(store.db.execute("SELECT id,payload FROM stories ORDER BY id"))
+        before_analyses = store.db.execute("SELECT COUNT(*) FROM analyses").fetchone()[0]
+        with pytest.raises(sqlite3.OperationalError, match="handoff"):
+            run(cfg, store, row_upd, writer, checker, observed=LATER)
+        # The merge and association must roll back together if the durable
+        # budget cannot be handed to the survivor. Physical calls stay spent.
+        assert list(store.db.execute("SELECT id,payload FROM stories ORDER BY id")) == before_stories
+        assert editorial.retired(store.db, story_id=newer["id"]) is None
+        unchanged = store.db.execute("SELECT status,story_id FROM items WHERE id=?", (row_upd["id"],)).fetchone()
+        assert tuple(unchanged) == ("pending", newer["id"])
+        assert store.db.execute("SELECT COUNT(*) FROM analyses").fetchone()[0] == before_analyses
+        saved = store.db.execute("SELECT stage,record_json FROM review_jobs WHERE item_id=?", (row_upd["id"],)).fetchone()
+        assert saved["stage"] == "verify"
+        assert json.loads(saved["record_json"])["request_budget"]["reserved"] == len(checker.calls) == 2
+        return
+    res_routed = run(cfg, store, row_upd, writer, checker, observed=LATER)
     assert res_routed["status"] == "routed" and res_routed["review_calls"] == 2
+    saved = store.db.execute("SELECT stage,record_json FROM review_jobs WHERE item_id=?", (row_upd["id"],)).fetchone()
+    assert saved["stage"] == "routed" and json.loads(saved["record_json"])["request_budget"]["reserved"] == 2
     assert editorial.retired(store.db, story_id=newer["id"]) == (newer["id"], older["id"])
     requeued = store.pending(1, LATER)[0]
     assert requeued["id"] == row_upd["id"] and requeued["story_id"] == older["id"]
@@ -625,6 +650,8 @@ def test_auto_merge_when_update_arrives_on_newer_duplicate_requeues_onto_origina
     res_final = run(cfg, store, requeued, Writer(draft_upd),
                     Reviewer(verdict("approve", update=True), verdict("approve", update=True)), observed=LATER)
     assert res_final["status"] == "published"
+    audit = json.loads(store.db.execute("SELECT review_record FROM analyses WHERE source_item_id=? ORDER BY rowid DESC", (row_upd["id"],)).fetchone()[0])
+    assert audit["request_budget"]["reserved"] == 4
     older_payload = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (older["id"],)).fetchone()[0])
     assert older_payload["updates"][-1]["text"] == "The stall only occurs when DirCache is disabled."
 
@@ -654,7 +681,10 @@ def test_merge_transfers_or_requeues_story_locked_held_updates(context):
     editorial.merge(store.db, dup_a["id"], surv_a["id"], reason="Consolidate duplicate report",
                     expect_hash=editorial.show(store.db, dup_a["id"])["hash"], observed=LATER)
     assert tuple(store.db.execute("SELECT status,story_id FROM items WHERE id=?", (row_held_a["id"],)).fetchone()) == ("pending", surv_a["id"])
-    assert store.db.execute("SELECT 1 FROM review_jobs WHERE item_id=?", (row_held_a["id"],)).fetchone() is None
+    held_job = store.db.execute("SELECT stage,record_json FROM review_jobs WHERE item_id=?", (row_held_a["id"],)).fetchone()
+    held_proof = json.loads(held_job["record_json"])
+    assert held_job["stage"] == "locked" and held_proof["request_budget"]["reserved"] == 1
+    assert held_proof["reviews"] == [] and not held_proof.get("approval")
 
     surv_b = _publish(store, item(
         url="https://example.org/surv-b", title="Primary bridge reachability report",

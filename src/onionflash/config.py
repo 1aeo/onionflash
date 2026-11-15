@@ -71,6 +71,7 @@ DEFAULTS = {
         "retry_base_seconds": 300,
         "retry_cap_seconds": 21600,
         "enable_thinking": False,
+        "writer_reasoning": False,
         "send_chat_template_kwargs": True,
     },
     "review": {"model": ""},
@@ -78,7 +79,7 @@ DEFAULTS = {
 }
 
 BOUNDS = {
-    "timeout_seconds": (1, 600),
+    "timeout_seconds": (1, 3600),
     "max_pages": (1, 100),
     "page_size": (1, 100),
     "max_items_per_source": (1, 10000),
@@ -90,7 +91,7 @@ OPERATOR_SETTINGS = {
     "http": set(),
     "llm": {
         "base_url", "fallback_base_urls", "model", "allowed_networks",
-        "allow_http", "send_chat_template_kwargs", "max_items_per_run", "timeout_seconds",
+        "allow_http", "send_chat_template_kwargs", "max_items_per_run", "timeout_seconds", "writer_reasoning",
     },
     "storage": {"database", "output_dir"},
 }
@@ -102,7 +103,7 @@ SECTION_SPECS = {
         "strings": {"title": (0, 300), "description": (0, 300)},
     },
     "llm": {
-        "bools": ("allow_http", "send_chat_template_kwargs"),
+        "bools": ("allow_http", "send_chat_template_kwargs", "writer_reasoning"),
         "ints": {"max_items_per_run": BOUNDS["max_items_per_run"]},
         "numbers": {"timeout_seconds": BOUNDS["timeout_seconds"]},
         "strings": {"model": (1, 200)},
@@ -118,6 +119,19 @@ _SOURCE_KEYS = {
     "id", "name", "url", "website_url", "alert_format", "publish",
     "gitlab_project", "max_pages", "max_items", *_SOURCE_DEFAULTS,
 }
+
+
+def completion_budget_seconds(llm: dict) -> float:
+    """Transport allowance for one admitted completion, including connection time."""
+    return max(llm["total_timeout_seconds"], llm["timeout_seconds"] + llm["connect_timeout_seconds"])
+
+
+def run_command_budget_seconds(config: dict) -> float:
+    """Run admission window plus the last admitted completion's transport allowance.
+
+    Wrappers should add their own allowance for build and cleanup work.
+    """
+    return config["collection"]["run_budget_seconds"] + completion_budget_seconds(config["llm"])
 
 
 def _check_range(value: object, low: int, high: int, *, allow_float: bool = False) -> bool:
@@ -223,6 +237,8 @@ def load_config(path: str | Path) -> dict:
         raise ValueError("Database must be outside public output")
 
     llm = config["llm"]
+    if llm["writer_reasoning"] and not llm["send_chat_template_kwargs"]:
+        raise ValueError("llm.writer_reasoning requires llm.send_chat_template_kwargs")
     llm["base_url"] = _expand(llm["base_url"]).rstrip("/")
     llm["fallback_base_urls"] = [_expand(u).rstrip("/") if isinstance(u, str) else "" for u in llm["fallback_base_urls"]]
     if any(not u.strip() for u in llm["fallback_base_urls"]):
