@@ -277,6 +277,7 @@ def is_hackerone_item(item: dict) -> bool:
 DIRAUTH_GITLAB_USERS = (
     "andreas",    # dannenberg
     "arma",       # moria1
+    "gman999",    # Serge (bridge authority)
     "linus",      # maatuska
     "micah",      # longclaw
     "sebastian",  # gabelmoo

@@ -37,10 +37,11 @@ product = "tor"
 
 
 def test_config_dirauth_gitlab_users_defaults_and_validation(tmp_path):
-    """Validate default voting authority handles and reject malformed or oversized handle lists."""
+    """Validate default directory and bridge authority handles and reject malformed handle lists."""
     assert list(DIRAUTH_GITLAB_USERS) == [
         "andreas",
         "arma",
+        "gman999",
         "linus",
         "micah",
         "sebastian",
@@ -84,7 +85,7 @@ def test_is_dirauth_item_opener_reply_label_and_anti_spoofing():
     """Match structured handles and dirauth labels on gitlab.torproject.org while blocking spoofing."""
     assert is_dirauth_item(None) is False  # type: ignore[arg-type]
 
-    for handle in ("stefani", "linus", "arma", "weasel"):
+    for handle in ("stefani", "gman999", "linus", "arma", "weasel"):
         opened = item(
             url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/41500",
             kind="gitlab_issue",
@@ -254,9 +255,9 @@ def test_comment_promotion_priority_and_uncommented_rest_refresh_invariant(tmp_p
     )
     cfg = {**make_config(tmp_path), "sources": [gitlab_src], "comments": {"enabled": True}}
 
-    bare_issue = collect.make_item(
+    serge_opened = collect.make_item(
         gitlab_src,
-        issue_url,
+        f"{origin}/{project}/-/work_items/41699",
         "Non-fatal assertion in conn_update_on_close on Serge",
         "After upgrading Serge to Tor 0.4.9.17, src/core/or/dos.c:745 logs non-fatal warnings.",
         "2026-11-12T09:00:00Z",
@@ -265,6 +266,21 @@ def test_comment_promotion_priority_and_uncommented_rest_refresh_invariant(tmp_p
         upstream_state="opened",
         title_html=False,
         author="gman999",
+    )
+    assert serge_opened["authority"] == "dirauth-operator"
+    assert item_priority(serge_opened) >= DIRAUTH_PRIORITY
+
+    bare_issue = collect.make_item(
+        gitlab_src,
+        issue_url,
+        "Non-fatal assertion in conn_update_on_close on guard relay",
+        "After upgrading to Tor 0.4.9.17, src/core/or/dos.c:745 logs non-fatal warnings.",
+        "2026-11-12T09:00:00Z",
+        "2026-11-12T09:00:00Z",
+        labels=["Bug"],
+        upstream_state="opened",
+        title_html=False,
+        author="relay_reporter",
     )
     assert bare_issue["authority"] == "development"
     base_score = item_priority(bare_issue)
@@ -329,7 +345,7 @@ def test_comment_promotion_priority_and_uncommented_rest_refresh_invariant(tmp_p
         assert queued[0]["priority_score"] == base_score + DIRAUTH_PRIORITY
         stored_enriched = json.loads(queued[0]["payload"])
         assert stored_enriched["authority"] == "dirauth-operator"
-        assert stored_enriched["author"] == "gman999"
+        assert stored_enriched["author"] == "relay_reporter"
 
         # Mark non-pending (published) and verify an un-enriched bare REST refresh does NOT clobber or re-queue.
         with store.db:
