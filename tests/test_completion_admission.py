@@ -113,6 +113,10 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
     def handle(request):
         body = json.loads(request.content)
         writer = body["max_tokens"] == 32768
+        # MockTransport does not enforce extensions itself. Pin the deadline
+        # supplied to the real checked transport, as well as its read allowance.
+        assert request.extensions["onionflash_deadline"] == clock[0] + 3610
+        assert request.extensions["timeout"]["read"] == 3600
         sent.append("writer" if writer else "review")
         if (expire == "writer" and len(sent) == 1) or (expire == "review" and len(sent) == 2):
             clock[0] += 300  # Past run admission, within the admitted transport allowance.
