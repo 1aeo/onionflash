@@ -15,7 +15,10 @@ from itertools import zip_longest
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from .transport import DeadlineReached, FetchError, HttpClient
-from .util import after, backoff_seconds, canonical_url, digest, is_dirauth_item, now_iso, plain_text, saved_object, timestamp
+from .util import (
+    DIRAUTH_GITLAB_USERS, after, backoff_seconds, canonical_url, digest, is_dirauth_item, now_iso,
+    plain_text, saved_object, timestamp,
+)
 
 
 QUERY = """query PublicIssueNotes($project: ID!, $iid: String!, $size: Int!) {
@@ -30,6 +33,7 @@ QUERY = """query PublicIssueNotes($project: ID!, $iid: String!, $size: Int!) {
 NOTE_WINDOW = 40  # the newest notes read per issue in one request, system notes included
 INPUT_CHARS = 14000  # the writer's fixed source window: description plus note bodies
 MAX_COMMENTS, COMMENT_CHARS, TOTAL_CHARS = 12, 2000, 8000  # notes kept per issue, text per note and per issue
+MAX_DIRAUTH_NOTES = 64  # durable authority-reply markers kept outside the newest-note body window
 MAX_ISSUES_PER_RUN, MAX_ISSUES_PER_SOURCE = 12, 4  # checks per run and per project
 CANDIDATE_DAYS = 14  # a pending issue seen this recently is a new candidate
 RUN_BUDGET_SECONDS = 30  # the phase's share of the collection window
@@ -45,6 +49,14 @@ class CommentError(Exception):
 
 class EndpointError(CommentError):
     """The answer is unusable for every issue of the project, not just this one."""
+
+
+class _CommentWindow(list):
+    """Verified newest-note slice carrying whether older public notes were excluded."""
+
+    def __init__(self, notes, *, truncated: bool = False):
+        super().__init__(notes)
+        self.truncated = bool(truncated)
 
 
 def _identity(source):
@@ -174,7 +186,8 @@ def fetch_comments(client, source, item):
             note.pop("edited_at", None)
             if isinstance(old_note.get("edited_at"), str) and old_note["edited_at"] > note["created_at"]:
                 note["edited_at"] = old_note["edited_at"]
-    return selected
+    window_truncated = len(connection["nodes"]) >= NOTE_WINDOW or len(selected) < len(notes)
+    return _CommentWindow(selected, truncated=window_truncated)
 
 
 def analysis_context(item):
@@ -188,7 +201,57 @@ def analysis_context(item):
     return item.get("source_content", item.get("content", ""))[:room], notes
 
 
-def _compose(item, notes, checked, *, source_key, dirauth_users=None):
+def _note_newer_than_floor(prev: dict, floor: dict) -> bool:
+    if prev["created_at"] != floor["created_at"]:
+        return prev["created_at"] > floor["created_at"]
+    pkey, fkey = note_key(prev["id"]), note_key(floor["id"])
+    if pkey.isdigit() and fkey.isdigit():
+        return int(pkey) > int(fkey) and prev["id"] >= floor["id"]
+    return prev["id"] > floor["id"]
+
+
+def _reconcile_dirauth_notes(item: dict, composed_notes: list[dict], dirauth_users, *, truncated: bool) -> list[dict]:
+    users = {
+        u.strip().lower()
+        for u in (DIRAUTH_GITLAB_USERS if dirauth_users is None else dirauth_users)
+        if isinstance(u, str) and u.strip()
+    }
+    if not users:
+        return []
+    seeded: dict[str, dict] = {}
+    for source_list in (item.get("public_comments"), item.get("dirauth_notes")):
+        if not isinstance(source_list, list):
+            continue
+        for raw in source_list:
+            if (
+                isinstance(raw, dict)
+                and all(isinstance(raw.get(f), str) and raw[f] for f in ("id", "author", "created_at"))
+                and raw["author"].strip().lower() in users
+                and (nkey := note_key(raw["id"]))
+            ):
+                seeded[nkey] = {"id": raw["id"], "author": raw["author"], "created_at": raw["created_at"]}
+    present_keys = {note_key(n["id"]) for n in composed_notes if isinstance(n.get("id"), str)}
+    floor = composed_notes[-1] if composed_notes else None
+    retained: dict[str, dict] = {}
+    for nkey, prev in seeded.items():
+        if nkey in present_keys or not truncated:
+            continue
+        if floor is not None and _note_newer_than_floor(prev, floor):
+            continue
+        retained[nkey] = prev
+    for note in composed_notes:
+        if note["author"].strip().lower() in users and (nkey := note_key(note["id"])):
+            retained[nkey] = {"id": note["id"], "author": note["author"], "created_at": note["created_at"]}
+    ordered = sorted(
+        retained.values(),
+        key=lambda n: (n["created_at"], int(k) if (k := note_key(n["id"])).isdigit() else -1, n["id"]),
+        reverse=True,
+    )
+    return ordered[:MAX_DIRAUTH_NOTES]
+
+
+def _compose(item, notes, checked, *, source_key, dirauth_users=None, window_truncated: bool | None = None):
+    truncated = bool(getattr(notes, "truncated", False) if window_truncated is None else window_truncated)
     result = dict(item)
     content = result.pop("source_content", result.get("content"))
     if not isinstance(content, str):
@@ -204,13 +267,24 @@ def _compose(item, notes, checked, *, source_key, dirauth_users=None):
             if not isinstance(entry.get("edited_at"), str) or entry["edited_at"] <= prev_time:
                 entry["edited_at"] = max(checked, prev_time)
         composed_notes.append(entry)
+    dirauth_list = _reconcile_dirauth_notes(item, composed_notes, dirauth_users, truncated=truncated)
     # Callers pass a key only for a verified fetch or an already verified stored snapshot.
-    result.update(content=content, public_comments=composed_notes, comments_checked_at=checked, comments_source_key=source_key)
+    result.update(
+        content=content,
+        public_comments=composed_notes,
+        comments_checked_at=checked,
+        comments_source_key=source_key,
+        comments_truncated=truncated,
+    )
+    if dirauth_list:
+        result["dirauth_notes"] = dirauth_list
+    else:
+        result.pop("dirauth_notes", None)
     if result.get("authority") == "development" and is_dirauth_item(result, dirauth_users):
         result["authority"] = "dirauth-operator"
     elif (
         result.get("authority") == "dirauth-operator"
-        and item.get("public_comments")
+        and (item.get("public_comments") or item.get("dirauth_notes"))
         and not is_dirauth_item({**result, "authority": "development"}, dirauth_users)
     ):
         result["authority"] = "development"
@@ -231,7 +305,14 @@ def merge_cached_comments(store, item, source, observed=None, *, dirauth_users=N
     old = (saved_object(row["payload"]) if row["payload_type"] == "text" else None) or {}
     key = _source_key(source)
     req_fields = ("id", "url", "title", "author", "created_at", "body")
+    dirauth_fields = ("id", "author", "created_at")
+    valid_dirauth = "dirauth_notes" not in old or (
+        isinstance(old["dirauth_notes"], list)
+        and all(isinstance(n, dict) and all(isinstance(n.get(f), str) for f in dirauth_fields) for n in old["dirauth_notes"])
+    )
+    valid_trunc = "comments_truncated" not in old or type(old["comments_truncated"]) is bool
     valid_notes = (isinstance(old.get("comments_checked_at"), str) and isinstance(old.get("public_comments"), list)
+                   and valid_dirauth and valid_trunc
                    and all(isinstance(n, dict) and all(isinstance(n.get(f), str) for f in req_fields) for n in old["public_comments"]))
     current = valid_notes and old.get("comments_source_key") == key
     if observed and (not current or item["updated_at"] > old["comments_checked_at"]):
@@ -239,10 +320,16 @@ def merge_cached_comments(store, item, source, observed=None, *, dirauth_users=N
             _request(store.db, row["id"], key, observed)
         if not current:
             store._comment_requests[row["id"]] = observed
-    return (
-        _compose(item, old["public_comments"], old["comments_checked_at"], source_key=key, dirauth_users=dirauth_users)
-        if current
-        else item
+    if not current:
+        return item
+    seeded_item = {**item, **({"dirauth_notes": old["dirauth_notes"]} if "dirauth_notes" in old else {})}
+    return _compose(
+        seeded_item,
+        old["public_comments"],
+        old["comments_checked_at"],
+        source_key=key,
+        dirauth_users=dirauth_users,
+        window_truncated=bool(old.get("comments_truncated")),
     )
 
 
@@ -375,7 +462,7 @@ def enrich_comments(config, store, observed, *, deadline=None):
                         break
                     continue
                 report["checked"] += 1
-                changed = bool(store.ingest(enriched, observed))
+                changed = bool(store.ingest(enriched, observed, dirauth_users=dirauth_users))
                 report["changed"] += changed
                 with store.db:
                     _advance_rotation(store.db, source["id"], row)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 import json
 import re
 
@@ -25,11 +26,11 @@ _UNSET = object()
 
 
 class ReviewRequired(ValueError):
-    pass
+    """Raised when an unapproved or non-normalized candidate cannot be committed."""
 
 
 class StaleCandidate(ValueError):
-    pass
+    """Raised when source, story, or editorial state changed after candidate assembly."""
 
 
 def _norm_url(raw: object) -> str | None:
@@ -154,6 +155,7 @@ def coverage_background(db, prior: dict | None, *, related_rows: list[tuple[str,
 
 
 def writer_info(previous: dict | None, db=None) -> tuple[str | None, str, str]:
+    """Return `(editorial_item_id, editorial_kind, editorial_authority)` for `previous`."""
     if not previous:
         return None, "", ""
     writer = previous.get("editorial_item")
@@ -414,6 +416,7 @@ def _comment_sources(item: dict, result: dict, *, after_at: str | None = None, i
 
 
 def item_fingerprint(row: dict) -> str:
+    """Return a deterministic digest binding item queue metadata and source content."""
     return digest([{key: row.get(key) for key in ("id", "url", "source_id", "content_hash", "cluster_key", "story_id", "status")},
                    source_packet.source_fingerprint(json.loads(row["payload"]))])
 
@@ -532,6 +535,7 @@ def associate(db, row: dict) -> tuple[dict | None, str | None]:
 
 
 def existing_story(db, row: dict):
+    """Return the single live story associated with `row`, or `None` if unassociated."""
     return associate(db, row)[0]
 
 
@@ -615,6 +619,7 @@ def _earlier_decision_ids(db, row: dict, exclude: set[str] | frozenset[str] = fr
 
 
 def control_fingerprint(db, story_id: str) -> str:
+    """Return a deterministic digest of the current editorial controls row for `story_id`."""
     row = db.execute("SELECT revision,locked,retracted,notice_action,notice_reason,notice_at FROM editorial_controls WHERE story_id=?", (story_id,)).fetchone()
     return digest(dict(row) if row else None)
 
@@ -665,7 +670,9 @@ def validate_approved(original: dict, approved: object, mode: str = "story") -> 
     return editable
 
 
-def prepare(db, row: dict, result: dict, observed: str) -> dict:
+def prepare(
+    db, row: dict, result: dict, observed: str, *, dirauth_users: Iterable[str] | None = None
+) -> dict:
     """Assemble the exact candidate and bind all state needed for its guarded commit."""
     # Copy caller-owned values so later repairs cannot mutate the original draft.
     row, result = json.loads(json.dumps(row)), json.loads(json.dumps(result))
@@ -688,6 +695,8 @@ def prepare(db, row: dict, result: dict, observed: str) -> dict:
                 "packet": {"sources": [], "missing_sources": [], "truncated": False},
                 "binding": binding, "locked": locked, "coverage": None,
                 "observed": observed}
+    if dirauth_users is not None:
+        envelope["dirauth_users"] = list(dirauth_users)
     if not locked:
         if ("update" in result) != (mode == "update"):
             raise StaleCandidate("Draft scope does not match current story state")
@@ -760,7 +769,9 @@ def prepare(db, row: dict, result: dict, observed: str) -> dict:
         related_rows = related(db, row, item, excluded)
         earlier_ids = _earlier_decision_ids(db, row, excluded | {sid for sid, _ in related_rows})
         writer = data["editorial_item"]
-        packet, bindings = source_packet.build_packet(db, item, data, public, writer, update=mode == "update")
+        packet, bindings = source_packet.build_packet(
+            db, item, data, public, writer, update=mode == "update", dirauth_users=dirauth_users
+        )
         binding["sources"] = bindings
         envelope.update(candidate=public, payload=data, packet=packet,
                         coverage=coverage_background(db, existing, related_rows=related_rows,

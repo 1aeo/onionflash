@@ -88,9 +88,16 @@ def _final_review(store, item_id: str, *, config: dict | None = None):
         return {"stage": row["stage"], "error": "Saved review record cannot be read", **extra}
     try:
         prepared = record.get("prepared", {})
+        raw_reviews = record.get("reviews")
         approval = record.get("approval")
-        reviews = record.get("reviews") or (approval.get("reviews", []) if isinstance(approval, dict) else [])
-        if not isinstance(prepared, dict) or not isinstance(reviews, list):
+        if (
+            not isinstance(prepared, dict)
+            or (raw_reviews is not None and not isinstance(raw_reviews, list))
+            or (approval is not None and not isinstance(approval, dict))
+        ):
+            raise TypeError
+        reviews = raw_reviews if raw_reviews else (approval.get("reviews", []) if isinstance(approval, dict) else [])
+        if not isinstance(reviews, list):
             raise TypeError
         latest = reviews[-1] if reviews else None
         candidate = record.get("candidate", prepared.get("candidate"))

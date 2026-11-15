@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from .comments import analysis_context
 from .util import canonical_url, digest, is_dirauth_item, is_hackerone_item, plain_text, saved_object
 
@@ -9,7 +11,7 @@ from .util import canonical_url, digest, is_dirauth_item, is_hackerone_item, pla
 # The review packet's fixed bounds.
 LIMITS = {"max_sources": 8, "max_source_chars": 24000, "max_passages": 64, "passage_chars": 1800}
 SOURCE_FIELDS = ("id", "source_id", "url", "title", "content", "source_content", "kind", "authority", "product",
-                 "published_at", "updated_at", "labels", "upstream_state", "public_comments")
+                 "published_at", "updated_at", "labels", "upstream_state", "public_comments", "author", "dirauth_notes")
 
 
 def source_fingerprint(item: dict) -> str:
@@ -130,7 +132,16 @@ def _shares(needs, floors, budget):
     return shares
 
 
-def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str | None, *, update: bool = False):
+def build_packet(
+    db,
+    incoming: dict,
+    payload: dict,
+    public: dict,
+    writer_id: str | None,
+    *,
+    update: bool = False,
+    dirauth_users: Iterable[str] | None = None,
+):
     """Assemble the bounded numbered source packet and durable bindings for final review."""
     missing, bindings, units, truncated = [], {}, [], False
     loaded_cache: dict[tuple[str | None, str, str | None], tuple | None] = {}
@@ -184,7 +195,7 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
         if unit["authority"] == "development":
             if is_hackerone_item(item):
                 unit["authority"] = "hackerone"
-            elif is_dirauth_item(item):
+            elif is_dirauth_item(item, dirauth_users):
                 unit["authority"] = "dirauth-operator"
         unit.update(labels=normalize_labels(item.get("labels")), url=canonical_url(item["url"]), title=item["title"], snapshot=snapshot)
         if isinstance(item.get("author"), str) and item["author"]:

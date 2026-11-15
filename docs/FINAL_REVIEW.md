@@ -271,11 +271,13 @@ skips are not checked.
 - Public story text (`title`, `summary`, `why_it_matters`) or a new update entry
   contains no unnormalized all-caps shouting beyond standard technical acronyms.
 - Public story text or a new update entry on Tor or network coverage cites no
-  nonexistent three-part C-Tor version typo (such as `0.4.17`) unless marked as a
-  literal source quote (`sic`, `typo` or `written`).
+  nonexistent three-part C-Tor version typo (such as `0.4.17`) unless directly
+  annotated as a literal source quote or typo (`[sic]`, `typo` or `written as ...`).
 - A new story whose sources are all untrusted `community` `lists.torproject.org`
   posts does not report an operational attack, compromise, DoS, flood, bypass or
-  vulnerability claim (`untrusted_operator_claim`).
+  vulnerability claim (`untrusted_operator_claim`); eligible `tor-dev` `[RFC]`,
+  numbered Tor proposal, and IETF Internet-Draft or IETF RFC specifications that
+  propose defenses without asserting a live operational incident are allowed.
 
 The writer's request and every review's repair offer only the confidence,
 state and category labels that these checks allow (and `tagged` only when a

@@ -38,7 +38,16 @@ _MALFORMED_TOR_VERSION_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
-_SIC_NOTE_RE = re.compile(r"\b(?:sic|typo|written)\b", re.IGNORECASE)
+_SIC_PREFIX_RE = re.compile(
+    r"\b(?:written(?:\s+literally)?\s+as|spelled\s+as|quoted\s+as|misspelled(?:\s+as)?|"
+    r"(?:version\s+)?typo(?:\s+(?:for|of|in)|\s*[:,])?)\s+[\"'“‘`]?(?:(?:c[-\s]?)?tor\s+v?)?$",
+    re.IGNORECASE,
+)
+_SIC_SUFFIX_RE = re.compile(
+    r"^\s*[\"'”’`]?(?:\s+(?:release|upgrade|version))?\s*"
+    r"(?:\[\s*sic\s*\]|\(\s*sic\s*\)|,\s*sic\b|typo\b|\([^()\n]{0,35}\b(?:sic|typo)\b[^()\n]{0,35}\))",
+    re.IGNORECASE,
+)
 
 
 class AnalysisError(Exception):
@@ -64,9 +73,11 @@ class RequestObserver:
         raise NotImplementedError
 
     def response_received(self) -> None:
+        """Record that an HTTP response arrived before parsing completion output."""
         pass
 
     def transport_failed(self) -> None:
+        """Record that transport failed before an HTTP completion response arrived."""
         pass
 
 
@@ -84,14 +95,17 @@ def has_shouting_caps(text: str) -> bool:
     return False
 
 
+def _is_sic_annotated(text: str, match: re.Match[str]) -> bool:
+    prefix = text[max(0, match.start() - 48) : match.start()]
+    suffix = text[match.end() : match.end() + 80]
+    return bool(_SIC_PREFIX_RE.search(prefix) or _SIC_SUFFIX_RE.search(suffix))
+
+
 def has_malformed_tor_version(text: str, products: list[str] | tuple[str, ...] = ()) -> bool:
     """Return whether text cites a nonexistent three-part C-Tor version such as 0.4.17."""
     if products and "tor" not in products and "network" not in products:
         return False
-    return any(
-        not _SIC_NOTE_RE.search(text[max(0, match.start() - 30) : match.end() + 30])
-        for match in _MALFORMED_TOR_VERSION_RE.finditer(text)
-    )
+    return any(not _is_sic_annotated(text, match) for match in _MALFORMED_TOR_VERSION_RE.finditer(text))
 
 
 def validate_text(value: object, maximum: int, *, empty: bool = False,

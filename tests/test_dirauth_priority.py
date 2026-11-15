@@ -525,3 +525,305 @@ def test_review_gate_holds_dirauth_not_news_and_approves_valid_dirauth_ticket(tm
         stories = store.stories(5)
         assert len(stories) == 1
         assert stories[0]["confidence"] == "reported"
+
+
+def test_evicted_dirauth_reply_retains_authority_while_deleted_reply_demotes(tmp_path):
+    """Preserve dirauth-operator when 40+ newer replies evict an authority note, but demote on deletion."""
+    cfg = make_config(tmp_path)
+    cfg["comments"]["enabled"] = True
+    issue_url = "https://gitlab.torproject.org/tpo/core/tor/-/issues/41950"
+    gitlab_src = {
+        "id": "tor-issues",
+        "name": "Tor issues",
+        "url": "https://gitlab.torproject.org/api/v4/projects/tpo%2Fcore%2Ftor/issues",
+        "gitlab_project": "tpo/core/tor",
+        "kind": "gitlab_issue",
+        "authority": "development",
+        "product": "tor",
+        "enabled": True,
+    }
+    cfg["sources"] = [gitlab_src]
+
+    bare = item(
+        id="tor-issues-41950",
+        source_id="tor-issues",
+        url=issue_url,
+        kind="gitlab_issue",
+        authority="development",
+        author="ordinary_reporter",
+        title="Consensus bandwidth weight discrepancy",
+        content="Observed a discrepancy in bandwidth weights across relays.",
+        published_at="2026-11-12T08:00:00Z",
+        updated_at="2026-11-12T08:05:00Z",
+        labels=[],
+    )
+
+    def gql_nodes(node_list):
+        return Response(
+            200,
+            json.dumps({
+                "data": {
+                    "project": {
+                        "id": "gid://gitlab/Project/426",
+                        "fullPath": "tpo/core/tor",
+                        "visibility": "public",
+                        "webUrl": "https://gitlab.torproject.org/tpo/core/tor",
+                        "issue": {
+                            "iid": "41950",
+                            "confidential": False,
+                            "webUrl": issue_url,
+                            "notes": {"nodes": node_list},
+                        },
+                    }
+                }
+            }).encode("utf-8"),
+            {"content-type": "application/json"},
+            "https://gitlab.torproject.org/api/graphql",
+        )
+
+    def make_node(num: int, username: str, created_at: str, body: str):
+        return {
+            "id": f"gid://gitlab/Note/{num}",
+            "body": body,
+            "createdAt": created_at,
+            "lastEditedAt": None,
+            "internal": False,
+            "system": False,
+            "url": f"{issue_url}#note_{num}",
+            "author": {"username": username},
+        }
+
+    stefani_node = make_node(1, "stefani", "2026-11-12T08:05:00Z", "Confirmed on bastet authority logs.")
+    forty_newer = [
+        make_node(i, f"commenter_{i}", f"2026-11-12T09:{i - 2:02d}:00Z", f"Follow-up discussion comment {i}.")
+        for i in range(2, 42)
+    ]
+    assert len(forty_newer) == comments.NOTE_WINDOW
+
+    with Store(tmp_path / "eviction.sqlite3") as store:
+        assert store.ingest(dict(bare), "2026-11-12T08:06:00Z") is True
+        with mock.patch("onionflash.comments.HttpClient", return_value=FakeClient([gql_nodes([stefani_node])])):
+            rep1 = enrich_comments(cfg, store, "2026-11-12T08:10:00Z")
+        assert rep1["checked"] == 1 and rep1["changed"] == 1
+
+        saved1 = json.loads(store.db.execute("SELECT payload FROM items WHERE url=?", (issue_url,)).fetchone()[0])
+        assert saved1["authority"] == "dirauth-operator"
+        assert saved1["comments_truncated"] is False
+        assert saved1["dirauth_notes"] == [
+            {"id": "gid://gitlab/Note/1", "author": "stefani", "created_at": "2026-11-12T08:05:00Z"}
+        ]
+
+        # Force immediate re-check when 40 newer ordinary comments have evicted @stefani's note from NOTE_WINDOW.
+        with store.db:
+            store.db.execute("UPDATE comment_cache SET next_fetch_at='2026-11-12T09:50:00Z' WHERE item_id=?", (saved1["id"],))
+        with mock.patch("onionflash.comments.HttpClient", return_value=FakeClient([gql_nodes(forty_newer)])):
+            rep2 = enrich_comments(cfg, store, "2026-11-12T10:00:00Z")
+        assert rep2["checked"] == 1
+
+        saved2 = json.loads(store.db.execute("SELECT payload FROM items WHERE url=?", (issue_url,)).fetchone()[0])
+        assert all(n["author"] != "stefani" for n in saved2["public_comments"])
+        assert saved2["comments_truncated"] is True
+        assert saved2["dirauth_notes"] == [
+            {"id": "gid://gitlab/Note/1", "author": "stefani", "created_at": "2026-11-12T08:05:00Z"}
+        ]
+        assert saved2["authority"] == "dirauth-operator"
+
+        # Mark published and verify both merge_cached_comments and bare REST refresh keep dirauth-operator.
+        with store.db:
+            store.db.execute("UPDATE items SET status='published', story_id='story-41950' WHERE url=?", (issue_url,))
+        refreshed = {**bare, "updated_at": "2026-11-12T10:05:00Z"}
+        merged = merge_cached_comments(
+            store, dict(refreshed), gitlab_src, "2026-11-12T10:06:00Z", dirauth_users=cfg["collection"]["dirauth_gitlab_users"]
+        )
+        assert merged["authority"] == "dirauth-operator"
+        assert merged["comments_truncated"] is True
+        assert merged["dirauth_notes"] == saved2["dirauth_notes"]
+        assert store.ingest(merged, "2026-11-12T10:06:00Z") is False
+        assert store.ingest(dict(refreshed), "2026-11-12T10:07:00Z") is False
+
+    # Actual deletion in a non-truncated fetch drops dirauth_notes and demotes authority.
+    remaining_two = [
+        {
+            "id": "gid://gitlab/Note/2",
+            "url": f"{issue_url}#note_2",
+            "title": "Public comment by @commenter_2",
+            "author": "commenter_2",
+            "created_at": "2026-11-12T09:00:00Z",
+            "body": "Follow-up discussion comment 2.",
+        }
+    ]
+    demoted_full = _compose(saved2, remaining_two, "2026-11-12T11:00:00Z", source_key="verified", window_truncated=False)
+    assert "dirauth_notes" not in demoted_full
+    assert demoted_full["authority"] == "development"
+
+    # Actual deletion of a newer authority note inside a truncated window (created_at > window floor) also demotes.
+    newer_auth = _compose(
+        bare,
+        [
+            {
+                "id": "gid://gitlab/Note/99",
+                "url": f"{issue_url}#note_99",
+                "title": "Public comment by @stefani",
+                "author": "stefani",
+                "created_at": "2026-11-12T09:35:00Z",
+                "body": "Recent note later deleted.",
+            },
+            *saved2["public_comments"][:5],
+        ],
+        "2026-11-12T09:36:00Z",
+        source_key="verified",
+        window_truncated=True,
+    )
+    assert newer_auth["authority"] == "dirauth-operator"
+    demoted_trunc = _compose(
+        newer_auth,
+        saved2["public_comments"],
+        "2026-11-12T11:05:00Z",
+        source_key="verified",
+        window_truncated=True,
+    )
+    assert "dirauth_notes" not in demoted_trunc
+    assert demoted_trunc["authority"] == "development"
+
+
+def test_custom_dirauth_gitlab_users_threads_through_queue_packet_and_gate(tmp_path):
+    """Honor custom dirauth_gitlab_users (including empty and custom handles) across queue, packet, and gate."""
+    observed = "2026-11-12T12:00:00Z"
+    linus_issue = item(
+        url="https://gitlab.torproject.org/tpo/core/tor/-/issues/41960",
+        kind="gitlab_issue",
+        authority="development",
+        author="linus",
+        title="Minor comment cleanup in test helper",
+        content="Clean up an unused variable comment in a unit test helper.",
+        published_at="2026-11-12T11:00:00Z",
+        updated_at="2026-11-12T11:00:00Z",
+        labels=[],
+    )
+    draft_linus = analysis(
+        title="Minor comment cleanup in test helper",
+        summary="A GitLab issue suggests cleaning up an unused variable comment in a unit test helper.",
+        why_it_matters="",
+        confidence="reported",
+        evidence=["Clean up an unused variable comment in a unit test helper."],
+    )
+    skip_news = verdict("skip", criterion="news_value")
+
+    cfg_empty = make_config(tmp_path / "empty")
+    cfg_empty["collection"]["dirauth_gitlab_users"] = []
+    assert item_priority(linus_issue, []) == 0
+    with Store(tmp_path / "empty.sqlite3", dirauth_users=[]) as store_empty:
+        store_empty.ingest(dict(linus_issue), observed)
+        [row_empty] = store_empty.pending(1, observed)
+        assert row_empty["priority_score"] == 0
+        prep_empty = store_empty.prepare_candidate(row_empty, draft_linus, observed)
+        assert prep_empty["packet"]["sources"][0]["authority"] == "development"
+        res_empty = review_gate.process_item(
+            cfg_empty, store_empty, row_empty, Writer(draft_linus), Reviewer(skip_news), observed
+        )
+        assert res_empty["status"] == "ignored"
+        assert res_empty["review_calls"] == 1
+        codes_empty = [entry["code"] for entry in decisions.for_item(store_empty.db, row_empty["id"])]
+        assert codes_empty == ["skipped.review.news_value"]
+
+    custom_issue = item(
+        url="https://gitlab.torproject.org/tpo/core/tor/-/issues/41961",
+        kind="gitlab_issue",
+        authority="development",
+        author="custom_auth",
+        title="Minor formatting note on custom authority host",
+        content="Formatting note opened by a custom configured authority handle.",
+        published_at="2026-11-12T11:10:00Z",
+        updated_at="2026-11-12T11:10:00Z",
+        labels=[],
+    )
+    draft_custom = analysis(
+        title="Minor formatting note on custom authority host",
+        summary="A GitLab issue notes a minor formatting detail on a configured authority host.",
+        why_it_matters="",
+        confidence="reported",
+        evidence=["Formatting note opened by a custom configured authority handle."],
+    )
+    cfg_custom = make_config(tmp_path / "custom")
+    cfg_custom["collection"]["dirauth_gitlab_users"] = ["custom_auth"]
+    assert item_priority(custom_issue, ["custom_auth"]) == DIRAUTH_PRIORITY
+    with Store(tmp_path / "custom.sqlite3", dirauth_users=["custom_auth"]) as store_custom:
+        store_custom.ingest(dict(custom_issue), observed)
+        [row_custom] = store_custom.pending(1, observed)
+        assert row_custom["priority_score"] == DIRAUTH_PRIORITY
+        prep_custom = store_custom.prepare_candidate(row_custom, draft_custom, observed)
+        assert prep_custom["packet"]["sources"][0]["authority"] == "dirauth-operator"
+        res_custom = review_gate.process_item(
+            cfg_custom, store_custom, row_custom, Writer(draft_custom), Reviewer(skip_news, skip_news), observed
+        )
+        assert res_custom["status"] == "held"
+        assert res_custom["review_calls"] == 2
+        codes_custom = [entry["code"] for entry in decisions.for_item(store_custom.db, row_custom["id"])]
+        assert "held.verification.official_not_news" in codes_custom
+        assert review_gate.approval(cfg_custom, store_custom, row_custom["id"])["eligible"] is True
+
+
+def test_author_changes_update_item_hash_ingest_source_fingerprint_and_analyzer(tmp_path):
+    """Refresh stored payloads and fingerprints when a development item's author is added or changed."""
+    from onionflash.store import item_hash
+
+    cfg = make_config(tmp_path)
+    observed = "2026-11-12T12:00:00Z"
+    base_issue = item(
+        url="https://gitlab.torproject.org/tpo/core/tor/-/issues/41970",
+        kind="gitlab_issue",
+        authority="development",
+        title="Relay descriptor upload retry delay",
+        content="Descriptor upload retries wait 60 seconds after transient EOF.",
+        published_at="2026-11-12T10:00:00Z",
+        updated_at="2026-11-12T10:00:00Z",
+        labels=[],
+    )
+    base_issue.pop("author", None)
+    with_first = {**base_issue, "author": "ordinary_user", "updated_at": "2026-11-12T10:05:00Z"}
+    with_second = {**base_issue, "author": "second_user", "updated_at": "2026-11-12T10:10:00Z"}
+
+    h0, h1, h2 = item_hash(base_issue), item_hash(with_first), item_hash(with_second)
+    assert len({h0, h1, h2}) == 3
+    fp0 = source_packet.source_fingerprint(base_issue)
+    fp1 = source_packet.source_fingerprint(with_first)
+    fp2 = source_packet.source_fingerprint(with_second)
+    assert len({fp0, fp1, fp2}) == 3
+
+    draft = analysis(
+        title="Relay descriptor upload retry delay",
+        summary="Ticket #41970 reports a 60-second descriptor upload retry delay after transient EOF.",
+        why_it_matters="",
+        confidence="reported",
+        evidence=["Descriptor upload retries wait 60 seconds after transient EOF."],
+    )
+
+    with Store(tmp_path / "author.sqlite3") as store:
+        assert store.ingest(dict(base_issue), observed) is True
+        [row0] = store.pending(1, observed)
+        assert "author" not in json.loads(row0["payload"])
+        prep0 = store.prepare_candidate(row0, draft, observed)
+        assert "author" not in prep0["packet"]["sources"][0]
+
+        assert store.ingest(dict(with_first), "2026-11-12T12:05:00Z") is True
+        [row1] = store.pending(1, "2026-11-12T12:05:00Z")
+        payload1 = json.loads(row1["payload"])
+        assert payload1["author"] == "ordinary_user"
+        prep1 = store.prepare_candidate(row1, draft, "2026-11-12T12:05:00Z")
+        assert prep1["packet"]["sources"][0]["author"] == "ordinary_user"
+
+        assert store.ingest(dict(with_second), "2026-11-12T12:10:00Z") is True
+        [row2] = store.pending(1, "2026-11-12T12:10:00Z")
+        payload2 = json.loads(row2["payload"])
+        assert payload2["author"] == "second_user"
+        prep2 = store.prepare_candidate(row2, draft, "2026-11-12T12:10:00Z")
+        assert prep2["packet"]["sources"][0]["author"] == "second_user"
+
+    client = FakeLLM(completion(draft))
+    writer = analyze.Analyzer(cfg)
+    writer.client = client
+    with mock.patch.dict("os.environ", {cfg["llm"]["api_key_env"]: "secret"}):
+        writer.llm = {**cfg["llm"], "base_url": "https://llm.example.org/v1"}
+        writer.analyze(dict(payload2))
+    sent_user = json.loads(client.requests[0][1]["messages"][1]["content"])
+    assert sent_user["author"] == "second_user"

@@ -319,12 +319,13 @@ def is_dirauth_item(item: dict, dirauth_users: Iterable[str] | None = None) -> b
     author = item.get("author")
     if isinstance(author, str) and author.strip().lower() in users:
         return True
-    comments = item.get("public_comments")
-    if isinstance(comments, list) and any(
-        isinstance(note, dict) and isinstance(note.get("author"), str) and note["author"].strip().lower() in users
-        for note in comments
-    ):
-        return True
+    for field in ("public_comments", "dirauth_notes"):
+        notes = item.get(field)
+        if isinstance(notes, list) and any(
+            isinstance(note, dict) and isinstance(note.get("author"), str) and note["author"].strip().lower() in users
+            for note in notes
+        ):
+            return True
     return False
 
 

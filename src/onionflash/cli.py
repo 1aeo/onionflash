@@ -161,10 +161,10 @@ def run(config: dict, store: Store) -> dict:
             network_ingested["reports_new"] += added
             network_ingested["rejected"] += rejected
             return received
+        dirauth_users = config["collection"].get("dirauth_gitlab_users")
         if comments_enabled:
-            dirauth_users = config["collection"].get("dirauth_gitlab_users")
             items = (merge_cached_comments(store, item, source, received, dirauth_users=dirauth_users) for item in items)
-        report["items_changed"] += sum(store.ingest(item, received) for item in items)
+        report["items_changed"] += sum(store.ingest(item, received, dirauth_users=dirauth_users) for item in items)
         return received
 
     with HttpClient(config["http"]) as client:
@@ -326,9 +326,10 @@ def main(argv: list[str] | None = None) -> int:
             }))
             return 0
         database = config["storage"]["database"]
+        dirauth_users = config["collection"]["dirauth_gitlab_users"]
         operator = args.command in OPERATOR_ACTIONS
         if args.command == "status" or (operator and args.action in READ_ONLY_ACTIONS):
-            with Store(database) as store:
+            with Store(database, dirauth_users=dirauth_users) as store:
                 payload = _status_report(config, store) if args.command == "status" else _operator_command(args, store, config)
             print(json.dumps(payload, ensure_ascii=operator))
             return 0
@@ -336,7 +337,7 @@ def main(argv: list[str] | None = None) -> int:
             if not acquired:
                 print(json.dumps({"status": "already-running"}))
                 return 0 if args.command == "run" else 75
-            with Store(database) as store:
+            with Store(database, dirauth_users=dirauth_users) as store:
                 if operator:
                     result = _operator_command(args, store, config)
                 elif args.command == "run":

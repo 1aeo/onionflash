@@ -35,10 +35,12 @@ class EvaluationReviewer(Reviewer):
     last_decoded = None
 
     def review(self, *args, **kwargs):
+        """Reset diagnostic decode capture before running a review pass."""
         self.last_decoded = None
         return super().review(*args, **kwargs)
 
     def complete(self, *args, **kwargs):
+        """Capture the decoded JSON response for private evaluation diagnostics."""
         result = super().complete(*args, **kwargs)
         self.last_decoded = result
         return result
@@ -246,6 +248,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                                 "review_scope": scope, "mode": "update" if scope == "latest_update" else "story",
                                 "story_id": prior["id"] if prior else None,
                                 "payload": {"editorial_kind": source["kind"]},
+                                "dirauth_users": list(config["collection"]["dirauth_gitlab_users"]),
                                 "row": {"url": source["url"], "story_id": prior["id"] if prior else None,
                                         "cluster_key": item_cluster({**item, "url": source["url"],
                                                                      "source_entry_id": source.get("source_entry_id", source["url"])}),

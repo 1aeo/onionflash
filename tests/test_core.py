@@ -933,18 +933,34 @@ def test_trusted_operator_sender_authority_and_spoofing_guards():
     assert _collected_items(_list_rss("<author>tor＠1aeo.com (Ops)</author>"), authority="official")[0]["authority"] == "official"
     assert collect._sender_authority("dev＠torproject.org (Dev)", ["torproject.org", "1aeo.com"]) == "project-sender"
     assert collect._sender_authority("ops＠.1aeo.com (Ops)", ["1aeo.com"]) is None
+    assert collect._sender_authority("operator＠ops.xn--p1ai (Operator)", ["ops.xn--p1ai"]) == "trusted-operator"
+    assert collect._sender_authority("operator＠sub.ops.xn--p1ai (Operator)", ["ops.xn--p1ai"]) == "trusted-operator"
+    assert collect._sender_authority("operator＠ops.xn--p1ai (Operator)", ["1aeo.com"]) is None
+    punycode_collection = {**DEFAULTS["collection"], "trusted_operator_domains": ["ops.xn--p1ai"]}
+    punycode_items = collect_source(
+        FakeClient([Response(200, _list_rss("<author>operator＠ops.xn--p1ai (Operator)</author>"), {}, LIST_URL)]),
+        source(url=LIST_URL, authority="community"),
+        {},
+        punycode_collection,
+        DATE,
+    )["items"]
+    assert punycode_items[0]["authority"] == "trusted-operator"
 
 
 @pytest.mark.parametrize("broken_patch", [
     {"title": 123},
     {"content": None},
     {"source_content": 99},
+    {"author": 123},
+    {"comments_truncated": "yes"},
     {"labels": "Security"},
     {"labels": [123]},
     {"public_comments": "not-a-list"},
     {"public_comments": [123]},
     {"public_comments": [{"author": "op"}]},
     {"public_comments": [{"author": None, "created_at": DATE, "body": "note"}]},
+    {"dirauth_notes": "not-a-list"},
+    {"dirauth_notes": [{"author": "stefani", "created_at": DATE}]},
 ])
 def test_ingest_replaces_saved_items_with_damaged_fields_or_comments(store, caplog, broken_patch):
     entry = lambda **kw: item(kind="gitlab_issue", **kw)

@@ -485,6 +485,9 @@ def test_shouting_caps_and_malformed_tor_version_helpers_and_validation(monkeypa
     for bad_ver in (
         "Tor 0.4.17 relays", "post-0.4.17 upgrade", "0.4.15 relays",
         "upgrading to v0.4.17", "basic Tor 0.4.17 daemon",
+        "Tor 0.4.17 release notes were written today.",
+        "The post written yesterday cites Tor 0.4.17.",
+        "A sic transit provider upgraded to Tor 0.4.17.",
     ):
         assert has_malformed_tor_version(bad_ver)
         assert has_malformed_tor_version(bad_ver, ["tor"])
@@ -492,7 +495,8 @@ def test_shouting_caps_and_malformed_tor_version_helpers_and_validation(monkeypa
         assert not has_malformed_tor_version(bad_ver, ["arti"])
     for valid_ver in (
         "Tor 0.4.9.17 is released", "Tor 0.4.9 branch", "Tor 0.4.10.1 alpha",
-        "Tor 0.4.17 [sic]", "written as Tor 0.4.17 in the message",
+        "Tor 0.4.17 [sic]", "Tor 0.4.17 (sic)", 'written as "Tor 0.4.17"',
+        "written as Tor 0.4.17 in the message", "the 0.4.17 release typo",
         "a 0.4.17 upgrade (version typo in subject)", "10.0.4.17 release",
     ):
         assert not has_malformed_tor_version(valid_ver, ["tor"])

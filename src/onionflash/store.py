@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import closing, contextmanager
 from itertools import islice
 import json
@@ -282,7 +282,7 @@ def source_due(state: dict, observed: str) -> bool:
     return not due or due <= observed
 
 
-def item_priority(item: dict) -> int:
+def item_priority(item: dict, dirauth_users: Iterable[str] | None = None) -> int:
     """Score a collected item so HackerOne, directory-authority and security reports run first."""
     words = (item["title"] + " " + item["content"][:1500] + " " + " ".join(item.get("labels", []))).lower()
     score = sum(
@@ -292,7 +292,7 @@ def item_priority(item: dict) -> int:
     )
     if is_hackerone_item(item):
         score += HACKERONE_PRIORITY
-    if is_dirauth_item(item):
+    if is_dirauth_item(item, dirauth_users):
         score += DIRAUTH_PRIORITY
     return max(score, TAG_PRIORITY if item["kind"] == "tag" else 0)
 
@@ -303,6 +303,10 @@ def _valid_saved_item(old: object) -> bool:
     if not all(isinstance(old.get(key), str) for key in ("title", "content", "updated_at")):
         return False
     if "source_content" in old and not isinstance(old["source_content"], str):
+        return False
+    if "author" in old and old["author"] is not None and not isinstance(old["author"], str):
+        return False
+    if "comments_truncated" in old and type(old["comments_truncated"]) is not bool:
         return False
     labels = old.get("labels")
     if labels is not None and (not isinstance(labels, list) or any(not isinstance(entry, str) for entry in labels)):
@@ -317,6 +321,16 @@ def _valid_saved_item(old: object) -> bool:
         )
     ):
         return False
+    dirauth_notes = old.get("dirauth_notes")
+    if dirauth_notes is not None and (
+        not isinstance(dirauth_notes, list)
+        or any(
+            not isinstance(note, dict)
+            or not all(isinstance(note.get(key), str) for key in ("id", "author", "created_at"))
+            for note in dirauth_notes
+        )
+    ):
+        return False
     return True
 
 
@@ -324,13 +338,17 @@ def item_hash(item: dict) -> str:
     """A digest of the fields that make a new revision of an item."""
     fields = {k: item.get(k) for k in ("title", "content", "kind", "product", "labels", "authority", "upstream_state")}
     fields["content"] = item.get("source_content", item.get("content"))
+    if item.get("author"):
+        fields["author"] = item["author"]
     if item.get("public_comments"):
         fields["public_comments"] = analysis_context(item)[1]
+    if item.get("dirauth_notes"):
+        fields["dirauth_notes"] = item["dirauth_notes"]
     return digest(fields)
 
 
 def _uncommented_hash(old: dict, item: dict) -> str:
-    base_old = {k: v for k, v in old.items() if k != "public_comments"}
+    base_old = {k: v for k, v in old.items() if k not in {"public_comments", "dirauth_notes", "comments_truncated"}}
     if base_old.get("authority") == "dirauth-operator" and item.get("authority") == "development":
         base_old["authority"] = "development"
     return item_hash(base_old)
@@ -339,8 +357,9 @@ def _uncommented_hash(old: dict, item: dict) -> str:
 class Store:
     """SQLite state store for sources, queued items, analyses and published stories."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, dirauth_users: Iterable[str] | None = None):
         """Open persistent state and apply idempotent schema maintenance before use."""
+        self.dirauth_users = tuple(dirauth_users) if dirauth_users is not None else None
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if path.is_symlink():
@@ -497,7 +516,7 @@ class Store:
         with self.db:
             self.db.execute(f"UPDATE source_state SET {assignments} WHERE id=?", (*fields.values(), source["id"]))
 
-    def ingest(self, item: dict, observed: str) -> bool:
+    def ingest(self, item: dict, observed: str, *, dirauth_users: Iterable[str] | None = None) -> bool:
         """Store a new or updated source item and return whether it was queued."""
         item_id = digest(item_identity(item))[:24]
         item["id"] = item_id
@@ -530,7 +549,7 @@ class Store:
             and row["status"] != "pending"
             and "comments_source_key" not in item
             and not check_requested
-            and old.get("public_comments")
+            and (old.get("public_comments") or old.get("dirauth_notes"))
             and _uncommented_hash(old, item) == content_hash
         ):
             return False
@@ -538,7 +557,8 @@ class Store:
             alias = editorial.retired(self.db, story_id=row["story_id"], cluster_key=row["cluster_key"])
             if alias is not None and alias[1] is None:
                 cluster = self.db.execute("SELECT cluster_key FROM story_aliases WHERE story_id=?", (alias[0],)).fetchone()[0]
-        score = item_priority(item)
+        effective_users = self.dirauth_users if dirauth_users is None else dirauth_users
+        score = item_priority(item, effective_users)
         try:
             with self.db:
                 self.db.execute(
@@ -662,9 +682,12 @@ class Store:
         )
         return cache_key
 
-    def prepare_candidate(self, row: dict, result: dict, observed: str) -> dict:
+    def prepare_candidate(
+        self, row: dict, result: dict, observed: str, *, dirauth_users: Iterable[str] | None = None
+    ) -> dict:
         """Assemble a read-only publication candidate and source bindings for `row`."""
-        return candidate.prepare(self.db, row, result, observed)
+        effective_users = self.dirauth_users if dirauth_users is None else dirauth_users
+        return candidate.prepare(self.db, row, result, observed, dirauth_users=effective_users)
 
     def _append_citation(self, story_id: str, story_payload: dict, source: dict) -> None:
         if "editorial_item" not in story_payload:

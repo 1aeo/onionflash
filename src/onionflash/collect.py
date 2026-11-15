@@ -25,8 +25,8 @@ LIST_ARCHIVE_HOST = "lists.torproject.org"
 # optionally followed by the display name in parentheses; only that address counts.
 HYPERKITTY_AUTHOR = re.compile(r"[^@\s()＠]+＠[^@\s()＠]+(?: \(.*\))?\Z", re.DOTALL)
 PROJECT_SENDER = re.compile(r"[a-z0-9._+-]+@torproject\.org")
-SENDER_ADDRESS = re.compile(r"[a-z0-9._+-]+@([a-z0-9.-]+\.[a-z]{2,})")
 SENDER_DOMAIN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
+SENDER_ADDRESS = re.compile(rf"[a-z0-9._+-]+@({SENDER_DOMAIN.pattern})")
 _GITLAB_AUTHOR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 
 
@@ -41,7 +41,7 @@ def _sender_authority(author: object, trusted_domains: list[str] | tuple[str, ..
     if address is None or not address.isascii():
         return None
     match = SENDER_ADDRESS.fullmatch(address.lower())
-    if match is None or not SENDER_DOMAIN.fullmatch(domain := match.group(1)):
+    if match is None or len(domain := match.group(1)) > 253 or not SENDER_DOMAIN.fullmatch(domain):
         return None
     if domain == "torproject.org":
         return "project-sender"

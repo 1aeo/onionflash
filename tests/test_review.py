@@ -486,8 +486,18 @@ def test_final_holds_shouting_malformed_version_and_untrusted_operator_claims():
 
     bad_ver_story = candidate(summary="Operators reported issues after a post-0.4.17 upgrade.", confidence="reported", products=["tor"])
     assert "malformed_version" in review.final_holds(bad_ver_story, prep_for("trusted-operator"))
-    sic_story = candidate(summary="An operator wrote Tor 0.4.17 [sic] in the message.", confidence="reported", products=["tor"])
-    assert review.final_holds(sic_story, prep_for("trusted-operator")) == []
+    written_bad_story = candidate(summary="Tor 0.4.17 release notes were written today.", confidence="reported", products=["tor"])
+    assert "malformed_version" in review.final_holds(written_bad_story, prep_for("trusted-operator"))
+    written_prefix_bad = candidate(summary="The post written yesterday cites Tor 0.4.17.", confidence="reported", products=["tor"])
+    assert "malformed_version" in review.final_holds(written_prefix_bad, prep_for("trusted-operator"))
+    for annotated in (
+        "An operator wrote Tor 0.4.17 [sic] in the message.",
+        "An operator wrote Tor 0.4.17 (sic) in the message.",
+        'The subject was written as "Tor 0.4.17" in the archive.',
+        "The subject was written as Tor 0.4.17 in the archive.",
+        "Maintainers corrected the Tor 0.4.17 typo.",
+    ):
+        assert review.final_holds(candidate(summary=annotated, confidence="reported", products=["tor"]), prep_for("trusted-operator")) == []
     arti_story = candidate(summary="Operators tested 0.4.17 relay builds.", confidence="reported", products=["arti"])
     assert review.final_holds(arti_story, prep_for("trusted-operator")) == []
 
@@ -504,6 +514,49 @@ def test_final_holds_shouting_malformed_version_and_untrusted_operator_claims():
                           summary="A proposal on tor-dev outlines congestion signaling frames.",
                           category="protocol", tags=["protocol"], confidence="reported")
     assert review.final_holds(rfc_story, prep_for("community", rfc_url)) == []
+
+    prop_sources = [{
+        "id": "S1", "url": rfc_url, "kind": "feed", "authority": "community",
+        "title": "[tor-dev] Proposal 375: Rate-limiting circuit flooding",
+        "passages": [{"id": "S1:P1", "text": "Proposal 375 specifies rate limits to defend against circuit flooding and DoS attacks."}],
+    }]
+    prop_story = candidate(
+        title="Proposal 375: Rate-limiting circuit flooding",
+        summary="Proposal 375 on tor-dev specifies rate limits to defend against circuit flooding and DoS attacks.",
+        category="protocol", tags=["protocol", "dos"], confidence="reported",
+    )
+    assert review.final_holds(prop_story, {"packet": {"sources": prop_sources}, "payload": {"editorial_kind": "feed"}}) == []
+
+    defense_framing = candidate(
+        title="Rate-limit proposal for directory requests",
+        summary="A tor-dev post proposes a rate-limit defense against directory flooding.",
+        category="protocol", tags=["protocol"], confidence="reported",
+    )
+    assert review.final_holds(defense_framing, prep_for("community", rfc_url)) == []
+
+    for live_inc in (
+        candidate(
+            title="Operator reports suspected VPS provider tampering and connection flood on exit relay",
+            summary="A mailing-list post describes suspected host tampering and a connection flood.",
+            category="relay", tags=["relay"], confidence="reported",
+        ),
+        candidate(
+            title="Operator reports HSDir-targeted circuit overload and attack",
+            summary="A mailing-list post reports an HSDir circuit attack on relays.",
+            category="relay", tags=["relay"], confidence="reported",
+        ),
+        candidate(
+            title="Post claims rate-limit defense bypass on relays",
+            summary="A mailing-list post reports a rate-limit defense bypass.",
+            category="relay", tags=["relay"], confidence="reported",
+        ),
+        candidate(
+            title="[RFC] Operator reports active DDoS flood hitting exit relays",
+            summary="A post marked RFC reports an active DDoS flood on exit relays.",
+            category="dos", tags=["dos"], confidence="reported",
+        ),
+    ):
+        assert review.final_holds(live_inc, prep_for("community", rfc_url)) == ["untrusted_operator_claim"]
 
     upd_cand = {
         **rfc_story,

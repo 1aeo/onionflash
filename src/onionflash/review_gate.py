@@ -20,8 +20,8 @@ from . import candidate as candidate_mod, decisions, editorial, review
 from .analyze import cache_key
 from .llm import AnalysisError, CompletionDeferred, RequestObserver
 from .util import (
-    _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, is_dirauth_item, is_hackerone_item,
-    now_iso, saved_object, thread_subject,
+    DIRAUTH_GITLAB_USERS, _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, is_dirauth_item,
+    is_hackerone_item, now_iso, saved_object, thread_subject,
 )
 
 REVIEW_STATE_VERSION = 2
@@ -63,6 +63,34 @@ HOLDS = {
 
 def _json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
+
+
+def _dirauth_users(config, store):
+    if isinstance(config, dict) and "dirauth_gitlab_users" in (config.get("collection") or {}):
+        return config["collection"]["dirauth_gitlab_users"]
+    return getattr(store, "dirauth_users", None)
+
+
+def _dirauth_set(users) -> set[str]:
+    return {
+        u.strip().lower()
+        for u in (DIRAUTH_GITLAB_USERS if users is None else users)
+        if isinstance(u, str) and u.strip()
+    }
+
+
+def _prepare_candidate(store, row, draft, prepared_at, dirauth_users):
+    had_attr = hasattr(store, "dirauth_users")
+    prior_users = getattr(store, "dirauth_users", None)
+    if dirauth_users is not None:
+        store.dirauth_users = tuple(dirauth_users)
+    try:
+        return store.prepare_candidate(row, draft, prepared_at)
+    finally:
+        if had_attr:
+            store.dirauth_users = prior_users
+        elif hasattr(store, "dirauth_users"):
+            delattr(store, "dirauth_users")
 
 
 def _record_input_hash(record: object) -> str | None:
@@ -494,7 +522,7 @@ def next_step(reviews, candidate, prepared):
     official = (
         item.get("authority") in {"official", "project-sender", "hackerone"}
         or is_hackerone_item(item)
-        or ((item.get("authority") in OFFICIAL_AUTHORITIES or is_dirauth_item(item)) and recent_dev)
+        or ((item.get("authority") in OFFICIAL_AUTHORITIES or is_dirauth_item(item, prepared.get("dirauth_users"))) and recent_dev)
     ) and item.get("kind") != "tag"
     # An official item that fails only news value is the operator's to judge, once a fresh
     # verification has passed its facts; a duplicate still skips.
@@ -581,6 +609,7 @@ class ReviewRequests:
         self.state = state
 
     def callback(self, *, correction=False):
+        """Return a `RequestObserver` that reserves and persists review request slots."""
         requests = self
 
         class Counter(RequestObserver):
@@ -645,6 +674,7 @@ def _context(prepared, policy):
 
 
 def pending_proposal(record):
+    """Return the active pending untrusted repair proposal on `record`, if any."""
     return next((proposal for proposal in record.get("untrusted_proposals", [])
                  if proposal["disposition"] == "pending"), None)
 
@@ -1168,6 +1198,7 @@ def developed_at(item: dict) -> str:
     dates = [item["published_at"]]
     if item.get("kind") == "gitlab_issue":
         dates += [note["created_at"] for note in item.get("public_comments") or []]
+        dates += [note["created_at"] for note in item.get("dirauth_notes") or []]
         if item.get("upstream_state") == "closed" and item.get("closed_at"):
             dates.append(item["closed_at"])
     return max(dates)
@@ -1303,11 +1334,22 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             if getattr(writer, "clears", 0):  # writer validation cleared the draft's impact sentence
                 record["writer"]["clears"] = writer.clears  # kept until an operator retry resets the record
             _save(store, row, writer_key, policy, "drafted", draft, None, record, observed, prepared_at=prepared_at)
-        prepared = store.prepare_candidate(row, draft, prepared_at)
-        same = old is not None and job["policy_hash"] == policy and _identity(old) == _identity(prepared)
+        prepared = _prepare_candidate(store, row, draft, prepared_at, _dirauth_users(config, store))
+        same = (
+            old is not None
+            and job["policy_hash"] == policy
+            and _identity(old) == _identity(prepared)
+            and _dirauth_set(old.get("dirauth_users")) == _dirauth_set(prepared.get("dirauth_users"))
+        )
         stage = job["stage"] if same else "review"
+        fresh_prepared = {
+            key: prepared[key]
+            for key in ("mode", "candidate", "packet", "coverage", "candidate_hash", "source_hash", "coverage_hash", "binding_hash")
+        }
+        if "dirauth_users" in prepared:
+            fresh_prepared["dirauth_users"] = prepared["dirauth_users"]
         fresh = {"schema_version": REVIEW_STATE_VERSION, "writer": record["writer"], "input_hash": row["content_hash"], "input_proof": 1, "input_row": row, "reviews": [], "policy_hash": policy, **initial_review_state(),
-                 "prepared": {key: prepared[key] for key in ("mode", "candidate", "packet", "coverage", "candidate_hash", "source_hash", "coverage_hash", "binding_hash")}}
+                 "prepared": fresh_prepared}
         # A coverage change invalidates old reviews, not the request budget of
         # this source revision and policy. Explicit operator retry starts afresh.
         if (job is not None and job["policy_hash"] == policy) or carry is not None:
@@ -1474,7 +1516,7 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
         "next_attempt_at", "last_error", "story_id", "first_seen", "last_seen", "priority_score")}
     row["payload"] = item_row["payload_blob"].decode("utf-8")
     try:
-        prepared = store.prepare_candidate(row, draft, job["prepared_at"])
+        prepared = _prepare_candidate(store, row, draft, job["prepared_at"], _dirauth_users(config, store))
     except Exception:
         return refuse("Its story or sources changed since the review; retry it", editorial_failures)
     if prepared["locked"]:
@@ -1487,6 +1529,7 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
         return refuse("Final review held: " + HOLDS["missing_sources"], editorial_failures, new_coverage)
     saved_binding = saved_env.get("binding") if isinstance(saved_env.get("binding"), dict) else {}
     if (prepared["story_id"] != saved_env.get("story_id")
+            or _dirauth_set(prepared.get("dirauth_users")) != _dirauth_set(saved_env.get("dirauth_users"))
             or prepared["candidate_hash"] != held_prepared.get("candidate_hash")
             or prepared["candidate_hash"] != saved_env.get("candidate_hash")
             or prepared["source_hash"] != held_prepared.get("source_hash")

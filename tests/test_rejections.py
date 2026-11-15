@@ -462,6 +462,9 @@ def test_show_prints_a_skip_that_repeats_the_first_decision_after_a_hold(store):
     '{"x":"\\ud800"}',
     "{" + '"a":' * 70 + "1" + "}" * 70,
     '{"prepared": [], "reviews": "bad"}',
+    '{"prepared": {}, "reviews": {}}',
+    '{"prepared": {}, "reviews": [], "approval": {"reviews": {}}}',
+    '{"prepared": {}, "reviews": [], "approval": "bad"}',
 ])
 def test_rejected_controls_and_cli_handle_blobs_surrogates_deep_json_and_damaged_records(tmp_path, capsys, record_damage):
     from onionflash import cli
