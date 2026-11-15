@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
+from .config import completion_budget_seconds
 from .schema import CATEGORIES, CONFIDENCES, STATES
 from .transport import DeadlineReached, FetchError, HttpClient
 
@@ -17,6 +19,10 @@ class AnalysisError(Exception):
         self.retryable = retryable
         if code is not None:
             self.code = code
+
+
+class CompletionDeferred(Exception):
+    """No request was sent because the run no longer admits completions."""
 
 
 class RequestObserver:
@@ -137,10 +143,12 @@ def generation_options(settings: dict) -> dict:
 class CompletionClient:
     stage = "writer"
     REQUEST_POLICY = {"transport": {"retry_attempts": 1, "max_redirects": 0},
-                      "deadline_refund": "before_dispatch_only"}
+                      "deadline_refund": "before_dispatch_only",
+                      "run_deadline": "admission_before_and_after_reservation"}
 
     def __init__(self, config: dict, deadline: float | None = None):
-        self.deadline = deadline  # absolute time.monotonic() limit for model requests
+        self.deadline = deadline  # absolute monotonic admission boundary, not a transport cutoff
+        self.clock = time.monotonic
         self.llm = config["llm"]
         # Each endpoint gets one metered request. Redirect hops cannot bypass
         # reservations; only explicitly configured fallbacks may send again.
@@ -148,10 +156,7 @@ class CompletionClient:
             **config["http"],
             **{k: v for k, v in self.llm.items() if k in config["http"]},
             # The fixed total must not cut short a longer configured response timeout.
-            "total_timeout_seconds": max(
-                self.llm["total_timeout_seconds"],
-                self.llm["timeout_seconds"] + self.llm["connect_timeout_seconds"],
-            ),
+            "total_timeout_seconds": completion_budget_seconds(self.llm),
             **self.REQUEST_POLICY["transport"],
         }
         self.client: HttpClient | None = None
@@ -170,8 +175,15 @@ class CompletionClient:
     def _fail_retryable(self, message: str) -> AnalysisError:
         return AnalysisError(message, retryable=True)
 
+    def _admit(self, failure: AnalysisError | None = None) -> None:
+        if self.deadline is not None and self.clock() >= self.deadline:
+            if failure is not None:
+                raise failure
+            raise CompletionDeferred("Run completion admission window has ended")
+
     def complete(self, prompt: str, payload: dict, schema: dict, name: str, *, on_request=None) -> dict:
         """One fresh request; drafting, review and link checks share transport policy."""
+        self._admit()
         if not self.llm["base_url"]:
             raise self._fail_retryable("LLM endpoint is not configured")
         key = os.environ.get(self.llm["api_key_env"], "")
@@ -182,8 +194,8 @@ class CompletionClient:
                 self.http_settings,
                 allowed_networks=self.llm["allowed_networks"],
                 allow_http=self.llm["allow_http"],
+                clock=self.clock,
             )
-            self.client.deadline = self.deadline
         try:
             content = json.dumps(payload, ensure_ascii=False, allow_nan=False)
             content.encode("utf-8")
@@ -202,10 +214,17 @@ class CompletionClient:
 
     def _complete(self, request: dict, key: str, *, on_request=None) -> dict:
         """POST one chat completion; only transport failures move on to a fallback."""
-        failure = AnalysisError("All LLM endpoints failed", retryable=True)
+        failure = None
         for base_url in [self.llm["base_url"], *self.llm["fallback_base_urls"]]:
+            self._admit(failure)
             if on_request is not None:
                 on_request(1)  # Reserve durably before any endpoint attempt.
+            try:
+                self._admit(failure)
+            except (CompletionDeferred, AnalysisError):
+                if on_request is not None:
+                    on_request(-1)
+                raise
             self.calls += 1
             try:
                 response = self.client.request(
@@ -217,7 +236,7 @@ class CompletionClient:
                 break
             except FetchError as exc:
                 # An endpoint or credential problem is not this item's fault.
-                failure = AnalysisError(
+                current_failure = AnalysisError(
                     "LLM request failed" + (f" (HTTP {exc.status})" if exc.status else ""),
                     retryable=True,
                 )
@@ -230,9 +249,10 @@ class CompletionClient:
                             on_request(-1)
                     if isinstance(on_request, RequestObserver):
                         on_request.transport_failed()
-                    raise failure from None
+                    raise failure or current_failure from None
                 if isinstance(on_request, RequestObserver):
                     on_request.transport_failed()
+                failure = current_failure
         else:
             raise failure
         if isinstance(on_request, RequestObserver):

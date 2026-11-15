@@ -86,6 +86,14 @@ profile's reasoning and sampling parameters. The request timeout remains an
 explicit operator setting; enabling reasoning does not change it. Review and
 link-check generation settings are unchanged.
 
+`llm.timeout_seconds` accepts 1–3600 seconds. The run budget controls admission
+of new model requests; an admitted request receives its full transport allowance.
+When that window ends, any remaining review or verification stays pending for a
+later run without a queue failure. Collection deadlines remain unchanged.
+Command wrappers can use `onionflash.config.run_command_budget_seconds(config)`
+for the admission window plus one in-flight completion, then add their own
+build and cleanup allowance.
+
 Collection, HTTP, model, comment, final-review and publication limits (lookback,
 budgets, retries, response sizes, backoff, source-packet bounds,
 render batch) are fixed in code.

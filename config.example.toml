@@ -26,7 +26,7 @@ model = "qwen3.8-27b"
 # and allowed_networks to the exact server IPs as /32 or /128 CIDRs.
 allow_http = false
 allowed_networks = []
-timeout_seconds = 120
+timeout_seconds = 120 # Per admitted completion; accepts 1–3600 seconds.
 max_items_per_run = 12
 # vLLM understands this optional extension. Set false for providers that do not.
 send_chat_template_kwargs = true

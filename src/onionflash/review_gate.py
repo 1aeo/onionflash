@@ -18,7 +18,7 @@ import re
 
 from . import candidate as candidate_mod, decisions, editorial, review
 from .analyze import cache_key
-from .llm import AnalysisError, RequestObserver
+from .llm import AnalysisError, CompletionDeferred, RequestObserver
 from .util import _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, now_iso, saved_object, thread_subject
 
 REVIEW_STATE_VERSION = 2
@@ -1372,6 +1372,8 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             stage, candidate = action, value  # the next review: a verification or a release-label repair
             record["candidate"] = candidate
             _save(store, row, writer_key, policy, stage, draft, prepared, record, observed, prepared_at=prepared_at)
+    except CompletionDeferred:
+        return {**report, "status": "deferred", "budget_reached": True}
     except RetiredStory:
         return _ignore_retired()
     except (StaleCandidate, ReviewRequired):

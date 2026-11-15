@@ -79,7 +79,7 @@ DEFAULTS = {
 }
 
 BOUNDS = {
-    "timeout_seconds": (1, 600),
+    "timeout_seconds": (1, 3600),
     "max_pages": (1, 100),
     "page_size": (1, 100),
     "max_items_per_source": (1, 10000),
@@ -119,6 +119,19 @@ _SOURCE_KEYS = {
     "id", "name", "url", "website_url", "alert_format", "publish",
     "gitlab_project", "max_pages", "max_items", *_SOURCE_DEFAULTS,
 }
+
+
+def completion_budget_seconds(llm: dict) -> float:
+    """Transport allowance for one admitted completion, including connection time."""
+    return max(llm["total_timeout_seconds"], llm["timeout_seconds"] + llm["connect_timeout_seconds"])
+
+
+def run_command_budget_seconds(config: dict) -> float:
+    """Run admission window plus the last admitted completion's transport allowance.
+
+    Wrappers should add their own allowance for build and cleanup work.
+    """
+    return config["collection"]["run_budget_seconds"] + completion_budget_seconds(config["llm"])
 
 
 def _check_range(value: object, low: int, high: int, *, allow_float: bool = False) -> bool:

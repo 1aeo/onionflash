@@ -15,6 +15,7 @@ import traceback
 
 from . import __version__, decisions, doctor, editorial, rejection
 from .analyze import AnalysisError, Analyzer
+from .llm import CompletionDeferred
 from .collect import CollectionError, collect_source
 from .comments import RUN_BUDGET_SECONDS as COMMENTS_BUDGET, enrich_comments, merge_cached_comments, status as comments_status
 from .config import DEFAULTS, load_config
@@ -244,12 +245,17 @@ def run(config: dict, store: Store) -> dict:
                 report["review_cache_hits"] += bool(result["cache_hit"])
                 report["review_stale"] += result["status"] == "stale"
                 report["review_routed"] += result["status"] == "routed"
+                if result.get("budget_reached"):
+                    report["budget_reached"] = True
+                    break
             except ReviewLimitReached:
                 # The gate already checked the exact source and recorded this
                 # terminal rejection; it must not become a second queue strike.
                 report["analysis_failed"] += 1
+            except CompletionDeferred:
+                report["budget_reached"] = True
+                break
             except AnalysisError as exc:
-                # A request cut off by the run deadline is retryable: the item backs off.
                 deferred = store.defer(row["id"], str(exc), config["llm"], now_iso(), terminal=not exc.retryable,
                                        code=exc.code, expected_row=row)
                 report["analysis_failed"] += deferred
