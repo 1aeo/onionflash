@@ -123,6 +123,17 @@ def json_object(text: str, code: str = "writer.invalid_json") -> dict:
     return result
 
 
+def generation_options(settings: dict) -> dict:
+    """The declared generation fields sent to the completion endpoint, without credentials."""
+    options = {"temperature": settings.get("temperature", 0), "max_tokens": settings["max_output_tokens"]}
+    for key in ("top_p", "top_k", "min_p", "presence_penalty", "repetition_penalty", "reasoning_effort"):
+        if key in settings:
+            options[key] = settings[key]
+    if settings["send_chat_template_kwargs"]:
+        options["chat_template_kwargs"] = {"enable_thinking": settings["enable_thinking"]}
+    return options
+
+
 class CompletionClient:
     stage = "writer"
     REQUEST_POLICY = {"transport": {"retry_attempts": 1, "max_redirects": 0},
@@ -178,15 +189,15 @@ class CompletionClient:
             content.encode("utf-8")
         except (ValueError, TypeError, RecursionError) as exc:
             raise AnalysisError("Model input is not valid UTF-8 JSON", code=self.stage + ".invalid_input") from exc
+        options = generation_options(self.llm)
         request = {
             "model": self.llm["model"],
             "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": content}],
-            "temperature": 0,
-            "max_tokens": self.llm["max_output_tokens"],
+            "temperature": options.pop("temperature"),
+            "max_tokens": options.pop("max_tokens"),
             "response_format": {"type": "json_schema", "json_schema": {"name": name, "strict": True, "schema": schema}},
         }
-        if self.llm["send_chat_template_kwargs"]:
-            request["chat_template_kwargs"] = {"enable_thinking": self.llm["enable_thinking"]}
+        request.update(options)
         return self._complete(request, key, **({"on_request": on_request} if on_request is not None else {}))
 
     def _complete(self, request: dict, key: str, *, on_request=None) -> dict:

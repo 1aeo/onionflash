@@ -9,12 +9,33 @@ import re
 from .comments import analysis_context
 from .llm import (
     AnalysisError, CompletionClient, apply_label_limits, is_complete_sentence,
-    label_limits, strip_unreleased_tag, tag_name, validate_text,
+    generation_options, label_limits, strip_unreleased_tag, tag_name, validate_text,
 )
 from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, STATES, UPDATE_CHARS
 from .util import digest, normalize_evidence as _plain
 
 PROMPT_VERSION = "onionflash-16"
+WRITER_REASONING_OPTIONS = {
+    "max_output_tokens": 32768, "max_response_bytes": 2097152,
+    "enable_thinking": True, "temperature": 1.0,
+    "top_p": 0.95, "top_k": 20, "min_p": 0.0,
+    "presence_penalty": 0.0, "repetition_penalty": 1.0, "reasoning_effort": "xhigh",
+}
+
+
+def writer_settings(settings: dict) -> dict:
+    """Apply the optional writer profile without changing other completion stages."""
+    enabled = settings.get("writer_reasoning", False)
+    if type(enabled) is not bool:
+        raise ValueError("llm.writer_reasoning must be a boolean")
+    result = copy.deepcopy(settings)
+    if enabled:
+        if settings.get("send_chat_template_kwargs") is not True:
+            raise ValueError("llm.writer_reasoning requires llm.send_chat_template_kwargs")
+        result.update(WRITER_REASONING_OPTIONS)
+    return result
+
+
 MIN_EVIDENCE_CHARS = 8
 MAX_EVIDENCE_CHOICES = 128
 SCHEMA = {
@@ -321,6 +342,9 @@ class Analyzer(CompletionClient):
 
     stage = "writer"  # names the stage in the codes of failed requests
     clears = 0  # 1 when validation cleared the latest draft's impact sentence, for the decision log
+
+    def __init__(self, config: dict, deadline: float | None = None):
+        super().__init__({**config, "llm": writer_settings(config["llm"])}, deadline=deadline)
 
     def analyze(self, item: dict, prior: dict | None = None) -> dict:
         """Return a bounded draft with literal evidence, never a publication decision."""

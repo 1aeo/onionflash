@@ -30,6 +30,9 @@ timeout_seconds = 120
 max_items_per_run = 12
 # vLLM understands this optional extension. Set false for providers that do not.
 send_chat_template_kwargs = true
+# Optional writer-only reasoning profile. The endpoint must support its reasoning
+# and sampling parameters; reviewers and link checks keep their own profiles.
+writer_reasoning = false
 
 # Every automatic publication, tag notices included, needs a final approval of its
 # exact candidate, bounded source packet and coverage background. The endpoint,
