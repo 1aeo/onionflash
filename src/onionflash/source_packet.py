@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .comments import analysis_context
-from .util import canonical_url, digest, is_hackerone_item, plain_text, saved_object
+from .util import canonical_url, digest, is_dirauth_item, is_hackerone_item, plain_text, saved_object
 
 
 # The review packet's fixed bounds.
@@ -181,9 +181,14 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
                 missing.append(source["url"])
             continue
         unit = {key: item.get(key) for key in ("kind", "authority", "product", "published_at", "updated_at", "upstream_state")}
-        if unit["authority"] == "development" and is_hackerone_item(item):
-            unit["authority"] = "hackerone"
+        if unit["authority"] == "development":
+            if is_hackerone_item(item):
+                unit["authority"] = "hackerone"
+            elif is_dirauth_item(item):
+                unit["authority"] = "dirauth-operator"
         unit.update(labels=normalize_labels(item.get("labels")), url=canonical_url(item["url"]), title=item["title"], snapshot=snapshot)
+        if isinstance(item.get("author"), str) and item["author"]:
+            unit["author"] = item["author"]
         if item.get("closed_at"):
             unit["closed_at"] = item["closed_at"]
         if captured:

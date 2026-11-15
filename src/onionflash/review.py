@@ -13,7 +13,7 @@ from .render import prepare_story
 from .schema import LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STORY_ID_RE, UPDATE_CHARS
 from .util import canonical_url, digest, normalize_evidence
 
-REVIEW_VERSION = "onionflash-review-13"
+REVIEW_VERSION = "onionflash-review-14"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details", "news_value", "new_information")
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
@@ -126,7 +126,9 @@ community claims.
 A mailing-list proposal is reported as proposed (state developing, confidence
 reported) and is its author's proposal for comment, not an adoption or Tor Project
 decision; project-sender authority marks a torproject.org list sender,
-trusted-operator marks a verified large AROI relay-family operator, and hackerone
+trusted-operator marks a verified large AROI relay-family operator,
+dirauth-operator marks a verified directory-authority operator opening or
+commenting on a GitLab ticket, and hackerone
 marks a disclosed HackerOne report: none of those authorities confirms a claim
 (keep confidence reported unless an official non-tag announcement or merged
 gitlab_mr confirms the change, and preserve any maintainer severity/scope triage
@@ -178,7 +180,15 @@ milestone. Unconfirmed reports can be important when faithfully attributed. Disc
 HackerOne reports (authority=hackerone or a gitlab_issue citing hackerone.com/reports/)
 are prioritized authoritative disclosures that pass news_value when newly disclosed,
 even if maintainers rate severity low or dispute DoS impact, provided the candidate
-accurately includes the maintainer triage and keeps confidence reported. Concrete
+accurately includes the maintainer triage and keeps confidence reported. GitLab issues
+or merge requests with authority=dirauth-operator (opened or commented on by a verified
+directory-authority operator) or labeled Directory Authority (dirauth) that report
+authority IP, key or host changes, consensus or voting anomalies, operational issues, or
+daemon bugs or warnings observed on authority infrastructure are prioritized authoritative
+operational reports that pass news_value (keeping confidence reported unless an official
+announcement or merged gitlab_mr confirms a change), whereas purely administrative chores,
+typo fixes or off-topic remarks without operational or software substance still fail
+news_value. Concrete
 official stable releases and platform-specific fix releases can merit normal-priority
 coverage without an invented impact claim. Credible, narrowly scoped security reports
 and major merged-feature milestones can also be newsworthy. An empty why_it_matters
@@ -211,14 +221,17 @@ A merged change, issue, proposal discussion or list post passes news_value ONLY 
 major standalone development: a capability users or operators can now use, a changed
 default, a major milestone, a new defense, a protocol change that ships, a merged fix
 for a remotely triggerable security defect, systematic empirical network measurements,
-a disclosed HackerOne report, or a credible vulnerability report with established scope.
+a disclosed HackerOne report, a directory-authority operational or bug report
+(authority=dirauth-operator or Directory Authority (dirauth) label), or a credible
+vulnerability report with established scope.
 Fail news_value (verdict skip) for: internal plumbing or refactors, partial sub-tasks
 with follow-up work toward an unfinished component, stall/crash/reactor fixes found while
 testing an unreleased component or development branch, documentation or specification
 sections for an existing design, user questions, release checklists, third-party tool
 announcements or updates, isolated operator error or relay-flag configuration reports
 without broader network impact, uncorroborated single-vantage observations, and ordinary
-non-HackerOne bug reports whose security impact and scope are explicitly unestablished.
+bug reports (neither hackerone nor dirauth-operator) whose security impact and scope are
+explicitly unestablished.
 On mailing lists (such as tor-relays, network-health and tor-dev), uncorroborated
 operational attack, compromise, DoS, flood, defense-bypass or anomaly claims from
 authority=community (neither official, project-sender nor trusted-operator) fail
@@ -383,7 +396,7 @@ Evaluate all nine criteria in order before choosing verdict:
 4. uncertainty_attribution: Keep hedges ("suspected", "plausibly", "may", "reported", "I think") and material
    maintainer disagreement or narrowing. Reserve confidence "confirmed" for an official non-tag Tor Project
    announcement or merged gitlab_mr (or when coverage_background.prior_story.confidence is already "confirmed",
-   which must never be downgraded). Community, issue, hackerone, project-sender and trusted-operator
+   which must never be downgraded). Community, issue, hackerone, dirauth-operator, project-sender and trusted-operator
    (verified large AROI relay-family operator) sources remain confidence "reported", never
    "confirmed" (use "reports", "says" or "notes", never "confirms"), and overload, flag loss
    or counters alone do not confirm an attack or compromise.
@@ -408,7 +421,8 @@ Evaluate all nine criteria in order before choosing verdict:
          not yet "tagged" or "released", such as a tag listing the version that ships an already-"merged" fix —
          never treat a version tag as already covered by a "merged" state; released when prior_story.state was not
          yet "released"; fixed, resolved, or reopened);
-     (b) an official statement or advisory adding substantive facts, scope changes or disclosure dates;
+     (b) an official statement or advisory, or a directory-authority operator report (authority=dirauth-operator or
+         naming a directory authority), adding substantive facts, authority impact, scope changes or disclosure dates;
      (c) concrete new empirical telemetry, multi-relay/vantage measurements, quantitative rates/counts, a newly
          identified root-cause mechanism, or newly reported affected versions, OSes or platforms;
      (d) a material maintainer correction, scope narrowing, withdrawal or dispute of prior_story;

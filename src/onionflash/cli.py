@@ -41,6 +41,7 @@ def _unexpected_error(exc: BaseException) -> str:
 
 @contextlib.contextmanager
 def run_lock(database: str):
+    """Acquire a non-blocking exclusive advisory file lock adjacent to `database`."""
     path = Path(database + ".lock")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
@@ -161,7 +162,8 @@ def run(config: dict, store: Store) -> dict:
             network_ingested["rejected"] += rejected
             return received
         if comments_enabled:
-            items = (merge_cached_comments(store, item, source, received) for item in items)
+            dirauth_users = config["collection"].get("dirauth_gitlab_users")
+            items = (merge_cached_comments(store, item, source, received, dirauth_users=dirauth_users) for item in items)
         report["items_changed"] += sum(store.ingest(item, received) for item in items)
         return received
 
@@ -293,6 +295,7 @@ def _status_report(config: dict, store: Store) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse CLI arguments and dispatch `run`, `build`, `check`, `status`, or operator actions."""
     parser = argparse.ArgumentParser(description="Collect, analyze, and build the Onion Flash static news feed.")
     parser.add_argument("--version", action="version", version=__version__)
     cfg_parent = argparse.ArgumentParser(add_help=False)

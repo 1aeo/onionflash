@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from .schema import PRODUCTS
-from .util import canonical_url
+from .util import DIRAUTH_GITLAB_USERS, canonical_url
 
 DEFAULT_TRUSTED_OPERATOR_DOMAINS = [
     "1aeo.com",
@@ -25,7 +25,9 @@ DEFAULT_TRUSTED_OPERATOR_DOMAINS = [
     "quintex.com",
     "unredacted.org",
 ]
+DEFAULT_DIRAUTH_GITLAB_USERS = list(DIRAUTH_GITLAB_USERS)
 _DOMAIN_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
+_GITLAB_USER_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,99}")
 
 DEFAULTS = {
     "site": {
@@ -54,6 +56,7 @@ DEFAULTS = {
         "source_budget_seconds": 60,
         "analysis_reserve_fraction": 0.5,
         "trusted_operator_domains": DEFAULT_TRUSTED_OPERATOR_DOMAINS,
+        "dirauth_gitlab_users": DEFAULT_DIRAUTH_GITLAB_USERS,
     },
     "http": {
         "timeout_seconds": 30,
@@ -101,7 +104,7 @@ BOUNDS = {
 }
 
 OPERATOR_SETTINGS = {
-    "collection": {"trusted_operator_domains"},
+    "collection": {"trusted_operator_domains", "dirauth_gitlab_users"},
     "http": set(),
     "llm": {
         "base_url", "fallback_base_urls", "model", "allowed_networks",
@@ -111,7 +114,7 @@ OPERATOR_SETTINGS = {
 }
 
 SECTION_SPECS = {
-    "collection": {"lists": ("trusted_operator_domains",)},
+    "collection": {"lists": ("trusted_operator_domains", "dirauth_gitlab_users")},
     "comments": {"bools": ("enabled",)},
     "site": {
         "ints": {"page_size": BOUNDS["page_size"]},
@@ -245,6 +248,27 @@ def load_config(path: str | Path) -> dict:
         if domain != "torproject.org" and domain not in trusted_domains:
             trusted_domains.append(domain)
     config["collection"]["trusted_operator_domains"] = trusted_domains
+
+    raw_users = config["collection"]["dirauth_gitlab_users"]
+    if len(raw_users) > 200:
+        raise ValueError("Each dirauth_gitlab_users entry must be a valid GitLab username")
+    dirauth_users: list[str] = []
+    for entry in raw_users:
+        if not isinstance(entry, str):
+            raise ValueError("Each dirauth_gitlab_users entry must be a valid GitLab username")
+        user = entry.strip().lower()
+        if (
+            not user
+            or len(user) > 100
+            or not user.isascii()
+            or ".." in user
+            or user.endswith(".")
+            or not _GITLAB_USER_RE.fullmatch(user)
+        ):
+            raise ValueError("Each dirauth_gitlab_users entry must be a valid GitLab username")
+        if user not in dirauth_users:
+            dirauth_users.append(user)
+    config["collection"]["dirauth_gitlab_users"] = dirauth_users
 
     config["site"]["base_url"] = _clean_endpoint_url(
         _expand(config["site"]["base_url"]),

@@ -33,7 +33,15 @@ boost ahead of ordinary issues, feeds, and tags, bypass the 14-day pre-model and
 review-packet staleness filters when confidential reports are later disclosed, keep
 `confidence` bounded below `confirmed` unless an official announcement or merged merge
 request confirms a change, and are held for the operator rather than silently skipped if
-review fails only `news_value`. Browser release announcements were already present in Tor
+review fails only `news_value`. On `gitlab.torproject.org`, `development`-authority
+issues and merge requests opened by or carrying a verified `public_comments` note from a
+voting directory-authority operator in `[collection].dirauth_gitlab_users`, or labeled
+`Directory Authority (dirauth)`, are upgraded to `dirauth-operator` (unless already
+`hackerone`): only structured API `author` handles and labels on `gitlab.torproject.org`
+match, never body or comment prose, and `dirauth-operator` items likewise receive a `+35`
+queue priority boost, keep `confidence` bounded below `confirmed` without an official
+announcement or merged merge request, and are held (`held.verification.official_not_news`)
+rather than skipped when review fails only `news_value`. Browser release announcements were already present in Tor
 Blog and tor-announce.
 The Browser issue stream is deliberately filtered; it does not replace those
 announcements or promise comprehensive vulnerability coverage.

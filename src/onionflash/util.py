@@ -7,6 +7,7 @@ import ipaddress
 import json
 import math
 import re
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -270,6 +271,59 @@ def is_hackerone_item(item: dict) -> bool:
         )
         if _HACKERONE_REPORT_RE.search(f"{title}\n{body}"):
             return True
+    return False
+
+
+DIRAUTH_GITLAB_USERS = (
+    "andreas",    # dannenberg
+    "arma",       # moria1
+    "linus",      # maatuska
+    "micah",      # longclaw
+    "sebastian",  # gabelmoo
+    "sina",       # faravahar
+    "stefani",    # bastet / sekhmet
+    "usura",      # dizum
+    "weasel",     # tor26
+)
+_DIRAUTH_LABELS = frozenset({"directory authority (dirauth)", "dirauth"})
+
+
+def is_dirauth_item(item: dict, dirauth_users: Iterable[str] | None = None) -> bool:
+    """Return whether `item` is a Tor GitLab ticket or MR from or with a directory-authority operator."""
+    if not isinstance(item, dict):
+        return False
+    if item.get("authority") == "dirauth-operator":
+        return True
+    if item.get("authority") == "community" or item.get("kind") not in {"gitlab_issue", "gitlab_mr"}:
+        return False
+    raw_url = item.get("url")
+    if not isinstance(raw_url, str) or not raw_url:
+        return False
+    try:
+        host = (urlsplit(raw_url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    if host != "gitlab.torproject.org":
+        return False
+    labels = item.get("labels") or ()
+    if isinstance(labels, (list, tuple, set, frozenset)):
+        for label in labels:
+            if isinstance(label, str) and label.strip().casefold() in _DIRAUTH_LABELS:
+                return True
+    users = {
+        u.strip().lower()
+        for u in (DIRAUTH_GITLAB_USERS if dirauth_users is None else dirauth_users)
+        if isinstance(u, str) and u.strip()
+    }
+    author = item.get("author")
+    if isinstance(author, str) and author.strip().lower() in users:
+        return True
+    comments = item.get("public_comments")
+    if isinstance(comments, list) and any(
+        isinstance(note, dict) and isinstance(note.get("author"), str) and note["author"].strip().lower() in users
+        for note in comments
+    ):
+        return True
     return False
 
 

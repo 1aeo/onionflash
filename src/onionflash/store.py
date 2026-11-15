@@ -14,10 +14,14 @@ import sqlite3
 from . import candidate, decisions, doctor, editorial, publication
 from .candidate import ReviewRequired
 from .comments import analysis_context
-from .util import after, backoff_seconds, canonical_json, digest, is_hackerone_item, item_cluster, item_identity, saved_object
+from .util import (
+    after, backoff_seconds, canonical_json, digest, is_dirauth_item, is_hackerone_item, item_cluster,
+    item_identity, saved_object,
+)
 
 TAG_PRIORITY = 5  # queue floor for deterministic tag notices
 HACKERONE_PRIORITY = 35  # queue boost so HackerOne disclosures run ahead of ordinary items
+DIRAUTH_PRIORITY = 35  # queue boost so directory-authority tickets and replies run first
 POLL_TOLERANCE_SECONDS = 5  # absorbs scheduler start jitter after a successful poll
 
 _RETENTION_SCHEMA = """
@@ -279,7 +283,7 @@ def source_due(state: dict, observed: str) -> bool:
 
 
 def item_priority(item: dict) -> int:
-    """Score a collected item so HackerOne, security and compromise reports run first."""
+    """Score a collected item so HackerOne, directory-authority and security reports run first."""
     words = (item["title"] + " " + item["content"][:1500] + " " + " ".join(item.get("labels", []))).lower()
     score = sum(
         weight
@@ -288,6 +292,8 @@ def item_priority(item: dict) -> int:
     )
     if is_hackerone_item(item):
         score += HACKERONE_PRIORITY
+    if is_dirauth_item(item):
+        score += DIRAUTH_PRIORITY
     return max(score, TAG_PRIORITY if item["kind"] == "tag" else 0)
 
 
@@ -321,6 +327,13 @@ def item_hash(item: dict) -> str:
     if item.get("public_comments"):
         fields["public_comments"] = analysis_context(item)[1]
     return digest(fields)
+
+
+def _uncommented_hash(old: dict, item: dict) -> str:
+    base_old = {k: v for k, v in old.items() if k != "public_comments"}
+    if base_old.get("authority") == "dirauth-operator" and item.get("authority") == "development":
+        base_old["authority"] = "development"
+    return item_hash(base_old)
 
 
 class Store:
@@ -518,7 +531,7 @@ class Store:
             and "comments_source_key" not in item
             and not check_requested
             and old.get("public_comments")
-            and item_hash({k: v for k, v in old.items() if k != "public_comments"}) == content_hash
+            and _uncommented_hash(old, item) == content_hash
         ):
             return False
         if row is not None:

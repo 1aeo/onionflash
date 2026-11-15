@@ -19,7 +19,10 @@ import re
 from . import candidate as candidate_mod, decisions, editorial, review
 from .analyze import cache_key
 from .llm import AnalysisError, CompletionDeferred, RequestObserver
-from .util import _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, is_hackerone_item, now_iso, saved_object, thread_subject
+from .util import (
+    _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, is_dirauth_item, is_hackerone_item,
+    now_iso, saved_object, thread_subject,
+)
 
 REVIEW_STATE_VERSION = 2
 MAX_APPROVALS = 2000  # cached approvals kept besides those unfinished jobs pin
@@ -33,7 +36,7 @@ MAX_VERIFY_REPAIRS = 5
 MAX_REVIEW_REQUESTS = MAX_VERIFY_REPAIRS + 2
 # An item from these sources, other than a version tag, that fails only news value is held for the
 # operator, never skipped.
-OFFICIAL_AUTHORITIES = frozenset({"official", "project-sender", "hackerone"})
+OFFICIAL_AUTHORITIES = frozenset({"official", "project-sender", "hackerone", "dirauth-operator"})
 # Each hold reason and its operator text, which follows "Final review held: " in last_error. A hold
 # is logged as held.<stage>.<reason>, the stage being gate, review, verification or final_check.
 HOLDS = {
@@ -483,7 +486,16 @@ def next_step(reviews, candidate, prepared):
     verdict = result["verdict"]
     failed = {name for name, check in result["criteria"].items() if check["outcome"] != "pass"}
     item = json.loads(prepared["row"]["payload"])
-    official = (item.get("authority") in OFFICIAL_AUTHORITIES or is_hackerone_item(item)) and item.get("kind") != "tag"
+    recent_dev = (
+        developed_at(item) >= after(-NEW_STORY_DAYS * 86400, item["updated_at"])
+        or _security_disclosure(item)
+        or (prepared.get("coverage") or {}).get("prior_story") is not None
+    )
+    official = (
+        item.get("authority") in {"official", "project-sender", "hackerone"}
+        or is_hackerone_item(item)
+        or ((item.get("authority") in OFFICIAL_AUTHORITIES or is_dirauth_item(item)) and recent_dev)
+    ) and item.get("kind") != "tag"
     # An official item that fails only news value is the operator's to judge, once a fresh
     # verification has passed its facts; a duplicate still skips.
     disputed = official and failed & review.EDITORIAL_CRITERIA == {"news_value"}

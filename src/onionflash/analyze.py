@@ -13,9 +13,9 @@ from .llm import (
     strip_unreleased_tag, tag_name, validate_text,
 )
 from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, STATES, UPDATE_CHARS
-from .util import digest, normalize_evidence as _plain
+from .util import digest, is_dirauth_item, is_hackerone_item, normalize_evidence as _plain
 
-PROMPT_VERSION = "onionflash-17"
+PROMPT_VERSION = "onionflash-18"
 # Change this when update input filtering changes, independently of prompt prose.
 UPDATE_INPUT_VERSION = 2
 WRITER_REASONING_OPTIONS = {
@@ -144,11 +144,14 @@ fixes or operator guidance. A count the source states may be restated.
 Convert ALL-CAPS shouted source phrases to normal sentence case while keeping standard
 technical acronyms, and never copy nonexistent three-part C-Tor versions such as 0.4.17
 as valid release numbers (C Tor versions use four numbers, such as 0.4.9.17).
-Metadata fields such as authority (including hackerone, trusted-operator and
-project-sender) are internal provenance tags, not prose labels: write 'a relay
+Metadata fields such as authority (including hackerone, dirauth-operator,
+trusted-operator and project-sender) and author are internal provenance tags, not
+prose role labels: never invent unstated roles from authority alone (write 'a relay
 operator' rather than 'a trusted operator' unless the source text itself uses that
-phrase, cite HackerOne in prose when the source text itself references HackerOne,
-and always include material maintainer triage comments.
+phrase), cite HackerOne in prose when the source text itself references HackerOne,
+preserve named hosts or directory authorities (such as Serge, sekhmet, bastet or
+maatuska) when stated in the issue or comments, and always include material
+follow-up corroboration or maintainer triage comments.
 {causal_check}A developer changing source code is not an operator changing configuration.
 
 {impact}the expected result for most merges, tags, checklists, questions and discussions.
@@ -430,11 +433,18 @@ class Analyzer(CompletionClient):
             return tag_update(item, prior) if is_update else tag_notice(item)
         bounded = {key: item.get(key) for key in (
             "title", "kind", "product", "authority", "published_at", "updated_at", "labels", "upstream_state")}
+        if isinstance(item.get("author"), str) and item["author"]:
+            bounded["author"] = item["author"]
+        if bounded["authority"] == "development":
+            if is_hackerone_item(item):
+                bounded["authority"] = "hackerone"
+            elif is_dirauth_item(item, getattr(self, "dirauth_users", None)):
+                bounded["authority"] = "dirauth-operator"
         bounded["content"], notes = analysis_context(item)
         if notes:
             bounded["public_comments"] = notes
         # Evidence may quote the description window or any note body the writer saw.
-        source = {**item, "content": "\n".join([bounded["content"], *(note["body"] for note in notes)])}
+        source = {**item, "authority": bounded["authority"], "content": "\n".join([bounded["content"], *(note["body"] for note in notes)])}
         base_schema = UPDATE_SCHEMA if is_update else SCHEMA
         payload = {**bounded, "prior_story": prior_context(prior)} if is_update else bounded
         prompt, schema_name = (UPDATE_PROMPT, "onionflash_update") if is_update else (SYSTEM_PROMPT, "onionflash_news")

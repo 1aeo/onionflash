@@ -358,14 +358,15 @@ def test_source_packet_upgrades_legacy_development_hackerone_item(tmp_path):
 
 def test_prompt_versions_and_hackerone_and_tordev_trusted_operator_rules():
     """Verify bumped prompt versions and presence of HackerOne and tor-dev trusted-operator instructions."""
-    assert analyze.PROMPT_VERSION == "onionflash-17"
-    assert review.REVIEW_VERSION == "onionflash-review-13"
+    assert analyze.PROMPT_VERSION == "onionflash-18"
+    assert review.REVIEW_VERSION == "onionflash-review-14"
     assert "hackerone" in store_mod.__dict__ or "hackerone" in review_gate.OFFICIAL_AUTHORITIES
-    assert "including hackerone, trusted-operator and\nproject-sender" in analyze.SYSTEM_PROMPT
+    assert "dirauth-operator" in review_gate.OFFICIAL_AUTHORITIES
+    assert "including hackerone, dirauth-operator,\ntrusted-operator and project-sender" in analyze.SYSTEM_PROMPT
     assert "cite HackerOne in prose when the source text itself references HackerOne" in analyze.SYSTEM_PROMPT
     assert "hackerone\nmarks a disclosed HackerOne report" in review.SYSTEM_PROMPT
     assert "unless source authority is hackerone, a gitlab_issue in the\npacket cites hackerone.com/reports/" in review.SYSTEM_PROMPT
     assert "Disclosed\nHackerOne reports (authority=hackerone or a gitlab_issue citing hackerone.com/reports/)" in review.SYSTEM_PROMPT
     assert "authority=project-sender or\nauthority=trusted-operator" in review.SYSTEM_PROMPT
     assert "substantive technical critique, protocol review, or empirical\nmulti-relay measurement" in review.SYSTEM_PROMPT
-    assert "Community, issue, hackerone, project-sender and trusted-operator" in review.UPDATE_SYSTEM_PROMPT
+    assert "Community, issue, hackerone, dirauth-operator, project-sender and trusted-operator" in review.UPDATE_SYSTEM_PROMPT

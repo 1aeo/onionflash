@@ -221,6 +221,7 @@ class CompletionClient:
         }
         self.client: HttpClient | None = None
         self.calls = 0  # requests sent, for the run report
+        self.dirauth_users = (config.get("collection") or {}).get("dirauth_gitlab_users")
 
     def __enter__(self) -> CompletionClient:
         return self

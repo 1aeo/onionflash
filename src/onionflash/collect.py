@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import calendar
+from collections.abc import Iterable
 import re
 from datetime import datetime, timedelta
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -12,7 +13,7 @@ import feedparser
 
 from .transport import FetchError, HttpClient
 from .util import (
-    UTC, after, canonical_url, format_utc, is_hackerone_item, parse_utc, plain_text, timestamp,
+    UTC, after, canonical_url, format_utc, is_dirauth_item, is_hackerone_item, parse_utc, plain_text, timestamp,
 )
 
 
@@ -26,6 +27,7 @@ HYPERKITTY_AUTHOR = re.compile(r"[^@\s()＠]+＠[^@\s()＠]+(?: \(.*\))?\Z", re.
 PROJECT_SENDER = re.compile(r"[a-z0-9._+-]+@torproject\.org")
 SENDER_ADDRESS = re.compile(r"[a-z0-9._+-]+@([a-z0-9.-]+\.[a-z]{2,})")
 SENDER_DOMAIN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
+_GITLAB_AUTHOR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 
 
 def _hyperkitty_address(author: object) -> str | None:
@@ -94,6 +96,8 @@ def make_item(
     *,
     title_html: bool = True,
     observed: str | None = None,
+    author: str = "",
+    dirauth_users: Iterable[str] | None = None,
 ) -> dict:
     """Normalize one collected record and clamp future timestamps to observation time."""
     if observed:
@@ -113,8 +117,14 @@ def make_item(
         "labels": [plain_text(str(x), 100, html=False) for x in (labels or [])[:30]],
         "upstream_state": upstream_state if upstream_state in {"opened", "closed", "merged"} else "",
     }
-    if item["authority"] == "development" and is_hackerone_item(item):
-        item["authority"] = "hackerone"
+    clean_author = plain_text(author, 100, html=False)
+    if clean_author and _GITLAB_AUTHOR_RE.fullmatch(clean_author) and ".." not in clean_author and not clean_author.endswith("."):
+        item["author"] = clean_author
+    if item["authority"] == "development":
+        if is_hackerone_item(item):
+            item["authority"] = "hackerone"
+        elif is_dirauth_item(item, dirauth_users):
+            item["authority"] = "dirauth-operator"
     return item
 
 
@@ -340,6 +350,12 @@ def _gitlab(
                     record.get("merged_at") if source["kind"] == "gitlab_mr" else record.get("created_at"),
                     started,
                 )
+                raw_author = record.get("author")
+                username = (
+                    raw_author.get("username", "")
+                    if isinstance(raw_author, dict) and isinstance(raw_author.get("username"), str)
+                    else ""
+                )
                 item = make_item(
                     source,
                     record["web_url"],
@@ -351,6 +367,8 @@ def _gitlab(
                     record.get("state", ""),
                     title_html=False,
                     observed=started,
+                    author=username,
+                    dirauth_users=settings.get("dirauth_gitlab_users"),
                 )
             except (KeyError, ValueError, TypeError):
                 continue

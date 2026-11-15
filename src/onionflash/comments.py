@@ -15,7 +15,7 @@ from itertools import zip_longest
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from .transport import DeadlineReached, FetchError, HttpClient
-from .util import after, backoff_seconds, canonical_url, digest, now_iso, plain_text, saved_object, timestamp
+from .util import after, backoff_seconds, canonical_url, digest, is_dirauth_item, now_iso, plain_text, saved_object, timestamp
 
 
 QUERY = """query PublicIssueNotes($project: ID!, $iid: String!, $size: Int!) {
@@ -188,7 +188,7 @@ def analysis_context(item):
     return item.get("source_content", item.get("content", ""))[:room], notes
 
 
-def _compose(item, notes, checked, *, source_key):
+def _compose(item, notes, checked, *, source_key, dirauth_users=None):
     result = dict(item)
     content = result.pop("source_content", result.get("content"))
     if not isinstance(content, str):
@@ -206,10 +206,18 @@ def _compose(item, notes, checked, *, source_key):
         composed_notes.append(entry)
     # Callers pass a key only for a verified fetch or an already verified stored snapshot.
     result.update(content=content, public_comments=composed_notes, comments_checked_at=checked, comments_source_key=source_key)
+    if result.get("authority") == "development" and is_dirauth_item(result, dirauth_users):
+        result["authority"] = "dirauth-operator"
+    elif (
+        result.get("authority") == "dirauth-operator"
+        and item.get("public_comments")
+        and not is_dirauth_item({**result, "authority": "development"}, dirauth_users)
+    ):
+        result["authority"] = "development"
     return result
 
 
-def merge_cached_comments(store, item, source, observed=None):
+def merge_cached_comments(store, item, source, observed=None, *, dirauth_users=None):
     """Keep the verified snapshot on a REST refresh; Store.ingest rejects stale revisions.
 
     REST activity after the last check, or a missing snapshot, requests a check at any status.
@@ -231,7 +239,11 @@ def merge_cached_comments(store, item, source, observed=None):
             _request(store.db, row["id"], key, observed)
         if not current:
             store._comment_requests[row["id"]] = observed
-    return _compose(item, old["public_comments"], old["comments_checked_at"], source_key=key) if current else item
+    return (
+        _compose(item, old["public_comments"], old["comments_checked_at"], source_key=key, dirauth_users=dirauth_users)
+        if current
+        else item
+    )
 
 
 def _request(db, item_id, key, observed):
@@ -304,6 +316,7 @@ def enrich_comments(config, store, observed, *, deadline=None):
     with store.db:
         store.db.execute(f"DELETE FROM comment_sources WHERE source_id NOT IN ({','.join('?' * len(sources))})", [s["id"] for s in sources])
     # Fresh sessionless client refusing redirects so requests never leave the verified endpoint.
+    dirauth_users = config.get("collection", {}).get("dirauth_gitlab_users")
     client = HttpClient({**config["http"], "max_redirects": 0})
     client.deadline = deadline
     try:
@@ -334,7 +347,9 @@ def enrich_comments(config, store, observed, *, deadline=None):
                                          (row["id"], key, observed, after(INTERVAL_SECONDS, observed), "Saved issue description unavailable"))
                     continue
                 try:
-                    enriched = _compose(item, fetch_comments(client, source, item), observed, source_key=key)
+                    enriched = _compose(
+                        item, fetch_comments(client, source, item), observed, source_key=key, dirauth_users=dirauth_users
+                    )
                 except DeadlineReached:
                     report["budget_reached"] = True
                     return report

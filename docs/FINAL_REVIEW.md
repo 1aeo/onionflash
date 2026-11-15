@@ -157,8 +157,8 @@ story; see [merging duplicate stories](EDITORIAL.md#merge-a-duplicate-story).
   coverage intact. A skip needs a failed news-value or new-information
   criterion, and a skip for new information alone must name an active covered
   story (not a `retracted` marker); otherwise the item is held. An item from an
-  official, `project-sender`, or `hackerone` source, other than a version tag,
-  skips only when new information fails; when news value fails while new
+  official, `project-sender`, `hackerone`, or `dirauth-operator` source, other than a
+  version tag, skips only when new information fails; when news value fails while new
   information passes, it is held for the operator (`held.verification.official_not_news`)
   once a fresh verification has passed its facts.
 - `hold`: potentially useful material is unsupported, ambiguous or not ready to
