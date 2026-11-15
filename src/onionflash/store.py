@@ -284,6 +284,7 @@ def item_priority(item: dict) -> int:
 def item_hash(item: dict) -> str:
     """A digest of the fields that make a new revision of an item."""
     fields = {k: item.get(k) for k in ("title", "content", "kind", "product", "labels", "authority", "upstream_state")}
+    fields["content"] = item.get("source_content", item.get("content"))
     if item.get("public_comments"):
         fields["public_comments"] = analysis_context(item)[1]
     return digest(fields)

@@ -46,6 +46,13 @@ def test_schema_property_order_is_part_of_writer_identity(monkeypatch,update):
     assert digest(schema)==canonical
     assert key(previous=previous)!=before
 
+
+def test_update_input_policy_invalidates_only_update_drafts(monkeypatch):
+    ordinary, update = key(), key(previous=prior())
+    monkeypatch.setattr(analyze, "UPDATE_INPUT_VERSION", analyze.UPDATE_INPUT_VERSION + 1)
+    assert key() == ordinary
+    assert key(previous=prior()) != update
+
 def test_unchanged_inputs_hit_and_existing_content_model_version_components_remain(monkeypatch):
     original=key()
     assert key(copy.deepcopy(source()))==original

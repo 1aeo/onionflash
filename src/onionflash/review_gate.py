@@ -185,9 +185,15 @@ def _saved_job(store, row, config):
             if (not isinstance(payload, dict) or value["id"] != row["id"] or payload.get("id") != value["id"]
                     or payload.get("url") != value["url"] or payload.get("source_id") != value["source_id"]
                     or not isinstance(value["content_hash"], str)
-                    or not re.fullmatch(r"[0-9a-f]{64}", value["content_hash"])
-                    or item_hash(payload) != value["content_hash"]):
+                    or not re.fullmatch(r"[0-9a-f]{64}", value["content_hash"])):
                 raise ValueError()
+            if item_hash(payload) != value["content_hash"]:
+                # Older saved rows hashed the composed description. Require
+                # that exact historical formula, never an arbitrary old hash.
+                if (not isinstance(payload.get("source_content"), str)
+                        or item_hash({k: v for k, v in payload.items() if k != "source_content"})
+                        != value["content_hash"]):
+                    raise ValueError()
             return value["content_hash"]
 
         version, marker = record.get("schema_version"), record.get("input_proof")
@@ -226,7 +232,9 @@ def _saved_job(store, row, config):
         if "input_row" in record and (source_identity(record["input_row"]) != source_hash
                 or candidate_mod.item_fingerprint(record["input_row"]) != candidate_mod.item_fingerprint(proof_row)):
             raise ValueError()
-        current_hash = source_identity(row)
+        source_identity(row)
+        same_source = (item_hash(saved_object(proof_row["payload"].encode("utf-8")))
+                       == item_hash(saved_object(row["payload"].encode("utf-8"))))
         if (not isinstance(job["writer_key"], str) or not re.fullmatch(r"[0-9a-f]{64}", job["writer_key"])
                 or not isinstance(record.get("writer"), dict) or record["writer"].get("key") != job["writer_key"]):
             raise ValueError()
@@ -246,7 +254,7 @@ def _saved_job(store, row, config):
         raise AnalysisError("Saved review job is damaged", code="app.damaged_job") from None
     if job["policy_hash"] == review.policy_hash(config):
         validate_review_state(record, job["stage"], record.get("candidate", (prepared or {}).get("candidate")), prepared)
-    return job, draft, prepared, record, source_hash == current_hash
+    return job, draft, prepared, record, same_source
 
 
 def _approval_key(candidate, prepared, policy):

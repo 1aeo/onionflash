@@ -15,6 +15,8 @@ from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, STATES, UPDAT
 from .util import digest, normalize_evidence as _plain
 
 PROMPT_VERSION = "onionflash-16"
+# Change this when update input filtering changes, independently of prompt prose.
+UPDATE_INPUT_VERSION = 2
 WRITER_REASONING_OPTIONS = {
     "max_output_tokens": 32768, "max_response_bytes": 2097152,
     "enable_thinking": True, "temperature": 1.0,
@@ -256,7 +258,7 @@ def cache_key(row: dict, llm: dict, prior: dict | None = None) -> str:
         # Category and this source predicate also shape the update grammar.
         sources = prior.get("sources")
         all_merges = bool(sources) and all("/-/merge_requests/" in source.get("url", "") for source in sources)
-        identity.extend([prior_context(prior), prior.get("category"), all_merges])
+        identity.extend([prior_context(prior), prior.get("category"), all_merges, UPDATE_INPUT_VERSION])
     return digest(identity)
 
 
