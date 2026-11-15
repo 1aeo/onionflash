@@ -201,13 +201,14 @@ def analysis_context(item):
     return item.get("source_content", item.get("content", ""))[:room], notes
 
 
-def _note_newer_than_floor(prev: dict, floor: dict) -> bool:
-    if prev["created_at"] != floor["created_at"]:
-        return prev["created_at"] > floor["created_at"]
-    pkey, fkey = note_key(prev["id"]), note_key(floor["id"])
-    if pkey.isdigit() and fkey.isdigit():
-        return int(pkey) > int(fkey) and prev["id"] >= floor["id"]
-    return prev["id"] > floor["id"]
+def _note_newer(a: dict, b: dict) -> bool:
+    if a["created_at"] != b["created_at"]:
+        return a["created_at"] > b["created_at"]
+    akey, bkey = note_key(a["id"]), note_key(b["id"])
+    if akey.isdigit() and bkey.isdigit():
+        if int(akey) != int(bkey):
+            return int(akey) > int(bkey)
+    return a["id"] > b["id"]
 
 
 def _reconcile_dirauth_notes(item: dict, composed_notes: list[dict], dirauth_users, *, truncated: bool) -> list[dict]:
@@ -231,12 +232,15 @@ def _reconcile_dirauth_notes(item: dict, composed_notes: list[dict], dirauth_use
             ):
                 seeded[nkey] = {"id": raw["id"], "author": raw["author"], "created_at": raw["created_at"]}
     present_keys = {note_key(n["id"]) for n in composed_notes if isinstance(n.get("id"), str)}
-    floor = composed_notes[-1] if composed_notes else None
+    floor = None
+    for note in composed_notes:
+        if floor is None or _note_newer(floor, note):
+            floor = note
     retained: dict[str, dict] = {}
     for nkey, prev in seeded.items():
         if nkey in present_keys or not truncated:
             continue
-        if floor is not None and _note_newer_than_floor(prev, floor):
+        if floor is not None and _note_newer(prev, floor):
             continue
         retained[nkey] = prev
     for note in composed_notes:

@@ -730,9 +730,23 @@ _TOR_DEV_SPEC_RE = re.compile(
 _SPEC_CANDIDATE_RE = re.compile(r"\b(?:propos\w*|rfc\b|internet-draft|draft\b|specif\w*|design\w*)\b")
 _LIVE_INCIDENT_CLAIM_RE = re.compile(
     r"\b(?:was|were|is|are|been|being|ongoing|active|actively|observed|experienc\w*|suffer\w*|hit|hitting|under)\s+"
-    r"(?:(?:\w+|[-/])\s+){0,3}(?:compromis\w*|hack\w*|breach\w*|tamper\w*|attack\w*|ddos|dos|flood\w*|exploit\w*)"
-    r"|\b(?:operator|relay\s+operator|sender)\s+(?:reports?|alleges?|claims?|describes?|suspects?)\s+"
-    r"(?:[^.;!?\n]{0,60}\b)?(?:compromis\w*|hack\w*|breach\w*|tamper\w*|attack\w*|ddos|dos|flood\w*|overload\w*|bypass\w*)"
+    r"(?:(?:\w+|[-/])\s+){0,3}(?:compromis\w*|hack\w*|breach\w*|tamper\w*|attack\w*|ddos|dos|flood\w*|exploit\w*|overload\w*)"
+    r"|\b(?:operators?|relay\s+operators?|sender|author|post|message|thread)\s+"
+    r"(?:reports?|reported|alleges?|alleged|claims?|claimed|describes?|described|suspects?|suspected)\s+"
+    r"(?:[^.;!?\n]{0,60}\b)?(?:compromis\w*|hack\w*|breach\w*|tamper\w*|attack\w*|ddos|dos|flood\w*|overload\w*|bypass\w*|exploit\w*)"
+    r"|\b(?:attackers?|adversar\w+|botnets?)\s+(?:(?:have|had|has|are|were|recently)\s+)?"
+    r"(?:flooded|attacked|compromised|exploited|bypassed|tampered|breached|overloaded|disrupted|targeted|hit|hitting)\b"
+)
+_ASSERTED_EVENT_RE = re.compile(
+    r"\b(?:(?:attackers?|adversar\w+|botnets?)\s+"
+    r"(?:floods?|attacks?|compromises?|exploits?|bypasses?|tampers?|breaches?|overloads?|disrupts?|targets?|hits?)"
+    r"|(?:attack\w*|flood\w*|ddos|dos|exploit\w*|compromis\w*|breach\w*|tamper\w*)\s+(?:(?:have|had|has)\s+)?"
+    r"(?:disrupt(?:ed|s)|target(?:ed|s)|overload(?:ed|s)|saturat(?:ed|es)|degrad(?:ed|es)|crash(?:ed|es)|"
+    r"struck|began|started|occurred|happened|hit|hits))\b"
+)
+_CONDITIONAL_PREFIX_RE = re.compile(r"\b(?:if|when|whenever|whether)\s+(?:(?:a|an|the)\s+)?$")
+_CLAUSE_SPLIT_RE = re.compile(
+    r"[.;!?]|\b(?:after|following|amid|during|because|since|while|whereas|although|though|but|yet)\b"
 )
 _DEFENSE_FRAMING_RE = re.compile(
     r"\b(?:propos\w*|rfc\b|internet-draft|draft\b|specif\w*|defen[cs]\w*|mitigat\w*|prevent\w*|"
@@ -746,9 +760,18 @@ def _plain(text: str) -> str:
     return normalize_evidence(text).replace("n't", " not")
 
 
+def _has_live_incident_claim(text: str) -> bool:
+    if _LIVE_INCIDENT_CLAIM_RE.search(text):
+        return True
+    return any(
+        not _CONDITIONAL_PREFIX_RE.search(text[max(0, match.start() - 25) : match.start()])
+        for match in _ASSERTED_EVENT_RE.finditer(text)
+    )
+
+
 def _is_tor_dev_spec(sources: list[dict], candidate_text: str) -> bool:
     norm_cand = _plain(candidate_text)
-    if _LIVE_INCIDENT_CLAIM_RE.search(norm_cand) or not _SPEC_CANDIDATE_RE.search(norm_cand):
+    if _untrusted_incident_mention(candidate_text) or not _SPEC_CANDIDATE_RE.search(norm_cand):
         return False
     for source in sources:
         url = str(source.get("url") or "").lower()
@@ -763,14 +786,17 @@ def _is_tor_dev_spec(sources: list[dict], candidate_text: str) -> bool:
 
 
 def _untrusted_incident_mention(raw_text: str) -> bool:
-    text = _plain(raw_text)
-    if _LIVE_INCIDENT_CLAIM_RE.search(text):
+    if _has_live_incident_claim(_plain(raw_text)):
         return True
-    for match in _UNTRUSTED_INCIDENT_RE.finditer(text):
-        clause = re.split(r"[.;!?\n]", text[max(0, match.start() - 65) : match.start()])[-1]
-        framing = _BYPASS_FRAMING_RE if match.group(0).startswith("bypass") else _DEFENSE_FRAMING_RE
-        if not framing.search(clause):
+    for line in raw_text.split("\n"):
+        field = _plain(line)
+        if _has_live_incident_claim(field):
             return True
+        for match in _UNTRUSTED_INCIDENT_RE.finditer(field):
+            clause = _CLAUSE_SPLIT_RE.split(field[max(0, match.start() - 65) : match.start()])[-1]
+            framing = _BYPASS_FRAMING_RE if match.group(0).startswith("bypass") else _DEFENSE_FRAMING_RE
+            if not framing.search(clause):
+                return True
     return False
 
 
@@ -825,14 +851,12 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
             source.get("authority") == "community" and "lists.torproject.org" in str(source.get("url") or "")
             for source in sources
         )
-        cand_body = candidate["title"] + "\n" + candidate["summary"]
-        tor_dev_spec = community_list and _is_tor_dev_spec(
-            sources, cand_body + "\n" + candidate.get("why_it_matters", "")
-        )
+        cand_full = "\n".join((candidate["title"], candidate["summary"], candidate.get("why_it_matters", "")))
+        tor_dev_spec = community_list and _is_tor_dev_spec(sources, cand_full)
         untrusted_claim = community_list and not tor_dev_spec and (
             candidate["category"] in {"security", "dos"}
             or bool({"security", "dos"} & set(candidate.get("tags") or ()))
-            or _untrusted_incident_mention(cand_body)
+            or _untrusted_incident_mention(cand_full)
         )
     compromise_headline = bool(_HEDGED.search(all_proof) and _COMPROMISE.search(lead) and not _QUALIFIED.search(lead))
     is_alert = candidate.get("origin") == "network-health"

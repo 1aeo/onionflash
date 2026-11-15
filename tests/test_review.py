@@ -526,6 +526,14 @@ def test_final_holds_shouting_malformed_version_and_untrusted_operator_claims():
         category="protocol", tags=["protocol", "dos"], confidence="reported",
     )
     assert review.final_holds(prop_story, {"packet": {"sources": prop_sources}, "payload": {"editorial_kind": "feed"}}) == []
+    prop_with_incident = candidate(
+        title="Attackers flooded exit relays yesterday",
+        summary="Proposal 375 proposes rate limits after the flood disrupted exit relays.",
+        category="dos", tags=["dos"], confidence="reported",
+    )
+    assert review.final_holds(
+        prop_with_incident, {"packet": {"sources": prop_sources}, "payload": {"editorial_kind": "feed"}}
+    ) == ["untrusted_operator_claim"]
 
     defense_framing = candidate(
         title="Rate-limit proposal for directory requests",
@@ -554,6 +562,21 @@ def test_final_holds_shouting_malformed_version_and_untrusted_operator_claims():
             title="[RFC] Operator reports active DDoS flood hitting exit relays",
             summary="A post marked RFC reports an active DDoS flood on exit relays.",
             category="dos", tags=["dos"], confidence="reported",
+        ),
+        candidate(
+            title="Attackers flooded exit relays yesterday",
+            summary="Proposal 375 proposes rate limits after the flood disrupted exit relays.",
+            category="dos", tags=["dos"], confidence="reported",
+        ),
+        candidate(
+            title="Rate-limit discussion on relay list",
+            summary="Operators propose rate limits after attackers flooded exit relays.",
+            category="relay", tags=["relay"], confidence="reported",
+        ),
+        candidate(
+            title="Relay defense measures",
+            summary="An attack targets exit relays.",
+            category="relay", tags=["relay"], confidence="reported",
         ),
     ):
         assert review.final_holds(live_inc, prep_for("community", rfc_url)) == ["untrusted_operator_claim"]

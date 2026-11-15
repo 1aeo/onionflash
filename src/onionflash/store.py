@@ -767,7 +767,10 @@ class Store:
                             or review_record.get("outcome") != "operator_approved"
                             or not isinstance(approval_meta.get("reason"), str) or not approval_meta["reason"]):
                         raise ReviewRequired("Operator approval requires an operator_approval audit record")
-                    current = candidate.prepare(self.db, row, result, prepared["observed"])
+                    effective_users = self.dirauth_users if self.dirauth_users is not None else prepared.get("dirauth_users")
+                    current = candidate.prepare(
+                        self.db, row, result, prepared["observed"], dirauth_users=effective_users
+                    )
                     held_job = self.db.execute("SELECT stage FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
                     item_state = self.db.execute("SELECT status FROM items WHERE id=?", (row["id"],)).fetchone()
                     if (current["locked"] or current["binding_hash"] != prepared["binding_hash"]

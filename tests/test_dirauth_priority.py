@@ -8,7 +8,7 @@ from unittest import mock
 import pytest
 
 from helpers import FakeClient, FakeLLM, Reviewer, Writer, analysis, completion, item, make_config, make_tag, response, source, verdict
-from onionflash import analyze, collect, comments, config as config_mod, decisions, llm, review, review_gate, source_packet
+from onionflash import analyze, collect, comments, config as config_mod, decisions, llm, rejection, review, review_gate, source_packet
 from onionflash.comments import _compose, enrich_comments, merge_cached_comments
 from onionflash.store import DIRAUTH_PRIORITY, HACKERONE_PRIORITY, Store, item_priority
 from onionflash.transport import Response
@@ -760,7 +760,61 @@ def test_custom_dirauth_gitlab_users_threads_through_queue_packet_and_gate(tmp_p
         assert res_custom["review_calls"] == 2
         codes_custom = [entry["code"] for entry in decisions.for_item(store_custom.db, row_custom["id"])]
         assert "held.verification.official_not_news" in codes_custom
-        assert review_gate.approval(cfg_custom, store_custom, row_custom["id"])["eligible"] is True
+        elig_custom = review_gate.approval(cfg_custom, store_custom, row_custom["id"])
+        assert elig_custom["eligible"] is True
+        approved_custom = rejection.approve_item(
+            cfg_custom, store_custom, row_custom["id"], elig_custom["hash"], "Approve custom authority", observed="2026-11-12T12:15:00Z"
+        )
+        assert approved_custom["status"] == "published"
+
+
+def test_numeric_note_ids_reconcile_same_timestamp_deletions_and_evictions():
+    """Compare numeric GitLab note IDs by integer value during same-timestamp deletion and floor checks."""
+    stamp = "2026-11-12T12:00:00Z"
+    window_60_to_99 = [
+        {
+            "id": f"gid://gitlab/Note/{nid}",
+            "url": f"https://gitlab.torproject.org/tpo/core/tor/-/issues/41990#note_{nid}",
+            "title": "Public comment by @user",
+            "author": "user",
+            "created_at": stamp,
+            "body": f"Comment {nid}",
+        }
+        for nid in range(99, 59, -1)
+    ]
+    deleted_100 = {
+        "kind": "gitlab_issue",
+        "authority": "dirauth-operator",
+        "url": "https://gitlab.torproject.org/tpo/core/tor/-/issues/41990",
+        "title": "Consensus timeout report",
+        "content": "Initial report.",
+        "published_at": "2026-11-12T11:00:00Z",
+        "updated_at": stamp,
+        "labels": [],
+        "dirauth_notes": [{"id": "gid://gitlab/Note/100", "author": "stefani", "created_at": stamp}],
+    }
+    after_del = _compose(deleted_100, window_60_to_99, "2026-11-12T12:05:00Z", source_key="verified", window_truncated=True)
+    assert "dirauth_notes" not in after_del
+    assert after_del["authority"] == "development"
+
+    evicted_50 = {
+        **deleted_100,
+        "dirauth_notes": [{"id": "gid://gitlab/Note/50", "author": "stefani", "created_at": stamp}],
+    }
+    window_with_101 = [
+        {
+            "id": "gid://gitlab/Note/101",
+            "url": "https://gitlab.torproject.org/tpo/core/tor/-/issues/41990#note_101",
+            "title": "Public comment by @user",
+            "author": "user",
+            "created_at": stamp,
+            "body": "Comment 101",
+        },
+        *window_60_to_99,
+    ]
+    after_evict = _compose(evicted_50, window_with_101, "2026-11-12T12:05:00Z", source_key="verified", window_truncated=True)
+    assert after_evict["authority"] == "dirauth-operator"
+    assert [n["id"] for n in after_evict["dirauth_notes"]] == ["gid://gitlab/Note/50"]
 
 
 def test_author_changes_update_item_hash_ingest_source_fingerprint_and_analyzer(tmp_path):
