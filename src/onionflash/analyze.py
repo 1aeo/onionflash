@@ -221,7 +221,12 @@ def cache_key(row: dict, llm: dict, prior: dict | None = None) -> str:
     """Bind cached drafts to the active writer contract and update context."""
     prompt = SYSTEM_PROMPT if prior is None else UPDATE_PROMPT
     schema = SCHEMA if prior is None else UPDATE_SCHEMA
-    identity = [row["content_hash"], llm["model"], PROMPT_VERSION, prompt,
+    effective = writer_settings(llm)
+    contract = {"model": effective["model"], "base_url": effective["base_url"],
+                "fallback_base_urls": effective["fallback_base_urls"],
+                "generation": generation_options(effective),
+                "max_response_bytes": effective["max_response_bytes"]}
+    identity = [row["content_hash"], contract, PROMPT_VERSION, prompt,
                 json.dumps(schema, ensure_ascii=False, allow_nan=False)]
     if prior is not None:
         # Category and this source predicate also shape the update grammar.

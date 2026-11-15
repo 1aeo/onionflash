@@ -2,6 +2,7 @@
 import copy
 import pytest
 from onionflash import analyze
+from onionflash.config import DEFAULTS
 from onionflash.store import item_hash
 from onionflash.util import digest
 
@@ -17,7 +18,9 @@ def prior():
             "updates":[{"at":"2020-01-01T00:00:00Z","text":"Earlier update."}]}
 
 def key(item=None,previous=None,model="writer-model"):
-    return analyze.cache_key({"content_hash":item_hash(item or source())},{"model":model},previous)
+    settings = copy.deepcopy(DEFAULTS["llm"])
+    settings["model"] = model
+    return analyze.cache_key({"content_hash":item_hash(item or source())},settings,previous)
 
 @pytest.mark.parametrize("update",[False,True])
 def test_active_prompt_and_base_schema_changes_invalidate_writer_cache(monkeypatch,update):
@@ -103,3 +106,42 @@ def test_comment_polling_identity_and_edit_timestamps_are_not_writer_inputs():
     changed.update(comments_checked_at="2020-01-04T00:00:00Z",comments_source_key="poll-marker")
     changed["public_comments"][0].update(id="another-id",url="https://source.example/other",edited_at="2020-01-04T00:00:00Z")
     assert key(incoming)==key(changed)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("model", "another-model"), ("base_url", "https://another.example/v1"),
+    ("fallback_base_urls", ["https://fallback.example/v1"]),
+    ("temperature", 0.4), ("top_p", 0.9), ("top_k", 15), ("min_p", 0.2),
+    ("presence_penalty", 0.2), ("repetition_penalty", 1.2), ("reasoning_effort", "medium"),
+    ("max_output_tokens", 4096), ("max_response_bytes", 131072),
+    ("enable_thinking", True), ("send_chat_template_kwargs", False), ("writer_reasoning", True),
+])
+@pytest.mark.parametrize("update", [False, True])
+def test_effective_generation_contract_changes_invalidate_writer_cache(field, value, update):
+    settings = copy.deepcopy(DEFAULTS["llm"])
+    row = {"content_hash": item_hash(source())}
+    previous = prior() if update else None
+    before = analyze.cache_key(row, settings, previous)
+    settings[field] = value
+    assert analyze.cache_key(row, settings, previous) != before
+
+
+def test_writer_cache_uses_effective_options_and_excludes_credentials(monkeypatch):
+    settings = copy.deepcopy(DEFAULTS["llm"])
+    settings["writer_reasoning"] = True
+    row = {"content_hash": item_hash(source())}
+    before = analyze.cache_key(row, settings)
+    settings.update(temperature=0, max_output_tokens=7, enable_thinking=False,
+                    api_key_env="ANOTHER_PRIVATE_KEY_NAME", credential="not-part-of-generation")
+    monkeypatch.setenv("ANOTHER_PRIVATE_KEY_NAME", "synthetic-private-value")
+    assert analyze.cache_key(row, settings) == before
+    assert analyze.cache_key(row, settings, prior()) != before
+
+
+def test_fallback_order_is_part_of_writer_identity():
+    settings = copy.deepcopy(DEFAULTS["llm"])
+    settings["fallback_base_urls"] = ["https://first.example/v1", "https://second.example/v1"]
+    row = {"content_hash": item_hash(source())}
+    before = analyze.cache_key(row, settings)
+    settings["fallback_base_urls"].reverse()
+    assert analyze.cache_key(row, settings) != before
