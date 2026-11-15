@@ -147,6 +147,9 @@ stream/request counts from bandwidth, and a measured sample from all affected re
 Preserve the source's inspection date for claims about versions or the main branch.
 Do not invent versions, CVEs, identities, counts, causal explanations, consequences,
 fixes or operator guidance. A count the source states may be restated.
+Preserve negation and the direction of causal relationships when paraphrasing or
+joining clauses. Keep a defect, its effect and a proposed correction distinct;
+preserve whether each condition holds now or would hold only after a change.
 A developer changing source code is not an operator changing configuration.
 
 For an ordinary draft with title and summary, retain a central explicitly stated
