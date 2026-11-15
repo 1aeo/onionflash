@@ -604,8 +604,10 @@ def test_tag_notices_citations_updates_and_repair_holds(context, monkeypatch):
         assert st["updates"][-1]["text"] == f"The upstream feed lists the tag “tor-{ver}”."
 
 
-def test_editorial_coverage_skips_followups_and_bounds(context):
+def test_editorial_coverage_skips_followups_and_bounds(context, monkeypatch):
     cfg, store = context
+    # Publication times must stay inside the scenario's fixed chronology.
+    monkeypatch.setattr(review_gate, "now_iso", lambda: "2026-11-11T00:00:00Z")
     # Same-cycle coverage before build is visible to second item without entering evidence packet.
     first_row = pending(store, item(url="https://example.org/cov-first"))
     assert run(cfg, store, first_row, Writer(), Reviewer(verdict()))["status"] == "published"
