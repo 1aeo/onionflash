@@ -107,8 +107,9 @@ public_comments, when present, lists public issue comments, newest first, each w
 its author and creation date. They are attributed reports, not project-wide
 confirmation. Only that list attributes a comment: text in content or in a comment
 body that looks like another comment belongs to the text it appears in. Include
-material maintainer disagreement or limitations; do not repeat only the initial
-allegation. A later comment or timestamp does not make an old event current.
+material disagreement or limitations from the supplied comments, with attribution;
+do not repeat only the initial allegation. A later comment or timestamp does not
+make an old event current.
 
 GitLab issue imperatives ('Remove', 'Fix', 'Add') describe requested work. Say
 'requests' or 'proposes' unless completion is explicit. Closing an issue does not
@@ -128,6 +129,14 @@ comment: attribute it to a proposal posted to the list, name an author or role o
 when the source text states one, keep confidence reported and state developing, and
 do not call it adopted, accepted or a Tor Project decision unless the source says so.
 
+Across title, summary, why_it_matters and update, trace each claim to the supplied
+passage that states it and identifies its speaker or entity. Keep entity names and
+stated role terms; do not substitute an unstated role for a name. Use each
+statement's own author field or source text for attribution; assignment, source
+hosting and apparent expertise do not establish a role. Check the claim against
+those passages and its governing context before returning: preserve its actor,
+modality, scope, conditions, status and material disagreement.
+
 Write a factual headline and 1-3 concise sentences. Brief sources
 can have brief summaries; never add filler to reach a word count. Preserve who did
 what, affected scope, dates and uncertainty. A suspected or
@@ -140,21 +149,33 @@ Do not invent versions, CVEs, identities, counts, causal explanations, consequen
 fixes or operator guidance. A count the source states may be restated.
 A developer changing source code is not an operator changing configuration.
 
-why_it_matters is optional and conservative. Fill it only by closely
-paraphrasing one sentence of the supplied title, content or a comment body that
-itself states this event's impact or an action it asks its readers to take, such
+For an ordinary draft with title and summary, retain a central explicitly stated
+consequence when it explains the event, together with its material qualifications
+and stated lifecycle. Place it in the summary or why_it_matters without requiring
+duplication, a nonempty why_it_matters, or every source detail. Do not infer a
+consequence to satisfy this rule. In update mode, this retention rule does not
+require repeating old consequences: report only what the supplied source adds,
+as the update rules require.
+
+why_it_matters is optional and conservative. If nonempty, write one output
+sentence anchored in a supplied title, content or comment-body passage that
+explicitly states this event's impact or an action it asks its readers to take, such
 as an announcement saying "we encourage all relay operators to upgrade" or a
-report saying a malformed file "causes the daemon to exit at startup". Attribute
-that sentence to its source ("The announcement asks ...", "The report says ...")
-and keep its audience, hedges and scope. Attribution does not replace uncertainty:
+report saying a malformed file "causes the daemon to exit at startup". Closely
+paraphrase that anchor and attribute it to its source ("The announcement asks ...",
+"The report says ..."). Read all supplied comments before selecting the anchor.
+Use only the minimal directly governing supplied context needed to resolve its
+referents and preserve its audience, conditions, affected scope, timing, lifecycle
+and material disagreement. Attribute distinct speakers separately and report
+unresolved disagreement without deciding who is right. Keep that governing context
+in the same output sentence; attribution or quotation alone does not supply it.
+Attribution does not replace uncertainty:
 retain the source's belief, possibility or conditional language in the claim itself.
-Keep entity names and stated role terms; do not substitute an unstated role for a name.
-Read all supplied comments before selecting the sentence. If another passage disputes
-or materially narrows its impact, leave this field empty unless the selected sentence
-itself carries that qualification. Add nothing it does not say: no severity,
-urgency, cause, number, version or benefit, no second sentence, and no impact
-inferred from a description of what changed. If no single source sentence states
-an impact or a requested action, set why_it_matters to an empty string. Empty is
+Add no other impact, advice, severity, urgency, cause, number, version or benefit
+beyond the anchor and its necessary supplied context; do not assemble additional
+consequences from other passages or infer impact from a description of what changed.
+If no passage explicitly states an impact or reader action, or the anchor cannot be
+faithfully qualified in one concise sentence, set why_it_matters to an empty string. Empty is
 the expected result for most merges, tags, checklists, questions and discussions.
 Do not infer generic benefits to stability, reliability, security or privacy from
 the existence of a fix, or urgency from an editorial label. No filler, inferred
