@@ -85,6 +85,9 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `held.final_check.compromise_headline` | The headline drops the sources' doubt about a compromise. |
 | `held.final_check.confirmed_source` | The story is confirmed without an official announcement or a merged merge request. |
 | `held.final_check.merge_state` | A story told only by merge requests is not marked merged. |
+| `held.final_check.shouting_caps` | The story or update contains unnormalized all-caps shouting. |
+| `held.final_check.malformed_version` | The story or update cites a nonexistent three-part C-Tor version number. |
+| `held.final_check.untrusted_operator_claim` | A new story reports an operational attack, compromise or vulnerability claim solely from an untrusted mailing-list post. |
 | `failed.writer.invalid_output` | The writer's draft did not match its schema. |
 | `failed.writer.evidence_too_short` | A draft evidence quote was too short. |
 | `failed.writer.evidence_not_exact` | A draft evidence quote was not an exact excerpt of the source. |

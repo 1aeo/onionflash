@@ -992,3 +992,34 @@ def test_pending_update_rewrites_and_own_comment_cutoff_admits_edited_notes(cont
     res_same = review_gate.process_item(cfg, store, store.pending(1, "2026-11-12T15:05:00Z")[0], Writer(), Reviewer(), "2026-11-12T15:05:00Z")
     assert res_same["status"] == "ignored" and res_same["writer_calls"] == res_same["review_calls"] == 0
     assert review_gate.candidate_mod._source_cutoff(store.db, st_edit, None, issue_a_edited) == "2026-11-12T14:00:00Z"
+
+
+def test_trusted_operator_vs_community_list_incidents_in_gate(context):
+    cfg, store = context
+    list_base = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/"
+
+    chat = pending(store, item(url=list_base + "chat1/", kind="feed", authority="trusted-operator",
+                               content="Routine relay operator question about bandwidth."))
+    assert run(cfg, store, chat, Writer(analysis(confidence="reported", category="relay", tags=["relay"],
+                                                 title="Operator asks about relay bandwidth",
+                                                 summary="An operator asks a routine question about relay bandwidth.",
+                                                 evidence=["Routine relay operator question"])),
+               Reviewer(verdict("skip", criterion="news_value")))["status"] == "ignored"
+    assert codes(store, chat) == ["skipped.review.news_value"]
+
+    trusted_inc = pending(store, item(url=list_base + "trusted1/", kind="feed", authority="trusted-operator",
+                                      content="Large relay family observed sustained SYN flood across exit relays."))
+    trusted_draft = analysis(title="Relay family reports sustained SYN flood on exit relays",
+                             summary="A large relay operator reports a sustained SYN flood across exit relays.",
+                             category="dos", tags=["dos"], confidence="reported", state="developing",
+                             evidence=["Large relay family observed sustained SYN flood"])
+    assert run(cfg, store, trusted_inc, Writer(trusted_draft), Reviewer(verdict(), verdict()))["status"] == "published"
+
+    untrusted_inc = pending(store, item(url=list_base + "comm1/", kind="feed", authority="community",
+                                        content="Single operator claims relays face deanonymization attack."))
+    untrusted_draft = analysis(title="Single operator claims relays face deanonymization attack",
+                               summary="A mailing-list post claims relays face a deanonymization attack.",
+                               category="security", tags=["security"], confidence="reported", state="developing",
+                               evidence=["Single operator claims relays face deanonymization attack."])
+    assert run(cfg, store, untrusted_inc, Writer(untrusted_draft), Reviewer(verdict(), verdict()))["status"] == "held"
+    assert codes(store, untrusted_inc) == ["held.final_check.untrusted_operator_claim"]

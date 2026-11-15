@@ -25,7 +25,10 @@ CODES = frozenset({
     *(f"held.{stage}.{reason}" for stage in ("review", "verification")
       for reason in ("model_hold", "tag_repair", "unusable_repair", "repeated_repair", "disagreed_news", "release_labels")),
     "held.verification.official_not_news", "held.verification.repairs_exhausted",
-    *(f"held.final_check.{reason}" for reason in ("completed_action", "compromise_headline", "confirmed_source", "merge_state")),
+    *(f"held.final_check.{reason}" for reason in (
+        "completed_action", "compromise_headline", "confirmed_source", "merge_state",
+        "shouting_caps", "malformed_version", "untrusted_operator_claim",
+    )),
     *(f"failed.writer.{reason}" for reason in ("invalid_output", "evidence_too_short", "evidence_not_exact",
                                                "no_literal_evidence", "invalid_input", "truncated", "invalid_json")),
     *(f"failed.review.{reason}" for reason in ("invalid_reply", "invalid_input", "truncated", "invalid_json", "request_limit")),
@@ -42,7 +45,7 @@ HISTORY_LIMIT = 20
 FEED_LIMIT_BYTES = 10 * 1024 * 1024
 FEED_SPLIT_BYTES = FEED_LIMIT_BYTES // 2
 _PREFIX = re.compile(r"[a-z_]+(?:\.[a-z_]+){0,2}\Z")
-_COLUMNS = "id,decided_at,code,subject,item_id,content_hash,source_id,story_id,CAST(detail_json AS BLOB) AS detail"
+_COLUMNS = "id,decided_at,code,subject,item_id,content_hash,source_id,story_id,CASE WHEN typeof(detail_json)='text' THEN CAST(detail_json AS BLOB) END AS detail"
 
 
 def _reviews(record) -> list:
@@ -114,7 +117,7 @@ def _write_decision(db, observed: str, subject: str, item_id: str | None, conten
 def record(db, item_id: str, code: str, observed: str, *, review: dict | None = None, **extra) -> None:
     """Append one decision about an item to the caller's transaction."""
     row = db.execute(
-        "SELECT content_hash,source_id,story_id,url,CAST(payload AS BLOB) AS payload FROM items WHERE id=?",
+        "SELECT content_hash,source_id,story_id,url,CASE WHEN typeof(payload)='text' THEN CAST(payload AS BLOB) END AS payload FROM items WHERE id=?",
         (item_id,),
     ).fetchone()
     columns = (row["content_hash"], row["source_id"], row["story_id"]) if row else (None, None, None)
@@ -131,6 +134,7 @@ def record_subject(db, subject: str, code: str, observed: str, *, source_id: str
 
 
 def latest_id(db) -> int:
+    """Return the highest decision_log row ID, or 0 when the log is empty."""
     return db.execute("SELECT COALESCE(MAX(id),0) FROM decision_log").fetchone()[0]
 
 
@@ -207,7 +211,7 @@ def summary(db, since: str) -> dict:
         clears += detail.get("writer_clears", 0)
     rejected = [{"item_id": item_id, "title": _title(payload), "code": code, "decided_at": decided_at, "reason": reason}
                 for item_id, payload, code, decided_at, reason in db.execute(
-                    """SELECT i.id,CAST(i.payload AS BLOB),d.code,d.decided_at,i.last_error FROM items i
+                    """SELECT i.id,CASE WHEN typeof(i.payload)='text' THEN CAST(i.payload AS BLOB) END,d.code,d.decided_at,i.last_error FROM items i
                     LEFT JOIN decision_log d ON d.id=(SELECT MAX(id) FROM decision_log WHERE item_id=i.id)
                     WHERE i.status='rejected' ORDER BY d.id,i.id LIMIT ?""", (AWAITING,))]
     return {

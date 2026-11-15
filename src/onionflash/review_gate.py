@@ -52,6 +52,9 @@ HOLDS = {
     "compromise_headline": "the headline drops the sources' doubt about a compromise",
     "confirmed_source": "confirmed needs an official announcement or a merged merge request",
     "merge_state": "a story told only by merge requests must be marked merged",
+    "shouting_caps": "the candidate contains unnormalized all-caps shouting",
+    "malformed_version": "the candidate cites a nonexistent three-part C-Tor version",
+    "untrusted_operator_claim": "an uncorroborated mailing-list incident claim needs a trusted source",
 }
 
 
@@ -167,12 +170,20 @@ def _saved_job(store, row, config):
     """Validate saved identity before a mismatch can start a fresh automatic review."""
     from .store import item_hash
 
-    job = store.db.execute("""SELECT writer_key,policy_hash,stage,approval_key,prepared_at,CAST(draft_json AS BLOB) AS draft,
-        CAST(envelope_json AS BLOB) AS envelope,CAST(record_json AS BLOB) AS record FROM review_jobs WHERE item_id=?""",
-        (row["id"],)).fetchone()
+    job = store.db.execute(
+        """SELECT writer_key,policy_hash,stage,approval_key,prepared_at,
+           typeof(draft_json) AS draft_type,CAST(draft_json AS BLOB) AS draft,
+           typeof(envelope_json) AS envelope_type,CAST(envelope_json AS BLOB) AS envelope,
+           typeof(record_json) AS record_type,CAST(record_json AS BLOB) AS record
+           FROM review_jobs WHERE item_id=?""",
+        (row["id"],),
+    ).fetchone()
     if job is None:
         return None, None, None, None, False
-    draft, prepared, record = (saved_object(job[key]) for key in ("draft", "envelope", "record"))
+    draft, prepared, record = (
+        saved_object(job[key]) if job[key + "_type"] == "text" else None
+        for key in ("draft", "envelope", "record")
+    )
     try:
         if (record is None or (draft is None) != (job["draft"] is None)
                 or (prepared is None) != (job["envelope"] is None)):
@@ -1410,8 +1421,10 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
         (item_id,),
     ).fetchone()
     job = store.db.execute(
-        """SELECT writer_key,policy_hash,stage,prepared_at,CAST(draft_json AS BLOB) AS draft,
-           CAST(envelope_json AS BLOB) AS envelope,CAST(record_json AS BLOB) AS record
+        """SELECT writer_key,policy_hash,stage,prepared_at,
+           CASE WHEN typeof(draft_json)='text' THEN CAST(draft_json AS BLOB) END AS draft,
+           CASE WHEN typeof(envelope_json)='text' THEN CAST(envelope_json AS BLOB) END AS envelope,
+           CASE WHEN typeof(record_json)='text' THEN CAST(record_json AS BLOB) END AS record
            FROM review_jobs WHERE item_id=?""", (item_id,),
     ).fetchone()
     if item_row is None or item_row["status"] != "rejected" or job is None or job["stage"] != "held":

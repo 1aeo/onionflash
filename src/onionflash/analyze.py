@@ -8,8 +8,9 @@ import re
 
 from .comments import analysis_context
 from .llm import (
-    AnalysisError, CompletionClient, apply_label_limits, is_complete_sentence,
-    generation_options, label_limits, strip_unreleased_tag, tag_name, validate_text,
+    AnalysisError, CompletionClient, apply_label_limits, generation_options,
+    has_malformed_tor_version, has_shouting_caps, is_complete_sentence, label_limits,
+    strip_unreleased_tag, tag_name, validate_text,
 )
 from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, STATES, UPDATE_CHARS
 from .util import digest, normalize_evidence as _plain
@@ -141,6 +142,12 @@ stream/request counts from bandwidth, and a measured sample from all affected re
 Preserve the source's inspection date for claims about versions or the main branch.
 Do not invent versions, CVEs, identities, counts, causal explanations, consequences,
 fixes or operator guidance. A count the source states may be restated.
+Convert ALL-CAPS shouted source phrases to normal sentence case while keeping standard
+technical acronyms, and never copy nonexistent three-part C-Tor versions such as 0.4.17
+as valid release numbers (C Tor versions use four numbers, such as 0.4.9.17).
+Metadata fields such as authority (including trusted-operator and project-sender) are
+internal provenance tags, not prose labels: write 'a relay operator' rather than
+'a trusted operator' unless the source text itself uses that phrase.
 {causal_check}A developer changing source code is not an operator changing configuration.
 
 {impact}the expected result for most merges, tags, checklists, questions and discussions.
@@ -352,9 +359,17 @@ def validate_analysis(result: dict, item: dict, schema: dict = SCHEMA) -> dict:
         raise AnalysisError("Published story needs text and source evidence")
     if "update" in fields and not is_complete_sentence(result["update"]):
         raise AnalysisError("Invalid model update: must be a complete punctuated sentence")
+    if any(has_shouting_caps(result.get(key, "")) for key in ("title", "summary", "update")):
+        raise AnalysisError("Model draft contains all-caps shouting")
     # The impact sentence may restate only numbers and versions from the title, content or comment
-    # bodies the writer saw. It is cleared, not refused: a retry would return the same reply.
-    if result.get("why_it_matters") and _numbers(result["why_it_matters"]) - _numbers(context):
+    # bodies the writer saw, and is cleared on untrusted list posts, shouting or malformed versions.
+    impact = result.get("why_it_matters")
+    if impact and (
+        _numbers(impact) - _numbers(context)
+        or (item.get("authority") == "community" and "lists.torproject.org" in str(item.get("url") or ""))
+        or has_shouting_caps(impact)
+        or has_malformed_tor_version(impact, result.get("products") or [item.get("product", "")])
+    ):
         result["why_it_matters"] = ""
     return result
 

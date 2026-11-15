@@ -79,7 +79,10 @@ a close, attributed restatement of one source sentence that states the event's
 impact or an action it asks its readers to take, with that sentence's audience,
 hedges and scope. Most drafts leave it empty. Validation clears a sentence with a
 number or version absent from the title, content and comment bodies the writer
-saw (source metadata does not count).
+saw (source metadata does not count), on an untrusted `community`
+`lists.torproject.org` post, or when it contains unnormalized all-caps shouting
+or a nonexistent three-part C-Tor version; drafts with unnormalized all-caps
+shouting in the headline, summary or update are refused.
 Historical impact text remains readable. A review repair may clear it, but cannot
 create or rewrite an impact paragraph; operator corrections remain separate.
 Automatic approvals also require consistent metadata: a `release` category or
@@ -240,7 +243,7 @@ an older policy can justify a fresh budget; older verdict schemas remain readabl
 
 ## Final checks
 
-A verified approval publishes only if four fixed checks also pass. They read the
+A verified approval publishes only if seven fixed checks also pass. They read the
 exact candidate, its source packet and the kind of source that wrote its text,
 make no model call, and run again when a saved approval is resumed. A failed
 check holds the item for the operator with its own [decision code](DECISIONS.md);
@@ -259,6 +262,14 @@ skips are not checked.
   marks as requested, planned or not done claims nothing.
 - When a source hedges a compromise ("plausibly compromised", "may have been
   hacked"), a new headline or update entry about the compromise keeps a qualifier.
+- Public story text (`title`, `summary`, `why_it_matters`) or a new update entry
+  contains no unnormalized all-caps shouting beyond standard technical acronyms.
+- Public story text or a new update entry on Tor or network coverage cites no
+  nonexistent three-part C-Tor version typo (such as `0.4.17`) unless marked as a
+  literal source quote (`sic`, `typo` or `written`).
+- A new story whose sources are all untrusted `community` `lists.torproject.org`
+  posts does not report an operational attack, compromise, DoS, flood, bypass or
+  vulnerability claim (`untrusted_operator_claim`).
 
 The writer's request and every review's repair offer only the confidence,
 state and category labels that these checks allow (and `tagged` only when a

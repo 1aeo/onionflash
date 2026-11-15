@@ -72,11 +72,13 @@ def backup_database(source: str | Path, destination: str | Path) -> None:
 
 
 def get_meta(db, key: str, default: str | None = None) -> str | None:
+    """Read one metadata value by key, or return `default` when absent."""
     row = db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
     return row[0] if row is not None else default
 
 
 def set_meta(db, **values: str) -> None:
+    """Upsert one or more key-value entries in the metadata table."""
     db.executemany(
         "INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         values.items(),
@@ -84,6 +86,7 @@ def set_meta(db, **values: str) -> None:
 
 
 def bump_meta(db, key: str) -> int:
+    """Increment an integer counter in metadata and return its new value."""
     value = int(get_meta(db, key) or 0) + 1
     set_meta(db, **{key: str(value)})
     return value
@@ -91,6 +94,7 @@ def bump_meta(db, key: str) -> int:
 
 @contextmanager
 def immediate_transaction(db, busy_message: str = "Database transaction already active"):
+    """Run a block inside a `BEGIN IMMEDIATE` write transaction."""
     if db.in_transaction:
         raise ValueError(busy_message)
     db.execute("BEGIN IMMEDIATE")
@@ -267,11 +271,13 @@ def compact_retained_rows(
 
 
 def source_due(state: dict, observed: str) -> bool:
+    """Return whether a source's next scheduled fetch time has arrived."""
     due = state.get("next_fetch_at")
     return not due or due <= observed
 
 
 def item_priority(item: dict) -> int:
+    """Score a collected item so security and compromise reports run first."""
     words = (item["title"] + " " + item["content"][:1500] + " " + " ".join(item.get("labels", []))).lower()
     score = sum(
         weight
@@ -279,6 +285,29 @@ def item_priority(item: dict) -> int:
         if word in words
     )
     return max(score, TAG_PRIORITY if item["kind"] == "tag" else 0)
+
+
+def _valid_saved_item(old: object) -> bool:
+    if not isinstance(old, dict):
+        return False
+    if not all(isinstance(old.get(key), str) for key in ("title", "content", "updated_at")):
+        return False
+    if "source_content" in old and not isinstance(old["source_content"], str):
+        return False
+    labels = old.get("labels")
+    if labels is not None and (not isinstance(labels, list) or any(not isinstance(entry, str) for entry in labels)):
+        return False
+    notes = old.get("public_comments")
+    if notes is not None and (
+        not isinstance(notes, list)
+        or any(
+            not isinstance(note, dict)
+            or not all(isinstance(note.get(key), str) for key in ("author", "created_at", "body"))
+            for note in notes
+        )
+    ):
+        return False
+    return True
 
 
 def item_hash(item: dict) -> str:
@@ -291,6 +320,8 @@ def item_hash(item: dict) -> str:
 
 
 class Store:
+    """SQLite state store for sources, queued items, analyses and published stories."""
+
     def __init__(self, path: str | Path):
         """Open persistent state and apply idempotent schema maintenance before use."""
         path = Path(path)
@@ -395,6 +426,7 @@ class Store:
         self.db.close()
 
     def source(self, source: dict) -> dict:
+        """Load or initialize persistent polling state for a configured source."""
         row = self.db.execute("SELECT * FROM source_state WHERE id=?", (source["id"],)).fetchone()
         if row and row["url"] == source["url"]:
             return dict(row)
@@ -404,6 +436,7 @@ class Store:
         return dict(self.db.execute("SELECT * FROM source_state WHERE id=?", (source["id"],)).fetchone())
 
     def source_success(self, source: dict, result: dict, observed: str, *, schedule_from: str | None = None) -> None:
+        """Record a successful poll, cache validators and next fetch timestamp."""
         with self.db:
             self.db.execute(
                 """UPDATE source_state SET active_url=?, watermark=COALESCE(?,watermark),
@@ -432,6 +465,7 @@ class Store:
         watermark: str | None = None,
         catching_up: bool = False,
     ) -> None:
+        """Record a failed or catching-up poll with bounded retry backoff."""
         state = self.source(source)
         failures = state["failures"] + 1
         delay = (
@@ -447,6 +481,7 @@ class Store:
             self.db.execute(f"UPDATE source_state SET {assignments} WHERE id=?", (*fields.values(), source["id"]))
 
     def ingest(self, item: dict, observed: str) -> bool:
+        """Store a new or updated source item and return whether it was queued."""
         item_id = digest(item_identity(item))[:24]
         item["id"] = item_id
         content_hash = item_hash(item)
@@ -459,7 +494,7 @@ class Store:
             (item_id,),
         ).fetchone()
         old = saved_object(row["payload"]) if row and row["payload_type"] == "text" else None
-        if row and not isinstance((old or {}).get("updated_at"), str):
+        if row and not _valid_saved_item(old):
             logging.getLogger(__name__).warning("Replacing damaged saved item %s", item_id)
             requested = "SELECT 1 FROM comment_cache WHERE item_id=? AND (failures>0 OR next_fetch_at<=checked_at)"
             if row["content_hash"] == content_hash or (row["status"] != "pending" and check_requested
@@ -523,6 +558,7 @@ class Store:
         return rows
 
     def pending_count(self) -> int:
+        """Return the total number of items currently in pending status."""
         return self.db.execute("SELECT COUNT(*) FROM items WHERE status='pending'").fetchone()[0]
 
     def require_pending_item(self, row: dict, message: str) -> dict:
@@ -583,6 +619,7 @@ class Store:
                 decisions.record(self.db, item_id, code, observed, error=error[:160])
 
     def rejected_count(self) -> int:
+        """Return the total number of items currently in rejected status."""
         return self.db.execute("SELECT COUNT(*) FROM items WHERE status='rejected'").fetchone()[0]
 
     def record_analysis(self, row: dict, result: dict, cache_key: str, observed: str, *,
@@ -609,6 +646,7 @@ class Store:
         return cache_key
 
     def prepare_candidate(self, row: dict, result: dict, observed: str) -> dict:
+        """Assemble a read-only publication candidate and source bindings for `row`."""
         return candidate.prepare(self.db, row, result, observed)
 
     def _append_citation(self, story_id: str, story_payload: dict, source: dict) -> None:
@@ -812,6 +850,7 @@ class Store:
         return result
 
     def get_meta(self, key: str) -> str | None:
+        """Read one metadata value by key from this store."""
         return get_meta(self.db, key)
 
     def set_meta(self, **values: str) -> None:

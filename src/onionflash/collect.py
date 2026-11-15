@@ -24,6 +24,8 @@ LIST_ARCHIVE_HOST = "lists.torproject.org"
 # optionally followed by the display name in parentheses; only that address counts.
 HYPERKITTY_AUTHOR = re.compile(r"[^@\s()＠]+＠[^@\s()＠]+(?: \(.*\))?\Z", re.DOTALL)
 PROJECT_SENDER = re.compile(r"[a-z0-9._+-]+@torproject\.org")
+SENDER_ADDRESS = re.compile(r"[a-z0-9._+-]+@([a-z0-9.-]+\.[a-z]{2,})")
+SENDER_DOMAIN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
 
 
 def _hyperkitty_address(author: object) -> str | None:
@@ -32,12 +34,31 @@ def _hyperkitty_address(author: object) -> str | None:
     return author.partition(" (")[0].replace("＠", "@")
 
 
-def _project_sender(author: object) -> bool:
+def _sender_authority(author: object, trusted_domains: list[str] | tuple[str, ...] = ()) -> str | None:
     address = _hyperkitty_address(author)
-    return address is not None and address.isascii() and PROJECT_SENDER.fullmatch(address.lower()) is not None
+    if address is None or not address.isascii():
+        return None
+    match = SENDER_ADDRESS.fullmatch(address.lower())
+    if match is None or not SENDER_DOMAIN.fullmatch(domain := match.group(1)):
+        return None
+    if domain == "torproject.org":
+        return "project-sender"
+    if domain.endswith(".torproject.org"):
+        return None
+    for raw in trusted_domains:
+        if isinstance(raw, str) and (td := raw.strip().lower()) and td != "torproject.org":
+            if domain == td or domain.endswith("." + td):
+                return "trusted-operator"
+    return None
+
+
+def _project_sender(author: object) -> bool:
+    return _sender_authority(author) == "project-sender"
 
 
 class CollectionError(Exception):
+    """Source collection failure, carrying any partial items or resume watermark."""
+
     def __init__(
         self,
         message: str,
@@ -229,8 +250,10 @@ def _feed(
             continue
         if not item["title"]:
             continue
-        if archive_senders and _project_sender(rss_authors[index]):
-            item["authority"] = "project-sender"
+        if archive_senders and (
+            sender_auth := _sender_authority(rss_authors[index], settings.get("trusted_operator_domains", ()))
+        ) is not None:
+            item["authority"] = sender_auth
         # Some Atom archives omit alternate links and reuse an ID for distinct
         # events. Do not silently choose one event when that fallback is ambiguous.
         has_alternate = any(
@@ -351,6 +374,7 @@ def _gitlab(
 def collect_source(
     client: HttpClient, source: dict, state: dict, settings: dict, started: str
 ) -> dict:
+    """Collect items from a source URL or its fallbacks within configured bounds."""
     errors: list[str] = []
     partial: list[dict] = []
     watermark = None

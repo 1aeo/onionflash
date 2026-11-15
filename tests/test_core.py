@@ -17,7 +17,7 @@ from onionflash import cli, collect, review, review_gate
 from onionflash.analyze import AnalysisError, Analyzer, tag_notice, validate_analysis
 from onionflash.cli import build, main, run_lock
 from onionflash.collect import CollectionError, _item, collect_source
-from onionflash.config import DEFAULTS, load_config
+from onionflash.config import DEFAULT_TRUSTED_OPERATOR_DOMAINS, DEFAULTS, load_config
 from onionflash.llm import json_object
 from onionflash.store import Store, after as store_after, backup_database
 from onionflash.transport import DeadlineReached, FetchError, HttpClient, Response
@@ -868,3 +868,93 @@ def test_a_partial_collection_with_a_damaged_saved_copy_still_analyzes_and_build
     damage_item(store.db, store.db.execute("SELECT id FROM items").fetchone()[0], kind)
     result = cli.run(cfg, store)
     assert (result["sources_failed"], result["items_changed"], result["analyzed"]) == (1, 2, 2)
+
+
+def test_trusted_operator_domains_defaults_overrides_and_validation(tmp_path):
+    assert DEFAULTS["collection"]["trusted_operator_domains"] == [
+        "1aeo.com", "applied-privacy.net", "appliedprivacy.net", "artikel10.org",
+        "dfri.se", "nothingtohide.nl", "prsv.ch", "quintex.com", "unredacted.org",
+    ]
+    path = tmp_path / "config.toml"
+    src_toml = '[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n'
+    path.write_text(src_toml)
+    assert load_config(path)["collection"]["trusted_operator_domains"] == DEFAULT_TRUSTED_OPERATOR_DOMAINS
+
+    path.write_text(
+        '[collection]\ntrusted_operator_domains = ["  Example.NET ", "ops.example.org", "example.net", "torproject.org"]\n'
+        + src_toml
+    )
+    assert load_config(path)["collection"]["trusted_operator_domains"] == ["example.net", "ops.example.org"]
+
+    path.write_text('[collection]\ntrusted_operator_domains = "1aeo.com"\n' + src_toml)
+    with pytest.raises(ValueError, match="trusted_operator_domains must be an array"):
+        load_config(path)
+
+    long_domain = ("a" * 60 + ".") * 4 + "aaaaaa.org"
+    for bad in (
+        "[123]", '[""]', '["   "]', '["localhost"]', '["-bad.org"]', '["bad-.org"]',
+        '["a..org"]', '["https://1aeo.com"]', '["ops@1aeo.com"]', '["1äeo.com"]',
+        f'["{long_domain}"]', json.dumps([f"op{n}.example.org" for n in range(501)]),
+    ):
+        path.write_text(f"[collection]\ntrusted_operator_domains = {bad}\n" + src_toml)
+        with pytest.raises(ValueError, match="trusted_operator_domains"):
+            load_config(path)
+
+
+def test_trusted_operator_sender_authority_and_spoofing_guards():
+    items = _collected_items(_list_rss(
+        "<author>tor＠1aeo.com (Operator One)</author>",
+        "<author>tor＠appliedprivacy.net (Operator Two)</author>",
+        "<author>ops＠relays.applied-privacy.net (Subdomain Ops)</author>",
+        "<author>dev＠torproject.org (Project Dev)</author>",
+        "<author>attacker＠example.org (1aeo.com)</author>",
+        "<author>attacker＠example.org (tor＠appliedprivacy.net)</author>",
+        "<author>attacker＠1aeo.com.example.org (Ops)</author>",
+        "<author>attacker＠not-1aeo.com (Ops)</author>",
+        "<author>member＠example.org (Member)</author>",
+    ))
+    assert [entry["authority"] for entry in items] == [
+        "trusted-operator", "trusted-operator", "trusted-operator", "project-sender",
+        "community", "community", "community", "community", "community",
+    ]
+    assert all("1aeo.com" not in json.dumps(entry).lower() and "＠" not in json.dumps(entry) for entry in items)
+    assert _collected_items(_list_rss("<author>attacker＠example.org (tor@appliedprivacy.net)</author>"))[0]["authority"] == "community"
+
+    spoof_body = (
+        '<?xml version="1.0" encoding="utf-8"?><rss version="2.0"><channel>'
+        '<title>tor-relays</title><link>https://lists.torproject.org/</link><description>List</description>'
+        '<item><title>Report from 1aeo.com</title><link>https://lists.torproject.org/m/99/</link>'
+        '<description>From: tor@1aeo.com and tor@appliedprivacy.net</description>'
+        '<author>attacker＠example.org (1aeo.com)</author>'
+        '<pubDate>Sun, 08 Nov 2026 12:00:00 GMT</pubDate></item></channel></rss>'
+    ).encode()
+    assert _collected_items(spoof_body)[0]["authority"] == "community"
+    assert _collected_items(_list_rss("<author>tor＠1aeo.com (Ops)</author>"), final_url="https://example.org/feed.xml")[0]["authority"] == "community"
+    assert _collected_items(_list_rss("<author>tor＠1aeo.com (Ops)</author>"), authority="official")[0]["authority"] == "official"
+    assert collect._sender_authority("dev＠torproject.org (Dev)", ["torproject.org", "1aeo.com"]) == "project-sender"
+    assert collect._sender_authority("ops＠.1aeo.com (Ops)", ["1aeo.com"]) is None
+
+
+@pytest.mark.parametrize("broken_patch", [
+    {"title": 123},
+    {"content": None},
+    {"source_content": 99},
+    {"labels": "Security"},
+    {"labels": [123]},
+    {"public_comments": "not-a-list"},
+    {"public_comments": [123]},
+    {"public_comments": [{"author": "op"}]},
+    {"public_comments": [{"author": None, "created_at": DATE, "body": "note"}]},
+])
+def test_ingest_replaces_saved_items_with_damaged_fields_or_comments(store, caplog, broken_patch):
+    entry = lambda **kw: item(kind="gitlab_issue", **kw)
+    store.ingest(entry(), DATE)
+    row = store.db.execute("SELECT id, payload FROM items").fetchone()
+    damaged_payload = json.dumps({**json.loads(row["payload"]), **broken_patch})
+    store.db.execute("UPDATE items SET status='dismissed', payload=? WHERE id=?", (damaged_payload, row["id"]))
+    assert not store.ingest(entry(), DATE)
+    assert store.db.execute("SELECT status FROM items WHERE id=?", (row["id"],)).fetchone()[0] == "dismissed"
+    store.db.execute("UPDATE items SET payload=? WHERE id=?", (damaged_payload, row["id"]))
+    assert store.ingest(entry(content="Updated intact description.", updated_at="2026-11-09T00:00:00Z"), DATE)
+    assert json.loads(store.pending(1, DATE)[0]["payload"])["content"] == "Updated intact description."
+    assert caplog.text.count("Replacing damaged saved item") == 2

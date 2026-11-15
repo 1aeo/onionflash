@@ -20,8 +20,11 @@ protocol changes. The additional configured streams are:
 
 On `lists.torproject.org` archives whose RSS items carry HyperKitty's `local＠domain`
 `<author>` element, an entry from an exact `torproject.org` address is classified
-`project-sender` unless the stream is already `official`; display names never count,
-and the address is not stored. Browser release announcements were already present in Tor Blog and tor-announce.
+`project-sender` and an entry matching `[collection].trusted_operator_domains` (verified
+large AROI relay-operator domains; subdomains included) is classified `trusted-operator`,
+unless the stream is already `official`; display names, subjects and message bodies never
+count, neither classification establishes `confirmed` confidence, and the address is not
+stored. Browser release announcements were already present in Tor Blog and tor-announce.
 The Browser issue stream is deliberately filtered; it does not replace those
 announcements or promise comprehensive vulnerability coverage.
 

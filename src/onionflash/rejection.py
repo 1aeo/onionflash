@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from . import decisions, editorial, review_gate
 from .schema import ITEM_ID_RE, PRODUCTS, SHA256_RE
+from .store import _valid_saved_item
 from .util import canonical_url, digest, format_utc, now_iso, parse_utc, saved_object
 
 MAX_LIMIT = 200
@@ -25,9 +26,13 @@ def _identifier(value: str) -> str:
     return value
 
 
+def _saved_payload(row) -> dict | None:
+    return saved_object(row["payload"]) if row["payload_type"] == "text" else None
+
+
 def _summary(row) -> dict:
     result = {key: row[key] for key in ("id", "content_hash", "source_id", "status", "attempts", "rejections", "next_attempt_at", "story_id")}
-    title = (saved_object(row["payload"]) or {}).get("title")
+    title = (_saved_payload(row) or {}).get("title")
     result.update(source_url=row["url"], rejection_reason=row["last_error"], title=title if isinstance(title, str) else None)
     return result
 
@@ -53,7 +58,7 @@ def show_item(store, item_id: str, config: dict | None = None) -> dict:
     if row is None:
         raise ValueError("Source item was not found")
     result = _summary(row)
-    result["saved_item"] = saved_object(row["payload"])
+    result["saved_item"] = _saved_payload(row)
     result["final_review"] = _final_review(store, item_id, config=config)
     result["actions"] = [dict(action) for action in store.db.execute(
         """SELECT action_id,action,content_hash,reason,created_at,before_status,before_attempts,before_rejections
@@ -66,21 +71,27 @@ def show_item(store, item_id: str, config: dict | None = None) -> dict:
 
 def _final_review(store, item_id: str, *, config: dict | None = None):
     row = store.db.execute(
-        "SELECT stage,CAST(record_json AS BLOB) AS record_json FROM review_jobs WHERE item_id=?",
+        "SELECT stage,typeof(record_json) AS record_type,CAST(record_json AS BLOB) AS record_json FROM review_jobs WHERE item_id=?",
         (item_id,),
     ).fetchone() or store.db.execute(
-        """SELECT 'finished' AS stage,CAST(review_record AS BLOB) AS record_json FROM analyses WHERE source_item_id=?1
+        """SELECT 'finished' AS stage,typeof(review_record) AS record_type,CAST(review_record AS BLOB) AS record_json
+           FROM analyses WHERE source_item_id=?1
            AND EXISTS(SELECT 1 FROM items WHERE id=?1 AND (status='published'
                OR (status='ignored' AND last_error GLOB 'Final review skipped:*'))) ORDER BY rowid DESC LIMIT 1""",
         (item_id,),
     ).fetchone()
     if row is None or row["record_json"] is None:
         return None
-    record = saved_object(row["record_json"])
+    record = saved_object(row["record_json"]) if row["record_type"] == "text" else None
     extra = {"approval": review_gate.approval(config, store, item_id)} if config is not None and row["stage"] == "held" else {}
+    if record is None:
+        return {"stage": row["stage"], "error": "Saved review record cannot be read", **extra}
     try:
         prepared = record.get("prepared", {})
-        reviews = record.get("reviews") or record.get("approval", {}).get("reviews", [])
+        approval = record.get("approval")
+        reviews = record.get("reviews") or (approval.get("reviews", []) if isinstance(approval, dict) else [])
+        if not isinstance(prepared, dict) or not isinstance(reviews, list):
+            raise TypeError
         latest = reviews[-1] if reviews else None
         candidate = record.get("candidate", prepared.get("candidate"))
         return {
@@ -125,9 +136,9 @@ def _checked(db, item_id: str, expected_hash: str, *, statuses: set[str]) -> dic
 
 
 def _ready(row: dict) -> None:
-    payload = saved_object(row["payload"]) or {}
+    payload = _saved_payload(row) or {}
     try:
-        if payload.get("id") != row["id"] or row["payload_type"] != "text":
+        if payload.get("id") != row["id"] or not _valid_saved_item(payload):
             raise ValueError
         for key in ("title", "content", "kind"):
             if not isinstance(payload.get(key), str) or (key != "content" and not payload[key]):
@@ -152,7 +163,7 @@ def _act(store, item_id: str, expected_hash: str, reason: str, action: str, obse
         update = editorial.RESET_PENDING_SQL if action == "retry" else "status='dismissed',next_attempt_at=NULL"
         changed = db.execute(
             f"""UPDATE items SET {update}
-                WHERE id=? AND content_hash=? AND CAST(payload AS BLOB)=? AND status=? AND attempts=?
+                WHERE id=? AND content_hash=? AND CAST(payload AS BLOB) IS ? AND status=? AND attempts=?
                 AND rejections=? AND last_error IS ? AND next_attempt_at IS ?""",
             (item_id, expected_hash, row["payload"], row["status"], row["attempts"],
              row["rejections"], row["last_error"], row["next_attempt_at"]),
@@ -179,14 +190,17 @@ def _act(store, item_id: str, expected_hash: str, reason: str, action: str, obse
 
 
 def retry_item(store, item_id: str, expected_hash: str, reason: str, observed: str | None = None) -> dict:
+    """Reset a rejected, dismissed, ignored or failed-pending item back to pending."""
     return _act(store, item_id, expected_hash, reason, "retry", observed)
 
 
 def dismiss_item(store, item_id: str, expected_hash: str, reason: str, observed: str | None = None) -> dict:
+    """Mark a rejected or failed-pending item dismissed and audit the action."""
     return _act(store, item_id, expected_hash, reason, "dismiss", observed)
 
 
 def approve_item(config, store, item_id: str, approval_hash: str, reason: str, observed: str | None = None) -> dict:
+    """Publish a held item whose verified candidate matches `approval_hash`."""
     _identifier(item_id)
     if config is None:
         raise ValueError("Configuration is required to approve a held item")

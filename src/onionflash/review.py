@@ -7,13 +7,13 @@ import json
 import re
 
 from .analyze import SCHEMA as DRAFT_SCHEMA
-from .llm import (AnalysisError, CompletionClient, apply_label_limits,
-                  is_complete_sentence, label_limits, repair_schema, validate_text)
+from .llm import (AnalysisError, CompletionClient, apply_label_limits, has_malformed_tor_version,
+                  has_shouting_caps, is_complete_sentence, label_limits, repair_schema, validate_text)
 from .render import prepare_story
 from .schema import LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STORY_ID_RE, UPDATE_CHARS
 from .util import canonical_url, digest, normalize_evidence
 
-REVIEW_VERSION = "onionflash-review-11"
+REVIEW_VERSION = "onionflash-review-12"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details", "news_value", "new_information")
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
@@ -82,9 +82,9 @@ Reported and suspected are both acceptable for attributed unconfirmed claims whe
 the current wording preserves uncertainty. Do not demand stronger certainty.
 
 Evaluate every criterion separately; no average score and no majority approval.
-Judge title, summary, why_it_matters and confidence while scoring criteria, because
-verdict and repair follow criteria: any defect you plan to revise, hold or skip MUST
-fail its criterion below before you reach verdict.
+Judge title, summary, why_it_matters, ALL-CAPS shouting, C-Tor version numbers and
+confidence while scoring criteria, because verdict and repair follow criteria: any
+defect you plan to revise, hold or skip MUST fail its criterion below before you reach verdict.
 source_support: every factual assertion is stated or faithfully paraphrased in the
 packet. Attribution alone cannot make an unsupported consequence true.
 A non-empty why_it_matters passes only when it closely restates one packet sentence
@@ -125,8 +125,9 @@ own change; use reported for issues, comments, maintainer statements, list posts
 community claims.
 A mailing-list proposal is reported as proposed (state developing, confidence
 reported) and is its author's proposal for comment, not an adoption or Tor Project
-decision; project-sender authority marks a torproject.org list sender and does not
-by itself confirm a claim.
+decision; project-sender authority marks a torproject.org list sender and
+trusted-operator marks a verified large AROI relay-family operator, and neither
+authority confirms a claim (keep confidence reported, never confirmed).
 In uncertainty_attribution's reason, check candidate.confidence: fail
 uncertainty_attribution whenever confidence is confirmed without an official non-tag
 announcement or merged gitlab_mr in the packet, when a headline or why_it_matters
@@ -153,8 +154,12 @@ does not create an operator instruction. For example, source 'remove X from sour
 supports 'the issue requests removing X from the software', but does not support
 'relay operators must edit configuration' or 'operators should upgrade'.
 technical_details: versions, identities, fingerprints, CVEs, counts, protocol details,
-causal mechanisms and security consequences must be supported precisely. Do not
+causal mechanisms, security consequences and text casing must be supported and normalized. Do not
 conflate authority signing keys, relay identities or software trust-list updates.
+BEFORE setting technical_details's outcome, check candidate.title, summary and why_it_matters
+for (a) unnormalized ALL-CAPS shouting (3+ consecutive uppercase non-acronym words) and
+(b) nonexistent three-part C-Tor version typos such as 0.4.17 or 0.4.16 (C Tor releases use
+four numbers, such as 0.4.9.17): FAIL technical_details on either defect so repair can normalize it.
 news_value: judge the packet, not only the candidate. First, when prior_story is null,
 compare source dates (never the current date): if the newest dated development in the
 packet (published_at, merge date, newest public comment, or closing) is more than 14
@@ -198,8 +203,13 @@ component or development branch, documentation or specification sections for an
 existing design, user questions, release checklists, third-party tool announcements or
 updates, isolated operator error or relay-flag configuration reports without broader
 network impact, uncorroborated single-vantage observations, and bug reports whose
-security impact and scope are explicitly unestablished; official releases and the
-tor-dev rule above are unchanged.
+security impact and scope are explicitly unestablished. On mailing lists (such as
+tor-relays and network-health), uncorroborated operational attack, compromise, DoS,
+flood, defense-bypass or anomaly claims from authority=community (neither official,
+project-sender nor trusted-operator) fail news_value (verdict skip), whereas substantive
+multi-relay operational findings or measurements from authority=trusted-operator or
+authority=project-sender may pass news_value when newsworthy (keeping confidence
+reported); official releases and the tor-dev rule above are unchanged.
 new_information: compare the packet's concrete event and facts, and the candidate, with
 the supplied existing coverage, not matching product or version keywords. Decide
 duplication only from coverage_background: fail new_information only when a story there
@@ -357,8 +367,10 @@ Evaluate all nine criteria in order before choosing verdict:
 4. uncertainty_attribution: Keep hedges ("suspected", "plausibly", "may", "reported", "I think") and material
    maintainer disagreement or narrowing. Reserve confidence "confirmed" for an official non-tag Tor Project
    announcement or merged gitlab_mr (or when coverage_background.prior_story.confidence is already "confirmed",
-   which must never be downgraded). Community, issue and operator posts are "reported" (use "reports", "says" or
-   "notes", never "confirms"), and overload, flag loss or counters alone do not confirm an attack or compromise.
+   which must never be downgraded). Community, issue, project-sender and trusted-operator
+   (verified large AROI relay-family operator) posts remain confidence "reported", never
+   "confirmed" (use "reports", "says" or "notes", never "confirms"), and overload, flag loss
+   or counters alone do not confirm an attack or compromise.
 5. scope_timing: Retain exact affected products, software versions, platforms, sample bounds, dates and inspection
    dates from the cited source. Never merge adjacent software version numbers into one claim when the observer
    measured only one version, and preserve temporal phrases such as "as with previous versions".
@@ -678,6 +690,9 @@ _HEDGED = re.compile(r"(?:plausib|suspect|possib|potential|alleg|unconfirmed|lik
                      r"\w*\s+(?:\w+\s+){0,2}(?:compromis|hack|breach)")
 _COMPROMISE = re.compile(r"compromis|hack|breach")
 _QUALIFIED = re.compile(r"suspect|report|plausib|possib|potential|alleg|concern|unconfirmed|likely|\b(?:may|might|could)\b")
+_UNTRUSTED_INCIDENT_RE = re.compile(
+    r"\b(?:attack\w*|compromis\w*|deanonymiz\w*|exploit\w*|vulnerabilit\w*|bypass\w*|flood\w*|ddos|dos)\b"
+)
 
 
 def _plain(text: str) -> str:
@@ -724,18 +739,35 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
             passage["text"] for source, source_url in cited_sources for passage in source["passages"]
             if (canonical_url(passage["url"]) if "url" in passage else source_url) in exact_urls))
         lead = _plain(entry["text"])
+        texts = (entry["text"],)
+        untrusted_claim = False
     else:
         proof = all_proof
         claimed = (_claimed_done(candidate["title"], candidate["summary"], candidate["why_it_matters"])
                    if prepared["payload"]["editorial_kind"] == "gitlab_issue" else [])
         lead = _plain(candidate["title"])
+        texts = (candidate["title"], candidate["summary"], candidate["why_it_matters"])
+        community_list = bool(sources) and all(
+            source.get("authority") == "community" and "lists.torproject.org" in str(source.get("url") or "")
+            for source in sources
+        )
+        untrusted_claim = community_list and (
+            candidate["category"] in {"security", "dos"}
+            or bool({"security", "dos"} & set(candidate.get("tags") or ()))
+            or bool(_UNTRUSTED_INCIDENT_RE.search(_plain(candidate["title"] + "\n" + candidate["summary"])))
+        )
     compromise_headline = bool(_HEDGED.search(all_proof) and _COMPROMISE.search(lead) and not _QUALIFIED.search(lead))
     is_alert = candidate.get("origin") == "network-health"
+    products = candidate.get("products", ())
     return [reason for reason, held in (
         ("completed_action", any(not (_stated(proof, word) or _stated(merged, DONE[word])) for word in claimed)),
         ("compromise_headline", compromise_headline),
         ("confirmed_source", not is_alert and candidate["confidence"] not in limits["confidence"]),
-        ("merge_state", not is_alert and limits["state"] == ["merged"] and candidate["state"] != "merged")) if held]
+        ("merge_state", not is_alert and limits["state"] == ["merged"] and candidate["state"] != "merged"),
+        ("shouting_caps", not is_alert and any(has_shouting_caps(text) for text in texts)),
+        ("malformed_version", not is_alert and any(has_malformed_tor_version(text, products) for text in texts)),
+        ("untrusted_operator_claim", not is_alert and untrusted_claim),
+    ) if held]
 
 
 def _skip_stands(criteria: dict, coverage: dict | None, same_story: str | None = None) -> bool:
@@ -754,6 +786,8 @@ def _skip_stands(criteria: dict, coverage: dict | None, same_story: str | None =
 
 
 class Reviewer(CompletionClient):
+    """Stateless final-story and latest-update publication reviewer."""
+
     stage = "review"
 
     def __init__(self, config: dict, deadline: float | None = None):
