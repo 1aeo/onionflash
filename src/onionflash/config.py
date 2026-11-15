@@ -159,6 +159,7 @@ def _expand(value: str) -> str:
         raise ValueError("Configuration value must be a string")
 
     def sub(match: re.Match) -> str:
+        """Resolve a `${NAME}` placeholder from the current process environment."""
         name = match.group(1)
         if name not in os.environ:
             raise ValueError(f"Required environment variable {name} is missing")
@@ -311,7 +312,7 @@ def load_config(path: str | Path) -> dict:
                 raise ValueError("Consensus alert sources require kind = 'feed'")
         if source["kind"] not in {"feed", "tag", "gitlab_issue", "gitlab_mr", "metrics_timeline"}:
             raise ValueError("Unsupported source kind")
-        if source["authority"] not in {"official", "community", "development", "telemetry"}:
+        if source["authority"] not in {"official", "community", "development", "telemetry", "hackerone"}:
             raise ValueError("Unsupported source authority")
         if source["product"] not in PRODUCTS:
             raise ValueError("Unsupported source product")

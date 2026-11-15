@@ -14,9 +14,10 @@ import sqlite3
 from . import candidate, decisions, doctor, editorial, publication
 from .candidate import ReviewRequired
 from .comments import analysis_context
-from .util import after, backoff_seconds, canonical_json, digest, item_cluster, item_identity, saved_object
+from .util import after, backoff_seconds, canonical_json, digest, is_hackerone_item, item_cluster, item_identity, saved_object
 
 TAG_PRIORITY = 5  # queue floor for deterministic tag notices
+HACKERONE_PRIORITY = 35  # queue boost so HackerOne disclosures run ahead of ordinary items
 POLL_TOLERANCE_SECONDS = 5  # absorbs scheduler start jitter after a successful poll
 
 _RETENTION_SCHEMA = """
@@ -192,6 +193,7 @@ def select_retention_candidates(
     size = base_overhead
 
     def scan(kind: str, query: str):
+        """Stream decoded cold item or analysis rows eligible for archival."""
         table, key_col = ("items", "id") if kind == "item" else ("analyses", "cache_key")
         columns = [info[1] for info in db.execute(f"PRAGMA table_info({table})")]
         for rowid, raw_key in db.execute(query, (cutoff,)):
@@ -277,13 +279,15 @@ def source_due(state: dict, observed: str) -> bool:
 
 
 def item_priority(item: dict) -> int:
-    """Score a collected item so security and compromise reports run first."""
+    """Score a collected item so HackerOne, security and compromise reports run first."""
     words = (item["title"] + " " + item["content"][:1500] + " " + " ".join(item.get("labels", []))).lower()
     score = sum(
         weight
         for word, weight in [("compromis", 30), ("security", 15), ("attack", 10), ("denial", 10), ("dirauth", 8), ("released", 5)]
         if word in words
     )
+    if is_hackerone_item(item):
+        score += HACKERONE_PRIORITY
     return max(score, TAG_PRIORITY if item["kind"] == "tag" else 0)
 
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .comments import analysis_context
-from .util import canonical_url, digest, plain_text, saved_object
+from .util import canonical_url, digest, is_hackerone_item, plain_text, saved_object
 
 
 # The review packet's fixed bounds.
@@ -74,6 +74,7 @@ def _load(db, source_id: str | None, url: str, analysis_key: str | None = None):
     # Stable repository-entry IDs can move to a different immutable commit URL.
     # Keep the retained citation tied to its actual bytes, never the newer entry.
     def snapshot(row):
+        """Decode and verify a historical analysis snapshot matching the requested citation."""
         if row is None:
             return None
         item = _decode(row["source_payload"])
@@ -97,6 +98,7 @@ def _load(db, source_id: str | None, url: str, analysis_key: str | None = None):
 
 
 def normalize_labels(value) -> list[str]:
+    """Normalize at most 30 plain-text GitLab labels without stripping angle-bracket text."""
     if not isinstance(value, list):
         return []
     return [text for label in value[:30] if isinstance(label, str) and (text := plain_text(label, 100, html=False))]
@@ -129,6 +131,7 @@ def _shares(needs, floors, budget):
 
 
 def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str | None, *, update: bool = False):
+    """Assemble the bounded numbered source packet and durable bindings for final review."""
     missing, bindings, units, truncated = [], {}, [], False
     loaded_cache: dict[tuple[str | None, str, str | None], tuple | None] = {}
     required_ids = {incoming["id"], writer_id}
@@ -178,6 +181,8 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
                 missing.append(source["url"])
             continue
         unit = {key: item.get(key) for key in ("kind", "authority", "product", "published_at", "updated_at", "upstream_state")}
+        if unit["authority"] == "development" and is_hackerone_item(item):
+            unit["authority"] = "hackerone"
         unit.update(labels=normalize_labels(item.get("labels")), url=canonical_url(item["url"]), title=item["title"], snapshot=snapshot)
         if item.get("closed_at"):
             unit["closed_at"] = item["closed_at"]

@@ -12,7 +12,7 @@ import feedparser
 
 from .transport import FetchError, HttpClient
 from .util import (
-    UTC, after, canonical_url, format_utc, parse_utc, plain_text, timestamp,
+    UTC, after, canonical_url, format_utc, is_hackerone_item, parse_utc, plain_text, timestamp,
 )
 
 
@@ -100,7 +100,7 @@ def make_item(
         # A future date (a typo or a scheduled event) must not pin a story to the
         # top or block later corrections. format_utc strings sort chronologically.
         published, updated = min(published, observed), min(updated, observed)
-    return {
+    item = {
         "source_id": source["id"],
         "url": canonical_url(url),
         "title": plain_text(title, 500, html=title_html),
@@ -113,6 +113,9 @@ def make_item(
         "labels": [plain_text(str(x), 100, html=False) for x in (labels or [])[:30]],
         "upstream_state": upstream_state if upstream_state in {"opened", "closed", "merged"} else "",
     }
+    if item["authority"] == "development" and is_hackerone_item(item):
+        item["authority"] = "hackerone"
+    return item
 
 
 def fetch_cached(client: HttpClient, url: str, state: dict):
@@ -139,9 +142,11 @@ def _scan_feed_xml(body: bytes) -> list[str | None]:
     state = {"elements": 0, "base_chars": 0, "longest": 0, "item_authors": 0, "plain_author": False}
 
     def reject_declaration(*_args):
+        """Refuse DOCTYPE and XML entity declarations in untrusted feeds."""
         raise CollectionError("Feed contains disallowed XML declarations")
 
     def start_element(name, attributes):
+        """Enforce XML element, nesting, and `xml:base` limits while tracking RSS `<author>`."""
         state["elements"] += 1
         stack.append(name)
         for key, value in attributes.items():
@@ -165,10 +170,12 @@ def _scan_feed_xml(body: bytes) -> list[str | None]:
             state["plain_author"] = False
 
     def char_data(data):
+        """Accumulate bounded character data for a single plain RSS `<author>` element."""
         if stack == ["rss", "channel", "item", "author"] and state["item_authors"] == 1 and sum(map(len, author_buf)) < 1000:
             author_buf.append(data[:1000])
 
     def end_element(_name):
+        """Record each RSS `<item>`'s verified plain `<author>` text on element close."""
         if stack == ["rss", "channel", "item"]:
             text = "".join(author_buf).strip()
             rss_authors.append(text if state["item_authors"] == 1 and state["plain_author"] and len(text) < 1000 else None)

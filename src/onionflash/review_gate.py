@@ -19,7 +19,7 @@ import re
 from . import candidate as candidate_mod, decisions, editorial, review
 from .analyze import cache_key
 from .llm import AnalysisError, CompletionDeferred, RequestObserver
-from .util import _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, now_iso, saved_object, thread_subject
+from .util import _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, is_hackerone_item, now_iso, saved_object, thread_subject
 
 REVIEW_STATE_VERSION = 2
 MAX_APPROVALS = 2000  # cached approvals kept besides those unfinished jobs pin
@@ -33,7 +33,7 @@ MAX_VERIFY_REPAIRS = 5
 MAX_REVIEW_REQUESTS = MAX_VERIFY_REPAIRS + 2
 # An item from these sources, other than a version tag, that fails only news value is held for the
 # operator, never skipped.
-OFFICIAL_AUTHORITIES = frozenset({"official", "project-sender"})
+OFFICIAL_AUTHORITIES = frozenset({"official", "project-sender", "hackerone"})
 # Each hold reason and its operator text, which follows "Final review held: " in last_error. A hold
 # is logged as held.<stage>.<reason>, the stage being gate, review, verification or final_check.
 HOLDS = {
@@ -483,7 +483,7 @@ def next_step(reviews, candidate, prepared):
     verdict = result["verdict"]
     failed = {name for name, check in result["criteria"].items() if check["outcome"] != "pass"}
     item = json.loads(prepared["row"]["payload"])
-    official = item.get("authority") in OFFICIAL_AUTHORITIES and item.get("kind") != "tag"
+    official = (item.get("authority") in OFFICIAL_AUTHORITIES or is_hackerone_item(item)) and item.get("kind") != "tag"
     # An official item that fails only news value is the operator's to judge, once a fresh
     # verification has passed its facts; a duplicate still skips.
     disputed = official and failed & review.EDITORIAL_CRITERIA == {"news_value"}
@@ -1101,6 +1101,7 @@ def _try_auto_merge(config, store, pair: tuple[str, str], *, propagate: bool,
     dup_id, survivor_id = pair
 
     def guard(db) -> None:
+        """Re-verify prepared bindings and merge eligibility inside the merge transaction."""
         if propagate:
             candidate_mod.verify_prepared_binding(db, prepared)
         if _auto_merge_pair(store, dup_id, survivor_id) != pair:
@@ -1161,7 +1162,9 @@ def developed_at(item: dict) -> str:
 
 
 def _security_disclosure(item: dict) -> bool:
-    """A high- or critical-severity security issue may become public long after it was filed."""
+    """A HackerOne disclosure or high/critical security issue may become public long after filing."""
+    if is_hackerone_item(item):
+        return True
     if item.get("kind") != "gitlab_issue":
         return False
     labels = {label.strip().casefold() for label in (item.get("labels") or []) if isinstance(label, str)}
@@ -1172,7 +1175,7 @@ def _not_recent(config, store, row, item, observed, *, existing=candidate_mod._U
     """Ignore, before any model call, an item that would start a story from an old development.
 
     An update of an existing story, a locked one included, is left to review, and so is a revision
-    an operator retried or a high- or critical-severity security issue. Like any skip, a new
+    an operator retried, a HackerOne disclosure or a high- or critical-severity security issue. Like any skip, a new
     revision of the item queues it again; an issue whose notes were never verified also gets a
     comment check, so a fresh public note does that.
     """
@@ -1186,6 +1189,7 @@ def _not_recent(config, store, row, item, observed, *, existing=candidate_mod._U
                                 (row["id"], row["content_hash"])).fetchone()):
         return None
     def maybe_check_comments() -> None:
+        """Queue an initial public-comment check before ignoring an unverified GitLab issue."""
         if item.get("kind") == "gitlab_issue" and "comments_source_key" not in item:
             from .comments import request_check
             request_check(store.db, config, row, observed)
@@ -1202,6 +1206,7 @@ def _not_recent(config, store, row, item, observed, *, existing=candidate_mod._U
             except (ValueError, TypeError, KeyError):
                 return "stale"
             if (current_developed >= threshold
+                    or _security_disclosure(current_item)
                     or candidate_mod.existing_story(store.db, current) is not None
                     or store.db.execute("SELECT 1 FROM rejection_actions WHERE item_id=? AND content_hash=? AND action='retry'",
                                         (row["id"], row["content_hash"])).fetchone()):
@@ -1411,6 +1416,7 @@ def _new_coverage(old_coverage, current_coverage) -> list[dict]:
 
 def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
     def refuse(reason: str, editorial_failures=(), new_coverage=()):
+        """Build an ineligible operator-approval check result with structured diagnostics."""
         return {"eligible": False, "reason": reason, "hash": None,
                 "editorial_failures": list(editorial_failures), "new_coverage": list(new_coverage)}, None
 

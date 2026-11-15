@@ -15,7 +15,7 @@ from .llm import (
 from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, STATES, UPDATE_CHARS
 from .util import digest, normalize_evidence as _plain
 
-PROMPT_VERSION = "onionflash-16"
+PROMPT_VERSION = "onionflash-17"
 # Change this when update input filtering changes, independently of prompt prose.
 UPDATE_INPUT_VERSION = 2
 WRITER_REASONING_OPTIONS = {
@@ -37,7 +37,6 @@ def writer_settings(settings: dict) -> dict:
             raise ValueError("llm.writer_reasoning requires llm.send_chat_template_kwargs")
         result.update(WRITER_REASONING_OPTIONS)
     return result
-
 
 MIN_EVIDENCE_CHARS = 8
 MAX_EVIDENCE_CHOICES = 128
@@ -145,9 +144,11 @@ fixes or operator guidance. A count the source states may be restated.
 Convert ALL-CAPS shouted source phrases to normal sentence case while keeping standard
 technical acronyms, and never copy nonexistent three-part C-Tor versions such as 0.4.17
 as valid release numbers (C Tor versions use four numbers, such as 0.4.9.17).
-Metadata fields such as authority (including trusted-operator and project-sender) are
-internal provenance tags, not prose labels: write 'a relay operator' rather than
-'a trusted operator' unless the source text itself uses that phrase.
+Metadata fields such as authority (including hackerone, trusted-operator and
+project-sender) are internal provenance tags, not prose labels: write 'a relay
+operator' rather than 'a trusted operator' unless the source text itself uses that
+phrase, cite HackerOne in prose when the source text itself references HackerOne,
+and always include material maintainer triage comments.
 {causal_check}A developer changing source code is not an operator changing configuration.
 
 {impact}the expected result for most merges, tags, checklists, questions and discussions.

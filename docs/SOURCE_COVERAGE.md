@@ -15,7 +15,7 @@ protocol changes. The additional configured streams are:
 | [Tor Browser Security-labeled public issues](https://gitlab.torproject.org/api/v4/projects/472/issues?labels=Security) | `tor-browser-security`, enabled | Earlier visibility into Browser security work; labels do not establish confirmed vulnerabilities or completed fixes. |
 | [Anti-Censorship team issues](https://gitlab.torproject.org/api/v4/projects/549/issues) | `anti-censorship-team`, enabled | Human investigations of blocking and bridge/transport availability, including unlabeled reports. |
 | [Tor Metrics Timeline repository](https://gitlab.torproject.org/tpo/network-health/metrics/timeline) | `tor-metrics-news`, enabled | Curated event rows from the maintained README; validated repository snapshots replace the stale Atom feed. |
-| [Tor Project Development Mailing List](https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/) | `tor-dev`, enabled | An RFC on `tor-dev` (numbered Tor proposal, `[RFC]` subject, or IETF Internet-Draft or RFC posted for comment) is news from any sender, a formal proposal from a `project-sender` address is news, and other messages need a significant development. |
+| [Tor Project Development Mailing List](https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/) | `tor-dev`, enabled | An RFC on `tor-dev` (numbered Tor proposal, `[RFC]` subject, or IETF Internet-Draft or RFC posted for comment) is news from any sender; a formal `[Proposal]`, technical critique, protocol review, or empirical multi-relay measurement from a `project-sender` or `trusted-operator` address is news (keeping `confidence` `reported`); and other `community` messages need an RFC/numbered proposal or concrete adoption/merge. |
 | [Tor Project Consensus Health Alerts](https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/) | `tor-consensus-health`, enabled (`alert_format = "consensus"`, `publish = false`) | Sustained consensus-health anomalies from DocTor rendered with fixed templates, never sent to the model writer queue. |
 
 On `lists.torproject.org` archives whose RSS items carry HyperKitty's `local＠domain`
@@ -24,7 +24,17 @@ On `lists.torproject.org` archives whose RSS items carry HyperKitty's `local＠d
 large AROI relay-operator domains; subdomains included) is classified `trusted-operator`,
 unless the stream is already `official`; display names, subjects and message bodies never
 count, neither classification establishes `confirmed` confidence, and the address is not
-stored. Browser release announcements were already present in Tor Blog and tor-announce.
+stored. Sources may also declare `authority = "hackerone"`, and `development`-authority
+GitLab issues and merge requests whose own URL, `HackerOne`/`HackerOne::*` label, title,
+or description (excluding `public_comments` and `community` mailing-list posts) references
+`hackerone.com/reports/<id>` or `Reported via HackerOne` are upgraded to `hackerone` during
+collection and source-packet assembly. `hackerone` items receive a `+35` queue priority
+boost ahead of ordinary issues, feeds, and tags, bypass the 14-day pre-model and
+review-packet staleness filters when confidential reports are later disclosed, keep
+`confidence` bounded below `confirmed` unless an official announcement or merged merge
+request confirms a change, and are held for the operator rather than silently skipped if
+review fails only `news_value`. Browser release announcements were already present in Tor
+Blog and tor-announce.
 The Browser issue stream is deliberately filtered; it does not replace those
 announcements or promise comprehensive vulnerability coverage.
 

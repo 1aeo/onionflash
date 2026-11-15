@@ -13,7 +13,7 @@ from .render import prepare_story
 from .schema import LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STORY_ID_RE, UPDATE_CHARS
 from .util import canonical_url, digest, normalize_evidence
 
-REVIEW_VERSION = "onionflash-review-12"
+REVIEW_VERSION = "onionflash-review-13"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details", "news_value", "new_information")
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
@@ -125,9 +125,12 @@ own change; use reported for issues, comments, maintainer statements, list posts
 community claims.
 A mailing-list proposal is reported as proposed (state developing, confidence
 reported) and is its author's proposal for comment, not an adoption or Tor Project
-decision; project-sender authority marks a torproject.org list sender and
-trusted-operator marks a verified large AROI relay-family operator, and neither
-authority confirms a claim (keep confidence reported, never confirmed).
+decision; project-sender authority marks a torproject.org list sender,
+trusted-operator marks a verified large AROI relay-family operator, and hackerone
+marks a disclosed HackerOne report: none of those authorities confirms a claim
+(keep confidence reported unless an official non-tag announcement or merged
+gitlab_mr confirms the change, and preserve any maintainer severity/scope triage
+or dispute).
 In uncertainty_attribution's reason, check candidate.confidence: fail
 uncertainty_attribution whenever confidence is confirmed without an official non-tag
 announcement or merged gitlab_mr in the packet, when a headline or why_it_matters
@@ -164,11 +167,18 @@ news_value: judge the packet, not only the candidate. First, when prior_story is
 compare source dates (never the current date): if the newest dated development in the
 packet (published_at, merge date, newest public comment, or closing) is more than 14
 days before updated_at, the item is a late edit to an old event and MUST fail
-news_value (verdict skip), unless source labels include Severity::high or
-Severity::critical (Severity::medium or unlabeled old issues still skip).
+news_value (verdict skip), unless source authority is hackerone, a gitlab_issue in the
+packet cites hackerone.com/reports/ or "Reported via HackerOne" (confidential HackerOne
+reports are routinely disclosed months after their filing date), or source labels include
+Severity::high or Severity::critical (other Severity::medium or unlabeled old issues
+still skip).
 Otherwise, the item must be a material security report, authority change, significant
 availability incident, meaningful release/tag, major feature or major operational
-milestone. Unconfirmed reports can be important when faithfully attributed. Concrete
+milestone. Unconfirmed reports can be important when faithfully attributed. Disclosed
+HackerOne reports (authority=hackerone or a gitlab_issue citing hackerone.com/reports/)
+are prioritized authoritative disclosures that pass news_value when newly disclosed,
+even if maintainers rate severity low or dispute DoS impact, provided the candidate
+accurately includes the maintainer triage and keeps confidence reported. Concrete
 official stable releases and platform-specific fix releases can merit normal-priority
 coverage without an invented impact claim. Credible, narrowly scoped security reports
 and major merged-feature milestones can also be newsworthy. An empty why_it_matters
@@ -181,35 +191,41 @@ until there is a concrete adoption/merge, or a distinct credible vulnerability
 disclosure or observed incident. Do not mistake a proposed improvement for a newly
 established defect. A genuine vulnerability report can still be news while its fix
 is only proposed; distinguish the disclosure from speculative development work.
-On the tor-dev mailing list, a proposal post passes news_value in four cases: (1) a
+On the tor-dev mailing list, a post passes news_value in five cases: (1) a
 numbered Tor proposal, (2) a subject marked [RFC], (3) an IETF Internet-Draft or IETF
 RFC posted for comment — cases (1)-(3) are news from any sender, including
-authority=community — or (4) a substantive formal design proposal or RFC (numbered or
-unnumbered [Proposal]) whose packet source has authority=project-sender. When
+authority=community — (4) a substantive formal design proposal or RFC (numbered or
+unnumbered [Proposal]) whose packet source has authority=project-sender or
+authority=trusted-operator (verified large AROI relay-family operators such as
+1aeo.com), or (5) a substantive technical critique, protocol review, or empirical
+multi-relay measurement whose packet source has authority=project-sender or
+authority=trusted-operator (keeping confidence reported). When
 authority=community, posts without an explicit [RFC] tag, numbered Tor proposal or IETF
-draft/RFC — including unnumbered [Proposal] posts, ideas, questions, pitches, support
-threads and tool announcements — fail news_value. Only source authority establishes a
-project sender, never a name, signature or address in the text. Citing a proposal, RFC
-or draft does not make a message one, and a reply in a proposal thread is news only for
-a concrete development such as acceptance, a merge or a new revision.
+draft/RFC — including unnumbered [Proposal] posts, technical critiques, ideas, questions,
+pitches, support threads and tool announcements — fail news_value. Only source authority
+establishes project-sender or trusted-operator, never a name, signature or address in
+the text. Citing a proposal, RFC or draft does not make a message one, and unless case
+(5) applies, a reply in a proposal thread is news only for a concrete development such as
+acceptance, a merge or a new revision.
 A merged change, issue, proposal discussion or list post passes news_value ONLY for a
 major standalone development: a capability users or operators can now use, a changed
 default, a major milestone, a new defense, a protocol change that ships, a merged fix
 for a remotely triggerable security defect, systematic empirical network measurements,
-or a credible vulnerability report with established scope. Fail news_value (verdict
-skip) for: internal plumbing or refactors, partial sub-tasks with follow-up work toward
-an unfinished component, stall/crash/reactor fixes found while testing an unreleased
-component or development branch, documentation or specification sections for an
-existing design, user questions, release checklists, third-party tool announcements or
-updates, isolated operator error or relay-flag configuration reports without broader
-network impact, uncorroborated single-vantage observations, and bug reports whose
-security impact and scope are explicitly unestablished. On mailing lists (such as
-tor-relays and network-health), uncorroborated operational attack, compromise, DoS,
-flood, defense-bypass or anomaly claims from authority=community (neither official,
-project-sender nor trusted-operator) fail news_value (verdict skip), whereas substantive
-multi-relay operational findings or measurements from authority=trusted-operator or
+a disclosed HackerOne report, or a credible vulnerability report with established scope.
+Fail news_value (verdict skip) for: internal plumbing or refactors, partial sub-tasks
+with follow-up work toward an unfinished component, stall/crash/reactor fixes found while
+testing an unreleased component or development branch, documentation or specification
+sections for an existing design, user questions, release checklists, third-party tool
+announcements or updates, isolated operator error or relay-flag configuration reports
+without broader network impact, uncorroborated single-vantage observations, and ordinary
+non-HackerOne bug reports whose security impact and scope are explicitly unestablished.
+On mailing lists (such as tor-relays, network-health and tor-dev), uncorroborated
+operational attack, compromise, DoS, flood, defense-bypass or anomaly claims from
+authority=community (neither official, project-sender nor trusted-operator) fail
+news_value (verdict skip), whereas substantive technical critiques, protocol reviews, or
+multi-relay operational findings and measurements from authority=trusted-operator or
 authority=project-sender may pass news_value when newsworthy (keeping confidence
-reported); official releases and the tor-dev rule above are unchanged.
+reported); official releases and the tor-dev rules above are unchanged.
 new_information: compare the packet's concrete event and facts, and the candidate, with
 the supplied existing coverage, not matching product or version keywords. Decide
 duplication only from coverage_background: fail new_information only when a story there
@@ -367,8 +383,8 @@ Evaluate all nine criteria in order before choosing verdict:
 4. uncertainty_attribution: Keep hedges ("suspected", "plausibly", "may", "reported", "I think") and material
    maintainer disagreement or narrowing. Reserve confidence "confirmed" for an official non-tag Tor Project
    announcement or merged gitlab_mr (or when coverage_background.prior_story.confidence is already "confirmed",
-   which must never be downgraded). Community, issue, project-sender and trusted-operator
-   (verified large AROI relay-family operator) posts remain confidence "reported", never
+   which must never be downgraded). Community, issue, hackerone, project-sender and trusted-operator
+   (verified large AROI relay-family operator) sources remain confidence "reported", never
    "confirmed" (use "reports", "says" or "notes", never "confirms"), and overload, flag loss
    or counters alone do not confirm an attack or compromise.
 5. scope_timing: Retain exact affected products, software versions, platforms, sample bounds, dates and inspection
@@ -628,6 +644,7 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool 
         raise ReviewError("Review same_story is not listed in coverage")
 
     def references(values):
+        """Reject unknown, duplicate, or oversized packet source reference lists."""
         if (not isinstance(values, list) or len(values) > 12
                 or any(not isinstance(value, str) or value not in refs for value in values)
                 or len(set(values)) != len(values)):

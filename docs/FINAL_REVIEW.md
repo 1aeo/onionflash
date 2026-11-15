@@ -17,8 +17,13 @@ distribution channel does not make an old event new.
 The application enforces that for new stories before any model request. An item
 that would start a story is ignored, as `skipped.gate.not_recent`, when its newest
 dated development is more than 14 days older than the collection of its current
-revision, unless it is an issue labeled `Security` with high or critical severity.
-That development is the post, creation, merge, tag or timeline event date, a
+revision, unless it is a HackerOne disclosure or an issue labeled `Security` with
+high or critical severity (both exemptions also apply to the reviewer's 14-day
+packet-date check, since confidential HackerOne reports are routinely made public
+months after filing; on `tor-dev`, `trusted-operator` senders share `project-sender`
+eligibility for formal `[Proposal]` posts as well as substantive technical
+critiques, protocol reviews, and empirical multi-relay measurements while keeping
+`confidence` `reported`). That development is the post, creation, merge, tag or timeline event date, a
 verified public comment, or the date an issue was closed; an upstream
 `updated_at`, which an edit, a label or a visibility change also moves, never
 counts. Updates of existing stories, locked ones included, still go to review,
@@ -152,9 +157,10 @@ story; see [merging duplicate stories](EDITORIAL.md#merge-a-duplicate-story).
   coverage intact. A skip needs a failed news-value or new-information
   criterion, and a skip for new information alone must name an active covered
   story (not a `retracted` marker); otherwise the item is held. An item from an
-  official source, other than a version tag, skips only when new information
-  fails; when news value fails while new information passes, it is held for the
-  operator once a fresh verification has passed its facts.
+  official, `project-sender`, or `hackerone` source, other than a version tag,
+  skips only when new information fails; when news value fails while new
+  information passes, it is held for the operator (`held.verification.official_not_news`)
+  once a fresh verification has passed its facts.
 - `hold`: potentially useful material is unsupported, ambiguous or not ready to
   publish. It remains available through the existing operator controls; a hold
   whose facts passed fresh verification and whose reviews disputed only news
