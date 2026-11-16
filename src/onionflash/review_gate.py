@@ -617,17 +617,27 @@ def _impact_repair(audit):
     return origin["result"]["repair"] if audit["kind"] == "review" else origin["repair"]
 
 
+def _impact_input_hash(candidate, prepared, context):
+    return digest([impact_audit.input_identity(candidate, prepared["packet"]), context])
+
+
+def _impact_effective_candidate(audit, candidate, result):
+    proposed = review.apply_repair(candidate, _impact_repair(audit))
+    if result["outcome"] == "supported":
+        proposed["why_it_matters"] = candidate["why_it_matters"]
+    return proposed
+
+
 def _effective_impact_repair(audit, candidate, prepared):
     repair = _impact_repair(audit)
     if (audit["before_hash"] != digest(candidate) or not _impact_clear(candidate, repair, prepared)
-            or digest(review.apply_repair(candidate, repair)) != audit["proposed_hash"]):
+            or digest(review.apply_repair(candidate, repair)) != audit["proposed_hash"]
+            or audit["input_hash"] != _impact_input_hash(candidate, prepared, audit["context"])):
         raise review.ReviewError("Impact audit target changed")
     if audit["status"] != "complete" or audit["result"]["outcome"] == "insufficient":
         return None
-    effective = copy.deepcopy(repair)
-    if audit["result"]["outcome"] == "supported":
-        effective.pop("why_it_matters")
-    expected = review.apply_repair(candidate, effective) if effective else candidate
+    expected = _impact_effective_candidate(audit, candidate, audit["result"])
+    effective = {key: copy.deepcopy(expected[key]) for key in review.EDITABLE if expected[key] != candidate[key]}
     if audit["effective_hash"] != digest(expected):
         raise review.ReviewError("Impact audit effective candidate changed")
     return effective
@@ -694,10 +704,7 @@ def _run_impact(audit, reviewer, stage, candidate, prepared, record, requests):
             except AnalysisError as error:
                 audit.update(status="failed", error={"type": type(error).__name__, "code": error.code})
             else:
-                repair = copy.deepcopy(_impact_repair(audit))
-                if result["outcome"] == "supported":
-                    repair.pop("why_it_matters")
-                effective = review.apply_repair(candidate, repair) if repair else candidate
+                effective = _impact_effective_candidate(audit, candidate, result)
                 audit.update(status="complete", result=result,
                              effective_hash=None if result["outcome"] == "insufficient" else digest(effective))
             requests.persist()
@@ -708,8 +715,9 @@ def _start_impact(kind, origin, reviewer, stage, candidate, proposed, prepared, 
     audit = {"kind": kind, "origin": copy.deepcopy(origin), "context": _context(prepared, record["policy_hash"]),
              "before_hash": digest(candidate), "proposed_hash": digest(proposed), "effective_hash": None,
              "status": "pending", "request": None, "result": None, "error": None}
+    audit["input_hash"] = _impact_input_hash(candidate, prepared, audit["context"])
     if any(a["status"] != "discarded_context" and a["context"] == audit["context"]
-           and a["before_hash"] == audit["before_hash"] and a["proposed_hash"] == audit["proposed_hash"]
+           and a["input_hash"] == audit["input_hash"]
            for a in record["impact_audits"]):
         audit.update(status="failed", error={"type": "RepeatedImpactAudit", "code": "review.impact_audit"})
     record["impact_audits"].append(audit)
@@ -722,9 +730,9 @@ def _validate_impact_audits(record, candidate, prepared, stage):
     if not isinstance(audits, list) or len(audits) > MAX_REVIEW_REQUESTS:
         raise ValueError()
     fields = {"kind", "origin", "context", "before_hash", "proposed_hash", "effective_hash",
-              "status", "request", "result", "error"}
+              "status", "request", "result", "error", "input_hash"}
     statuses = {"pending", "sent", "complete", "failed", "discarded_context"}
-    origins, requests, pending = set(), set(), []
+    origins, requests, pending, inputs = set(), set(), [], set()
     events = record["reviews"] + record["untrusted_proposals"]
     event_requests = {e.get("request") for e in events}
     bound = record["request_budget"]["reserved"]
@@ -736,6 +744,7 @@ def _validate_impact_audits(record, candidate, prepared, stage):
                 or set(audit["context"]) != {"source_hash", "coverage_hash", "binding_hash", "policy_hash"}
                 or not all(hashed(v) for v in audit["context"].values())
                 or not hashed(audit["before_hash"]) or not hashed(audit["proposed_hash"])
+                or not hashed(audit["input_hash"])
                 or (audit["effective_hash"] is not None and not hashed(audit["effective_hash"]))):
             raise ValueError()
         origin, number = audit["origin"], audit["request"]
@@ -752,6 +761,10 @@ def _validate_impact_audits(record, candidate, prepared, stage):
             continue
         if prepared is None or audit["context"] != _context(prepared, record["policy_hash"]):
             raise ValueError()
+        if audit["input_hash"] in inputs and (audit["status"] != "failed" or number is not None
+                or audit["error"] != {"type": "RepeatedImpactAudit", "code": "review.impact_audit"}):
+            raise ValueError()
+        inputs.add(audit["input_hash"])
         if audit["kind"] == "review":
             if ({k: origin.get(k) for k in audit["context"]} != audit["context"]
                     or origin.get("candidate_hash") != audit["before_hash"]

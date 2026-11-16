@@ -3,6 +3,7 @@
 import copy
 
 from .llm import AnalysisError, validate_text
+from .util import digest
 
 
 PROMPT = """Assess the original_impact sentence against the complete source packet.
@@ -35,7 +36,8 @@ SCHEMA = {
     },
     "required": ["outcome", "reason", "source_refs"],
 }
-POLICY = {"prompt": PROMPT, "schema": SCHEMA, "validation": "impact-audit-v1",
+POLICY = {"prompt": PROMPT, "schema": SCHEMA, "validation": "impact-audit-v2",
+          "input_identity": "original-impact-proposed-empty-complete-packet",
           "supported_requires_refs": True, "unique_refs": True, "utf8_text": True, "impact_max_length": 800}
 
 
@@ -88,16 +90,25 @@ def validate(result, packet):
     return {"outcome": result["outcome"], "reason": result["reason"], "source_refs": list(supplied)}
 
 
-def audit(reviewer, candidate_before, packet, *, on_request):
-    """Use the configured completion client once; the caller owns request accounting."""
+def _payload(candidate_before, packet):
     impact = candidate_before.get("why_it_matters") if isinstance(candidate_before, dict) else None
     _text(impact, 800, "Impact audit requires a nonempty sentence")
+    return {"original_impact": impact, "proposed_impact": "", "packet": copy.deepcopy(packet)}
+
+
+def input_identity(candidate_before, packet):
+    """Identify exactly the source-only input, independent of unrelated story edits."""
+    return digest(_payload(candidate_before, packet))
+
+
+def audit(reviewer, candidate_before, packet, *, on_request):
+    """Use the configured completion client once; the caller owns request accounting."""
+    payload = _payload(candidate_before, packet)
     refs = _packet_refs(packet)
     schema = copy.deepcopy(SCHEMA)
     if refs:
         schema["properties"]["source_refs"]["items"]["enum"] = sorted(refs)
     else:
         schema["properties"]["source_refs"]["maxItems"] = 0
-    payload = {"original_impact": impact, "proposed_impact": "", "packet": copy.deepcopy(packet)}
     result = reviewer.complete(PROMPT, payload, schema, "onionflash_impact_audit", on_request=on_request)
     return validate(result, packet)

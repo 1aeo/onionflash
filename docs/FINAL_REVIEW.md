@@ -252,6 +252,12 @@ An unsent reservation can be refunded. Interrupted dispatched audits hold, while
 durably completed audit resumes at verification. Context changes discard audit
 authority without replenishing the applicable request budget. Skips and edits that
 do not clear the impact field do not invoke this audit.
+The audit identity binds its actual impact sentence and packet together with the
+source, coverage, binding and review policy. Unrelated title, summary or label edits
+cannot obtain another judgment of that input. A repeated deletion proposal holds
+instead of resampling, which can withhold an otherwise publishable candidate when
+the reviewer repeatedly proposes the same deletion. Effective edits are normalized
+after a veto; unchanged fields do not prevent verification of the retained text.
 
 If that invalid reply has no usable edit, the ledger permits one logical
 validation-correction request. It reviews the same candidate, packet, scope and

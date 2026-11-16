@@ -296,7 +296,7 @@ def test_no_deletion_does_not_add_an_audit_or_force_factual_repairs(context, dec
     assert saved_audit(store)["impact_audits"] == []
 
 
-@pytest.mark.parametrize("damage", [None, "missing-list", "source-ref", "context", "effective-hash", "missing-result"])
+@pytest.mark.parametrize("damage", [None, "missing-list", "source-ref", "context", "input-hash", "effective-hash", "missing-result"])
 def test_completed_audit_receipt_cannot_be_forged_or_bypassed_by_cached_approval(context, monkeypatch, damage):
     cfg, store = context
     row = pending(store)
@@ -314,6 +314,8 @@ def test_completed_audit_receipt_cannot_be_forged_or_bypassed_by_cached_approval
         saved["impact_audits"][0]["result"]["source_refs"] = ["S9:P9"]
     elif damage == "context":
         saved["impact_audits"][0]["context"]["source_hash"] = "0" * 64
+    elif damage == "input-hash":
+        saved["impact_audits"][0]["input_hash"] = "0" * 64
     elif damage == "effective-hash":
         saved["impact_audits"][0]["effective_hash"] = "0" * 64
     elif damage == "missing-result":
@@ -519,3 +521,44 @@ def test_revise_without_impact_clear_keeps_original_two_request_path(context):
     assert checker.calls == 2 and schemas(checker) == ["onionflash_review"] * 2
     assert saved_audit(store)["impact_audits"] == []
     assert store.stories()[0]["why_it_matters"] == IMPACT
+
+
+@pytest.mark.parametrize("first_kind", ["review", "proposal"])
+@pytest.mark.parametrize("second_kind", ["review", "proposal"])
+def test_unrelated_repairs_cannot_resample_the_same_impact_input(context, first_kind, second_kind):
+    cfg, store = context
+    first = proposed(first_kind, title="The report describes a narrower issue")
+    second = proposed(second_kind, summary="The supplied source describes the same issue more precisely.")
+    checker = reviewer(cfg, first, assessed("supported"), second, assessed("unsupported"), verdict())
+    result = run(cfg, store, pending(store), writer(), checker)
+    assert result["status"] == "held" and checker.calls == 3 and not store.stories()
+    assert schemas(checker) == ["onionflash_review", "onionflash_impact_audit", "onionflash_review"]
+    first_audit, blocked = record(store)["impact_audits"]
+    assert first_audit["before_hash"] != blocked["before_hash"]
+    assert first_audit["proposed_hash"] != blocked["proposed_hash"]
+    assert first_audit["input_hash"] == blocked["input_hash"]
+    assert first_audit["result"]["outcome"] == "supported"
+    assert blocked["status"] == "failed" and blocked["request"] is None
+    assert blocked["error"]["type"] == "RepeatedImpactAudit"
+    assert record(store)["request_budget"]["reserved"] == 3
+    assert record(store)["candidate"]["why_it_matters"] == IMPACT
+
+
+@pytest.mark.parametrize("kind", ["review", "proposal"])
+@pytest.mark.parametrize("field", ["title", "summary", "products", "confidence", "normalized-summary"])
+def test_supported_veto_removes_unchanged_effective_fields_before_verification(context, kind, field):
+    cfg, store = context
+    original = analysis(why_it_matters=IMPACT)
+    key = "summary" if field == "normalized-summary" else field
+    value = original[key]
+    if field == "normalized-summary":
+        value = value.replace(" ", "  ")
+    checker = reviewer(cfg, proposed(kind, **{key: value}), assessed("supported"), verdict())
+    result = run(cfg, store, pending(store), writer(), checker)
+    assert result["status"] == "published" and checker.calls == 3
+    bodies = payloads(checker)
+    assert bodies[2]["candidate"] == bodies[0]["candidate"]
+    assert store.stories()[0]["why_it_matters"] == IMPACT
+    audit = saved_audit(store)["impact_audits"][0]
+    assert audit["status"] == "complete" and audit["before_hash"] == audit["effective_hash"]
+    assert saved_audit(store)["reviews"][-1]["stage"] == "verification"
