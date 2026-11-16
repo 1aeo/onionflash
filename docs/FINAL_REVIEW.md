@@ -340,7 +340,7 @@ an older policy can justify a fresh budget; older verdict schemas remain readabl
 
 ## Final checks
 
-A verified approval publishes only if seven fixed checks also pass. They read the
+A verified approval publishes only if eight fixed checks also pass. They read the
 exact candidate, its source packet and the kind of source that wrote its text,
 make no model call, and run again when a saved approval is resumed. A failed
 check holds the item for the operator with its own [decision code](DECISIONS.md);
@@ -369,6 +369,11 @@ skips are not checked.
   vulnerability claim (`untrusted_operator_claim`); eligible `tor-dev` `[RFC]`,
   numbered Tor proposal, and IETF Internet-Draft or IETF RFC specifications that
   propose defenses without asserting a live operational incident are allowed.
+
+- An explicit named reporting clause (`named_attribution`) needs its literal name
+  in the scoped packet text, author metadata or exact sender domain. Suspected
+  names are rebuilt from observed, applied edits in saved review history, so a
+  case, grammar, quotation or field change cannot hide a previously absent name.
 
 The writer's request and every review's repair offer only the confidence,
 state and category labels that these checks allow (and `tagged` only when a
