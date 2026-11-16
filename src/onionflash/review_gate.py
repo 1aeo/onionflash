@@ -104,6 +104,8 @@ def _record_input_hash(record: object) -> str | None:
 
 def initial_review_state():
     """Only newly created chains initialize these fields; saved chains require them."""
+    # Keep the real version-two ledger shape: this legacy-named index covers all
+    # rejected-response events; each event's fixed error distinguishes its type.
     return {"request_budget": {"reserved": 0, "inconsistent_requests": [], "validation_reask": None},
             "untrusted_proposals": []}
 
@@ -738,7 +740,7 @@ def _pending_reask(record, stage, candidate, prepared):
         return False
     correction = record["request_budget"]["validation_reask"]
     if correction is None or correction["trigger"] != latest["request"]:
-        raise review.InconsistentReview()
+        raise review.validation_failure(latest["error"])
     if (latest["stage"] != stage or latest["mode"] != prepared.get("mode", "story")
             or latest["candidate_before_hash"] != digest(candidate)
             or latest["context"] != _context(prepared, record["policy_hash"])):
@@ -747,7 +749,7 @@ def _pending_reask(record, stage, candidate, prepared):
         raise review.ReviewError("Validation correction did not yield a usable review")
     if correction["attempts"] and not correction["transport_failed"]:
         raise review.ReviewError("Interrupted validation correction cannot be repeated")
-    return True
+    return latest["error"]
 
 
 def validate_review_state(record, stage, candidate, prepared, *, allow_cached=True):
@@ -777,7 +779,7 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                                    update=prepared.get("mode") == "update", coverage=prepared.get("coverage"))
         for proposal in proposals:
             if (not isinstance(proposal, dict) or set(proposal) != fields
-                    or proposal["error"] != review.INCONSISTENT_VERDICT
+                    or proposal["error"] not in review.VALIDATION_ERRORS
                     or type(proposal["request"]) is not int or not 1 <= proposal["request"] <= budget["reserved"]
                     or proposal["stage"] not in {"review", "verify", "repair"}
                     or proposal["mode"] not in {"story", "update"}
@@ -793,6 +795,10 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                     or set(proposal["changed_fields"]) - set(candidate_mod.UPDATE_FIELDS if proposal["mode"] == "update" else review.EDITABLE)):
                 raise ValueError()
             accepted = proposal["accepted"]
+            if proposal["error"] == review.DEGENERATE_REASONS and (
+                    accepted or proposal["repair"] is not None or proposal["candidate_after_hash"] is not None
+                    or proposal["changed_fields"] or proposal["disposition"] not in {"unusable", "discarded_context"}):
+                raise ValueError()
             if (proposal["repair"] is not None and not isinstance(proposal["repair"], dict)):
                 raise ValueError()
             if proposal["repair"] is not None:
@@ -961,8 +967,12 @@ def recovery_status(record):
     terminal = record.get("outcome") in {"approved", "skipped", "held", "locked", "routed"}
     unresolved = bool(proposals) and (proposal_needs_check(record) or not terminal
         or record.get("hold_code") in {"unusable_repair", "repeated_repair", "repairs_exhausted", "release_labels"})
-    return {"raw_inconsistency_count": len(proposals), "accepted_proposal_count": sum(p["accepted"] for p in proposals),
-            "unresolved_inconsistency": unresolved}
+    inconsistent = sum(p["error"] == review.INCONSISTENT_VERDICT for p in proposals)
+    degenerate = sum(p["error"] == review.DEGENERATE_REASONS for p in proposals)
+    return {"raw_inconsistency_count": inconsistent, "raw_degenerate_count": degenerate,
+            "accepted_proposal_count": sum(p["accepted"] for p in proposals),
+            "unresolved_inconsistency": bool(inconsistent and unresolved),
+            "unresolved_degenerate": bool(degenerate and unresolved)}
 
 
 def call_review(reviewer, stage, candidate, prepared, *, requests, correction=False) -> dict:
@@ -970,7 +980,7 @@ def call_review(reviewer, stage, candidate, prepared, *, requests, correction=Fa
     result = reviewer.review(candidate, prepared["packet"], coverage=prepared["coverage"], verification=stage == "verify",
                              issue=review.RELEASE_ISSUE if stage == "repair" else None,
                              on_request=requests.callback(correction=correction),
-                             **({"validation_error": review.INCONSISTENT_VERDICT} if correction else {}),
+                             **({"validation_error": correction} if correction else {}),
                              **({"update": True} if prepared.get("mode") == "update" else {}))
     if correction and requests.state["validation_reask"]["response"] != requests.state["reserved"]:
         raise AnalysisError("Validation response was not observed", code="app.damaged_job")
@@ -993,20 +1003,22 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
     before = requests.actual
     try:
         entry = call_review(reviewer, stage, candidate, prepared, requests=requests, correction=correction)
-    except review.InconsistentReview as error:
+    except review.CorrectableReviewError as error:
         if requests.actual == before:
             raise
         if correction and requests.state["validation_reask"]["response"] != requests.state["reserved"]:
             raise AnalysisError("Validation response was not observed", code="app.damaged_job")
-        event = {"error": review.INCONSISTENT_VERDICT, "request": requests.state["reserved"], "stage": stage,
+        event = {"error": error.validation_error, "request": requests.state["reserved"], "stage": stage,
                  "mode": prepared.get("mode", "story"),
                  "candidate_before_hash": digest(candidate), "candidate_after_hash": None,
                  "context": _context(prepared, record["policy_hash"]), "changed_fields": [],
                  "repair": None, "accepted": False, "disposition": "unusable",
-                 "reask_trigger": False, "reask_response": correction}
+                 "reask_trigger": False, "reask_response": bool(correction)}
         requests.state["inconsistent_requests"].append(event["request"])
         record.setdefault("untrusted_proposals", []).append(event)
         try:
+            if isinstance(error, review.DegenerateReview):
+                raise error
             if _literal_tag(prepared):
                 event["disposition"] = "literal_tag"
                 raise review.ReviewError("Literal tags cannot use untrusted edits")

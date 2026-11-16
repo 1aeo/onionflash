@@ -31,7 +31,7 @@ CODES = frozenset({
     )),
     *(f"failed.writer.{reason}" for reason in ("invalid_output", "evidence_too_short", "evidence_not_exact",
                                                "no_literal_evidence", "invalid_input", "truncated", "invalid_json")),
-    *(f"failed.review.{reason}" for reason in ("invalid_reply", "invalid_input", "truncated", "invalid_json", "request_limit")),
+    *(f"failed.review.{reason}" for reason in ("invalid_reply", "invalid_input", "truncated", "invalid_json", "request_limit", "degenerate_reasons")),
     "failed.app.invalid_tag_name", "failed.app.unexpected", "failed.app.damaged_item", "failed.app.damaged_job",
     "failed.app.source_proof_unavailable",
     "merged.auto.same_event",

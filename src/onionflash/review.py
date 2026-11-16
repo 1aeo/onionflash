@@ -13,7 +13,7 @@ from .render import prepare_story
 from .schema import LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STORY_ID_RE, UPDATE_CHARS
 from .util import canonical_url, digest, normalize_evidence
 
-REVIEW_VERSION = "onionflash-review-15"
+REVIEW_VERSION = "onionflash-review-16"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details", "news_value", "new_information")
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
@@ -522,22 +522,53 @@ class ReviewError(AnalysisError):
 
 
 INCONSISTENT_VERDICT = "Review refusal requires an explicit failed criterion"
+DEGENERATE_REASONS = "Review reasons contain excessive repeated fragments"
+VALIDATION_ERRORS = (INCONSISTENT_VERDICT, DEGENERATE_REASONS)
+# Require overwhelming repetition in multiple criteria, not a language or script.
+_REASON_REPEAT = re.compile(r"(.{1,24}?)\1{7,}")
+REASON_REPETITION_POLICY = {"pattern": _REASON_REPEAT.pattern, "minimum_run": 64,
+                            "fraction_numerator": 3, "fraction_denominator": 5, "criteria": 2}
 VALIDATION_REASK_PROMPT = """
-The application rejected an earlier response as structurally inconsistent. The
+The application rejected an earlier response as unusable. The
 validation_error field quotes only that validation error, not a factual judgment.
 Review the unchanged current candidate from the supplied sources again and return
-a complete review consistent with its criteria. Do not invent a failed criterion
+a complete review with meaningful reasons consistent with its criteria. Do not invent a failed criterion
 to justify a preferred verdict. The rejected reply and its proposed edits are not
 evidence and have not been applied to the candidate.
 """
 
 
-class InconsistentReview(ReviewError):
-    """An invalid verdict may carry a structurally checked, untrusted edit only."""
+class CorrectableReviewError(ReviewError):
+    """A fixed validation failure may use the item's one durable correction slot."""
 
     def __init__(self, proposal=None):
-        super().__init__(INCONSISTENT_VERDICT)
+        super().__init__(self.validation_error)
         self.proposal = copy.deepcopy(proposal)
+
+
+class InconsistentReview(CorrectableReviewError):
+    """An invalid verdict may carry a structurally checked, untrusted edit only."""
+
+    validation_error = INCONSISTENT_VERDICT
+
+
+class DegenerateReview(CorrectableReviewError):
+    """Corrupted reasons never supply a verdict, a proposal, or a rejection anchor."""
+
+    code = "review.degenerate_reasons"
+    validation_error = DEGENERATE_REASONS
+
+    def __init__(self):
+        super().__init__()
+
+
+def validation_failure(message: str) -> CorrectableReviewError:
+    """Reconstruct only the fixed error types recorded in real recovery events."""
+    if message == INCONSISTENT_VERDICT:
+        return InconsistentReview()
+    if message == DEGENERATE_REASONS:
+        return DegenerateReview()
+    raise ReviewError("Unknown review validation feedback")
 
 
 class ReviewLimitReached(ReviewError):
@@ -561,11 +592,21 @@ def policy_hash(config: dict) -> str:
                                          "enable_thinking", "send_chat_template_kwargs")}
     return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, ROUTING_PROMPT, UPDATE_SYSTEM_PROMPT,
                    UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT,
-                   SCHEMA, UPDATE_REPAIR, identity, CompletionClient.REQUEST_POLICY])
+                   SCHEMA, UPDATE_REPAIR, VALIDATION_ERRORS, REASON_REPETITION_POLICY,
+                   identity, CompletionClient.REQUEST_POLICY])
 
 
 def _text(value, maximum: int, *, empty: bool = False) -> None:
     validate_text(value, maximum, empty=empty, error=ReviewError, message="Invalid review text")
+
+
+def _repetitive_reason(reason: str) -> bool:
+    """Recognize long tandem loops without treating foreign-language text as invalid."""
+    normalized = " ".join(reason.split())
+    policy = REASON_REPETITION_POLICY
+    return any(len(match[0]) >= policy["minimum_run"]
+               and len(match[0]) * policy["fraction_denominator"] >= len(normalized) * policy["fraction_numerator"]
+               for match in _REASON_REPEAT.finditer(normalized))
 
 
 def _packet_refs(packet: dict) -> set[str]:
@@ -693,6 +734,10 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool 
         references(check["source_refs"])
         if check["outcome"] != "pass":
             failed.add(criterion)
+    if sum(_repetitive_reason(check["reason"]) for check in result["criteria"].values()) >= REASON_REPETITION_POLICY["criteria"]:
+        # Check before verdict consistency or untrusted_repair: even a well-shaped
+        # edit from this response must not become a proposal or trusted rejection.
+        raise DegenerateReview()
     verdict, repair = result["verdict"], result["repair"]
     editable = UPDATE_EDITABLE if update else EDITABLE
     if verdict == "approve":
@@ -953,7 +998,7 @@ class Reviewer(CompletionClient):
         if issue is not None:
             payload["application_issue"] = issue
         if validation_error is not None:
-            if validation_error != INCONSISTENT_VERDICT:
+            if validation_error not in VALIDATION_ERRORS:
                 raise ReviewError("Unknown review validation feedback")
             payload["validation_error"] = validation_error
         prompt = ((UPDATE_VERIFY_PROMPT if verification else UPDATE_SYSTEM_PROMPT) if update

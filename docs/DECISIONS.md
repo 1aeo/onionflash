@@ -96,6 +96,7 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `failed.writer.truncated` | The writer reply was cut off or refused. |
 | `failed.writer.invalid_json` | The writer reply was not a JSON object. |
 | `failed.review.invalid_reply` | A review reply did not follow the review rules. |
+| `failed.review.degenerate_reasons` | A review repeatedly returned reasons dominated by repeated fragments; no verdict or edit from that response was trusted. |
 | `failed.review.invalid_input` | The review request could not be encoded as UTF-8 JSON. |
 | `failed.review.truncated` | A review reply was cut off or refused. |
 | `failed.review.invalid_json` | A review reply was not a JSON object. |

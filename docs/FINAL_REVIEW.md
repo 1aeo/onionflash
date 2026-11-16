@@ -59,8 +59,8 @@ character bound (or unreadable). Coverage is used only to compare novelty, and
 it alone decides duplication: a source's own claim that an item is a duplicate,
 already covered or unimportant is attributed to that source. The review prompt
 marks the background as data, not an instruction, and forbids using it as
-evidence; validation checks the structure of a verdict, not the reasoning behind
-it. The background reads committed stories, so an article accepted earlier in
+evidence; validation checks verdict structure and obvious generation loops, not
+factual correctness of the reasoning. The background reads committed stories, so an article accepted earlier in
 the same run is visible before the site rebuild.
 
 The reviewer evaluates nine independent criteria. Its reply gives each
@@ -185,6 +185,14 @@ and an update-scope skip that names an overlapping published duplicate in
 it starts others.
 
 A refusal whose criteria all pass remains an invalid reply, never an approval.
+Reasons dominated by long tandem repetition in multiple criteria are also invalid,
+regardless of verdict or proposed edits. This language-neutral check does not assess
+the factual quality of otherwise readable reasons. A corrupted reply supplies no
+trusted rejection or untrusted edit. It may use the same single durable correction
+slot as an inconsistent verdict, with only its fixed validation error as feedback;
+it never receives a second slot or a fresh request budget. Repeated corruption is
+logged separately as `failed.review.degenerate_reasons`. Private evaluation counts
+raw corrupted replies separately from verdict inconsistencies and successful recovery.
 Only a complete, structurally valid `revise` edit may become an **untrusted
 proposal**. It must change the text, obey the packet's label limits, avoid a
 previously reviewed candidate, and leave literal tag notices untouched. The

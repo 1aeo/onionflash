@@ -346,6 +346,8 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                 record["review_request_count"] = requests.actual
                 record.update(recovery_status(record))
                 totals["raw_inconsistencies"] = totals.get("raw_inconsistencies", 0) + record["raw_inconsistency_count"]
+                totals["raw_degenerate_reviews"] = totals.get("raw_degenerate_reviews", 0) + record["raw_degenerate_count"]
+                totals["unresolved_degenerate_reviews"] = totals.get("unresolved_degenerate_reviews", 0) + int(record["unresolved_degenerate"])
                 totals["unresolved_inconsistencies"] = totals.get("unresolved_inconsistencies", 0) + int(record["unresolved_inconsistency"])
                 record["seconds"] = round(time.monotonic() - started, 2)
                 encoded = json.dumps(record, ensure_ascii=False, allow_nan=False)

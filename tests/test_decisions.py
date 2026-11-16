@@ -215,9 +215,10 @@ def run_with(monkeypatch, cfg, store, error=None):
     class Replies:
         calls = 0
 
-        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, on_request=None):
+        def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, validation_error=None, on_request=None):
             if on_request is not None:
                 on_request(1)
+                on_request.response_received()
             url = packet["sources"][0]["url"]
             if url.endswith("/fail"):
                 raise error
@@ -236,11 +237,12 @@ def run_with(monkeypatch, cfg, store, error=None):
 @pytest.mark.parametrize("error,code", [
     (AnalysisError("Model evidence quote 1 is not an exact excerpt", code="writer.evidence_not_exact"), "failed.writer.evidence_not_exact"),
     (review.ReviewError("Review response fields do not match schema"), "failed.review.invalid_reply"),
+    (review.DegenerateReview(), "failed.review.degenerate_reasons"),
     (AnalysisError("Saved draft source proof is unavailable", code="app.source_proof_unavailable"),
      "failed.app.source_proof_unavailable"),
     (RuntimeError("boom"), "failed.app.unexpected"),
     (AnalysisError("LLM request failed", retryable=True), None),
-], ids=["writer", "review", "source-proof", "unexpected", "retryable"])
+], ids=["writer", "review", "degenerate-review", "source-proof", "unexpected", "retryable"])
 def test_only_the_third_terminal_failure_is_logged(context, monkeypatch, error, code):
     cfg, store = context
     cfg["sources"] = []
