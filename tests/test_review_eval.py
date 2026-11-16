@@ -563,6 +563,11 @@ def test_expected_same_story_scores_matched_missed_wrong_unroutable_and_false_ro
     recs_ok = {r["case"]: r for r in map(json.loads, out_ok.read_text().splitlines()[:-1])}
     assert recs_ok[pos["id"]]["same_story"] == target_id and recs_ok[neg["id"]]["same_story"] is None
 
+    repost = by_id["same-story-official-release-only-repeat"]
+    monkeypatch.setattr(module, "EvaluationReviewer", routed_reviewer(lambda *_: ("skip", repost["expected_same_story"])))
+    routed = module.evaluate(config, [repost], tmp_path / "release-repost.jsonl")
+    assert (routed["matched_routes"], routed["matched"], routed["controlled_mismatches"]) == (1, 1, 0)
+
     for fn, exp_key in ((lambda *_: ("skip", None), "missed_routes"), (lambda *_: ("skip", other_id), "wrong_routes")):
         monkeypatch.setattr(module, "EvaluationReviewer", routed_reviewer(fn))
         res = module.evaluate(config, [pos], tmp_path / f"{exp_key}.jsonl")
