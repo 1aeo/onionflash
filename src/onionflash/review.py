@@ -125,6 +125,12 @@ source_support when any field generalizes one sample, treats template checkboxes
 confidential patches shipped, infers developer work, maintainer rulings or fix
 effectiveness beyond the text, omits a material packet disclosure, or labels a bugfix
 release security without a vulnerability.
+For a NEW official announcement whose release is already in recent coverage but whose
+incident-response work is new, a release-led headline buries the selected new event EVEN
+WHEN the summary mentions the response plans. Fail source_support for that material
+framing defect and repair the title, summary and labels to lead with the response work,
+keeping planned defenses developing and tentative. This is a required news-focus repair,
+not an optional stylistic rewrite; keep the shipped version only as supported context.
 actor_and_action: preserve who does what. A developer changing compiled source is not a
 relay operator changing configuration. Preserve requested versus actual action;
 why_it_matters keeps the role terms and audience of the source sentence it restates.
@@ -237,6 +243,8 @@ facts or response plans in a later official announcement. Compare the actual fac
 newly announced evaluation of further defenses or expected response releases can be
 material even when the version and ongoing attack are already known. Keep expectations
 attributed and tentative; skip them only when the supplied coverage already states them.
+For such an announcement, name the response work and whether it was already covered in
+new_information's reason before deciding on routing; do not consider only the version or upgrade advice.
 Compare lifecycle states explicitly (a later merge completes an earlier request):
 - When prior_story is present, this candidate UPDATES that same article. Pass meaningful
   fixes, resolutions, merges, releases, or material maintainer corrections/narrowings/
@@ -280,8 +288,9 @@ SAME-STORY ROUTING (coverage_background.recent is present):
   adding material incident-response news (such as newly announced evaluation of further defenses or expected
   response releases) gets a NEW article
   with same_story null even if recent coverage already describes the release and ongoing attack. A matching
-  version or incident does not absorb this distinct announcement. If the draft merely repeats the covered release,
-  revise its headline and summary to lead with the new response development, or hold; never route or skip away
+  version or incident does not absorb this distinct announcement. Apply the source_support news-focus rule
+  even when a release-led draft already includes the new plans in its summary: revise its headline and summary
+  to lead with the new response development, or hold; never route or skip away
   the omitted news. Classify that distinct response event as developing, without release labels for defenses
   still being evaluated. Keep plans attributed and tentative. This exception does not apply when that response news
   itself is already covered: route a repeat to the story covering those facts, or skip if no route is appropriate.

@@ -132,6 +132,15 @@ Preserve substantive incident facts, affected scope and announced response work,
 including evaluation of additional defenses and expectations of further releases.
 Attribute plans and expectations to the announcement; do not present them as shipped
 mitigations, a promised release date, proven effectiveness or a resolved attack.
+When an official announcement describes an ONGOING denial-of-service attack and active work on
+ADDITIONAL defenses or anticipated response releases, make that response work the
+headline and the opening of the summary, even if the source title only names a
+software release. Describe the shipped version and fixes afterwards as context.
+This draft reports the ongoing response: use category=dos and state=developing,
+without release labels for defenses still being evaluated. Keep plans tentative.
+For example, lead with the project's evaluation of further defenses, not another
+headline saying the already-existing version was released. This selects the source's
+substantive focus; the reviewer still decides novelty from existing coverage.
 When merge metadata says merged, describe the completed change rather than another
 proposal. Pre-merge scheduling comments describe earlier plans, not current status.
 A fix present only in a proposed patch series does not establish a merged or

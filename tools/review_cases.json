@@ -5742,7 +5742,19 @@
       },
       "required": [
         "additional defenses"
-      ]
+      ],
+      "forbidden_classifications": {
+        "state": [
+          "released",
+          "tagged"
+        ],
+        "category": [
+          "release"
+        ],
+        "tags": [
+          "release"
+        ]
+      }
     },
     {
       "id": "same-story-official-release-only-repeat",
@@ -5809,6 +5821,53 @@
         "published_at": "2026-11-13T19:35:00Z",
         "updated_at": "2026-11-13T19:35:00Z",
         "added_at": "2026-11-13T19:35:00Z"
+      }
+    },
+    {
+      "id": "official-dos-response-buried-in-release-draft",
+      "packet": "official-relay-dos-response",
+      "coverage_set": "tor-release-only-recent",
+      "expected": "not_approve",
+      "expected_same_story": null,
+      "coverage": [
+        "news_value",
+        "new_information",
+        "source_support",
+        "status",
+        "uncertainty_attribution"
+      ],
+      "candidate": {
+        "id": "b65106df4dc985ebc3248d09",
+        "title": "Tor 0.4.9.17 security release responds to ongoing relay attack",
+        "summary": "The announcement introduces Tor 0.4.9.17 with security fixes, including an IPv6 change relevant to relay DoS protection. It describes client circuits overwhelming relays and urges relay operators to upgrade. It also says further defenses are being evaluated and additional releases are anticipated.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security",
+          "release",
+          "dos"
+        ],
+        "published_at": "2026-11-13T19:35:00Z",
+        "updated_at": "2026-11-13T19:35:00Z",
+        "added_at": "2026-11-13T19:35:00Z"
+      },
+      "forbidden_classifications": {
+        "state": [
+          "released",
+          "tagged"
+        ],
+        "category": [
+          "release"
+        ],
+        "tags": [
+          "release"
+        ]
       }
     }
   ],
