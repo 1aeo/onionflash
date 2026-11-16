@@ -1950,6 +1950,80 @@
           ]
         }
       ]
+    },
+    "official-relay-dos-response": {
+      "description": "Paraphrase of the public forum announcement. Coverage histories, candidate wording and their variants are synthetic evaluation material.",
+      "sources": [
+        {
+          "url": "https://forum.torproject.org/t/security-release-0-4-9-17/22454",
+          "title": "Security Release 0.4.9.17",
+          "kind": "feed",
+          "authority": "official",
+          "product": "tor",
+          "published_at": "2026-11-13T19:35:00Z",
+          "updated_at": "2026-11-13T19:35:00Z",
+          "passages": [
+            "Tor 0.4.9.17 is available with several security fixes; an IPv6 handling correction is particularly relevant to relay DoS protection.",
+            "The release responds to a continuing DDoS attack affecting most relay operators. Relays are being swamped by client circuits.",
+            "The project is assessing more defenses and anticipates additional releases shortly.",
+            "Relay operators are asked to upgrade promptly. No additional action is needed after the upgrade."
+          ]
+        }
+      ]
+    },
+    "official-release-only-repeat": {
+      "description": "Synthetic release-only notice for comparison; this is not the full public forum announcement.",
+      "sources": [
+        {
+          "url": "https://example.org/sources/tor-security-release-repeat",
+          "title": "Tor 0.4.9.17 release notice",
+          "kind": "feed",
+          "authority": "official",
+          "product": "tor",
+          "published_at": "2026-11-14T10:00:00Z",
+          "updated_at": "2026-11-14T10:00:00Z",
+          "passages": [
+            "Tor 0.4.9.17 was released with several security fixes, including an IPv6 handling fix affecting relay DoS defenses. Relay operators are asked to upgrade promptly."
+          ]
+        }
+      ]
+    },
+    "official-relay-dos-response-update": {
+      "description": "The same paraphrased public announcement as a combined description passage for update-scope evaluation.",
+      "sources": [
+        {
+          "url": "https://forum.torproject.org/t/security-release-0-4-9-17/22454",
+          "title": "Security Release 0.4.9.17",
+          "kind": "feed",
+          "authority": "official",
+          "product": "tor",
+          "published_at": "2026-11-13T19:35:00Z",
+          "updated_at": "2026-11-13T19:35:00Z",
+          "passages": [
+            "Tor 0.4.9.17 is available with several security fixes; an IPv6 handling correction is particularly relevant to relay DoS protection.\n\nThe release responds to a continuing DDoS attack affecting most relay operators. Relays are being swamped by client circuits.\n\nThe project is assessing more defenses and anticipates additional releases shortly.\n\nRelay operators are asked to upgrade promptly. No additional action is needed after the upgrade."
+          ]
+        }
+      ]
+    },
+    "official-relay-dos-response-qualified": {
+      "description": "Synthetic product-qualified headline variation of the paraphrased public announcement; the incident facts and plans are unchanged.",
+      "sources": [
+        {
+          "url": "https://forum.torproject.org/t/security-release-0-4-9-17/22454",
+          "title": "Tor 0.4.9.17 security release",
+          "kind": "feed",
+          "authority": "official",
+          "product": "tor",
+          "published_at": "2026-11-13T19:35:00Z",
+          "updated_at": "2026-11-13T19:35:00Z",
+          "passages": [
+            "Tor 0.4.9.17 is available with several security fixes; an IPv6 handling correction is particularly relevant to relay DoS protection.",
+            "The release responds to a continuing DDoS attack affecting most relay operators. Relays are being swamped by client circuits.",
+            "The project is assessing more defenses and anticipates additional releases shortly.",
+            "Relay operators are asked to upgrade promptly. No additional action is needed after the upgrade."
+          ]
+        }
+      ]
     }
   },
   "cases": [
@@ -5218,6 +5292,524 @@
           "tor"
         ]
       }
+    },
+    {
+      "id": "official-dos-response-beyond-release",
+      "packet": "official-relay-dos-response",
+      "coverage_set": "tor-release-only-recent",
+      "expected": "approve",
+      "expected_same_story": null,
+      "coverage": [
+        "news_value",
+        "new_information",
+        "source_support",
+        "status",
+        "uncertainty_attribution"
+      ],
+      "candidate": {
+        "id": "f87b019fdccd7dee29fef520",
+        "title": "Tor evaluates additional DoS defenses as attack overwhelms relays",
+        "summary": "The Tor Project says an ongoing DDoS attack is overwhelming relays with client circuits and has affected most relay operators. Its release announcement says additional defenses are being evaluated and further releases are expected.",
+        "why_it_matters": "",
+        "category": "dos",
+        "priority": "high",
+        "confidence": "confirmed",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "dos"
+        ],
+        "published_at": "2026-11-13T19:35:00Z",
+        "updated_at": "2026-11-13T19:35:00Z",
+        "added_at": "2026-11-13T19:35:00Z"
+      }
+    },
+    {
+      "id": "update-official-dos-response-beyond-release",
+      "scope": "latest_update",
+      "packet": "official-relay-dos-response-update",
+      "coverage_set": "tor-release-only-prior",
+      "expected": "approve",
+      "coverage": [
+        "new_information",
+        "source_support",
+        "status",
+        "uncertainty_attribution"
+      ],
+      "candidate": {
+        "id": "9c26b1e4a525ad33adbf68f0",
+        "title": "Tor 0.4.9.17 released with security fixes",
+        "summary": "Tor 0.4.9.17 was released with several security fixes, including an IPv6 handling fix affecting relay DoS defenses. Relay operators are asked to upgrade promptly.",
+        "why_it_matters": "",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "release",
+          "security"
+        ],
+        "published_at": "2026-11-13T18:00:00Z",
+        "updated_at": "2026-11-13T19:35:00Z",
+        "added_at": "2026-11-13T18:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-13T19:35:00Z",
+            "text": "The Tor Project says it is evaluating additional defenses against the ongoing relay DDoS attack and expects further releases soon.",
+            "sources": [
+              {
+                "url": "https://forum.torproject.org/t/security-release-0-4-9-17/22454",
+                "title": "Security Release 0.4.9.17"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "update-official-dos-response-omitted",
+      "scope": "latest_update",
+      "packet": "official-relay-dos-response-update",
+      "coverage_set": "tor-release-only-prior",
+      "expected": "not_approve",
+      "coverage": [
+        "new_information",
+        "source_support",
+        "status",
+        "uncertainty_attribution"
+      ],
+      "candidate": {
+        "id": "9c26b1e4a525ad33adbf68f0",
+        "title": "Tor 0.4.9.17 released with security fixes",
+        "summary": "Tor 0.4.9.17 was released with several security fixes, including an IPv6 handling fix affecting relay DoS defenses. Relay operators are asked to upgrade promptly.",
+        "why_it_matters": "",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "release",
+          "security"
+        ],
+        "published_at": "2026-11-13T18:00:00Z",
+        "updated_at": "2026-11-13T19:35:00Z",
+        "added_at": "2026-11-13T18:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-13T19:35:00Z",
+            "text": "The forum also announces the Tor 0.4.9.17 release.",
+            "sources": [
+              {
+                "url": "https://forum.torproject.org/t/security-release-0-4-9-17/22454",
+                "title": "Security Release 0.4.9.17"
+              }
+            ]
+          }
+        ]
+      },
+      "required": [
+        "defenses"
+      ]
+    },
+    {
+      "id": "update-official-dos-response-already-covered",
+      "scope": "latest_update",
+      "packet": "official-relay-dos-response-update",
+      "coverage_set": "tor-response-already-covered",
+      "expected": "skip",
+      "coverage": [
+        "new_information",
+        "source_support",
+        "status",
+        "uncertainty_attribution"
+      ],
+      "candidate": {
+        "id": "9c26b1e4a525ad33adbf68f0",
+        "title": "Tor 0.4.9.17 released with security fixes",
+        "summary": "Tor 0.4.9.17 was released with several security fixes, including an IPv6 handling fix affecting relay DoS defenses. Relay operators are asked to upgrade promptly. The project says client circuits are overwhelming relays and affecting most relay operators; no further action is needed after upgrading.",
+        "why_it_matters": "",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "release",
+          "security"
+        ],
+        "published_at": "2026-11-13T18:00:00Z",
+        "updated_at": "2026-11-13T19:35:00Z",
+        "added_at": "2026-11-13T18:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-13T19:35:00Z",
+            "text": "The Tor Project says it is evaluating additional defenses against the ongoing relay DDoS attack and expects further releases soon.",
+            "sources": [
+              {
+                "url": "https://forum.torproject.org/t/security-release-0-4-9-17/22454",
+                "title": "Security Release 0.4.9.17"
+              }
+            ]
+          },
+          {
+            "at": "2026-11-13T19:35:00Z",
+            "text": "The Tor Project says it is evaluating additional defenses against the ongoing relay DDoS attack and expects further releases soon.",
+            "sources": [
+              {
+                "url": "https://forum.torproject.org/t/security-release-0-4-9-17/22454",
+                "title": "Security Release 0.4.9.17"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "update-official-release-only-repeat",
+      "scope": "latest_update",
+      "packet": "official-release-only-repeat",
+      "coverage_set": "tor-release-only-prior",
+      "expected": "skip",
+      "coverage": [
+        "new_information",
+        "source_support",
+        "status",
+        "uncertainty_attribution"
+      ],
+      "candidate": {
+        "id": "9c26b1e4a525ad33adbf68f0",
+        "title": "Tor 0.4.9.17 released with security fixes",
+        "summary": "Tor 0.4.9.17 was released with several security fixes, including an IPv6 handling fix affecting relay DoS defenses. Relay operators are asked to upgrade promptly.",
+        "why_it_matters": "",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "release",
+          "security"
+        ],
+        "published_at": "2026-11-13T18:00:00Z",
+        "updated_at": "2026-11-14T10:00:00Z",
+        "added_at": "2026-11-13T18:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-14T10:00:00Z",
+            "text": "A separate notice repeats the Tor 0.4.9.17 security release.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/tor-security-release-repeat",
+                "title": "Tor 0.4.9.17 release notice"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "official-dos-response-plans-not-shipped",
+      "packet": "official-relay-dos-response",
+      "coverage_set": "tor-release-only-recent",
+      "expected": "not_approve",
+      "expected_same_story": null,
+      "coverage": [
+        "news_value",
+        "new_information",
+        "source_support",
+        "status",
+        "uncertainty_attribution"
+      ],
+      "candidate": {
+        "id": "8bbedd0ccf462298283f95cf",
+        "title": "Tor evaluates additional DoS defenses as attack overwhelms relays",
+        "summary": "The Tor Project says an ongoing DDoS attack is overwhelming relays with client circuits. The additional defenses are already deployed across the network.",
+        "why_it_matters": "",
+        "category": "dos",
+        "priority": "high",
+        "confidence": "confirmed",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "dos"
+        ],
+        "published_at": "2026-11-13T19:35:00Z",
+        "updated_at": "2026-11-13T19:35:00Z",
+        "added_at": "2026-11-13T19:35:00Z"
+      },
+      "unsupported": [
+        "already deployed across the network"
+      ]
+    },
+    {
+      "id": "official-dos-response-attack-not-resolved",
+      "packet": "official-relay-dos-response",
+      "coverage_set": "tor-release-only-recent",
+      "expected": "not_approve",
+      "expected_same_story": null,
+      "coverage": [
+        "news_value",
+        "new_information",
+        "source_support",
+        "status",
+        "uncertainty_attribution"
+      ],
+      "candidate": {
+        "id": "7fbaf36b21849e319f021dc0",
+        "title": "Tor ends relay DDoS attack with additional defenses",
+        "summary": "Tor 0.4.9.17 ended the relay DDoS attack; the network is no longer affected.",
+        "why_it_matters": "",
+        "category": "dos",
+        "priority": "high",
+        "confidence": "confirmed",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "dos"
+        ],
+        "published_at": "2026-11-13T19:35:00Z",
+        "updated_at": "2026-11-13T19:35:00Z",
+        "added_at": "2026-11-13T19:35:00Z"
+      },
+      "unsupported": [
+        "ends relay DDoS attack",
+        "ended the relay DDoS attack",
+        "network is no longer affected"
+      ]
+    },
+    {
+      "id": "update-official-dos-response-plans-not-shipped",
+      "scope": "latest_update",
+      "packet": "official-relay-dos-response-update",
+      "coverage_set": "tor-release-only-prior",
+      "expected": "not_approve",
+      "coverage": [
+        "new_information",
+        "source_support",
+        "status",
+        "uncertainty_attribution"
+      ],
+      "candidate": {
+        "id": "9c26b1e4a525ad33adbf68f0",
+        "title": "Tor 0.4.9.17 released with security fixes",
+        "summary": "Tor 0.4.9.17 was released with several security fixes, including an IPv6 handling fix affecting relay DoS defenses. Relay operators are asked to upgrade promptly.",
+        "why_it_matters": "",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "release",
+          "security"
+        ],
+        "published_at": "2026-11-13T18:00:00Z",
+        "updated_at": "2026-11-13T19:35:00Z",
+        "added_at": "2026-11-13T18:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-13T19:35:00Z",
+            "text": "The additional defenses discussed by the Tor Project are already deployed across the network.",
+            "sources": [
+              {
+                "url": "https://forum.torproject.org/t/security-release-0-4-9-17/22454",
+                "title": "Security Release 0.4.9.17"
+              }
+            ]
+          }
+        ]
+      },
+      "unsupported": [
+        "already deployed across the network"
+      ]
+    },
+    {
+      "id": "official-dos-response-product-qualified-title",
+      "packet": "official-relay-dos-response-qualified",
+      "coverage_set": "tor-release-only-recent",
+      "expected": "approve",
+      "expected_same_story": null,
+      "coverage": [
+        "news_value",
+        "new_information",
+        "source_support",
+        "status",
+        "uncertainty_attribution"
+      ],
+      "candidate": {
+        "id": "42bd9b2b0da4d98973a1ddde",
+        "title": "Tor evaluates additional DoS defenses as attack overwhelms relays",
+        "summary": "The Tor Project says an ongoing DDoS attack is overwhelming relays with client circuits and has affected most relay operators. Its release announcement says additional defenses are being evaluated and further releases are expected.",
+        "why_it_matters": "",
+        "category": "dos",
+        "priority": "high",
+        "confidence": "confirmed",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "dos"
+        ],
+        "published_at": "2026-11-13T19:35:00Z",
+        "updated_at": "2026-11-13T19:35:00Z",
+        "added_at": "2026-11-13T19:35:00Z"
+      }
+    },
+    {
+      "id": "official-dos-response-beyond-known-incident",
+      "packet": "official-relay-dos-response",
+      "coverage_set": "tor-release-and-incident-recent",
+      "expected": "approve",
+      "expected_same_story": null,
+      "coverage": [
+        "news_value",
+        "new_information",
+        "source_support",
+        "status",
+        "uncertainty_attribution"
+      ],
+      "candidate": {
+        "id": "2e0ca00be748b631551736d8",
+        "title": "Tor evaluates additional DoS defenses as attack overwhelms relays",
+        "summary": "The Tor Project says an ongoing DDoS attack is overwhelming relays with client circuits and has affected most relay operators. Its release announcement says additional defenses are being evaluated and further releases are expected.",
+        "why_it_matters": "",
+        "category": "dos",
+        "priority": "high",
+        "confidence": "confirmed",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "dos"
+        ],
+        "published_at": "2026-11-13T19:35:00Z",
+        "updated_at": "2026-11-13T19:35:00Z",
+        "added_at": "2026-11-13T19:35:00Z"
+      }
+    },
+    {
+      "id": "official-dos-response-omitted-from-release-draft",
+      "packet": "official-relay-dos-response",
+      "coverage_set": "tor-release-only-recent",
+      "expected": "not_approve",
+      "expected_same_story": null,
+      "coverage": [
+        "news_value",
+        "new_information",
+        "source_support",
+        "status",
+        "uncertainty_attribution"
+      ],
+      "candidate": {
+        "id": "d780c610118659314992a030",
+        "title": "Tor 0.4.9.17 released with security fixes",
+        "summary": "Tor 0.4.9.17 was released with several security fixes, including an IPv6 handling fix affecting relay DoS defenses. Relay operators are asked to upgrade promptly.",
+        "why_it_matters": "",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "release",
+          "security"
+        ],
+        "published_at": "2026-11-13T19:35:00Z",
+        "updated_at": "2026-11-13T19:35:00Z",
+        "added_at": "2026-11-13T19:35:00Z"
+      },
+      "required": [
+        "additional defenses"
+      ]
+    },
+    {
+      "id": "same-story-official-release-only-repeat",
+      "packet": "official-release-only-repeat",
+      "coverage_set": "tor-release-only-recent",
+      "expected": "skip",
+      "expected_same_story": "9c26b1e4a525ad33adbf68f0",
+      "coverage": [
+        "news_value",
+        "new_information",
+        "source_support",
+        "status",
+        "uncertainty_attribution"
+      ],
+      "candidate": {
+        "id": "74d03df1850c5374bc79d9e5",
+        "title": "Tor 0.4.9.17 released with security fixes",
+        "summary": "Tor 0.4.9.17 was released with several security fixes, including an IPv6 handling fix affecting relay DoS defenses. Relay operators are asked to upgrade promptly.",
+        "why_it_matters": "",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "release",
+          "security"
+        ],
+        "published_at": "2026-11-14T10:00:00Z",
+        "updated_at": "2026-11-14T10:00:00Z",
+        "added_at": "2026-11-14T10:00:00Z"
+      }
+    },
+    {
+      "id": "same-story-official-dos-response-repeat",
+      "packet": "official-relay-dos-response",
+      "coverage_set": "tor-response-and-release-recent",
+      "expected": "skip",
+      "expected_same_story": "f87b019fdccd7dee29fef520",
+      "coverage": [
+        "news_value",
+        "new_information",
+        "source_support",
+        "status",
+        "uncertainty_attribution"
+      ],
+      "candidate": {
+        "id": "983eeaf5a33e3b5981be8eea",
+        "title": "Tor evaluates additional DoS defenses as attack overwhelms relays",
+        "summary": "The Tor Project says an ongoing DDoS attack is overwhelming relays with client circuits and has affected most relay operators. Its release announcement says additional defenses are being evaluated and further releases are expected.",
+        "why_it_matters": "",
+        "category": "dos",
+        "priority": "high",
+        "confidence": "confirmed",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "dos"
+        ],
+        "published_at": "2026-11-13T19:35:00Z",
+        "updated_at": "2026-11-13T19:35:00Z",
+        "added_at": "2026-11-13T19:35:00Z"
+      }
     }
   ],
   "coverage_sets": {
@@ -5905,6 +6497,129 @@
         "added_at": "2026-11-08T12:00:00Z"
       },
       "recent": [],
+      "truncated": false
+    },
+    "tor-release-only-recent": {
+      "prior_story": null,
+      "recent": [
+        {
+          "id": "9c26b1e4a525ad33adbf68f0",
+          "title": "Tor 0.4.9.17 released with security fixes",
+          "summary": "Tor 0.4.9.17 was released with several security fixes, including an IPv6 handling fix affecting relay DoS defenses. Relay operators are asked to upgrade promptly.",
+          "category": "release",
+          "state": "released",
+          "updated_at": "2026-11-13T18:00:00Z",
+          "summary_truncated": false
+        }
+      ],
+      "truncated": false
+    },
+    "tor-release-only-prior": {
+      "prior_story": {
+        "id": "9c26b1e4a525ad33adbf68f0",
+        "title": "Tor 0.4.9.17 released with security fixes",
+        "summary": "Tor 0.4.9.17 was released with several security fixes, including an IPv6 handling fix affecting relay DoS defenses. Relay operators are asked to upgrade promptly.",
+        "why_it_matters": "",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "release",
+          "security"
+        ],
+        "published_at": "2026-11-13T18:00:00Z",
+        "updated_at": "2026-11-13T18:00:00Z",
+        "added_at": "2026-11-13T18:00:00Z"
+      },
+      "recent": [],
+      "truncated": false
+    },
+    "tor-response-already-covered": {
+      "prior_story": {
+        "id": "9c26b1e4a525ad33adbf68f0",
+        "title": "Tor 0.4.9.17 released with security fixes",
+        "summary": "Tor 0.4.9.17 was released with several security fixes, including an IPv6 handling fix affecting relay DoS defenses. Relay operators are asked to upgrade promptly. The project says client circuits are overwhelming relays and affecting most relay operators; no further action is needed after upgrading.",
+        "why_it_matters": "",
+        "category": "release",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "release",
+          "security"
+        ],
+        "published_at": "2026-11-13T18:00:00Z",
+        "updated_at": "2026-11-13T19:35:00Z",
+        "added_at": "2026-11-13T18:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-13T19:35:00Z",
+            "text": "The Tor Project says it is evaluating additional defenses against the ongoing relay DDoS attack and expects further releases soon.",
+            "sources": [
+              {
+                "url": "https://forum.torproject.org/t/security-release-0-4-9-17/22454",
+                "title": "Security Release 0.4.9.17"
+              }
+            ]
+          }
+        ]
+      },
+      "recent": [],
+      "truncated": false
+    },
+    "tor-release-and-incident-recent": {
+      "prior_story": null,
+      "recent": [
+        {
+          "id": "9c26b1e4a525ad33adbf68f0",
+          "title": "Tor 0.4.9.17 released with security fixes",
+          "summary": "Tor 0.4.9.17 was released with several security fixes, including an IPv6 handling fix affecting relay DoS defenses. Relay operators are asked to upgrade promptly.",
+          "category": "release",
+          "state": "released",
+          "updated_at": "2026-11-13T18:00:00Z",
+          "summary_truncated": false
+        },
+        {
+          "id": "5843c938feb83b3bb4198a4b",
+          "title": "Ongoing DDoS attack overwhelms Tor relays",
+          "summary": "An ongoing DDoS attack is overwhelming Tor relays with client circuits and affecting relay operators. No further response plans have been announced.",
+          "category": "dos",
+          "state": "developing",
+          "updated_at": "2026-11-13T18:00:00Z",
+          "summary_truncated": false
+        }
+      ],
+      "truncated": false
+    },
+    "tor-response-and-release-recent": {
+      "prior_story": null,
+      "recent": [
+        {
+          "id": "9c26b1e4a525ad33adbf68f0",
+          "title": "Tor 0.4.9.17 released with security fixes",
+          "summary": "Tor 0.4.9.17 was released with several security fixes, including an IPv6 handling fix affecting relay DoS defenses. Relay operators are asked to upgrade promptly.",
+          "category": "release",
+          "state": "released",
+          "updated_at": "2026-11-13T18:00:00Z",
+          "summary_truncated": false
+        },
+        {
+          "id": "f87b019fdccd7dee29fef520",
+          "title": "Tor evaluates additional DoS defenses as attack overwhelms relays",
+          "summary": "The Tor Project says an ongoing DDoS attack is overwhelming relays with client circuits and has affected most relay operators. Its release announcement says additional defenses are being evaluated and further releases are expected. The announcement asks relay operators to upgrade promptly. No further action is needed after upgrading.",
+          "category": "dos",
+          "state": "developing",
+          "updated_at": "2026-11-13T19:35:00Z",
+          "summary_truncated": false
+        }
+      ],
       "truncated": false
     }
   }

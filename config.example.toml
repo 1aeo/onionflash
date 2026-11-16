@@ -85,6 +85,16 @@ product = "network"
 authority = "official"
 
 [[sources]]
+id = "tor-release-announcements"
+name = "Tor Project Forum Release Announcements"
+website_url = "https://forum.torproject.org/c/news/tor-release-announcement/28"
+kind = "feed"
+url = "https://forum.torproject.org/c/news/tor-release-announcement/28.rss"
+product = "tor"
+authority = "official"
+enabled = true
+
+[[sources]]
 id = "network-health-list"
 name = "Tor Project Network Health Mailing List"
 website_url = "https://lists.torproject.org/mailman3/hyperkitty/list/network-health@lists.torproject.org/"

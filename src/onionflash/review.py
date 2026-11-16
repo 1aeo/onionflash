@@ -13,7 +13,7 @@ from .render import prepare_story
 from .schema import LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STORY_ID_RE, UPDATE_CHARS
 from .util import canonical_url, digest, normalize_evidence
 
-REVIEW_VERSION = "onionflash-review-15"
+REVIEW_VERSION = "onionflash-review-17"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details", "news_value", "new_information")
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
@@ -206,6 +206,12 @@ and major merged-feature milestones can also be newsworthy. An empty why_it_matt
 remains valid. Routine CI, data-refresh/test tags, minor chores, generic discussion,
 praise and unsupported expectations do not merit standalone news. A genuine upstream
 version tag can be newsworthy as an observed tag, without claiming a release shipped.
+An official incident-response announcement is also news when it adds substantive
+facts about an ongoing attack, affected operators or active mitigation work, including
+evaluation of additional defenses and expected further releases. These are attributed
+facts about the announced response, not proof that planned defenses have shipped,
+will work, have a firm release date or have resolved the attack. Distinguish them from
+community speculation, routine scheduling and unsupported hopes for future fixes.
 Open feature requests, design ideas and exploratory implementation benchmarks are
 not news merely because they propose a security or performance benefit. Skip them
 until there is a concrete adoption/merge, or a distinct credible vulnerability
@@ -249,7 +255,8 @@ authority=community (neither official, project-sender nor trusted-operator) fail
 news_value (verdict skip), whereas substantive technical critiques, protocol reviews, or
 multi-relay operational findings and measurements from authority=trusted-operator or
 authority=project-sender may pass news_value when newsworthy (keeping confidence
-reported); official releases and the tor-dev rules above are unchanged.
+reported); official releases, substantive official incident-response announcements
+and the tor-dev rules above are unchanged.
 new_information: compare the packet's concrete event and facts, and the candidate, with
 the supplied existing coverage, not matching product or version keywords. Decide
 duplication only from coverage_background: fail new_information only when a story there
@@ -257,6 +264,11 @@ describes the same concrete event, and name that story's id in the reason. If a 
 item a duplicate or already covered and truncated coverage does not show that story, hold.
 A newly reported security issue affecting an already-released version can be new
 information; a different release version is a distinct release event.
+Prior coverage of a release or its changelog does not automatically cover incident
+facts or response plans in a later official announcement. Compare the actual facts:
+newly announced evaluation of further defenses or expected response releases can be
+material even when the version and ongoing attack are already known. Keep expectations
+attributed and tentative; skip them only when the supplied coverage already states them.
 A different URL, repeated announcement, newer timestamp or quoted parent message is not
 a new development. In replies, identify the author's new unquoted contribution and
 whether it materially changes the account. Mere corroborating anecdotes, requests
@@ -341,6 +353,15 @@ this exact candidate.
 """
 ROUTING_PROMPT = """
 SAME-STORY ROUTING (coverage_background.recent is present):
+- Read the source packet's substantive new contribution before choosing a target, not just its release title
+  or the draft's emphasis. When prior_story is null, an official announcement adding material incident-response
+  news (such as newly announced evaluation of further defenses or expected response releases) gets a NEW article
+  with same_story null even if recent coverage already describes the release and ongoing attack. A matching
+  version or incident does not absorb this distinct announcement. If the draft merely repeats the covered release,
+  revise its headline and summary to lead with the new response development, or hold; never route or skip away
+  the omitted news. Classify that distinct response event as developing, without release labels for defenses
+  still being evaluated. Keep plans attributed and tentative. This exception does not apply when that response news
+  itself is already covered: route a repeat to the story covering those facts, or skip if no route is appropriate.
 - When prior_story is present, set same_story to a separate non-retracted recent entry's id ONLY when
   that entry and prior_story report the exact same concrete event; otherwise keep same_story null.
 - When prior_story is null, attach an earlier or later stage of a concrete bug, incident, request or
@@ -352,16 +373,19 @@ SAME-STORY ROUTING (coverage_background.recent is present):
   problem or mechanism that an already-covered emergency or hotfix release addresses (note that recent
   entries with summary_truncated true show only the opening sentence, so match shared technical mechanisms
   even if the merge also includes a companion workaround), or (d) a follow-up resolution, closing note or
-  cross-channel report of an already-covered incident. In every such case — whether you fail
+  cross-channel report of an already-covered incident without distinct response news as defined above, or
+  (e) another tag or announcement of the same product/version release without distinct incident-response news.
+  In every such case — whether you fail
   new_information (verdict skip, repair null), pass all nine criteria because this stage adds new facts
   (verdict approve, repair null; never return revise or skip when all nine pass), or return verdict revise
   when a criterion failed — you MUST set same_story to that recent entry's id so the application attaches
   the item to that story for update review.
 - Keep same_story null for: a different software version's release, a general release shipping multiple
-  distinct fixes or features, a newly reported bug or regression in an already-released version, a
+  distinct fixes or features not already covered as that release, a newly reported bug or regression in an
+  already-released version, a
   distinct bug found while auditing an earlier issue, or a different incident on the same authority or
   topic. Entries marked related only share a reference, version or thread; check whether they match
-  (a)-(d) rather than routing from the related marker alone.
+  (a)-(e) rather than routing from the related marker alone.
 - An entry marked retracted is a withdrawn story: if the candidate repeats its withdrawn claim, fail
   new_information (keeping news_value pass) and return verdict hold (never skip, same_story null).
   Otherwise keep same_story null.
@@ -443,6 +467,9 @@ Evaluate all nine criteria in order before choosing verdict:
          yet "released"; fixed, resolved, or reopened);
      (b) an official statement or advisory, or a directory-authority operator report (authority=dirauth-operator or
          naming a directory authority), adding substantive facts, authority impact, scope changes or disclosure dates;
+         an official statement can also add incident-response plans, including active evaluation of additional
+         defenses and expected further releases during an ongoing attack; keep plans attributed and tentative,
+         never shipped or proven;
      (c) concrete new empirical telemetry, multi-relay/vantage measurements, quantitative rates/counts, a newly
          identified root-cause mechanism, or newly reported affected versions, OSes or platforms;
      (d) a material maintainer correction, scope narrowing, withdrawal or dispute of prior_story;
@@ -452,7 +479,8 @@ Evaluate all nine criteria in order before choosing verdict:
    - FAIL new_information (outcome "fail", verdict "skip", repair null, keeping news_value "pass", and MUST include
      coverage_background.prior_story.id verbatim in new_information.reason) for ALL of the following, even when minor
      wording, sub-component versions, dates or names were absent from candidate.summary:
-     (1) Alternate-channel release announcements ([tor-announce], blog, forum), package notices or sub-component
+     (1) Alternate-channel release announcements ([tor-announce], blog, forum) that ONLY repeat covered release
+         facts, package notices or sub-component
          changelog lists for a software version prior_story ALREADY covers as released (prior_story.state == "released"
          and that version is already in candidate.title, summary or earlier updates), or metrics_timeline rows that
          ONLY list the release or defect already in candidate.summary without new post-release network effects (pass
@@ -471,6 +499,13 @@ Evaluate all nine criteria in order before choosing verdict:
          incident thread (such as "Yes guard and hsdir flags" or "Just to confirm ... HSDir flag did not stick")
          that add no quantitative measurements, multi-relay telemetry, new affected version or root-cause finding;
      (8) Restating facts already covered in candidate.title, candidate.summary or candidate.updates[:-1].
+   - Before skipping, examine the cited new source's own unquoted passages, not just the drafted update.
+     The repeated-release rule does not apply when an official announcement adds material incident facts,
+     affected scope, response plans or operator instructions absent from prior coverage. If the draft merely
+     repeats the release or omits that development, PASS new_information for the source's new material,
+     fail source_support for the material omission and revise update to state the supported new information,
+     or hold; never skip that source as a duplicate. Do not
+     require a new version, completed mitigation or state change for an attributed announcement of response work.
    - Unrelated-event guard: If candidate.updates[-1] or its packet source concerns a completely different,
      unrelated event or product wrongly attached to this story (not a follow-up, fix, release or discussion of
      candidate.title / candidate.summary), FAIL new_information (outcome "fail", reason explaining why the event is

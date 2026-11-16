@@ -15,13 +15,19 @@ LATER = "2026-11-09T12:00:00Z"
 BODY = "The operator reports that old directory-authority keys cannot be trusted and requests a source-code change. " * 4
 
 
-def pending(store, incoming=None, observed=DATE):
+def pending(store, incoming=None, observed=DATE, *, target=None):
     store.ingest(incoming or item(content=BODY), observed)
-    return store.pending(1, observed)[0]
+    row = store.pending(1, observed)[0]
+    if target is not None:
+        # These packet/commit tests start after same-story review selected its target.
+        with store.db:
+            store.db.execute("UPDATE items SET story_id=? WHERE id=?", (target, row["id"]))
+        row["story_id"] = target
+    return row
 
 
-def publish(store, incoming=None, result=None, *, observed=DATE, key="fixture"):
-    finish_reviewed(store, pending(store, incoming, observed), result or analysis(), key, observed)
+def publish(store, incoming=None, result=None, *, observed=DATE, key="fixture", target=None):
+    finish_reviewed(store, pending(store, incoming, observed, target=target), result or analysis(), key, observed)
     return store.stories()[0]
 
 
@@ -328,12 +334,13 @@ def test_writer_source_keeps_the_text_its_writer_saw_and_short_sources_leave_roo
     writer = _compose(release("issue", "Release notes for the announced change. " * 250, kind="gitlab_issue",
                               url=url, updated_at=LATER), notes, LATER, source_key="k")
     long_mirror = release("0-long", "A longer mirror of the announcement. " * 130)
-    publish(store, writer, analysis(evidence=["The oldest note confirms TROVE-2026-001"]), observed=LATER, key="writer")
+    original = publish(store, writer, analysis(evidence=["The oldest note confirms TROVE-2026-001"]), observed=LATER, key="writer")
     for name in ["a", "b", "c", "d", "e"]:
         publish(store, release(name, f"Short mirror {name}."),
-                update_analysis(update=f"Short mirror {name}.", evidence=[f"Short mirror {name}."]), key=name)
-    publish(store, long_mirror, update_analysis(update="Long mirror posted.", evidence=["A longer mirror of the announcement."]), key="long")
-    row = pending(store, release("f", "Short mirror f."), LATER)
+                update_analysis(update=f"Short mirror {name}.", evidence=[f"Short mirror {name}."]), key=name, target=original["id"])
+    publish(store, long_mirror, update_analysis(update="Long mirror posted.", evidence=["A longer mirror of the announcement."]),
+            key="long", target=original["id"])
+    row = pending(store, release("f", "Short mirror f."), LATER, target=original["id"])
     prepared = store.prepare_candidate(row, update_analysis(update="Short mirror f.", evidence=["Short mirror f."]), LATER)
     assert prepared["payload"]["editorial_item"] == writer["id"] and not prepared["packet"]["missing_sources"]
     assert url + "#note_1" in {s["url"] for s in prepared["candidate"]["sources"]}
@@ -357,11 +364,11 @@ def test_kept_prose_keeps_its_writer_window_and_an_incoming_issue_keeps_every_no
     notes[-1]["body"] = "Correction: this release does not fix the reported crash."
     incoming = _compose(item(title=post["title"], url=url, updated_at=LATER, content="Release tracking notes. " * 75),
                         notes, LATER, source_key="k")
-    publish(store, post, analysis(confidence="confirmed", evidence=["The release fixes the reported crash"]), key="post")
+    original = publish(store, post, analysis(confidence="confirmed", evidence=["The release fixes the reported crash"]), key="post")
     for name in "abcdef":
         publish(store, release(name, f"Mirror {name} of the announcement. " * 75),
                 update_analysis(update=f"Mirror {name} posted.", confidence="confirmed",
-                                evidence=[f"Mirror {name} of the announcement."]), key=name)
+                                evidence=[f"Mirror {name} of the announcement."]), key=name, target=original["id"])
     row = pending(store, incoming, LATER)
     prepared = store.prepare_candidate(row, update_analysis(update="Release tracking notes updated.",
                                                             confidence="confirmed", evidence=["Release tracking notes"]), LATER)
@@ -421,7 +428,7 @@ def test_tag_and_timeline_notices_upgrade_in_story_scope_while_prose_uses_update
         action(store.db, first["id"], *args, reason="Seed update.",
                expect_hash=editorial.show(store.db, first["id"])["hash"], observed=LATER)
     row = pending(store, item(kind="feed", title="Tor 0.4.9.16 released", url="https://example.org/post/0.4.9.16",
-                              content="Tor 0.4.9.16 was released with directory fixes.", updated_at=LATER), LATER)
+                              content="Tor 0.4.9.16 was released with directory fixes.", updated_at=LATER), LATER, target=first["id"])
     with pytest.raises(StaleCandidate):
         store.prepare_candidate(row, update_analysis(evidence=["Tor 0.4.9.16 was released"]), LATER)
     upgraded = store.prepare_candidate(row, analysis(title="Tor 0.4.9.16 released", state="released",
@@ -432,7 +439,7 @@ def test_tag_and_timeline_notices_upgrade_in_story_scope_while_prose_uses_update
 
     later2 = "2026-11-10T12:00:00Z"
     followup = pending(store, item(kind="feed", title="Tor 0.4.9.16 released", url="https://example.org/mirror/0.4.9.16",
-                                   content="Mirror reports package availability.", updated_at=later2), later2)
+                                   content="Mirror reports package availability.", updated_at=later2), later2, target=first["id"])
     with pytest.raises(StaleCandidate):
         store.prepare_candidate(followup, analysis(evidence=["Mirror reports package availability."]), later2)
     upd = store.prepare_candidate(followup, update_analysis(update="Mirror reports package availability.",
@@ -460,7 +467,8 @@ def test_tag_and_timeline_notices_upgrade_in_story_scope_while_prose_uses_update
                            analysis(title="Tor 0.4.9.17 tagged ahead of packaging", state="tagged",
                                     evidence=["Upstream tagged Tor 0.4.9.17 ahead of packaging."]), observed=later3, key="tagged-prose")
     prose_followup = pending(store, item(kind="feed", title="Tor 0.4.9.17 released", url="https://example.org/release/0.4.9.17",
-                                         content="Tor 0.4.9.17 packages are now available.", published_at=later4, updated_at=later4), later4)
+                                         content="Tor 0.4.9.17 packages are now available.", published_at=later4, updated_at=later4),
+                             later4, target=tagged_prose["id"])
     with pytest.raises(StaleCandidate):
         store.prepare_candidate(prose_followup, analysis(state="released", evidence=["Tor 0.4.9.17 packages are now available."]), later4)
     prose_upd = store.prepare_candidate(prose_followup, update_analysis(update="Tor 0.4.9.17 packages are now available.",

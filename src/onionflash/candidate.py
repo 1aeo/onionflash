@@ -12,7 +12,7 @@ from .comments import analysis_context, is_budget_clipped_prefix, note_key, prio
 from .llm import strip_unreleased_tag, unquoted_text
 from .schema import SEMANTIC_FIELDS, UPDATE_FIELDS
 from .util import (after, digest, gitlab_refs, gitlab_url_variants, normalize_evidence,
-                   release_mentions, safe_canonical_url, saved_object, thread_subject)
+                   release_mentions, safe_canonical_url, saved_object, story_cluster, thread_subject)
 
 
 UNVERIFIED_ROUTE = "Attached to an existing story for update review"
@@ -505,16 +505,35 @@ def _thread_matches(db, row: dict, item: dict, subject: str) -> list[dict]:
 
 def associate(db, row: dict) -> tuple[dict | None, str | None]:
     """Attach an item to at most one live story using deterministic identities."""
-    matched, how = _lookup_story(db, story_id=row.get("story_id"), cluster_key=row["cluster_key"])
+    matched, how = _lookup_story(db, story_id=row.get("story_id"))
     if matched is not None:
         return matched, how
-    cluster_matches = _mapped_stories(db, "cluster_key=?", row["cluster_key"])
+    payload = row.get("payload")
+    item = saved_object(payload.encode("utf-8") if isinstance(payload, str) else payload) if isinstance(payload, (str, bytes)) else None
+    cluster = row["cluster_key"]
+    # Release versions are coverage hints for new prose, not an automatic article
+    # assignment. Explicit prior mappings and permanent aliases still take precedence.
+    if (isinstance(item, dict) and item.get("kind") == "feed" and cluster.startswith("release:")
+            and editorial.retired(db, cluster_key=cluster) is None):
+        legacy, _ = _lookup_story(db, cluster_key=cluster)
+        if legacy is not None:
+            public = saved_object(legacy["payload"].encode("utf-8") if isinstance(legacy["payload"], str) else legacy["payload"])
+            if isinstance(public, dict) and story_cites_item(public, item):
+                return legacy, "source"
+        cluster = story_cluster(item)
+    matched, how = _lookup_story(db, cluster_key=cluster)
+    if matched is not None:
+        return matched, how
+    cluster_matches = _mapped_stories(db, "cluster_key=?", cluster)
+    if isinstance(item, dict) and item.get("kind") == "tag" and cluster.startswith("release:"):
+        cluster_matches = [story for story in cluster_matches
+                           if isinstance(public := saved_object(story["payload"].encode("utf-8")
+                                                                if isinstance(story["payload"], str) else story["payload"]), dict)
+                           and public.get("state") in {"tagged", "released"}]
     if len(cluster_matches) == 1:
         return cluster_matches[0], "item_cluster"
     if len(cluster_matches) > 1:
         return None, None
-    payload = row.get("payload")
-    item = saved_object(payload.encode("utf-8") if isinstance(payload, str) else payload) if isinstance(payload, (str, bytes)) else None
     if not isinstance(item, dict):
         return None, None
     if item.get("kind") == "gitlab_mr" and item.get("upstream_state") == "merged":
@@ -561,7 +580,10 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
         marker = f"!{number}" if "/-/merge_requests/" in ref else f"#{number}"
         for match in _stories_for_urls(db, [ref]):
             add(match["id"], f"references {marker}")
-    for key in release_mentions(item):
+    release_keys = release_mentions(item)
+    if (row.get("cluster_key") or "").startswith("release:") and row["cluster_key"] not in release_keys:
+        release_keys.insert(0, row["cluster_key"])
+    for key in release_keys:
         _, prod, ver = key.split(":", 2)
         reason = f"mentions {prod.replace('-', ' ')} {ver}"
         if (rel_story := _lookup_story(db, cluster_key=key, raise_retired=False)[0]) is not None:
@@ -681,8 +703,9 @@ def prepare(
         raise StaleCandidate("Source item changed before candidate preparation")
     item = json.loads(row["payload"])
     existing, how = associate(db, row)
-    story_id = existing["id"] if existing else digest(row["cluster_key"])[:24]
-    if existing is None and editorial.retired(db, story_id=story_id, cluster_key=row["cluster_key"]) is not None:
+    cluster = existing["cluster_key"] if existing else (story_cluster(item) if item.get("kind") == "feed" else row["cluster_key"])
+    story_id = existing["id"] if existing else digest(cluster)[:24]
+    if existing is None and editorial.retired(db, story_id=story_id, cluster_key=cluster) is not None:
         raise editorial.RetiredStory("Story is retired")
     locked = editorial.is_locked(db, story_id)
     previous = json.loads(existing["payload"]) if existing else None
@@ -690,7 +713,7 @@ def prepare(
     binding = {"item": item_fingerprint(row), "prior_story": digest(existing),
                "lock": control_fingerprint(db, story_id), "mode": mode, "sources": []}
     envelope = {"row": row, "result": result, "story_id": story_id,
-                "cluster_key": existing["cluster_key"] if existing else row["cluster_key"],
+                "cluster_key": cluster,
                 "mode": mode, "how": how, "candidate": None, "payload": None,
                 "packet": {"sources": [], "missing_sources": [], "truncated": False},
                 "binding": binding, "locked": locked, "coverage": None,
