@@ -439,3 +439,22 @@ def test_narrative_em_dash_asides_do_not_hide_literal_source_names(source):
 def test_author_handles_and_ambiguous_compounds_do_not_use_prose_aside_normalization():
     assert missing_named_attributions(candidate("@Juno says that clients fail."), packet(author="Juno—who"))
     assert missing_named_attributions(candidate("Vale says that clients fail."), packet("Juno–Vale published measurements.", author="other"))
+
+
+@pytest.mark.parametrize("domain,missing", [
+    ("example.org", False), ("EXAMPLE.ORG", False),
+    ("mail.example.org", True), ("example.org.invalid", True),
+])
+def test_sender_domain_can_support_only_its_exact_literal_attribution(domain, missing):
+    packet = {"sources": [{"url": "https://lists.example/thread", "sender_domain": domain,
+                           "passages": [{"text": "The sender reports a connection failure."}]}]}
+    candidate = {"title": "Example.org reports that a connection fails"}
+    assert bool(missing_named_attributions(candidate, packet)) is missing
+
+
+def test_sender_domain_is_not_inferred_from_url_or_note_metadata():
+    packet = {"sources": [{"url": "https://example.org/report", "name": "Example.org",
+                           "passages": [{"text": "The sender reports a connection failure.",
+                                         "sender_domain": "example.org"}]}]}
+    candidate = {"title": "Example.org reports that a connection fails"}
+    assert missing_named_attributions(candidate, packet)
