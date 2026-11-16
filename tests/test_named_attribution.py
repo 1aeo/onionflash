@@ -554,3 +554,37 @@ def test_emphasized_name_blocks_cached_and_final_operator_approval(context):
     with pytest.raises(ReviewRequired, match="Named attribution needs literal source evidence"):
         store.commit_candidate(prepared, prepared["candidate"], "writer-key", LATER, operator=True, review_record=audit)
     assert not store.stories()
+
+
+@pytest.mark.parametrize("handle", ["_Alice_", "__Alice__", "___Alice___", "_Juno_Vale_"])
+@pytest.mark.parametrize("emphasized", [False, True])
+def test_exact_supplied_underscore_account_is_not_reinterpreted_as_emphasis(handle, emphasized):
+    text = f"{handle} reports that the issue remains."
+    if emphasized:
+        text = f"**{handle}** reports that the issue remains."
+    source = packet("The issue remains.", author=handle.lower())
+    assert not missing_named_attributions(candidate(text), source)
+    assert not missing_named_attributions(candidate(text), source, known_names=[handle.strip("_")])
+    assert missing_named_attributions(candidate(f"{handle.strip('_')} reports that the issue remains."), source)
+    # Without the exact account token, underscores are ordinary emphasis.
+    assert missing_named_attributions(candidate(text), packet(author="other"))
+
+
+def test_literal_underscore_account_protection_is_whole_and_scoped_to_update_citation():
+    text = candidate("_Alice_ reports that the issue remains.")
+    assert missing_named_attributions(text, packet(author="_Alice_extra_"))
+    assert missing_named_attributions(text, packet(author="Alice _Alice_"))
+    sources = packet("The issue remains.", author="_Alice_")
+    sources["sources"][0]["passages"].append({"id": "S1:P3", "text": "The fix is being investigated.",
+                                               "url": "https://example.org/report#note_1", "author": "other"})
+    updated = {**text, "updates": [{"text": text["title"], "sources": [{"url": "https://example.org/report#note_1"}]}]}
+    assert missing_named_attributions(updated, sources, update=True, known_names=["Alice"])
+    sources["sources"][0]["passages"][-1]["author"] = "_Alice_"
+    assert not missing_named_attributions(updated, sources, update=True, known_names=["Alice"])
+
+
+def test_literal_account_in_source_prose_does_not_prove_its_unwrapped_name():
+    sources = packet("_Alice_ submitted the report.", author="_Alice_")
+    assert missing_named_attributions(candidate("Alice reports that the issue remains."), sources)
+    assert not missing_named_attributions(candidate("@_Alice_ reports that the issue remains."), sources)
+    assert missing_named_attributions(candidate("Alice **Smith** reported that the issue remains."), sources)

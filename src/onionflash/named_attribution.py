@@ -113,8 +113,13 @@ def _numeric_boundary(word: _Word) -> bool:
     return word.value.isnumeric() or re.fullmatch(r"\d+(?:[._]\d+)*", word.value) is not None
 
 
-def _emphasis_text(text: str) -> str:
+def _emphasis_text(text: str, *, literal_tokens=()) -> str:
     """Remove balanced word-boundary emphasis, retaining code and literal handles."""
+    # An exact supplied account token takes precedence over ambiguous italic
+    # syntax. Preserve its entire lexical span, never an inferred alias.
+    protected = {index for word in _tokens(text)
+                 if _normalized(word.value).lstrip("@") in literal_tokens
+                 for index in range(word.start(), word.end())}
     parts = list(_EMPHASIS_PART.finditer(text))
     opened, removed = [], set()
     previous = 0
@@ -126,7 +131,7 @@ def _emphasis_text(text: str) -> str:
         if marker.startswith("`"):
             opened.clear()
             continue
-        if len(marker) > 3:
+        if len(marker) > 3 or any(index in protected for index in range(part.start(), part.end())):
             continue
         before = text[part.start() - 1:part.start()]
         after = text[part.end():part.end() + 1]
@@ -147,13 +152,13 @@ def _emphasis_text(text: str) -> str:
     return "".join(char for index, char in enumerate(text) if index not in removed)
 
 
-def _literal_present(name: str, text: str) -> bool:
+def _literal_present(name: str, text: str, *, literal_tokens=()) -> bool:
     """Match whole lexical spans, including marks and numeric dotted handles."""
     wanted = [_normalized(word.value).lstrip("@") for word in _tokens(_normalized(name))]
     # A clear narrative aside/quotation is prose punctuation, not a compound
     # name. Keep this narrower than arbitrary dash normalization, and do not
     # apply it to author/account metadata.
-    source = _normalized(_NARRATIVE_DASH.sub(" ", _emphasis_text(text)))
+    source = _normalized(_NARRATIVE_DASH.sub(" ", _emphasis_text(text, literal_tokens=literal_tokens)))
     words = _tokens(source)
     def literal(word):
         value = word.value.lstrip("@")
@@ -185,11 +190,11 @@ def _name_word(value: str) -> bool:
     return first.isupper() or (not first.isascii() and first.isalpha() and first.lower() == first.upper())
 
 
-def _names(text: str) -> list[str]:
+def _names(text: str, *, literal_tokens=()) -> list[str]:
     # Code examples are not speaker attributions. Quoted prose remains a claim
     # and is checked; a quotation cannot create source evidence for its speaker.
     text = _FENCE.sub(lambda match: " " * len(match[0]), unicodedata.normalize("NFC", text))
-    text = _emphasis_text(text)
+    text = _emphasis_text(text, literal_tokens=literal_tokens)
     text = _INLINE_CODE.sub(lambda match: " " + match[1] + " " if _single_token(match[1])
                             else " " * len(match[0]), text)
     # Quoting or styling a name does not remove its attribution. Keep internal
@@ -296,17 +301,19 @@ def missing_named_attributions(candidate: dict, packet: dict, *, update: bool = 
         targets = [(field, candidate.get(field, "")) for field in ("title", "summary", "why_it_matters")]
         cited = None
     evidence = [(_URL.sub(" ", text), author) for text, author in _evidence(packet, cited)]
+    literal_tokens = frozenset(_normalized(text).lstrip("@") for text, author in evidence
+                               if author and "_" in text)
     def supported(name):
-        return any(_organization_name(source) == _organization_name(name) if author else _literal_present(name, source)
+        return any(_organization_name(source) == _organization_name(name) if author else _literal_present(name, source, literal_tokens=literal_tokens)
                    for source, author in evidence)
 
     retained = [name for name in known_names if not supported(name)]
     flags = []
     for field, text in targets:
-        names = _names(text)
+        names = _names(text, literal_tokens=literal_tokens)
         # Names already found absent in an observed candidate cannot survive a
         # repair merely by changing case, grammar, quoting, code style, or field.
-        names += [name for name in retained if _literal_present(name, text)]
+        names += [name for name in retained if _literal_present(name, text, literal_tokens=literal_tokens)]
         seen = set()
         for name in names:
             if _normalized(name).lstrip("@") in seen:
