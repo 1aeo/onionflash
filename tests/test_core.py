@@ -74,6 +74,45 @@ def test_blockquote_marking_keeps_literal_quotes_and_plain_text_defaults():
     assert plain_text(literal, 2000) == "Literal markup in a text field."
 
 
+@pytest.mark.parametrize("limit", [200, 20_000])
+def test_blockquote_prefix_materialization_stays_proportional_to_output_limit(monkeypatch, limit):
+    from onionflash import util
+
+    class BoundedParts(list):
+        characters = 0
+
+        def append(self, text):
+            self.characters += len(text)
+            assert self.characters <= 6 * limit
+            super().append(text)
+
+    original = util._TextParser
+
+    class InspectingParser(original):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.parts = BoundedParts()
+
+    monkeypatch.setattr(util, "_TextParser", InspectingParser)
+    depth = limit // 5
+    lines = (4 * limit - len("<blockquote>") * depth) // 2
+    raw = "<blockquote>" * depth + "x\n" * lines
+    expected = (">" * depth + " x\n") * (limit // depth + 1)
+    assert plain_text(raw, limit, mark_blockquotes=True) == expected[:limit]
+
+
+@pytest.mark.parametrize("raw,limit,expected", [
+    (" \t\x00" + "<blockquote>" * 5 + "\t\x00\n \t\nx\n\nY \t", 20,
+     ">>>>> \n>>>>> \n>>>>> "),
+    (" " * 40 + "<blockquote>" * 3 + "\x00\n" * 10, 24,
+     ">>> \n>>> \n>>> \n>>> \n>>> "),
+    ("<blockquote>" * 4 + " \t\u2028\x00\n\tA\t\tB\nZ \x85 " * 2, 20,
+     ">>>> \u2028>>>> \n>>>> A B"),
+])
+def test_quote_budget_preserves_truncation_after_whitespace_and_control_cleanup(raw, limit, expected):
+    assert plain_text(raw, limit, mark_blockquotes=True) == expected
+
+
 def _quoted_reply_feed(entry_url, authority="community"):
     body = ("<p>The current reply narrows the measurement to a smaller sample.</p>"
             "<blockquote>The earlier author reported failures across every measured relay.</blockquote>")

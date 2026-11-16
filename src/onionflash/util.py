@@ -113,22 +113,33 @@ def normalize_evidence(text: str) -> str:
 
 
 class _TextParser(HTMLParser):
-    def __init__(self, *, mark_blockquotes: bool = False) -> None:
+    def __init__(self, limit: int, *, mark_blockquotes: bool = False) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self.hidden = 0
         self.mark_blockquotes = mark_blockquotes
         self.quote_depth = 0
         self.line_start = True
+        self.quote_remaining = limit
 
     def _append(self, text: str) -> None:
         """Keep inline text together while marking each visible quoted line."""
         if not self.mark_blockquotes:
             self.parts.append(text)
             return
+        if self.quote_remaining <= 0:
+            return
         for part in text.replace("\r\n", "\n").replace("\r", "\n").splitlines(keepends=True):
             if self.line_start and self.quote_depth and part.strip("\n"):
-                self.parts.append(">" * self.quote_depth + " ")
+                count = min(self.quote_depth, self.quote_remaining)
+                self.parts.append(">" * count)
+                self.quote_remaining -= count
+                # These markers survive all later whitespace/control cleanup.
+                # Once their count reaches the output limit, no suffix can
+                # enter the truncated text, even if earlier whitespace collapses.
+                if not self.quote_remaining:
+                    return
+                self.parts.append(" ")
             self.parts.append(part)
             self.line_start = part.endswith(("\n", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"))
 
@@ -172,7 +183,7 @@ def plain_text(value: object, limit: int, *, html: bool = True, mark_blockquotes
         return ""
     text = value[: limit * 4]
     if html:
-        parser = _TextParser(mark_blockquotes=mark_blockquotes)
+        parser = _TextParser(limit, mark_blockquotes=mark_blockquotes)
         parser.feed(text)
         pending, parts, hidden = parser.rawdata, len(parser.parts), parser.hidden
         parser.close()
