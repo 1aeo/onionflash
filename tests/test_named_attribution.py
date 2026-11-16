@@ -472,3 +472,85 @@ def test_unquoted_reply_evidence_survives_passage_trimming_without_crossing_upda
     assert missing_named_attributions(updated, source, update=True)
     updated["updates"][0]["sources"] = [{"url": "https://example.org/report"}]
     assert not missing_named_attributions(updated, source, update=True)
+
+
+@pytest.mark.parametrize("text,name", [
+    ("Juno **Vale** reported that clients fail.", "Juno Vale"),
+    ("**Juno** Vale reported that clients fail.", "Juno Vale"),
+    ("**Juno Vale** reported that clients fail.", "Juno Vale"),
+    ("Juno *Vale* reported that clients fail.", "Juno Vale"),
+    ("***Juno Vale*** reported that clients fail.", "Juno Vale"),
+    ("**_Juno Vale_** reported that clients fail.", "Juno Vale"),
+    ("__*Juno Vale*__ reported that clients fail.", "Juno Vale"),
+    ("Juno __Vale__ reported that clients fail.", "Juno Vale"),
+    ("_Juno Vale_ reported that clients fail.", "Juno Vale"),
+    ("___Juno Vale___ reported that clients fail.", "Juno Vale"),
+    ("According to Juno **Vale**, clients fail.", "Juno Vale"),
+    ("According to **Juno Vale**, clients fail.", "Juno Vale"),
+    ('Juno **Vale** said: "Clients fail."', "Juno Vale"),
+    ("Ирина **Волкова** reports that clients fail.", "Ирина Волкова"),
+    ("**@juno_vale** reports that clients fail.", "@juno_vale"),
+    ("**@_juno_** reports that clients fail.", "@_juno_"),
+])
+def test_balanced_emphasis_cannot_hide_absent_full_names(text, name):
+    flags = missing_named_attributions(candidate(text), packet())
+    assert flags == [{"field": "title", "name": name, "finding": "literal_name_absent_from_source"}]
+    assert not missing_named_attributions(candidate(text), packet(author=name.lstrip("@")))
+
+
+@pytest.mark.parametrize("text", ["Juno **Vale** supplied the report.", "**Juno Vale** supplied the report.",
+                                  "Juno _Vale_ supplied the report.", "***Juno Vale*** supplied the report."])
+def test_balanced_source_emphasis_matches_the_whole_name_and_retained_history(text):
+    assert not missing_named_attributions(candidate("Juno Vale reports that clients fail."), packet(text, author="other"))
+    assert missing_named_attributions(candidate(text.lower()), packet(), known_names=["Juno Vale"]) == [
+        {"field": "title", "name": "Juno Vale", "finding": "literal_name_absent_from_source"}]
+
+
+@pytest.mark.parametrize("name", ["Juno*Vale", "Juno**Vale", "Juno*Vale*", "Juno_Vale", "@_juno_", "@juno__vale"])
+def test_emphasis_normalization_does_not_split_identifiers_or_author_handles(name):
+    from onionflash.named_attribution import _names
+    if "*" in name:
+        assert _names(f"{name} reports that clients fail.") == []
+    else:
+        assert not missing_named_attributions(candidate(f"{name} reports that clients fail."), packet(author=name.lstrip("@")))
+    for suffix in ("Juno", "Vale"):
+        assert missing_named_attributions(candidate(f"{suffix} reports that clients fail."), packet(name, author="other"))
+        assert missing_named_attributions(candidate(f"{suffix} reports that clients fail."), packet(author=name))
+
+
+@pytest.mark.parametrize("text", ["`_Juno_` reports that clients fail.", "`**Juno Vale** reports that clients fail.`",
+                                  "```text\nJuno **Vale** reports that clients fail.\n```"])
+def test_code_emphasis_is_not_reinterpreted_as_a_new_name(text):
+    from onionflash.named_attribution import _names
+    assert _names(text) == []
+
+
+def test_retained_full_name_cannot_escape_through_emphasis_after_an_applied_repair(context):
+    cfg, store = context
+    draft = {**analysis(), "title": "Juno Vale reports that the source describes a problem."}
+    escaped = verdict("revise", criterion="actor_and_action", repair={"title": "juno **vale**'s account describes the observations."})
+    checker = reviewer(cfg, verdict(), escaped, verdict())
+    with pytest.raises(review.UnsupportedAttributionReview):
+        run(cfg, store, pending(store), Writer(draft), checker)
+    assert checker.calls == 3 and not store.stories()
+    last = json.loads(checker.client.requests[-1]["messages"][1]["content"])
+    assert last["application_attribution_checks"] == [
+        {"field": "title", "name": "Juno Vale", "finding": "literal_name_absent_from_source"}]
+
+
+def test_emphasized_name_blocks_cached_and_final_operator_approval(context):
+    cfg, store = context
+    row = pending(store)
+    draft = {**analysis(), "title": "Juno **Vale** reports that the source describes a problem."}
+    prepared = store.prepare_candidate(row, draft, LATER)
+    insert_approval(store, prepared, policy=review.policy_hash(cfg))
+    checker = reviewer(cfg, verdict("hold", criterion="actor_and_action"))
+    result = run(cfg, store, row, Writer(draft), checker)
+    assert result["status"] == "held" and not result["cache_hit"] and checker.calls == 1
+    row = dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone())
+    prepared = store.prepare_candidate(row, draft, LATER)
+    assert "named_attribution" in review.final_holds(prepared["candidate"], prepared)
+    audit = {"outcome": "operator_approved", "operator_approval": {"reason": "Synthetic approval attempt"}}
+    with pytest.raises(ReviewRequired, match="Named attribution needs literal source evidence"):
+        store.commit_candidate(prepared, prepared["candidate"], "writer-key", LATER, operator=True, review_record=audit)
+    assert not store.stories()

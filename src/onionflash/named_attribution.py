@@ -10,7 +10,7 @@ from .util import safe_canonical_url
 
 # Advance when extraction or source matching changes; review policy binds this.
 NAMED_ATTRIBUTION_POLICY = {
-    "version": 4, "normalization": "NFC-lower-whole-tokens-optional-at-and-organization-article", "maximum_name_words": 4,
+    "version": 5, "normalization": "NFC-lower-whole-tokens-optional-at-and-organization-article", "maximum_name_words": 4,
     "patterns": "named-reporting-clause-or-according-to", "source_scope": "packet-text-unquoted-reply-author-and-sender-domain",
     "repair_context": "rematerialized-missing-name-literals",
 }
@@ -21,6 +21,7 @@ _REPORTING = re.compile(
 _ACCORDING = re.compile(r"\baccording\s+to\s+", re.I)
 _FENCE = re.compile(r"```.*?(?:```|\Z)", re.S)
 _INLINE_CODE = re.compile(r"`([^`\n]*)`")
+_EMPHASIS_PART = re.compile(r"```.*?(?:```|\Z)|`[^`\n]*`|\*+|_+", re.S)
 _URL = re.compile(r"https?://\S+", re.I)
 _DOCUMENT_REFERENCE = re.compile(r"(?:(?:IETF\s+)?RFC\s*[- ]?\d+\b|(?:CVE|TROVE)-\d{4}-\d+\b)", re.I)
 _NARRATIVE_DASH = re.compile(r"—(?=\s*(?:[\"'“”‘’]|who\b))")
@@ -72,7 +73,7 @@ def _word_char(char: str) -> bool:
 
 
 def _joiner(char: str) -> bool:
-    return char in "'‘’.\"“”−-" or unicodedata.category(char) == "Pd"
+    return char in "'‘’.\"“”−-*" or unicodedata.category(char) == "Pd"
 
 
 def _tokens(text: str) -> list[_Word]:
@@ -112,13 +113,47 @@ def _numeric_boundary(word: _Word) -> bool:
     return word.value.isnumeric() or re.fullmatch(r"\d+(?:[._]\d+)*", word.value) is not None
 
 
+def _emphasis_text(text: str) -> str:
+    """Remove balanced word-boundary emphasis, retaining code and literal handles."""
+    parts = list(_EMPHASIS_PART.finditer(text))
+    opened, removed = [], set()
+    previous = 0
+    for index, part in enumerate(parts):
+        marker = part[0]
+        if "\n" in text[previous:part.start()]:
+            opened.clear()
+        previous = part.end()
+        if marker.startswith("`"):
+            opened.clear()
+            continue
+        if len(marker) > 3:
+            continue
+        before = text[part.start() - 1:part.start()]
+        after = text[part.end():part.end() + 1]
+        adjacent_open = bool(opened and opened[-1].end() == part.start())
+        next_part = parts[index + 1] if index + 1 < len(parts) else None
+        adjacent_close = (len(opened) > 1 and next_part is not None
+                          and next_part.start() == part.end() and next_part[0] == opened[-2][0])
+        can_open = bool(after and not after.isspace() and (adjacent_open or not before
+                        or not (_word_char(before) or before in "@\\*_")))
+        can_close = bool(before and not before.isspace() and (adjacent_close or not after
+                         or not (_word_char(after) or after in "@\\*_")))
+        if can_close and opened and opened[-1][0] == marker:
+            opening = opened.pop()
+            removed.update(range(opening.start(), opening.end()))
+            removed.update(range(part.start(), part.end()))
+        elif can_open:
+            opened.append(part)
+    return "".join(char for index, char in enumerate(text) if index not in removed)
+
+
 def _literal_present(name: str, text: str) -> bool:
     """Match whole lexical spans, including marks and numeric dotted handles."""
     wanted = [_normalized(word.value).lstrip("@") for word in _tokens(_normalized(name))]
     # A clear narrative aside/quotation is prose punctuation, not a compound
     # name. Keep this narrower than arbitrary dash normalization, and do not
     # apply it to author/account metadata.
-    source = _normalized(_NARRATIVE_DASH.sub(" ", text))
+    source = _normalized(_NARRATIVE_DASH.sub(" ", _emphasis_text(text)))
     words = _tokens(source)
     def literal(word):
         value = word.value.lstrip("@")
@@ -154,6 +189,7 @@ def _names(text: str) -> list[str]:
     # Code examples are not speaker attributions. Quoted prose remains a claim
     # and is checked; a quotation cannot create source evidence for its speaker.
     text = _FENCE.sub(lambda match: " " * len(match[0]), unicodedata.normalize("NFC", text))
+    text = _emphasis_text(text)
     text = _INLINE_CODE.sub(lambda match: " " + match[1] + " " if _single_token(match[1])
                             else " " * len(match[0]), text)
     # Quoting or styling a name does not remove its attribution. Keep internal
