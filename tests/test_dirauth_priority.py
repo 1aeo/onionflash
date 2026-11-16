@@ -559,6 +559,7 @@ def test_evicted_dirauth_reply_retains_authority_while_deleted_reply_demotes(tmp
     )
 
     def gql_nodes(node_list):
+        """Build a canned GitLab GraphQL issue-notes response."""
         return Response(
             200,
             json.dumps({
@@ -582,6 +583,7 @@ def test_evicted_dirauth_reply_retains_authority_while_deleted_reply_demotes(tmp
         )
 
     def make_node(num: int, username: str, created_at: str, body: str):
+        """Construct one public GitLab GraphQL note node."""
         return {
             "id": f"gid://gitlab/Note/{num}",
             "body": body,
@@ -881,3 +883,174 @@ def test_author_changes_update_item_hash_ingest_source_fingerprint_and_analyzer(
         writer.analyze(dict(payload2))
     sent_user = json.loads(client.requests[0][1]["messages"][1]["content"])
     assert sent_user["author"] == "second_user"
+
+
+def test_dirauth_notes_backfill_keeps_item_hash_and_legacy_review_jobs_remain_valid(tmp_path):
+    """Avoid spurious item_hash changes on dirauth_notes backfill and accept pre-#53 and transitional saved envelopes."""
+    from onionflash import candidate as candidate_mod
+    from onionflash.store import item_hash
+    from onionflash.util import digest
+
+    cfg = make_config(tmp_path)
+    cfg["comments"]["enabled"] = True
+    issue_url = "https://gitlab.torproject.org/tpo/core/tor/-/issues/41980"
+    gitlab_src = {
+        "id": "tor-issues",
+        "name": "Tor issues",
+        "url": "https://gitlab.torproject.org/api/v4/projects/tpo%2Fcore%2Ftor/issues",
+        "gitlab_project": "tpo/core/tor",
+        "kind": "gitlab_issue",
+        "authority": "development",
+        "product": "tor",
+        "enabled": True,
+    }
+    cfg["sources"] = [gitlab_src]
+    observed = "2026-11-12T12:00:00Z"
+
+    arma_comment = {
+        "id": "gid://gitlab/Note/77",
+        "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41980#note_77",
+        "title": "Public comment by @arma",
+        "author": "arma",
+        "created_at": "2026-11-12T10:00:00Z",
+        "body": "Triaged on moria1; low severity.",
+    }
+    h1_with_arma = item(
+        id="tor-issues-41980",
+        source_id="tor-issues",
+        url=issue_url,
+        kind="gitlab_issue",
+        authority="hackerone",
+        title="Descriptor bounds check reported via HackerOne",
+        content="Reported via [HackerOne](https://hackerone.com/reports/3990001).",
+        published_at="2026-11-12T09:00:00Z",
+        updated_at="2026-11-12T10:00:00Z",
+        labels=["Security"],
+        public_comments=[arma_comment],
+    )
+    backfilled = {
+        **h1_with_arma,
+        "dirauth_notes": [{"id": "gid://gitlab/Note/77", "author": "arma", "created_at": "2026-11-12T10:00:00Z"}],
+    }
+    assert item_hash(h1_with_arma) == item_hash(backfilled)
+    assert source_packet.source_fingerprint(h1_with_arma) == source_packet.source_fingerprint(backfilled)
+
+    # 1. Pre-#53 held review_jobs row (binding["item"] computed with BASE_SOURCE_FIELDS, no author/dirauth_notes).
+    legacy_issue = item(
+        source_id="tor-issues",
+        url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/41981",
+        kind="gitlab_issue",
+        authority="development",
+        title="Authority consensus fetch warning",
+        content="Observed a transient warning during consensus fetch.",
+        published_at="2026-11-12T09:00:00Z",
+        updated_at="2026-11-12T09:00:00Z",
+        labels=["Bug"],
+    )
+    legacy_issue.pop("author", None)
+    legacy_issue.pop("dirauth_notes", None)
+    initial_draft = analysis(
+        title="Authority consensus fetch warning",
+        summary="Ticket #41981 notes a transient warning during consensus fetch.",
+        why_it_matters="",
+        confidence="reported",
+        evidence=["Observed a transient warning during consensus fetch."],
+    )
+    updated_draft = analysis(
+        title="Bastet authority operator corroborates consensus fetch warning",
+        summary="Ticket #41981 and @stefani report a consensus fetch warning on bastet.",
+        why_it_matters="",
+        confidence="reported",
+        evidence=["Observed a transient warning during consensus fetch."],
+    )
+
+    with Store(tmp_path / "legacy-job.sqlite3") as store:
+        assert store.ingest(dict(legacy_issue), observed) is True
+        [held_row] = store.pending(1, observed)
+        res_hold = review_gate.process_item(
+            cfg, store, held_row, Writer(initial_draft), Reviewer(verdict("hold")), observed
+        )
+        assert res_hold["status"] == "held"
+
+        # Rewrite binding["item"] with explicit BASE_SOURCE_FIELDS formula to model a pre-#53 saved envelope.
+        job_row = store.db.execute("SELECT envelope_json FROM review_jobs WHERE item_id=?", (held_row["id"],)).fetchone()
+        env = json.loads(job_row["envelope_json"])
+        saved_payload = json.loads(env["row"]["payload"])
+        meta = {k: env["row"].get(k) for k in ("id", "url", "source_id", "content_hash", "cluster_key", "story_id", "status")}
+        pre53_fp = digest([meta, digest({k: saved_payload.get(k) for k in source_packet.BASE_SOURCE_FIELDS})])
+        assert pre53_fp == candidate_mod.item_fingerprint(env["row"])
+        env["binding"]["item"] = pre53_fp
+        with store.db:
+            store.db.execute("UPDATE review_jobs SET envelope_json=? WHERE item_id=?", (json.dumps(env), held_row["id"]))
+
+        # Now comment rotation adds @stefani's dirauth reply + dirauth_notes -> new content_hash, status='pending'.
+        stefani_note = {
+            "id": "gid://gitlab/Note/88",
+            "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41981#note_88",
+            "title": "Public comment by @stefani",
+            "author": "stefani",
+            "created_at": "2026-11-12T11:30:00Z",
+            "body": "Confirmed on bastet.",
+        }
+        enriched_rev = _compose(dict(saved_payload), [stefani_note], "2026-11-12T12:05:00Z", source_key="verified")
+        assert enriched_rev["authority"] == "dirauth-operator"
+        assert "dirauth_notes" in enriched_rev
+        assert store.ingest(enriched_rev, "2026-11-12T12:05:00Z") is True
+        [requeued_row] = store.pending(1, "2026-11-12T12:05:00Z")
+
+        loaded_job, _, _, _, same_source = review_gate._saved_job(store, requeued_row, cfg)
+        assert loaded_job is not None and same_source is False
+
+        res_pub = review_gate.process_item(
+            cfg,
+            store,
+            requeued_row,
+            Writer(updated_draft),
+            Reviewer(verdict("approve"), verdict("approve")),
+            "2026-11-12T12:06:00Z",
+        )
+        assert res_pub["status"] == "published"
+
+    # 2. Transitional #53 held review_jobs row (saved with author/dirauth_notes in SOURCE_FIELDS and dirauth_notes in item_hash).
+    with Store(tmp_path / "transitional-job.sqlite3") as store2:
+        trans_item = {
+            **legacy_issue,
+            "authority": "dirauth-operator",
+            "public_comments": [arma_comment],
+            "dirauth_notes": [{"id": "gid://gitlab/Note/77", "author": "arma", "created_at": "2026-11-12T10:00:00Z"}],
+        }
+        assert store2.ingest(dict(trans_item), observed) is True
+        [t_row] = store2.pending(1, observed)
+        assert review_gate.process_item(cfg, store2, t_row, Writer(initial_draft), Reviewer(verdict("hold")), observed)["status"] == "held"
+
+        # Rewrite saved envelope + record + items row with transitional #53 hashes (including dirauth_notes).
+        t_job = store2.db.execute("SELECT envelope_json, record_json FROM review_jobs WHERE item_id=?", (t_row["id"],)).fetchone()
+        t_env = json.loads(t_job["envelope_json"])
+        t_rec = json.loads(t_job["record_json"])
+        t_payload = json.loads(t_env["row"]["payload"])
+        trans_fields = {k: t_payload.get(k) for k in ("title", "content", "kind", "product", "labels", "authority", "upstream_state")}
+        trans_fields["content"] = t_payload.get("source_content", t_payload.get("content"))
+        trans_fields["public_comments"] = comments.analysis_context(t_payload)[1]
+        trans_fields["dirauth_notes"] = t_payload["dirauth_notes"]
+        trans_hash = digest(trans_fields)
+        t_env["row"]["content_hash"] = trans_hash
+        t_rec["input_hash"] = trans_hash
+        t_meta = {k: t_env["row"].get(k) for k in ("id", "url", "source_id", "content_hash", "cluster_key", "story_id", "status")}
+        t_src_fp = digest({k: t_payload.get(k) for k in (*source_packet.BASE_SOURCE_FIELDS, "author", "dirauth_notes")})
+        t_env["binding"]["item"] = digest([t_meta, t_src_fp])
+        t_env["binding_hash"] = digest(t_env["binding"])
+        t_rec["prepared"]["binding_hash"] = t_env["binding_hash"]
+        for rev_entry in t_rec["reviews"]:
+            rev_entry["binding_hash"] = t_env["binding_hash"]
+        with store2.db:
+            store2.db.execute("UPDATE review_jobs SET envelope_json=?, record_json=? WHERE item_id=?",
+                              (json.dumps(t_env), json.dumps(t_rec), t_row["id"]))
+
+        next_rev = {**t_payload, "content": t_payload["content"] + " Updated authority details.", "updated_at": "2026-11-12T12:10:00Z"}
+        assert store2.ingest(next_rev, "2026-11-12T12:10:00Z") is True
+        [next_row] = store2.pending(1, "2026-11-12T12:10:00Z")
+        loaded_t_job, _, _, _, t_same = review_gate._saved_job(store2, next_row, cfg)
+        assert loaded_t_job is not None and t_same is False
+        assert review_gate.process_item(
+            cfg, store2, next_row, Writer(updated_draft), Reviewer(verdict("approve"), verdict("approve")), "2026-11-12T12:11:00Z"
+        )["status"] == "published"

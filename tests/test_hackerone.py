@@ -358,7 +358,7 @@ def test_source_packet_upgrades_legacy_development_hackerone_item(tmp_path):
 
 def test_prompt_versions_and_hackerone_and_tordev_trusted_operator_rules():
     """Verify bumped prompt versions and presence of HackerOne and tor-dev trusted-operator instructions."""
-    assert analyze.PROMPT_VERSION == "onionflash-19"
+    assert analyze.PROMPT_VERSION == "onionflash-20"
     assert review.REVIEW_VERSION == "onionflash-review-15"
     assert "hackerone" in store_mod.__dict__ or "hackerone" in review_gate.OFFICIAL_AUTHORITIES
     assert "dirauth-operator" in review_gate.OFFICIAL_AUTHORITIES
