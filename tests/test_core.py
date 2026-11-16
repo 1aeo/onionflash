@@ -1,3 +1,5 @@
+"""Core unit tests for text normalization, URLs, storage, collection, transport, and config."""
+
 import copy
 from datetime import datetime, timezone
 import json
@@ -39,10 +41,12 @@ EXAMPLE_TOML = (Path(__file__).parents[1] / "config.example.toml").read_text()
     ("security\ud800 report", "security\ufffd report"),
 ])
 def test_plain_text_and_unicode_normalization(raw, expected):
+    """Strip hidden HTML elements, control characters, and lone surrogates in plain_text."""
     assert plain_text(raw, 100) == expected
 
 
 def test_tag_notice_clean_text_and_surrogate_json_rejection():
+    """Format literal tag notices and reject unpaired surrogate JSON escapes."""
     cleaned = plain_text("v1\r\n<word", 100)
     assert tag_notice(tag(title=cleaned, content=""))["evidence"] == [cleaned]
     with pytest.raises(AnalysisError, match="invalid JSON"):
@@ -57,11 +61,13 @@ def test_tag_notice_clean_text_and_surrogate_json_rejection():
     "https://[64:ff9b::127.0.0.1]/", "https://example.org:0/feed.xml",
 ])
 def test_bad_citation_urls_are_rejected(url):
+    """Reject non-HTTPS, credentialed, local, numeric, or malformed citation URLs."""
     with pytest.raises(ValueError):
         canonical_url(url)
 
 
 def test_gitlab_aliases_url_identities_utc_helpers_and_extra_fields():
+    """Unify GitLab issue/work_item URLs, extract references, and validate UTC timestamps."""
     assert canonical_url("https://gitlab.torproject.org/tpo/core/tor/-/issues/123?utm_source=x") == "https://gitlab.torproject.org/tpo/core/tor/-/work_items/123"
     assert canonical_url("https://[2606:4700:4700::1111]/feed.xml") == "https://[2606:4700:4700::1111]/feed.xml"
     assert canonical_url("https://gitlab.torproject.org/tpo/core/tor/-/issues/123/designs") == "https://gitlab.torproject.org/tpo/core/tor/-/issues/123/designs"
@@ -86,6 +92,7 @@ def test_gitlab_aliases_url_identities_utc_helpers_and_extra_fields():
 
 
 def test_queue_is_durable_idempotent_and_ignores_stale_or_late_defer(tmp_path):
+    """Persist pending items idempotently and ignore stale deferrals after source updates."""
     db = tmp_path / "state.db"
     with Store(db) as store:
         assert store.ingest(item(), DATE)
@@ -118,6 +125,7 @@ def test_queue_is_durable_idempotent_and_ignores_stale_or_late_defer(tmp_path):
 
 
 def test_private_backup_copies_wal_and_cleans_up_failed_partial(tmp_path):
+    """Create mode-0600 SQLite backups and unlink partial files when validation fails."""
     src_db, dest_db = tmp_path / "source.db", tmp_path / "copy.db"
     with Store(src_db) as store:
         store.set_meta(kept="committed")
@@ -132,6 +140,7 @@ def test_private_backup_copies_wal_and_cleans_up_failed_partial(tmp_path):
     original_connect, opened = sqlite3.connect, []
 
     def connect(path, *args, **kwargs):
+        """Intercept SQLite backup destination connection to simulate failed quick_check."""
         if path == partial:
             assert partial.stat().st_mode & 0o777 == 0o600
             raise RuntimeError("simulated destination failure")
@@ -148,6 +157,7 @@ def test_private_backup_copies_wal_and_cleans_up_failed_partial(tmp_path):
 
 
 def test_exact_body_duplicates_release_mirrors_and_older_mirrors(store):
+    """Cluster identical issue bodies and release versions while ignoring older mirror revisions."""
     body = item()["content"] * 3
     for n in (1, 2):
         store.ingest(item(url=f"https://example.org/{n}", content=body), DATE)
@@ -177,6 +187,7 @@ def test_exact_body_duplicates_release_mirrors_and_older_mirrors(store):
 
 
 def test_source_failure_keeps_last_success_and_updates_in_one_statement(store):
+    """Preserve last_success and apply bounded backoff when recording source failures."""
     s = source()
     store.source(s)
     store.source_success(s, {"url": s["url"], "watermark": DATE}, DATE)
@@ -190,6 +201,7 @@ def test_source_failure_keeps_last_success_and_updates_in_one_statement(store):
 
 
 def test_collect_fallback_conditional_cache_and_feed_bounds():
+    """Use conditional GET validators, fall back across mirrors, and cap collected feed items."""
     xml = b'<?xml version="1.0"?><rss version="2.0"><channel><title>News</title><item><title>Hello</title><link>https://example.org/one</link><description>Safe story</description><pubDate>Sun, 08 Nov 2026 10:00:00 GMT</pubDate></item></channel></rss>'
     s = source(fallback_urls=["https://backup.example/feed.xml"])
     res = collect_source(FakeClient([FetchError("HTTP 503", status=503, retryable=True), response(xml, {"etag": "abc"})]), s, {}, DEFAULTS["collection"], DATE)
@@ -214,6 +226,7 @@ def test_collect_fallback_conditional_cache_and_feed_bounds():
     '<?xml version="1.0" encoding="UTF-16"?><!DOCTYPE rss [<!ENTITY x "ENTITY_EXPANDED">]><rss version="2.0"><channel><title>&x;</title></channel></rss>'.encode("utf-16"),
 ])
 def test_malformed_or_entity_feeds_rejected(body):
+    """Reject bozo feeds, DTDs, and XML entity declarations during feed collection."""
     with pytest.raises(CollectionError):
         collect_source(FakeClient([response(body)]), source(), {}, DEFAULTS["collection"], DATE)
 
@@ -229,12 +242,14 @@ _BASE_EXP = "https://example.org/" + "a" * 60000 + "/"
     "<rss>" + ('<a xml:base="' + "a" * 60000 + '/">') * 100 + "</a>" * 100 + "</rss>",
 ])
 def test_xml_base_expansion_rejected_before_feedparser(monkeypatch, bad_base):
+    """Abort feed XML scans when cumulative xml:base growth exceeds limits."""
     monkeypatch.setattr(collect.feedparser, "parse", lambda *a, **kw: pytest.fail("feedparser ran"))
     with pytest.raises(CollectionError, match="xml:base text"):
         collect_source(FakeClient([response(bad_base.encode())]), source(), {}, DEFAULTS["collection"], DATE)
 
 
 def test_xml_guards_before_feedparser_and_accepted_bases(monkeypatch):
+    """Enforce XML element and nesting caps while accepting bounded relative xml:base attributes."""
     item_tpl = '<item data-padding="' + "x" * 40000 + '"><title>Item {n}</title><link>https://example.org/{n}</link></item>'
     xml = f'<rss version="2.0" xml:base="https://example.org/"><channel><title>News</title>{item_tpl.format(n=1)}{item_tpl.format(n=2)}</channel></rss>'
     assert sorted(r["title"] for r in collect_source(FakeClient([response(xml.encode())]), source(), {}, DEFAULTS["collection"], DATE)["items"]) == ["Item 1", "Item 2"]
@@ -252,15 +267,18 @@ def test_xml_guards_before_feedparser_and_accepted_bases(monkeypatch):
 
 
 def gitlab_records(*stamps):
+    """Build synthetic GitLab issue API records for given timestamps."""
     return json.dumps([{"web_url": f"https://example.org/issues/{n}", "title": f"Report {n}", "description": "Body",
                         "created_at": stamp, "updated_at": stamp} for n, stamp in enumerate(stamps)]).encode()
 
 
 def gitlab_queries(client):
+    """Extract parsed query-parameter dictionaries from recorded client requests."""
     return [parse_qs(urlsplit(call[1]).query) for call in client.calls]
 
 
 def test_gitlab_collection_watermarks_ties_and_fallbacks(store):
+    """Step through GitLab updated_at watermarks, same-timestamp tie pages, and fallbacks."""
     client = FakeClient([response(gitlab_records(DATE))])
     res = collect_source(client, source(kind="gitlab_issue"), {}, DEFAULTS["collection"], DATE)
     q0 = gitlab_queries(client)[0]
@@ -310,6 +328,7 @@ def test_gitlab_collection_watermarks_ties_and_fallbacks(store):
 
 
 def test_http_client_request_deadlines_and_retry_after():
+    """Enforce address policy, Retry-After caps, and monotonic request deadlines in HttpClient."""
     calls, sleeps, clock = [], [], [100.0]
     settings = {**DEFAULTS["http"], "retry_attempts": 3, "backoff_base_seconds": 5}
     with HttpClient(settings, transport=httpx.MockTransport(lambda req: calls.append(req) or httpx.Response(503, content=b"busy")),
@@ -344,6 +363,7 @@ def test_http_client_request_deadlines_and_retry_after():
 
 
 def test_run_deadlines_source_budgets_and_endpoint_circuit_breakers(tmp_path, monkeypatch):
+    """Bound per-source collection and reserve analysis time within the run budget."""
     cfg = config(tmp_path)
     patch_cli_pipeline(monkeypatch, now=None, analyzer=ScriptedAnalyzer.factory(), reviewer=ApprovingReviewer,
                        collect=lambda *a: (_ for _ in ()).throw(CollectionError("request deadline reached")), no_build=False)
@@ -360,6 +380,7 @@ def test_run_deadlines_source_budgets_and_endpoint_circuit_breakers(tmp_path, mo
         collected = []
 
         def collect_cut(client, stream, *args):
+            """Advance fake clock during collection to exercise source budget cutoffs."""
             collected.append(stream["id"]); client.deadline_reached = True
             raise CollectionError("request deadline reached")
 
@@ -383,6 +404,7 @@ def test_run_deadlines_source_budgets_and_endpoint_circuit_breakers(tmp_path, mo
 
 
 def test_two_endpoint_failures_leave_the_remaining_rows_untouched(tmp_path, monkeypatch):
+    """Stop analyzing remaining queued items after consecutive retryable LLM endpoint failures."""
     patch_cli_pipeline(monkeypatch, analyzer=lambda *a, **kw: ScriptedAnalyzer(
         lambda p: (_ for _ in ()).throw(AnalysisError("Unavailable", retryable=True))), reviewer=ApprovingReviewer)
     with Store(tmp_path / "state.db") as store:
@@ -395,6 +417,7 @@ def test_two_endpoint_failures_leave_the_remaining_rows_untouched(tmp_path, monk
 
 
 def test_render_failure_ownership_and_build_counts(tmp_path, monkeypatch):
+    """Verify output directory ownership guards and incremental static build artifact counts."""
     cfg = config(tmp_path)
     with Store(tmp_path / "state.db") as store:
         store.source(cfg["sources"][0])
@@ -460,6 +483,7 @@ def test_render_failure_ownership_and_build_counts(tmp_path, monkeypatch):
 
 
 def test_run_lock_and_status_commands(tmp_path, capsys):
+    """Acquire exclusive run locks and report JSON status summaries via the CLI."""
     with run_lock(str(tmp_path / "db")) as first, run_lock(str(tmp_path / "db")) as second:
         assert first and not second
     cfg_path = tmp_path / "config.toml"
@@ -495,6 +519,7 @@ def test_run_lock_and_status_commands(tmp_path, capsys):
     ('["ftp://backup.example/v1"]', "   ", "Invalid LLM base URL"),
 ])
 def test_invalid_fallback_base_urls_rejected(tmp_path, monkeypatch, fb, env_val, match):
+    """Reject non-HTTPS, private, or empty fallback LLM endpoint URLs."""
     monkeypatch.setenv("ONIONFLASH_LLM_BASE_URL", "https://model.example/v1")
     monkeypatch.setenv("ONIONFLASH_LLM_FALLBACK_URL", env_val)
     p = tmp_path / "config.toml"
@@ -504,6 +529,7 @@ def test_invalid_fallback_base_urls_rejected(tmp_path, monkeypatch, fb, env_val,
 
 
 def test_example_config_and_validation_guards(tmp_path, monkeypatch):
+    """Validate config.example.toml and reject out-of-range or malformed TOML settings."""
     p = tmp_path / "config.toml"
     p.write_text(EXAMPLE_TOML)
     monkeypatch.setenv("ONIONFLASH_LLM_BASE_URL", "https://model.example/v1")
@@ -537,6 +563,7 @@ def test_example_config_and_validation_guards(tmp_path, monkeypatch):
 
 
 def test_only_operator_settings_are_configurable_and_the_rest_are_ignored(tmp_path, caplog):
+    """Ignore unknown internal keys while applying documented operator configuration fields."""
     path = tmp_path / "config.toml"
     path.write_text('[collection]\nlookback_days = 3\n[http]\nretry_attempts = 7\n'
                     '[storage]\nrender_batch_size = 7\n[llm]\nmax_items_per_run = 20\nenable_thinking = true\n'
@@ -561,6 +588,7 @@ def test_only_operator_settings_are_configurable_and_the_rest_are_ignored(tmp_pa
 @pytest.mark.parametrize("base", ["javascript:bad", "https://example.com/x/../", "https://example.com/%2e%2e/",
                                   "https://example.com/?token=secret", "https://secret@example.com/"])
 def test_bad_base_url_and_traversal_are_rejected(tmp_path, base):
+    """Reject non-HTTPS site base URLs and path-traversal storage paths."""
     path = tmp_path / "config.toml"
     path.write_text(f'[site]\nbase_url = "{base}"\n[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
     with pytest.raises(ValueError, match="base_url"):
@@ -569,14 +597,24 @@ def test_bad_base_url_and_traversal_are_rejected(tmp_path, base):
 
 @pytest.mark.parametrize("base", ["https://example.com/news?", "https://example.com/news/#", "https://example.com/news"])
 def test_base_url_is_normalized_to_a_clean_directory(tmp_path, base):
+    """Normalize site.base_url to end with a single trailing slash."""
     path = tmp_path / "config.toml"
     path.write_text(f'[site]\nbase_url = "{base}"\n[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
     assert load_config(path)["site"]["base_url"] == "https://example.com/news/"
 
 
 def test_story_precedence_legacy_stories_and_added_at(tmp_path):
+    """Preserve story source-tier upgrades, dated updates, and chronological ordering."""
+    def known_update(store, url):
+        # These fixtures exercise prose precedence after same-event association.
+        with store.db:
+            store.db.execute("UPDATE items SET story_id=? WHERE url=?", (store.stories(1)[0]["id"], url))
+
     def pub_arti(store, url, updated, draft, content=item()["content"]):
+        """Ingest and publish a synthetic Arti story revision for precedence tests."""
         store.ingest(item(url=url, title="Arti 2.8.0 released", updated_at=updated, kind="feed", content=content, product="arti"), updated)
+        if "update" in draft:
+            known_update(store, url)
         finish_reviewed(store, next(r for r in store.pending(10, updated) if r["url"] == url), draft, "key-" + url + updated, updated)
         return store.stories(10)
 
@@ -593,7 +631,10 @@ def test_story_precedence_legacy_stories_and_added_at(tmp_path):
         assert [e["text"] for e in stories[0]["updates"]] == ["Arti 2.8.0 release checklist completed.", "Update: the release was withdrawn."]
 
     def pub_tor(store, url, updated, draft):
+        """Ingest and publish a synthetic Tor story revision for precedence tests."""
         store.ingest(item(url=url, title="Tor 0.4.9.17 released", updated_at=updated, kind="feed", content=url), updated)
+        if "update" in draft:
+            known_update(store, url)
         finish_reviewed(store, next(r for r in store.pending(10, updated) if r["url"] == url), draft, "k" + url, updated)
         return store.stories(10)[0]
 
@@ -616,6 +657,7 @@ def test_story_precedence_legacy_stories_and_added_at(tmp_path):
         store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (legacy["id"], item_cluster(item(title="Tor 0.4.9.18 released", kind="feed")), json.dumps(legacy), DATE, legacy["updated_at"]))
         for idx, stamp in enumerate([later, latest]):
             store.ingest(item(url=f"https://new.example/{idx}", title="Tor 0.4.9.18 released", kind="feed", content=f"Follow-up {idx} notes.", updated_at=stamp), stamp)
+            known_update(store, f"https://new.example/{idx}")
             finish_reviewed(store, next(r for r in store.pending(10, stamp) if r["url"].endswith(str(idx))),
                             update_analysis(update=f"Item {idx}.", evidence=[f"Follow-up {idx} notes."]), f"k{idx}", stamp)
         ls = store.stories(10)[0]
@@ -668,11 +710,13 @@ def test_story_precedence_legacy_stories_and_added_at(tmp_path):
     )],
 ])
 def test_release_clusters_include_two_part_versions_and_alpha_suffixes(title, kind, product, expected):
+    """Cluster product release announcements while keeping delays and EOL notices separate."""
     cluster = item_cluster({"title": title, "kind": kind, "product": product, "content": "", "url": "https://example.org/" + title})
     assert cluster.startswith("url:") if expected == "url:" else cluster == expected
 
 
 def test_feed_item_titles_dates_and_non_permalink_guids():
+    """Normalize HTML/plain feed titles, clamp future dates, and skip non-permalink GUIDs."""
     stream = source(kind="gitlab_issue")
     assert _item(stream, "https://example.org/1", "Use Vec<u8> instead of String", "", DATE, DATE, title_html=False)["title"] == "Use Vec<u8> instead of String"
     assert _item(stream, "https://example.org/2", "A <b>bold</b> claim", "", DATE, DATE)["title"] == "A bold claim"
@@ -699,6 +743,46 @@ def test_feed_item_titles_dates_and_non_permalink_guids():
     assert collect_source(FakeClient([response(guid_xml)]), source(), {}, DEFAULTS["collection"], DATE)["items"] == []
 
 
+def test_configured_forum_announcements_keep_operational_context(tmp_path, monkeypatch):
+    monkeypatch.setenv("ONIONFLASH_LLM_BASE_URL", "https://model.example/v1")
+    path = tmp_path / "config.toml"
+    path.write_text(EXAMPLE_TOML)
+    stream = next(s for s in load_config(path)["sources"] if s["id"] == "tor-release-announcements")
+    assert stream["enabled"] and stream["kind"] == "feed"
+    assert stream["authority"] == "official" and stream["product"] == "tor"
+    assert stream["url"] == "https://forum.torproject.org/c/news/tor-release-announcement/28.rss"
+
+    url = "https://forum.torproject.org/t/security-release-0-4-9-17/22454"
+    # Discourse category RSS shape, with paraphrased announcement text.
+    xml = (f'<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">'
+           f'<channel><title>Tor Release Announcement</title><link>{stream["website_url"]}</link>'
+           '<description>Release announcements</description><item><title>Security Release 0.4.9.17</title>'
+           f'<link>{url}</link><dc:creator><![CDATA[dgoulet]]></dc:creator>'
+           '<pubDate>Fri, 13 Nov 2026 19:35:15 +0000</pubDate>'
+           '<guid isPermaLink="false">forum.torproject.org-topic-22454</guid><description><![CDATA['
+           '<p>The release improves IPv6-related relay DoS protections.</p>'
+           '<p>The ongoing circuit flood affects relay operators across the network.</p>'
+           '<p>Additional defenses are being assessed, with further releases expected soon.</p>'
+           '<p><strong>Relay operators are asked to upgrade promptly.</strong> No subsequent action is requested.</p>'
+           '<p><small>1 post - 1 participant</small></p>'
+           f'<p><a href="{url}">Read full topic</a></p>]]></description></item></channel></rss>').encode()
+    result = collect_source(FakeClient([response(xml, url=stream["url"])]), stream, {}, DEFAULTS["collection"],
+                            "2026-11-15T12:00:00Z")
+    assert len(result["items"]) == 1
+    entry = result["items"][0]
+    assert entry["url"] == url and entry["title"] == "Security Release 0.4.9.17"
+    assert entry["published_at"] == entry["updated_at"] == "2026-11-13T19:35:15Z"
+    assert entry["authority"] == "official" and entry["product"] == "tor"
+    for text in ("The ongoing circuit flood affects relay operators across the network.",
+                 "Additional defenses are being assessed, with further releases expected soon.",
+                 "Relay operators are asked to upgrade promptly.", "No subsequent action is requested."):
+        assert text in entry["content"]
+    # The same author and host on an ordinary community stream confer no authority.
+    community = {**stream, "authority": "community"}
+    assert collect_source(FakeClient([response(xml, url=stream["url"])]), community, {}, DEFAULTS["collection"],
+                          "2026-11-15T12:00:00Z")["items"][0]["authority"] == "community"
+
+
 def _list_rss(*author_xml: str) -> bytes:
     entries = "".join(f'<item><title>Message {n}</title><link>https://lists.torproject.org/m/{n}/</link>'
                       f'<description>Body</description>{xml}<pubDate>Sun, 08 Nov 2026 12:00:00 GMT</pubDate></item>'
@@ -714,6 +798,7 @@ def _collected_items(body: bytes, *, src_url: str = LIST_URL, final_url: str = L
 
 
 def test_a_torproject_org_sender_on_the_list_archive_is_project_sender():
+    """Classify verified HyperKitty @torproject.org RSS authors as project-sender."""
     items = _collected_items(_list_rss(
         "<author>dev＠torproject.org (A Developer)</author>",
         "<author>Dev.Name+x_1-2＠TorProject.ORG</author>",
@@ -766,10 +851,12 @@ def test_a_torproject_org_sender_on_the_list_archive_is_project_sender():
     (["<author>dev＠torproject.org (Dev)</author>"], "https://lists.torproject.org.example.org/feed/"),
 ])
 def test_names_lookalikes_and_other_hosts_never_make_a_sender_project_sender(author_entries, final_url):
+    """Reject spoofed display names, homoglyphs, subdomains, and non-HyperKitty hosts."""
     assert all(e["authority"] == "community" for e in _collected_items(_list_rss(*author_entries), final_url=final_url))
 
 
 def test_atom_and_namespaced_items_never_make_a_sender_project_sender():
+    """Keep Atom and mixed-namespace feed entries at community authority."""
     atom = (b'<feed xmlns="http://www.w3.org/2005/Atom"><title>T</title><id>urn:t</id><updated>2026-11-08T12:00:00Z</updated>'
             b'<entry><title>Msg</title><link href="https://lists.torproject.org/m/1/"/><id>urn:1</id>'
             b'<updated>2026-11-08T12:00:00Z</updated><author><name>dev\xef\xbc\xa0torproject.org</name>'
@@ -785,6 +872,7 @@ def test_atom_and_namespaced_items_never_make_a_sender_project_sender():
 @pytest.mark.parametrize("error, where", [(RuntimeError("unexpected parser crash"), "RuntimeError at test_core.py:"),
                                           (CollectionError("unexpected parser crash", [{"title": "No URL"}]), "KeyError at ")])
 def test_an_unexpected_source_error_is_recorded_and_other_sources_still_run(tmp_path, monkeypatch, error, where):
+    """Sanitize unexpected collector exceptions while continuing other configured sources."""
     cfg = config(tmp_path, sources=[source(id="broken", url="https://broken.example/feed.xml"), source(id="fine")])
     patch_cli_pipeline(monkeypatch, now=None, reviewer=None,
                        collect=lambda client, stream, *args: (_ for _ in ()).throw(error) if stream["id"] == "broken" else {"items": [], "url": stream["url"]})
@@ -800,6 +888,7 @@ def test_an_unexpected_source_error_is_recorded_and_other_sources_still_run(tmp_
     b'{"x":23456789012E666}', b'{"x":-23456789012E666}',
 ])
 def test_a_saved_object_nests_at_most_the_cap_and_holds_no_lone_surrogate(bad_raw):
+    """Reject over-deep JSON structures, non-finite numbers, and lone surrogates in saved_object."""
     within = b'{"x":' + b"[" * (MAX_SAVED_DEPTH - 1) + b"]" * (MAX_SAVED_DEPTH - 1) + b"}"
     assert saved_object(within) is not None and saved_object(b'{"x":"\\ud83d\\ude00"}') == {"x": "\U0001f600"}
     assert saved_object(bad_raw) is None
@@ -808,6 +897,7 @@ def test_a_saved_object_nests_at_most_the_cap_and_holds_no_lone_surrogate(bad_ra
 
 
 def test_number_sources_assigns_sequential_ids_over_caller_keys():
+    """Overwrite caller-supplied IDs with sequential S<i> and S<i>:P<j> identifiers."""
     from onionflash.source_packet import number_sources
 
     numbered = number_sources([({"id": "custom", "url": "https://example.org/a"}, [{"id": "P99", "text": "body"}])])
@@ -816,6 +906,7 @@ def test_number_sources_assigns_sequential_ids_over_caller_keys():
 
 @pytest.mark.parametrize("kind", [*DAMAGE, "blob", "undated"])
 def test_collection_replaces_a_damaged_saved_copy(store, caplog, kind):
+    """Heal damaged saved item payloads during collection without spurious re-queueing."""
     entry = lambda **kw: item(kind="feed", **kw)
     store.ingest(entry(), DATE)
     item_id = store.db.execute("SELECT id FROM items").fetchone()[0]
@@ -830,6 +921,7 @@ def test_collection_replaces_a_damaged_saved_copy(store, caplog, kind):
 
 @pytest.mark.parametrize("kind", [*DAMAGE, "blob"])
 def test_pending_reports_a_damaged_saved_copy_without_reading_or_changing_it(store, kind):
+    """Return damaged markers from Store.pending without mutating database rows."""
     store.ingest(item(url="https://example.org/damaged"), DATE)
     store.ingest(item(url="https://example.org/intact", content="An intact report."), DATE)
     damaged_id, intact_id = (store.db.execute("SELECT id FROM items WHERE url=?", (u,)).fetchone()[0] for u in ("https://example.org/damaged", "https://example.org/intact"))
@@ -842,6 +934,7 @@ def test_pending_reports_a_damaged_saved_copy_without_reading_or_changing_it(sto
 
 @pytest.mark.parametrize("kind", ["invalid-utf8", "blob", "escaped-surrogate"])
 def test_a_run_rejects_a_damaged_pending_item_without_a_model_call_and_still_builds(context, monkeypatch, kind):
+    """Mark damaged pending items rejected during cli.run and complete static site builds."""
     cfg, store = context
     cfg["sources"] = []
     writer = ScriptedAnalyzer()
@@ -859,6 +952,7 @@ def test_a_run_rejects_a_damaged_pending_item_without_a_model_call_and_still_bui
 
 @pytest.mark.parametrize("kind", ["invalid-json", "invalid-utf8"])
 def test_a_partial_collection_with_a_damaged_saved_copy_still_analyzes_and_builds(context, monkeypatch, kind):
+    """Ingest partial collection items and heal damaged rows when a source hits a deadline."""
     cfg, store = context
     collected = [item(url="https://example.org/damaged", content="A changed report."), item(url="https://example.org/next")]
     patch_cli_pipeline(monkeypatch, now=None, analyzer=ScriptedAnalyzer.factory(), reviewer=ApprovingReviewer,
@@ -871,6 +965,7 @@ def test_a_partial_collection_with_a_damaged_saved_copy_still_analyzes_and_build
 
 
 def test_trusted_operator_domains_defaults_overrides_and_validation(tmp_path):
+    """Validate default, custom, normalized, and malformed trusted_operator_domains lists."""
     assert DEFAULTS["collection"]["trusted_operator_domains"] == [
         "1aeo.com", "applied-privacy.net", "appliedprivacy.net", "artikel10.org",
         "dfri.se", "nothingtohide.nl", "prsv.ch", "quintex.com", "unredacted.org",
@@ -902,6 +997,7 @@ def test_trusted_operator_domains_defaults_overrides_and_validation(tmp_path):
 
 
 def test_trusted_operator_sender_authority_and_spoofing_guards():
+    """Assign trusted-operator and sender_domain only to verified HyperKitty domains."""
     items = _collected_items(_list_rss(
         "<author>tor＠1aeo.com (Operator One)</author>",
         "<author>tor＠appliedprivacy.net (Operator Two)</author>",
@@ -917,7 +1013,12 @@ def test_trusted_operator_sender_authority_and_spoofing_guards():
         "trusted-operator", "trusted-operator", "trusted-operator", "project-sender",
         "community", "community", "community", "community", "community",
     ]
-    assert all("1aeo.com" not in json.dumps(entry).lower() and "＠" not in json.dumps(entry) for entry in items)
+    assert [entry.get("sender_domain") for entry in items] == [
+        "1aeo.com", "appliedprivacy.net", "relays.applied-privacy.net", "torproject.org",
+        None, None, None, None, None,
+    ]
+    assert all("tor@1aeo.com" not in json.dumps(entry).lower() and "＠" not in json.dumps(entry) for entry in items)
+    assert all("1aeo.com" not in json.dumps(entry).lower() for entry in items[4:])
     assert _collected_items(_list_rss("<author>attacker＠example.org (tor@appliedprivacy.net)</author>"))[0]["authority"] == "community"
 
     spoof_body = (
@@ -952,6 +1053,7 @@ def test_trusted_operator_sender_authority_and_spoofing_guards():
     {"content": None},
     {"source_content": 99},
     {"author": 123},
+    {"sender_domain": 123},
     {"comments_truncated": "yes"},
     {"labels": "Security"},
     {"labels": [123]},
@@ -963,6 +1065,7 @@ def test_trusted_operator_sender_authority_and_spoofing_guards():
     {"dirauth_notes": [{"author": "stefani", "created_at": DATE}]},
 ])
 def test_ingest_replaces_saved_items_with_damaged_fields_or_comments(store, caplog, broken_patch):
+    """Replace saved items containing malformed scalar, comment, or dirauth_notes fields."""
     entry = lambda **kw: item(kind="gitlab_issue", **kw)
     store.ingest(entry(), DATE)
     row = store.db.execute("SELECT id, payload FROM items").fetchone()

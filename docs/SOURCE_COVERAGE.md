@@ -17,6 +17,7 @@ protocol changes. The additional configured streams are:
 | [Tor Metrics Timeline repository](https://gitlab.torproject.org/tpo/network-health/metrics/timeline) | `tor-metrics-news`, enabled | Curated event rows from the maintained README; validated repository snapshots replace the stale Atom feed. |
 | [Tor Project Development Mailing List](https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/) | `tor-dev`, enabled | An RFC on `tor-dev` (numbered Tor proposal, `[RFC]` subject, or IETF Internet-Draft or RFC posted for comment) is news from any sender; a formal `[Proposal]`, technical critique, protocol review, or empirical multi-relay measurement from a `project-sender` or `trusted-operator` address is news (keeping `confidence` `reported`); and other `community` messages need an RFC/numbered proposal or concrete adoption/merge. |
 | [Tor Project Consensus Health Alerts](https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/) | `tor-consensus-health`, enabled (`alert_format = "consensus"`, `publish = false`) | Sustained consensus-health anomalies from DocTor rendered with fixed templates, never sent to the model writer queue. |
+| [Tor Project Forum Release Announcements](https://forum.torproject.org/c/news/tor-release-announcement/28) | `tor-release-announcements`, enabled | Official announcement prose can add incident scope, response plans and relay-operator instructions beyond the release notes; novelty follows the [publication review](FINAL_REVIEW.md#selection-and-grounding). |
 
 On `lists.torproject.org` archives whose RSS items carry HyperKitty's `local＠domain`
 `<author>` element, an entry from an exact `torproject.org` address is classified
@@ -49,6 +50,18 @@ announcements or promise comprehensive vulnerability coverage.
 All source URLs, fallback URLs, intervals and enable flags are editable in TOML.
 The REST issue-note API currently returns 401 anonymously. The optional public
 GraphQL discussion adapter below reads verified public notes without authentication.
+
+### Tor forum release announcements
+
+The category RSS feed was checked on November 15, 2026. Each entry contains the
+topic's opening announcement, publication date and topic permalink; replies are
+not included, even when the topic has multiple posts. The existing RSS collector
+keeps the announcement body, including operational context and future plans.
+`official` describes this selected release-announcement stream, not the forum as
+a whole, a display name, or community replies. The stream is separate from
+`tor-announce` because announcements need not have identical text across channels.
+Existing installations can add its source block from `config.example.toml` to
+their configuration.
 
 ### Anonymous public GitLab discussion updates
 

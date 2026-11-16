@@ -205,3 +205,20 @@ def test_audit_reason_validation_participates_in_review_policy_identity(monkeypa
     before = review.policy_hash(DEFAULTS)
     monkeypatch.setitem(impact_audit.POLICY, "reason_repetition", "changed-validation-contract")
     assert review.policy_hash(DEFAULTS) != before
+
+
+def test_reply_audit_preserves_sender_boundary_and_earlier_quoted_context():
+    source = packet()
+    source["sources"][0].update(
+        unquoted_content="Please submit the proposed change for review.",
+        sender_domain="example.org")
+    source["sources"][0]["passages"][0]["text"] = (
+        "> Earlier author: The failure interrupts downloads.\n"
+        "Please submit the proposed change for review.")
+    checker = CompletionStub(result("unsupported"))
+    impact_audit.audit(checker, CANDIDATE, source, on_request=None)
+    prompt, payload, _, _ = checker.requests[0][0]
+    assert payload["packet"] == source
+    assert "unquoted_content" in prompt
+    assert "quoted earlier" in prompt and "cannot supply this reply's impact" in prompt
+    assert "another supplied source" in prompt

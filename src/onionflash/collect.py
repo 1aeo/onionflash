@@ -271,6 +271,10 @@ def _feed(
             sender_auth := _sender_authority(rss_authors[index], settings.get("trusted_operator_domains", ()))
         ) is not None:
             item["authority"] = sender_auth
+            if sender_auth in {"project-sender", "trusted-operator"} and (
+                sender_addr := _hyperkitty_address(rss_authors[index])
+            ):
+                item["sender_domain"] = sender_addr.lower().partition("@")[2]
         # Some Atom archives omit alternate links and reuse an ID for distinct
         # events. Do not silently choose one event when that fallback is ambiguous.
         has_alternate = any(

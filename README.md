@@ -244,8 +244,9 @@ fresh verification. See
   hosting alone does not establish confirmation. Tags are marked `tagged`, and a
   story told only by merge requests is `merged`. A later tag cannot downgrade an
   already announced release. See the [final checks](docs/FINAL_REVIEW.md#final-checks).
-- Matching release versions/products, identical titled issue bodies, and
-  canonical URLs provide conservative duplicate grouping, and reviewer-confirmed
+- Identical titled issue bodies and canonical URLs provide conservative duplicate
+  grouping. Release versions/products relate prose announcements for review,
+  while new announcement URLs retain separate story identities. Reviewer-confirmed
   same-event candidates attach to existing stories instead of opening second
   headlines (see [editorial controls](docs/EDITORIAL.md)). Semantic similarity
   alone does not combine unrelated incidents. Follow-ups add short dated updates

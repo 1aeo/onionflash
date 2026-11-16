@@ -56,8 +56,12 @@ def timeline_item(**changes):
     )
 
 
-def finish_tl(store, incoming, result):
+def finish_tl(store, incoming, result, *, target=None):
     assert store.ingest(incoming, DATE)
+    if target is not None:
+        # Exercise assembly after same-story review selected the timeline article.
+        with store.db:
+            store.db.execute("UPDATE items SET story_id=? WHERE id=?", (target, incoming["id"]))
     stored = dict(store.db.execute("SELECT * FROM items WHERE id=?", (incoming["id"],)).fetchone())
     finish_reviewed(store, stored, result, incoming["id"] + result.get("summary", result.get("update", "")), DATE)
     return store.stories(10)[0]
@@ -241,7 +245,8 @@ def test_timeline_store_continuity_release_protection_and_clock_skew(tmp_path):
 
     with Store(tmp_path / "db3") as store:
         first = finish_tl(store, ctx_item, analysis(summary="Brief timeline context."))
-        final = finish_tl(store, primary, analysis(summary="Detailed official release announcement.", state="released", confidence="confirmed"))
+        final = finish_tl(store, primary, analysis(summary="Detailed official release announcement.", state="released", confidence="confirmed"),
+                          target=first["id"])
         assert len(store.stories(10)) == 1 and final["id"] == first["id"]
         assert final["summary"] == "Detailed official release announcement."
         assert final["editorial_kind"] == "feed" and final["published_at"] == first["published_at"]

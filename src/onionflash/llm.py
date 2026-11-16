@@ -145,6 +145,37 @@ def unquoted_text(text: str) -> str:
     return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith(">"))
 
 
+_MAIL_QUOTE_INTRO_RE = re.compile(
+    r"^(?:on\s+.+\bwrote:|am\s+.+\bschrieb\b.*:|le\s+.+\ba\s+écrit\s*:|[- ]*original message[- ]*|from:\s+.+)$",
+    re.IGNORECASE,
+)
+
+
+def unquoted_mail_text(text: str) -> str:
+    """Strip >-quoted reply lines and quote-attribution headers preceding them."""
+    lines = text.splitlines()
+    drop = [line.lstrip().startswith(">") for line in lines]
+    for index in range(len(lines) - 1, -1, -1):
+        if drop[index] or not (stripped := lines[index].strip()):
+            continue
+        probe = index + 1
+        while probe < len(lines) and not lines[probe].strip():
+            probe += 1
+        if (probe == len(lines) or drop[probe]) and _MAIL_QUOTE_INTRO_RE.match(stripped):
+            drop[index] = True
+            continue
+        if index + 1 < len(lines) and not drop[index + 1] and (next_line := lines[index + 1].strip()):
+            probe2 = index + 2
+            while probe2 < len(lines) and not lines[probe2].strip():
+                probe2 += 1
+            if (probe2 == len(lines) or drop[probe2]) and re.match(
+                r"^on\s+.+\bwrote:$", f"{stripped} {next_line}", re.IGNORECASE
+            ):
+                drop[index] = drop[index + 1] = True
+    kept = "\n".join(line for line, remove in zip(lines, drop) if not remove)
+    return re.sub(r"\n{3,}", "\n\n", kept).strip()
+
+
 def label_limits(sources: list[dict]) -> dict:
     """The confidence, state and category labels a story told by these sources may carry: confirmed
     needs an official source that is not a tag, or a merged merge request; tagged needs a tag
@@ -162,6 +193,7 @@ def label_limits(sources: list[dict]) -> dict:
 def apply_label_limits(properties: dict, limits: dict, *, nullable: bool = False) -> None:
     """Restrict schema enum choices in place to the labels allowed by source limits."""
     def rule(field: str) -> dict:
+        """Select the target property schema dictionary for nullable or required fields."""
         return properties[field]["anyOf"][0] if nullable else properties[field]
 
     for key, allowed in limits.items():
@@ -181,6 +213,7 @@ def repair_schema(fields: dict, required: tuple[str, ...]) -> dict:
 def json_object(text: str, code: str = "writer.invalid_json") -> dict:
     """Parse a strict UTF-8 JSON object without duplicate keys, surrogates or NaNs."""
     def unique(pairs):
+        """Reject duplicate object keys while constructing a JSON dictionary."""
         result = {}
         for key, value in pairs:
             if key in result:

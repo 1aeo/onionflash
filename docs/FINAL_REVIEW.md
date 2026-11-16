@@ -14,7 +14,26 @@ maintenance, template checklists, acknowledgments, unsupported speculation and
 repeated quotations do not merit standalone news. A later timestamp or another
 distribution channel does not make an old event new.
 
-The application enforces that for new stories before any model request. An item
+An official announcement can add news beyond its release notes: new facts about an
+ongoing attack, affected operators, mitigation work being evaluated or further
+response releases being anticipated. Compare those facts with the supplied prior
+coverage, not just the version or channel. Preserve plans as attributed plans;
+they do not establish shipped defenses, effectiveness, a release date or resolution.
+New official response announcements receive their own article even when the
+release and ongoing attack already have coverage. The reviewer reads the full
+source before routing it; shared versions do not force that new development into
+the release story. Material new facts also remain eligible in updates of sources
+already attached to an article. When a draft repeats the release but omits material
+new response information, the reviewer repairs or holds it instead of skipping the
+source as a duplicate. Announcements whose substantive facts are already covered
+still skip or join the story covering those facts.
+For a new official feed announcement with a release-version hint, passing the
+new-information check prevents routing into an already released story. A later
+verification that disagrees about novelty holds the candidate before it can change
+the target. Duplicate notices can still attach, as can announcements upgrading a
+tag-only story; existing source mappings retain their history.
+
+The application enforces recency for new stories before any model request. An item
 that would start a story is ignored, as `skipped.gate.not_recent`, when its newest
 dated development is more than 14 days older than the collection of its current
 revision, unless it is a HackerOne disclosure or an issue labeled `Security` with
@@ -93,11 +112,12 @@ anchor. Minimal directly governing supplied context may resolve referents and
 preserve audience, conditions, scope, timing, lifecycle and disagreement; it does
 not permit assembling additional consequences from other passages. Most drafts
 leave it empty. Validation clears a sentence with a
-number or version absent from the title, content and comment bodies the writer
-saw (source metadata does not count), on an untrusted `community`
+number or version absent from the title, unquoted reply text or content and comment
+bodies the writer saw (source metadata does not count), on an untrusted `community`
 `lists.torproject.org` post, or when it contains unnormalized all-caps shouting
 or a nonexistent three-part C-Tor version; drafts with unnormalized all-caps
-shouting in the headline, summary or update are refused.
+shouting in the headline, summary or update, or mailing-list reply evidence quoting
+only `>`-quoted history are refused.
 Historical impact text remains readable. A review repair may clear it, but cannot
 create or rewrite an impact paragraph; operator corrections remain separate.
 Automatic approvals also require consistent metadata: a `release` category or
@@ -112,7 +132,12 @@ most one live story in fixed order: `items.story_id`, retired/merged aliases,
 GitLab merge-request closing references (when unique), and same-source
 HyperKitty replies within 45 days sharing at least a three-word normalized
 subject (when unique); ambiguous matches stay unattached and surface as
-`related` entries. Relations compare source tier: a version tag joining a story
+`related` entries. For an unmapped feed announcement, a release-version cluster
+is only a related-coverage hint: its URL supplies the new story identity and the
+reviewer decides whether it reports the same event. Existing item mappings,
+original source citations and permanent aliases retain their histories. A later
+tag's mapped-release fallback considers only tagged or released stories, never a
+developing response article. Relations compare source tier: a version tag joining a story
 already in state `tagged` or `released` (or a fixed-text network-health alert)
 is a `citation` (adding its collected source metadata with zero writer or review
 calls and leaving prose, labels and `updated_at` unchanged), while a version tag

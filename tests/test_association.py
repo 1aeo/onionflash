@@ -11,7 +11,7 @@ from helpers import (
 from onionflash import candidate, editorial, rejection, review, review_gate
 from onionflash.analyze import tag_notice
 from onionflash.config import DEFAULTS
-from onionflash.util import digest, gitlab_refs, item_cluster, release_mentions, thread_subject
+from onionflash.util import digest, gitlab_refs, item_cluster, release_mentions, story_cluster, thread_subject
 
 LIST_BASE = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/"
 OTHER_LIST_BASE = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/"
@@ -169,6 +169,210 @@ def test_remapped_item_cluster_associates_to_survivor_without_recreating_removed
     assert prepared["candidate"]["id"] == survivor["id"] != removed_id
 
 
+@pytest.mark.parametrize("title", ["Security Release 0.4.9.17", "Tor 0.4.9.17 released"])
+def test_release_announcement_can_publish_distinct_incident_development(context, title):
+    cfg, store = context
+    tag = item(kind="tag", authority="official", title="tor-0.4.9.17", content="",
+               url="https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-0.4.9.17")
+    release = _publish(store, tag)
+    incoming = item(kind="feed", authority="official", product="tor", title=title,
+                    url="https://forum.torproject.org/t/security-release-0-4-9-17/22454",
+                    content="The announcement describes an ongoing relay attack and evaluation of further defenses.")
+    row = pending(store, incoming)
+    assert row["cluster_key"] == "release:tor:0.4.9.17"
+    assert candidate.associate(store.db, row) == (None, None)
+    draft = analysis(title="Tor evaluates additional defenses against relay attack", summary=incoming["content"],
+                     why_it_matters="", category="dos", tags=["dos"], confidence="confirmed",
+                     evidence=[incoming["content"]])
+    prepared = store.prepare_candidate(row, draft, LATER)
+    assert prepared["coverage"]["prior_story"] is None
+    assert prepared["cluster_key"] == story_cluster(incoming)
+    assert prepared["cluster_key"].startswith("url:")
+    assert (release["id"], "mentions tor 0.4.9.17") in candidate.related(store.db, row, incoming)
+    assert run_gate(cfg, store, row, Writer(draft), Reviewer(verdict()))["status"] == "published"
+    assert len(store.stories()) == 2
+    original = next(s for s in store.stories() if s["id"] == release["id"])
+    assert original == release
+
+
+def test_feed_first_release_hints_find_release_but_never_attach_tag_to_response_story(store):
+    response = item(kind="feed", authority="official", product="tor", title="Security Release 0.4.9.17",
+                    url="https://example.org/response", content="Additional relay defenses are under evaluation.")
+    response_story = _publish(store, response, analysis(title="Further relay defenses under evaluation",
+                              summary=response["content"], why_it_matters="", category="dos", tags=["dos"],
+                              evidence=[response["content"]]))
+    tag = item(kind="tag", authority="official", title="tor-0.4.9.17", content="",
+               url="https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-0.4.9.17")
+    row = pending(store, tag)
+    assert candidate.associate(store.db, row) == (None, None)
+    assert (response_story["id"], "mentions tor 0.4.9.17") in candidate.related(store.db, row, tag)
+
+    release = item(kind="feed", authority="official", product="tor", title="Tor 0.4.9.17 released",
+                   url="https://example.org/release", content="Tor 0.4.9.17 is available with security fixes.")
+    release_story = _publish(store, release, analysis(title=release["title"], summary=release["content"],
+                             why_it_matters="", category="release", tags=["release"], state="released",
+                             confidence="confirmed", evidence=[release["content"]]))
+    matched, how = candidate.associate(store.db, row)
+    assert matched["id"] == release_story["id"] and how == "item_cluster"
+
+    repost = item(kind="feed", authority="official", product="tor", title="Security Release 0.4.9.17",
+                  url="https://example.org/repost", content=release["content"])
+    repost_row = pending(store, repost)
+    assert candidate.associate(store.db, repost_row) == (None, None)
+    assert {sid for sid, _ in candidate.related(store.db, repost_row, repost)} == {
+        release_story["id"], response_story["id"]}
+
+
+def test_tag_reviews_separately_when_legacy_response_owns_release_identity(context):
+    cfg, store = context
+    response = item(kind="feed", authority="official", title="Tor 0.4.9.17 released",
+                    url="https://example.org/response", content="Additional relay defenses are under evaluation.")
+    original = _publish(store, response, analysis(title="Further relay defenses under evaluation",
+                        summary=response["content"], why_it_matters="", category="dos", tags=["dos"],
+                        evidence=[response["content"]]))
+    with store.db:
+        store.db.execute("UPDATE stories SET cluster_key=? WHERE id=?", (item_cluster(response), original["id"]))
+    tag = item(kind="tag", authority="official", title="tor-0.4.9.17", content="",
+               url="https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-0.4.9.17")
+    row = pending(store, tag)
+    assert candidate.associate(store.db, row) == (None, None)
+    prepared = store.prepare_candidate(row, tag_notice(tag), LATER)
+    assert prepared["cluster_key"].startswith("url:")
+    assert prepared["story_id"] != original["id"] and prepared["coverage"]["prior_story"] is None
+    assert run_gate(cfg, store, row, Writer(tag_notice(tag)), Reviewer(verdict()))["status"] == "published"
+    assert len(store.stories()) == 2
+    assert next(s for s in store.stories() if s["id"] == original["id"]) == original
+    tagged = next(s for s in store.stories() if s["id"] != original["id"])
+    assert tagged["state"] == "tagged"
+
+    mirror = {**tag, "url": "https://example.org/mirror-tag"}
+    mirror_row = pending(store, mirror)
+    assert candidate.associate(store.db, mirror_row)[0]["id"] == tagged["id"]
+    outcome = run_gate(cfg, store, mirror_row, Writer(), Reviewer())
+    assert outcome["status"] == "cited" and len(store.stories()) == 2
+
+
+def test_tag_explicit_mapping_and_retirement_alias_preserve_existing_lifecycle(store):
+    prior = _publish(store, item(url="https://example.org/merged-fix", kind="gitlab_mr", upstream_state="merged",
+                                title="Merge relay defense", content="A relay defense was merged."),
+                     analysis(title="Relay defense merged", summary="A relay defense was merged.",
+                              state="merged", confidence="confirmed", why_it_matters=""))
+    tag = item(kind="tag", authority="official", title="tor-0.4.9.17", content="",
+               url="https://example.org/tag17")
+    row = pending(store, tag)
+    with store.db:
+        store.db.execute("UPDATE items SET story_id=? WHERE id=?", (prior["id"], row["id"]))
+    mapped = {**row, "story_id": prior["id"]}
+    assert candidate.associate(store.db, mapped)[0]["id"] == prior["id"]
+    with store.db:
+        store.db.execute("UPDATE items SET story_id=NULL WHERE id=?", (row["id"],))
+        store.db.execute(
+            "INSERT INTO story_aliases(story_id,cluster_key,survivor_id,reason,created_at) VALUES(?,?,?,?,?)",
+            ("a" * 24, row["cluster_key"], prior["id"], "Merged fixture", DATE))
+    matched, how = candidate.associate(store.db, row)
+    assert matched["id"] == prior["id"] and how == "alias"
+
+
+@pytest.mark.parametrize("title", ["Tor 0.4.9.17 released", "Security Release 0.4.9.17"])
+def test_announcement_repost_routes_to_reviewed_release_and_adds_only_citation(context, title):
+    cfg, store = context
+    release = item(kind="feed", authority="official", product="tor", title=title,
+                   url="https://example.org/release", content="Tor 0.4.9.17 is available with security fixes.")
+    draft = analysis(title=release["title"], summary=release["content"], why_it_matters="", category="release",
+                     tags=["release"], state="released", confidence="confirmed", evidence=[release["content"]])
+    original = _publish(store, release, draft)
+    repost = item(kind="feed", authority="official", product="tor", title="Security Release 0.4.9.17",
+                  url="https://example.org/repost", content=release["content"])
+    reply = verdict("skip", criterion="new_information", same_story=original["id"])
+    reply["criteria"]["new_information"]["reason"] = f"The release is already covered by {original['id']}."
+    assert run_gate(cfg, store, pending(store, repost), Writer(draft), Reviewer(reply))["status"] == "routed"
+    row = next(r for r in store.pending(20, LATER) if r["id"] == repost["id"])
+    skip = verdict("skip", criterion="new_information", update=True)
+    skip["criteria"]["new_information"]["reason"] = reply["criteria"]["new_information"]["reason"]
+    update = update_analysis(update="Another announcement reports Tor 0.4.9.17 is available.",
+                             state="released", confidence="confirmed", evidence=[release["content"]])
+    assert run_gate(cfg, store, row, Writer(update), Reviewer(skip))["status"] == "ignored"
+    assert len(store.stories()) == 1
+    current = store.stories()[0]
+    assert current["title"] == original["title"] and current["summary"] == original["summary"]
+    assert not current.get("updates")
+    assert {s["url"] for s in current["sources"]} == {release["url"], repost["url"]}
+
+
+@pytest.mark.parametrize("summary", ["Tor 0.4.9.18 is available.", "Tor 0.4.9.18 supersedes Tor 0.4.9.17."])
+@pytest.mark.parametrize("title", ["Tor 0.4.9.18 released", "Security Release 0.4.9.18",
+                                   "Tor 0.4.9.18 released after Tor 0.4.9.17", "Tor security update"])
+def test_release_announcement_cannot_route_to_a_different_released_version(context, summary, title):
+    cfg, store = context
+    older = item(kind="feed", authority="official", title=title,
+                 url="https://example.org/release18", content=summary)
+    target = _publish(store, older, analysis(title=older["title"], summary=older["content"],
+                      why_it_matters="", category="release", tags=["release"], state="released",
+                      confidence="confirmed", evidence=[older["content"]]))
+    newer = item(kind="feed", authority="official", title="Tor 0.4.9.17 released",
+                 url="https://example.org/release17", content="Tor 0.4.9.17 is available.")
+    draft = analysis(title=newer["title"], summary=newer["content"], why_it_matters="", category="release",
+                     tags=["release"], state="released", confidence="confirmed", evidence=[newer["content"]])
+    outcome = run_gate(cfg, store, pending(store, newer), Writer(draft),
+                       Reviewer(verdict(same_story=target["id"])))
+    assert outcome["status"] == "published"
+    assert len(store.stories()) == 2
+    assert next(s for s in store.stories() if s["id"] == target["id"]) == target
+
+
+@pytest.mark.parametrize("hint_stage", ["initial-approve", "late-approve", "late-revise"])
+def test_material_official_announcement_stays_separate_despite_release_routing_hint(context, hint_stage):
+    cfg, store = context
+    release = item(kind="feed", authority="official", title="Tor 0.4.9.17 released",
+                   url="https://example.org/release", content="Tor 0.4.9.17 is available with security fixes.")
+    original = _publish(store, release, analysis(title=release["title"], summary=release["content"],
+                        why_it_matters="", category="release", tags=["release"], state="released",
+                        confidence="confirmed", evidence=[release["content"]]))
+    incoming = item(kind="feed", authority="official", title="Security Release 0.4.9.17",
+                    url="https://example.org/response", content="Additional defenses are being evaluated against the ongoing relay attack.")
+    draft = analysis(title="Tor evaluates further relay attack defenses", summary=incoming["content"],
+                     why_it_matters="", category="dos", tags=["dos"], state="developing",
+                     confidence="confirmed", evidence=[incoming["content"]])
+    hinted = verdict(same_story=original["id"])
+    if hint_stage == "initial-approve":
+        replies = [hinted, verdict()]
+    elif hint_stage == "late-approve":
+        replies = [verdict(), hinted]
+    else:
+        replies = [verdict(), verdict("revise", criterion="source_support", same_story=original["id"],
+                                     repair={"summary": "Tor is evaluating further defenses against the continuing relay attack."}), hinted]
+    row = pending(store, incoming)
+    result = run_gate(cfg, store, row, Writer(draft), Reviewer(*replies))
+    assert result["status"] == "published" and len(store.stories()) == 2
+    assert next(s for s in store.stories() if s["id"] == original["id"]) == original
+    fresh = next(s for s in store.stories() if s["id"] != original["id"])
+    assert fresh["title"] == draft["title"] and fresh["state"] == "developing"
+    assert not fresh.get("updates")
+    assert store.db.execute("SELECT story_id FROM items WHERE id=?", (row["id"],)).fetchone()[0] == fresh["id"]
+
+
+def test_later_novelty_disagreement_holds_before_same_story_routing(context):
+    cfg, store = context
+    release = item(kind="feed", authority="official", title="Tor 0.4.9.17 released",
+                   url="https://example.org/release", content="Tor 0.4.9.17 is available with security fixes.")
+    original = _publish(store, release, analysis(title=release["title"], summary=release["content"],
+                        why_it_matters="", category="release", tags=["release"], state="released",
+                        confidence="confirmed", evidence=[release["content"]]))
+    incoming = item(kind="feed", authority="official", title="Security Release 0.4.9.17",
+                    url="https://example.org/response", content="Additional defenses are being evaluated against the ongoing relay attack.")
+    draft = analysis(title="Tor evaluates further relay attack defenses", summary=incoming["content"],
+                     why_it_matters="", category="dos", tags=["dos"], state="developing",
+                     confidence="confirmed", evidence=[incoming["content"]])
+    duplicate = verdict("skip", criterion="new_information", same_story=original["id"])
+    duplicate["criteria"]["new_information"]["reason"] = f"Already covered by {original['id']}."
+    row = pending(store, incoming)
+    result = run_gate(cfg, store, row, Writer(draft), Reviewer(verdict(), duplicate))
+    assert result["status"] == "held" and store.stories() == [original]
+    assert store.db.execute("SELECT story_id FROM items WHERE id=?", (row["id"],)).fetchone()[0] is None
+    assert store.db.execute("SELECT code FROM decision_log WHERE item_id=? ORDER BY id DESC LIMIT 1",
+                            (row["id"],)).fetchone()[0] == "held.verification.disagreed_news"
+
+
 def test_mr_closing_and_list_reply_association_boundaries(store):
     issue_story = _publish(store, item(
         kind="gitlab_issue", url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/41339",
@@ -232,10 +436,18 @@ def test_mr_closing_and_list_reply_association_boundaries(store):
 
 def test_relations_tag_citation_locked_hold_upgrade_and_update(context):
     cfg, store = context
+
+    def route(incoming, draft, target_id):
+        outcome = run_gate(cfg, store, pending(store, incoming), Writer(draft),
+                           Reviewer(verdict(same_story=target_id)))
+        assert outcome["status"] == "routed"
+        return next(r for r in store.pending(20, LATER) if r["id"] == incoming["id"])
+
     tag_first = item(kind="tag", authority="official", title="tor-0.4.9.20", content="",
                      url="https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-0.4.9.20")
     assert run_gate(cfg, store, pending(store, tag_first), Writer(tag_notice(tag_first)), Reviewer(verdict()))["status"] == "published"
     assert store.stories()[0]["state"] == "tagged"
+    release_id = store.stories()[0]["id"]
 
     community_post = item(kind="feed", authority="community", title="Tor 0.4.9.20 released",
                           url="https://forum.example.org/tor-0-4-9-20", content="Community summary of Tor 0.4.9.20 changes.")
@@ -243,7 +455,8 @@ def test_relations_tag_citation_locked_hold_upgrade_and_update(context):
                           why_it_matters="Operators can review the reported Tor 0.4.9.20 changes.",
                           confidence="reported", state="released", category="release", tags=["tor", "release"],
                           evidence=["Community summary of Tor 0.4.9.20 changes."])
-    assert run_gate(cfg, store, pending(store, community_post), Writer(comm_draft), Reviewer(verdict()))["status"] == "published"
+    assert run_gate(cfg, store, route(community_post, comm_draft, release_id),
+                    Writer(comm_draft), Reviewer(verdict()))["status"] == "published"
     assert store.stories()[0]["title"] == "Community note on Tor 0.4.9.20"
 
     official_ann = item(kind="feed", authority="official", title="[tor-announce] [RELEASE] Tor release 0.4.9.20",
@@ -252,7 +465,13 @@ def test_relations_tag_citation_locked_hold_upgrade_and_update(context):
     ann_upd = update_analysis(update="Official announcement confirms Tor 0.4.9.20 with security fixes.",
                               confidence="confirmed", state="released",
                               evidence=["Official Tor 0.4.9.20 release announcement with security fixes."])
-    assert run_gate(cfg, store, pending(store, official_ann), Writer(ann_upd), Reviewer(verdict(update=True)))["status"] == "published"
+    # This downstream confidence-update check starts from a previously mapped source.
+    ann_row = pending(store, official_ann)
+    with store.db:
+        store.db.execute("UPDATE items SET story_id=? WHERE id=?", (release_id, ann_row["id"]))
+    ann_row["story_id"] = release_id
+    assert run_gate(cfg, store, ann_row,
+                    Writer(ann_upd), Reviewer(verdict(update=True)))["status"] == "published"
     after_ann = store.stories()[0]
     assert after_ann["title"] == "Community note on Tor 0.4.9.20"
     assert after_ann["summary"] == "Community summary of Tor 0.4.9.20 changes."
@@ -266,7 +485,10 @@ def test_relations_tag_citation_locked_hold_upgrade_and_update(context):
     upd_draft = update_analysis(update="Relay operators report clean upgrades on Debian bookworm.",
                                 confidence="confirmed", state="released",
                                 evidence=["Relay operators report clean upgrades on Debian bookworm."])
-    assert run_gate(cfg, store, pending(store, followup), Writer(upd_draft), Reviewer(verdict(update=True)))["status"] == "published"
+    followup_draft = analysis(title="Operator upgrade report", summary=followup["content"], why_it_matters="",
+                              evidence=[followup["content"]])
+    assert run_gate(cfg, store, route(followup, followup_draft, release_id),
+                    Writer(upd_draft), Reviewer(verdict(update=True)))["status"] == "published"
     after_upd = store.stories()[0]
     assert after_upd["title"] == "Community note on Tor 0.4.9.20" and len(after_upd["updates"]) == 2
     assert after_upd["updates"][-1]["text"] == "Relay operators report clean upgrades on Debian bookworm."
@@ -287,6 +509,7 @@ def test_relations_tag_citation_locked_hold_upgrade_and_update(context):
                         confidence="confirmed", state="released", category="release", tags=["tor", "release"],
                         evidence=["Timeline entry noting Tor 0.4.9.21."])
     assert run_gate(cfg, store, pending(store, timeline_item), Writer(tl_draft), Reviewer(verdict()))["status"] == "published"
+    timeline_id = next(s for s in store.stories() if "0.4.9.21" in s["title"])["id"]
     prose_after_tl = item(kind="feed", authority="community", title="Tor 0.4.9.21 released",
                           url="https://forum.example.org/tor-0-4-9-21",
                           content="Full release prose covering Tor 0.4.9.21 relay changes.")
@@ -294,7 +517,8 @@ def test_relations_tag_citation_locked_hold_upgrade_and_update(context):
                            summary="Full release prose covering Tor 0.4.9.21 relay changes.",
                            confidence="confirmed", state="released", category="release", tags=["tor", "release"],
                            evidence=["Full release prose covering Tor 0.4.9.21 relay changes."])
-    assert run_gate(cfg, store, pending(store, prose_after_tl), Writer(prose_draft), Reviewer(verdict()))["status"] == "published"
+    assert run_gate(cfg, store, route(prose_after_tl, prose_draft, timeline_id),
+                    Writer(prose_draft), Reviewer(verdict()))["status"] == "published"
     assert next(s for s in store.stories() if "0.4.9.21" in s["title"])["title"] == "Tor 0.4.9.21 brings relay changes"
 
 

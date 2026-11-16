@@ -122,14 +122,14 @@ class _TextParser(HTMLParser):
         """Track hidden markup blocks and emit line breaks around block elements."""
         if tag in {"script", "style", "noscript", "template"}:
             self.hidden += 1
-        elif tag in {"p", "br", "div", "li", "h1", "h2", "h3", "pre"}:
+        elif tag in {"p", "br", "div", "li", "h1", "h2", "h3", "pre", "blockquote"}:
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
         """Exit hidden markup blocks and close block-level paragraphs."""
         if tag in {"script", "style", "noscript", "template"}:
             self.hidden = max(0, self.hidden - 1)
-        elif tag in {"p", "div", "li", "pre"}:
+        elif tag in {"p", "div", "li", "pre", "blockquote"}:
             self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
@@ -350,9 +350,9 @@ _RELEASE_MENTION = re.compile(
 
 
 def item_cluster(item: dict) -> str:
-    """Only merge strong matches: canonical identity, identical body, release version.
+    """Index canonical identities, identical bodies and release-version hints.
 
-    Semantic similarity alone never merges independent incidents.
+    A release hint relates prose announcements without deciding their novelty.
     """
     title = item["title"].lower()
     product = item.get("product", "network")
@@ -363,6 +363,7 @@ def item_cluster(item: dict) -> str:
         # name, directly or after release qualifiers ("Tor Browser 16.0", "arti-v2.8.0",
         # "Tor stable release 0.4.8.19"); titles such as "Tails 7.16 ... Tor Browser
         # 16.0" keep their own identity, and so do delay and end-of-life notices.
+        # A product-scoped feed may omit the product ("Security Release 0.4.9.17").
         match = re.search(r"(?<![\w.])v?(\d+\.\d+(?:[\w.-]*\w)?)", title)
         if (
             match
@@ -372,7 +373,11 @@ def item_cluster(item: dict) -> str:
                 or re.search(r"\breleas(?:e|ed|ing)\b", title)
                 or _RELEASE_AFTER.match(title[match.end() :])
             )
-            and re.search(r"\b" + _PRODUCT_NAMES[product] + r"[- ]" + _RELEASE_QUALIFIERS + "$", title[: match.start()])
+            and (
+                re.search(r"\b" + _PRODUCT_NAMES[product] + r"[- ]" + _RELEASE_QUALIFIERS + "$", title[: match.start()])
+                or (item.get("kind") == "feed" and item.get("product") in _PRODUCT_NAMES
+                    and re.fullmatch(_RELEASE_QUALIFIERS, title[: match.start()]))
+            )
             and (re.search(r"\breleased\b", title) or not re.search(r"\b(?:delayed|postponed)\b", title))
             and not _RELEASE_EOL.search(title)
         ):
@@ -382,6 +387,11 @@ def item_cluster(item: dict) -> str:
         clean_title = re.sub(r"^(?:dirauth|authority|security|tor|arti):\s*", "", re.sub(r"\s+", " ", title).strip())
         return "body:" + digest([clean_title, body])
     return "url:" + digest(item_identity(item))
+
+
+def story_cluster(item: dict) -> str:
+    """Give prose feeds their own identity so review can distinguish new developments."""
+    return "url:" + digest(item_identity(item)) if item.get("kind") == "feed" else item_cluster(item)
 
 
 def gitlab_refs(item: dict) -> tuple[list[str], list[str]]:
