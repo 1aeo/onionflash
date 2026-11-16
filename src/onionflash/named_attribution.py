@@ -10,8 +10,8 @@ from .util import safe_canonical_url
 
 # Advance when extraction or source matching changes; review policy binds this.
 NAMED_ATTRIBUTION_POLICY = {
-    "version": 3, "normalization": "NFC-lower-whole-tokens-optional-at-and-organization-article", "maximum_name_words": 4,
-    "patterns": "named-reporting-clause-or-according-to", "source_scope": "packet-text-author-and-sender-domain",
+    "version": 4, "normalization": "NFC-lower-whole-tokens-optional-at-and-organization-article", "maximum_name_words": 4,
+    "patterns": "named-reporting-clause-or-according-to", "source_scope": "packet-text-unquoted-reply-author-and-sender-domain",
     "repair_context": "rematerialized-missing-name-literals",
 }
 _REPORTING = re.compile(
@@ -230,7 +230,7 @@ def _evidence(packet: dict, cited: set[str] | None):
     for source in packet.get("sources", []):
         whole = cited is None or safe_canonical_url(source.get("url")) in cited
         if whole:
-            for field in ("title", "author", "sender_domain"):
+            for field in ("title", "unquoted_content", "author", "sender_domain"):
                 if isinstance(source.get(field), str):
                     yield source[field], field in {"author", "sender_domain"}
         for passage in source.get("passages", []):

@@ -458,3 +458,17 @@ def test_sender_domain_is_not_inferred_from_url_or_note_metadata():
                                          "sender_domain": "example.org"}]}]}
     candidate = {"title": "Example.org reports that a connection fails"}
     assert missing_named_attributions(candidate, packet)
+
+
+def test_unquoted_reply_evidence_survives_passage_trimming_without_crossing_update_scope():
+    source = packet(author="other")
+    source["sources"][0]["unquoted_content"] = "Juno reports that the connection still fails."
+    source["sources"][0]["passages"].append({"id": "S1:P3", "text": "A separate note.",
+                                              "url": "https://example.org/report#note_1"})
+    text = candidate("Juno reports that the connection still fails.")
+    assert not missing_named_attributions(text, source)
+    updated = {**text, "updates": [{"text": text["title"],
+                                    "sources": [{"url": "https://example.org/report#note_1"}]}]}
+    assert missing_named_attributions(updated, source, update=True)
+    updated["updates"][0]["sources"] = [{"url": "https://example.org/report"}]
+    assert not missing_named_attributions(updated, source, update=True)
