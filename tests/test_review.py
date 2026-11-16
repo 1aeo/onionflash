@@ -14,16 +14,19 @@ from onionflash.transport import FetchError, Response
 
 
 def cfg_llm():
+    """Return default configuration with a placeholder LLM endpoint URL."""
     result = copy.deepcopy(DEFAULTS)
     result["llm"]["base_url"] = "https://llm.example/v1"
     return result
 
 
 def candidate(**changes):
+    """Build a normalized public story candidate with optional overrides."""
     return prepare_story({**copy.deepcopy(STORY), **changes})
 
 
 def packet():
+    """Return a minimal single-source numbered review packet."""
     return {
         "sources": [{"id": "S1", "url": STORY["sources"][0]["url"], "title": "Release notes",
                      "kind": "rss", "authority": "official", "product": "tor",
@@ -34,6 +37,7 @@ def packet():
 
 
 def reviewer(monkeypatch, *responses, settings=None):
+    """Instantiate a Reviewer wired to scripted FakeLLM responses."""
     monkeypatch.setenv("ONIONFLASH_LLM_API_KEY", "unit-test-secret")
     result = review.Reviewer(settings or cfg_llm())
     result.client = FakeLLM(*responses)
@@ -41,6 +45,7 @@ def reviewer(monkeypatch, *responses, settings=None):
 
 
 def unit(kind, *texts, authority="development", state=""):
+    """Construct an unnumbered source packet unit with passage texts."""
     return {"kind": kind, "authority": authority, "upstream_state": state, "title": texts[0],
             "passages": [{"text": text} for text in texts]}
 
@@ -107,7 +112,9 @@ PRIOR = {"prior_story": {"id": COVERED, "title": "Earlier coverage"}, "recent": 
 
 
 def test_review_keeps_only_its_model_and_rejects_unknown_settings(tmp_path):
+    """Accept review.model overrides while rejecting unknown review settings."""
     def configured(name, extra):
+        """Load a temporary TOML configuration with extra settings."""
         p = tmp_path / name
         p.write_text('[[sources]]\nid="test"\nurl="https://example.org/feed.xml"\n' + extra)
         return load_config(p)
@@ -131,10 +138,12 @@ def test_review_keeps_only_its_model_and_rejects_unknown_settings(tmp_path):
 @pytest.mark.parametrize("st", ["released", "tagged"])
 @pytest.mark.parametrize("ver", [False, True])
 def test_released_and_tagged_candidates_pass_review_and_verification(monkeypatch, st, ver):
+    """Approve released and tagged candidates in both review and verification stages."""
     assert reviewer(monkeypatch, completion(verdict())).review(candidate(state=st), packet(), verification=ver)["verdict"] == "approve"
 
 
 def test_review_protocol_fresh_verification_and_application_issue(monkeypatch):
+    """Verify schema constraints, repair application, fresh verification, and application_issue payloads."""
     public = candidate(why_it_matters="Operators must edit their configuration to exclude the compromised node.")
     checker = reviewer(monkeypatch, completion(verdict("revise", repair={"why_it_matters": ""})), completion(verdict()))
     result = checker.review(public, packet())
@@ -174,6 +183,7 @@ def test_review_protocol_fresh_verification_and_application_issue(monkeypatch):
     "failed-news-value-approve", "failed-new-information-approve",
 ])
 def test_malformed_or_ambiguous_approval_is_rejected(monkeypatch, bad):
+    """Reject malformed, extra-field, or inconsistent approval responses."""
     resp = verdict()
     if bad == "source-ref": resp["criteria"]["source_support"]["source_refs"] = ["S2:P99"]
     elif bad == "issues": resp["issues"] = []
@@ -197,6 +207,7 @@ def test_malformed_or_ambiguous_approval_is_rejected(monkeypatch, bad):
 
 @pytest.mark.parametrize("writer,sources,fields,expected", [c[1:] for c in FINAL_CASES], ids=[c[0] for c in FINAL_CASES])
 def test_final_holds_on_real_cases(writer, sources, fields, expected):
+    """Verify deterministic final_holds reasons across issue, MR, and feed cases."""
     story = candidate(**{"title": "Bastet reported plausibly compromised", "why_it_matters": "", "category": "security",
                          "tags": ["security"], "summary": "A public issue reports that bastet's machine is very plausibly compromised.",
                          "confidence": "reported", "state": "developing", **fields})
@@ -210,6 +221,7 @@ def test_final_holds_on_real_cases(writer, sources, fields, expected):
     ([unit("tag", "tor-0.4.9.16", authority="official"), FEED], analyze.CONFIDENCES, analyze.STATES, analyze.CATEGORIES),
 ], ids=["issue", "merged-request", "official-feed", "tagged-release"])
 def test_repair_schema_offers_only_labels_the_packet_allows(monkeypatch, sources, confidence, state, categories):
+    """Constrain repair enum choices to packet-supported confidence, state, and category labels."""
     evidence = {"sources": [{**s, "id": f"S{i}", "passages": [{"id": f"S{i}:P1", **s["passages"][0]}]}
                             for i, s in enumerate(sources, 1)], "missing_sources": [], "truncated": False}
     checker = reviewer(monkeypatch, completion(verdict()), completion(verdict()))
@@ -243,6 +255,7 @@ def test_repair_schema_offers_only_labels_the_packet_allows(monkeypatch, sources
     ({"update": "Forbidden in story scope."}, False, None),
 ])
 def test_apply_repair_rejects_immutable_noop_and_invalid_patches(patch, is_upd, match):
+    """Refuse immutable-field, no-op, empty, or unpunctuated repairs."""
     base = candidate(updates=[{"at": "2026-11-08T14:00:00Z", "text": "Maintainers opened a tracking ticket.",
                                "sources": [{"url": STORY["sources"][0]["url"], "title": "Release notes"}]}])
     with pytest.raises(review.ReviewError, match=match):
@@ -260,6 +273,7 @@ def test_apply_repair_rejects_immutable_noop_and_invalid_patches(patch, is_upd, 
     ("attr", "ROUTING_PROMPT", None),
 ])
 def test_policy_hash_changes_on_model_endpoint_and_prompt_mutations(monkeypatch, kind, target, val):
+    """Change policy_hash when model, endpoint, or prompt constants change, ignoring API keys."""
     initial = review.policy_hash(cfg_llm())
     monkeypatch.setenv("ONIONFLASH_LLM_API_KEY", "a-different-secret")
     assert review.policy_hash(cfg_llm()) == initial
@@ -273,8 +287,15 @@ def test_policy_hash_changes_on_model_endpoint_and_prompt_mutations(monkeypatch,
 
 
 def test_prompts_coverage_isolation_repairs_and_transport_settings(monkeypatch):
+    """Check prompt invariants, coverage isolation, UTF-8/JSON errors, and endpoint failover."""
     assert "unnumbered [Proposal]) whose packet source has authority=project-sender" in review.SYSTEM_PROMPT
     assert "When\nauthority=community, posts without an explicit [RFC] tag" in review.SYSTEM_PROMPT
+    for prompt in (review.SYSTEM_PROMPT, review.UPDATE_SYSTEM_PROMPT):
+        assert "committed into C Tor's codebase" in prompt
+        assert "including project-sender and official" in prompt
+        assert "unquoted_content" in prompt
+    for prompt in (review.SYSTEM_PROMPT, review.VERIFY_PROMPT):
+        assert "Claims supported by other packet sources need only that source's support." in prompt
     assert reviewer(monkeypatch, completion(verdict("skip", criterion="news_value"))).review(candidate(state="merged"), packet())["verdict"] == "skip"
 
     public = candidate(why_it_matters="Existing commentary")
@@ -359,6 +380,7 @@ def test_prompts_coverage_isolation_repairs_and_transport_settings(monkeypatch):
 ])
 @pytest.mark.parametrize("verification", [False, True])
 def test_a_skip_stands_only_on_a_failed_editorial_criterion(monkeypatch, criterion, outcome, expected, verification):
+    """Convert skips without a failed editorial criterion into holds while recording model_verdict."""
     reply = verdict("skip", criterion=criterion)
     reply["criteria"][criterion].update(outcome=outcome, reason=f"Story {COVERED} reports the same event.")
     res = reviewer(monkeypatch, completion(reply)).review(candidate(), packet(), coverage=COVERAGE, verification=verification)
@@ -377,6 +399,7 @@ def test_a_skip_stands_only_on_a_failed_editorial_criterion(monkeypatch, criteri
     (None, f"Story {COVERED} reports the same event.", "hold"),
 ], ids=["unnamed", "recent", "prior", "no-coverage"])
 def test_a_skip_for_new_information_alone_names_a_story_from_coverage(monkeypatch, coverage, reason, expected):
+    """Require skips on new_information alone to cite a story ID from coverage."""
     reply = verdict("skip", criterion="new_information")
     reply["criteria"]["new_information"]["reason"] = reason
     assert reviewer(monkeypatch, completion(reply)).review(candidate(), packet(), coverage=coverage)["verdict"] == expected
@@ -385,6 +408,7 @@ def test_a_skip_for_new_information_alone_names_a_story_from_coverage(monkeypatc
 
 
 def test_update_scope_confirmed_updates_uncited_notes_and_punctuation_repairs(monkeypatch):
+    """Validate latest_update review prompts, repair limits, and per-note completed-action checks."""
     prior = candidate(
         title="Relay compromise confirmed by maintainer", summary="The release fixed the issue before this follow-up.",
         updates=[{"at": "2026-11-08T14:00:00Z", "text": "Maintainers opened a tracking ticket.",
@@ -474,6 +498,7 @@ def test_update_scope_confirmed_updates_uncited_notes_and_punctuation_repairs(mo
 
 
 def test_final_holds_shouting_malformed_version_and_untrusted_operator_claims():
+    """Enforce shouting_caps, malformed_version, and untrusted_operator_claim guards."""
     list_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/xyz/"
     src_for = lambda auth, url=list_url: [{"id": "S1", "url": url, "kind": "feed", "authority": auth,
                                            "passages": [{"id": "S1:P1", "text": "Relay telemetry report."}]}]

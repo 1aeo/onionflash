@@ -5,18 +5,27 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from .comments import analysis_context
+from .llm import unquoted_mail_text
 from .util import canonical_url, digest, is_dirauth_item, is_hackerone_item, plain_text, saved_object
 
 
 # The review packet's fixed bounds.
 LIMITS = {"max_sources": 8, "max_source_chars": 24000, "max_passages": 64, "passage_chars": 1800}
-SOURCE_FIELDS = ("id", "source_id", "url", "title", "content", "source_content", "kind", "authority", "product",
-                 "published_at", "updated_at", "labels", "upstream_state", "public_comments", "author", "dirauth_notes")
+BASE_SOURCE_FIELDS = (
+    "id", "source_id", "url", "title", "content", "source_content", "kind", "authority", "product",
+    "published_at", "updated_at", "labels", "upstream_state", "public_comments",
+)
+OPTIONAL_SOURCE_FIELDS = ("author", "sender_domain")
+SOURCE_FIELDS = (*BASE_SOURCE_FIELDS, *OPTIONAL_SOURCE_FIELDS)
 
 
 def source_fingerprint(item: dict) -> str:
     """Polling receipts and scheduling metadata do not change evidence identity."""
-    return digest({key: item.get(key) for key in SOURCE_FIELDS})
+    fields = {key: item.get(key) for key in BASE_SOURCE_FIELDS}
+    for opt in OPTIONAL_SOURCE_FIELDS:
+        if item.get(opt):
+            fields[opt] = item[opt]
+    return digest(fields)
 
 
 def _source_body(item: dict | None) -> str | None:
@@ -200,10 +209,16 @@ def build_packet(
         unit.update(labels=normalize_labels(item.get("labels")), url=canonical_url(item["url"]), title=item["title"], snapshot=snapshot)
         if isinstance(item.get("author"), str) and item["author"]:
             unit["author"] = item["author"]
+        if isinstance(item.get("sender_domain"), str) and item["sender_domain"]:
+            unit["sender_domain"] = item["sender_domain"]
         if item.get("closed_at"):
             unit["closed_at"] = item["closed_at"]
         if captured:
             unit["captured_at"] = captured
+        if "lists.torproject.org" in unit["url"] and any(ln.lstrip().startswith(">") for ln in body.splitlines()):
+            unquoted = unquoted_mail_text(body).strip()
+            if unquoted and unquoted != body.strip():
+                unit["unquoted_content"] = plain_text(unquoted, LIMITS["max_source_chars"], html=False)
         # First the text a writer sees for this item: its title, every note and its
         # description window; then the rest of the description. A share too small
         # for the whole source cuts description text before any note.
