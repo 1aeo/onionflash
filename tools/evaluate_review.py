@@ -262,13 +262,15 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                         if action not in {"verify", "repair"}:
                             break
                         stage, text = action, value
-                    first = record["reviews"][0]["result"]
+                    first = record["reviews"][0]["result"] if record["reviews"] else {}
                     last = next((entry["result"] for entry in reversed(record["reviews"]) if entry["stage"] == "verification"), None)
                     actual_route = (value if action == "route" and isinstance(value, str) else
                                     next((entry["result"].get("same_story") for entry in record["reviews"]
                                           if entry["result"]["verdict"] in {"approve", "revise", "skip"}
                                           and entry["result"].get("same_story")), None))
-                    record.update(result=first, same_story=actual_route, kept_unsupported=kept_unsupported(case, text))
+                    record.update(same_story=actual_route, kept_unsupported=kept_unsupported(case, text))
+                    if first:
+                        record["result"] = first
                     if last:
                         record["verification"] = last
                     for field, reply in (("model_verdict", first), ("verification_model_verdict", last or {})):
@@ -290,7 +292,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                     record["verification_repairs"] = sum(entry["stage"] == "verification" and entry["result"]["verdict"] == "revise"
                                                          for entry in record["reviews"][:-1])
                     totals["verification_repairs"] += record["verification_repairs"]
-                    if record["result"]["verdict"] == "revise":
+                    if first.get("verdict") == "revise":
                         totals["repairs_verified" if published else "repairs_skipped" if action in {"skip", "route"} else "repairs_held"] += 1
                     final_verdict = "approve" if published else action
                     route_ok = True

@@ -643,3 +643,30 @@ def test_expected_same_story_scores_matched_missed_wrong_unroutable_and_false_ro
         rec_gate = json.loads(out_gate.read_text().splitlines()[0])
         assert (res_gate["matched_routes"], res_gate["matched"], res_gate["false_approvals"]) == (1, 1, 0)
         assert rec_gate["final_verdict"] == "route" and rec_gate["published_candidate"] is None
+
+
+def test_impact_audit_hold_without_trusted_review_keeps_evaluation_running(evaluation, tmp_path, monkeypatch):
+    module, config = evaluation
+    calls = []
+
+    def reply(verification):
+        calls.append(verification)
+        if len(calls) == 1:
+            inconsistent = verdict("revise", repair={"why_it_matters": ""})
+            for check in inconsistent["criteria"].values():
+                check["outcome"] = "pass"
+            return inconsistent
+        return verdict()
+
+    monkeypatch.setattr(module, "EvaluationReviewer", scripted(reply, impact_outcome="insufficient"))
+    output = tmp_path / "audit-hold.jsonl"
+    summary = module.evaluate(config, [copy.deepcopy(BY_ID["bastet-original"]),
+                                      copy.deepcopy(BY_ID["legitimate-custom-config"])], output)
+    held, approved, total = [json.loads(line) for line in output.read_text().splitlines()]
+    assert summary["cases"] == 2 and summary["errors"] == 0
+    assert held["outcome"] == "held" and held["hold_code"] == "impact_audit"
+    assert held["reviews"] == [] and "result" not in held
+    assert held["published_candidate"] is None and held["review_request_count"] == 2
+    assert len(held["untrusted_proposals"]) == 1
+    assert held["impact_audits"][0]["result"]["outcome"] == "insufficient"
+    assert approved["outcome"] == "approved" and total["summary"] == summary
