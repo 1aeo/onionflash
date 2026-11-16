@@ -3,25 +3,27 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from typing import NamedTuple
 
 from .util import safe_canonical_url
 
 
 # Advance when extraction or source matching changes; review policy binds this.
 NAMED_ATTRIBUTION_POLICY = {
-    "version": 1, "normalization": "NFC-lower-whitespace-optional-leading-at", "maximum_name_words": 4,
+    "version": 2, "normalization": "NFC-lower-whole-tokens-optional-at-and-organization-article", "maximum_name_words": 4,
     "patterns": "named-reporting-clause-or-according-to", "source_scope": "packet-text-and-author-only",
     "repair_context": "rematerialized-missing-name-literals",
 }
-_TOKEN = re.compile(r"(?<![\w@])(?:@\w+|[^\W\d_]\w*)(?:['’.-][^\W_]\w*)*", re.UNICODE)
 _REPORTING = re.compile(
     r"\b(?:reports|reported|says|said|writes|wrote|states|stated|notes|noted|"
     r"claims|claimed|explains|explained|warns|warned|confirms|confirmed)\b"
-    r"(?:\s+that\b|\s*[:,]|\s+[\"“‘])", re.I)
+    r"(?:\s+that\b|\s*[:,]|\s+[\"'“”‘’])", re.I)
 _ACCORDING = re.compile(r"\baccording\s+to\s+", re.I)
 _FENCE = re.compile(r"```.*?(?:```|\Z)", re.S)
 _INLINE_CODE = re.compile(r"`([^`\n]*)`")
 _URL = re.compile(r"https?://\S+", re.I)
+_DOCUMENT_REFERENCE = re.compile(r"(?:(?:IETF\s+)?RFC\s*[- ]?\d+\b|(?:CVE|TROVE)-\d{4}-\d+\b)", re.I)
+_NARRATIVE_DASH = re.compile(r"—(?=\s*(?:[\"'“”‘’]|who\b))")
 _GENERIC = frozenset("""a an the i we you he she it they this that these those one someone anyone
 everyone nobody people authors author commenter commenters contributor contributors developer developers
 maintainer maintainers operator operators reporter reporters researcher researchers team staff project
@@ -52,6 +54,90 @@ def _normalized(value: str) -> str:
     return " ".join(unicodedata.normalize("NFC", value).lower().split())
 
 
+class _Word(NamedTuple):
+    value: str
+    begin: int
+    finish: int
+    supported: bool
+
+    def start(self):
+        return self.begin
+
+    def end(self):
+        return self.finish
+
+
+def _word_char(char: str) -> bool:
+    return char == "_" or unicodedata.category(char)[0] in "LNM"
+
+
+def _joiner(char: str) -> bool:
+    return char in "'‘’.\"“”−-" or unicodedata.category(char) == "Pd"
+
+
+def _tokens(text: str) -> list[_Word]:
+    """Keep lexical spans whole; unsupported joins never become name suffixes."""
+    words, index = [], 0
+    while index < len(text):
+        char = text[index]
+        if not (_word_char(char) or char == "@" or unicodedata.category(char) == "Cf"):
+            index += 1
+            continue
+        start = index
+        while index < len(text) and (_word_char(text[index]) or text[index] == "@"
+                                     or _joiner(text[index]) or unicodedata.category(text[index]) == "Cf"):
+            index += 1
+        end = index
+        while end > start and _joiner(text[end - 1]):
+            end -= 1  # A sentence's period or closing quotation is not a name.
+        value = text[start:end]
+        body = value[1:] if value.startswith("@") else value
+        supported = bool(body) and (value.startswith("@") or body[0].isalpha())
+        for number, char in enumerate(body):
+            if _word_char(char):
+                continue
+            if (char not in "'’.-" or number == 0 or number + 1 == len(body)
+                    or not _word_char(body[number - 1]) or not _word_char(body[number + 1])):
+                supported = False
+        words.append(_Word(value, start, end, supported))
+    return words
+
+
+def _single_token(text: str) -> bool:
+    words = _tokens(text)
+    return bool(len(words) == 1 and words[0].supported and words[0].start() == 0 and words[0].end() == len(text))
+
+
+def _numeric_boundary(word: _Word) -> bool:
+    return word.value.isnumeric() or re.fullmatch(r"\d+(?:[._]\d+)*", word.value) is not None
+
+
+def _literal_present(name: str, text: str) -> bool:
+    """Match whole lexical spans, including marks and numeric dotted handles."""
+    wanted = [_normalized(word.value).lstrip("@") for word in _tokens(_normalized(name))]
+    # A clear narrative aside/quotation is prose punctuation, not a compound
+    # name. Keep this narrower than arbitrary dash normalization, and do not
+    # apply it to author/account metadata.
+    source = _normalized(_NARRATIVE_DASH.sub(" ", text))
+    words = _tokens(source)
+    def literal(word):
+        value = word.value.lstrip("@")
+        return value[:-2] if value.endswith(("'s", "’s")) else value
+    for start in range(len(words) - len(wanted) + 1):
+        selected = words[start:start + len(wanted)]
+        if (wanted and [literal(word) for word in selected] == wanted
+                and all(not source[left.end():right.start()].strip() for left, right in zip(selected, selected[1:]))):
+            return True
+    return False
+
+
+def _organization_name(name: str) -> str:
+    value = _normalized(name).lstrip("@")
+    if value.startswith("the ") and value.rsplit(" ", 1)[-1] in _ORGANIZATION_WORDS:
+        return value[4:]
+    return value
+
+
 def _name_word(value: str) -> bool:
     plain = value.lstrip("@")
     if not plain:
@@ -68,21 +154,28 @@ def _names(text: str) -> list[str]:
     # Code examples are not speaker attributions. Quoted prose remains a claim
     # and is checked; a quotation cannot create source evidence for its speaker.
     text = _FENCE.sub(lambda match: " " * len(match[0]), unicodedata.normalize("NFC", text))
-    text = _INLINE_CODE.sub(lambda match: " " + match[1] + " " if _TOKEN.fullmatch(match[1])
+    text = _INLINE_CODE.sub(lambda match: " " + match[1] + " " if _single_token(match[1])
                             else " " * len(match[0]), text)
     # Quoting or styling a name does not remove its attribution. Keep internal
     # apostrophes in names while treating surrounding quotation marks as markup.
-    text = re.sub(r'["“”]|(?<!\w)[\'‘’]|[\'‘’](?!\w)', " ", text)
-    words = list(_TOKEN.finditer(text))
+    triggers = text  # Reporting verbs still need their direct-speech delimiter.
+    text = "".join(" " if char in "\"'“”‘’" and not (
+        index > 0 and index + 1 < len(text) and _word_char(text[index - 1]) and _word_char(text[index + 1]))
+        else char for index, char in enumerate(text))
+    words = _tokens(text)
     found = []
-    for verb in _REPORTING.finditer(text):
+    for verb in _REPORTING.finditer(triggers):
         prior = [word for word in words if word.end() <= verb.start()]
-        if (not prior or text[prior[-1].end():verb.start()].strip()
+        if (not prior or not prior[-1].supported or text[prior[-1].end():verb.start()].strip()
                 or not (_name_word(prior[-1][0]) or prior[-1][0].casefold() in _ORGANIZATION_WORDS)):
             continue
         selected = [prior[-1]]
         for word in reversed(prior[:-1]):
             if text[word.end():selected[0].start()].strip():
+                break
+            if not word.supported:
+                if not _numeric_boundary(word):
+                    selected = []
                 break
             if len(selected) >= NAMED_ATTRIBUTION_POLICY["maximum_name_words"]:
                 if _name_word(word[0]) or word[0].casefold() in _ORGANIZATION_WORDS:
@@ -99,18 +192,23 @@ def _names(text: str) -> list[str]:
                        and not text[prefix[-1].end():selected[0].start()].strip())
             if article and selected[-1][0].casefold() not in _ORGANIZATION_WORDS:
                 continue
-        if selected and any(_name_word(word[0]) for word in selected):
+        if selected and not _DOCUMENT_REFERENCE.match(text, selected[0].start()) and any(_name_word(word[0]) for word in selected):
             found.append(text[selected[0].start():selected[-1].end()])
     for marker in _ACCORDING.finditer(text):
         following = [word for word in words if word.start() >= marker.end()]
         article = bool(following and following[0][0].casefold() == "the")
         if article:
             following = following[1:]
-        if not following or not _name_word(following[0][0]):
+        if (not following or not following[0].supported or not _name_word(following[0][0])
+                or _DOCUMENT_REFERENCE.match(text, following[0].start())):
             continue
         selected = [following[0]]
         for word in following[1:]:
             if text[selected[-1].end():word.start()].strip():
+                break
+            if not word.supported:
+                if not _numeric_boundary(word):
+                    selected = []
                 break
             if len(selected) >= NAMED_ATTRIBUTION_POLICY["maximum_name_words"]:
                 if _name_word(word[0]) or word[0].casefold() in _ORGANIZATION_WORDS:
@@ -161,15 +259,10 @@ def missing_named_attributions(candidate: dict, packet: dict, *, update: bool = 
     else:
         targets = [(field, candidate.get(field, "")) for field in ("title", "summary", "why_it_matters")]
         cited = None
-    evidence = [(_normalized(_URL.sub(" ", text)), author) for text, author in _evidence(packet, cited)]
-    def pattern(name):
-        return re.compile(r"(?<![\w'’.-])" + re.escape(_normalized(name))
-                          + r"(?![\w-])(?!(?:['’](?!s\b)[^\W\d_])|\.[^\W\d_])")
-
+    evidence = [(_URL.sub(" ", text), author) for text, author in _evidence(packet, cited)]
     def supported(name):
-        literal = _normalized(name).lstrip("@")
-        match = pattern(literal)
-        return any(source.lstrip("@") == literal if author else match.search(source) for source, author in evidence)
+        return any(_organization_name(source) == _organization_name(name) if author else _literal_present(name, source)
+                   for source, author in evidence)
 
     retained = [name for name in known_names if not supported(name)]
     flags = []
@@ -177,7 +270,7 @@ def missing_named_attributions(candidate: dict, packet: dict, *, update: bool = 
         names = _names(text)
         # Names already found absent in an observed candidate cannot survive a
         # repair merely by changing case, grammar, quoting, code style, or field.
-        names += [name for name in retained if pattern(name.lstrip("@")).search(_normalized(text))]
+        names += [name for name in retained if _literal_present(name, text)]
         seen = set()
         for name in names:
             if _normalized(name).lstrip("@") in seen:

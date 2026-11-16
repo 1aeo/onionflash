@@ -211,6 +211,9 @@ handles and names in scripts without letter case in reporting clauses and
 "according to" forms, ignoring generic source/role/pronoun subjects and code examples. It performs no
 fuzzy spelling, transliteration or identity lookup. Source-name presence is not
 proof that the person made a statement and never establishes approval.
+Combining marks stay with the complete token. Unsupported joined-name syntax is
+skipped whole, never reduced to a suffix; formal document identifiers are not
+classified as people. Source URLs remain excluded from personal-name evidence.
 Missing-name locations are supplied only when found, as application data beside
 the unchanged packet. An invalid actor pass may use the same single correction
 slot, without using the rejected reply's edits. Repairs must preserve the report

@@ -262,7 +262,7 @@ def test_commit_boundary_cannot_publish_missing_name_through_operator_or_receipt
 def test_named_attribution_policy_changes_review_identity(context, monkeypatch):
     cfg, _ = context
     before = review.policy_hash(cfg)
-    monkeypatch.setitem(NAMED_ATTRIBUTION_POLICY, "version", 2)
+    monkeypatch.setitem(NAMED_ATTRIBUTION_POLICY, "version", NAMED_ATTRIBUTION_POLICY["version"] + 1)
     assert review.policy_hash(cfg) != before
 
 
@@ -366,3 +366,76 @@ def test_current_receipt_cannot_publish_known_name_after_a_possessive_repair(con
         store.commit_candidate(prepared, escaped, "writer-key", LATER, **receipt)
     assert not store.stories()
     assert store.db.execute("SELECT 1 FROM review_approvals WHERE key=?", (receipt["approval_key"],)).fetchone()
+
+
+@pytest.mark.parametrize("opening,closing", [('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’")])
+@pytest.mark.parametrize("verb", ["says", "reports", "confirms"])
+def test_direct_speech_delimiter_survives_quoted_name_normalization(opening, closing, verb):
+    text = f'"Juno" {verb} {opening}Clients fail.{closing}'
+    assert missing_named_attributions(candidate(text), packet()) == [
+        {"field": "title", "name": "Juno", "finding": "literal_name_absent_from_source"}]
+    assert not missing_named_attributions(candidate(text), packet(author="juno"))
+
+
+@pytest.mark.parametrize("name", ["Mira", "@Mira"])
+def test_numeric_dotted_handle_cannot_prove_a_shorter_name(name):
+    assert missing_named_attributions(candidate(f"{name} says that clients fail."),
+                                     packet("The account @Mira.2 reported measurements.", author="other"))
+    assert not missing_named_attributions(candidate("@Mira.2 says that clients fail."),
+                                         packet("The account @Mira.2 reported measurements.", author="other"))
+
+
+def test_combining_marks_stay_with_the_whole_name_and_cannot_supply_a_suffix_identity():
+    from onionflash.named_attribution import _names
+    text = "राहुल reports that clients fail."
+    assert _names(text) == ["राहुल"]
+    assert missing_named_attributions(candidate(text), packet("सुशील reported the observations.", author="other"))
+    assert not missing_named_attributions(candidate(text), packet(author="राहुल"))
+    assert missing_named_attributions(candidate("ल reports that clients fail."), packet("सुशील reported the observations.", author="other"))
+
+
+@pytest.mark.parametrize("separator", ["–", "—", "‑", "−", "\u200d"])
+def test_unsupported_joined_name_syntax_is_skipped_whole_without_suffix_guessing(separator):
+    from onionflash.named_attribution import _names
+    assert _names(f"Juno{separator}Vale reports that clients fail.") == []
+    assert missing_named_attributions(candidate("Vale reports that clients fail."),
+                                     packet(f"Juno{separator}Vale supplied measurements.", author="other"))
+
+
+@pytest.mark.parametrize("text", ["The Juno Project says that clients fail.",
+                                 "According to the Juno Project, clients fail.",
+                                 "Juno Project reports that clients fail."])
+def test_organization_article_is_consistent_between_extraction_and_author_metadata(text):
+    assert not missing_named_attributions(candidate(text), packet(author="The Juno Project"))
+    assert missing_named_attributions(candidate("Juno reports that clients fail."), packet(author="The Juno"))
+
+
+@pytest.mark.parametrize("reference", ["RFC 9000", "RFC9000", "IETF RFC 9000", "CVE-2026-1234"])
+def test_document_references_are_not_people_and_urls_are_not_person_evidence(reference):
+    sources = packet("The fetched specification describes a transport protocol.", author="other")
+    sources["sources"][0]["url"] = "https://www.rfc-editor.org/rfc/rfc9000"
+    assert not missing_named_attributions(candidate(f"According to {reference}, the transport has streams."), sources)
+    sources["sources"][0]["url"] = "https://example.org/authors/Juno"
+    assert missing_named_attributions(candidate("According to Juno, clients fail."), sources)
+
+
+@pytest.mark.parametrize("text", ["In 2026 Juno says that clients fail.",
+                                 "By 2026 Juno says that clients fail.",
+                                 "At 12:00 Juno says that clients fail.",
+                                 "According to Juno 2026 measurements show a failure."])
+def test_standalone_numbers_bound_names_without_erasing_the_named_speaker(text):
+    flags = missing_named_attributions(candidate(text), packet())
+    assert flags and flags[0]["name"] == "Juno"
+
+
+@pytest.mark.parametrize("source", ['Juno—who operates a relay—says that clients fail.',
+                                   'Juno—"Clients fail."',
+                                   'Juno—“Clients fail.”'])
+def test_narrative_em_dash_asides_do_not_hide_literal_source_names(source):
+    assert not missing_named_attributions(candidate("Juno says that clients fail."), packet(source, author="other"))
+    assert missing_named_attributions(candidate(source), packet(), known_names=["Juno"])
+
+
+def test_author_handles_and_ambiguous_compounds_do_not_use_prose_aside_normalization():
+    assert missing_named_attributions(candidate("@Juno says that clients fail."), packet(author="Juno—who"))
+    assert missing_named_attributions(candidate("Vale says that clients fail."), packet("Juno–Vale published measurements.", author="other"))
