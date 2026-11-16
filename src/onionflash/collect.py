@@ -243,10 +243,15 @@ def _feed(
         updated = _entry_time(entry, "updated", published)
         if updated < cutoff:
             continue
+        try:
+            entry_url = canonical_url(entry.get("link", ""))
+        except ValueError:
+            continue
         content_parts = entry.get("content") or []
         text = plain_text(
             content_parts[0].get("value", "") if content_parts else entry.get("summary", ""),
             settings["content_chars"],
+            mark_blockquotes=urlsplit(entry_url).hostname == LIST_ARCHIVE_HOST,
         )
         # Only an explicit text/plain title keeps its angle brackets; HTML/XHTML titles are stripped.
         title_html = (entry.get("title_detail") or {}).get("type", "text/html") != "text/plain"
@@ -260,7 +265,7 @@ def _feed(
         # link exists; an RSS guid that is not a permalink is never a citation.
         try:
             item = make_item(
-                source, entry.get("link", ""), title, text, published, updated,
+                source, entry_url, title, text, published, updated,
                 title_html=title_html, observed=started,
             )
         except ValueError:
