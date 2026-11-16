@@ -49,6 +49,35 @@ def test_standard_api_contract_does_not_receive_native_sampling_extensions():
         "temperature": 0.7, "max_tokens": review.OUTPUT_TOKENS, "top_p": 0.8, "presence_penalty": 1.5}
 
 
+@pytest.mark.parametrize("model", ["nemotron-3-ultra", "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"])
+def test_review_override_uses_selected_model_family_profile(model):
+    config = copy.deepcopy(DEFAULTS)
+    config["review"]["model"] = model
+    settings = review._llm(config)
+    assert settings["model"] == model
+    assert generation_options(settings) == {"temperature": 1.0, "top_p": 0.95,
+                                            "max_tokens": review.OUTPUT_TOKENS,
+                                            "chat_template_kwargs": {"enable_thinking": False}}
+
+
+def test_unknown_model_keeps_existing_general_generation_settings():
+    config = copy.deepcopy(DEFAULTS)
+    config["review"]["model"] = "other-model"
+    config["llm"]["temperature"] = 0.25
+    assert generation_options(review._llm(config)) == {"temperature": 0.25,
+                                                     "max_tokens": review.OUTPUT_TOKENS,
+                                                     "chat_template_kwargs": {"enable_thinking": False}}
+
+
+@pytest.mark.parametrize("field,value", [("temperature", 0.8), ("top_p", 0.9)])
+def test_selected_model_profile_changes_invalidate_policy(monkeypatch, field, value):
+    config = copy.deepcopy(DEFAULTS)
+    config["review"]["model"] = "nemotron-3-ultra"
+    previous = review.policy_hash(config)
+    monkeypatch.setitem(review.NEMOTRON_SAMPLING, field, value)
+    assert review.policy_hash(config) != previous
+
+
 def test_review_model_override_and_explicit_thinking_profile_are_preserved():
     config = copy.deepcopy(DEFAULTS)
     config["review"]["model"] = "alternate-model"

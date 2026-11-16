@@ -7,6 +7,7 @@ import json
 import re
 
 from .analyze import SCHEMA as DRAFT_SCHEMA
+from .config import DEFAULTS
 from .llm import (AnalysisError, CompletionClient, apply_label_limits, has_malformed_tor_version,
                   generation_options, has_shouting_caps, is_complete_sentence, label_limits, repair_schema, validate_text)
 from .render import prepare_story
@@ -625,6 +626,7 @@ class ReviewLimitReached(ReviewError):
 OUTPUT_TOKENS = 2200  # room for every criterion and a repair
 REVIEW_SAMPLING = {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0,
                    "presence_penalty": 1.5, "repetition_penalty": 1.0}
+NEMOTRON_SAMPLING = {"temperature": 1.0, "top_p": 0.95}
 NATIVE_SAMPLING = frozenset({"top_k", "min_p", "repetition_penalty"})
 
 
@@ -633,7 +635,12 @@ def _llm(config: dict) -> dict:
     settings = {**config["llm"], "model": config["review"]["model"] or config["llm"]["model"],
                 "max_output_tokens": OUTPUT_TOKENS}
     if not settings["enable_thinking"]:
-        settings.update(REVIEW_SAMPLING)
+        family = settings["model"].casefold().rsplit("/", 1)[-1]
+        default_family = DEFAULTS["llm"]["model"].casefold().rsplit("/", 1)[-1].split("-", 1)[0] + "-"
+        if family.startswith(default_family):
+            settings.update(REVIEW_SAMPLING)
+        elif family.startswith(("nemotron-3-", "nvidia-nemotron-3-")):
+            settings.update(NEMOTRON_SAMPLING)
         if not settings["send_chat_template_kwargs"]:
             for name in NATIVE_SAMPLING:
                 settings.pop(name, None)
