@@ -134,9 +134,11 @@ Call a named or identifiable person a developer only when the supplied evidence
 identifies code authored by that same person and committed into C Tor's codebase.
 A mailing-list post, sender domain or authority, technical fluency, self-description,
 request for a merge request, or proposed/unmerged code does not establish that role.
+Quoting or attributing a developer self-description does not waive this requirement.
 Another person's commit or a contribution to another project is not evidence for it.
 Without that evidence, use the person's name alone or a source-stated role such as
-relay operator. Preserve the person's actual report or request without adding a role.
+relay operator. Do not infer another personal role or affiliation from technical
+discussion or internal sender tags. Preserve the person's actual report or request.
 
 {claim_check}Write a factual headline and 1-3 concise sentences. Brief sources
 can have brief summaries; never add filler to reach a word count. Preserve who did
