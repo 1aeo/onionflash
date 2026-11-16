@@ -285,9 +285,13 @@ SAME-STORY ROUTING (coverage_background.recent is present):
   the omitted news. Classify that distinct response event as developing, without release labels for defenses
   still being evaluated. Keep plans attributed and tentative. This exception does not apply when that response news
   itself is already covered: route a repeat to the story covering those facts, or skip if no route is appropriate.
+  The exception applies to revise/repair verdicts as well as approvals: if an inaccurate draft says planned
+  defenses shipped or the attack ended, judge the event the source actually reports, repair those claims,
+  and keep same_story null for its new response news. An erroneous release label never selects the target.
 - When prior_story is present, set same_story to a separate non-retracted recent entry's id ONLY when
   that entry and prior_story report the exact same concrete event; otherwise keep same_story null.
-- When prior_story is null, attach an earlier or later stage of a concrete bug, incident, request or
+- Only when the distinct-response exception above does NOT apply and prior_story is null, attach an earlier
+  or later stage of a concrete bug, incident, request or
   single-fix emergency release already in non-retracted recent coverage to that story via same_story
   instead of publishing a second standalone article. Treat all of the following as the same story (even
   when this candidate adds material lifecycle progress such as a merge or release): (a) a merge completing
@@ -362,6 +366,11 @@ Evaluate all nine criteria in order before choosing verdict:
    redundant follow-up under new_information; fail news_value only for off-topic spam.
 9. new_information (UPDATE NOVELTY GATE — compare candidate.updates[-1] against candidate.title, summary,
    updates[:-1] and coverage_background.prior_story):
+   - First read EVERY earlier update, not just the headline and summary. Facts already in updates[:-1]
+     are already published even if absent from the summary. For example, another statement that defenses
+     are being evaluated and further releases are expected adds nothing if an earlier update already says
+     that. If the source adds no other material facts, FAIL new_information and skip; official authority,
+     a newer timestamp or different wording does not renew that news. An identical repeated update is not new.
    - PASS ONLY for a MATERIAL new factual development: (a) a real lifecycle transition (issue closed with fix/"Done."
      or linked MR; merged gitlab_mr; version tag when prior_story.state is not yet "tagged"/"released" — never treat
      a version tag as covered by "merged"; released when not yet "released"; fixed, resolved or reopened); (b) an
@@ -400,7 +409,9 @@ Evaluate all nine criteria in order before choosing verdict:
 Update repair and skip rules: Set same_story to a separate non-retracted recent id ONLY when it and prior_story
 report the exact same concrete event, else null. When new_information fails for items (1)-(8) above, ALWAYS return
 verdict "skip" with repair null and prior_story.id in new_information.reason (even if updates[-1].text or state also
-failed a check); for an unrelated wrongly attached event, return "hold" with repair null. When new_information passes
+failed a check). Copy the actual coverage_background.prior_story.id literally into that reason before returning
+skip; a phrase such as "already covered" without the id is invalid. For an unrelated wrongly attached event,
+return "hold" with repair null. When new_information passes
 and a defect is fixable from packet, return "revise" editing only update (one complete punctuated sentence <= 200
 chars; do not add "fixed", "resolved" or "removed" on a gitlab_issue unless a passage states that word) and/or
 changed labels, never downgrading a "confirmed" prior_story.confidence; otherwise return "hold" with repair null.
