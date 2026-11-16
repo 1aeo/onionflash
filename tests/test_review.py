@@ -106,14 +106,14 @@ COVERAGE = {"prior_story": None, "recent": [{"id": COVERED, "title": "Earlier co
 PRIOR = {"prior_story": {"id": COVERED, "title": "Earlier coverage"}, "recent": [], "truncated": False}
 
 
-def test_review_keeps_only_its_model_and_rejects_unknown_settings(tmp_path):
+def test_review_preserves_legacy_model_config_and_rejects_unknown_settings(tmp_path):
     def configured(name, extra):
         p = tmp_path / name
         p.write_text('[[sources]]\nid="test"\nurl="https://example.org/feed.xml"\n' + extra)
         return load_config(p)
 
     cfg = configured("c1.toml", '[llm]\ntimeout_seconds=45\n[review]\nmodel="critic-model"\n')
-    assert cfg["review"] == {"model": "critic-model"}
+    assert cfg["review"] == {"model": "critic-model", "reasoning": False}
     with review.Reviewer(cfg) as rev:
         assert rev.llm["model"] == "critic-model" and rev.llm["max_output_tokens"] == review.OUTPUT_TOKENS
         assert (rev.http_settings["timeout_seconds"], rev.http_settings["total_timeout_seconds"]) == (45, 180)

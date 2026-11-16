@@ -332,14 +332,18 @@ needs enough context for a full packet. Requests also obey the shared run
 deadline. The coverage background is bounded separately; truncation is explicit
 and never proves the absence of older coverage.
 
-Non-thinking review requests use fixed profiles for recognized model families.
-The default model family uses temperature 0.7, top-p 0.8 and presence penalty 1.5. Endpoints using
-chat-template extensions also receive top-k 20, min-p 0 and repetition penalty 1;
-standard API requests omit those native extensions. Nemotron 3 uses temperature 1
-and top-p 0.95 without the default family's additional sampling fields. Other models retain the
-general generation settings. Writer and link-check sampling remain independent.
+Non-thinking review requests retain the general generation settings, except that
+Nemotron 3 uses its supported temperature 1 and top-p 0.95 profile. Standard API
+requests omit native sampling extensions. Writer and link-check sampling remain independent.
 Every effective review generation option participates in the
 policy identity, so an earlier profile's approvals cannot be reused unchanged.
+
+`review.reasoning = true` enables a separate full-thinking profile for final reviews
+and verification, with a larger completion allowance. The default model family uses
+xhigh effort; Nemotron 3 uses its full-thinking template. The endpoint must support
+chat-template extensions. This setting does not change writer or link-check reasoning.
+`review.model` continues to select both the final reviewer and link-check model, so
+changing that model requires validating both uses.
 
 The controlled evaluation does not collect, open the application database or
 publish. It takes the gate's steps, from the first review through every repair

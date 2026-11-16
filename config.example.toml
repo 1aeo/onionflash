@@ -39,6 +39,7 @@ writer_reasoning = false
 # credentials, network policy and timeout are inherited from [llm].
 [review]
 model = ""                     # Empty uses llm.model.
+reasoning = false              # Reviewer-only full reasoning; requires chat-template support.
 
 # Source kind is feed, tag, gitlab_issue, gitlab_mr, or metrics_timeline.
 # Fallbacks must offer the same logical stream; they are tried in order.

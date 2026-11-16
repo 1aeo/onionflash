@@ -27,12 +27,10 @@ def test_native_review_requests_use_declared_sampling_without_mutating_config(mo
         checker.client = FakeLLM(completion(verdict(update=update)))
         assert checker.review(candidate, packet, verification=verification, update=update)["verdict"] == "approve"
         body = checker.client.requests[0][1]
-        for key, value in {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0,
-                           "presence_penalty": 1.5, "repetition_penalty": 1.0,
-                           "max_tokens": review.OUTPUT_TOKENS,
+        for key, value in {"temperature": 0, "max_tokens": review.OUTPUT_TOKENS,
                            "chat_template_kwargs": {"enable_thinking": False}}.items():
             assert body[key] == value
-        assert "reasoning_effort" not in body
+        assert not {"reasoning_effort", "top_p", "top_k", "min_p", "presence_penalty", "repetition_penalty"} & body.keys()
         assert checker.http_settings["timeout_seconds"] == 1800
     assert config == original
     writer = generation_options(analyze.writer_settings(config["llm"]))
@@ -46,7 +44,7 @@ def test_standard_api_contract_does_not_receive_native_sampling_extensions():
     config = copy.deepcopy(DEFAULTS)
     config["llm"]["send_chat_template_kwargs"] = False
     assert generation_options(review._llm(config)) == {
-        "temperature": 0.7, "max_tokens": review.OUTPUT_TOKENS, "top_p": 0.8, "presence_penalty": 1.5}
+        "temperature": 0, "max_tokens": review.OUTPUT_TOKENS}
 
 
 @pytest.mark.parametrize("model", ["nemotron-3-ultra", "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"])
@@ -90,7 +88,8 @@ def test_review_model_override_and_explicit_thinking_profile_are_preserved():
 
 @pytest.mark.parametrize("field,value", [("temperature", 0.6), ("top_p", 0.9), ("top_k", 30),
                                          ("min_p", 0.1), ("presence_penalty", 1.0), ("repetition_penalty", 1.1)])
-def test_each_effective_sampling_change_invalidates_review_identity(monkeypatch, field, value):
-    previous = review.policy_hash(DEFAULTS)
-    monkeypatch.setitem(review.REVIEW_SAMPLING, field, value)
-    assert review.policy_hash(DEFAULTS) != previous
+def test_each_effective_sampling_change_invalidates_review_identity(field, value):
+    config = copy.deepcopy(DEFAULTS)
+    previous = review.policy_hash(config)
+    config["llm"][field] = value
+    assert review.policy_hash(config) != previous

@@ -91,7 +91,7 @@ DEFAULTS = {
         "writer_reasoning": False,
         "send_chat_template_kwargs": True,
     },
-    "review": {"model": ""},
+    "review": {"model": "", "reasoning": False},
     "sources": [],
 }
 
@@ -116,6 +116,7 @@ OPERATOR_SETTINGS = {
 SECTION_SPECS = {
     "collection": {"lists": ("trusted_operator_domains", "dirauth_gitlab_users")},
     "comments": {"bools": ("enabled",)},
+    "review": {"bools": ("reasoning",)},
     "site": {
         "ints": {"page_size": BOUNDS["page_size"]},
         "strings": {"title": (0, 300), "description": (0, 300)},
@@ -309,6 +310,8 @@ def load_config(path: str | Path) -> dict:
     if not isinstance(review["model"], str) or len(review["model"]) > 200 or any(ord(c) < 32 for c in review["model"]):
         raise ValueError("review.model must be a short model identifier, or empty to inherit llm.model")
     review["model"] = review["model"].strip()
+    if review["reasoning"] and not llm["send_chat_template_kwargs"]:
+        raise ValueError("review.reasoning requires llm.send_chat_template_kwargs")
 
     sources = config["sources"]
     if not isinstance(sources, list) or not 1 <= len(sources) <= 100:

@@ -624,22 +624,30 @@ class ReviewLimitReached(ReviewError):
 
 
 OUTPUT_TOKENS = 2200  # room for every criterion and a repair
-REVIEW_SAMPLING = {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0,
-                   "presence_penalty": 1.5, "repetition_penalty": 1.0}
 NEMOTRON_SAMPLING = {"temperature": 1.0, "top_p": 0.95}
 NATIVE_SAMPLING = frozenset({"top_k", "min_p", "repetition_penalty"})
+REVIEW_REASONING_OPTIONS = {"enable_thinking": True, "temperature": 1.0, "top_p": 0.95,
+                            "max_output_tokens": 32768, "max_response_bytes": 2097152}
 
 
 def _llm(config: dict) -> dict:
     """The writer's endpoint and transport policy, timeout included, with the review model."""
     settings = {**config["llm"], "model": config["review"]["model"] or config["llm"]["model"],
                 "max_output_tokens": OUTPUT_TOKENS}
-    if not settings["enable_thinking"]:
-        family = settings["model"].casefold().rsplit("/", 1)[-1]
-        default_family = DEFAULTS["llm"]["model"].casefold().rsplit("/", 1)[-1].split("-", 1)[0] + "-"
+    family = settings["model"].casefold().rsplit("/", 1)[-1]
+    default_family = DEFAULTS["llm"]["model"].casefold().rsplit("/", 1)[-1].split("-", 1)[0] + "-"
+    reasoning = config["review"].get("reasoning", False)
+    if type(reasoning) is not bool:
+        raise ValueError("review.reasoning must be a boolean")
+    if reasoning:
+        if not settings["send_chat_template_kwargs"]:
+            raise ValueError("review.reasoning requires llm.send_chat_template_kwargs")
+        settings.update(REVIEW_REASONING_OPTIONS)
         if family.startswith(default_family):
-            settings.update(REVIEW_SAMPLING)
-        elif family.startswith(("nemotron-3-", "nvidia-nemotron-3-")):
+            settings.update(top_k=20, min_p=0.0, presence_penalty=0.0,
+                            repetition_penalty=1.0, reasoning_effort="xhigh")
+    if not settings["enable_thinking"]:
+        if family.startswith(("nemotron-3-", "nvidia-nemotron-3-")):
             settings.update(NEMOTRON_SAMPLING)
         if not settings["send_chat_template_kwargs"]:
             for name in NATIVE_SAMPLING:
