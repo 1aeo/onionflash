@@ -16,7 +16,7 @@ import copy
 import json
 import re
 
-from . import candidate as candidate_mod, decisions, editorial, review
+from . import candidate as candidate_mod, decisions, editorial, impact_audit, review
 from .analyze import cache_key
 from .llm import AnalysisError, CompletionDeferred, RequestObserver
 from .util import (
@@ -24,7 +24,7 @@ from .util import (
     is_hackerone_item, now_iso, saved_object, thread_subject,
 )
 
-REVIEW_STATE_VERSION = 2
+REVIEW_STATE_VERSION = 3
 MAX_APPROVALS = 2000  # cached approvals kept besides those unfinished jobs pin
 # An item starts a new story only if its newest dated development is at most this many days older
 # than the collection of its current revision: the same window the collector's lookback uses.
@@ -59,6 +59,7 @@ HOLDS = {
     "malformed_version": "the candidate cites a nonexistent three-part C-Tor version",
     "untrusted_operator_claim": "an uncorroborated mailing-list incident claim needs a trusted source",
     "named_attribution": "a named attribution has no literal source evidence",
+    "impact_audit": "the proposed impact deletion could not be independently justified",
 }
 
 
@@ -108,7 +109,7 @@ def initial_review_state():
     # Keep the real version-two ledger shape: this legacy-named index covers all
     # rejected-response events; each event's fixed error distinguishes its type.
     return {"request_budget": {"reserved": 0, "inconsistent_requests": [], "validation_reask": None},
-            "untrusted_proposals": []}
+            "untrusted_proposals": [], "impact_audits": []}
 
 
 def _carried_requests(record):
@@ -116,7 +117,9 @@ def _carried_requests(record):
     ReviewRequests(record)
     return {"request_budget": copy.deepcopy(record["request_budget"]),
             "untrusted_proposals": [{**copy.deepcopy(proposal), "disposition": "discarded_context"}
-                                    for proposal in record["untrusted_proposals"]]}
+                                    for proposal in record["untrusted_proposals"]],
+            "impact_audits": [{**copy.deepcopy(audit), "status": "discarded_context"}
+                              for audit in record.get("impact_audits", [])]}
 
 
 def status(store):
@@ -196,6 +199,10 @@ def _policy_copies(record, policy):
             if context is not None and (not isinstance(context, dict)
                     or ("policy_hash" in context and context["policy_hash"] != policy)):
                 raise ValueError()
+        for audit in proof.get("impact_audits", []):
+            if (not isinstance(audit, dict) or not isinstance(audit.get("context"), dict)
+                    or audit["context"].get("policy_hash") != policy):
+                raise ValueError()
         if proof.get("approval") is not None:
             pending.append(proof["approval"])
 
@@ -242,19 +249,23 @@ def _saved_job(store, row, config):
             return value["content_hash"]
 
         version, marker = record.get("schema_version"), record.get("input_proof")
-        if type(version) is not int or version not in {1, REVIEW_STATE_VERSION}:
+        if type(version) is not int or version not in {1, 2, REVIEW_STATE_VERSION}:
             raise ValueError()
-        if version == REVIEW_STATE_VERSION:
+        if version in {2, REVIEW_STATE_VERSION}:
             if type(marker) is not int or marker != 1:
                 raise ValueError()
             ReviewRequests(record)
-        elif {"input_proof", "request_budget", "untrusted_proposals"} & set(record):
+            if version == 2 and "impact_audits" in record:
+                raise ValueError()  # A version-two producer never wrote impact audits.
+            if version == REVIEW_STATE_VERSION and not isinstance(record.get("impact_audits"), list):
+                raise ValueError()
+        elif {"input_proof", "request_budget", "untrusted_proposals", "impact_audits"} & set(record):
             # These fields were never emitted by a merged version-one producer.
             raise ValueError()
         if "input_hash" in record and (not isinstance(record["input_hash"], str)
                 or not re.fullmatch(r"[0-9a-f]{64}", record["input_hash"])):
             raise ValueError()
-        if version == REVIEW_STATE_VERSION:
+        if version in {2, REVIEW_STATE_VERSION}:
             if "input_hash" not in record:
                 raise ValueError()
             proof_row = record.get("input_row") if prepared is None else prepared["row"]
@@ -502,7 +513,7 @@ def _can_route(candidate: dict, prepared: dict, result: dict, target_id) -> bool
     return bool(item_subj and item_subj == target_subj)
 
 
-def next_step(reviews, candidate, prepared):
+def next_step(reviews, candidate, prepared, *, impact_audits=(), plan_impact=False):
     """What follows the latest review of `candidate`, decided from the chain of reviews alone.
 
     ("route", story_id) attaches an unmapped item to an existing story, ("verify", text) sends text
@@ -562,8 +573,24 @@ def next_step(reviews, candidate, prepared):
         return "hold", (stage, "tag_repair")
     if len(reviews) > MAX_VERIFY_REPAIRS + 1:
         return "hold", (stage, "repairs_exhausted")
+    repair = result["repair"]
     try:
-        repaired = review.apply_repair(candidate, result["repair"], update=is_update)
+        repaired = review.apply_repair(candidate, repair, update=is_update)
+    except review.ReviewError:
+        return ("verify", candidate) if disputed and not later else ("hold", (stage, "unusable_repair"))
+    if _impact_clear(candidate, repair, prepared):
+        audit = _impact_receipt(impact_audits, "review", latest["request"])
+        if audit is None:
+            if plan_impact:
+                return "impact_audit", repaired
+            raise review.ReviewError("Impact deletion lacks an audit receipt")
+        repair = _effective_impact_repair(audit, candidate, prepared)
+        if repair is None:
+            return "hold", (stage, "impact_audit")
+        if not repair:
+            return "verify", candidate  # A veto is not an edit or an approval.
+    try:
+        repaired = review.apply_repair(candidate, repair, update=is_update)
     except review.ReviewError:
         # After a disputed official item's first review, the unchanged text goes to its fresh verification.
         return ("verify", candidate) if disputed and not later else ("hold", (stage, "unusable_repair"))
@@ -572,6 +599,205 @@ def next_step(reviews, candidate, prepared):
     if digest(repaired) in {entry["candidate_hash"] for entry in reviews}:
         return "hold", (stage, "repeated_repair")  # every text of the chain was refused once already
     return "verify", repaired
+
+
+def _impact_clear(candidate, repair, prepared):
+    return (prepared.get("mode") != "update" and not _literal_tag(prepared)
+            and isinstance(repair, dict) and repair.get("why_it_matters") == ""
+            and bool(candidate.get("why_it_matters")))
+
+
+def _impact_receipt(audits, kind, request):
+    return next((a for a in audits if a["status"] != "discarded_context"
+                 and a["kind"] == kind and a["origin"]["request"] == request), None)
+
+
+def _impact_repair(audit):
+    origin = audit["origin"]
+    return origin["result"]["repair"] if audit["kind"] == "review" else origin["repair"]
+
+
+def _effective_impact_repair(audit, candidate, prepared):
+    repair = _impact_repair(audit)
+    if (audit["before_hash"] != digest(candidate) or not _impact_clear(candidate, repair, prepared)
+            or digest(review.apply_repair(candidate, repair)) != audit["proposed_hash"]):
+        raise review.ReviewError("Impact audit target changed")
+    if audit["status"] != "complete" or audit["result"]["outcome"] == "insufficient":
+        return None
+    effective = copy.deepcopy(repair)
+    if audit["result"]["outcome"] == "supported":
+        effective.pop("why_it_matters")
+    expected = review.apply_repair(candidate, effective) if effective else candidate
+    if audit["effective_hash"] != digest(expected):
+        raise review.ReviewError("Impact audit effective candidate changed")
+    return effective
+
+
+def _pending_impact(record):
+    for audit in record.get("impact_audits", []):
+        events = record["reviews"] if audit["kind"] == "review" else record["untrusted_proposals"]
+        if (audit["status"] != "discarded_context"
+                and not any(e["request"] == audit["origin"]["request"] for e in events)):
+            return audit
+    return None
+
+
+def _finish_impact(audit, stage, candidate, prepared, record):
+    origin = copy.deepcopy(audit["origin"])
+    if audit["kind"] == "review":
+        record["reviews"].append(origin)
+        return next_step(record["reviews"], candidate, prepared, impact_audits=record["impact_audits"])
+    effective = _effective_impact_repair(audit, candidate, prepared)
+    repaired = review.apply_repair(candidate, effective) if effective else candidate
+    origin.update(repair=effective or None, candidate_after_hash=digest(repaired),
+                  changed_fields=sorted(k for k in candidate if repaired.get(k) != candidate[k]),
+                  accepted=bool(effective), impact_audit=True, disposition="pending" if effective else
+                  "impact_hold" if effective is None else "impact_veto")
+    waiting = pending_proposal(record)
+    if waiting is not None:
+        waiting["disposition"] = "superseded_unverified"
+    record["request_budget"]["inconsistent_requests"].append(origin["request"])
+    record["untrusted_proposals"].append(origin)
+    return ("hold", ("verification" if stage == "verify" else "review", "impact_audit")) if effective is None else ("verify", repaired)
+
+
+def _run_impact(audit, reviewer, stage, candidate, prepared, record, requests):
+    if audit["status"] == "sent":
+        audit.update(status="failed", error={"type": "InterruptedAudit", "code": "review.impact_audit"})
+        requests.persist()  # An unknown dispatched attempt must not be resampled.
+    if audit["status"] == "pending":
+        if requests.state["reserved"] > MAX_REVIEW_REQUESTS - 2:
+            audit.update(status="failed", error={"type": "VerificationSlotUnavailable", "code": "review.request_budget"})
+            requests.persist()
+        else:
+            base = requests.callback()
+
+            class Counter(RequestObserver):
+                def __call__(self, delta):
+                    if delta == 1 and (audit["request"] is not None
+                                       or requests.state["reserved"] >= MAX_REVIEW_REQUESTS - 1):
+                        raise impact_audit.AuditError("Impact audit cannot spend its verification slot or repeat a dispatched attempt")
+                    audit.update(status="sent" if delta == 1 else "pending",
+                                 request=requests.state["reserved"] + 1 if delta == 1 else None)
+                    base(delta)
+
+                def response_received(self):
+                    base.response_received()
+
+                def transport_failed(self):
+                    base.transport_failed()
+
+            try:
+                result = impact_audit.audit(reviewer, candidate, prepared["packet"], on_request=Counter())
+            except CompletionDeferred:
+                raise
+            except AnalysisError as error:
+                audit.update(status="failed", error={"type": type(error).__name__, "code": error.code})
+            else:
+                repair = copy.deepcopy(_impact_repair(audit))
+                if result["outcome"] == "supported":
+                    repair.pop("why_it_matters")
+                effective = review.apply_repair(candidate, repair) if repair else candidate
+                audit.update(status="complete", result=result,
+                             effective_hash=None if result["outcome"] == "insufficient" else digest(effective))
+            requests.persist()
+    return _finish_impact(audit, stage, candidate, prepared, record)
+
+
+def _start_impact(kind, origin, reviewer, stage, candidate, proposed, prepared, record, requests):
+    audit = {"kind": kind, "origin": copy.deepcopy(origin), "context": _context(prepared, record["policy_hash"]),
+             "before_hash": digest(candidate), "proposed_hash": digest(proposed), "effective_hash": None,
+             "status": "pending", "request": None, "result": None, "error": None}
+    if any(a["status"] != "discarded_context" and a["context"] == audit["context"]
+           and a["before_hash"] == audit["before_hash"] and a["proposed_hash"] == audit["proposed_hash"]
+           for a in record["impact_audits"]):
+        audit.update(status="failed", error={"type": "RepeatedImpactAudit", "code": "review.impact_audit"})
+    record["impact_audits"].append(audit)
+    requests.persist()
+    return _run_impact(audit, reviewer, stage, candidate, prepared, record, requests)
+
+
+def _validate_impact_audits(record, candidate, prepared, stage):
+    audits = record.get("impact_audits")
+    if not isinstance(audits, list) or len(audits) > MAX_REVIEW_REQUESTS:
+        raise ValueError()
+    fields = {"kind", "origin", "context", "before_hash", "proposed_hash", "effective_hash",
+              "status", "request", "result", "error"}
+    statuses = {"pending", "sent", "complete", "failed", "discarded_context"}
+    origins, requests, pending = set(), set(), []
+    events = record["reviews"] + record["untrusted_proposals"]
+    event_requests = {e.get("request") for e in events}
+    bound = record["request_budget"]["reserved"]
+    hashed = lambda value: isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+    for audit in audits:
+        if (not isinstance(audit, dict) or set(audit) != fields or audit["kind"] not in {"review", "proposal"}
+                or audit["status"] not in statuses or not isinstance(audit["origin"], dict)
+                or not isinstance(audit["context"], dict)
+                or set(audit["context"]) != {"source_hash", "coverage_hash", "binding_hash", "policy_hash"}
+                or not all(hashed(v) for v in audit["context"].values())
+                or not hashed(audit["before_hash"]) or not hashed(audit["proposed_hash"])
+                or (audit["effective_hash"] is not None and not hashed(audit["effective_hash"]))):
+            raise ValueError()
+        origin, number = audit["origin"], audit["request"]
+        trigger = origin.get("request")
+        if type(trigger) is not int or not 1 <= trigger <= bound or trigger in origins:
+            raise ValueError()
+        origins.add(trigger)
+        if number is not None:
+            if (type(number) is not int or number != trigger + 1 or number > bound
+                    or number in requests or number in event_requests):
+                raise ValueError()
+            requests.add(number)
+        if audit["status"] == "discarded_context":
+            continue
+        if prepared is None or audit["context"] != _context(prepared, record["policy_hash"]):
+            raise ValueError()
+        if audit["kind"] == "review":
+            if ({k: origin.get(k) for k in audit["context"]} != audit["context"]
+                    or origin.get("candidate_hash") != audit["before_hash"]
+                    or origin.get("stage") not in {"review", "verification"}):
+                raise ValueError()
+            review.validate_review(origin["result"], prepared["packet"], coverage=prepared.get("coverage"))
+            if origin["result"]["verdict"] != "revise":
+                raise ValueError()
+            matching = [e for e in record["reviews"] if e.get("request") == trigger]
+        else:
+            if (origin.get("context") != audit["context"] or origin.get("candidate_before_hash") != audit["before_hash"]
+                    or origin.get("error") != review.INCONSISTENT_VERDICT or origin.get("accepted") is not False
+                    or origin.get("impact_audit") is not False
+                    or origin.get("stage") not in {"review", "verify", "repair"} or origin.get("mode") != "story"):
+                raise ValueError()
+            review._repair_fields(origin["repair"])
+            matching = [e for e in record["untrusted_proposals"] if e.get("request") == trigger]
+        if len(matching) > 1:
+            raise ValueError()
+        if not matching:
+            pending.append(audit)
+            origin_stage = ("verify" if origin["stage"] == "verification" else
+                            "repair" if origin.get("issue") == "release_labels" else origin["stage"])
+            if (stage != origin_stage or audit["before_hash"] != digest(candidate)
+                    or any(e.get("request", 0) > trigger for e in events)):
+                raise ValueError()
+            _effective_impact_repair(audit, candidate, prepared)
+        if audit["status"] == "complete":
+            if number is None or audit["error"] is not None:
+                raise ValueError()
+            impact_audit.validate(audit["result"], prepared["packet"])
+            if (audit["result"]["outcome"] == "insufficient") != (audit["effective_hash"] is None):
+                raise ValueError()
+        elif audit["result"] is not None or audit["effective_hash"] is not None:
+            raise ValueError()
+        if audit["status"] == "failed":
+            if (not isinstance(audit["error"], dict) or set(audit["error"]) != {"type", "code"}
+                    or any(not isinstance(v, str) or not v or len(v) > 120 for v in audit["error"].values())):
+                raise ValueError()
+        elif audit["error"] is not None:
+            raise ValueError()
+        if audit["status"] in {"pending", "sent"}:
+            if matching or (audit["status"] == "pending") != (number is None):
+                raise ValueError()
+    if len(pending) > 1 or requests & origins:
+        raise ValueError()
 
 
 class ReviewRequests:
@@ -686,7 +912,7 @@ def proposal_needs_check(record):
     """Earlier verified facts cannot clear a later invalid proposal attempt."""
     active = [p for p in record.get("untrusted_proposals", []) if p["disposition"] != "discarded_context"]
     latest = max((entry.get("request", 0) for entry in record["reviews"]), default=0)
-    return bool(pending_proposal(record)) or bool(active and latest <= active[-1]["request"])
+    return bool(_pending_impact(record)) or bool(pending_proposal(record)) or bool(active and latest <= active[-1]["request"])
 
 
 def _validate_reask(record, stage):
@@ -696,12 +922,17 @@ def _validate_reask(record, stage):
     triggers = [proposal for proposal in proposals if proposal["reask_trigger"]]
     responses = [(entry, False) for entry in record["reviews"]]
     responses += [(proposal, True) for proposal in proposals]
+    if (pending := _pending_impact(record)) is not None:
+        responses.append((pending["origin"], pending["kind"] == "proposal"))
     if any(type(entry.get("reask_response", False)) is not bool for entry, _ in responses):
         raise ValueError()
     if correction is None:
         if triggers or any(entry.get("reask_response", False) for entry, _ in responses):
             raise ValueError()
-        if any(not p["accepted"] and p["request"] < MAX_REVIEW_REQUESTS for p in proposals):
+        if any(not p["accepted"] and p["disposition"] not in {"impact_veto", "impact_hold"}
+               and not any(a["kind"] == "proposal" and a["origin"]["request"] == p["request"]
+                           and a["status"] == "discarded_context" for a in record.get("impact_audits", []))
+               and p["request"] < MAX_REVIEW_REQUESTS for p in proposals):
             raise ValueError()
         return
     if len(triggers) != 1 or triggers[0]["request"] != correction["trigger"] or triggers[0]["accepted"]:
@@ -737,7 +968,7 @@ def _pending_reask(record, stage, candidate, prepared):
     events += [(proposal["request"], proposal) for proposal in record["untrusted_proposals"]
                if proposal["disposition"] != "discarded_context"]
     latest = max(events, default=(0, None), key=lambda event: event[0])[1]
-    if latest is None or latest["accepted"]:
+    if latest is None or latest["accepted"] or latest["disposition"] in {"impact_veto", "impact_hold"}:
         return False
     correction = record["request_budget"]["validation_reask"]
     if correction is None or correction["trigger"] != latest["request"]:
@@ -758,12 +989,14 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
     budget = ReviewRequests(record).state
     proposals = record.get("untrusted_proposals", [])
     dispositions = {"pending", "superseded_unverified", "discarded_context", "unusable", "literal_tag", "labels", "repeated",
+                    "impact_veto", "impact_hold",
                     "checked_approve", "checked_revise", "checked_hold", "checked_skip"}
     fields = {"error", "request", "stage", "mode", "candidate_before_hash", "candidate_after_hash", "context", "changed_fields", "repair",
-              "accepted", "disposition", "reask_trigger", "reask_response"}
+              "accepted", "disposition", "reask_trigger", "reask_response", "impact_audit"}
     def hashed(value):
         return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
     try:
+        _validate_impact_audits(record, candidate, prepared, stage)
         if stage == "drafted":
             if (prepared is not None or record["reviews"] or "candidate" in record
                     or any(p.get("disposition") != "discarded_context" for p in proposals)):
@@ -788,6 +1021,7 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                     or (proposal["candidate_after_hash"] is not None and not hashed(proposal["candidate_after_hash"]))
                     or type(proposal["accepted"]) is not bool or proposal["disposition"] not in dispositions
                     or type(proposal["reask_trigger"]) is not bool or type(proposal["reask_response"]) is not bool
+                    or type(proposal["impact_audit"]) is not bool
                     or not isinstance(proposal["context"], dict)
                     or set(proposal["context"]) != {"source_hash", "coverage_hash", "binding_hash", "policy_hash"}
                     or not all(hashed(value) for value in proposal["context"].values())
@@ -796,6 +1030,9 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                     or set(proposal["changed_fields"]) - set(candidate_mod.UPDATE_FIELDS if proposal["mode"] == "update" else review.EDITABLE)):
                 raise ValueError()
             accepted = proposal["accepted"]
+            if proposal["impact_audit"] and not any(a["kind"] == "proposal" and a["origin"]["request"] == proposal["request"]
+                                                   for a in record["impact_audits"]):
+                raise ValueError()
             if proposal["error"] != review.INCONSISTENT_VERDICT and (
                     accepted or proposal["repair"] is not None or proposal["candidate_after_hash"] is not None
                     or proposal["changed_fields"] or proposal["disposition"] not in {"unusable", "discarded_context"}):
@@ -806,7 +1043,7 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                 review._repair_fields(proposal["repair"], update=proposal["mode"] == "update")
             if accepted and (proposal["candidate_after_hash"] is None or not proposal["changed_fields"]):
                 raise ValueError()
-            if accepted and proposal["disposition"] in {"unusable", "literal_tag", "labels", "repeated"}:
+            if accepted and proposal["disposition"] in {"unusable", "literal_tag", "labels", "repeated", "impact_veto", "impact_hold"}:
                 raise ValueError()
             if proposal["disposition"] in {"pending", "superseded_unverified"} and not accepted:
                 raise ValueError()
@@ -827,7 +1064,8 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
         if stage == "locked":
             if (not prepared.get("locked") or candidate is not None or prepared.get("candidate") is not None
                     or record.get("outcome") != "locked" or record["reviews"]
-                    or any(p["disposition"] != "discarded_context" for p in proposals)):
+                    or any(p["disposition"] != "discarded_context" for p in proposals)
+                    or any(a["status"] != "discarded_context" for a in record["impact_audits"])):
                 raise ValueError()
             _context(prepared, record["policy_hash"])
             return
@@ -841,7 +1079,7 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                            and entry.get("request", 0) > waiting[0]["request"] for entry in record["reviews"])):
                 raise ValueError()
         _validate_candidate_path(record, stage, candidate, prepared, allow_cached=allow_cached)
-    except (ValueError, TypeError, KeyError, AttributeError, review.ReviewError):
+    except (ValueError, TypeError, KeyError, AttributeError, review.ReviewError, impact_audit.AuditError):
         raise AnalysisError("Saved review proposal state is damaged", code="app.damaged_job") from None
 
 
@@ -864,6 +1102,23 @@ def _validate_candidate_path(record, stage, candidate, prepared, *, allow_cached
             if (entry["context"] != context or entry["stage"] != expected_stage
                     or entry["mode"] != prepared.get("mode", "story") or entry["candidate_before_hash"] != digest(current)):
                 raise ValueError()
+            audit = _impact_receipt(record["impact_audits"], "proposal", entry["request"])
+            if audit is not None:
+                effective = _effective_impact_repair(audit, current, prepared)
+                expected = copy.deepcopy(audit["origin"])
+                after = review.apply_repair(current, effective) if effective else current
+                expected.update(repair=effective or None, candidate_after_hash=digest(after),
+                                changed_fields=sorted(k for k in current if after.get(k) != current[k]),
+                                accepted=bool(effective), impact_audit=True)
+                if any(entry[k] != value for k, value in expected.items() if k != "disposition"):
+                    raise ValueError()
+                if effective is None or not effective:
+                    if entry["disposition"] != ("impact_hold" if effective is None else "impact_veto"):
+                        raise ValueError()
+                    expected_stage = "held" if effective is None else "verify"
+                    continue
+            elif entry["disposition"] in {"impact_veto", "impact_hold"}:
+                raise ValueError()
             if entry["candidate_after_hash"] is not None:
                 after = review.apply_repair(current, entry["repair"], update=entry["mode"] == "update")
                 if (digest(after) != entry["candidate_after_hash"]
@@ -885,7 +1140,10 @@ def _validate_candidate_path(record, stage, candidate, prepared, *, allow_cached
             review.validate_review(entry["result"], prepared["packet"], update=prepared.get("mode") == "update",
                                    coverage=prepared.get("coverage"), candidate=current, attribution_names=known_attributions)
             trusted.append(entry)
-            action, value = next_step(trusted, current, prepared)
+            audit = _impact_receipt(record["impact_audits"], "review", entry["request"])
+            if audit is not None and audit["origin"] != entry:
+                raise ValueError()
+            action, value = next_step(trusted, current, prepared, impact_audits=record["impact_audits"])
             last_action, last_value = action, value
             if action in {"verify", "repair"}:
                 if digest(value) != digest(current) and digest(value) in seen:
@@ -1009,6 +1267,8 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
     become a disagreement anchor.
     """
     validate_review_state(record, stage, candidate, prepared)
+    if (audit := _pending_impact(record)) is not None:
+        return _run_impact(audit, reviewer, stage, candidate, prepared, record, requests)
     correction = _pending_reask(record, stage, candidate, prepared)
     seen = _seen_candidates(record, candidate, prepared)
     waiting = pending_proposal(record)
@@ -1025,9 +1285,7 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
                  "candidate_before_hash": digest(candidate), "candidate_after_hash": None,
                  "context": _context(prepared, record["policy_hash"]), "changed_fields": [],
                  "repair": None, "accepted": False, "disposition": "unusable",
-                 "reask_trigger": False, "reask_response": bool(correction)}
-        requests.state["inconsistent_requests"].append(event["request"])
-        record.setdefault("untrusted_proposals", []).append(event)
+                 "reask_trigger": False, "reask_response": bool(correction), "impact_audit": False}
         try:
             if not isinstance(error, review.InconsistentReview):
                 raise error
@@ -1047,6 +1305,8 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
                 event["disposition"] = "repeated"
                 raise review.ReviewError("Untrusted edit repeats a reviewed candidate")
         except review.ReviewError:
+            requests.state["inconsistent_requests"].append(event["request"])
+            record["untrusted_proposals"].append(event)
             if requests.state["validation_reask"] is None and requests.state["reserved"] < MAX_REVIEW_REQUESTS:
                 event["reask_trigger"] = True
                 requests.state["validation_reask"] = {"trigger": event["request"], "attempts": [],
@@ -1057,6 +1317,10 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
                 return advance_review(reviewer, stage, candidate, prepared, record, requests)
             requests.persist()
             raise error
+        if _impact_clear(candidate, event["repair"], prepared):
+            return _start_impact("proposal", event, reviewer, stage, candidate, repaired, prepared, record, requests)
+        requests.state["inconsistent_requests"].append(event["request"])
+        record["untrusted_proposals"].append(event)
         if waiting is not None:
             waiting["disposition"] = "superseded_unverified"
         event.update(accepted=True, disposition="pending")
@@ -1067,8 +1331,13 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
         if entry["stage"] != "verification" or entry["candidate_hash"] != waiting["candidate_after_hash"]:
             raise AnalysisError("Proposal verification identity changed", code="app.damaged_job")
         waiting["disposition"] = "checked_" + entry["result"]["verdict"]
-    record["reviews"].append({**entry, **_context(prepared, record["policy_hash"])})
-    action, value = next_step(record["reviews"], candidate, prepared)
+    entry = {**entry, **_context(prepared, record["policy_hash"])}
+    planned = next_step([*record["reviews"], entry], candidate, prepared,
+                        impact_audits=record["impact_audits"], plan_impact=True)
+    if planned[0] == "impact_audit":
+        return _start_impact("review", entry, reviewer, stage, candidate, planned[1], prepared, record, requests)
+    record["reviews"].append(entry)
+    action, value = planned
     if action in {"verify", "repair"} and digest(value) != digest(candidate) and digest(value) in seen:
         return "hold", ("verification" if stage == "verify" else "review", "repeated_repair")
     return action, value

@@ -13,10 +13,11 @@ from .llm import (AnalysisError, CompletionClient, apply_label_limits, has_malfo
 from .render import prepare_story
 from .review_evidence import EVIDENCE_POLICY, evidence_context
 from .named_attribution import NAMED_ATTRIBUTION_POLICY, missing_named_attributions
+from .impact_audit import POLICY as IMPACT_AUDIT_POLICY
 from .schema import LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STORY_ID_RE, UPDATE_CHARS
 from .util import canonical_url, digest, normalize_evidence
 
-REVIEW_VERSION = "onionflash-review-16"
+REVIEW_VERSION = "onionflash-review-17"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details", "news_value", "new_information")
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
@@ -690,7 +691,7 @@ def policy_hash(config: dict) -> str:
                    UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT,
                    SCHEMA, UPDATE_REPAIR, VALIDATION_ERRORS, REASON_REPETITION_POLICY,
                    identity, CompletionClient.REQUEST_POLICY, EVIDENCE_POLICY,
-                   NAMED_ATTRIBUTION_POLICY, ATTRIBUTION_CHECK_PROMPT])
+                   NAMED_ATTRIBUTION_POLICY, ATTRIBUTION_CHECK_PROMPT, IMPACT_AUDIT_POLICY])
 
 
 def _text(value, maximum: int, *, empty: bool = False) -> None:

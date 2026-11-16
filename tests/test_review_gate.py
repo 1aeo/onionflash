@@ -32,6 +32,9 @@ def codes(store, row):
     return [entry["code"] for entry in decisions.for_item(store.db, row["id"])]
 
 
+UNSUPPORTED_IMPACT = {"outcome": "unsupported", "reason": "The proposed advice is not supported.", "source_refs": ["S1"]}
+
+
 def add_coverage(store, identity="other-story", **changes):
     public = {"id": identity, "title": "A previous report", "summary": "The source reported an event.",
               "why_it_matters": "", "category": "network", "priority": "normal", "confidence": "reported",
@@ -80,7 +83,8 @@ def test_review_timeout_or_malformed_verdict_resumes_without_regenerating_writer
 def test_repair_requires_fresh_verification_and_resumes_that_exact_stage(context):
     cfg, store = context
     row = pending(store)
-    first = Reviewer(verdict("revise", repair={"why_it_matters": ""}), AnalysisError("timeout", retryable=True))
+    first = Reviewer(verdict("revise", repair={"why_it_matters": ""}), UNSUPPORTED_IMPACT,
+                     AnalysisError("timeout", retryable=True))
     with pytest.raises(AnalysisError):
         run(cfg, store, row, Writer(analysis(why_it_matters="Operators must edit their relay configuration.")), first)
     assert [c[2] for c in first.calls] == [False, True] and job(store)["stage"] == "verify" and len(store.stories()) == 0
@@ -415,7 +419,7 @@ def test_a_recorded_decision_without_a_usable_receipt_reviews_the_draft_again(co
     row = pending(store)
     commit = store.commit_candidate
     monkeypatch.setattr(store, "commit_candidate", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash")))
-    first = Reviewer(verdict("revise", repair={"why_it_matters": ""}), verdict())
+    first = Reviewer(verdict("revise", repair={"why_it_matters": ""}), UNSUPPORTED_IMPACT, verdict())
     with pytest.raises(RuntimeError):
         run(cfg, store, row, Writer(analysis(why_it_matters="Operators must edit their relay configuration.")), first)
     monkeypatch.setattr(store, "commit_candidate", commit)
@@ -510,7 +514,7 @@ def test_update_review_repairs_human_lock_and_missing_retained_source(context):
     with store.db:
         saved = job(store)
         legacy = json.loads(saved["record_json"])
-        for field in ("request_budget", "untrusted_proposals", "input_proof", "input_row"):
+        for field in ("request_budget", "untrusted_proposals", "input_proof", "input_row", "impact_audits"):
             legacy.pop(field, None)
         legacy["schema_version"] = 1
         legacy["policy_hash"] = "a" * 64
@@ -694,7 +698,7 @@ def test_status_retry_reverted_hold_and_rejected_show_views(context, monkeypatch
     assert list(store.db.iterdump()) == before_dump
 
     with pytest.raises(AnalysisError):
-        run(cfg, store, row, Writer(), Reviewer(verdict("revise", repair={"why_it_matters": ""}),
+        run(cfg, store, row, Writer(), Reviewer(verdict("revise", repair={"why_it_matters": ""}), UNSUPPORTED_IMPACT,
                                                 AnalysisError("timeout", retryable=True)))
     assert review_gate.status(store) == {"stages": {"verify": 1}, "approval_cache_entries": 0}
     shown_v = rejection.show_item(store, row["id"])["final_review"]

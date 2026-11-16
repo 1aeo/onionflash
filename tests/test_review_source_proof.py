@@ -28,7 +28,8 @@ def test_new_jobs_keep_one_source_snapshot_in_the_active_owner(context, monkeypa
     drafted = pause_before_prepare(cfg, store, row, monkeypatch)
     draft_record = json.loads(drafted["record_json"])
     assert drafted["envelope_json"] is None
-    assert draft_record["schema_version"] == review_gate.REVIEW_STATE_VERSION == 2
+    assert draft_record["schema_version"] == review_gate.REVIEW_STATE_VERSION == 3
+    assert draft_record["impact_audits"] == []
     assert draft_record["input_proof"] == 1 and draft_record["input_row"] == row
     assert draft_record["input_hash"] == row["content_hash"]
     with pytest.raises(AnalysisError):
@@ -46,7 +47,7 @@ def test_legacy_source_proof_is_validated_before_policy_reset(context, legacy):
     with pytest.raises(AnalysisError):
         run(cfg, store, row, Writer(), reviewer(cfg, FetchError("Temporary error", status=500)))
     old = record(store)
-    for field in ("input_proof", "request_budget", "untrusted_proposals"):
+    for field in ("input_proof", "request_budget", "untrusted_proposals", "impact_audits"):
         old.pop(field)
     if legacy == "full":
         old["input_row"] = json.loads(job(store)["envelope_json"])["row"]
@@ -69,7 +70,7 @@ def test_compact_draft_without_source_proof_requires_explicit_retry(context, mon
     row = pending(store)
     pause_before_prepare(cfg, store, row, monkeypatch)
     old = record(store)
-    for field in ("input_proof", "input_row", "request_budget", "untrusted_proposals"):
+    for field in ("input_proof", "input_row", "request_budget", "untrusted_proposals", "impact_audits"):
         old.pop(field)
     old["schema_version"] = 1
     old_policy = digest(["legacy draft policy"])

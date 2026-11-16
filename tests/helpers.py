@@ -285,6 +285,7 @@ class ScriptedReviewer:
 
     def __init__(self, *responses):
         self.responses, self.calls, self.coverages, self.issues = list(responses), CallLog(), [], []
+        self.audit_calls = []
         if len(responses) == 1 and (callable(responses[0]) or
                 isinstance(responses[0], dict) and responses[0].get("verdict") == "approve"):
             self.responses.append(verdict())
@@ -294,6 +295,16 @@ class ScriptedReviewer:
 
     def __exit__(self, *args):
         pass
+
+    def complete(self, prompt, payload, schema, schema_name, *, on_request):
+        assert schema_name == "onionflash_impact_audit"
+        on_request(1)
+        self.audit_calls.append(copy.deepcopy(payload))
+        reply = self.responses.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        on_request.response_received()
+        return copy.deepcopy(reply)
 
     def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False, on_request=None):
         if on_request is not None:

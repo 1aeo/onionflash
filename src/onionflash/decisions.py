@@ -23,7 +23,7 @@ CODES = frozenset({
     "held.gate.missing_sources", "held.gate.repeat_hold", "held.gate.story_locked",
     *(f"held.network.{reason}" for reason in ("dry_run", "link_pending", "story_locked")),
     *(f"held.{stage}.{reason}" for stage in ("review", "verification")
-      for reason in ("model_hold", "tag_repair", "unusable_repair", "repeated_repair", "disagreed_news", "release_labels")),
+      for reason in ("model_hold", "tag_repair", "unusable_repair", "repeated_repair", "disagreed_news", "release_labels", "impact_audit")),
     "held.verification.official_not_news", "held.verification.repairs_exhausted",
     *(f"held.final_check.{reason}" for reason in (
         "completed_action", "compromise_headline", "confirmed_source", "merge_state",

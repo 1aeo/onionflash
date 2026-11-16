@@ -41,12 +41,18 @@ def full(reply, packet, *, update=False):
     return validate_review(reply, packet, update=update)
 
 
-def scripted(reply):
+def scripted(reply, *, impact_outcome="unsupported"):
     class Reviewer:
         last_decoded = None
         def __init__(self, *args, **kwargs): pass
         def __enter__(self): return self
         def __exit__(self, *args): pass
+        def complete(self, prompt, payload, schema, schema_name, *, on_request):
+            assert schema_name == "onionflash_impact_audit"
+            on_request(1)
+            on_request.response_received()
+            return {"outcome": impact_outcome, "reason": "Scripted impact classification for scoring checks.",
+                    "source_refs": sorted(_packet_refs(payload["packet"]))[:1]}
         def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False, on_request=None):
             if on_request is not None:
                 on_request(1)
@@ -591,7 +597,7 @@ def test_expected_same_story_scores_matched_missed_wrong_unroutable_and_false_ro
 
     with monkeypatch.context() as mp:
         mp.setattr(module, "EvaluationReviewer", routed_reviewer(lambda *_: ("approve", target_id)))
-        mp.setattr(review_gate, "next_step", lambda reviews, text, prepared: ("route", target_id))
+        mp.setattr(review_gate, "next_step", lambda reviews, text, prepared, **kwargs: ("route", target_id))
         out_gate = tmp_path / "routes-gate.jsonl"
         res_gate = module.evaluate(config, [pos], out_gate)
         rec_gate = json.loads(out_gate.read_text().splitlines()[0])
