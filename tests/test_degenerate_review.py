@@ -189,12 +189,7 @@ def test_old_policy_schema_two_corrupted_reviews_are_readable_but_never_reused(c
         with pytest.raises(AnalysisError):
             run(cfg, store, row, Writer(), old)
     old_record = record(store)
-    # Reconstruct the actual older record shape, which had no impact-audit field.
-    old_record["schema_version"] = 2
-    old_record.pop("impact_audits")
-    with store.db:
-        store.db.execute("UPDATE review_jobs SET record_json=? WHERE item_id=?", (json.dumps(old_record), row["id"]))
-    assert len(old_record["reviews"]) == 1
+    assert old_record["schema_version"] == 2 and len(old_record["reviews"]) == 1
     assert set(old_record["request_budget"]) == {"reserved", "inconsistent_requests", "validation_reask"}
     fresh = reviewer(cfg, verdict(), verdict())
     assert run(cfg, store, row, Writer(), fresh)["status"] == "published"

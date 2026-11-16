@@ -73,8 +73,6 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `held.verification.tag_repair` | A verification proposed editing a literal tag notice. |
 | `held.review.unusable_repair` | The review proposed a repair that cannot be applied. |
 | `held.verification.unusable_repair` | A verification proposed a repair that cannot be applied. |
-| `held.review.impact_audit` | A proposed impact deletion could not be independently justified within the request budget. |
-| `held.verification.impact_audit` | A verification's proposed impact deletion could not be independently justified within the request budget. |
 | `held.review.repeated_repair` | A release-label repair request proposed a text the item's reviews already refused. |
 | `held.verification.repeated_repair` | A verification proposed a text the item's reviews already refused. |
 | `held.review.disagreed_news` | A release-label repair request and the first review disagree on whether news value and new information both pass. |

@@ -284,33 +284,6 @@ from validated reviews, then requires a fresh verification of that exact text.
 The previous reply is never included in the verifier's input. Pending proposals
 bypass cached approvals and cannot borrow facts verified for an earlier text.
 
-A proposal to clear a nonempty `why_it_matters` first receives a separate,
-source-only impact audit. Its input contains the original sentence, proposed empty
-field and complete packet, all as untrusted data; it receives no earlier review
-or news verdict. Supported specific impact vetoes only the deletion. Unsupported
-or unsuitable impact permits it; insufficient evidence or an audit failure holds.
-Other proposed edits remain untrusted. Even a veto that leaves the original text
-unchanged requires fresh full verification of that exact candidate before publication.
-
-This applies to ordinary repairs and usable edits from inconsistent replies.
-The private record retains the original proposal, audit outcome and effective
-candidate identity separately. A pending audit cannot authorize cached or operator
-publication. Each audit shares the existing request ledger and requires a remaining
-verification slot; a dispatched audit is never silently repeated or sent to a fallback.
-An unsent reservation can be refunded. Interrupted dispatched audits hold, while a
-durably completed audit resumes at verification. Context changes discard audit
-authority without replenishing the applicable request budget. Skips and edits that
-do not clear the impact field do not invoke this audit.
-The audit identity binds its actual impact sentence and packet together with the
-source, coverage, binding and review policy. Unrelated title, summary or label edits
-cannot obtain another judgment of that input. A repeated deletion proposal holds
-instead of resampling, which can withhold an otherwise publishable candidate when
-the reviewer repeatedly proposes the same deletion. Effective edits are normalized
-after a veto; unchanged fields do not prevent verification of the retained text.
-An audit whose single reason is dominated by repeated fragments fails validation
-using the existing language-neutral per-reason check. It holds without a re-ask,
-retaining the charged attempt and granting no deletion or veto authority.
-
 If that invalid reply has no usable edit, the ledger permits one logical
 validation-correction request. It reviews the same candidate, packet, scope and
 coverage, with only a fixed corrective instruction and the application's quoted
@@ -358,12 +331,10 @@ Missing or inconsistent identity fails closed; it is not a new source revision.
 A new draft keeps its source snapshot until the prepared envelope supplies that
 proof, without storing a second copy in the record. Older compact records can
 use a valid retained envelope; a hash-only draft without source proof requires
-an explicit operator retry. New durable jobs use record format version three and
-require their source-proof marker and impact-audit history. Real version-two jobs
-retain their earlier source-proof and request-ledger checks; they do not acquire
-invented audit receipts when their old policy is invalidated. The version-one
-reader accepts only shapes emitted by earlier releases. Missing required fields
-cannot authorize a current-policy record or be interpreted as a completed audit.
+an explicit operator retry. New durable jobs use record format version two and
+require their source-proof marker; the version-one reader accepts only the
+shapes emitted by earlier releases. Missing new fields cannot make a current
+record look older, even after a policy change.
 Retained review, proposal and cached-proof policy metadata must also agree before
 an older policy can justify a fresh budget; older verdict schemas remain readable.
 

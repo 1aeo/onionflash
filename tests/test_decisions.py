@@ -44,12 +44,10 @@ def write_config(tmp_path):
 @pytest.mark.parametrize("replies,code,chain", [
     ([verdict()], "published.new", ["review:approve", "verification:approve"]),
     ([verdict("skip", criterion="news_value")], "skipped.review.news_value", ["review:skip"]),
-    ([verdict("revise", repair={"why_it_matters": ""}, criterion="news_value"),
-      {"outcome": "unsupported", "reason": "Unsupported impact.", "source_refs": ["S1"]}, both_editorial()],
+    ([verdict("revise", repair={"why_it_matters": ""}, criterion="news_value"), both_editorial()],
      "skipped.verification.new_information_and_news_value", ["review:revise", "verification:skip"]),
     ([verdict("hold")], "held.review.model_hold", ["review:hold"]),
-    ([verdict("revise", repair={"why_it_matters": ""}),
-      {"outcome": "unsupported", "reason": "Unsupported impact.", "source_refs": ["S1"]}, verdict("hold")], "held.verification.model_hold",
+    ([verdict("revise", repair={"why_it_matters": ""}), verdict("hold")], "held.verification.model_hold",
      ["review:revise", "verification:hold"]),
     ([verdict("revise", repair={"title": ""})], "held.review.unusable_repair", ["review:revise"]),
 ], ids=["approve", "skip", "verified-skip", "hold", "verification-refusal", "unusable-repair"])

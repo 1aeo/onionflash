@@ -773,7 +773,7 @@ class Store:
                     current = candidate.prepare(
                         self.db, row, result, prepared["observed"], dirauth_users=effective_users
                     )
-                    held_job = self.db.execute("SELECT stage,record_json,envelope_json FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
+                    held_job = self.db.execute("SELECT stage,record_json FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
                     item_state = self.db.execute("SELECT status FROM items WHERE id=?", (row["id"],)).fetchone()
                     if (current["locked"] or current["binding_hash"] != prepared["binding_hash"]
                             or held_job is None or held_job["stage"] != "held"
@@ -800,24 +800,6 @@ class Store:
                     self.db.execute("DELETE FROM review_approvals WHERE key=?", (approval_key,))
                 from .review import attribution_names
                 from .named_attribution import missing_named_attributions
-                # Current durable proofs include the impact audit and the exact
-                # verification after it. The supplied audit text cannot replace
-                # the authoritative job/receipt checked inside this transaction.
-                from .review_gate import REVIEW_STATE_VERSION, validate_review_state
-                active_job = self.db.execute("SELECT record_json FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
-                active_record = json.loads(active_job["record_json"]) if active_job else {}
-                if any(isinstance(proof, dict) and proof.get("schema_version") == REVIEW_STATE_VERSION
-                       for proof in (attribution_record, active_record)):
-                    from .llm import AnalysisError
-                    try:
-                        proof_prepared = json.loads(held_job["envelope_json"]) if operator else prepared
-                        if proof_prepared["source_hash"] != prepared["source_hash"]:
-                            raise ReviewRequired("Reviewed source changed before commit")
-                        validate_review_state(attribution_record, "held" if operator else
-                                              "approved" if decision == "approve" else "skipped",
-                                              approved_candidate, proof_prepared, allow_cached=operator)
-                    except AnalysisError as exc:
-                        raise ReviewRequired("Review decision lacks its complete verification proof") from exc
                 if decision == "approve" and missing_named_attributions(
                         approved_candidate, prepared["packet"], update=mode == "update",
                         known_names=attribution_names(prepared, attribution_record)):
