@@ -117,6 +117,11 @@ rulings or fix effectiveness beyond the text, or omits a material packet disclos
 also fail source_support when a bugfix release is labeled security without a vulnerability.
 actor_and_action: preserve who does what. A developer changing compiled source is
 not a relay operator changing configuration. Preserve requested versus actual action.
+When the target text names an actor, quote that exact name in this criterion's reason
+and identify its matching identity in source text or author metadata. Do not silently
+read a different spelling as the intended name or turn a software name into a person;
+an actor absent from the packet fails this criterion even when the remaining claim matches.
+An explicit supplied alias or identity link can establish a match; spelling similarity alone cannot.
 why_it_matters keeps the role terms and audience of the source sentence it restates.
 Check each personal role or affiliation in every target field, including repeated mentions. A person's
 reported activity or sender authority does not establish a role: require explicit
@@ -160,13 +165,21 @@ marks a disclosed HackerOne report: none of those authorities confirms a claim
 (keep confidence reported unless an official non-tag announcement or merged
 gitlab_mr confirms the change, and preserve any maintainer severity/scope triage
 or dispute).
-In uncertainty_attribution's reason, check candidate.confidence: fail
+In uncertainty_attribution's reason, first compare the source's material qualifying
+words with the candidate's actual wording, quoting both briefly when they differ.
+Attribution and confidence="reported" do not restore a missing hedge inside a claim.
+A tentative cause or effect must remain tentative in every field asserting it.
+Then check candidate.confidence: fail
 uncertainty_attribution whenever confidence is confirmed without an official non-tag
 announcement or merged gitlab_mr in the packet, when a headline or why_it_matters
 drops a material precondition or turns an anecdotal reply into confirmation, or when
 a comment's scope narrowing replaces the original issue report as unattributed fact.
 scope_timing: retain actual affected product, scope, dates and sequence. Updated
 issue/comment timestamps do not make an old incident new or currently ongoing.
+When later supplied evidence corrects or narrows an earlier observation, account for
+that change when retelling the affected claim. State the correction in this criterion's
+reason and check whether the candidate preserves it; do not retell a withdrawn inference
+as the current conclusion or resolve an ongoing disagreement by choosing a speaker.
 operational_advice: instructions, necessity or urgency for operators require explicit
 source support for that actor and action. Do not invent configuration edits, upgrades,
 workarounds, key changes, commands or required mitigations. Empty why_it_matters is
@@ -259,6 +272,8 @@ announcements or updates, isolated operator error or relay-flag configuration re
 without broader network impact, uncorroborated single-vantage observations, and ordinary
 bug reports (neither hackerone nor dirauth-operator) whose security impact and scope are
 explicitly unestablished.
+Assess the candidate's event across the complete packet: a checklist source does not
+make a release announcement or observed tag in that packet mere checklist activity.
 On mailing lists (such as tor-relays, network-health and tor-dev), uncorroborated
 operational attack, compromise, DoS, flood, defense-bypass or anomaly claims from
 authority=community (neither official, project-sender nor trusted-operator) fail
@@ -267,8 +282,11 @@ multi-relay operational findings and measurements from authority=trusted-operato
 authority=project-sender may pass news_value when newsworthy (keeping confidence
 reported); official releases and the tor-dev rules above are unchanged.
 new_information: compare the packet's concrete event and facts, and the candidate, with
-the supplied existing coverage, not matching product or version keywords. Decide
-duplication only from coverage_background: fail new_information only when a story there
+the supplied existing coverage, not matching product or version keywords.
+A published source document is factual evidence, not evidence that this feed already
+covered it. Do not infer prior feed coverage merely because an announcement is public
+or another source in the packet reports the same event.
+Decide duplication only from coverage_background: fail new_information only when a story there
 describes the same concrete event, and name that story's id in the reason. If a source calls the
 item a duplicate or already covered and truncated coverage does not show that story, hold.
 A newly reported security issue affecting an already-released version can be new
@@ -410,6 +428,10 @@ Evaluate all nine criteria in order before choosing verdict:
    passage's author field; fail if one commenter's statement is attributed to an adjacent commenter, the issue
    opener or official Tor Project authority. Distinguish official announcements, maintainer ticket actions, merge
    requests, proposals and individual operator/community posts, and never turn code changes into operator config edits.
+   When the new update names an actor, quote that exact name in this reason and identify its matching packet
+   identity. Do not silently read a different spelling as the intended name or turn a software name into a person;
+   an actor absent from the packet fails even when the remaining claim matches.
+   An explicit supplied alias or identity link can establish a match; spelling similarity alone cannot.
    Check each personal role or affiliation throughout the new update, including repeated mentions. A person's reported activity
    or sender authority does not establish a role: require explicit role evidence rather than inferring an
    occupation from what the person discusses. Fail if it calls a named or identifiable person a developer without evidence of code
@@ -430,7 +452,10 @@ Evaluate all nine criteria in order before choosing verdict:
      "merged", state may advance to "tagged" or remain "merged".
    - Release labels (category "release" or tag "release") require state in {"released", "tagged"}.
 4. uncertainty_attribution: Keep hedges ("suspected", "plausibly", "may", "reported", "I think") and material
-   maintainer disagreement or narrowing. Reserve confidence "confirmed" for an official non-tag Tor Project
+   maintainer disagreement or narrowing. In this reason, first compare material source qualifying words with
+   the new update's actual wording, quoting both briefly when they differ. Attribution and confidence="reported"
+   do not restore a missing hedge inside a claim; tentative causes or effects must remain tentative.
+   Reserve confidence "confirmed" for an official non-tag Tor Project
    announcement or merged gitlab_mr (or when coverage_background.prior_story.confidence is already "confirmed",
    which must never be downgraded). Community, issue, hackerone, dirauth-operator, project-sender and trusted-operator
    (verified large AROI relay-family operator) sources remain confidence "reported", never
@@ -439,6 +464,9 @@ Evaluate all nine criteria in order before choosing verdict:
 5. scope_timing: Retain exact affected products, software versions, platforms, sample bounds, dates and inspection
    dates from the cited source. Never merge adjacent software version numbers into one claim when the observer
    measured only one version, and preserve temporal phrases such as "as with previous versions".
+   When the supplied source corrects or narrows an earlier observation retold by the new update, state the
+   correction in this reason and check that the new text preserves it. Do not retell a withdrawn inference as
+   the current conclusion or resolve an ongoing disagreement by choosing a speaker.
 6. operational_advice: Any operator instruction or upgrade directive in candidate.updates[-1].text requires an
    explicit passage in the cited new source directing that audience to act; never invent advice, urgency or generic
    benefits. Pass operational_advice when updates[-1].text states no operator advice.
