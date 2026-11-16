@@ -204,6 +204,26 @@ slot as an inconsistent verdict, with only its fixed validation error as feedbac
 it never receives a second slot or a fresh request budget. Repeated corruption is
 logged separately as `failed.review.degenerate_reasons`. Private evaluation counts
 raw corrupted replies separately from verdict inconsistencies and successful recovery.
+An explicit named reporting clause also cannot pass `actor_and_action` when its
+literal name is absent from the relevant packet text and actual author metadata.
+The narrow initial check recognizes short capitalized names, explicit account
+handles and names in scripts without letter case in reporting clauses and
+"according to" forms, ignoring generic source/role/pronoun subjects and code examples. It performs no
+fuzzy spelling, transliteration or identity lookup. Source-name presence is not
+proof that the person made a statement and never establishes approval.
+Missing-name locations are supplied only when found, as application data beside
+the unchanged packet. An invalid actor pass may use the same single correction
+slot, without using the rejected reply's edits. Repairs must preserve the report
+and use neutral public attribution rather than guess a replacement identity.
+Within the review context, absent names are rematerialized from the original
+prepared candidate and applied edits in the existing history. Their presence in
+any current target field remains a failure after a case, grammar, quoting or field
+change. These earlier texts supply suspected names, never factual evidence; each
+name's absence is checked against the packet again. No additional state or budget
+is created, and discarded review contexts do not supply names.
+Fresh verification remains mandatory. The matching final and commit-boundary
+check also protects cached approvals and operator publication; update checks
+apply only to the newest update and its cited source scope, never prior text.
 Only a complete, structurally valid `revise` edit may become an **untrusted
 proposal**. It must change the text, obey the packet's label limits, avoid a
 previously reviewed candidate, and leave literal tag notices untouched. The

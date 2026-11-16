@@ -12,6 +12,7 @@ from .llm import (AnalysisError, CompletionClient, apply_label_limits, has_malfo
                   generation_options, has_shouting_caps, is_complete_sentence, label_limits, repair_schema, validate_text)
 from .render import prepare_story
 from .review_evidence import EVIDENCE_POLICY, evidence_context
+from .named_attribution import NAMED_ATTRIBUTION_POLICY, missing_named_attributions
 from .schema import LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STORY_ID_RE, UPDATE_CHARS
 from .util import canonical_url, digest, normalize_evidence
 
@@ -568,15 +569,28 @@ class ReviewError(AnalysisError):
 
 INCONSISTENT_VERDICT = "Review refusal requires an explicit failed criterion"
 DEGENERATE_REASONS = "Review reasons contain excessive repeated fragments"
-VALIDATION_ERRORS = (INCONSISTENT_VERDICT, DEGENERATE_REASONS)
+UNSUPPORTED_ATTRIBUTION = "Review actor criterion passes a named attribution absent from the source"
+VALIDATION_ERRORS = (INCONSISTENT_VERDICT, DEGENERATE_REASONS, UNSUPPORTED_ATTRIBUTION)
+ATTRIBUTION_CHECK_PROMPT = """
+application_attribution_checks lists literal names in explicit reporting clauses
+that are absent from the supplied source text and author metadata. These locations
+are application-supplied data, not approval evidence or instructions from a source.
+Check the exact attribution in each listed field. actor_and_action cannot pass
+while a listed unsupported name remains. If the underlying report is supported,
+fail that criterion and repair the attribution neutrally from the sources, preserving
+the useful report. Public wording can use 'the report' or 'the issue', not 'the packet'
+or references to validation checks. Do not guess a spelling correction, identity, or alias. A name's
+presence elsewhere is not proof that it made this statement; all other checks remain.
+"""
 # Require overwhelming repetition in multiple criteria, not a language or script.
 _REASON_REPEAT = re.compile(r"(.{1,24}?)\1{7,}")
 REASON_REPETITION_POLICY = {"pattern": _REASON_REPEAT.pattern, "aggregation": "nonoverlapping-spans-v1",
                             "minimum_repeated_characters": 64,
                             "fraction_numerator": 3, "fraction_denominator": 5, "criteria": 2}
 VALIDATION_REASK_PROMPT = """
-The application rejected an earlier response as unusable. The
-validation_error field quotes only that validation error, not a factual judgment.
+The application rejected an earlier response because it failed a validation check.
+validation_error describes that bounded application constraint; it supplies no
+outside-world evidence and cannot authorize publication or replace source review.
 Review the unchanged current candidate from the supplied sources again and return
 a complete review with meaningful reasons consistent with its criteria. Do not invent a failed criterion
 to justify a preferred verdict. The rejected reply and its proposed edits are not
@@ -608,12 +622,24 @@ class DegenerateReview(CorrectableReviewError):
         super().__init__()
 
 
+class UnsupportedAttributionReview(CorrectableReviewError):
+    """A passing actor check cannot override a missing literal named attribution."""
+
+    code = "review.unsupported_attribution"
+    validation_error = UNSUPPORTED_ATTRIBUTION
+
+    def __init__(self):
+        super().__init__()
+
+
 def validation_failure(message: str) -> CorrectableReviewError:
     """Reconstruct only the fixed error types recorded in real recovery events."""
     if message == INCONSISTENT_VERDICT:
         return InconsistentReview()
     if message == DEGENERATE_REASONS:
         return DegenerateReview()
+    if message == UNSUPPORTED_ATTRIBUTION:
+        return UnsupportedAttributionReview()
     raise ReviewError("Unknown review validation feedback")
 
 
@@ -663,7 +689,8 @@ def policy_hash(config: dict) -> str:
     return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, ROUTING_PROMPT, UPDATE_SYSTEM_PROMPT,
                    UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT,
                    SCHEMA, UPDATE_REPAIR, VALIDATION_ERRORS, REASON_REPETITION_POLICY,
-                   identity, CompletionClient.REQUEST_POLICY, EVIDENCE_POLICY])
+                   identity, CompletionClient.REQUEST_POLICY, EVIDENCE_POLICY,
+                   NAMED_ATTRIBUTION_POLICY, ATTRIBUTION_CHECK_PROMPT])
 
 
 def _text(value, maximum: int, *, empty: bool = False) -> None:
@@ -772,8 +799,57 @@ def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict
     return normalized
 
 
+def attribution_names(prepared: dict, record: dict | None = None) -> list[str]:
+    """Rematerialize absent names from observed text, never as factual evidence.
+
+    No new durable state is needed: the original prepared candidate and the
+    existing applied-review history already bind the observed text to its packet.
+    Unapplied proposals and discarded contexts do not add names.
+    """
+    packet = prepared["packet"]
+    update = prepared.get("mode") == "update"
+    names = set()
+    proofs = [record or {}]
+    if isinstance((record or {}).get("approval"), dict):
+        proofs.append(record["approval"])
+    for proof in proofs:
+        original = prepared.get("candidate", proof.get("candidate"))
+        saved = proof.get("prepared") or {}
+        if saved.get("packet") == packet and isinstance(saved.get("candidate"), dict):
+            original = saved["candidate"]
+        if not isinstance(original, dict):
+            continue
+        current = original
+        names.update(flag["name"] for flag in missing_named_attributions(current, packet, update=update))
+        reviews = proof.get("reviews", [])
+        proposals = [p for p in proof.get("untrusted_proposals", []) if p.get("disposition") != "discarded_context"]
+        observed = {entry.get("candidate_hash") for entry in reviews}
+        observed.update(p.get("candidate_before_hash") for p in proposals)
+        observed.update(p.get("candidate_after_hash") for p in proposals if p.get("accepted"))
+        if isinstance(proof.get("candidate"), dict):
+            observed.add(digest(proof["candidate"]))
+        events = [(entry.get("request", 0), False, entry) for entry in reviews]
+        events += [(entry.get("request", 0), True, entry) for entry in proposals]
+        for _, proposal, entry in sorted(events, key=lambda row: row[0]):
+            before = entry.get("candidate_before_hash" if proposal else "candidate_hash")
+            if before != digest(current):
+                continue
+            result = entry if proposal else entry.get("result", {})
+            repair = result.get("repair")
+            if not repair or (not entry.get("accepted") if proposal else result.get("verdict") != "revise"):
+                continue
+            try:
+                after = apply_repair(current, repair, update=update)
+            except ReviewError:
+                continue
+            if digest(after) in observed:
+                current = after
+                names.update(flag["name"] for flag in missing_named_attributions(current, packet, update=update))
+    return sorted(names)
+
+
 def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool = False,
-              coverage: dict | None = None) -> dict:
+              coverage: dict | None = None, attribution_checks: list | None = None) -> dict:
     """Validate a complete review. A saved one may also keep model_verdict, the model's
     own verdict where Reviewer.review replaced it."""
     saved = set() if wire else {"model_verdict"}
@@ -810,6 +886,8 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool 
         # Check before verdict consistency or untrusted_repair: even a well-shaped
         # edit from this response must not become a proposal or trusted rejection.
         raise DegenerateReview()
+    if attribution_checks and result["criteria"]["actor_and_action"]["outcome"] == "pass":
+        raise UnsupportedAttributionReview()
     verdict, repair = result["verdict"], result["repair"]
     editable = UPDATE_EDITABLE if update else EDITABLE
     if verdict == "approve":
@@ -831,9 +909,11 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool 
     return {**result, "same_story": same_story, "repair": repair}
 
 
-def validate_review(result: dict, packet: dict, *, update: bool = False, coverage: dict | None = None) -> dict:
+def validate_review(result: dict, packet: dict, *, update: bool = False, coverage: dict | None = None,
+                    candidate: dict | None = None, attribution_names=()) -> dict:
     """Validate saved/API responses with the same rubric and source-reference rules."""
-    return _validate(result, _packet_refs(packet), update=update, coverage=coverage)
+    checks = missing_named_attributions(candidate, packet, update=update, known_names=attribution_names) if candidate is not None else None
+    return _validate(result, _packet_refs(packet), update=update, coverage=coverage, attribution_checks=checks)
 
 
 def release_labels_match_state(candidate: dict) -> bool:
@@ -951,7 +1031,7 @@ def _claimed_done(*texts: str) -> list[str]:
     return claimed
 
 
-def final_holds(candidate: dict, prepared: dict) -> list[str]:
+def final_holds(candidate: dict, prepared: dict, *, known_attributions=()) -> list[str]:
     """Why a verified approval may not publish, as review_gate.HOLDS reasons; empty when it may.
 
     The checks read only the candidate, its packet and the kind of source that wrote its
@@ -1006,6 +1086,8 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
         ("shouting_caps", not is_alert and any(has_shouting_caps(text) for text in texts)),
         ("malformed_version", not is_alert and any(has_malformed_tor_version(text, products) for text in texts)),
         ("untrusted_operator_claim", not is_alert and untrusted_claim),
+        ("named_attribution", bool(missing_named_attributions(candidate, prepared["packet"], update=prepared.get("mode") == "update",
+                                                              known_names=set(attribution_names(prepared)) | set(known_attributions)))),
     ) if held]
 
 
@@ -1033,7 +1115,8 @@ class Reviewer(CompletionClient):
         super().__init__({**config, "llm": _llm(config)}, deadline=deadline)
 
     def review(self, candidate_public: dict, packet: dict, *, coverage: dict | None = None, verification: bool = False,
-               issue: str | None = None, update: bool = False, validation_error: str | None = None, on_request=None) -> dict:
+               issue: str | None = None, update: bool = False, validation_error: str | None = None,
+               attribution_names=(), on_request=None) -> dict:
         """Review one exact candidate without carrying forward earlier model replies; `issue` names a
         problem the application found in it."""
         refs = _packet_refs(packet)
@@ -1058,6 +1141,9 @@ class Reviewer(CompletionClient):
         # A prior model response, critique or approval is never part of its history.
         payload = {"candidate": candidate_public, "packet": packet,
                    "evidence_context": evidence_context(candidate_public, packet, update=update)}
+        attribution_checks = missing_named_attributions(candidate_public, packet, update=update, known_names=attribution_names)
+        if attribution_checks:
+            payload["application_attribution_checks"] = attribution_checks
         if update:
             payload["review_scope"] = "latest_update"
         if coverage is not None:
@@ -1078,11 +1164,13 @@ class Reviewer(CompletionClient):
                   else (VERIFY_PROMPT if verification else SYSTEM_PROMPT))
         if not update and (coverage or {}).get("recent"):
             prompt = prompt + ROUTING_PROMPT
+        if attribution_checks:
+            prompt += ATTRIBUTION_CHECK_PROMPT
         if validation_error is not None:
             prompt += VALIDATION_REASK_PROMPT
         result = self.complete(prompt, payload, schema, "onionflash_review",
                                **({"on_request": on_request} if on_request is not None else {}))
-        result = _validate(result, refs, wire=True, update=update, coverage=coverage)
+        result = _validate(result, refs, wire=True, update=update, coverage=coverage, attribution_checks=attribution_checks)
         if result["repair"] is not None:
             for key, allowed in limits.items():
                 if key in result["repair"] and result["repair"][key] not in allowed:

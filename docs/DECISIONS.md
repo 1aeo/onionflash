@@ -88,6 +88,7 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `held.final_check.shouting_caps` | The story or update contains unnormalized all-caps shouting. |
 | `held.final_check.malformed_version` | The story or update cites a nonexistent three-part C-Tor version number. |
 | `held.final_check.untrusted_operator_claim` | A new story reports an operational attack, compromise or vulnerability claim solely from an untrusted mailing-list post. |
+| `held.final_check.named_attribution` | An explicit named attribution is absent from the relevant source text and author metadata. |
 | `failed.writer.invalid_output` | The writer's draft did not match its schema. |
 | `failed.writer.evidence_too_short` | A draft evidence quote was too short. |
 | `failed.writer.evidence_not_exact` | A draft evidence quote was not an exact excerpt of the source. |
@@ -97,6 +98,7 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `failed.writer.invalid_json` | The writer reply was not a JSON object. |
 | `failed.review.invalid_reply` | A review reply did not follow the review rules. |
 | `failed.review.degenerate_reasons` | A review repeatedly returned reasons dominated by repeated fragments; no verdict or edit from that response was trusted. |
+| `failed.review.unsupported_attribution` | A reviewer repeatedly passed an actor check despite an explicit named attribution absent from the supplied source. |
 | `failed.review.invalid_input` | The review request could not be encoded as UTF-8 JSON. |
 | `failed.review.truncated` | A review reply was cut off or refused. |
 | `failed.review.invalid_json` | A review reply was not a JSON object. |

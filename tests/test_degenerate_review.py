@@ -40,8 +40,8 @@ def test_corrupted_verdict_is_reasked_without_trusting_edits_or_rejection(contex
     assert event["changed_fields"] == [] and event["accepted"] is False
     assert event["reask_trigger"] is True
     assert review_gate.recovery_status(audit) == {
-        "raw_inconsistency_count": 0, "raw_degenerate_count": 1, "accepted_proposal_count": 0,
-        "unresolved_inconsistency": False, "unresolved_degenerate": False}
+        "raw_inconsistency_count": 0, "raw_degenerate_count": 1, "raw_attribution_count": 0, "accepted_proposal_count": 0,
+        "unresolved_inconsistency": False, "unresolved_degenerate": False, "unresolved_attribution": False}
 
 
 def test_corrupted_approval_cannot_anchor_disagreement_with_corrective_skip(context):

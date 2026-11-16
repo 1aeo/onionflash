@@ -771,13 +771,14 @@ class Store:
                     current = candidate.prepare(
                         self.db, row, result, prepared["observed"], dirauth_users=effective_users
                     )
-                    held_job = self.db.execute("SELECT stage FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
+                    held_job = self.db.execute("SELECT stage,record_json FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
                     item_state = self.db.execute("SELECT status FROM items WHERE id=?", (row["id"],)).fetchone()
                     if (current["locked"] or current["binding_hash"] != prepared["binding_hash"]
                             or held_job is None or held_job["stage"] != "held"
                             or item_state is None or item_state["status"] != "rejected"):
                         raise candidate.StaleCandidate("Item or coverage changed before approval committed")
                     operator_reason = approval_meta["reason"]
+                    attribution_record = json.loads(held_job["record_json"])
                 else:
                     receipt = self.db.execute("SELECT * FROM review_approvals WHERE key=?", (approval_key,)).fetchone()
                     if receipt is None or any(receipt[key] != expected for key, expected in (
@@ -785,14 +786,22 @@ class Store:
                             ("policy_hash", policy_hash), ("binding_hash", prepared["binding_hash"]))):
                         raise ReviewRequired("Review decision does not match this candidate and its context")
                     from .review import validate_review
-
+                    attribution_record = json.loads(receipt["review_record_json"])
+                    from .review import attribution_names
                     verdict = validate_review(json.loads(receipt["result_json"]), prepared["packet"],
-                                              update=mode == "update", coverage=prepared["coverage"])
+                                              update=mode == "update", coverage=prepared["coverage"], candidate=approved_candidate,
+                                              attribution_names=attribution_names(prepared, attribution_record))
                     if verdict["verdict"] != decision:
                         raise ReviewRequired("Final review did not authorize this decision")
                     if review_record is None:
-                        review_record = json.loads(receipt["review_record_json"])
+                        review_record = attribution_record
                     self.db.execute("DELETE FROM review_approvals WHERE key=?", (approval_key,))
+                from .review import attribution_names
+                from .named_attribution import missing_named_attributions
+                if decision == "approve" and missing_named_attributions(
+                        approved_candidate, prepared["packet"], update=mode == "update",
+                        known_names=attribution_names(prepared, attribution_record)):
+                    raise ReviewRequired("Named attribution needs literal source evidence")
             if not operator:
                 candidate.verify_prepared_binding(self.db, prepared)
             cited_on_skip = False

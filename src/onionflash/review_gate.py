@@ -58,6 +58,7 @@ HOLDS = {
     "shouting_caps": "the candidate contains unnormalized all-caps shouting",
     "malformed_version": "the candidate cites a nonexistent three-part C-Tor version",
     "untrusted_operator_claim": "an uncorroborated mailing-list incident claim needs a trusted source",
+    "named_attribution": "a named attribution has no literal source evidence",
 }
 
 
@@ -795,7 +796,7 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                     or set(proposal["changed_fields"]) - set(candidate_mod.UPDATE_FIELDS if proposal["mode"] == "update" else review.EDITABLE)):
                 raise ValueError()
             accepted = proposal["accepted"]
-            if proposal["error"] == review.DEGENERATE_REASONS and (
+            if proposal["error"] != review.INCONSISTENT_VERDICT and (
                     accepted or proposal["repair"] is not None or proposal["candidate_after_hash"] is not None
                     or proposal["changed_fields"] or proposal["disposition"] not in {"unusable", "discarded_context"}):
                 raise ValueError()
@@ -848,6 +849,8 @@ def _validate_candidate_path(record, stage, candidate, prepared, *, allow_cached
     """Reconstruct the exact edited text; removing a pending flag cannot bless it."""
     context = _context(prepared, record["policy_hash"])
     current = prepared.get("candidate", record.get("candidate"))
+    known_attributions = {flag["name"] for flag in review.missing_named_attributions(
+        current, prepared["packet"], update=prepared.get("mode") == "update")}
     expected_stage, trusted, seen = "review", [], {digest(current)}
     last_action, last_value = None, None
     events = [(entry.get("request"), False, entry) for entry in record["reviews"]]
@@ -871,12 +874,16 @@ def _validate_candidate_path(record, stage, candidate, prepared, *, allow_cached
                         or not _allowed_proposal(current, after, prepared, entry["repair"])):
                     raise ValueError()
                 current, expected_stage = after, "verify"
+                known_attributions.update(flag["name"] for flag in review.missing_named_attributions(
+                    current, prepared["packet"], update=prepared.get("mode") == "update"))
                 seen.add(digest(current))
         else:
             actual_stage = "repair" if entry.get("issue") == "release_labels" else "verify" if entry["stage"] == "verification" else "review"
             if (actual_stage != expected_stage or entry["candidate_hash"] != digest(current)
                     or any(entry.get(key) != value for key, value in context.items())):
                 raise ValueError()
+            review.validate_review(entry["result"], prepared["packet"], update=prepared.get("mode") == "update",
+                                   coverage=prepared.get("coverage"), candidate=current, attribution_names=known_attributions)
             trusted.append(entry)
             action, value = next_step(trusted, current, prepared)
             last_action, last_value = action, value
@@ -885,6 +892,8 @@ def _validate_candidate_path(record, stage, candidate, prepared, *, allow_cached
                     expected_stage = "held"
                 else:
                     current, expected_stage = value, action
+                    known_attributions.update(flag["name"] for flag in review.missing_named_attributions(
+                        current, prepared["packet"], update=prepared.get("mode") == "update"))
                     seen.add(digest(current))
             else:
                 expected_stage = {"approve": "approved", "skip": "skipped", "hold": "held", "route": "routed"}[action]
@@ -969,18 +978,21 @@ def recovery_status(record):
         or record.get("hold_code") in {"unusable_repair", "repeated_repair", "repairs_exhausted", "release_labels"})
     inconsistent = sum(p["error"] == review.INCONSISTENT_VERDICT for p in proposals)
     degenerate = sum(p["error"] == review.DEGENERATE_REASONS for p in proposals)
-    return {"raw_inconsistency_count": inconsistent, "raw_degenerate_count": degenerate,
+    attribution = sum(p["error"] == review.UNSUPPORTED_ATTRIBUTION for p in proposals)
+    return {"raw_inconsistency_count": inconsistent, "raw_degenerate_count": degenerate, "raw_attribution_count": attribution,
             "accepted_proposal_count": sum(p["accepted"] for p in proposals),
             "unresolved_inconsistency": bool(inconsistent and unresolved),
-            "unresolved_degenerate": bool(degenerate and unresolved)}
+            "unresolved_degenerate": bool(degenerate and unresolved), "unresolved_attribution": bool(attribution and unresolved)}
 
 
 def call_review(reviewer, stage, candidate, prepared, *, requests, correction=False) -> dict:
     """Return only a genuinely validated reply; an invalid reply remains an exception."""
+    known_attributions = review.attribution_names(prepared, requests.record)
     result = reviewer.review(candidate, prepared["packet"], coverage=prepared["coverage"], verification=stage == "verify",
                              issue=review.RELEASE_ISSUE if stage == "repair" else None,
                              on_request=requests.callback(correction=correction),
                              **({"validation_error": correction} if correction else {}),
+                             **({"attribution_names": known_attributions} if known_attributions else {}),
                              **({"update": True} if prepared.get("mode") == "update" else {}))
     if correction and requests.state["validation_reask"]["response"] != requests.state["reserved"]:
         raise AnalysisError("Validation response was not observed", code="app.damaged_job")
@@ -1017,7 +1029,7 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
         requests.state["inconsistent_requests"].append(event["request"])
         record.setdefault("untrusted_proposals", []).append(event)
         try:
-            if isinstance(error, review.DegenerateReview):
+            if not isinstance(error, review.InconsistentReview):
                 raise error
             if _literal_tag(prepared):
                 event["disposition"] = "literal_tag"
@@ -1388,7 +1400,8 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         if cached is not None:
             try:
                 verdict = review.validate_review(json.loads(cached["result_json"]), prepared["packet"],
-                                                 update=prepared.get("mode") == "update", coverage=prepared["coverage"])
+                                                 update=prepared.get("mode") == "update", coverage=prepared["coverage"], candidate=candidate,
+                                                 attribution_names=review.attribution_names(prepared, json.loads(cached["review_record_json"])))
                 proof = json.loads(cached["review_record_json"])
                 if not isinstance(proof, dict) or proof.get("policy_hash") != policy:
                     raise AnalysisError("Cached review policy is damaged", code="app.damaged_job")
@@ -1399,7 +1412,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             if valid:
                 record["approval"] = proof
                 record["approval_key"] = key
-                if verdict["verdict"] == "approve" and (held := review.final_holds(candidate, prepared)):
+                if verdict["verdict"] == "approve" and (held := review.final_holds(candidate, prepared, known_attributions=review.attribution_names(prepared, proof))):
                     _hold(store, row, draft, writer_key, record, observed, "final_check", held[0])
                     return {**report, "status": "held", "cache_hit": True}
                 record["outcome"] = "skipped" if verdict["verdict"] == "skip" else "approved"
@@ -1583,7 +1596,7 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
             or any(not result["criteria"]["source_support"]["source_refs"] for _, result in reviews_of_text)):
         return refuse("No fresh verification with cited sources approved the facts; retry or dismiss it",
                       editorial_failures, new_coverage)
-    if held := review.final_holds(candidate, prepared):
+    if held := review.final_holds(candidate, prepared, known_attributions=review.attribution_names(prepared, record)):
         return refuse("Final review held: " + HOLDS[held[0]], editorial_failures, new_coverage)
     if not review.release_labels_match_state(candidate):
         return refuse("Final review held: " + HOLDS["release_labels"], editorial_failures, new_coverage)

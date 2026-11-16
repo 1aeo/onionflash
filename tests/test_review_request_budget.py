@@ -109,9 +109,9 @@ def test_invalid_criteria_stay_outside_reviews_and_proposal_is_persisted_before_
     assert event["candidate_after_hash"] == digest(payloads[1]["candidate"])
     assert event["error"] == review.INCONSISTENT_VERDICT and event["disposition"] == "checked_approve"
     assert event["repair"] == {"summary": REPAIRED} and event["accepted"]
-    assert review_gate.recovery_status(audit) == {"raw_inconsistency_count": 1, "raw_degenerate_count": 0,
+    assert review_gate.recovery_status(audit) == {"raw_inconsistency_count": 1, "raw_degenerate_count": 0, "raw_attribution_count": 0,
                                                   "accepted_proposal_count": 1, "unresolved_inconsistency": False,
-                                                  "unresolved_degenerate": False}
+                                                  "unresolved_degenerate": False, "unresolved_attribution": False}
 
 
 def test_unsupported_proposal_rejected_by_fresh_verification_cannot_publish_or_be_operator_approved(context):
