@@ -570,7 +570,8 @@ DEGENERATE_REASONS = "Review reasons contain excessive repeated fragments"
 VALIDATION_ERRORS = (INCONSISTENT_VERDICT, DEGENERATE_REASONS)
 # Require overwhelming repetition in multiple criteria, not a language or script.
 _REASON_REPEAT = re.compile(r"(.{1,24}?)\1{7,}")
-REASON_REPETITION_POLICY = {"pattern": _REASON_REPEAT.pattern, "minimum_run": 64,
+REASON_REPETITION_POLICY = {"pattern": _REASON_REPEAT.pattern, "aggregation": "nonoverlapping-spans-v1",
+                            "minimum_repeated_characters": 64,
                             "fraction_numerator": 3, "fraction_denominator": 5, "criteria": 2}
 VALIDATION_REASK_PROMPT = """
 The application rejected an earlier response as unusable. The
@@ -645,12 +646,14 @@ def _text(value, maximum: int, *, empty: bool = False) -> None:
 
 
 def _repetitive_reason(reason: str) -> bool:
-    """Recognize long tandem loops without treating foreign-language text as invalid."""
+    """Count disjoint tandem spans, including loops interrupted by other fragments."""
     normalized = " ".join(reason.split())
     policy = REASON_REPETITION_POLICY
-    return any(len(match[0]) >= policy["minimum_run"]
-               and len(match[0]) * policy["fraction_denominator"] >= len(normalized) * policy["fraction_numerator"]
-               for match in _REASON_REPEAT.finditer(normalized))
+    # finditer returns non-overlapping spans: alternate periods or matches inside
+    # a longer repeated sequence must not count the same characters twice.
+    repeated = sum(match.end() - match.start() for match in _REASON_REPEAT.finditer(normalized))
+    return (repeated >= policy["minimum_repeated_characters"]
+            and repeated * policy["fraction_denominator"] >= len(normalized) * policy["fraction_numerator"])
 
 
 def _packet_refs(packet: dict) -> set[str]:

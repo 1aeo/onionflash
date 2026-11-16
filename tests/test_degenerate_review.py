@@ -248,6 +248,48 @@ def test_repetition_policy_is_bound_to_review_cache_identity(context, monkeypatc
     assert review.policy_hash(cfg) != old
 
 
+@pytest.mark.parametrize("reason,expected", [
+    ("a" * 32 + "|" + "b" * 32, True),  # 64 covered characters; neither span is long enough alone.
+    ("a" * 31 + "|" + "b" * 32, False),  # 63 covered characters.
+    ("abc" * 8 + "/" + "def" * 8 + "/" + "ghi" * 8, True),
+    ("abc" * 7 + "/" + "def" * 7 + "/" + "ghi" * 7 + "/" + "jkl" * 7, False),
+    ("a" * 33 + "|" + "b" * 33 + "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!?.,:;_", True),  # 66 / 110.
+    ("a" * 33 + "|" + "b" * 33 + "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!?.,:;_-", False),  # 66 / 111.
+    ("ab" * 32 + "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!?", False),
+    ("ab" * 40 + "Distinct conditions.", True),
+    ("abcdefghijklmnopqrstuvwx" * 8, True),
+    ("abcdefghijklmnopqrstuvwxy" * 8, False),
+    ("The source repeats a short quoted input: abcabcabcabc. The summary preserves its conditions.", False),
+    ("観測結果を報告した人物と、ソースに記載された条件および対象範囲を正確に保持しています。", False),
+])
+def test_repeated_span_coverage_boundaries_and_overlap(reason, expected):
+    assert review._repetitive_reason(reason) is expected
+
+
+@pytest.mark.parametrize("affected", [1, 2])
+def test_fragmented_reasons_require_multiple_criteria_and_use_existing_correction(context, affected):
+    cfg, store = context
+    reply = verdict()
+    for criterion in ("source_support", "actor_and_action")[:affected]:
+        reply["criteria"][criterion]["reason"] = "abc" * 12 + "|" + "xyz" * 12
+    checker = reviewer(cfg, reply, verdict(), verdict())
+    assert run(cfg, store, pending(store), Writer(), checker)["status"] == "published"
+    audit = saved_audit(store)
+    assert checker.calls == (3 if affected == 2 else 2)
+    assert len(audit["untrusted_proposals"]) == (1 if affected == 2 else 0)
+    if affected == 2:
+        assert audit["request_budget"]["validation_reask"]["attempts"] == [2]
+        assert audit["request_budget"]["reserved"] == 3
+        assert review_gate.recovery_status(audit)["raw_degenerate_count"] == 1
+
+
+def test_span_aggregation_mode_is_bound_to_review_policy(context, monkeypatch):
+    cfg, _ = context
+    current = review.policy_hash(cfg)
+    monkeypatch.setitem(review.REASON_REPETITION_POLICY, "aggregation", "single-span")
+    assert review.policy_hash(cfg) != current
+
+
 def test_current_policy_saved_corrupted_review_cannot_reach_cached_approval(context):
     cfg, store = context
     row = pending(store)

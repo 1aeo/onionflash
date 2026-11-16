@@ -193,7 +193,10 @@ and an update-scope skip that names an overlapping published duplicate in
 it starts others.
 
 A refusal whose criteria all pass remains an invalid reply, never an approval.
-Reasons dominated by long tandem repetition in multiple criteria are also invalid,
+Reasons dominated by tandem repetition in multiple criteria are also invalid.
+Repeated spans are counted once each and summed, including repetition interrupted
+by other fragments; overlapping matches cannot inflate the repeated coverage.
+The same minimum repeated-character count and coverage threshold apply
 regardless of verdict or proposed edits. This language-neutral check does not assess
 the factual quality of otherwise readable reasons. A corrupted reply supplies no
 trusted rejection or untrusted edit. It may use the same single durable correction
