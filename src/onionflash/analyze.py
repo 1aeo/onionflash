@@ -15,7 +15,7 @@ from .llm import (
 from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, STATES, UPDATE_CHARS
 from .util import digest, is_dirauth_item, is_hackerone_item, normalize_evidence as _plain
 
-PROMPT_VERSION = "onionflash-20"
+PROMPT_VERSION = "onionflash-21"
 # Change this when update input filtering changes, independently of prompt prose.
 UPDATE_INPUT_VERSION = 2
 WRITER_REASONING_OPTIONS = {
@@ -127,6 +127,20 @@ security-patch step does not prove there were patches or that they shipped. An o
 post-release checklist does not negate an explicit release announcement. A merged
 change (kind=gitlab_mr) is merged, not released or deployed. A tag is only tagged
 until an announcement establishes release status.
+Read an official announcement's full body, not only its version or release notes.
+Preserve substantive incident facts, affected scope and announced response work,
+including evaluation of additional defenses and expectations of further releases.
+Attribute plans and expectations to the announcement; do not present them as shipped
+mitigations, a promised release date, proven effectiveness or a resolved attack.
+When an official announcement describes an ONGOING denial-of-service attack and active work on
+ADDITIONAL defenses or anticipated response releases, make that response work the
+headline and the opening of the summary, even if the source title only names a
+software release. Describe the shipped version and fixes afterwards as context.
+This draft reports the ongoing response: use category=dos and state=developing,
+without release labels for defenses still being evaluated. Keep plans tentative.
+For example, lead with the project's evaluation of further defenses, not another
+headline saying the already-existing version was released. This selects the source's
+substantive focus; the reviewer still decides novelty from existing coverage.
 When merge metadata says merged, describe the completed change rather than another
 proposal. Pre-merge scheduling comments describe earlier plans, not current status.
 A fix present only in a proposed patch series does not establish a merged or
@@ -258,10 +272,14 @@ closed with a code fix, commit or release, or resolved when closed as completed 
 (keep developing on a closed issue only if the closing note says it remains unresolved).
 Otherwise update state when this source establishes a new lifecycle status (merged, tagged,
 released, fixed, resolved, or developing on a concrete post-fix recurrence) and keep
-prior_story's state when status is unchanged. When the new material is only a mailing-list
+prior_story's state when status is unchanged. An official announcement can add material
+incident facts or response plans even when prior_story already covers its release version.
+State that new information in update rather than merely repeating the release; preserve
+whether defenses are being evaluated and further releases are expected, not shipped.
+When the new material is only a mailing-list
 question, routine triage/assignment/scheduling note, unmerged local branch intention, status
 check-in reporting no material change, duplicate bug filing, single-operator corroboration, or
-alternate-channel release or timeline notice for a version prior_story already covers, state
+alternate-channel release or timeline notice repeating only facts prior_story already covers, state
 that literal action plainly (for example "An operator asks ...", "@author assigns ...",
 or "A mailing-list announcement also announces ...") without framing it as a milestone. Every
 rule above applies. Set confidence to confirmed when this source is an official non-tag

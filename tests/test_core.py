@@ -605,9 +605,16 @@ def test_base_url_is_normalized_to_a_clean_directory(tmp_path, base):
 
 def test_story_precedence_legacy_stories_and_added_at(tmp_path):
     """Preserve story source-tier upgrades, dated updates, and chronological ordering."""
+    def known_update(store, url):
+        # These fixtures exercise prose precedence after same-event association.
+        with store.db:
+            store.db.execute("UPDATE items SET story_id=? WHERE url=?", (store.stories(1)[0]["id"], url))
+
     def pub_arti(store, url, updated, draft, content=item()["content"]):
         """Ingest and publish a synthetic Arti story revision for precedence tests."""
         store.ingest(item(url=url, title="Arti 2.8.0 released", updated_at=updated, kind="feed", content=content, product="arti"), updated)
+        if "update" in draft:
+            known_update(store, url)
         finish_reviewed(store, next(r for r in store.pending(10, updated) if r["url"] == url), draft, "key-" + url + updated, updated)
         return store.stories(10)
 
@@ -626,6 +633,8 @@ def test_story_precedence_legacy_stories_and_added_at(tmp_path):
     def pub_tor(store, url, updated, draft):
         """Ingest and publish a synthetic Tor story revision for precedence tests."""
         store.ingest(item(url=url, title="Tor 0.4.9.17 released", updated_at=updated, kind="feed", content=url), updated)
+        if "update" in draft:
+            known_update(store, url)
         finish_reviewed(store, next(r for r in store.pending(10, updated) if r["url"] == url), draft, "k" + url, updated)
         return store.stories(10)[0]
 
@@ -648,6 +657,7 @@ def test_story_precedence_legacy_stories_and_added_at(tmp_path):
         store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (legacy["id"], item_cluster(item(title="Tor 0.4.9.18 released", kind="feed")), json.dumps(legacy), DATE, legacy["updated_at"]))
         for idx, stamp in enumerate([later, latest]):
             store.ingest(item(url=f"https://new.example/{idx}", title="Tor 0.4.9.18 released", kind="feed", content=f"Follow-up {idx} notes.", updated_at=stamp), stamp)
+            known_update(store, f"https://new.example/{idx}")
             finish_reviewed(store, next(r for r in store.pending(10, stamp) if r["url"].endswith(str(idx))),
                             update_analysis(update=f"Item {idx}.", evidence=[f"Follow-up {idx} notes."]), f"k{idx}", stamp)
         ls = store.stories(10)[0]
@@ -731,6 +741,46 @@ def test_feed_item_titles_dates_and_non_permalink_guids():
                 b'<item><title>No link</title><guid isPermaLink="false">https://example.org/?p=123</guid>'
                 b'<pubDate>Sun, 08 Nov 2026 12:00:00 GMT</pubDate></item></channel></rss>')
     assert collect_source(FakeClient([response(guid_xml)]), source(), {}, DEFAULTS["collection"], DATE)["items"] == []
+
+
+def test_configured_forum_announcements_keep_operational_context(tmp_path, monkeypatch):
+    monkeypatch.setenv("ONIONFLASH_LLM_BASE_URL", "https://model.example/v1")
+    path = tmp_path / "config.toml"
+    path.write_text(EXAMPLE_TOML)
+    stream = next(s for s in load_config(path)["sources"] if s["id"] == "tor-release-announcements")
+    assert stream["enabled"] and stream["kind"] == "feed"
+    assert stream["authority"] == "official" and stream["product"] == "tor"
+    assert stream["url"] == "https://forum.torproject.org/c/news/tor-release-announcement/28.rss"
+
+    url = "https://forum.torproject.org/t/security-release-0-4-9-17/22454"
+    # Discourse category RSS shape, with paraphrased announcement text.
+    xml = (f'<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">'
+           f'<channel><title>Tor Release Announcement</title><link>{stream["website_url"]}</link>'
+           '<description>Release announcements</description><item><title>Security Release 0.4.9.17</title>'
+           f'<link>{url}</link><dc:creator><![CDATA[dgoulet]]></dc:creator>'
+           '<pubDate>Fri, 13 Nov 2026 19:35:15 +0000</pubDate>'
+           '<guid isPermaLink="false">forum.torproject.org-topic-22454</guid><description><![CDATA['
+           '<p>The release improves IPv6-related relay DoS protections.</p>'
+           '<p>The ongoing circuit flood affects relay operators across the network.</p>'
+           '<p>Additional defenses are being assessed, with further releases expected soon.</p>'
+           '<p><strong>Relay operators are asked to upgrade promptly.</strong> No subsequent action is requested.</p>'
+           '<p><small>1 post - 1 participant</small></p>'
+           f'<p><a href="{url}">Read full topic</a></p>]]></description></item></channel></rss>').encode()
+    result = collect_source(FakeClient([response(xml, url=stream["url"])]), stream, {}, DEFAULTS["collection"],
+                            "2026-11-15T12:00:00Z")
+    assert len(result["items"]) == 1
+    entry = result["items"][0]
+    assert entry["url"] == url and entry["title"] == "Security Release 0.4.9.17"
+    assert entry["published_at"] == entry["updated_at"] == "2026-11-13T19:35:15Z"
+    assert entry["authority"] == "official" and entry["product"] == "tor"
+    for text in ("The ongoing circuit flood affects relay operators across the network.",
+                 "Additional defenses are being assessed, with further releases expected soon.",
+                 "Relay operators are asked to upgrade promptly.", "No subsequent action is requested."):
+        assert text in entry["content"]
+    # The same author and host on an ordinary community stream confer no authority.
+    community = {**stream, "authority": "community"}
+    assert collect_source(FakeClient([response(xml, url=stream["url"])]), community, {}, DEFAULTS["collection"],
+                          "2026-11-15T12:00:00Z")["items"][0]["authority"] == "community"
 
 
 def _list_rss(*author_xml: str) -> bytes:

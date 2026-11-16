@@ -19,7 +19,7 @@ from onionflash.render import prepare_story
 from onionflash.review import EDITABLE, Reviewer, final_holds, policy_hash
 from onionflash.review_gate import ReviewRequests, advance_review, initial_review_state, recovery_status
 from onionflash.source_packet import normalize_labels, number_sources
-from onionflash.util import item_cluster
+from onionflash.util import item_cluster, story_cluster
 
 CASE_FILES = ("review_cases.json", "review_cases_judged.json", "review_cases_roles.json")
 SCOPES = ("story", "latest_update")
@@ -244,14 +244,16 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                         record["draft_kept_unsupported"] = kept_unsupported(case, candidate)
                         totals["draft_unsupported"] += bool(record["draft_kept_unsupported"])
                     prior = (case.get("existing_coverage") or {}).get("prior_story")
+                    identity_item = {**item, "url": source["url"],
+                                     "source_entry_id": source.get("source_entry_id", source["url"])}
                     prepared = {"packet": case["packet"], "coverage": case.get("existing_coverage"),
                                 "review_scope": scope, "mode": "update" if scope == "latest_update" else "story",
                                 "story_id": prior["id"] if prior else None,
+                                "cluster_key": story_cluster(identity_item),
                                 "payload": {"editorial_kind": source["kind"]},
                                 "dirauth_users": list(config["collection"]["dirauth_gitlab_users"]),
                                 "row": {"url": source["url"], "story_id": prior["id"] if prior else None,
-                                        "cluster_key": item_cluster({**item, "url": source["url"],
-                                                                     "source_entry_id": source.get("source_entry_id", source["url"])}),
+                                        "cluster_key": item_cluster(identity_item),
                                         "payload": json.dumps(item)}}
                     stage, text, record["reviews"] = "review", candidate, []
                     while True:

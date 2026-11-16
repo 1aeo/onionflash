@@ -32,6 +32,13 @@ def codes(store, row):
     return [entry["code"] for entry in decisions.for_item(store.db, row["id"])]
 
 
+def mapped_item(store, row, story_id):
+    """Start a gate-only scenario after its source-to-story association."""
+    with store.db:
+        store.db.execute("UPDATE items SET story_id=? WHERE id=?", (story_id, row["id"]))
+    return {**row, "story_id": story_id}
+
+
 def add_coverage(store, identity="other-story", **changes):
     public = {"id": identity, "title": "A previous report", "summary": "The source reported an event.",
               "why_it_matters": "", "category": "network", "priority": "normal", "confidence": "reported",
@@ -585,19 +592,21 @@ def test_tag_notices_citations_updates_and_repair_holds(context, monkeypatch):
         assert out["status"] == "cited" and out["writer_calls"] == out["review_calls"] == 0
         assert st["state"] == state and st["updated_at"] == before_upd and len(st["sources"]) == 2
 
-    # Tag on pre-release story runs update review without calling writer LLM, and holds if review repairs tag update.
+    # An associated tag on a pre-release story runs update review without writer LLM calls.
     monkeypatch.setattr(Analyzer, "complete", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("writer LLM forbidden")))
     for idx, state in enumerate(("developing", "fixed", "resolved", "mitigation-available", "merged")):
         ver = f"0.4.9.{30 + idx}"
         ex = item(kind="feed", product="tor", title=f"Tor {ver} release preparation", url=f"https://example.org/prep-{ver}")
-        finish_reviewed(store, pending(store, ex), analysis(title=f"Prep {ver}", state=state), f"prep-{ver}", DATE)
+        prepared_story = finish_reviewed(store, pending(store, ex), analysis(title=f"Prep {ver}", state=state), f"prep-{ver}", DATE)
         if state == "merged":
             bad_tag = tag(title=f"tor-{ver}", url=f"https://example.org/bad-tag-{ver}", updated_at="2026-11-09T16:00:00Z")
-            held = run(cfg, store, pending(store, bad_tag), Analyzer(cfg), Reviewer(verdict("revise", update=True, repair={"state": "released"})))
+            bad_row = mapped_item(store, pending(store, bad_tag), prepared_story["story_id"])
+            held = run(cfg, store, bad_row, Analyzer(cfg), Reviewer(verdict("revise", update=True, repair={"state": "released"})))
             assert held["status"] == "held" and held["review_calls"] == 1
         t_item = tag(title=f"tor-{ver}", url=f"https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-{ver}", updated_at="2026-11-09T16:00:00Z")
+        tag_row = mapped_item(store, pending(store, t_item), prepared_story["story_id"])
         with Analyzer(cfg) as real_writer:
-            out = review_gate.process_item(cfg, store, pending(store, t_item), real_writer, ApprovingReviewer(cfg), "2026-11-09T16:05:00Z")
+            out = review_gate.process_item(cfg, store, tag_row, real_writer, ApprovingReviewer(cfg), "2026-11-09T16:05:00Z")
         st = next(s for s in store.stories(20) if f"Prep {ver}" == s["title"])
         assert out["status"] == "published" and out["writer_calls"] == 0 and out["review_calls"] == 2
         assert st["state"] == ("tagged" if state == "merged" else state)
@@ -900,16 +909,16 @@ def test_own_item_newness_skips_unchanged_or_quoted_and_unlock_requeues_locked_u
 
     later3, later4 = "2026-11-10T16:00:00Z", "2026-11-10T17:00:00Z"
     list_base = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/"
-    store.ingest(item(kind="feed", url=list_base + "MSG0/", source_id="msg-0", title="[tor-announce] Tor 0.4.9.15 released",
+    store.ingest(item(kind="feed", url=list_base + "MSG0/", source_id="tor-relays", title="[tor-relays] Tor 0.4.9.15 released",
                       content="Initial report details for the relay issue.", updated_at=DATE), DATE)
     assert run(cfg, store, store.pending(1, DATE)[0], Writer(analysis(evidence=["Initial report details for the relay issue."])),
                Reviewer(verdict()))["status"] == "published"
-    store.ingest(item(kind="feed", url=list_base + "MSG1/", source_id="msg-1", title="[tor-relays] Re: Tor 0.4.9.15 released",
+    store.ingest(item(kind="feed", url=list_base + "MSG1/", source_id="tor-relays", title="[tor-relays] Re: Tor 0.4.9.15 released",
                       content="On Wed, Nov 10, 2026 at 09:00 AM, alice via tor-relays wrote:\n\n> Initial report details for the relay issue.\n>> Older nested quote with 53-day-old relay numbers.",
                       updated_at=later3), later3)
     assert run(cfg, store, store.pending(1, later3)[0], Writer(), Reviewer()) == {
         "status": "ignored", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
-    store.ingest(item(kind="feed", url=list_base + "MSG2/", source_id="msg-2", title="[tor-relays] Re: Tor 0.4.9.15 released",
+    store.ingest(item(kind="feed", url=list_base + "MSG2/", source_id="tor-relays", title="[tor-relays] Re: Tor 0.4.9.15 released",
                       content="Operator observed three dropped circuits.\n\nOn Wed, Nov 10, 2026 at 09:00 AM, alice via tor-relays wrote:\n\n> Quoted 53-day-old relay backstory.",
                       updated_at=later4), later4)
     w_reply = Writer(update_analysis(update="An operator observed three dropped circuits.", state="developing",
@@ -921,15 +930,15 @@ def test_own_item_newness_skips_unchanged_or_quoted_and_unlock_requeues_locked_u
 
 def test_pending_update_rewrites_and_own_comment_cutoff_admits_edited_notes(context):
     cfg, store = context
-    seed_legacy(store, item(title="Tor 0.4.9.16 released", kind="feed", authority="official", content="Tor 0.4.9.16 was released with fixes."),
-                analysis(title="Tor 0.4.9.16 released", state="released", confidence="confirmed"))
+    _, release_id = seed_legacy(store, item(title="Tor 0.4.9.16 released", kind="feed", authority="official", content="Tor 0.4.9.16 was released with fixes."),
+                               analysis(title="Tor 0.4.9.16 released", state="released", confidence="confirmed"))
     m1 = item(title="Tor 0.4.9.16 released", kind="feed", url="https://example.org/m1", source_id="m1",
               content="Debian packages for Tor 0.4.9.16 are live.", updated_at=LATER)
     m2 = item(title="Tor 0.4.9.16 released", kind="feed", url="https://example.org/m2", source_id="m2",
               content="RPM packages for Tor 0.4.9.16 are live.", updated_at="2026-11-10T13:00:00Z")
     store.ingest(m1, LATER)
     store.ingest(m2, LATER)
-    rows = {r["url"]: r for r in store.pending(5, LATER)}
+    rows = {r["url"]: mapped_item(store, r, release_id) for r in store.pending(5, LATER)}
     w1 = Writer(update_analysis(update="Debian packages are live.", confidence="confirmed", state="released",
                                 evidence=["Debian packages for Tor 0.4.9.16 are live."]))
     with pytest.raises(AnalysisError):

@@ -22,7 +22,7 @@ from .comments import analysis_context
 from .llm import AnalysisError, CompletionDeferred, RequestObserver
 from .util import (
     DIRAUTH_GITLAB_USERS, _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, is_dirauth_item,
-    is_hackerone_item, now_iso, saved_object, thread_subject,
+    is_hackerone_item, item_cluster, now_iso, release_mentions, saved_object, thread_subject,
 )
 
 REVIEW_STATE_VERSION = 2
@@ -495,7 +495,7 @@ def _news(result) -> bool:
 
 
 def _can_route(candidate: dict, prepared: dict, result: dict, target_id) -> bool:
-    """Only route new non-tag, non-release candidates when deterministic context overlaps."""
+    """Route a new item only when its overlap and publication policy allow attachment."""
     if not isinstance(target_id, str) or not target_id:
         return False
     if prepared.get("mode", "story") != "story" or prepared["row"].get("story_id"):
@@ -513,6 +513,21 @@ def _can_route(candidate: dict, prepared: dict, result: dict, target_id) -> bool
         return False
     if (target := _live_recent(coverage, target_id)) is None:
         return False
+    release_hint = prepared["row"].get("cluster_key") or ""
+    if (item.get("kind") == "feed" and item.get("authority") == "official"
+            and release_hint.startswith("release:") and target.get("state") == "released"
+            and result["criteria"]["new_information"]["outcome"] == "pass"):
+        # New official announcement facts merit their own article after the release
+        # is already covered; a positive novelty judgment must not become an update.
+        return False
+    if release_hint.startswith("release:") and target.get("state") in {"tagged", "released"}:
+        products = target.get("products") or ()
+        versions = release_mentions({"title": target.get("title", "")})
+        target_release = versions[0] if versions else item_cluster({
+            "kind": "feed", "title": target.get("title", ""), "content": "", "url": "",
+            "product": products[0] if len(products) == 1 else "network"})
+        if target_release != release_hint:
+            return False
     cand_products = set(candidate.get("products") or ())
     if isinstance(item.get("product"), str) and item["product"]:
         cand_products.add(item["product"])
@@ -536,6 +551,8 @@ def next_step(reviews, candidate, prepared):
     """
     latest = reviews[-1]
     result, stage, later = latest["result"], latest["stage"], len(reviews) > 1
+    if later and _news(result) != _news(reviews[0]["result"]):
+        return "hold", (stage, "disagreed_news")
     if _can_route(candidate, prepared, result, result.get("same_story")):
         return "route", result["same_story"]
     verdict = result["verdict"]
@@ -554,8 +571,6 @@ def next_step(reviews, candidate, prepared):
     # An official item that fails only news value is the operator's to judge, once a fresh
     # verification has passed its facts; a duplicate still skips.
     disputed = official and failed & review.EDITORIAL_CRITERIA == {"news_value"}
-    if later and _news(result) != _news(reviews[0]["result"]):
-        return "hold", (stage, "disagreed_news")
     if disputed:
         if stage == "verification" and failed == {"news_value"}:
             return "hold", (stage, "official_not_news")

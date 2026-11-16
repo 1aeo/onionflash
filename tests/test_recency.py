@@ -178,6 +178,10 @@ def test_an_update_of_an_existing_story_still_reaches_review_and_a_locked_story_
     finish_reviewed(store, store.pending(1, COLLECTED)[0], analysis(), "key", COLLECTED)
     store.ingest(item(kind="feed", url="https://example.org/old-post", title=title, content="Old post.",
                       published_at="2026-09-01T00:00:00Z", updated_at=COLLECTED), COLLECTED)
+    # Seed an existing association; the test checks recency of known updates.
+    with store.db:
+        store.db.execute("UPDATE items SET story_id=? WHERE url=?",
+                         (store.stories()[0]["id"], "https://example.org/old-post"))
     writer = Writer()
     process(cfg, store, writer, Reviewer(verdict("skip", criterion="news_value")), COLLECTED)
     assert len(writer.calls) == 1 and logged(store)[-1][0] == "skipped.review.news_value"
@@ -186,6 +190,8 @@ def test_an_update_of_an_existing_story_still_reaches_review_and_a_locked_story_
                       expect_hash=editorial.show(store.db, story_id)["hash"], observed=COLLECTED)
     store.ingest(item(kind="feed", url="https://example.org/old-post", title=title, content="Old post, edited.",
                       published_at="2026-09-01T00:00:00Z", updated_at=COLLECTED), COLLECTED)
+    with store.db:
+        store.db.execute("UPDATE items SET story_id=? WHERE url=?", (story_id, "https://example.org/old-post"))
     assert process(cfg, store, Writer(), Reviewer(), COLLECTED)["status"] == "locked"
     assert logged(store)[-1][0] == "held.gate.story_locked"
 
