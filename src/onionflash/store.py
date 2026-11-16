@@ -306,6 +306,8 @@ def _valid_saved_item(old: object) -> bool:
         return False
     if "author" in old and old["author"] is not None and not isinstance(old["author"], str):
         return False
+    if "sender_domain" in old and old["sender_domain"] is not None and not isinstance(old["sender_domain"], str):
+        return False
     if "comments_truncated" in old and type(old["comments_truncated"]) is not bool:
         return False
     labels = old.get("labels")
@@ -340,10 +342,10 @@ def item_hash(item: dict) -> str:
     fields["content"] = item.get("source_content", item.get("content"))
     if item.get("author"):
         fields["author"] = item["author"]
+    if item.get("sender_domain"):
+        fields["sender_domain"] = item["sender_domain"]
     if item.get("public_comments"):
         fields["public_comments"] = analysis_context(item)[1]
-    if item.get("dirauth_notes"):
-        fields["dirauth_notes"] = item["dirauth_notes"]
     return digest(fields)
 
 

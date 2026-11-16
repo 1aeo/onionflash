@@ -97,11 +97,12 @@ A draft has a concise factual summary and may have one `why_it_matters` sentence
 a close, attributed restatement of one source sentence that states the event's
 impact or an action it asks its readers to take, with that sentence's audience,
 hedges and scope. Most drafts leave it empty. Validation clears a sentence with a
-number or version absent from the title, content and comment bodies the writer
-saw (source metadata does not count), on an untrusted `community`
+number or version absent from the title, unquoted reply text or content and comment
+bodies the writer saw (source metadata does not count), on an untrusted `community`
 `lists.torproject.org` post, or when it contains unnormalized all-caps shouting
 or a nonexistent three-part C-Tor version; drafts with unnormalized all-caps
-shouting in the headline, summary or update are refused.
+shouting in the headline, summary or update, or mailing-list reply evidence quoting
+only `>`-quoted history are refused.
 Historical impact text remains readable. A review repair may clear it, but cannot
 create or rewrite an impact paragraph; operator corrections remain separate.
 Automatic approvals also require consistent metadata: a `release` category or

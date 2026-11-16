@@ -122,14 +122,14 @@ class _TextParser(HTMLParser):
         """Track hidden markup blocks and emit line breaks around block elements."""
         if tag in {"script", "style", "noscript", "template"}:
             self.hidden += 1
-        elif tag in {"p", "br", "div", "li", "h1", "h2", "h3", "pre"}:
+        elif tag in {"p", "br", "div", "li", "h1", "h2", "h3", "pre", "blockquote"}:
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
         """Exit hidden markup blocks and close block-level paragraphs."""
         if tag in {"script", "style", "noscript", "template"}:
             self.hidden = max(0, self.hidden - 1)
-        elif tag in {"p", "div", "li", "pre"}:
+        elif tag in {"p", "div", "li", "pre", "blockquote"}:
             self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:

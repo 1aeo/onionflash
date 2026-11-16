@@ -16,8 +16,9 @@ import copy
 import json
 import re
 
-from . import candidate as candidate_mod, decisions, editorial, review
+from . import candidate as candidate_mod, decisions, editorial, review, source_packet
 from .analyze import cache_key
+from .comments import analysis_context
 from .llm import AnalysisError, CompletionDeferred, RequestObserver
 from .util import (
     DIRAUTH_GITLAB_USERS, _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, is_dirauth_item,
@@ -197,6 +198,35 @@ def _policy_copies(record, policy):
             pending.append(proof["approval"])
 
 
+def _valid_item_hashes(payload: dict) -> set[str]:
+    """Return current and exact historical item_hash digests accepted for saved payloads."""
+    from .store import item_hash
+
+    hashes = {item_hash(payload)}
+    if isinstance(payload.get("source_content"), str):
+        hashes.add(item_hash({k: v for k, v in payload.items() if k != "source_content"}))
+    if payload.get("dirauth_notes"):
+        fields = {k: payload.get(k) for k in ("title", "content", "kind", "product", "labels", "authority", "upstream_state")}
+        fields["content"] = payload.get("source_content", payload.get("content"))
+        if payload.get("author"):
+            fields["author"] = payload["author"]
+        if payload.get("public_comments"):
+            fields["public_comments"] = analysis_context(payload)[1]
+        fields["dirauth_notes"] = payload["dirauth_notes"]
+        hashes.add(digest(fields))
+    return hashes
+
+
+def _valid_item_fingerprints(row: dict) -> set[str]:
+    """Return current and transitional item_fingerprint digests accepted for saved envelopes."""
+    payload = saved_object(row["payload"].encode("utf-8"))
+    if payload is None:
+        raise ValueError()
+    meta = {key: row.get(key) for key in ("id", "url", "source_id", "content_hash", "cluster_key", "story_id", "status")}
+    transitional_src = digest({key: payload.get(key) for key in (*source_packet.BASE_SOURCE_FIELDS, "author", "dirauth_notes")})
+    return {candidate_mod.item_fingerprint(row), digest([meta, transitional_src])}
+
+
 def _saved_job(store, row, config):
     """Validate saved identity before a mismatch can start a fresh automatic review."""
     from .store import item_hash
@@ -221,6 +251,7 @@ def _saved_job(store, row, config):
             raise ValueError()
 
         def source_identity(value):
+            """Verify saved row identifiers, payload integrity, and content_hash binding."""
             if not isinstance(value, dict):
                 raise ValueError()
             payload = saved_object(value["payload"].encode("utf-8"))
@@ -229,13 +260,8 @@ def _saved_job(store, row, config):
                     or not isinstance(value["content_hash"], str)
                     or not re.fullmatch(r"[0-9a-f]{64}", value["content_hash"])):
                 raise ValueError()
-            if item_hash(payload) != value["content_hash"]:
-                # Older saved rows hashed the composed description. Require
-                # that exact historical formula, never an arbitrary old hash.
-                if (not isinstance(payload.get("source_content"), str)
-                        or item_hash({k: v for k, v in payload.items() if k != "source_content"})
-                        != value["content_hash"]):
-                    raise ValueError()
+            if value["content_hash"] not in _valid_item_hashes(payload):
+                raise ValueError()
             return value["content_hash"]
 
         version, marker = record.get("schema_version"), record.get("input_proof")
@@ -283,7 +309,8 @@ def _saved_job(store, row, config):
         if prepared is not None:
             if (source_identity(prepared["row"]) != source_hash
                     or candidate_mod.item_fingerprint(proof_row) != candidate_mod.item_fingerprint(prepared["row"])
-                    or prepared["binding"]["item"] != candidate_mod.item_fingerprint(prepared["row"])):
+                    or not isinstance(prepared["binding"].get("item"), str)
+                    or prepared["binding"]["item"] not in _valid_item_fingerprints(prepared["row"])):
                 raise ValueError()
         elif job["stage"] != "drafted":
             raise ValueError()
@@ -622,6 +649,8 @@ class ReviewRequests:
         requests = self
 
         class Counter(RequestObserver):
+            """Track durable request slot reservations and transport outcomes for one call."""
+
             previous = None
 
             def __call__(self, delta):
@@ -650,6 +679,7 @@ class ReviewRequests:
                 requests.actual += delta
 
             def response_received(self):
+                """Persist receipt of a validation-reask HTTP response before JSON parsing."""
                 if not correction:
                     return
                 reask = requests.state["validation_reask"]
@@ -661,6 +691,7 @@ class ReviewRequests:
                 requests.persist()
 
             def transport_failed(self):
+                """Mark a validation-reask transport failure eligible for retry."""
                 if not correction:
                     return
                 reask = requests.state["validation_reask"]
@@ -768,6 +799,7 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
     fields = {"error", "request", "stage", "mode", "candidate_before_hash", "candidate_after_hash", "context", "changed_fields", "repair",
               "accepted", "disposition", "reask_trigger", "reask_response"}
     def hashed(value):
+        """Return whether value is a lowercase 64-character hexadecimal SHA-256 string."""
         return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
     try:
         if stage == "drafted":

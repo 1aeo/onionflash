@@ -92,6 +92,7 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `failed.writer.evidence_too_short` | A draft evidence quote was too short. |
 | `failed.writer.evidence_not_exact` | A draft evidence quote was not an exact excerpt of the source. |
 | `failed.writer.no_literal_evidence` | The source has no excerpt long enough to quote. |
+| `failed.writer.quoted_only_evidence` | A mailing-list reply draft cited only `>`-quoted history instead of the author's unquoted contribution. |
 | `failed.writer.invalid_input` | The writer request could not be encoded as UTF-8 JSON. |
 | `failed.writer.truncated` | The writer reply was cut off or refused. |
 | `failed.writer.invalid_json` | The writer reply was not a JSON object. |

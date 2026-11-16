@@ -18,7 +18,9 @@ from onionflash.analyze import (
 )
 from onionflash.comments import INPUT_CHARS
 from onionflash.config import DEFAULTS
-from onionflash.llm import has_malformed_tor_version, has_shouting_caps, json_object
+from onionflash.llm import (
+    has_malformed_tor_version, has_shouting_caps, json_object, unquoted_mail_text,
+)
 from onionflash.schema import CATEGORIES, CONFIDENCES, STATES
 from onionflash.store import Store
 from onionflash.transport import DeadlineReached, FetchError, Response
@@ -32,6 +34,7 @@ NUMBERED = item(
 
 
 def analyzer(monkeypatch, *responses, fallbacks=()):
+    """Instantiate an Analyzer backed by scripted FakeLLM responses."""
     monkeypatch.setenv("ONIONFLASH_LLM_API_KEY", "test-key")
     cfg = copy.deepcopy(DEFAULTS)
     cfg["llm"].update(base_url="https://llm.example/v1", fallback_base_urls=list(fallbacks))
@@ -42,11 +45,13 @@ def analyzer(monkeypatch, *responses, fallbacks=()):
 
 @pytest.mark.parametrize("text", ['{"publish": false, "priority": NaN}', '{"publish": false, "x": 1e999}', "[" * 10000 + "]" * 10000])
 def test_json_object_rejects_nonstandard_and_deep_json(text):
+    """Reject NaN, overflowing floats, and deeply nested JSON payloads."""
     with pytest.raises(AnalysisError, match="invalid JSON"):
         json_object(text)
 
 
 def test_historical_impact_and_mandatory_draft(monkeypatch):
+    """Accept source-grounded drafts and reject publish=false responses."""
     saved = analysis(why_it_matters="The report concerns directory authority trust.")
     assert validate_analysis(saved, item()) == saved
     assert analyzer(monkeypatch, completion(analysis(why_it_matters=""))).analyze(item())["why_it_matters"] == ""
@@ -65,6 +70,7 @@ def test_historical_impact_and_mandatory_draft(monkeypatch):
 
 @pytest.mark.parametrize("use_fallback", [False, True])
 def test_writer_keeps_a_source_stated_impact_sentence(monkeypatch, use_fallback):
+    """Retain a source-supported why_it_matters sentence across primary and fallback endpoints."""
     responses = [FetchError("network request failed", retryable=True)] if use_fallback else []
     sentence = "The report says the keys must no longer be trusted."
     responses.append(completion(analysis(why_it_matters=f" {sentence} ")))
@@ -88,6 +94,7 @@ def test_writer_keeps_a_source_stated_impact_sentence(monkeypatch, use_fallback)
     ("The announcement says four authorities voted.", False),
 ])
 def test_impact_sentence_numbers_and_versions_must_appear_in_the_source(sentence, kept):
+    """Clear why_it_matters when numbers or versions do not match source text."""
     draft = analysis(why_it_matters=sentence, evidence=["Upgrade to 0.4.9.16 now."])
     assert validate_analysis(copy.deepcopy(draft), NUMBERED) == {**draft, "why_it_matters": sentence if kept else ""}
 
@@ -112,6 +119,7 @@ def test_impact_sentence_numbers_and_versions_must_appear_in_the_source(sentence
     ("1.2.3", "1.2.3-rc1", False),
 ])
 def test_impact_versions_keep_their_prerelease_qualifier(source_version, sentence_version, kept):
+    """Require prerelease suffixes in why_it_matters versions to match the source."""
     source = f"Version {source_version} includes the reported correction."
     sentence = f"The report says version {sentence_version} includes the correction."
     draft = analysis(why_it_matters=sentence, evidence=[source])
@@ -120,6 +128,7 @@ def test_impact_versions_keep_their_prerelease_qualifier(source_version, sentenc
 
 
 def test_prerelease_words_in_prose_do_not_change_a_count():
+    """Keep spelled-out prose counts distinct from prerelease version tokens."""
     source = "The developers corrected 3 connection failures. A separate release candidate is under review."
     sentence = "The report says developers corrected three connection failures."
     draft = analysis(why_it_matters=sentence, evidence=[source])
@@ -127,6 +136,7 @@ def test_prerelease_words_in_prose_do_not_change_a_count():
 
 
 def test_impact_clears_across_comments_decisions_retries_and_approvals(context, monkeypatch):
+    """Track writer_clears across comment bodies, retries, operator approvals, and decision summaries."""
     note = {"id": "gid://gitlab/DiscussionNote/1", "url": "https://example.org/issue#note_1",
             "title": "Public comment by @operator", "author": "operator", "created_at": DATE,
             "body": "Relays running 0.4.8.17 must upgrade."}
@@ -183,6 +193,7 @@ def test_impact_clears_across_comments_decisions_retries_and_approvals(context, 
     (item(kind="feed", authority="official"), CONFIDENCES, NON_TAG_STATES, CATEGORIES),
 ], ids=["issue", "merged-request", "official-feed"])
 def test_writer_schema_limits_labels_by_source(monkeypatch, src_item, confidence, state, categories):
+    """Restrict writer schema label enums according to source kind and authority."""
     llm = analyzer(monkeypatch, completion(analysis(why_it_matters="", state=state[0])))
     llm.analyze(src_item)
     fields = llm.client.requests[0][1]["response_format"]["json_schema"]["schema"]["properties"]
@@ -200,6 +211,7 @@ def test_writer_schema_limits_labels_by_source(monkeypatch, src_item, confidence
     (item(kind="gitlab_mr", upstream_state="merged"), {"state": "merged", "category": "release"}),
 ], ids=["confirmed-issue", "tagged-issue", "released-mr", "release-category-mr"])
 def test_writer_rejects_labels_outside_source_limits(monkeypatch, use_fallback, src_item, labels):
+    """Refuse writer responses whose labels exceed source-derived limits."""
     responses = [FetchError("network request failed", retryable=True)] if use_fallback else []
     responses.append(completion(analysis(why_it_matters="", **labels)))
     llm = analyzer(monkeypatch, *responses, fallbacks=["https://fallback.example/v1"])
@@ -218,12 +230,14 @@ def test_writer_rejects_labels_outside_source_limits(monkeypatch, use_fallback, 
     ({"title": " \uffff "}, "Invalid model title"),
 ])
 def test_validate_analysis_rejects_malformed_scalars_and_noncharacters(overrides, match):
+    """Reject invalid enum values, non-string scalars, and XML noncharacters."""
     with pytest.raises(AnalysisError, match=match) as caught:
         validate_analysis(analysis(**overrides), item())
     assert not caught.value.retryable
 
 
 def test_label_normalization_schema_limits_and_release_tag_stripping(monkeypatch):
+    """Deduplicate array labels, enforce length caps, and strip unannounced release tags."""
     merged_mr = item(kind="gitlab_mr", upstream_state="merged")
     draft = analysis(why_it_matters="", state="merged", category="feature", tags=["feature", "release"])
     assert analyzer(monkeypatch, completion(draft)).analyze(merged_mr)["tags"] == ["feature"]
@@ -251,6 +265,7 @@ def test_label_normalization_schema_limits_and_release_tag_stripping(monkeypatch
 
 @pytest.mark.parametrize("sent", [0, 1])
 def test_endpoint_deadlines_retries_and_malformed_completions(monkeypatch, sent):
+    """Distinguish retryable transport/auth failures from terminal truncation and evidence errors."""
     responses = [FetchError("network request failed", retryable=True)] * sent + [DeadlineReached()] * (3 - sent)
     llm = analyzer(monkeypatch, *responses, fallbacks=["https://fallback.example/v1", "https://third.example/v1"])
     with pytest.raises(AnalysisError, match="LLM request failed") as caught:
@@ -300,6 +315,7 @@ def test_endpoint_deadlines_retries_and_malformed_completions(monkeypatch, sent)
     ("The reply was acknowledged.", [], "needs text and source evidence"),
 ])
 def test_literal_evidence_formatting_and_reformatting_guards(body, quotes, match):
+    """Require exact normalized source excerpts while preserving Markdown, quotes, and > markers."""
     if match is None:
         assert validate_analysis(analysis(evidence=quotes), item(content=body))["evidence"] == quotes
     else:
@@ -309,11 +325,13 @@ def test_literal_evidence_formatting_and_reformatting_guards(body, quotes, match
 
 @pytest.mark.parametrize("text", ["Straße!", "ßßßß", "ﬃﬃﬃ"])
 def test_writer_schema_rejects_short_nfkc_titles(text):
+    """Refuse inputs whose normalized literal excerpts fall below MIN_EVIDENCE_CHARS."""
     with pytest.raises(AnalysisError, match="no qualifying literal evidence"):
         _writer_schema({"title": text, "content": ""})
 
 
 def test_evidence_matching_diagnostics_and_grammar_bounds(monkeypatch):
+    """Bound evidence enum choices to MAX_EVIDENCE_CHOICES across descriptions and comments."""
     llm = analyzer(monkeypatch, completion(analysis(why_it_matters="")))
     llm.analyze(item())
     fields = llm.client.requests[0][1]["response_format"]["json_schema"]["schema"]["properties"]
@@ -359,6 +377,7 @@ def test_evidence_matching_diagnostics_and_grammar_bounds(monkeypatch):
 
 
 def test_rejection_strikes_run_endpoint_circuit_breaker_and_source_snapshot(tmp_path, monkeypatch):
+    """Stop retrying after three terminal strikes and trip the run circuit breaker on endpoint errors."""
     llm_cfg = DEFAULTS["llm"]
     with Store(tmp_path / "state.db") as store:
         src = item()
@@ -385,6 +404,7 @@ def test_rejection_strikes_run_endpoint_circuit_breaker_and_source_snapshot(tmp_
     failing_endpoint = False
 
     def step(payload):
+        """Simulate per-item writer success or retryable HTTP failure."""
         calls.append(payload["url"])
         if payload["url"].endswith("/bad") or failing_endpoint:
             raise AnalysisError("LLM request failed (HTTP 400)", retryable=True)
@@ -411,6 +431,7 @@ def test_rejection_strikes_run_endpoint_circuit_breaker_and_source_snapshot(tmp_
     {"evidence": ["Distinct prior summary that must never enter evidence choices."]},
 ])
 def test_validate_update_analysis_rejects_invalid_payloads(bad_update):
+    """Reject malformed, empty, unpunctuated, or prior-story-quoting update drafts."""
     base = update_analysis(update="Packages for Debian are now published.", confidence="confirmed",
                            state="released", evidence=[item()["title"]])
     with pytest.raises(AnalysisError):
@@ -418,6 +439,7 @@ def test_validate_update_analysis_rejects_invalid_payloads(bad_update):
 
 
 def test_update_mode_sends_prior_context_narrows_schema_and_validates(monkeypatch):
+    """Bound prior_story updates, narrow update state/confidence enums, and bind cache keys."""
     prior = {
         "id": "a" * 24, "title": "Distinct prior headline",
         "summary": "Distinct prior summary that must never enter evidence choices.",
@@ -468,6 +490,7 @@ def test_update_mode_sends_prior_context_narrows_schema_and_validates(monkeypatc
 
 
 def test_shouting_caps_and_malformed_tor_version_helpers_and_validation(monkeypatch):
+    """Detect ALL-CAPS shouting and three-part C-Tor version typos across writer validation."""
     for clean in (
         "TCP SYN flood on relays", "HTTP CONNECT proxy", "CVE-2026-1234",
         "BSD PF firewall", "TLS SNI ALPN", "IPV4 IPV6 NAT64", "HSDir and DoS on macOS",
@@ -526,3 +549,183 @@ def test_shouting_caps_and_malformed_tor_version_helpers_and_validation(monkeypa
     )
     assert llm_clear.analyze(src)["why_it_matters"] == "" and llm_clear.clears == 1
     assert llm_clear.analyze(src)["why_it_matters"] == "" and llm_clear.clears == 1
+
+
+def test_mailing_list_blockquote_unquoted_mail_text_and_sender_domain_guards(monkeypatch, tmp_path):
+    """Preserve blockquote breaks and isolate unquoted mail text, sender_domain, and reply evidence."""
+    from helpers import FakeClient, response, source
+    from onionflash import collect, source_packet
+    from onionflash.store import item_hash
+    from onionflash.util import plain_text
+
+    html_reply = (
+        "<p>Hi Adam,</p><p>Three corrections follow.</p>"
+        "<blockquote>&gt; Please create a merge request.<br>&gt; Many relays are falling.</blockquote>"
+    )
+    parsed_html = plain_text(html_reply, 2000, html=True)
+    assert "\n> Please create a merge request.\n> Many relays are falling." in parsed_html
+
+    sample_reply = (
+        "Hi Adam,\n\n"
+        "Three corrections:\n"
+        "buf_new() allocates an empty buffer structure.\n\n"
+        "[1] Our measurements:\n"
+        "https://1aeo.com/blog/tor-begindir-hsdir-mitigation-pressure.html\n\n"
+        "On Friday, November 13th, 2026 at 11:02 AM, forest via tor-dev wrote:\n\n"
+        "> On 2026-11-11 15:13, keevesadam98--- via tor-dev wrote:\n"
+        "> > We are happy to submit this logic as a formal merge request.\n"
+        "> Please do. Many of our 42 relays are falling due to this continued attack.\n"
+        ">\n"
+        "> Regards,\n"
+        "> forest"
+    )
+    stripped = unquoted_mail_text(sample_reply)
+    assert "[1] Our measurements:\nhttps://1aeo.com/blog/tor-begindir-hsdir-mitigation-pressure.html" in stripped
+    assert "On Friday, November 13th" not in stripped
+    assert "forest" not in stripped
+    assert "keevesadam98" not in stripped
+
+    orig_msg = "Top reply text.\n\n-----Original Message-----\nFrom: someone@example.org\n\n> Quoted line"
+    assert unquoted_mail_text(orig_msg) == "Top reply text."
+
+    # Verify collect._feed extracts verified sender_domain for trusted-operator and project-sender only.
+    rss_xml = b"""<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0"><channel><title>tor-dev</title>
+<item>
+  <title>[tor-dev] Re: BEGIN_DIR buffer behavior</title>
+  <link>https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/MSG1/</link>
+  <author>tor\xef\xbc\xa01aeo.com (Tor at 1AEO)</author>
+  <pubDate>Sun, 15 Nov 2026 12:00:00 +0000</pubDate>
+  <description>Unquoted operator clarification.</description>
+</item>
+<item>
+  <title>[tor-dev] Core update</title>
+  <link>https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/MSG2/</link>
+  <author>nickm\xef\xbc\xa0torproject.org (Nick Mathewson)</author>
+  <pubDate>Sun, 15 Nov 2026 12:01:00 +0000</pubDate>
+  <description>Project sender note.</description>
+</item>
+<item>
+  <title>[tor-dev] Community question</title>
+  <link>https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/MSG3/</link>
+  <author>forest\xef\xbc\xa0example.net (forest)</author>
+  <pubDate>Sun, 15 Nov 2026 12:02:00 +0000</pubDate>
+  <description>Community note.</description>
+</item>
+</channel></rss>"""
+    feed_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/feed/"
+    list_src = source(id="tor-dev", url=feed_url, kind="feed", authority="community", product="tor")
+    settings = {**DEFAULTS["collection"], "trusted_operator_domains": ["1aeo.com"]}
+    collected = collect.collect_source(
+        FakeClient([response(rss_xml, url=feed_url)]), list_src, {}, settings, "2026-11-15T12:05:00Z"
+    )
+    by_msg = {entry["url"].rstrip("/").rsplit("/", 1)[-1]: entry for entry in collected["items"]}
+    assert by_msg["MSG1"]["authority"] == "trusted-operator" and by_msg["MSG1"]["sender_domain"] == "1aeo.com"
+    assert by_msg["MSG2"]["authority"] == "project-sender" and by_msg["MSG2"]["sender_domain"] == "torproject.org"
+    assert by_msg["MSG3"]["authority"] == "community" and "sender_domain" not in by_msg["MSG3"]
+
+    assert item_hash(by_msg["MSG1"]) != item_hash({k: v for k, v in by_msg["MSG1"].items() if k != "sender_domain"})
+    assert source_packet.source_fingerprint(by_msg["MSG1"]) != source_packet.source_fingerprint(
+        {k: v for k, v in by_msg["MSG1"].items() if k != "sender_domain"}
+    )
+
+    reply_item = {
+        **by_msg["MSG1"],
+        "content": sample_reply,
+    }
+    valid_draft = analysis(
+        title="Relay operator clarifies BEGIN_DIR buffer allocation on tor-dev",
+        summary="A relay operator at 1aeo.com clarifies that buf_new() allocates an empty buffer structure.",
+        why_it_matters="",
+        confidence="reported",
+        evidence=["buf_new() allocates an empty buffer structure."],
+    )
+    with Store(tmp_path / "reply.sqlite3") as store:
+        store.ingest(dict(reply_item), "2026-11-15T12:05:00Z")
+        [row] = store.pending(1, "2026-11-15T12:05:00Z")
+        prep = store.prepare_candidate(row, valid_draft, "2026-11-15T12:05:00Z")
+        pkt_src = prep["packet"]["sources"][0]
+        assert pkt_src["sender_domain"] == "1aeo.com"
+        assert "buf_new() allocates an empty buffer structure." in pkt_src["unquoted_content"]
+        assert "forest" not in pkt_src["unquoted_content"]
+
+    writer = analyzer(monkeypatch, completion(valid_draft))
+    writer.analyze(dict(reply_item))
+    sent_payload = json.loads(writer.client.requests[0][1]["messages"][1]["content"])
+    assert sent_payload["sender_domain"] == "1aeo.com"
+    assert "forest" not in sent_payload["unquoted_content"]
+
+    # Quoted-only evidence is rejected with writer.quoted_only_evidence.
+    with pytest.raises(AnalysisError, match="unquoted author text") as quoted_err:
+        validate_analysis(
+            analysis(
+                title="Relay operator replies on tor-dev",
+                summary="A relay operator replied to the thread.",
+                evidence=["> Please do. Many of our 42 relays are falling due to this continued attack."],
+            ),
+            reply_item,
+        )
+    assert quoted_err.value.code == "writer.quoted_only_evidence"
+    assert "failed." + quoted_err.value.code in decisions.CODES
+
+    # Numbers present only in >-quoted lines clear why_it_matters; unquoted numbers survive.
+    cleared_num = validate_analysis(
+        analysis(
+            title="Relay operator clarifies BEGIN_DIR buffer allocation",
+            summary="A relay operator clarifies buf_new() behavior.",
+            why_it_matters="The post notes 42 relays are falling.",
+            evidence=["buf_new() allocates an empty buffer structure."],
+        ),
+        reply_item,
+    )
+    assert cleared_num["why_it_matters"] == ""
+    kept_num = validate_analysis(
+        analysis(
+            title="Relay operator clarifies BEGIN_DIR buffer allocation",
+            summary="A relay operator clarifies buf_new() behavior.",
+            why_it_matters="The post gives three corrections on buffer allocation.",
+            evidence=["buf_new() allocates an empty buffer structure."],
+        ),
+        reply_item,
+    )
+    assert kept_num["why_it_matters"] == "The post gives three corrections on buffer allocation."
+
+    # Short unquoted replies (< MIN_EVIDENCE_CHARS) still reject quoted-only evidence.
+    short_reply = {**reply_item, "content": "ACK.\n> Our 42 relays are failing right now."}
+    with pytest.raises(AnalysisError, match="unquoted author text") as short_err:
+        validate_analysis(
+            analysis(
+                title="Relay operator replies on tor-dev",
+                summary="A relay operator acknowledged the message.",
+                evidence=["> Our 42 relays are failing right now."],
+            ),
+            short_reply,
+        )
+    assert short_err.value.code == "writer.quoted_only_evidence"
+
+    # Inherited reply subjects neither satisfy unquoted author evidence nor license quoted numbers.
+    subject_reply = {
+        **reply_item,
+        "title": "Re: 42 relays are failing right now",
+        "content": "That count is incorrect and should not be cited.\n> 42 relays are failing right now.",
+    }
+    with pytest.raises(AnalysisError, match="unquoted author text") as subj_err:
+        validate_analysis(
+            analysis(
+                title="Relay operator disputes count",
+                summary="A relay operator says the count is incorrect.",
+                evidence=["Re: 42 relays are failing right now"],
+            ),
+            subject_reply,
+        )
+    assert subj_err.value.code == "writer.quoted_only_evidence"
+    subj_checked = validate_analysis(
+        analysis(
+            title="Relay operator disputes count",
+            summary="A relay operator says the count is incorrect.",
+            why_it_matters="The post says 42 relays are failing.",
+            evidence=["That count is incorrect and should not be cited."],
+        ),
+        subject_reply,
+    )
+    assert subj_checked["why_it_matters"] == ""

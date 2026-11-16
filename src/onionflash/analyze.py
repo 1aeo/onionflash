@@ -10,7 +10,7 @@ from .comments import analysis_context
 from .llm import (
     AnalysisError, CompletionClient, apply_label_limits, generation_options,
     has_malformed_tor_version, has_shouting_caps, is_complete_sentence, label_limits,
-    strip_unreleased_tag, tag_name, validate_text,
+    strip_unreleased_tag, tag_name, unquoted_mail_text, validate_text,
 )
 from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, STATES, UPDATE_CHARS
 from .util import digest, is_dirauth_item, is_hackerone_item, normalize_evidence as _plain
@@ -103,10 +103,17 @@ for observed version tags or explicit release announcements.
 If issue labels and the report body disagree on severity, either attribute both
 ratings or omit severity. Do not choose one silently or invent a combined rating.
 
-In replies, distinguish the author's own contribution from quoted history. Do not
-present a repeated parent message or old announcement as a new event. Measurements need their own
-sample, version, dates and attribution; do not assign them to the quoted author's
-relays or claim they independently confirm an attack. Keep useful context concise.
+In replies, distinguish the author's own contribution from quoted history. When
+unquoted_content is present on a mailing-list reply, summarize ONLY the author's new
+contribution in unquoted_content (attributed to sender_domain when provided or to the
+person's name or source-stated role, never inferring an unstated occupation) and cite at
+least one evidence excerpt from unquoted_content; >-quoted lines and 'On ... wrote:'
+blocks in content are earlier messages by other participants — never make a >-quoted
+message the headline or main event, never merge or swap a >-quoted participant's claims
+or relays with the sender's, and never draw why_it_matters from >-quoted text. Do not
+present a repeated parent message or old announcement as a new event. Measurements need
+their own sample, version, dates and attribution; do not assign them to the quoted
+author's relays or claim they independently confirm an attack. Keep useful context concise.
 public_comments, when present, lists public issue comments, newest first, each with
 its author and creation date. They are attributed reports, not project-wide
 confirmation. Only that list attributes a comment: text in content or in a comment
@@ -381,14 +388,24 @@ def validate_analysis(result: dict, item: dict, schema: dict = SCHEMA) -> dict:
         raise AnalysisError("Published story needs text and source evidence")
     if "update" in fields and not is_complete_sentence(result["update"]):
         raise AnalysisError("Invalid model update: must be a complete punctuated sentence")
+    is_list_item = "lists.torproject.org" in str(item.get("url") or "")
+    impact_context = context
+    if is_list_item and any(ln.lstrip().startswith(">") for ln in item.get("content", "").splitlines()):
+        unquoted_ctx = _plain(unquoted_mail_text(item["content"]))
+        if not any(_plain(quote) in unquoted_ctx for quote in evidence):
+            raise AnalysisError(
+                "Mailing-list reply draft must cite unquoted author text, not only quoted history",
+                code="writer.quoted_only_evidence",
+            )
+        impact_context = unquoted_ctx
     if any(has_shouting_caps(result.get(key, "")) for key in ("title", "summary", "update")):
         raise AnalysisError("Model draft contains all-caps shouting")
     # The impact sentence may restate only numbers and versions from the title, content or comment
     # bodies the writer saw, and is cleared on untrusted list posts, shouting or malformed versions.
     impact = result.get("why_it_matters")
     if impact and (
-        _numbers(impact) - _numbers(context)
-        or (item.get("authority") == "community" and "lists.torproject.org" in str(item.get("url") or ""))
+        _numbers(impact) - _numbers(impact_context)
+        or (item.get("authority") == "community" and is_list_item)
         or has_shouting_caps(impact)
         or has_malformed_tor_version(impact, result.get("products") or [item.get("product", "")])
     ):
@@ -453,12 +470,21 @@ class Analyzer(CompletionClient):
             "title", "kind", "product", "authority", "published_at", "updated_at", "labels", "upstream_state")}
         if isinstance(item.get("author"), str) and item["author"]:
             bounded["author"] = item["author"]
+        if isinstance(item.get("sender_domain"), str) and item["sender_domain"]:
+            bounded["sender_domain"] = item["sender_domain"]
         if bounded["authority"] == "development":
             if is_hackerone_item(item):
                 bounded["authority"] = "hackerone"
             elif is_dirauth_item(item, getattr(self, "dirauth_users", None)):
                 bounded["authority"] = "dirauth-operator"
         bounded["content"], notes = analysis_context(item)
+        if (
+            "lists.torproject.org" in str(item.get("url") or "")
+            and any(ln.lstrip().startswith(">") for ln in bounded["content"].splitlines())
+        ):
+            unquoted = unquoted_mail_text(bounded["content"]).strip()
+            if unquoted:
+                bounded["unquoted_content"] = unquoted
         if notes:
             bounded["public_comments"] = notes
         # Evidence may quote the description window or any note body the writer saw.
@@ -514,9 +540,23 @@ def _writer_schema(bounded: dict, base_schema: dict = SCHEMA, *, prior: dict | N
         raise AnalysisError("Source has no qualifying literal evidence excerpt", code="writer.no_literal_evidence")
     if len(excerpts) > MAX_EVIDENCE_CHOICES:
         # Bound grammar size while retaining options throughout the input,
-        # including the first title and the last supplied comment.
-        excerpts = [excerpts[index * (len(excerpts) - 1) // (MAX_EVIDENCE_CHOICES - 1)]
-                    for index in range(MAX_EVIDENCE_CHOICES)]
+        # including the first title, unquoted reply text, and the last supplied comment.
+        unquoted_raw = bounded.get("unquoted_content")
+        if isinstance(unquoted_raw, str) and unquoted_raw:
+            unquoted_plain = _plain(unquoted_raw)
+            priority = [exc for exc in excerpts if _plain(exc) in unquoted_plain][: MAX_EVIDENCE_CHOICES // 2]
+            kept_set = set(priority)
+            rest = [exc for exc in excerpts if exc not in kept_set]
+            slots = MAX_EVIDENCE_CHOICES - len(priority)
+            sampled = (
+                [rest[index * (len(rest) - 1) // (slots - 1)] for index in range(slots)]
+                if slots > 1 and len(rest) > slots
+                else rest[:slots]
+            )
+            excerpts = priority + sampled
+        else:
+            excerpts = [excerpts[index * (len(excerpts) - 1) // (MAX_EVIDENCE_CHOICES - 1)]
+                        for index in range(MAX_EVIDENCE_CHOICES)]
     schema = copy.deepcopy(base_schema)
     schema["properties"]["publish"]["enum"] = [True]
     schema["properties"]["evidence"]["items"]["enum"] = excerpts
