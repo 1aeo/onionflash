@@ -258,6 +258,9 @@ cannot obtain another judgment of that input. A repeated deletion proposal holds
 instead of resampling, which can withhold an otherwise publishable candidate when
 the reviewer repeatedly proposes the same deletion. Effective edits are normalized
 after a veto; unchanged fields do not prevent verification of the retained text.
+An audit whose single reason is dominated by repeated fragments fails validation
+using the existing language-neutral per-reason check. It holds without a re-ask,
+retaining the charged attempt and granting no deletion or veto authority.
 
 If that invalid reply has no usable edit, the ledger permits one logical
 validation-correction request. It reviews the same candidate, packet, scope and

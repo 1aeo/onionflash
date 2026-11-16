@@ -80,7 +80,11 @@ def test_invalid_audit_output_is_a_dedicated_nonapproving_error(invalid):
 def test_durable_validation_keeps_bounds_and_rejects_references_from_another_packet():
     source = packet()
     source["sources"][0]["passages"] = [{"id": f"S1:P{i}", "text": "Supplied evidence."} for i in range(1, 14)]
-    good = result(reason="x" * 240, source_refs=[f"S1:P{i}" for i in range(1, 13)])
+    reason = ("The source describes an interrupted download when both servers are unavailable. "
+              "Its later correction narrows the affected release and preserves the prerequisite. "
+              "The candidate keeps these limits without adding advice, severity or a different cause.")[:240]
+    assert len(reason) == 240
+    good = result(reason=reason, source_refs=[f"S1:P{i}" for i in range(1, 13)])
     assert impact_audit.validate(good, source) == good
     with pytest.raises(impact_audit.AuditError):
         impact_audit.validate(result(source_refs=[f"S1:P{i}" for i in range(1, 14)]), source)
@@ -176,3 +180,28 @@ def test_native_failures_keep_original_codes_and_accounting(monkeypatch, failure
         assert not isinstance(caught.value, impact_audit.AuditError)
         assert caught.value.code == code and observer.events == events
         assert checker.calls == 1 and len(checker.client.requests) == 1
+
+
+@pytest.mark.parametrize("outcome", ["supported", "unsupported", "insufficient"])
+@pytest.mark.parametrize("reason", ["abc" * 30, "資料" * 45, "abc" * 13 + " note " + "def" * 13 + " ghi" * 13])
+def test_a_single_repetitive_audit_reason_is_invalid_for_every_outcome(outcome, reason):
+    assert len(reason) <= 240
+    with pytest.raises(impact_audit.AuditError, match="repetition"):
+        impact_audit.validate(result(outcome, reason=reason), packet())
+
+
+@pytest.mark.parametrize("outcome", ["supported", "unsupported", "insufficient"])
+@pytest.mark.parametrize("reason", [
+    "The source states the interruption and its prerequisites; the candidate preserves those limits.",
+    "資料には接続が途切れる条件と影響が明記されており、後の訂正も反映されています。",
+    "abc" * 10,
+])
+def test_ordinary_non_latin_and_short_repetition_audit_reasons_remain_valid(outcome, reason):
+    response = result(outcome, reason=reason)
+    assert impact_audit.validate(response, packet()) == response
+
+
+def test_audit_reason_validation_participates_in_review_policy_identity(monkeypatch):
+    before = review.policy_hash(DEFAULTS)
+    monkeypatch.setitem(impact_audit.POLICY, "reason_repetition", "changed-validation-contract")
+    assert review.policy_hash(DEFAULTS) != before

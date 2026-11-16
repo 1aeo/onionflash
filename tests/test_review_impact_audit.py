@@ -296,7 +296,7 @@ def test_no_deletion_does_not_add_an_audit_or_force_factual_repairs(context, dec
     assert saved_audit(store)["impact_audits"] == []
 
 
-@pytest.mark.parametrize("damage", [None, "missing-list", "source-ref", "context", "input-hash", "effective-hash", "missing-result"])
+@pytest.mark.parametrize("damage", [None, "missing-list", "source-ref", "reason", "context", "input-hash", "effective-hash", "missing-result"])
 def test_completed_audit_receipt_cannot_be_forged_or_bypassed_by_cached_approval(context, monkeypatch, damage):
     cfg, store = context
     row = pending(store)
@@ -312,6 +312,8 @@ def test_completed_audit_receipt_cannot_be_forged_or_bypassed_by_cached_approval
         saved.pop("impact_audits")
     elif damage == "source-ref":
         saved["impact_audits"][0]["result"]["source_refs"] = ["S9:P9"]
+    elif damage == "reason":
+        saved["impact_audits"][0]["result"]["reason"] = "abc" * 30
     elif damage == "context":
         saved["impact_audits"][0]["context"]["source_hash"] = "0" * 64
     elif damage == "input-hash":
@@ -562,3 +564,22 @@ def test_supported_veto_removes_unchanged_effective_fields_before_verification(c
     audit = saved_audit(store)["impact_audits"][0]
     assert audit["status"] == "complete" and audit["before_hash"] == audit["effective_hash"]
     assert saved_audit(store)["reviews"][-1]["stage"] == "verification"
+
+
+@pytest.mark.parametrize("kind", ["review", "proposal"])
+@pytest.mark.parametrize("outcome", ["supported", "unsupported"])
+def test_corrupted_impact_audit_holds_without_editing_verifying_or_reasking(context, kind, outcome):
+    cfg, store = context
+    row = pending(store)
+    response = {**assessed(outcome), "reason": "abc" * 30}
+    checker = reviewer(cfg, proposed(kind), response, verdict())
+    assert run(cfg, store, row, writer(), checker)["status"] == "held"
+    assert checker.calls == 2 and schemas(checker) == ["onionflash_review", "onionflash_impact_audit"]
+    saved = record(store)
+    audit = saved["impact_audits"][0]
+    assert audit["status"] == "failed" and audit["result"] is None and audit["effective_hash"] is None
+    assert audit["error"] == {"type": "AuditError", "code": "review.impact_audit"}
+    assert saved["request_budget"]["reserved"] == 2 and saved["request_budget"]["validation_reask"] is None
+    retained = saved.get("candidate", json.loads(job(store)["envelope_json"])["candidate"])
+    assert retained["why_it_matters"] == IMPACT and not store.stories()
+    assert not review_gate.approval(cfg, store, row["id"])["eligible"]

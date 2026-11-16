@@ -36,8 +36,9 @@ SCHEMA = {
     },
     "required": ["outcome", "reason", "source_refs"],
 }
-POLICY = {"prompt": PROMPT, "schema": SCHEMA, "validation": "impact-audit-v2",
+POLICY = {"prompt": PROMPT, "schema": SCHEMA, "validation": "impact-audit-v3",
           "input_identity": "original-impact-proposed-empty-complete-packet",
+          "reason_repetition": "shared-per-reason-v1",
           "supported_requires_refs": True, "unique_refs": True, "utf8_text": True, "impact_max_length": 800}
 
 
@@ -81,6 +82,11 @@ def validate(result, packet):
     if result["outcome"] not in SCHEMA["properties"]["outcome"]["enum"]:
         raise AuditError("Invalid impact audit outcome")
     _text(result["reason"], 240, "Invalid impact audit reason")
+    # Resolve after module initialization: the review policy also imports this
+    # audit's schema. One corrupted reason invalidates this single-reason reply.
+    from .review import _repetitive_reason
+    if _repetitive_reason(result["reason"]):
+        raise AuditError("Impact audit reason is dominated by repetition")
     supplied = result["source_refs"]
     if (not isinstance(supplied, list) or len(supplied) > 12
             or any(not isinstance(ref, str) or ref not in refs for ref in supplied)
