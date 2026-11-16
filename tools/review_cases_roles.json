@@ -1,0 +1,567 @@
+{
+  "description": "Controlled synthetic role-evidence cases. Names, source passages and events are fictional; these are not news or publications. Person-role labels require the specified evidence, while neutral attribution and source-stated operator roles remain usable.",
+  "defaults": {
+    "why_it_matters": "",
+    "category": "network",
+    "tags": [
+      "network"
+    ],
+    "priority": "normal",
+    "confidence": "reported",
+    "state": "developing",
+    "products": [
+      "tor"
+    ],
+    "published_at": "2026-11-10T12:00:00Z",
+    "updated_at": "2026-11-10T12:00:00Z",
+    "added_at": "2026-11-10T12:00:00Z"
+  },
+  "packets": {
+    "role-mr-request": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/08b149400b7f80f8f649cf14",
+          "title": "[tor-dev] Multi-relay directory-stream measurements",
+          "kind": "feed",
+          "authority": "trusted-operator",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "Taylor posted the following empirical multi-relay report to tor-dev. Systematic measurements across independently operated relays show sustained directory-stream bursts, high CPU use and failed circuit requests. The report states that sustained stream bursts leave relays unable to serve new circuits.",
+            "Taylor identifies as a relay operator and asks a correspondent to submit the proposed stream-handling fix as a merge request."
+          ]
+        }
+      ]
+    },
+    "role-sender-authority": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/b4417891555da2bc662a0093",
+          "title": "[tor-dev] Multi-relay directory-stream measurements",
+          "kind": "feed",
+          "authority": "project-sender",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "Avery posted the following empirical multi-relay report to tor-dev. Systematic measurements across independently operated relays show sustained directory-stream bursts, high CPU use and failed circuit requests. The report states that sustained stream bursts leave relays unable to serve new circuits.",
+            "Avery describes the measurements and asks for review of the directory-stream scheduler."
+          ]
+        }
+      ]
+    },
+    "role-unmerged-code": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/9840c5cc7652a158e01bfea7",
+          "title": "[tor-dev] Multi-relay directory-stream measurements",
+          "kind": "feed",
+          "authority": "trusted-operator",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "Robin posted the following empirical multi-relay report to tor-dev. Systematic measurements across independently operated relays show sustained directory-stream bursts, high CPU use and failed circuit requests. The report states that sustained stream bursts leave relays unable to serve new circuits.",
+            "Robin identifies as a relay operator and attaches a proposed C Tor patch for discussion. The patch is unmerged."
+          ]
+        }
+      ]
+    },
+    "role-other-author": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/a93f9c7980c70f63e6267d99",
+          "title": "[tor-dev] Multi-relay directory-stream measurements",
+          "kind": "feed",
+          "authority": "trusted-operator",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "Casey posted the following empirical multi-relay report to tor-dev. Systematic measurements across independently operated relays show sustained directory-stream bursts, high CPU use and failed circuit requests. The report states that sustained stream bursts leave relays unable to serve new circuits.",
+            "Casey uses account @stone-casey and identifies as a relay operator. The supplied C Tor commit record lists author Jordan, account @delta-jordan, for committed code changing stream accounting. Casey discusses Jordan's change."
+          ]
+        }
+      ]
+    },
+    "role-other-repository": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/ff3f51e88a73a9f6556e6cfc",
+          "title": "[tor-dev] Multi-relay directory-stream measurements",
+          "kind": "feed",
+          "authority": "project-sender",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "Morgan posted the following empirical multi-relay report to tor-dev. Systematic measurements across independently operated relays show sustained directory-stream bursts, high CPU use and failed circuit requests. The report states that sustained stream bursts leave relays unable to serve new circuits.",
+            "Morgan uses account @brook-morgan. The supplied contribution record credits @brook-morgan with committed code in an unrelated packet-visualization application, not C Tor."
+          ]
+        }
+      ]
+    },
+    "role-self-description": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/3df0340bcab963f6ab05d185",
+          "title": "[tor-dev] Multi-relay directory-stream measurements",
+          "kind": "feed",
+          "authority": "trusted-operator",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "Drew posted the following empirical multi-relay report to tor-dev. Systematic measurements across independently operated relays show sustained directory-stream bursts, high CPU use and failed circuit requests. The report states that sustained stream bursts leave relays unable to serve new circuits.",
+            "Drew identifies as a relay operator and also writes, \"I am a developer.\""
+          ]
+        }
+      ]
+    },
+    "role-unknown-occupation": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/b3c2a8d9d0253690ebe5dec6",
+          "title": "[tor-dev] Multi-relay directory-stream measurements",
+          "kind": "feed",
+          "authority": "project-sender",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "Quinn posted the following empirical multi-relay report to tor-dev. Systematic measurements across independently operated relays show sustained directory-stream bursts, high CPU use and failed circuit requests. The report states that sustained stream bursts leave relays unable to serve new circuits.",
+            "Quinn compiled the submitted relay measurements. The report asks developers to inspect stream scheduling."
+          ]
+        }
+      ]
+    },
+    "role-same-author-commit": {
+      "sources": [
+        {
+          "url": "https://example.org/sources/5cc225872ad74c9782c83b79",
+          "title": "[tor-dev] Multi-relay directory-stream measurements",
+          "kind": "feed",
+          "authority": "project-sender",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "Sam posted the following empirical multi-relay report to tor-dev. Systematic measurements across independently operated relays show sustained directory-stream bursts, high CPU use and failed circuit requests. The report states that sustained stream bursts leave relays unable to serve new circuits.",
+            "Sam posts under account @river-sam. The supplied C Tor repository commit record identifies @river-sam as the author of committed stream-accounting code merged into C Tor; it explicitly links that author identity to this report's Sam. The report asks developers to inspect stream scheduling; it does not state that the reported overload has been fixed."
+          ]
+        }
+      ]
+    }
+  },
+  "cases": [
+    {
+      "id": "role-mr-request-operator",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "role-mr-request",
+      "candidate": {
+        "id": "0efe996bbbbd58e2775205af",
+        "title": "Relay operator Taylor reports relay directory-stream overload",
+        "summary": "Relay operator Taylor reports sustained directory-stream bursts, high CPU use and failed circuit requests across independently operated relays. Taylor asks a correspondent to submit the proposed fix as a merge request.",
+        "why_it_matters": "The report says sustained stream bursts leave relays unable to serve new circuits."
+      }
+    },
+    {
+      "id": "role-mr-request-developer",
+      "expected": "not_approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "role-mr-request",
+      "candidate": {
+        "id": "3b44a9eadebd648cd897861f",
+        "title": "Developer Taylor reports relay directory-stream overload",
+        "summary": "Developer Taylor reports sustained directory-stream bursts, high CPU use and failed circuit requests across independently operated relays. Taylor asks a correspondent to submit the proposed fix as a merge request.",
+        "why_it_matters": "The report says sustained stream bursts leave relays unable to serve new circuits."
+      },
+      "unsupported": [
+        "Developer Taylor"
+      ]
+    },
+    {
+      "id": "role-sender-authority-neutral",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "role-sender-authority",
+      "candidate": {
+        "id": "a44f8af173e339e86e0f383e",
+        "title": "Avery reports relay directory-stream overload",
+        "summary": "Avery reports sustained directory-stream bursts, high CPU use and failed circuit requests across independently operated relays.",
+        "why_it_matters": "The report says sustained stream bursts leave relays unable to serve new circuits."
+      }
+    },
+    {
+      "id": "role-sender-authority-developer",
+      "expected": "not_approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "role-sender-authority",
+      "candidate": {
+        "id": "11e24a7ae918e11b21b17b4b",
+        "title": "Tor Project developer Avery reports relay directory-stream overload",
+        "summary": "Tor Project developer Avery reports sustained directory-stream bursts, high CPU use and failed circuit requests across independently operated relays.",
+        "why_it_matters": "The report says sustained stream bursts leave relays unable to serve new circuits."
+      },
+      "unsupported": [
+        "Tor Project developer Avery"
+      ]
+    },
+    {
+      "id": "role-unmerged-code-operator",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "role-unmerged-code",
+      "candidate": {
+        "id": "3fd06f0daf5053fe0b50477d",
+        "title": "Relay operator Robin reports relay directory-stream overload",
+        "summary": "Relay operator Robin reports sustained directory-stream bursts, high CPU use and failed circuit requests across independently operated relays. Robin attaches an unmerged C Tor patch for discussion.",
+        "why_it_matters": "The report says sustained stream bursts leave relays unable to serve new circuits."
+      }
+    },
+    {
+      "id": "role-unmerged-code-developer",
+      "expected": "not_approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "role-unmerged-code",
+      "candidate": {
+        "id": "011ba02451633e2c80aade50",
+        "title": "Developer Robin reports relay directory-stream overload",
+        "summary": "Developer Robin reports sustained directory-stream bursts, high CPU use and failed circuit requests across independently operated relays. Robin attaches an unmerged C Tor patch for discussion.",
+        "why_it_matters": "The report says sustained stream bursts leave relays unable to serve new circuits."
+      },
+      "unsupported": [
+        "Developer Robin"
+      ]
+    },
+    {
+      "id": "role-other-author-operator",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "role-other-author",
+      "candidate": {
+        "id": "8a4ce1a4164d32c6c637aeb0",
+        "title": "Relay operator Casey reports relay directory-stream overload",
+        "summary": "Relay operator Casey reports sustained directory-stream bursts, high CPU use and failed circuit requests across independently operated relays. Casey discusses a C Tor stream-accounting change authored by Jordan.",
+        "why_it_matters": "The report says sustained stream bursts leave relays unable to serve new circuits."
+      }
+    },
+    {
+      "id": "role-other-author-developer",
+      "expected": "not_approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "role-other-author",
+      "candidate": {
+        "id": "b77f97ee3867f9f49a5a5aa9",
+        "title": "Developer Casey reports relay directory-stream overload",
+        "summary": "Developer Casey reports sustained directory-stream bursts, high CPU use and failed circuit requests across independently operated relays. Casey discusses a C Tor stream-accounting change authored by Jordan.",
+        "why_it_matters": "The report says sustained stream bursts leave relays unable to serve new circuits."
+      },
+      "unsupported": [
+        "Developer Casey"
+      ]
+    },
+    {
+      "id": "role-other-repository-neutral",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "role-other-repository",
+      "candidate": {
+        "id": "56800aa264333923604750c4",
+        "title": "Morgan reports relay directory-stream overload",
+        "summary": "Morgan reports sustained directory-stream bursts, high CPU use and failed circuit requests across independently operated relays.",
+        "why_it_matters": "The report says sustained stream bursts leave relays unable to serve new circuits."
+      }
+    },
+    {
+      "id": "role-other-repository-developer",
+      "expected": "not_approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "role-other-repository",
+      "candidate": {
+        "id": "5199ae140f3fa698f014a34b",
+        "title": "Developer Morgan reports relay directory-stream overload",
+        "summary": "Developer Morgan reports sustained directory-stream bursts, high CPU use and failed circuit requests across independently operated relays.",
+        "why_it_matters": "The report says sustained stream bursts leave relays unable to serve new circuits."
+      },
+      "unsupported": [
+        "Developer Morgan"
+      ]
+    },
+    {
+      "id": "role-self-description-operator",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "role-self-description",
+      "candidate": {
+        "id": "8ebd44f2c2f73cfbfef9cdb6",
+        "title": "Relay operator Drew reports relay directory-stream overload",
+        "summary": "Relay operator Drew reports sustained directory-stream bursts, high CPU use and failed circuit requests across independently operated relays.",
+        "why_it_matters": "The report says sustained stream bursts leave relays unable to serve new circuits."
+      }
+    },
+    {
+      "id": "role-self-description-developer",
+      "expected": "not_approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "role-self-description",
+      "candidate": {
+        "id": "c962b118f6239efd4230a283",
+        "title": "Developer Drew reports relay directory-stream overload",
+        "summary": "Developer Drew reports sustained directory-stream bursts, high CPU use and failed circuit requests across independently operated relays.",
+        "why_it_matters": "The report says sustained stream bursts leave relays unable to serve new circuits."
+      },
+      "unsupported": [
+        "Developer Drew"
+      ]
+    },
+    {
+      "id": "role-unknown-occupation-neutral",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "role-unknown-occupation",
+      "candidate": {
+        "id": "d05cc20632adf2e7d4c26613",
+        "title": "Quinn reports relay directory-stream overload",
+        "summary": "Quinn reports sustained directory-stream bursts, high CPU use and failed circuit requests across independently operated relays.",
+        "why_it_matters": "The report says sustained stream bursts leave relays unable to serve new circuits."
+      }
+    },
+    {
+      "id": "role-unknown-occupation-developer",
+      "expected": "not_approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "role-unknown-occupation",
+      "candidate": {
+        "id": "2ce3f15e77d7b612c251ba16",
+        "title": "Developer Quinn reports relay directory-stream overload",
+        "summary": "Developer Quinn reports sustained directory-stream bursts, high CPU use and failed circuit requests across independently operated relays.",
+        "why_it_matters": "The report says sustained stream bursts leave relays unable to serve new circuits."
+      },
+      "unsupported": [
+        "Developer Quinn"
+      ]
+    },
+    {
+      "id": "role-unknown-occupation-operator",
+      "expected": "not_approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "role-unknown-occupation",
+      "candidate": {
+        "id": "2c74a49470b23eac3fcb8a3e",
+        "title": "Relay operator Quinn reports relay directory-stream overload",
+        "summary": "Relay operator Quinn reports sustained directory-stream bursts, high CPU use and failed circuit requests across independently operated relays.",
+        "why_it_matters": "The report says sustained stream bursts leave relays unable to serve new circuits."
+      },
+      "unsupported": [
+        "Relay operator Quinn"
+      ]
+    },
+    {
+      "id": "role-same-author-commit-developer",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "role-same-author-commit",
+      "candidate": {
+        "id": "5e50b327515dda7a3eb56aa8",
+        "title": "C Tor developer Sam reports relay directory-stream overload",
+        "summary": "C Tor developer Sam reports sustained directory-stream bursts, high CPU use and failed circuit requests across independently operated relays.",
+        "why_it_matters": "The report says sustained stream bursts leave relays unable to serve new circuits."
+      }
+    },
+    {
+      "id": "role-same-author-commit-neutral",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "role-same-author-commit",
+      "candidate": {
+        "id": "f7c065342ece10fbdecf02a4",
+        "title": "Sam reports relay directory-stream overload",
+        "summary": "Sam reports sustained directory-stream bursts, high CPU use and failed circuit requests across independently operated relays.",
+        "why_it_matters": "The report says sustained stream bursts leave relays unable to serve new circuits."
+      }
+    },
+    {
+      "id": "role-generic-developer-audience",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "packet": "role-unknown-occupation",
+      "candidate": {
+        "id": "7759e76b9ba043afe71bdf43",
+        "title": "Quinn reports relay directory-stream overload",
+        "summary": "Quinn reports sustained directory-stream bursts, high CPU use and failed circuit requests across independently operated relays. The report asks developers to inspect stream scheduling.",
+        "why_it_matters": "The report says sustained stream bursts leave relays unable to serve new circuits."
+      }
+    },
+    {
+      "id": "role-update-operator",
+      "scope": "latest_update",
+      "packet": "role-mr-request",
+      "coverage_set": "role-prior-stream-observation",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "new_information"
+      ],
+      "candidate": {
+        "why_it_matters": "",
+        "category": "network",
+        "tags": [
+          "network"
+        ],
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "id": "d38bc1f612365a53ab7ee380",
+        "title": "Directory-stream failures reported on relays",
+        "summary": "A report describes failed circuit requests on relays; their relationship to directory-stream load remains under investigation.",
+        "updates": [
+          {
+            "at": "2026-11-10T12:00:00Z",
+            "text": "Relay operator Taylor reports multi-relay measurements showing directory-stream bursts, high CPU use and failed circuit requests.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/08b149400b7f80f8f649cf14",
+                "title": "[tor-dev] Multi-relay directory-stream measurements"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "role-update-developer",
+      "scope": "latest_update",
+      "packet": "role-mr-request",
+      "coverage_set": "role-prior-stream-observation",
+      "expected": "not_approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "new_information"
+      ],
+      "candidate": {
+        "why_it_matters": "",
+        "category": "network",
+        "tags": [
+          "network"
+        ],
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "id": "d38bc1f612365a53ab7ee380",
+        "title": "Directory-stream failures reported on relays",
+        "summary": "A report describes failed circuit requests on relays; their relationship to directory-stream load remains under investigation.",
+        "updates": [
+          {
+            "at": "2026-11-10T12:00:00Z",
+            "text": "Developer Taylor reports multi-relay measurements showing directory-stream bursts, high CPU use and failed circuit requests.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/08b149400b7f80f8f649cf14",
+                "title": "[tor-dev] Multi-relay directory-stream measurements"
+              }
+            ]
+          }
+        ]
+      },
+      "unsupported": [
+        "Developer Taylor"
+      ]
+    }
+  ],
+  "coverage_sets": {
+    "role-prior-stream-observation": {
+      "prior_story": {
+        "why_it_matters": "",
+        "category": "network",
+        "tags": [
+          "network"
+        ],
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "id": "d38bc1f612365a53ab7ee380",
+        "title": "Directory-stream failures reported on relays",
+        "summary": "A report describes failed circuit requests on relays; their relationship to directory-stream load remains under investigation."
+      },
+      "recent": [],
+      "truncated": false
+    }
+  }
+}
