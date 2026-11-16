@@ -15,7 +15,7 @@ from .llm import (
 from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, STATES, UPDATE_CHARS
 from .util import digest, is_dirauth_item, is_hackerone_item, normalize_evidence as _plain
 
-PROMPT_VERSION = "onionflash-18"
+PROMPT_VERSION = "onionflash-19"
 # Change this when update input filtering changes, independently of prompt prose.
 UPDATE_INPUT_VERSION = 2
 WRITER_REASONING_OPTIONS = {
@@ -130,6 +130,13 @@ A mailing-list proposal, [RFC] or Internet-Draft is its author's proposal for
 comment: attribute it to a proposal posted to the list, name an author or role only
 when the source text states one, keep confidence reported and state developing, and
 do not call it adopted, accepted or a Tor Project decision unless the source says so.
+Call a named or identifiable person a developer only when the supplied evidence
+identifies code authored by that same person and committed into C Tor's codebase.
+A mailing-list post, sender domain or authority, technical fluency, self-description,
+request for a merge request, or proposed/unmerged code does not establish that role.
+Another person's commit or a contribution to another project is not evidence for it.
+Without that evidence, use the person's name alone or a source-stated role such as
+relay operator. Preserve the person's actual report or request without adding a role.
 
 {claim_check}Write a factual headline and 1-3 concise sentences. Brief sources
 can have brief summaries; never add filler to reach a word count. Preserve who did

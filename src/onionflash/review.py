@@ -13,7 +13,7 @@ from .render import prepare_story
 from .schema import LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STORY_ID_RE, UPDATE_CHARS
 from .util import canonical_url, digest, normalize_evidence
 
-REVIEW_VERSION = "onionflash-review-14"
+REVIEW_VERSION = "onionflash-review-15"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details", "news_value", "new_information")
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
@@ -102,9 +102,15 @@ also fail source_support when a bugfix release is labeled security without a vul
 actor_and_action: preserve who does what. A developer changing compiled source is
 not a relay operator changing configuration. Preserve requested versus actual action.
 why_it_matters keeps the role terms and audience of the source sentence it restates.
-Fail actor_and_action if the text calls a list sender or author a Tor Project
-developer without project-sender or official source authority, or substitutes a
-different role (such as relay for directory authority, or operators for software).
+Fail actor_and_action if the text calls a named or identifiable person a developer
+without supplied evidence of code authored by that same person and committed into
+C Tor's codebase. Mailing-list participation, sender domain or authority (including
+project-sender and official), technical fluency, self-description, requesting a merge
+request, and proposed/unmerged code do not establish this role. Another person's
+commit or a contribution to another project is not evidence for it. Repair only the
+unsupported role: use the person's name or a source-stated role such as relay operator,
+preserving the underlying report or request. Also fail when a different role is
+substituted (such as relay for directory authority, or operators for software).
 status: distinguish an issue/request, merged change, observed tag, announced release,
 deployment and resolution. An issue closed or updated is not proof a fix shipped.
 Developer checklists and conditional steps do not prove a patch was merged or shipped.
@@ -383,6 +389,12 @@ Evaluate all nine criteria in order before choosing verdict:
    passage's author field; fail if one commenter's statement is attributed to an adjacent commenter, the issue
    opener or official Tor Project authority. Distinguish official announcements, maintainer ticket actions, merge
    requests, proposals and individual operator/community posts, and never turn code changes into operator config edits.
+   Fail if the new update calls a named or identifiable person a developer without supplied evidence of code
+   authored by that same person and committed into C Tor's codebase. Mailing-list participation, sender domain
+   or authority (including project-sender and official), technical fluency, self-description, requesting a merge
+   request, and proposed/unmerged code do not establish this role. Another person's commit or a contribution
+   to another project is not evidence for it. Repair only the unsupported role in the new update: use the person's
+   name or a source-stated role such as relay operator, preserving the underlying report or request.
 3. status: candidate.state and candidate.updates[-1].text must reflect the lifecycle status AFTER this update.
    - When an issue's upstream_state is "closed" with a fix, commit, release, linked fix MR or completion note
      (such as "Done." or "fixed in ..."), candidate.state MUST advance to "fixed" (for a code/bug/security fix) or

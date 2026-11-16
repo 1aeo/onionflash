@@ -21,7 +21,7 @@ from onionflash.review_gate import ReviewRequests, advance_review, initial_revie
 from onionflash.source_packet import normalize_labels, number_sources
 from onionflash.util import item_cluster
 
-CASE_FILES = ("review_cases.json", "review_cases_judged.json")
+CASE_FILES = ("review_cases.json", "review_cases_judged.json", "review_cases_roles.json")
 SCOPES = ("story", "latest_update")
 STORY_ID = re.compile(r"[0-9a-f]{24}\Z")
 # A judged case names the flaw of its labeled wording or labels; one without a flaw is clean.
