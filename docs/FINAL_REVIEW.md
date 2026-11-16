@@ -27,6 +27,11 @@ already attached to an article. When a draft repeats the release but omits mater
 new response information, the reviewer repairs or holds it instead of skipping the
 source as a duplicate. Announcements whose substantive facts are already covered
 still skip or join the story covering those facts.
+For a new official feed announcement with a release-version hint, passing the
+new-information check prevents routing into an already released story. A later
+verification that disagrees about novelty holds the candidate before it can change
+the target. Duplicate notices can still attach, as can announcements upgrading a
+tag-only story; existing source mappings retain their history.
 
 The application enforces recency for new stories before any model request. An item
 that would start a story is ignored, as `skipped.gate.not_recent`, when its newest
