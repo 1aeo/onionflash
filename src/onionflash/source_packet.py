@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from .comments import analysis_context
-from .util import canonical_url, digest, plain_text, saved_object
+from .util import canonical_url, digest, is_dirauth_item, is_hackerone_item, plain_text, saved_object
 
 
 # The review packet's fixed bounds.
 LIMITS = {"max_sources": 8, "max_source_chars": 24000, "max_passages": 64, "passage_chars": 1800}
 SOURCE_FIELDS = ("id", "source_id", "url", "title", "content", "source_content", "kind", "authority", "product",
-                 "published_at", "updated_at", "labels", "upstream_state", "public_comments")
+                 "published_at", "updated_at", "labels", "upstream_state", "public_comments", "author", "dirauth_notes")
 
 
 def source_fingerprint(item: dict) -> str:
@@ -74,6 +76,7 @@ def _load(db, source_id: str | None, url: str, analysis_key: str | None = None):
     # Stable repository-entry IDs can move to a different immutable commit URL.
     # Keep the retained citation tied to its actual bytes, never the newer entry.
     def snapshot(row):
+        """Decode and verify a historical analysis snapshot matching the requested citation."""
         if row is None:
             return None
         item = _decode(row["source_payload"])
@@ -97,6 +100,7 @@ def _load(db, source_id: str | None, url: str, analysis_key: str | None = None):
 
 
 def normalize_labels(value) -> list[str]:
+    """Normalize at most 30 plain-text GitLab labels without stripping angle-bracket text."""
     if not isinstance(value, list):
         return []
     return [text for label in value[:30] if isinstance(label, str) and (text := plain_text(label, 100, html=False))]
@@ -128,7 +132,17 @@ def _shares(needs, floors, budget):
     return shares
 
 
-def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str | None, *, update: bool = False):
+def build_packet(
+    db,
+    incoming: dict,
+    payload: dict,
+    public: dict,
+    writer_id: str | None,
+    *,
+    update: bool = False,
+    dirauth_users: Iterable[str] | None = None,
+):
+    """Assemble the bounded numbered source packet and durable bindings for final review."""
     missing, bindings, units, truncated = [], {}, [], False
     loaded_cache: dict[tuple[str | None, str, str | None], tuple | None] = {}
     required_ids = {incoming["id"], writer_id}
@@ -178,7 +192,14 @@ def build_packet(db, incoming: dict, payload: dict, public: dict, writer_id: str
                 missing.append(source["url"])
             continue
         unit = {key: item.get(key) for key in ("kind", "authority", "product", "published_at", "updated_at", "upstream_state")}
+        if unit["authority"] == "development":
+            if is_hackerone_item(item):
+                unit["authority"] = "hackerone"
+            elif is_dirauth_item(item, dirauth_users):
+                unit["authority"] = "dirauth-operator"
         unit.update(labels=normalize_labels(item.get("labels")), url=canonical_url(item["url"]), title=item["title"], snapshot=snapshot)
+        if isinstance(item.get("author"), str) and item["author"]:
+            unit["author"] = item["author"]
         if item.get("closed_at"):
             unit["closed_at"] = item["closed_at"]
         if captured:

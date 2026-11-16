@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import calendar
+from collections.abc import Iterable
 import re
 from datetime import datetime, timedelta
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -12,7 +13,7 @@ import feedparser
 
 from .transport import FetchError, HttpClient
 from .util import (
-    UTC, after, canonical_url, format_utc, parse_utc, plain_text, timestamp,
+    UTC, after, canonical_url, format_utc, is_dirauth_item, is_hackerone_item, parse_utc, plain_text, timestamp,
 )
 
 
@@ -24,6 +25,9 @@ LIST_ARCHIVE_HOST = "lists.torproject.org"
 # optionally followed by the display name in parentheses; only that address counts.
 HYPERKITTY_AUTHOR = re.compile(r"[^@\s()＠]+＠[^@\s()＠]+(?: \(.*\))?\Z", re.DOTALL)
 PROJECT_SENDER = re.compile(r"[a-z0-9._+-]+@torproject\.org")
+SENDER_DOMAIN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
+SENDER_ADDRESS = re.compile(rf"[a-z0-9._+-]+@({SENDER_DOMAIN.pattern})")
+_GITLAB_AUTHOR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 
 
 def _hyperkitty_address(author: object) -> str | None:
@@ -32,12 +36,31 @@ def _hyperkitty_address(author: object) -> str | None:
     return author.partition(" (")[0].replace("＠", "@")
 
 
-def _project_sender(author: object) -> bool:
+def _sender_authority(author: object, trusted_domains: list[str] | tuple[str, ...] = ()) -> str | None:
     address = _hyperkitty_address(author)
-    return address is not None and address.isascii() and PROJECT_SENDER.fullmatch(address.lower()) is not None
+    if address is None or not address.isascii():
+        return None
+    match = SENDER_ADDRESS.fullmatch(address.lower())
+    if match is None or len(domain := match.group(1)) > 253 or not SENDER_DOMAIN.fullmatch(domain):
+        return None
+    if domain == "torproject.org":
+        return "project-sender"
+    if domain.endswith(".torproject.org"):
+        return None
+    for raw in trusted_domains:
+        if isinstance(raw, str) and (td := raw.strip().lower()) and td != "torproject.org":
+            if domain == td or domain.endswith("." + td):
+                return "trusted-operator"
+    return None
+
+
+def _project_sender(author: object) -> bool:
+    return _sender_authority(author) == "project-sender"
 
 
 class CollectionError(Exception):
+    """Source collection failure, carrying any partial items or resume watermark."""
+
     def __init__(
         self,
         message: str,
@@ -73,13 +96,15 @@ def make_item(
     *,
     title_html: bool = True,
     observed: str | None = None,
+    author: str = "",
+    dirauth_users: Iterable[str] | None = None,
 ) -> dict:
     """Normalize one collected record and clamp future timestamps to observation time."""
     if observed:
         # A future date (a typo or a scheduled event) must not pin a story to the
         # top or block later corrections. format_utc strings sort chronologically.
         published, updated = min(published, observed), min(updated, observed)
-    return {
+    item = {
         "source_id": source["id"],
         "url": canonical_url(url),
         "title": plain_text(title, 500, html=title_html),
@@ -92,6 +117,15 @@ def make_item(
         "labels": [plain_text(str(x), 100, html=False) for x in (labels or [])[:30]],
         "upstream_state": upstream_state if upstream_state in {"opened", "closed", "merged"} else "",
     }
+    clean_author = plain_text(author, 100, html=False)
+    if clean_author and _GITLAB_AUTHOR_RE.fullmatch(clean_author) and ".." not in clean_author and not clean_author.endswith("."):
+        item["author"] = clean_author
+    if item["authority"] == "development":
+        if is_hackerone_item(item):
+            item["authority"] = "hackerone"
+        elif is_dirauth_item(item, dirauth_users):
+            item["authority"] = "dirauth-operator"
+    return item
 
 
 def fetch_cached(client: HttpClient, url: str, state: dict):
@@ -118,9 +152,11 @@ def _scan_feed_xml(body: bytes) -> list[str | None]:
     state = {"elements": 0, "base_chars": 0, "longest": 0, "item_authors": 0, "plain_author": False}
 
     def reject_declaration(*_args):
+        """Refuse DOCTYPE and XML entity declarations in untrusted feeds."""
         raise CollectionError("Feed contains disallowed XML declarations")
 
     def start_element(name, attributes):
+        """Enforce XML element, nesting, and `xml:base` limits while tracking RSS `<author>`."""
         state["elements"] += 1
         stack.append(name)
         for key, value in attributes.items():
@@ -144,10 +180,12 @@ def _scan_feed_xml(body: bytes) -> list[str | None]:
             state["plain_author"] = False
 
     def char_data(data):
+        """Accumulate bounded character data for a single plain RSS `<author>` element."""
         if stack == ["rss", "channel", "item", "author"] and state["item_authors"] == 1 and sum(map(len, author_buf)) < 1000:
             author_buf.append(data[:1000])
 
     def end_element(_name):
+        """Record each RSS `<item>`'s verified plain `<author>` text on element close."""
         if stack == ["rss", "channel", "item"]:
             text = "".join(author_buf).strip()
             rss_authors.append(text if state["item_authors"] == 1 and state["plain_author"] and len(text) < 1000 else None)
@@ -229,8 +267,10 @@ def _feed(
             continue
         if not item["title"]:
             continue
-        if archive_senders and _project_sender(rss_authors[index]):
-            item["authority"] = "project-sender"
+        if archive_senders and (
+            sender_auth := _sender_authority(rss_authors[index], settings.get("trusted_operator_domains", ()))
+        ) is not None:
+            item["authority"] = sender_auth
         # Some Atom archives omit alternate links and reuse an ID for distinct
         # events. Do not silently choose one event when that fallback is ambiguous.
         has_alternate = any(
@@ -310,6 +350,12 @@ def _gitlab(
                     record.get("merged_at") if source["kind"] == "gitlab_mr" else record.get("created_at"),
                     started,
                 )
+                raw_author = record.get("author")
+                username = (
+                    raw_author.get("username", "")
+                    if isinstance(raw_author, dict) and isinstance(raw_author.get("username"), str)
+                    else ""
+                )
                 item = make_item(
                     source,
                     record["web_url"],
@@ -321,6 +367,8 @@ def _gitlab(
                     record.get("state", ""),
                     title_html=False,
                     observed=started,
+                    author=username,
+                    dirauth_users=settings.get("dirauth_gitlab_users"),
                 )
             except (KeyError, ValueError, TypeError):
                 continue
@@ -351,6 +399,7 @@ def _gitlab(
 def collect_source(
     client: HttpClient, source: dict, state: dict, settings: dict, started: str
 ) -> dict:
+    """Collect items from a source URL or its fallbacks within configured bounds."""
     errors: list[str] = []
     partial: list[dict] = []
     watermark = None

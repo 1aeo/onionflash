@@ -992,3 +992,79 @@ def test_pending_update_rewrites_and_own_comment_cutoff_admits_edited_notes(cont
     res_same = review_gate.process_item(cfg, store, store.pending(1, "2026-11-12T15:05:00Z")[0], Writer(), Reviewer(), "2026-11-12T15:05:00Z")
     assert res_same["status"] == "ignored" and res_same["writer_calls"] == res_same["review_calls"] == 0
     assert review_gate.candidate_mod._source_cutoff(store.db, st_edit, None, issue_a_edited) == "2026-11-12T14:00:00Z"
+
+
+def test_trusted_operator_vs_community_list_incidents_in_gate(context):
+    cfg, store = context
+    list_base = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/"
+
+    chat = pending(store, item(url=list_base + "chat1/", kind="feed", authority="trusted-operator",
+                               content="Routine relay operator question about bandwidth."))
+    assert run(cfg, store, chat, Writer(analysis(confidence="reported", category="relay", tags=["relay"],
+                                                 title="Operator asks about relay bandwidth",
+                                                 summary="An operator asks a routine question about relay bandwidth.",
+                                                 evidence=["Routine relay operator question"])),
+               Reviewer(verdict("skip", criterion="news_value")))["status"] == "ignored"
+    assert codes(store, chat) == ["skipped.review.news_value"]
+
+    trusted_inc = pending(store, item(url=list_base + "trusted1/", kind="feed", authority="trusted-operator",
+                                      content="Large relay family observed sustained SYN flood across exit relays."))
+    trusted_draft = analysis(title="Relay family reports sustained SYN flood on exit relays",
+                             summary="A large relay operator reports a sustained SYN flood across exit relays.",
+                             category="dos", tags=["dos"], confidence="reported", state="developing",
+                             evidence=["Large relay family observed sustained SYN flood"])
+    assert run(cfg, store, trusted_inc, Writer(trusted_draft), Reviewer(verdict(), verdict()))["status"] == "published"
+
+    untrusted_inc = pending(store, item(url=list_base + "comm1/", kind="feed", authority="community",
+                                        content="Single operator claims relays face deanonymization attack."))
+    untrusted_draft = analysis(title="Single operator claims relays face deanonymization attack",
+                               summary="A mailing-list post claims relays face a deanonymization attack.",
+                               category="security", tags=["security"], confidence="reported", state="developing",
+                               evidence=["Single operator claims relays face deanonymization attack."])
+    assert run(cfg, store, untrusted_inc, Writer(untrusted_draft), Reviewer(verdict(), verdict()))["status"] == "held"
+    assert codes(store, untrusted_inc) == ["held.final_check.untrusted_operator_claim"]
+
+    tordev_base = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/"
+    prop_item = pending(store, item(
+        url=tordev_base + "prop375/",
+        kind="feed",
+        authority="community",
+        title="[tor-dev] Proposal 375: Rate-limiting circuit flooding",
+        content="Proposal 375 specifies rate limits to defend against circuit flooding and DoS attacks.",
+    ))
+    prop_draft = analysis(
+        title="Proposal 375: Rate-limiting circuit flooding",
+        summary="Proposal 375 on tor-dev specifies rate limits to defend against circuit flooding and DoS attacks.",
+        category="protocol",
+        tags=["protocol", "dos"],
+        confidence="reported",
+        state="developing",
+        evidence=["Proposal 375 specifies rate limits to defend against circuit flooding"],
+    )
+    assert run(cfg, store, prop_item, Writer(prop_draft), Reviewer(verdict(), verdict()))["status"] == "published"
+
+    prop_disputed = pending(store, item(
+        url=tordev_base + "prop376/",
+        kind="feed",
+        authority="community",
+        title="[tor-dev] Proposal 376: Circuit flood defense parameters",
+        content="Proposal 376 adjusts rate-limiting parameters to mitigate circuit flooding and DoS attacks.",
+    ))
+    prop_disputed_draft = analysis(
+        title="Proposal 376: Circuit flood defense parameters",
+        summary="Proposal 376 on tor-dev adjusts rate-limiting parameters to mitigate circuit flooding and DoS attacks.",
+        category="protocol",
+        tags=["protocol", "dos"],
+        confidence="reported",
+        state="developing",
+        evidence=["Proposal 376 adjusts rate-limiting parameters to mitigate circuit flooding"],
+    )
+    assert run(
+        cfg, store, prop_disputed, Writer(prop_disputed_draft),
+        Reviewer(verdict(), verdict("skip", criterion="news_value")),
+    )["status"] == "held"
+    assert codes(store, prop_disputed) == ["held.verification.disagreed_news"]
+    elig = review_gate.approval(cfg, store, prop_disputed["id"])
+    assert elig["eligible"] is True
+    approved = rejection.approve_item(cfg, store, prop_disputed["id"], elig["hash"], "Publish Tor proposal", observed=LATER)
+    assert approved["status"] == "published"

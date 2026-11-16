@@ -19,7 +19,10 @@ import re
 from . import candidate as candidate_mod, decisions, editorial, review
 from .analyze import cache_key
 from .llm import AnalysisError, CompletionDeferred, RequestObserver
-from .util import _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, now_iso, saved_object, thread_subject
+from .util import (
+    DIRAUTH_GITLAB_USERS, _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, is_dirauth_item,
+    is_hackerone_item, now_iso, saved_object, thread_subject,
+)
 
 REVIEW_STATE_VERSION = 2
 MAX_APPROVALS = 2000  # cached approvals kept besides those unfinished jobs pin
@@ -33,7 +36,7 @@ MAX_VERIFY_REPAIRS = 5
 MAX_REVIEW_REQUESTS = MAX_VERIFY_REPAIRS + 2
 # An item from these sources, other than a version tag, that fails only news value is held for the
 # operator, never skipped.
-OFFICIAL_AUTHORITIES = frozenset({"official", "project-sender"})
+OFFICIAL_AUTHORITIES = frozenset({"official", "project-sender", "hackerone", "dirauth-operator"})
 # Each hold reason and its operator text, which follows "Final review held: " in last_error. A hold
 # is logged as held.<stage>.<reason>, the stage being gate, review, verification or final_check.
 HOLDS = {
@@ -52,11 +55,42 @@ HOLDS = {
     "compromise_headline": "the headline drops the sources' doubt about a compromise",
     "confirmed_source": "confirmed needs an official announcement or a merged merge request",
     "merge_state": "a story told only by merge requests must be marked merged",
+    "shouting_caps": "the candidate contains unnormalized all-caps shouting",
+    "malformed_version": "the candidate cites a nonexistent three-part C-Tor version",
+    "untrusted_operator_claim": "an uncorroborated mailing-list incident claim needs a trusted source",
 }
 
 
 def _json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
+
+
+def _dirauth_users(config, store):
+    if isinstance(config, dict) and "dirauth_gitlab_users" in (config.get("collection") or {}):
+        return config["collection"]["dirauth_gitlab_users"]
+    return getattr(store, "dirauth_users", None)
+
+
+def _dirauth_set(users) -> set[str]:
+    return {
+        u.strip().lower()
+        for u in (DIRAUTH_GITLAB_USERS if users is None else users)
+        if isinstance(u, str) and u.strip()
+    }
+
+
+def _prepare_candidate(store, row, draft, prepared_at, dirauth_users):
+    had_attr = hasattr(store, "dirauth_users")
+    prior_users = getattr(store, "dirauth_users", None)
+    if dirauth_users is not None:
+        store.dirauth_users = tuple(dirauth_users)
+    try:
+        return store.prepare_candidate(row, draft, prepared_at)
+    finally:
+        if had_attr:
+            store.dirauth_users = prior_users
+        elif hasattr(store, "dirauth_users"):
+            delattr(store, "dirauth_users")
 
 
 def _record_input_hash(record: object) -> str | None:
@@ -167,12 +201,20 @@ def _saved_job(store, row, config):
     """Validate saved identity before a mismatch can start a fresh automatic review."""
     from .store import item_hash
 
-    job = store.db.execute("""SELECT writer_key,policy_hash,stage,approval_key,prepared_at,CAST(draft_json AS BLOB) AS draft,
-        CAST(envelope_json AS BLOB) AS envelope,CAST(record_json AS BLOB) AS record FROM review_jobs WHERE item_id=?""",
-        (row["id"],)).fetchone()
+    job = store.db.execute(
+        """SELECT writer_key,policy_hash,stage,approval_key,prepared_at,
+           typeof(draft_json) AS draft_type,CAST(draft_json AS BLOB) AS draft,
+           typeof(envelope_json) AS envelope_type,CAST(envelope_json AS BLOB) AS envelope,
+           typeof(record_json) AS record_type,CAST(record_json AS BLOB) AS record
+           FROM review_jobs WHERE item_id=?""",
+        (row["id"],),
+    ).fetchone()
     if job is None:
         return None, None, None, None, False
-    draft, prepared, record = (saved_object(job[key]) for key in ("draft", "envelope", "record"))
+    draft, prepared, record = (
+        saved_object(job[key]) if job[key + "_type"] == "text" else None
+        for key in ("draft", "envelope", "record")
+    )
     try:
         if (record is None or (draft is None) != (job["draft"] is None)
                 or (prepared is None) != (job["envelope"] is None)):
@@ -472,7 +514,16 @@ def next_step(reviews, candidate, prepared):
     verdict = result["verdict"]
     failed = {name for name, check in result["criteria"].items() if check["outcome"] != "pass"}
     item = json.loads(prepared["row"]["payload"])
-    official = item.get("authority") in OFFICIAL_AUTHORITIES and item.get("kind") != "tag"
+    recent_dev = (
+        developed_at(item) >= after(-NEW_STORY_DAYS * 86400, item["updated_at"])
+        or _security_disclosure(item)
+        or (prepared.get("coverage") or {}).get("prior_story") is not None
+    )
+    official = (
+        item.get("authority") in {"official", "project-sender", "hackerone"}
+        or is_hackerone_item(item)
+        or ((item.get("authority") in OFFICIAL_AUTHORITIES or is_dirauth_item(item, prepared.get("dirauth_users"))) and recent_dev)
+    ) and item.get("kind") != "tag"
     # An official item that fails only news value is the operator's to judge, once a fresh
     # verification has passed its facts; a duplicate still skips.
     disputed = official and failed & review.EDITORIAL_CRITERIA == {"news_value"}
@@ -558,6 +609,7 @@ class ReviewRequests:
         self.state = state
 
     def callback(self, *, correction=False):
+        """Return a `RequestObserver` that reserves and persists review request slots."""
         requests = self
 
         class Counter(RequestObserver):
@@ -622,6 +674,7 @@ def _context(prepared, policy):
 
 
 def pending_proposal(record):
+    """Return the active pending untrusted repair proposal on `record`, if any."""
     return next((proposal for proposal in record.get("untrusted_proposals", [])
                  if proposal["disposition"] == "pending"), None)
 
@@ -1090,6 +1143,7 @@ def _try_auto_merge(config, store, pair: tuple[str, str], *, propagate: bool,
     dup_id, survivor_id = pair
 
     def guard(db) -> None:
+        """Re-verify prepared bindings and merge eligibility inside the merge transaction."""
         if propagate:
             candidate_mod.verify_prepared_binding(db, prepared)
         if _auto_merge_pair(store, dup_id, survivor_id) != pair:
@@ -1144,13 +1198,16 @@ def developed_at(item: dict) -> str:
     dates = [item["published_at"]]
     if item.get("kind") == "gitlab_issue":
         dates += [note["created_at"] for note in item.get("public_comments") or []]
+        dates += [note["created_at"] for note in item.get("dirauth_notes") or []]
         if item.get("upstream_state") == "closed" and item.get("closed_at"):
             dates.append(item["closed_at"])
     return max(dates)
 
 
 def _security_disclosure(item: dict) -> bool:
-    """A high- or critical-severity security issue may become public long after it was filed."""
+    """A HackerOne disclosure or high/critical security issue may become public long after filing."""
+    if is_hackerone_item(item):
+        return True
     if item.get("kind") != "gitlab_issue":
         return False
     labels = {label.strip().casefold() for label in (item.get("labels") or []) if isinstance(label, str)}
@@ -1161,7 +1218,7 @@ def _not_recent(config, store, row, item, observed, *, existing=candidate_mod._U
     """Ignore, before any model call, an item that would start a story from an old development.
 
     An update of an existing story, a locked one included, is left to review, and so is a revision
-    an operator retried or a high- or critical-severity security issue. Like any skip, a new
+    an operator retried, a HackerOne disclosure or a high- or critical-severity security issue. Like any skip, a new
     revision of the item queues it again; an issue whose notes were never verified also gets a
     comment check, so a fresh public note does that.
     """
@@ -1175,6 +1232,7 @@ def _not_recent(config, store, row, item, observed, *, existing=candidate_mod._U
                                 (row["id"], row["content_hash"])).fetchone()):
         return None
     def maybe_check_comments() -> None:
+        """Queue an initial public-comment check before ignoring an unverified GitLab issue."""
         if item.get("kind") == "gitlab_issue" and "comments_source_key" not in item:
             from .comments import request_check
             request_check(store.db, config, row, observed)
@@ -1191,6 +1249,7 @@ def _not_recent(config, store, row, item, observed, *, existing=candidate_mod._U
             except (ValueError, TypeError, KeyError):
                 return "stale"
             if (current_developed >= threshold
+                    or _security_disclosure(current_item)
                     or candidate_mod.existing_story(store.db, current) is not None
                     or store.db.execute("SELECT 1 FROM rejection_actions WHERE item_id=? AND content_hash=? AND action='retry'",
                                         (row["id"], row["content_hash"])).fetchone()):
@@ -1275,11 +1334,22 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             if getattr(writer, "clears", 0):  # writer validation cleared the draft's impact sentence
                 record["writer"]["clears"] = writer.clears  # kept until an operator retry resets the record
             _save(store, row, writer_key, policy, "drafted", draft, None, record, observed, prepared_at=prepared_at)
-        prepared = store.prepare_candidate(row, draft, prepared_at)
-        same = old is not None and job["policy_hash"] == policy and _identity(old) == _identity(prepared)
+        prepared = _prepare_candidate(store, row, draft, prepared_at, _dirauth_users(config, store))
+        same = (
+            old is not None
+            and job["policy_hash"] == policy
+            and _identity(old) == _identity(prepared)
+            and _dirauth_set(old.get("dirauth_users")) == _dirauth_set(prepared.get("dirauth_users"))
+        )
         stage = job["stage"] if same else "review"
+        fresh_prepared = {
+            key: prepared[key]
+            for key in ("mode", "candidate", "packet", "coverage", "candidate_hash", "source_hash", "coverage_hash", "binding_hash")
+        }
+        if "dirauth_users" in prepared:
+            fresh_prepared["dirauth_users"] = prepared["dirauth_users"]
         fresh = {"schema_version": REVIEW_STATE_VERSION, "writer": record["writer"], "input_hash": row["content_hash"], "input_proof": 1, "input_row": row, "reviews": [], "policy_hash": policy, **initial_review_state(),
-                 "prepared": {key: prepared[key] for key in ("mode", "candidate", "packet", "coverage", "candidate_hash", "source_hash", "coverage_hash", "binding_hash")}}
+                 "prepared": fresh_prepared}
         # A coverage change invalidates old reviews, not the request budget of
         # this source revision and policy. Explicit operator retry starts afresh.
         if (job is not None and job["policy_hash"] == policy) or carry is not None:
@@ -1400,6 +1470,7 @@ def _new_coverage(old_coverage, current_coverage) -> list[dict]:
 
 def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
     def refuse(reason: str, editorial_failures=(), new_coverage=()):
+        """Build an ineligible operator-approval check result with structured diagnostics."""
         return {"eligible": False, "reason": reason, "hash": None,
                 "editorial_failures": list(editorial_failures), "new_coverage": list(new_coverage)}, None
 
@@ -1410,8 +1481,10 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
         (item_id,),
     ).fetchone()
     job = store.db.execute(
-        """SELECT writer_key,policy_hash,stage,prepared_at,CAST(draft_json AS BLOB) AS draft,
-           CAST(envelope_json AS BLOB) AS envelope,CAST(record_json AS BLOB) AS record
+        """SELECT writer_key,policy_hash,stage,prepared_at,
+           CASE WHEN typeof(draft_json)='text' THEN CAST(draft_json AS BLOB) END AS draft,
+           CASE WHEN typeof(envelope_json)='text' THEN CAST(envelope_json AS BLOB) END AS envelope,
+           CASE WHEN typeof(record_json)='text' THEN CAST(record_json AS BLOB) END AS record
            FROM review_jobs WHERE item_id=?""", (item_id,),
     ).fetchone()
     if item_row is None or item_row["status"] != "rejected" or job is None or job["stage"] != "held":
@@ -1443,7 +1516,7 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
         "next_attempt_at", "last_error", "story_id", "first_seen", "last_seen", "priority_score")}
     row["payload"] = item_row["payload_blob"].decode("utf-8")
     try:
-        prepared = store.prepare_candidate(row, draft, job["prepared_at"])
+        prepared = _prepare_candidate(store, row, draft, job["prepared_at"], _dirauth_users(config, store))
     except Exception:
         return refuse("Its story or sources changed since the review; retry it", editorial_failures)
     if prepared["locked"]:
@@ -1456,6 +1529,7 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
         return refuse("Final review held: " + HOLDS["missing_sources"], editorial_failures, new_coverage)
     saved_binding = saved_env.get("binding") if isinstance(saved_env.get("binding"), dict) else {}
     if (prepared["story_id"] != saved_env.get("story_id")
+            or _dirauth_set(prepared.get("dirauth_users")) != _dirauth_set(saved_env.get("dirauth_users"))
             or prepared["candidate_hash"] != held_prepared.get("candidate_hash")
             or prepared["candidate_hash"] != saved_env.get("candidate_hash")
             or prepared["source_hash"] != held_prepared.get("source_hash")

@@ -97,9 +97,15 @@ def test_coded_holds_missing_sources_and_locked_updates(context):
     assert decisions.summary(store.db, DATE)["awaiting_operator"]["held_updates"] == [{"story_id": story_id, "held_updates": 1, "locked": True}]
     editorial.unlock(store.db, story_id, reason="Automation resumes.", expect_hash=editorial.show(store.db, story_id)["hash"],
                      observed="2026-11-10T14:00:00Z")
+    assert editorial.show(store.db, story_id)["held_updates"] == 0
+    assert decisions.summary(store.db, DATE)["awaiting_operator"]["held_updates"] == []
+    [requeued] = [r for r in store.pending(10, "2026-11-10T14:00:00Z") if r["id"] == orig_u["id"]]
+    assert run(cfg, store, requeued, Writer(), Reviewer(verdict("skip", criterion="news_value")))["status"] == "ignored"
+    assert editorial.show(store.db, story_id)["held_updates"] == 0
+    assert decisions.summary(store.db, DATE)["awaiting_operator"]["held_updates"] == []
     minor = {**later, "content": later["content"] + " A minor note.", "updated_at": "2026-11-10T14:30:00Z"}
     assert run(cfg, store, pending(store, minor), Writer(), Reviewer(verdict("skip", criterion="news_value")))["status"] == "ignored"
-    assert decisions.summary(store.db, DATE)["awaiting_operator"]["held_updates"] == [{"story_id": story_id, "held_updates": 1, "locked": False}]
+    assert decisions.summary(store.db, DATE)["awaiting_operator"]["held_updates"] == []
     final = {**minor, "content": minor["content"] + " A final report.", "updated_at": "2026-11-10T15:00:00Z"}
     assert run(cfg, store, pending(store, final), Writer(), Reviewer(verdict()))["status"] == "published"
     assert decisions.summary(store.db, DATE)["awaiting_operator"]["held_updates"] == []
@@ -116,7 +122,16 @@ def test_a_hold_the_log_never_saw_waits_until_an_update_publishes(context):
     assert decisions.summary(store.db, DATE)["awaiting_operator"]["held_updates"] == [{"story_id": story_id, "held_updates": 1, "locked": True}]
     editorial.unlock(store.db, story_id, reason="Automation resumes.", expect_hash=editorial.show(store.db, story_id)["hash"],
                      observed="2026-11-10T14:00:00Z")
-    revision = {**original, "content": original["content"] + " A later report.", "updated_at": "2026-11-10T15:00:00Z"}
+    assert editorial.show(store.db, story_id)["held_updates"] == 0
+    assert decisions.summary(store.db, DATE)["awaiting_operator"]["held_updates"] == []
+    # Simulate an unlocked row left with held_updates>0 before unlock reset the counter.
+    with store.db:
+        editorial.record_held(store.db, story_id)
+    assert decisions.summary(store.db, DATE)["awaiting_operator"]["held_updates"] == [{"story_id": story_id, "held_updates": 1, "locked": False}]
+    minor = {**original, "content": original["content"] + " A minor note.", "updated_at": "2026-11-10T14:30:00Z"}
+    assert run(cfg, store, pending(store, minor), Writer(), Reviewer(verdict("skip", criterion="news_value")))["status"] == "ignored"
+    assert decisions.summary(store.db, DATE)["awaiting_operator"]["held_updates"] == [{"story_id": story_id, "held_updates": 1, "locked": False}]
+    revision = {**minor, "content": minor["content"] + " A later report.", "updated_at": "2026-11-10T15:00:00Z"}
     assert run(cfg, store, pending(store, revision), Writer(), Reviewer(verdict()))["status"] == "published"
     assert decisions.summary(store.db, DATE)["awaiting_operator"]["held_updates"] == []
 

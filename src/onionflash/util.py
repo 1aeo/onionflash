@@ -7,6 +7,7 @@ import ipaddress
 import json
 import math
 import re
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -15,6 +16,7 @@ UTC = timezone.utc
 
 
 def now_iso() -> str:
+    """Return the current UTC timestamp formatted as a second-precision `Z` string."""
     return format_utc(datetime.now(UTC))
 
 
@@ -32,12 +34,14 @@ def parse_utc(value: str) -> datetime:
 
 
 def format_utc(moment: datetime) -> str:
+    """Format an aware datetime as a second-precision UTC ISO-8601 `Z` string."""
     if moment.tzinfo is None:
         raise ValueError("Missing or invalid timezone-aware timestamp")
     return moment.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def after(seconds: float, start: str | None = None) -> str:
+    """Return the UTC timestamp `seconds` after `start`, or after now when omitted."""
     return format_utc(parse_utc(start or now_iso()) + timedelta(seconds=seconds))
 
 
@@ -91,10 +95,12 @@ def _within(value, depth: int, allow_surrogates: bool = False) -> bool:
 
 
 def canonical_json(value: object, *, sort_keys: bool = True) -> str:
+    """Serialize `value` to deterministic UTF-8 JSON without NaN or Inf constants."""
     return json.dumps(value, ensure_ascii=False, sort_keys=sort_keys, separators=(",", ":"), allow_nan=False)
 
 
 def digest(value: object) -> str:
+    """Return the hex SHA-256 digest of `canonical_json(value)`."""
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
@@ -113,18 +119,21 @@ class _TextParser(HTMLParser):
         self.hidden = 0
 
     def handle_starttag(self, tag: str, attrs: list) -> None:
+        """Track hidden markup blocks and emit line breaks around block elements."""
         if tag in {"script", "style", "noscript", "template"}:
             self.hidden += 1
         elif tag in {"p", "br", "div", "li", "h1", "h2", "h3", "pre"}:
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
+        """Exit hidden markup blocks and close block-level paragraphs."""
         if tag in {"script", "style", "noscript", "template"}:
             self.hidden = max(0, self.hidden - 1)
         elif tag in {"p", "div", "li", "pre"}:
             self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
+        """Collect visible character data outside hidden script or style tags."""
         if not self.hidden:
             self.parts.append(data)
 
@@ -229,6 +238,97 @@ def item_identity(item: dict) -> str:
     return "timeline:" + item["source_entry_id"] if item.get("kind") == "metrics_timeline" else item["url"]
 
 
+_HACKERONE_REPORT_RE = re.compile(
+    r"https?://(?:www\.)?hackerone\.com/reports/\d+\b|\breported\s+via\s+\[?hackerone\b",
+    re.IGNORECASE,
+)
+
+
+def is_hackerone_item(item: dict) -> bool:
+    """Return whether `item` is an authoritative HackerOne disclosure or GitLab report."""
+    if not isinstance(item, dict):
+        return False
+    if item.get("authority") == "hackerone":
+        return True
+    raw_url = item.get("url", "")
+    if isinstance(raw_url, str) and raw_url:
+        host = (urlsplit(raw_url).hostname or "").lower().rstrip(".")
+        if host == "hackerone.com" or host.endswith(".hackerone.com"):
+            return True
+    if item.get("authority") != "community" and item.get("kind") in {"gitlab_issue", "gitlab_mr"}:
+        labels = item.get("labels") or ()
+        if isinstance(labels, (list, tuple, set, frozenset)):
+            for label in labels:
+                if isinstance(label, str):
+                    folded = label.strip().casefold()
+                    if folded == "hackerone" or folded.startswith("hackerone::"):
+                        return True
+        title = item.get("title", "") if isinstance(item.get("title"), str) else ""
+        body = (
+            item["source_content"]
+            if isinstance(item.get("source_content"), str)
+            else (item.get("content", "") if isinstance(item.get("content"), str) else "")
+        )
+        if _HACKERONE_REPORT_RE.search(f"{title}\n{body}"):
+            return True
+    return False
+
+
+DIRAUTH_GITLAB_USERS = (
+    "andreas",    # dannenberg
+    "arma",       # moria1
+    "gman999",    # Serge (bridge authority)
+    "linus",      # maatuska
+    "micah",      # longclaw
+    "sebastian",  # gabelmoo
+    "sina",       # faravahar
+    "stefani",    # bastet / sekhmet
+    "usura",      # dizum
+    "weasel",     # tor26
+)
+_DIRAUTH_LABELS = frozenset({"directory authority (dirauth)", "dirauth"})
+
+
+def is_dirauth_item(item: dict, dirauth_users: Iterable[str] | None = None) -> bool:
+    """Return whether `item` is a Tor GitLab ticket or MR from or with a directory-authority operator."""
+    if not isinstance(item, dict):
+        return False
+    if item.get("authority") == "dirauth-operator":
+        return True
+    if item.get("authority") == "community" or item.get("kind") not in {"gitlab_issue", "gitlab_mr"}:
+        return False
+    raw_url = item.get("url")
+    if not isinstance(raw_url, str) or not raw_url:
+        return False
+    try:
+        host = (urlsplit(raw_url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    if host != "gitlab.torproject.org":
+        return False
+    labels = item.get("labels") or ()
+    if isinstance(labels, (list, tuple, set, frozenset)):
+        for label in labels:
+            if isinstance(label, str) and label.strip().casefold() in _DIRAUTH_LABELS:
+                return True
+    users = {
+        u.strip().lower()
+        for u in (DIRAUTH_GITLAB_USERS if dirauth_users is None else dirauth_users)
+        if isinstance(u, str) and u.strip()
+    }
+    author = item.get("author")
+    if isinstance(author, str) and author.strip().lower() in users:
+        return True
+    for field in ("public_comments", "dirauth_notes"):
+        notes = item.get(field)
+        if isinstance(notes, list) and any(
+            isinstance(note, dict) and isinstance(note.get("author"), str) and note["author"].strip().lower() in users
+            for note in notes
+        ):
+            return True
+    return False
+
+
 _PRODUCT_NAMES = {"tor-browser": r"tor[- ]browser", "arti": "arti", "tor": "tor"}
 _VERSION = re.compile(r"\d+\.\d+(?:\.\d+){0,2}(?:[-.]?(?:alpha|beta|rc|a)\.?\d*)?")
 _RELEASE_QUALIFIERS = r"(?:(?:new|stable|alpha|beta|security|bugfix|release|version)\s+)*"
@@ -292,6 +392,7 @@ def gitlab_refs(item: dict) -> tuple[list[str], list[str]]:
     own_project = own_match.group(2) if own_match else None
 
     def normalize_ref(token: str) -> str | None:
+        """Resolve one full or shorthand GitLab issue or merge-request token."""
         if token.startswith("https://"):
             match = _GITLAB_URL_REF.match(token.rstrip(".,;:!?)>]").split("#", 1)[0].split("?", 1)[0])
             if not match:

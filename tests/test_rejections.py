@@ -33,7 +33,7 @@ def actions(store):
     return [dict(row) for row in store.db.execute("SELECT * FROM rejection_actions ORDER BY action_id")]
 
 
-@pytest.mark.parametrize("kind", DAMAGE)
+@pytest.mark.parametrize("kind", [*DAMAGE, "blob"])
 def test_a_damaged_saved_item_stays_listable_and_inspectable(store, kind):
     _, row = seed_rejected(store, 0)
     _, intact = seed_rejected(store, 1)
@@ -454,3 +454,58 @@ def test_show_prints_a_skip_that_repeats_the_first_decision_after_a_hold(store):
     rejection.retry_item(store, row["id"], row["content_hash"], "Retry the held item", DATE)
     reviewed_skip(store)
     assert rejection.show_item(store, row["id"])["final_review"]["latest_review"]["verdict"] == "skip"
+
+
+@pytest.mark.parametrize("record_damage", [
+    b"\x80",
+    b'{"prepared":1}',
+    '{"x":"\\ud800"}',
+    "{" + '"a":' * 70 + "1" + "}" * 70,
+    '{"prepared": [], "reviews": "bad"}',
+    '{"prepared": {}, "reviews": {}}',
+    '{"prepared": {}, "reviews": [], "approval": {"reviews": {}}}',
+    '{"prepared": {}, "reviews": [], "approval": "bad"}',
+])
+def test_rejected_controls_and_cli_handle_blobs_surrogates_deep_json_and_damaged_records(tmp_path, capsys, record_damage):
+    from onionflash import cli
+    from onionflash.store import Store
+
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        '[storage]\ndatabase = "state.db"\noutput_dir = "public"\n'
+        '[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n'
+    )
+    with Store(tmp_path / "state.db") as store:
+        _, row = seed_rejected(store, 0)
+        store.db.execute("UPDATE items SET payload=X'80' WHERE id=?", (row["id"],))
+        store.db.execute(
+            "INSERT INTO review_jobs(item_id,writer_key,policy_hash,stage,prepared_at,record_json,updated_at) VALUES(?,?,?,?,?,?,?)",
+            (row["id"], "wk", "ph", "held", DATE, record_damage, DATE),
+        )
+        store.db.commit()
+
+        shown = rejection.show_item(store, row["id"], DEFAULTS)
+        assert shown["saved_item"] is None
+        assert shown["final_review"]["error"] == "Saved review record cannot be read"
+        assert shown["final_review"]["approval"]["eligible"] is False
+        with pytest.raises(ValueError, match="incomplete or unreadable"):
+            rejection.retry_item(store, row["id"], row["content_hash"], "cannot retry raw blob", DATE)
+
+    capsys.readouterr()
+    assert cli.main(["rejected", "list", "--config", str(cfg_path)]) == 0
+    listed_out = json.loads(capsys.readouterr().out)
+    assert listed_out["items"][0]["id"] == row["id"] and listed_out["items"][0]["title"] is None
+
+    assert cli.main(["rejected", "show", "--item", row["id"], "--config", str(cfg_path)]) == 0
+    shown_out = json.loads(capsys.readouterr().out)
+    assert shown_out["saved_item"] is None and shown_out["final_review"]["error"] == "Saved review record cannot be read"
+
+    with Store(tmp_path / "state.db") as store:
+        assert rejection.dismiss_item(store, row["id"], row["content_hash"], "dismiss raw blob", DATE)["status"] == "dismissed"
+
+        _, bad_comments_row = seed_rejected(store, 1)
+        bad_payload = json.dumps({**json.loads(bad_comments_row["payload"]), "public_comments": [{"author": "op"}]})
+        store.db.execute("UPDATE items SET payload=? WHERE id=?", (bad_payload, bad_comments_row["id"]))
+        store.db.commit()
+        with pytest.raises(ValueError, match="incomplete or unreadable"):
+            rejection.retry_item(store, bad_comments_row["id"], bad_comments_row["content_hash"], "bad comments", DATE)

@@ -12,7 +12,22 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from .schema import PRODUCTS
-from .util import canonical_url
+from .util import DIRAUTH_GITLAB_USERS, canonical_url
+
+DEFAULT_TRUSTED_OPERATOR_DOMAINS = [
+    "1aeo.com",
+    "applied-privacy.net",
+    "appliedprivacy.net",
+    "artikel10.org",
+    "dfri.se",
+    "nothingtohide.nl",
+    "prsv.ch",
+    "quintex.com",
+    "unredacted.org",
+]
+DEFAULT_DIRAUTH_GITLAB_USERS = list(DIRAUTH_GITLAB_USERS)
+_DOMAIN_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
+_GITLAB_USER_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,99}")
 
 DEFAULTS = {
     "site": {
@@ -40,6 +55,8 @@ DEFAULTS = {
         "run_budget_seconds": 240,
         "source_budget_seconds": 60,
         "analysis_reserve_fraction": 0.5,
+        "trusted_operator_domains": DEFAULT_TRUSTED_OPERATOR_DOMAINS,
+        "dirauth_gitlab_users": DEFAULT_DIRAUTH_GITLAB_USERS,
     },
     "http": {
         "timeout_seconds": 30,
@@ -87,7 +104,7 @@ BOUNDS = {
 }
 
 OPERATOR_SETTINGS = {
-    "collection": set(),
+    "collection": {"trusted_operator_domains", "dirauth_gitlab_users"},
     "http": set(),
     "llm": {
         "base_url", "fallback_base_urls", "model", "allowed_networks",
@@ -97,6 +114,7 @@ OPERATOR_SETTINGS = {
 }
 
 SECTION_SPECS = {
+    "collection": {"lists": ("trusted_operator_domains", "dirauth_gitlab_users")},
     "comments": {"bools": ("enabled",)},
     "site": {
         "ints": {"page_size": BOUNDS["page_size"]},
@@ -144,6 +162,7 @@ def _expand(value: str) -> str:
         raise ValueError("Configuration value must be a string")
 
     def sub(match: re.Match) -> str:
+        """Resolve a `${NAME}` placeholder from the current process environment."""
         name = match.group(1)
         if name not in os.environ:
             raise ValueError(f"Required environment variable {name} is missing")
@@ -216,6 +235,41 @@ def load_config(path: str | Path) -> dict:
             if not isinstance(table[key], list):
                 raise ValueError(f"{section}.{key} must be an array")
 
+    raw_domains = config["collection"]["trusted_operator_domains"]
+    if len(raw_domains) > 500:
+        raise ValueError("Each trusted_operator_domains entry must be a valid domain name (at most 500 entries)")
+    trusted_domains: list[str] = []
+    for entry in raw_domains:
+        if not isinstance(entry, str):
+            raise ValueError("Each trusted_operator_domains entry must be a valid domain name")
+        domain = entry.strip().lower()
+        if not domain or len(domain) > 253 or not domain.isascii() or not _DOMAIN_RE.fullmatch(domain):
+            raise ValueError("Each trusted_operator_domains entry must be a valid domain name")
+        if domain != "torproject.org" and domain not in trusted_domains:
+            trusted_domains.append(domain)
+    config["collection"]["trusted_operator_domains"] = trusted_domains
+
+    raw_users = config["collection"]["dirauth_gitlab_users"]
+    if len(raw_users) > 200:
+        raise ValueError("Each dirauth_gitlab_users entry must be a valid GitLab username")
+    dirauth_users: list[str] = []
+    for entry in raw_users:
+        if not isinstance(entry, str):
+            raise ValueError("Each dirauth_gitlab_users entry must be a valid GitLab username")
+        user = entry.strip().lower()
+        if (
+            not user
+            or len(user) > 100
+            or not user.isascii()
+            or ".." in user
+            or user.endswith(".")
+            or not _GITLAB_USER_RE.fullmatch(user)
+        ):
+            raise ValueError("Each dirauth_gitlab_users entry must be a valid GitLab username")
+        if user not in dirauth_users:
+            dirauth_users.append(user)
+    config["collection"]["dirauth_gitlab_users"] = dirauth_users
+
     config["site"]["base_url"] = _clean_endpoint_url(
         _expand(config["site"]["base_url"]),
         allow_http=True,
@@ -282,7 +336,7 @@ def load_config(path: str | Path) -> dict:
                 raise ValueError("Consensus alert sources require kind = 'feed'")
         if source["kind"] not in {"feed", "tag", "gitlab_issue", "gitlab_mr", "metrics_timeline"}:
             raise ValueError("Unsupported source kind")
-        if source["authority"] not in {"official", "community", "development", "telemetry"}:
+        if source["authority"] not in {"official", "community", "development", "telemetry", "hackerone"}:
             raise ValueError("Unsupported source authority")
         if source["product"] not in PRODUCTS:
             raise ValueError("Unsupported source product")

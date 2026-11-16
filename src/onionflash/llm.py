@@ -4,14 +4,55 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 
 from .config import completion_budget_seconds
 from .schema import CATEGORIES, CONFIDENCES, STATES
 from .transport import DeadlineReached, FetchError, HttpClient
 
+_ACRONYM_ALLOWLIST = frozenset({
+    "TOR", "ARTI", "TCP", "UDP", "TLS", "SSL", "DNS", "HTTP", "HTTPS", "SOCKS", "SOCKS4",
+    "SOCKS5", "CPU", "RAM", "POW", "DOS", "DDOS", "HSDIR", "HSDIRS", "IPV4", "IPV6", "OR",
+    "ORPORT", "DIRPORT", "DIRAUTH", "AROI", "RFC", "IETF", "CVE", "TROVE", "API", "CLI",
+    "GUI", "VPN", "NAT", "ASN", "BGP", "BSD", "GNU", "SSH", "GPG", "PGP", "RSA", "SHA",
+    "AES", "KDF", "KEM", "CIRC", "SYN", "ACK", "RST", "FIN", "SNI", "ALPN", "QUIC",
+    "JSON", "TOML", "YAML", "HTML", "XML", "RSS", "REST", "SQL", "URL", "URI", "UUID",
+    "GID", "OID", "MAC", "HMAC", "AEAD", "NTOR", "CONFLUX", "VANGUARDS", "EXIT", "GUARD",
+    "PF", "NAT64", "ICMP", "OS", "IO", "CI", "MR", "PR", "ID", "IP", "AS", "UTC", "GMT",
+    "EOF", "OOM", "PID", "UID", "FD", "FIFO", "LRU", "TTL", "MTU", "MSS", "RTT", "BPS",
+    "KB", "MB", "GB", "TB", "KIB", "MIB", "GIB",
+})
+_UPPER_WORD = r"(?:[A-Z][A-Z0-9]*'[A-Z]+|[A-Z]{2,}[0-9]*)"
+_UPPER_WORD_RE = re.compile(rf"(?<![A-Za-z0-9_]){_UPPER_WORD}(?![A-Za-z0-9_])")
+_SHOUT_RUN_RE = re.compile(
+    rf"(?<![A-Za-z0-9_]){_UPPER_WORD}"
+    rf"(?:[\s&/+|-]+(?:[A-Z](?![A-Za-z0-9_])[\s&/+|-]+)*{_UPPER_WORD}){{2,}}(?![A-Za-z0-9_])"
+)
+_MALFORMED_TOR_VERSION_RE = re.compile(
+    r"(?:"
+    r"(?:tor\s+(?:v|version\s+|release\s+|stable\s+|alpha\s+)?|(?:post|pre|since|after|before|to|from|running|on)[- ])"
+    r"v?0\.[34]\.[1-9][0-9]\b(?!\.\d)"
+    r"|"
+    r"(?<![\w.])v?0\.[34]\.[1-9][0-9](?!\.\d)\s+(?:upgrade|upgrades|release|releases|relay|relays|branch|build|daemon)\b"
+    r")",
+    re.IGNORECASE,
+)
+_SIC_PREFIX_RE = re.compile(
+    r"\b(?:written(?:\s+literally)?\s+as|spelled\s+as|quoted\s+as|misspelled(?:\s+as)?|"
+    r"(?:version\s+)?typo(?:\s+(?:for|of|in)|\s*[:,])?)\s+[\"'“‘`]?(?:(?:c[-\s]?)?tor\s+v?)?$",
+    re.IGNORECASE,
+)
+_SIC_SUFFIX_RE = re.compile(
+    r"^\s*[\"'”’`]?(?:\s+(?:release|upgrade|version))?\s*"
+    r"(?:\[\s*sic\s*\]|\(\s*sic\s*\)|,\s*sic\b|typo\b|\([^()\n]{0,35}\b(?:sic|typo)\b[^()\n]{0,35}\))",
+    re.IGNORECASE,
+)
+
 
 class AnalysisError(Exception):
+    """Non-publishing writer or review error with retryability and decision code."""
+
     code = "writer.invalid_output"  # logged as failed.<code> when it is the item's third failure
 
     def __init__(self, message: str, retryable: bool = False, *, code: str | None = None):
@@ -32,9 +73,11 @@ class RequestObserver:
         raise NotImplementedError
 
     def response_received(self) -> None:
+        """Record that an HTTP response arrived before parsing completion output."""
         pass
 
     def transport_failed(self) -> None:
+        """Record that transport failed before an HTTP completion response arrived."""
         pass
 
 
@@ -43,8 +86,31 @@ def has_invalid_text_chars(value: str) -> bool:
     return any((ord(c) < 32 and c not in "\n\t") or c in "\ufffe\uffff" for c in value)
 
 
+def has_shouting_caps(text: str) -> bool:
+    """Return whether text contains a 3+ word ALL-CAPS run beyond technical acronyms."""
+    for match in _SHOUT_RUN_RE.finditer(text):
+        words = _UPPER_WORD_RE.findall(match.group(0))
+        if len(words) >= 3 and sum(1 for word in words if word not in _ACRONYM_ALLOWLIST) >= 2:
+            return True
+    return False
+
+
+def _is_sic_annotated(text: str, match: re.Match[str]) -> bool:
+    prefix = text[max(0, match.start() - 48) : match.start()]
+    suffix = text[match.end() : match.end() + 80]
+    return bool(_SIC_PREFIX_RE.search(prefix) or _SIC_SUFFIX_RE.search(suffix))
+
+
+def has_malformed_tor_version(text: str, products: list[str] | tuple[str, ...] = ()) -> bool:
+    """Return whether text cites a nonexistent three-part C-Tor version such as 0.4.17."""
+    if products and "tor" not in products and "network" not in products:
+        return False
+    return any(not _is_sic_annotated(text, match) for match in _MALFORMED_TOR_VERSION_RE.finditer(text))
+
+
 def validate_text(value: object, maximum: int, *, empty: bool = False,
                   error: type[Exception] = AnalysisError, message: str = "Invalid model text") -> str:
+    """Strip and bound model text while rejecting control or noncharacter code points."""
     if not isinstance(value, str) or len(value) > maximum or has_invalid_text_chars(value):
         raise error(message)
     stripped = value.strip()
@@ -54,11 +120,13 @@ def validate_text(value: object, maximum: int, *, empty: bool = False,
 
 
 def is_complete_sentence(text: str) -> bool:
+    """Return whether stripped text contains alphanumeric content and terminal punctuation."""
     stripped = text.strip()
     return bool(stripped) and stripped[-1] in '.!?"\')”’' and any(c.isalnum() for c in stripped)
 
 
 def tag_name(item: dict) -> str:
+    """Extract and bound a non-empty tag title for deterministic tag notices."""
     name = item["title"].strip()
     if not name or len(name) > 500:
         raise AnalysisError("Invalid tag name", code="app.invalid_tag_name")
@@ -66,6 +134,7 @@ def tag_name(item: dict) -> str:
 
 
 def strip_unreleased_tag(story: dict) -> None:
+    """Remove a redundant release tag when a draft is neither a release nor tagged/released."""
     if (story.get("category") != "release" and story.get("state") not in {"released", "tagged"}
             and "release" in (story.get("tags") or ())):
         story["tags"] = [tag for tag in story["tags"] if tag != "release"]
@@ -91,6 +160,7 @@ def label_limits(sources: list[dict]) -> dict:
 
 
 def apply_label_limits(properties: dict, limits: dict, *, nullable: bool = False) -> None:
+    """Restrict schema enum choices in place to the labels allowed by source limits."""
     def rule(field: str) -> dict:
         return properties[field]["anyOf"][0] if nullable else properties[field]
 
@@ -102,12 +172,14 @@ def apply_label_limits(properties: dict, limits: dict, *, nullable: bool = False
 
 
 def repair_schema(fields: dict, required: tuple[str, ...]) -> dict:
+    """Build a strict nullable JSON schema for minimal semantic review repairs."""
     return {"anyOf": [{"type": "null"}, {"type": "object", "additionalProperties": False,
         "properties": {key: {"anyOf": [rule, {"type": "null"}]} for key, rule in fields.items()},
         "required": list(required)}]}
 
 
 def json_object(text: str, code: str = "writer.invalid_json") -> dict:
+    """Parse a strict UTF-8 JSON object without duplicate keys, surrogates or NaNs."""
     def unique(pairs):
         result = {}
         for key, value in pairs:
@@ -141,6 +213,8 @@ def generation_options(settings: dict) -> dict:
 
 
 class CompletionClient:
+    """Shared chat-completion HTTP client with endpoint failover and schema enforcement."""
+
     stage = "writer"
     REQUEST_POLICY = {"transport": {"retry_attempts": 1, "max_redirects": 0},
                       "deadline_refund": "before_dispatch_only",
@@ -161,6 +235,7 @@ class CompletionClient:
         }
         self.client: HttpClient | None = None
         self.calls = 0  # requests sent, for the run report
+        self.dirauth_users = (config.get("collection") or {}).get("dirauth_gitlab_users")
 
     def __enter__(self) -> CompletionClient:
         return self
@@ -169,6 +244,7 @@ class CompletionClient:
         self.close()
 
     def close(self) -> None:
+        """Close the underlying HTTP client if one was opened."""
         if self.client is not None:
             self.client.close()
 

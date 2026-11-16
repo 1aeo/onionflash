@@ -85,6 +85,9 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `held.final_check.compromise_headline` | The headline drops the sources' doubt about a compromise. |
 | `held.final_check.confirmed_source` | The story is confirmed without an official announcement or a merged merge request. |
 | `held.final_check.merge_state` | A story told only by merge requests is not marked merged. |
+| `held.final_check.shouting_caps` | The story or update contains unnormalized all-caps shouting. |
+| `held.final_check.malformed_version` | The story or update cites a nonexistent three-part C-Tor version number. |
+| `held.final_check.untrusted_operator_claim` | A new story reports an operational attack, compromise or vulnerability claim solely from an untrusted mailing-list post. |
 | `failed.writer.invalid_output` | The writer's draft did not match its schema. |
 | `failed.writer.evidence_too_short` | A draft evidence quote was too short. |
 | `failed.writer.evidence_not_exact` | A draft evidence quote was not an exact excerpt of the source. |
@@ -110,9 +113,10 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `operator.merged` | An operator merged a published duplicate story into a survivor story. |
 
 A held update of a locked story leaves the item `published`: it maps to that
-story and the story's held-update count grows. Unlocking the story re-queues
-items whose latest decision is `held.gate.story_locked` at their current
-revision; the summary lists the story under `awaiting_operator` until an update
+story and the story's held-update count grows. Unlocking the story resets its
+held-update count and re-queues items whose latest decision is
+`held.gate.story_locked` at their current revision; the summary lists a story
+with held updates under `awaiting_operator` until it is unlocked or an update
 of it is published after its latest hold.
 
 ## Commands
@@ -135,7 +139,7 @@ a timestamp with a time zone.
 - `awaiting_operator`: the number of rejected items, the 20 whose latest decision
   is oldest (with that decision's code; items rejected before the log existed
   come first), and the stories whose held updates still wait, each with its
-  lifetime held-update count, as `story show` reports it;
+  current held-update count, as `story show` reports it;
 - `retrying`: pending items that failed and will be retried;
 - `story_actions`: editorial actions on published stories, by action;
 - `feed`: the size of `feed.xml`, as recorded by the last build, against the

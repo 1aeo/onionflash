@@ -41,6 +41,7 @@ def _unexpected_error(exc: BaseException) -> str:
 
 @contextlib.contextmanager
 def run_lock(database: str):
+    """Acquire a non-blocking exclusive advisory file lock adjacent to `database`."""
     path = Path(database + ".lock")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
@@ -160,9 +161,10 @@ def run(config: dict, store: Store) -> dict:
             network_ingested["reports_new"] += added
             network_ingested["rejected"] += rejected
             return received
+        dirauth_users = config["collection"].get("dirauth_gitlab_users")
         if comments_enabled:
-            items = (merge_cached_comments(store, item, source, received) for item in items)
-        report["items_changed"] += sum(store.ingest(item, received) for item in items)
+            items = (merge_cached_comments(store, item, source, received, dirauth_users=dirauth_users) for item in items)
+        report["items_changed"] += sum(store.ingest(item, received, dirauth_users=dirauth_users) for item in items)
         return received
 
     with HttpClient(config["http"]) as client:
@@ -293,6 +295,7 @@ def _status_report(config: dict, store: Store) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse CLI arguments and dispatch `run`, `build`, `check`, `status`, or operator actions."""
     parser = argparse.ArgumentParser(description="Collect, analyze, and build the Onion Flash static news feed.")
     parser.add_argument("--version", action="version", version=__version__)
     cfg_parent = argparse.ArgumentParser(add_help=False)
@@ -323,9 +326,10 @@ def main(argv: list[str] | None = None) -> int:
             }))
             return 0
         database = config["storage"]["database"]
+        dirauth_users = config["collection"]["dirauth_gitlab_users"]
         operator = args.command in OPERATOR_ACTIONS
         if args.command == "status" or (operator and args.action in READ_ONLY_ACTIONS):
-            with Store(database) as store:
+            with Store(database, dirauth_users=dirauth_users) as store:
                 payload = _status_report(config, store) if args.command == "status" else _operator_command(args, store, config)
             print(json.dumps(payload, ensure_ascii=operator))
             return 0
@@ -333,7 +337,7 @@ def main(argv: list[str] | None = None) -> int:
             if not acquired:
                 print(json.dumps({"status": "already-running"}))
                 return 0 if args.command == "run" else 75
-            with Store(database) as store:
+            with Store(database, dirauth_users=dirauth_users) as store:
                 if operator:
                     result = _operator_command(args, store, config)
                 elif args.command == "run":

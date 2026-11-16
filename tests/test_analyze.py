@@ -18,7 +18,7 @@ from onionflash.analyze import (
 )
 from onionflash.comments import INPUT_CHARS
 from onionflash.config import DEFAULTS
-from onionflash.llm import json_object
+from onionflash.llm import has_malformed_tor_version, has_shouting_caps, json_object
 from onionflash.schema import CATEGORIES, CONFIDENCES, STATES
 from onionflash.store import Store
 from onionflash.transport import DeadlineReached, FetchError, Response
@@ -465,3 +465,64 @@ def test_update_mode_sends_prior_context_narrows_schema_and_validates(monkeypatc
     assert base_key != cache_key(row, DEFAULTS["llm"])
     assert base_key != cache_key(row, DEFAULTS["llm"], {**prior, "state": "tagged"})
     assert base_key != cache_key(row, DEFAULTS["llm"], {**prior, "updates": prior["updates"][:-1]})
+
+
+def test_shouting_caps_and_malformed_tor_version_helpers_and_validation(monkeypatch):
+    for clean in (
+        "TCP SYN flood on relays", "HTTP CONNECT proxy", "CVE-2026-1234",
+        "BSD PF firewall", "TLS SNI ALPN", "IPV4 IPV6 NAT64", "HSDir and DoS on macOS",
+        "CELL_STATS_EXTEND counter",
+    ):
+        assert not has_shouting_caps(clean)
+    for shouted in (
+        "AT RISK FOR DEANONYMIZATION AND CONNECTION TRACKING",
+        "ROOT CAUSE & BULLETPROOF FIX",
+        "DO NOT UPGRADE NOW",
+        "THIS IS A CRITICAL WARNING",
+    ):
+        assert has_shouting_caps(shouted)
+
+    for bad_ver in (
+        "Tor 0.4.17 relays", "post-0.4.17 upgrade", "0.4.15 relays",
+        "upgrading to v0.4.17", "basic Tor 0.4.17 daemon",
+        "Tor 0.4.17 release notes were written today.",
+        "The post written yesterday cites Tor 0.4.17.",
+        "A sic transit provider upgraded to Tor 0.4.17.",
+    ):
+        assert has_malformed_tor_version(bad_ver)
+        assert has_malformed_tor_version(bad_ver, ["tor"])
+        assert has_malformed_tor_version(bad_ver, ["network"])
+        assert not has_malformed_tor_version(bad_ver, ["arti"])
+    for valid_ver in (
+        "Tor 0.4.9.17 is released", "Tor 0.4.9 branch", "Tor 0.4.10.1 alpha",
+        "Tor 0.4.17 [sic]", "Tor 0.4.17 (sic)", 'written as "Tor 0.4.17"',
+        "written as Tor 0.4.17 in the message", "the 0.4.17 release typo",
+        "a 0.4.17 upgrade (version typo in subject)", "10.0.4.17 release",
+    ):
+        assert not has_malformed_tor_version(valid_ver, ["tor"])
+
+    src = item(content="Operators reported a relay issue on 0.4.17 and 0.4.9.17.")
+    ev = ["Operators reported a relay issue"]
+    with pytest.raises(AnalysisError, match="all-caps shouting"):
+        validate_analysis(analysis(title="DO NOT UPGRADE NOW", evidence=ev), src)
+    with pytest.raises(AnalysisError, match="all-caps shouting"):
+        validate_analysis(analysis(summary="Relays are AT RISK FOR DEANONYMIZATION.", evidence=ev), src)
+    with pytest.raises(AnalysisError, match="all-caps shouting"):
+        validate_analysis(update_analysis(update="OPERATORS MUST UPGRADE NOW.", evidence=ev), src, UPDATE_SCHEMA)
+
+    list_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/abc/"
+    impact = "The post says operators should monitor relay load."
+    comm_item = item(url=list_url, authority="community", content="Operators should monitor relay load.")
+    trusted_item = item(url=list_url, authority="trusted-operator", content="Operators should monitor relay load.")
+    proj_item = item(url=list_url, authority="project-sender", content="Operators should monitor relay load.")
+    assert validate_analysis(analysis(why_it_matters=impact, evidence=["Operators should monitor relay load."]), comm_item)["why_it_matters"] == ""
+    assert validate_analysis(analysis(why_it_matters=impact, evidence=["Operators should monitor relay load."]), trusted_item)["why_it_matters"] == impact
+    assert validate_analysis(analysis(why_it_matters=impact, evidence=["Operators should monitor relay load."]), proj_item)["why_it_matters"] == impact
+
+    llm_clear = analyzer(
+        monkeypatch,
+        completion(analysis(why_it_matters="The report warns DO NOT UPGRADE NOW.", evidence=ev)),
+        completion(analysis(why_it_matters="The report warns about a post-0.4.17 upgrade.", evidence=ev)),
+    )
+    assert llm_clear.analyze(src)["why_it_matters"] == "" and llm_clear.clears == 1
+    assert llm_clear.analyze(src)["why_it_matters"] == "" and llm_clear.clears == 1

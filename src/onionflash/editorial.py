@@ -36,6 +36,7 @@ class RetiredStory(ValueError):
 
 
 def retracted_fields(reason: str) -> dict:
+    """Public replacement fields shown after an operator retracts a story."""
     return {
         "title": "Retracted story",
         "summary": "This story has been retracted by the publisher. " + reason,
@@ -45,6 +46,7 @@ def retracted_fields(reason: str) -> dict:
 
 
 def initialize(db) -> None:
+    """Create permanent editorial control, revision, and alias tables and triggers."""
     db.executescript("""
         CREATE TABLE IF NOT EXISTS editorial_controls (
             story_id TEXT PRIMARY KEY, revision INTEGER NOT NULL,
@@ -247,6 +249,7 @@ def _snapshot(db, story_id: str) -> dict:
 
 
 def show(db, story_id: str) -> dict:
+    """Return the current editorial state, compare-and-swap hash, and snapshots for a story."""
     current = _snapshot(db, story_id)
     control = current["control"] or {}
     return {"story_id": story_id, "revision": current["revision"], "hash": current["hash"],
@@ -256,6 +259,7 @@ def show(db, story_id: str) -> dict:
 
 
 def history(db, story_id: str) -> dict:
+    """Return the append-only editorial revision history for `story_id`, newest first."""
     revisions = []
     for row in db.execute("SELECT * FROM editorial_revisions WHERE story_id=? ORDER BY revision DESC", (_id(story_id),)):
         record = dict(row)
@@ -271,14 +275,17 @@ def history(db, story_id: str) -> dict:
 
 
 def is_locked(db, story_id: str) -> bool:
+    """Whether `story_id` is currently editorially locked or retracted."""
     return bool(db.execute("SELECT 1 FROM editorial_controls WHERE story_id=? AND (locked=1 OR retracted=1)", (story_id,)).fetchone())
 
 
 def record_held(db, story_id: str) -> None:
+    """Increment the held-update counter for an editorially locked story."""
     db.execute("UPDATE editorial_controls SET held_updates=held_updates+1 WHERE story_id=?", (story_id,))
 
 
 def public_metadata(db, story_id: str) -> dict | None:
+    """Build bounded public editorial notice and revision metadata for rendering."""
     control = db.execute("SELECT * FROM editorial_controls WHERE story_id=?", (story_id,)).fetchone()
     if control is None:
         return None
@@ -419,12 +426,13 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
         candidate["sources"] = [{**previous_sources.get(s["url"], {}), **s} for s in public["sources"]]
         next_revision = current["revision"] + 1
         after_story = _json(candidate)
+        held_updates = 0 if action == "unlock" else control.get("held_updates", 0)
         db.execute("UPDATE stories SET payload=?,updated_at=? WHERE id=?", (after_story, stamp, story_id))
-        db.execute("""INSERT INTO editorial_controls(story_id,revision,locked,retracted,notice_action,notice_reason,notice_at)
-            VALUES(?,?,?,?,?,?,?) ON CONFLICT(story_id) DO UPDATE SET revision=excluded.revision,
+        db.execute("""INSERT INTO editorial_controls(story_id,revision,locked,retracted,notice_action,notice_reason,notice_at,held_updates)
+            VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(story_id) DO UPDATE SET revision=excluded.revision,
             locked=excluded.locked,retracted=excluded.retracted,notice_action=excluded.notice_action,
-            notice_reason=excluded.notice_reason,notice_at=excluded.notice_at""",
-            (story_id, next_revision, int(locked), int(retracted), notice_action, notice_reason, notice_at))
+            notice_reason=excluded.notice_reason,notice_at=excluded.notice_at,held_updates=excluded.held_updates""",
+            (story_id, next_revision, int(locked), int(retracted), notice_action, notice_reason, notice_at, held_updates))
         after_hash = _snapshot(db, story_id)["hash"]
         db.execute("""INSERT INTO editorial_revisions(story_id,revision,action,reason,created_at,
             before_story_json,before_public_json,after_story_json,after_public_json,before_hash,after_hash)
@@ -440,18 +448,22 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
 
 
 def correct(db, story_id: str, patch: dict, *, reason: str, expect_hash: str, observed: str | None = None) -> dict:
+    """Apply an operator correction to `story_id` and lock automated updates."""
     return _apply(db, story_id, "correct", patch=patch, reason=reason, expect_hash=expect_hash, observed=observed)
 
 
 def retract(db, story_id: str, *, reason: str, expect_hash: str, observed: str | None = None) -> dict:
+    """Retract `story_id` with a public reason and lock automated updates."""
     return _apply(db, story_id, "retract", reason=reason, expect_hash=expect_hash, observed=observed)
 
 
 def unlock(db, story_id: str, *, reason: str, expect_hash: str, observed: str | None = None) -> dict:
+    """Unlock `story_id`, reset its held-update count, and re-queue held items."""
     return _apply(db, story_id, "unlock", reason=reason, expect_hash=expect_hash, observed=observed)
 
 
 def restore(db, story_id: str, revision: int, *, reason: str, expect_hash: str, observed: str | None = None) -> dict:
+    """Restore `story_id` to an earlier accepted revision while keeping it locked."""
     return _apply(db, story_id, "restore", revision=revision, reason=reason, expect_hash=expect_hash, observed=observed)
 
 

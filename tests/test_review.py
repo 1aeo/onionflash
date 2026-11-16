@@ -471,3 +471,121 @@ def test_update_scope_confirmed_updates_uncited_notes_and_punctuation_repairs(mo
         analyze.validate_analysis({"publish": True, "update": ".", "confidence": "reported", "state": "developing",
                                    "evidence": ["exact words here"]}, item(content="Some exact words here in the item."),
                                   schema=analyze.UPDATE_SCHEMA)
+
+
+def test_final_holds_shouting_malformed_version_and_untrusted_operator_claims():
+    list_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/xyz/"
+    src_for = lambda auth, url=list_url: [{"id": "S1", "url": url, "kind": "feed", "authority": auth,
+                                           "passages": [{"id": "S1:P1", "text": "Relay telemetry report."}]}]
+    prep_for = lambda auth, url=list_url: {"packet": {"sources": src_for(auth, url)}, "payload": {"editorial_kind": "feed"}}
+
+    shout_story = candidate(title="Relays AT RISK FOR DEANONYMIZATION", confidence="reported")
+    assert "shouting_caps" in review.final_holds(shout_story, prep_for("trusted-operator"))
+    acronym_story = candidate(title="TLS SNI ALPN changes in relay connections", confidence="reported")
+    assert review.final_holds(acronym_story, prep_for("trusted-operator")) == []
+
+    bad_ver_story = candidate(summary="Operators reported issues after a post-0.4.17 upgrade.", confidence="reported", products=["tor"])
+    assert "malformed_version" in review.final_holds(bad_ver_story, prep_for("trusted-operator"))
+    written_bad_story = candidate(summary="Tor 0.4.17 release notes were written today.", confidence="reported", products=["tor"])
+    assert "malformed_version" in review.final_holds(written_bad_story, prep_for("trusted-operator"))
+    written_prefix_bad = candidate(summary="The post written yesterday cites Tor 0.4.17.", confidence="reported", products=["tor"])
+    assert "malformed_version" in review.final_holds(written_prefix_bad, prep_for("trusted-operator"))
+    for annotated in (
+        "An operator wrote Tor 0.4.17 [sic] in the message.",
+        "An operator wrote Tor 0.4.17 (sic) in the message.",
+        'The subject was written as "Tor 0.4.17" in the archive.',
+        "The subject was written as Tor 0.4.17 in the archive.",
+        "Maintainers corrected the Tor 0.4.17 typo.",
+    ):
+        assert review.final_holds(candidate(summary=annotated, confidence="reported", products=["tor"]), prep_for("trusted-operator")) == []
+    arti_story = candidate(summary="Operators tested 0.4.17 relay builds.", confidence="reported", products=["arti"])
+    assert review.final_holds(arti_story, prep_for("trusted-operator")) == []
+
+    inc_story = candidate(title="Operator reports DDoS flood against exit relays",
+                          summary="A mailing-list post describes an ongoing DDoS attack.",
+                          category="dos", tags=["dos"], confidence="reported")
+    assert review.final_holds(inc_story, prep_for("community")) == ["untrusted_operator_claim"]
+    assert review.final_holds(inc_story, prep_for("trusted-operator")) == []
+    assert review.final_holds(inc_story, prep_for("project-sender")) == []
+    assert "confirmed_source" in review.final_holds({**inc_story, "confidence": "confirmed"}, prep_for("trusted-operator"))
+
+    rfc_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/rfc1/"
+    rfc_story = candidate(title="[RFC] Relay congestion signaling extension",
+                          summary="A proposal on tor-dev outlines congestion signaling frames.",
+                          category="protocol", tags=["protocol"], confidence="reported")
+    assert review.final_holds(rfc_story, prep_for("community", rfc_url)) == []
+
+    prop_sources = [{
+        "id": "S1", "url": rfc_url, "kind": "feed", "authority": "community",
+        "title": "[tor-dev] Proposal 375: Rate-limiting circuit flooding",
+        "passages": [{"id": "S1:P1", "text": "Proposal 375 specifies rate limits to defend against circuit flooding and DoS attacks."}],
+    }]
+    prop_story = candidate(
+        title="Proposal 375: Rate-limiting circuit flooding",
+        summary="Proposal 375 on tor-dev specifies rate limits to defend against circuit flooding and DoS attacks.",
+        category="protocol", tags=["protocol", "dos"], confidence="reported",
+    )
+    assert review.final_holds(prop_story, {"packet": {"sources": prop_sources}, "payload": {"editorial_kind": "feed"}}) == []
+    prop_with_incident = candidate(
+        title="Attackers flooded exit relays yesterday",
+        summary="Proposal 375 proposes rate limits after the flood disrupted exit relays.",
+        category="dos", tags=["dos"], confidence="reported",
+    )
+    assert review.final_holds(
+        prop_with_incident, {"packet": {"sources": prop_sources}, "payload": {"editorial_kind": "feed"}}
+    ) == ["untrusted_operator_claim"]
+
+    defense_framing = candidate(
+        title="Rate-limit proposal for directory requests",
+        summary="A tor-dev post proposes a rate-limit defense against directory flooding.",
+        category="protocol", tags=["protocol"], confidence="reported",
+    )
+    assert review.final_holds(defense_framing, prep_for("community", rfc_url)) == []
+
+    for live_inc in (
+        candidate(
+            title="Operator reports suspected VPS provider tampering and connection flood on exit relay",
+            summary="A mailing-list post describes suspected host tampering and a connection flood.",
+            category="relay", tags=["relay"], confidence="reported",
+        ),
+        candidate(
+            title="Operator reports HSDir-targeted circuit overload and attack",
+            summary="A mailing-list post reports an HSDir circuit attack on relays.",
+            category="relay", tags=["relay"], confidence="reported",
+        ),
+        candidate(
+            title="Post claims rate-limit defense bypass on relays",
+            summary="A mailing-list post reports a rate-limit defense bypass.",
+            category="relay", tags=["relay"], confidence="reported",
+        ),
+        candidate(
+            title="[RFC] Operator reports active DDoS flood hitting exit relays",
+            summary="A post marked RFC reports an active DDoS flood on exit relays.",
+            category="dos", tags=["dos"], confidence="reported",
+        ),
+        candidate(
+            title="Attackers flooded exit relays yesterday",
+            summary="Proposal 375 proposes rate limits after the flood disrupted exit relays.",
+            category="dos", tags=["dos"], confidence="reported",
+        ),
+        candidate(
+            title="Rate-limit discussion on relay list",
+            summary="Operators propose rate limits after attackers flooded exit relays.",
+            category="relay", tags=["relay"], confidence="reported",
+        ),
+        candidate(
+            title="Relay defense measures",
+            summary="An attack targets exit relays.",
+            category="relay", tags=["relay"], confidence="reported",
+        ),
+    ):
+        assert review.final_holds(live_inc, prep_for("community", rfc_url)) == ["untrusted_operator_claim"]
+
+    upd_cand = {
+        **rfc_story,
+        "sources": [{"url": list_url, "title": "List"}],
+        "updates": [{"at": LATER, "text": "OPERATORS REPORT POST-0.4.17 UPGRADE FAILURE.", "sources": [{"url": list_url, "title": "List"}]}],
+    }
+    upd_holds = review.final_holds(upd_cand, {"mode": "update", "packet": {"sources": src_for("community")}})
+    assert set(upd_holds) == {"shouting_caps", "malformed_version"}
+    assert review.final_holds({**shout_story, "origin": "network-health"}, prep_for("community")) == []

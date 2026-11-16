@@ -17,8 +17,13 @@ distribution channel does not make an old event new.
 The application enforces that for new stories before any model request. An item
 that would start a story is ignored, as `skipped.gate.not_recent`, when its newest
 dated development is more than 14 days older than the collection of its current
-revision, unless it is an issue labeled `Security` with high or critical severity.
-That development is the post, creation, merge, tag or timeline event date, a
+revision, unless it is a HackerOne disclosure or an issue labeled `Security` with
+high or critical severity (both exemptions also apply to the reviewer's 14-day
+packet-date check, since confidential HackerOne reports are routinely made public
+months after filing; on `tor-dev`, `trusted-operator` senders share `project-sender`
+eligibility for formal `[Proposal]` posts as well as substantive technical
+critiques, protocol reviews, and empirical multi-relay measurements while keeping
+`confidence` `reported`). That development is the post, creation, merge, tag or timeline event date, a
 verified public comment, or the date an issue was closed; an upstream
 `updated_at`, which an edit, a label or a visibility change also moves, never
 counts. Updates of existing stories, locked ones included, still go to review,
@@ -79,7 +84,10 @@ a close, attributed restatement of one source sentence that states the event's
 impact or an action it asks its readers to take, with that sentence's audience,
 hedges and scope. Most drafts leave it empty. Validation clears a sentence with a
 number or version absent from the title, content and comment bodies the writer
-saw (source metadata does not count).
+saw (source metadata does not count), on an untrusted `community`
+`lists.torproject.org` post, or when it contains unnormalized all-caps shouting
+or a nonexistent three-part C-Tor version; drafts with unnormalized all-caps
+shouting in the headline, summary or update are refused.
 Historical impact text remains readable. A review repair may clear it, but cannot
 create or rewrite an impact paragraph; operator corrections remain separate.
 Automatic approvals also require consistent metadata: a `release` category or
@@ -149,9 +157,10 @@ story; see [merging duplicate stories](EDITORIAL.md#merge-a-duplicate-story).
   coverage intact. A skip needs a failed news-value or new-information
   criterion, and a skip for new information alone must name an active covered
   story (not a `retracted` marker); otherwise the item is held. An item from an
-  official source, other than a version tag, skips only when new information
-  fails; when news value fails while new information passes, it is held for the
-  operator once a fresh verification has passed its facts.
+  official, `project-sender`, `hackerone`, or `dirauth-operator` source, other than a
+  version tag, skips only when new information fails; when news value fails while new
+  information passes, it is held for the operator (`held.verification.official_not_news`)
+  once a fresh verification has passed its facts.
 - `hold`: potentially useful material is unsupported, ambiguous or not ready to
   publish. It remains available through the existing operator controls; a hold
   whose facts passed fresh verification and whose reviews disputed only news
@@ -240,7 +249,7 @@ an older policy can justify a fresh budget; older verdict schemas remain readabl
 
 ## Final checks
 
-A verified approval publishes only if four fixed checks also pass. They read the
+A verified approval publishes only if seven fixed checks also pass. They read the
 exact candidate, its source packet and the kind of source that wrote its text,
 make no model call, and run again when a saved approval is resumed. A failed
 check holds the item for the operator with its own [decision code](DECISIONS.md);
@@ -259,6 +268,16 @@ skips are not checked.
   marks as requested, planned or not done claims nothing.
 - When a source hedges a compromise ("plausibly compromised", "may have been
   hacked"), a new headline or update entry about the compromise keeps a qualifier.
+- Public story text (`title`, `summary`, `why_it_matters`) or a new update entry
+  contains no unnormalized all-caps shouting beyond standard technical acronyms.
+- Public story text or a new update entry on Tor or network coverage cites no
+  nonexistent three-part C-Tor version typo (such as `0.4.17`) unless directly
+  annotated as a literal source quote or typo (`[sic]`, `typo` or `written as ...`).
+- A new story whose sources are all untrusted `community` `lists.torproject.org`
+  posts does not report an operational attack, compromise, DoS, flood, bypass or
+  vulnerability claim (`untrusted_operator_claim`); eligible `tor-dev` `[RFC]`,
+  numbered Tor proposal, and IETF Internet-Draft or IETF RFC specifications that
+  propose defenses without asserting a live operational incident are allowed.
 
 The writer's request and every review's repair offer only the confidence,
 state and category labels that these checks allow (and `tagged` only when a

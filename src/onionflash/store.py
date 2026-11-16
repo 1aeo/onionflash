@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import closing, contextmanager
 from itertools import islice
 import json
@@ -14,9 +14,14 @@ import sqlite3
 from . import candidate, decisions, doctor, editorial, publication
 from .candidate import ReviewRequired
 from .comments import analysis_context
-from .util import after, backoff_seconds, canonical_json, digest, item_cluster, item_identity, saved_object
+from .util import (
+    after, backoff_seconds, canonical_json, digest, is_dirauth_item, is_hackerone_item, item_cluster,
+    item_identity, saved_object,
+)
 
 TAG_PRIORITY = 5  # queue floor for deterministic tag notices
+HACKERONE_PRIORITY = 35  # queue boost so HackerOne disclosures run ahead of ordinary items
+DIRAUTH_PRIORITY = 35  # queue boost so directory-authority tickets and replies run first
 POLL_TOLERANCE_SECONDS = 5  # absorbs scheduler start jitter after a successful poll
 
 _RETENTION_SCHEMA = """
@@ -72,11 +77,13 @@ def backup_database(source: str | Path, destination: str | Path) -> None:
 
 
 def get_meta(db, key: str, default: str | None = None) -> str | None:
+    """Read one metadata value by key, or return `default` when absent."""
     row = db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
     return row[0] if row is not None else default
 
 
 def set_meta(db, **values: str) -> None:
+    """Upsert one or more key-value entries in the metadata table."""
     db.executemany(
         "INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         values.items(),
@@ -84,6 +91,7 @@ def set_meta(db, **values: str) -> None:
 
 
 def bump_meta(db, key: str) -> int:
+    """Increment an integer counter in metadata and return its new value."""
     value = int(get_meta(db, key) or 0) + 1
     set_meta(db, **{key: str(value)})
     return value
@@ -91,6 +99,7 @@ def bump_meta(db, key: str) -> int:
 
 @contextmanager
 def immediate_transaction(db, busy_message: str = "Database transaction already active"):
+    """Run a block inside a `BEGIN IMMEDIATE` write transaction."""
     if db.in_transaction:
         raise ValueError(busy_message)
     db.execute("BEGIN IMMEDIATE")
@@ -188,6 +197,7 @@ def select_retention_candidates(
     size = base_overhead
 
     def scan(kind: str, query: str):
+        """Stream decoded cold item or analysis rows eligible for archival."""
         table, key_col = ("items", "id") if kind == "item" else ("analyses", "cache_key")
         columns = [info[1] for info in db.execute(f"PRAGMA table_info({table})")]
         for rowid, raw_key in db.execute(query, (cutoff,)):
@@ -267,32 +277,89 @@ def compact_retained_rows(
 
 
 def source_due(state: dict, observed: str) -> bool:
+    """Return whether a source's next scheduled fetch time has arrived."""
     due = state.get("next_fetch_at")
     return not due or due <= observed
 
 
-def item_priority(item: dict) -> int:
+def item_priority(item: dict, dirauth_users: Iterable[str] | None = None) -> int:
+    """Score a collected item so HackerOne, directory-authority and security reports run first."""
     words = (item["title"] + " " + item["content"][:1500] + " " + " ".join(item.get("labels", []))).lower()
     score = sum(
         weight
         for word, weight in [("compromis", 30), ("security", 15), ("attack", 10), ("denial", 10), ("dirauth", 8), ("released", 5)]
         if word in words
     )
+    if is_hackerone_item(item):
+        score += HACKERONE_PRIORITY
+    if is_dirauth_item(item, dirauth_users):
+        score += DIRAUTH_PRIORITY
     return max(score, TAG_PRIORITY if item["kind"] == "tag" else 0)
+
+
+def _valid_saved_item(old: object) -> bool:
+    if not isinstance(old, dict):
+        return False
+    if not all(isinstance(old.get(key), str) for key in ("title", "content", "updated_at")):
+        return False
+    if "source_content" in old and not isinstance(old["source_content"], str):
+        return False
+    if "author" in old and old["author"] is not None and not isinstance(old["author"], str):
+        return False
+    if "comments_truncated" in old and type(old["comments_truncated"]) is not bool:
+        return False
+    labels = old.get("labels")
+    if labels is not None and (not isinstance(labels, list) or any(not isinstance(entry, str) for entry in labels)):
+        return False
+    notes = old.get("public_comments")
+    if notes is not None and (
+        not isinstance(notes, list)
+        or any(
+            not isinstance(note, dict)
+            or not all(isinstance(note.get(key), str) for key in ("author", "created_at", "body"))
+            for note in notes
+        )
+    ):
+        return False
+    dirauth_notes = old.get("dirauth_notes")
+    if dirauth_notes is not None and (
+        not isinstance(dirauth_notes, list)
+        or any(
+            not isinstance(note, dict)
+            or not all(isinstance(note.get(key), str) for key in ("id", "author", "created_at"))
+            for note in dirauth_notes
+        )
+    ):
+        return False
+    return True
 
 
 def item_hash(item: dict) -> str:
     """A digest of the fields that make a new revision of an item."""
     fields = {k: item.get(k) for k in ("title", "content", "kind", "product", "labels", "authority", "upstream_state")}
     fields["content"] = item.get("source_content", item.get("content"))
+    if item.get("author"):
+        fields["author"] = item["author"]
     if item.get("public_comments"):
         fields["public_comments"] = analysis_context(item)[1]
+    if item.get("dirauth_notes"):
+        fields["dirauth_notes"] = item["dirauth_notes"]
     return digest(fields)
 
 
+def _uncommented_hash(old: dict, item: dict) -> str:
+    base_old = {k: v for k, v in old.items() if k not in {"public_comments", "dirauth_notes", "comments_truncated"}}
+    if base_old.get("authority") == "dirauth-operator" and item.get("authority") == "development":
+        base_old["authority"] = "development"
+    return item_hash(base_old)
+
+
 class Store:
-    def __init__(self, path: str | Path):
+    """SQLite state store for sources, queued items, analyses and published stories."""
+
+    def __init__(self, path: str | Path, *, dirauth_users: Iterable[str] | None = None):
         """Open persistent state and apply idempotent schema maintenance before use."""
+        self.dirauth_users = tuple(dirauth_users) if dirauth_users is not None else None
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if path.is_symlink():
@@ -395,6 +462,7 @@ class Store:
         self.db.close()
 
     def source(self, source: dict) -> dict:
+        """Load or initialize persistent polling state for a configured source."""
         row = self.db.execute("SELECT * FROM source_state WHERE id=?", (source["id"],)).fetchone()
         if row and row["url"] == source["url"]:
             return dict(row)
@@ -404,6 +472,7 @@ class Store:
         return dict(self.db.execute("SELECT * FROM source_state WHERE id=?", (source["id"],)).fetchone())
 
     def source_success(self, source: dict, result: dict, observed: str, *, schedule_from: str | None = None) -> None:
+        """Record a successful poll, cache validators and next fetch timestamp."""
         with self.db:
             self.db.execute(
                 """UPDATE source_state SET active_url=?, watermark=COALESCE(?,watermark),
@@ -432,6 +501,7 @@ class Store:
         watermark: str | None = None,
         catching_up: bool = False,
     ) -> None:
+        """Record a failed or catching-up poll with bounded retry backoff."""
         state = self.source(source)
         failures = state["failures"] + 1
         delay = (
@@ -446,7 +516,8 @@ class Store:
         with self.db:
             self.db.execute(f"UPDATE source_state SET {assignments} WHERE id=?", (*fields.values(), source["id"]))
 
-    def ingest(self, item: dict, observed: str) -> bool:
+    def ingest(self, item: dict, observed: str, *, dirauth_users: Iterable[str] | None = None) -> bool:
+        """Store a new or updated source item and return whether it was queued."""
         item_id = digest(item_identity(item))[:24]
         item["id"] = item_id
         content_hash = item_hash(item)
@@ -459,7 +530,7 @@ class Store:
             (item_id,),
         ).fetchone()
         old = saved_object(row["payload"]) if row and row["payload_type"] == "text" else None
-        if row and not isinstance((old or {}).get("updated_at"), str):
+        if row and not _valid_saved_item(old):
             logging.getLogger(__name__).warning("Replacing damaged saved item %s", item_id)
             requested = "SELECT 1 FROM comment_cache WHERE item_id=? AND (failures>0 OR next_fetch_at<=checked_at)"
             if row["content_hash"] == content_hash or (row["status"] != "pending" and check_requested
@@ -478,15 +549,16 @@ class Store:
             and row["status"] != "pending"
             and "comments_source_key" not in item
             and not check_requested
-            and old.get("public_comments")
-            and item_hash({k: v for k, v in old.items() if k != "public_comments"}) == content_hash
+            and (old.get("public_comments") or old.get("dirauth_notes"))
+            and _uncommented_hash(old, item) == content_hash
         ):
             return False
         if row is not None:
             alias = editorial.retired(self.db, story_id=row["story_id"], cluster_key=row["cluster_key"])
             if alias is not None and alias[1] is None:
                 cluster = self.db.execute("SELECT cluster_key FROM story_aliases WHERE story_id=?", (alias[0],)).fetchone()[0]
-        score = item_priority(item)
+        effective_users = self.dirauth_users if dirauth_users is None else dirauth_users
+        score = item_priority(item, effective_users)
         try:
             with self.db:
                 self.db.execute(
@@ -523,6 +595,7 @@ class Store:
         return rows
 
     def pending_count(self) -> int:
+        """Return the total number of items currently in pending status."""
         return self.db.execute("SELECT COUNT(*) FROM items WHERE status='pending'").fetchone()[0]
 
     def require_pending_item(self, row: dict, message: str) -> dict:
@@ -583,6 +656,7 @@ class Store:
                 decisions.record(self.db, item_id, code, observed, error=error[:160])
 
     def rejected_count(self) -> int:
+        """Return the total number of items currently in rejected status."""
         return self.db.execute("SELECT COUNT(*) FROM items WHERE status='rejected'").fetchone()[0]
 
     def record_analysis(self, row: dict, result: dict, cache_key: str, observed: str, *,
@@ -608,8 +682,12 @@ class Store:
         )
         return cache_key
 
-    def prepare_candidate(self, row: dict, result: dict, observed: str) -> dict:
-        return candidate.prepare(self.db, row, result, observed)
+    def prepare_candidate(
+        self, row: dict, result: dict, observed: str, *, dirauth_users: Iterable[str] | None = None
+    ) -> dict:
+        """Assemble a read-only publication candidate and source bindings for `row`."""
+        effective_users = self.dirauth_users if dirauth_users is None else dirauth_users
+        return candidate.prepare(self.db, row, result, observed, dirauth_users=effective_users)
 
     def _append_citation(self, story_id: str, story_payload: dict, source: dict) -> None:
         if "editorial_item" not in story_payload:
@@ -689,7 +767,10 @@ class Store:
                             or review_record.get("outcome") != "operator_approved"
                             or not isinstance(approval_meta.get("reason"), str) or not approval_meta["reason"]):
                         raise ReviewRequired("Operator approval requires an operator_approval audit record")
-                    current = candidate.prepare(self.db, row, result, prepared["observed"])
+                    effective_users = self.dirauth_users if self.dirauth_users is not None else prepared.get("dirauth_users")
+                    current = candidate.prepare(
+                        self.db, row, result, prepared["observed"], dirauth_users=effective_users
+                    )
                     held_job = self.db.execute("SELECT stage FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
                     item_state = self.db.execute("SELECT status FROM items WHERE id=?", (row["id"],)).fetchone()
                     if (current["locked"] or current["binding_hash"] != prepared["binding_hash"]
@@ -812,6 +893,7 @@ class Store:
         return result
 
     def get_meta(self, key: str) -> str | None:
+        """Read one metadata value by key from this store."""
         return get_meta(self.db, key)
 
     def set_meta(self, **values: str) -> None:
