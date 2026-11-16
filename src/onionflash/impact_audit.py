@@ -15,6 +15,11 @@ Return supported when every material claim faithfully states a concrete source-
 stated consequence, limitation, practical effect or action explicitly requested of
 its readers, including its prerequisites,
 scope and uncertainty. Read surrounding passages, corrections and disagreement.
+Require one explicit impact or reader-action anchor. Use only minimal directly
+governing supplied context needed to resolve its referents and preserve audience,
+conditions, affected scope, timing, lifecycle and material disagreement. Do not
+assemble additional consequences or infer new impact, advice, severity, urgency,
+cause, number, version or benefit beyond that anchor and its necessary context.
 Preserve a faithful consequence even when the source is cautious or rates it minor.
 Return unsupported for a demonstrated factual mismatch, a claim absent from an
 adequate packet, unrequested advice, or generic filler that supplies no concrete

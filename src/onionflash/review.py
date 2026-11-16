@@ -17,7 +17,7 @@ from .impact_audit import POLICY as IMPACT_AUDIT_POLICY
 from .schema import LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STORY_ID_RE, UPDATE_CHARS
 from .util import canonical_url, digest, normalize_evidence
 
-REVIEW_VERSION = "onionflash-review-17"
+REVIEW_VERSION = "onionflash-review-16"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details", "news_value", "new_information")
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
@@ -106,10 +106,15 @@ confidence while scoring criteria, because verdict and repair follow criteria: a
 defect you plan to revise, hold or skip MUST fail its criterion below before you reach verdict.
 source_support: every factual assertion is stated or faithfully paraphrased in the
 packet. Attribution alone cannot make an unsupported consequence true.
-A non-empty why_it_matters passes only when it closely restates one packet sentence
-that itself states this event's impact or an action it asks its readers to take,
-adding no severity, urgency, cause, number, version, benefit or impact inferred from
-a description of what changed.
+A non-empty why_it_matters passes only when one output sentence closely paraphrases
+one supplied passage that explicitly states this event's impact or a reader action.
+Use only minimal directly governing supplied context needed to resolve its referents
+and preserve its audience, conditions, affected scope, timing, lifecycle and material
+disagreement. Keep that context in the same output sentence; attribute distinct
+speakers separately without deciding unresolved disagreement. Add no other impact,
+advice, severity, urgency, cause, number, version or benefit beyond the anchor and
+its necessary supplied context. Do not assemble additional consequences from other
+passages or infer impact from a description of what changed.
 When why_it_matters is non-empty, judge it in source_support's reason before setting
 outcome: accept a faithful paraphrase of stated impact or reader instructions, and
 fail source_support (clearing why_it_matters) for claims absent from the packet,

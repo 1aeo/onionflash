@@ -88,9 +88,11 @@ criterion before the verdict:
 | New information | Require meaningful new facts, not quoted history; only existing coverage shows a duplicate, and a correction of the existing article is new. |
 
 A draft has a concise factual summary and may have one `why_it_matters` sentence:
-a close, attributed restatement of one source sentence that states the event's
-impact or an action it asks its readers to take, with that sentence's audience,
-hedges and scope. Most drafts leave it empty. Validation clears a sentence with a
+a close, attributed restatement of one explicit source impact or reader-action
+anchor. Minimal directly governing supplied context may resolve referents and
+preserve audience, conditions, scope, timing, lifecycle and disagreement; it does
+not permit assembling additional consequences from other passages. Most drafts
+leave it empty. Validation clears a sentence with a
 number or version absent from the title, content and comment bodies the writer
 saw (source metadata does not count), on an untrusted `community`
 `lists.torproject.org` post, or when it contains unnormalized all-caps shouting
