@@ -145,9 +145,16 @@ def test_review_protocol_fresh_verification_and_application_issue(monkeypatch):
     for check in first["response_format"]["json_schema"]["schema"]["properties"]["criteria"]["properties"].values():
         assert check["properties"]["source_refs"]["items"]["enum"] == sorted(review._packet_refs(packet()))
     assert "enum" not in review.REFS["items"]
-    assert json.loads(first["messages"][1]["content"]) == {"candidate": public, "packet": packet()}
+    first_payload = json.loads(first["messages"][1]["content"])
+    first_context = first_payload.pop("evidence_context")
+    assert first_payload == {"candidate": public, "packet": packet()}
+    assert "why_it_matters" in {field["field"] for field in first_context["fields"]}
+    assert all(passage in packet()["sources"][0]["passages"] for passage in first_context["passages"])
     assert len(second["messages"]) == 2 and second["messages"][0]["content"] == review.VERIFY_PROMPT
-    assert json.loads(second["messages"][1]["content"]) == {"candidate": repaired, "packet": packet()}
+    second_payload = json.loads(second["messages"][1]["content"])
+    second_context = second_payload.pop("evidence_context")
+    assert second_payload == {"candidate": repaired, "packet": packet()}
+    assert "why_it_matters" not in {field["field"] for field in second_context["fields"]}
 
     schema = first["response_format"]["json_schema"]["schema"]
     assert list(schema["properties"]) == schema["required"] == ["criteria", "verdict", "same_story", "repair"]
@@ -164,7 +171,9 @@ def test_review_protocol_fresh_verification_and_application_issue(monkeypatch):
     rel_res = rel_chk.review(rel_pub, packet(), issue=review.RELEASE_ISSUE)
     assert rel_res == review.validate_review(verdict(), packet()) and "model_verdict" not in rel_res
     assert rel_chk.client.requests[0][1]["messages"][0]["content"] == review.SYSTEM_PROMPT
-    assert json.loads(rel_chk.client.requests[0][1]["messages"][1]["content"]) == {
+    issue_payload = json.loads(rel_chk.client.requests[0][1]["messages"][1]["content"])
+    issue_payload.pop("evidence_context")
+    assert issue_payload == {
         "candidate": rel_pub, "packet": packet(), "application_issue": review.RELEASE_ISSUE}
 
 
@@ -289,7 +298,10 @@ def test_prompts_coverage_isolation_repairs_and_transport_settings(monkeypatch):
     bg_chk.review(candidate(), packet(), coverage=bg)
     bg_chk.review(candidate(), packet(), coverage=bg, verification=True)
     for _, req in bg_chk.client.requests:
-        assert json.loads(req["messages"][1]["content"]) == {"candidate": candidate(), "packet": packet(), "coverage_background": bg}
+        payload = json.loads(req["messages"][1]["content"])
+        context = payload.pop("evidence_context")
+        assert payload == {"candidate": candidate(), "packet": packet(), "coverage_background": bg}
+        assert all(passage in packet()["sources"][0]["passages"] for passage in context["passages"])
         fields = req["response_format"]["json_schema"]["schema"]["properties"]["criteria"]["properties"]
         assert set(fields) == set(review.CRITERIA)
         assert all(c["properties"]["source_refs"]["items"]["enum"] == ["S1", "S1:P1"] for c in fields.values())

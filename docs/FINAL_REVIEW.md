@@ -45,6 +45,14 @@ come before its description, so a long description is cut first. Comment passage
 name their author, so comment text cannot pose as another comment. Previous
 generated summaries are never factual evidence.
 
+Each review also receives deterministic reminders linking the current text fields
+to verbatim passages in that same packet. Matching body text, named speakers,
+whole available comments and later comment context help expose qualifications and
+corrections. The complete packet remains unchanged; reminders never establish
+support, authority, news value or absence of evidence. Update reminders use only
+the newest entry and its cited sources. Reminder construction is part of the
+review policy identity, so changing it invalidates earlier approval reuse.
+
 A separate, bounded coverage background contains the existing article for a
 known update (`prior_story`, never repeated in `recent`) and compact entries
 ordered by recent story activity (`updated_at` or `added_at`). Up to six active
