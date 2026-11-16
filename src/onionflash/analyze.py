@@ -15,7 +15,7 @@ from .llm import (
 from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, STATES, UPDATE_CHARS
 from .util import digest, is_dirauth_item, is_hackerone_item, normalize_evidence as _plain
 
-PROMPT_VERSION = "onionflash-21"
+PROMPT_VERSION = "onionflash-22"
 # Change this when update input filtering changes, independently of prompt prose.
 UPDATE_INPUT_VERSION = 2
 WRITER_REASONING_OPTIONS = {
@@ -148,15 +148,23 @@ generally available fix; preserve that limited scope.
 Use developing for observations, discussions and unresolved reports. Reserve merged
 for an explicitly completed code merge, not a measurement report mentioning software.
 A mailing-list proposal, [RFC] or Internet-Draft is its author's proposal for
-comment: attribute it to a proposal posted to the list, name an author or role only
-when the source text states one, keep confidence reported and state developing, and
+comment: attribute it to a proposal posted to the list, name an author only when
+the supplied evidence identifies them, and use a role only when stated or established
+by the developer-evidence rule below. Keep confidence reported and state developing, and
 do not call it adopted, accepted or a Tor Project decision unless the source says so.
-Call a named or identifiable person a developer only when the supplied evidence
-identifies code authored by that same person and committed into C Tor's codebase.
+Call a named or identifiable person a developer only when supplied commit evidence
+identifies code authored by that same person and committed into C Tor or Arti.
+Either contribution supports the generic role "developer" in news about either
+project; the source need not literally use that role word. A project-specific label
+such as "C Tor developer" or "Arti developer" requires that person's committed code
+in the named project, not just the other one.
 A mailing-list post, sender domain or authority, technical fluency, self-description,
 request for a merge request, or proposed/unmerged code does not establish that role.
 Quoting or attributing a developer self-description does not waive this requirement.
-Another person's commit or a contribution to another project is not evidence for it.
+Another person's commit or contributions only to an unrelated project do not qualify.
+Developer status does not establish official authority, confirm a claim, or make a
+routine comment newsworthy. Preserve the supplied topic and substantive report;
+do not invent extra importance from the role.
 Without that evidence, use the person's name alone or a source-stated role such as
 relay operator. Do not infer another personal role or affiliation from technical
 discussion or internal sender tags. Preserve the person's actual report or request.
@@ -207,7 +215,8 @@ do not repeat only the initial allegation. A later comment or timestamp does not
 make an old event current.""",
     claim_check="""Across title, summary, why_it_matters and update, trace each claim to the supplied
 passage that states it and identifies its speaker or entity. Keep entity names and
-stated role terms; do not substitute an unstated role for a name. Use each
+supported role terms, including developer roles established by the commit-evidence
+rule; never guess a role from a name. Use each
 statement's own author field or source text for attribution; assignment, source
 hosting and apparent expertise do not establish a role. Check the claim against
 those passages and its governing context before returning: preserve its actor,
@@ -287,7 +296,7 @@ announcement or merged gitlab_mr (or when prior_story is already confirmed); oth
 prior_story's confidence. Evidence must support the update.
 """
 UPDATE_PROMPT = _writer_prompt(
-    comments="""material maintainer disagreement or limitations; do not repeat only the initial
+    comments="""material disagreement or limitations from the supplied comments; do not repeat only the initial
 allegation. A later comment or timestamp does not make an old event current.""",
     impact="""why_it_matters is optional and conservative. Fill it only by closely
 paraphrasing one sentence of the supplied title, content or a comment body that
@@ -297,7 +306,8 @@ report saying a malformed file "causes the daemon to exit at startup". Attribute
 that sentence to its source ("The announcement asks ...", "The report says ...")
 and keep its audience, hedges and scope. Attribution does not replace uncertainty:
 retain the source's belief, possibility or conditional language in the claim itself.
-Keep entity names and stated role terms; do not substitute an unstated role for a name.
+Keep entity names and supported role terms; the commit-evidence rule may establish
+developer, but no other unstated role may be inferred from a name.
 Read all supplied comments before selecting the sentence. If another passage disputes
 or materially narrows its impact, leave this field empty unless the selected sentence
 itself carries that qualification. Add nothing it does not say: no severity,

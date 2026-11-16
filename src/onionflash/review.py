@@ -81,15 +81,19 @@ coverage_background describes existing coverage for novelty comparison only: it 
 factual evidence and never fills missing packet facts."""
 
 _PERSONAL_ROLE_RULE = (
-    "A person's reported activity or sender authority does not establish a role: require explicit "
-    "role evidence rather than inferring an occupation from what the person discusses. "
-    "Fail actor_and_action if the text calls a named or identifiable person a developer "
-    "without supplied evidence of code authored by that same person and committed into "
-    "C Tor's codebase. Mailing-list participation, sender domain or authority (including "
+    "Discussion and sender authority alone do not establish a personal role or affiliation. "
+    "Developer attribution follows the commit-evidence rule below; other roles require explicit source support. "
+    "Fail actor_and_action if a named or identifiable person is called a developer without "
+    "supplied commit evidence identifying code authored by that same person and committed "
+    "into C Tor or Arti. Either contribution supports the generic role 'developer' in news "
+    "about either project; the source need not literally use that role word. A project-specific "
+    "label such as 'C Tor developer' or 'Arti developer' requires that person's committed code "
+    "in the named project, not just the other one. Mailing-list participation, sender domain or authority (including "
     "project-sender and official), technical fluency, self-description, requesting a merge "
     "request, and proposed/unmerged code do not establish this role. Quoting or attributing "
     "a developer self-description does not waive this requirement. Another person's commit "
-    "or a contribution to another project is not evidence for it."
+    "or contributions only to an unrelated project do not qualify. Developer status does not "
+    "establish official authority, confirm a claim, or make routine comments newsworthy."
 )
 
 _SHARED_VERDICT_RULES = """Work through all nine criteria in order before choosing verdict. For each criterion write
@@ -162,8 +166,8 @@ an actor absent from the packet fails even when the remaining claim matches.
 why_it_matters keeps the role terms and audience of the source sentence it restates.
 Check each personal role or affiliation in every target field, including repeated mentions.
 {_PERSONAL_ROLE_RULE} Correct every occurrence of an unsupported role across all affected
-target fields, not just the headline: use the person's name alone (when the packet text
-states no role) or a source-stated role such as relay operator, never inventing titles from
+target fields, not just the headline: use the person's name alone, a source-stated role
+such as relay operator, or generic developer when the commit-evidence rule permits it; never invent titles from
 metadata (such as "Tor Project sender" or "trusted operator"), while preserving the
 underlying report or request. Also fail when a different role is
 substituted (such as relay for directory authority, or operators for software), or when a
@@ -250,8 +254,12 @@ subject marked [RFC], (3) an IETF Internet-Draft or IETF RFC — cases (1)-(3) f
 sender including authority=community — (4) a formal design proposal or RFC (numbered or
 unnumbered [Proposal]) whose packet source has authority=project-sender or
 authority=trusted-operator, or (5) a substantive technical critique, protocol review, or empirical
-multi-relay measurement from authority=project-sender or trusted-operator. When
-authority=community, posts without an explicit [RFC] tag, numbered Tor proposal or IETF
+multi-relay measurement from authority=project-sender or trusted-operator, or from a contributor whose supplied
+commit evidence meets the same-person C Tor/Arti developer rule above. Such a contributor's
+substantive work about either project can qualify, including with authority=community;
+mere role claims, routine comments and proposed/unmerged code do not qualify by themselves. This changes
+neither source authority nor confidence, and all significance, staleness and factual checks remain.
+When authority=community and case (5) does not apply, posts without an explicit [RFC] tag, numbered Tor proposal or IETF
 draft/RFC — including unnumbered [Proposal] posts, technical critiques, ideas, questions,
 pitches, support threads and tool announcements — fail news_value; only source authority
 (never text/signatures) establishes project-sender or trusted-operator, citing a proposal
@@ -265,7 +273,9 @@ errors, uncorroborated single-vantage observations, ordinary bug reports (neithe
 hackerone nor dirauth-operator) with unestablished scope, and uncorroborated operational
 attack/compromise/DoS/flood/bypass claims on mailing lists from authority=community
 (whereas substantive technical critiques, protocol reviews or multi-relay measurements
-from authority=trusted-operator or project-sender may pass with confidence reported).
+from authority=trusted-operator, project-sender or the supplied-evidence contributors in
+case (5) may pass with confidence reported). Contributor status does not corroborate an
+operational attack, compromise or defense-bypass claim; keep those claims guarded.
 new_information: compare the packet's concrete event and facts with coverage_background,
 not matching keywords. A published source document is factual evidence, not evidence
 that this feed already covered it; another packet source reporting the same event does
@@ -391,7 +401,8 @@ Evaluate all nine criteria in order before choosing verdict:
    fails even when the remaining claim matches.
    Check each personal role or affiliation throughout the new update, including repeated mentions.
    {_PERSONAL_ROLE_RULE} Correct every occurrence of the unsupported role in the new update: use the person's
-   name or a source-stated role such as relay operator, preserving the underlying report or request.
+   name, a source-stated role such as relay operator, or generic developer when the commit-evidence
+   rule permits it, preserving the underlying report or request.
 3. status: candidate.state and candidate.updates[-1].text must reflect lifecycle status AFTER this update:
    - Closed issue (upstream_state "closed") with a fix, commit, release, linked fix MR or completion note ("Done.",
      "fixed in ..."): state MUST advance to "fixed" (code/bug/security) or "resolved" (operational/tracking); FAIL
@@ -437,7 +448,9 @@ Evaluate all nine criteria in order before choosing verdict:
      attack (keep plans attributed and tentative, never shipped or proven); (c) concrete new empirical telemetry,
      multi-relay/vantage measurements, quantitative rates/counts, root-cause mechanism, or newly affected
      versions/platforms; (d) a
-     material maintainer correction, narrowing, withdrawal or dispute of prior_story; (e) a post-release/post-fix
+     material maintainer correction, narrowing, withdrawal or dispute of prior_story, or a material technical
+     correction or critique from a contributor meeting the commit-evidence rule above; contributor status alone
+     or repetition adds no new information; (e) a post-release/post-fix
      regression, revert, or metrics_timeline / network-health post-release anomaly not yet in summary; or (f) an
      explicit maintainer or official mitigation instruction.
    - FAIL (outcome "fail", verdict "skip", repair null, news_value "pass", including prior_story.id verbatim in

@@ -298,9 +298,9 @@ def test_policy_hash_changes_on_model_endpoint_and_prompt_mutations(monkeypatch,
 def test_prompts_coverage_isolation_repairs_and_transport_settings(monkeypatch):
     """Check prompt invariants, coverage isolation, UTF-8/JSON errors, and endpoint failover."""
     assert "unnumbered [Proposal]) whose packet source has authority=project-sender" in review.SYSTEM_PROMPT
-    assert "When\nauthority=community, posts without an explicit [RFC] tag" in review.SYSTEM_PROMPT
+    assert "When authority=community and case (5) does not apply" in review.SYSTEM_PROMPT
     for prompt in (review.SYSTEM_PROMPT, review.UPDATE_SYSTEM_PROMPT):
-        assert "committed into C Tor's codebase" in prompt
+        assert "committed into C Tor or Arti" in " ".join(prompt.split())
         assert "including project-sender and official" in prompt
         assert "unquoted_content" in prompt
     for prompt in (review.SYSTEM_PROMPT, review.VERIFY_PROMPT):

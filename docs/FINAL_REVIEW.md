@@ -42,7 +42,8 @@ packet-date check, since confidential HackerOne reports are routinely made publi
 months after filing; on `tor-dev`, `trusted-operator` senders share `project-sender`
 eligibility for formal `[Proposal]` posts as well as substantive technical
 critiques, protocol reviews, and empirical multi-relay measurements while keeping
-`confidence` `reported`). That development is the post, creation, merge, tag or timeline event date, a
+`confidence` `reported`; the additional [contributor eligibility](#developer-evidence)
+does not waive recency). That development is the post, creation, merge, tag or timeline event date, a
 verified public comment, or the date an issue was closed; an upstream
 `updated_at`, which an edit, a label or a visibility change also moves, never
 counts. Updates of existing stories, locked ones included, still go to review,
@@ -105,6 +106,27 @@ criterion before the verdict:
 | Technical details | Ground identities, counts, mechanisms and consequences. |
 | News value | Require a concrete development worth publishing, judged from the sources, not only the draft. |
 | New information | Require meaningful new facts, not quoted history; only existing coverage shows a duplicate, and a correction of the existing article is new. |
+
+### Developer evidence
+
+Calling a named or identifiable person a developer requires supplied evidence of
+code authored by that same person and committed into C Tor or Arti. Contributions
+to either project support generic "developer" attribution when discussing either
+project. A specific "C Tor developer" or "Arti developer" label requires committed
+code in that named project. Another person's work, unrelated repositories,
+self-description, technical fluency, mailing-list participation, sender domains,
+and proposed or unmerged code do not establish the role. A literal role word is
+not required when the supplied commit evidence establishes it.
+
+On tor-dev, this verified contribution evidence also makes substantive technical
+critiques, protocol reviews and empirical multi-relay measurements eligible across
+the two projects, even from a `community` source. It does not make routine comments
+news, change source authority, establish `confirmed` confidence, corroborate an
+operational attack claim, or waive significance, staleness and factual checks.
+Existing source classifications and deterministic incident guards remain unchanged;
+there is no identity lookup or inferred contributor metadata.
+An otherwise substantive review may discuss a current unmerged patch when prior
+committed code establishes the contributor; keep that patch's proposed status.
 
 A draft has a concise factual summary and may have one `why_it_matters` sentence:
 a close, attributed restatement of one explicit source impact or reader-action
