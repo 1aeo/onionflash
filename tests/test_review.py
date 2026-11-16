@@ -294,6 +294,8 @@ def test_prompts_coverage_isolation_repairs_and_transport_settings(monkeypatch):
         assert "committed into C Tor's codebase" in prompt
         assert "including project-sender and official" in prompt
         assert "unquoted_content" in prompt
+    for prompt in (review.SYSTEM_PROMPT, review.VERIFY_PROMPT):
+        assert "Claims supported by other packet sources need only that source's support." in prompt
     assert reviewer(monkeypatch, completion(verdict("skip", criterion="news_value"))).review(candidate(state="merged"), packet())["verdict"] == "skip"
 
     public = candidate(why_it_matters="Existing commentary")

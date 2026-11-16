@@ -382,15 +382,13 @@ def validate_analysis(result: dict, item: dict, schema: dict = SCHEMA) -> dict:
     is_list_item = "lists.torproject.org" in str(item.get("url") or "")
     impact_context = context
     if is_list_item and any(ln.lstrip().startswith(">") for ln in item.get("content", "").splitlines()):
-        unquoted = unquoted_mail_text(item["content"]).strip()
-        if len(_plain(unquoted)) >= MIN_EVIDENCE_CHARS:
-            unquoted_ctx = _plain(item["title"] + "\n" + unquoted)
-            if not any(_plain(quote) in unquoted_ctx for quote in evidence):
-                raise AnalysisError(
-                    "Mailing-list reply draft must cite unquoted author text, not only quoted history",
-                    code="writer.quoted_only_evidence",
-                )
-            impact_context = unquoted_ctx
+        unquoted_ctx = _plain(unquoted_mail_text(item["content"]))
+        if not any(_plain(quote) in unquoted_ctx for quote in evidence):
+            raise AnalysisError(
+                "Mailing-list reply draft must cite unquoted author text, not only quoted history",
+                code="writer.quoted_only_evidence",
+            )
+        impact_context = unquoted_ctx
     if any(has_shouting_caps(result.get(key, "")) for key in ("title", "summary", "update")):
         raise AnalysisError("Model draft contains all-caps shouting")
     # The impact sentence may restate only numbers and versions from the title, content or comment
@@ -536,7 +534,7 @@ def _writer_schema(bounded: dict, base_schema: dict = SCHEMA, *, prior: dict | N
         # including the first title, unquoted reply text, and the last supplied comment.
         unquoted_raw = bounded.get("unquoted_content")
         if isinstance(unquoted_raw, str) and unquoted_raw:
-            unquoted_plain = _plain(bounded["title"] + "\n" + unquoted_raw)
+            unquoted_plain = _plain(unquoted_raw)
             priority = [exc for exc in excerpts if _plain(exc) in unquoted_plain][: MAX_EVIDENCE_CHOICES // 2]
             kept_set = set(priority)
             rest = [exc for exc in excerpts if exc not in kept_set]

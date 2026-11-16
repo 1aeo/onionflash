@@ -689,3 +689,43 @@ def test_mailing_list_blockquote_unquoted_mail_text_and_sender_domain_guards(mon
         reply_item,
     )
     assert kept_num["why_it_matters"] == "The post gives three corrections on buffer allocation."
+
+    # Short unquoted replies (< MIN_EVIDENCE_CHARS) still reject quoted-only evidence.
+    short_reply = {**reply_item, "content": "ACK.\n> Our 42 relays are failing right now."}
+    with pytest.raises(AnalysisError, match="unquoted author text") as short_err:
+        validate_analysis(
+            analysis(
+                title="Relay operator replies on tor-dev",
+                summary="A relay operator acknowledged the message.",
+                evidence=["> Our 42 relays are failing right now."],
+            ),
+            short_reply,
+        )
+    assert short_err.value.code == "writer.quoted_only_evidence"
+
+    # Inherited reply subjects neither satisfy unquoted author evidence nor license quoted numbers.
+    subject_reply = {
+        **reply_item,
+        "title": "Re: 42 relays are failing right now",
+        "content": "That count is incorrect and should not be cited.\n> 42 relays are failing right now.",
+    }
+    with pytest.raises(AnalysisError, match="unquoted author text") as subj_err:
+        validate_analysis(
+            analysis(
+                title="Relay operator disputes count",
+                summary="A relay operator says the count is incorrect.",
+                evidence=["Re: 42 relays are failing right now"],
+            ),
+            subject_reply,
+        )
+    assert subj_err.value.code == "writer.quoted_only_evidence"
+    subj_checked = validate_analysis(
+        analysis(
+            title="Relay operator disputes count",
+            summary="A relay operator says the count is incorrect.",
+            why_it_matters="The post says 42 relays are failing.",
+            evidence=["That count is incorrect and should not be cited."],
+        ),
+        subject_reply,
+    )
+    assert subj_checked["why_it_matters"] == ""

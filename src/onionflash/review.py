@@ -110,10 +110,11 @@ stronger certainty.
 Evaluate every criterion separately (no average score); any defect you plan to revise,
 hold or skip MUST fail its criterion below before verdict:
 source_support: every factual assertion is stated or faithfully paraphrased in the packet.
-When a packet source has unquoted_content, title, summary and why_it_matters MUST be
-grounded in unquoted_content (the sender's own reply): FAIL source_support whenever title
-or summary centers on claims, requests, relay counts or participants ('On ... wrote:' or
-'>' lines) absent from unquoted_content, and rewrite from unquoted_content or hold.
+When a packet source has unquoted_content, any title, summary or why_it_matters claim
+attributed to that source MUST be grounded in its unquoted_content (the sender's own reply):
+FAIL source_support whenever such a claim, request, relay count or participant ('On ... wrote:'
+or '>' lines) is absent from unquoted_content, and rewrite from unquoted_content or hold.
+Claims supported by other packet sources need only that source's support.
 Attribution alone cannot make an unsupported consequence true.
 A non-empty why_it_matters passes only when it closely restates one unquoted packet
 sentence stating this event's impact or an action it asks readers to take, adding no
@@ -250,10 +251,10 @@ with repair null.
 """
 VERIFY_PROMPT = """You are performing an adversarial evidence audit, not endorsing a draft.
 Falsify each claim, speaker attribution, role label and classification by locating exact
-support in the packet (and inside unquoted_content whenever a packet source provides
-unquoted_content — reject any draft centered on >-quoted text absent from unquoted_content);
-distinguish an emergency/useful fix from an explicit operator instruction, a bugfix from a
-security fix, and merged code from a release.
+support in the packet (when a claim is attributed to a packet source with unquoted_content,
+require support in that source's unquoted_content rather than >-quoted text; claims supported
+by other packet sources need only that source's support); distinguish an emergency/useful fix
+from an explicit operator instruction, a bugfix from a security fix, and merged code from a release.
 Check title, why_it_matters and classification arrays as carefully as summary.
 
 """ + SYSTEM_PROMPT + """
