@@ -248,15 +248,16 @@ def test_announcement_repost_routes_to_reviewed_release_and_adds_only_citation(c
     assert {s["url"] for s in current["sources"]} == {release["url"], repost["url"]}
 
 
-def test_release_announcement_cannot_route_to_a_different_released_version(context):
+@pytest.mark.parametrize("summary", ["Tor 0.4.9.18 is available.", "Tor 0.4.9.18 supersedes Tor 0.4.9.17."])
+def test_release_announcement_cannot_route_to_a_different_released_version(context, summary):
     cfg, store = context
-    older = item(kind="feed", authority="official", title="Tor 0.4.9.17 released",
-                 url="https://example.org/release17", content="Tor 0.4.9.17 is available.")
+    older = item(kind="feed", authority="official", title="Tor 0.4.9.18 released",
+                 url="https://example.org/release18", content=summary)
     target = _publish(store, older, analysis(title=older["title"], summary=older["content"],
                       why_it_matters="", category="release", tags=["release"], state="released",
                       confidence="confirmed", evidence=[older["content"]]))
-    newer = item(kind="feed", authority="official", title="Tor 0.4.9.18 released",
-                 url="https://example.org/release18", content="Tor 0.4.9.18 is available.")
+    newer = item(kind="feed", authority="official", title="Tor 0.4.9.17 released",
+                 url="https://example.org/release17", content="Tor 0.4.9.17 is available.")
     draft = analysis(title=newer["title"], summary=newer["content"], why_it_matters="", category="release",
                      tags=["release"], state="released", confidence="confirmed", evidence=[newer["content"]])
     outcome = run_gate(cfg, store, pending(store, newer), Writer(draft),

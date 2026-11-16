@@ -488,7 +488,8 @@ def _can_route(candidate: dict, prepared: dict, result: dict, target_id) -> bool
         return False
     release_hint = prepared["row"].get("cluster_key") or ""
     if release_hint.startswith("release:") and target.get("state") in {"tagged", "released"}:
-        versions = release_mentions({"title": target.get("title", ""), "content": target.get("summary", "")})
+        versions = (release_mentions({"title": target.get("title", "")})
+                    or release_mentions({"content": target.get("summary", "")}))
         if versions and release_hint not in versions:
             return False
     cand_products = set(candidate.get("products") or ())
