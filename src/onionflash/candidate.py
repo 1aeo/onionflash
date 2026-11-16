@@ -11,7 +11,7 @@ from .analyze import MIN_EVIDENCE_CHARS
 from .comments import analysis_context, is_budget_clipped_prefix, note_key, prior_notes
 from .llm import strip_unreleased_tag, unquoted_text
 from .schema import SEMANTIC_FIELDS, UPDATE_FIELDS
-from .util import (after, digest, gitlab_refs, gitlab_url_variants, normalize_evidence,
+from .util import (after, digest, gitlab_refs, gitlab_url_variants, item_identity, normalize_evidence,
                    release_mentions, safe_canonical_url, saved_object, story_cluster, thread_subject)
 
 
@@ -511,6 +511,12 @@ def associate(db, row: dict) -> tuple[dict | None, str | None]:
     payload = row.get("payload")
     item = saved_object(payload.encode("utf-8") if isinstance(payload, str) else payload) if isinstance(payload, (str, bytes)) else None
     cluster = row["cluster_key"]
+    release_tag = isinstance(item, dict) and item.get("kind") == "tag" and cluster.startswith("release:")
+
+    def tagged_or_released(story):
+        public = saved_object(story["payload"].encode("utf-8") if isinstance(story["payload"], str) else story["payload"])
+        return isinstance(public, dict) and public.get("state") in {"tagged", "released"}
+
     # Release versions are coverage hints for new prose, not an automatic article
     # assignment. Explicit prior mappings and permanent aliases still take precedence.
     if (isinstance(item, dict) and item.get("kind") == "feed" and cluster.startswith("release:")
@@ -522,14 +528,11 @@ def associate(db, row: dict) -> tuple[dict | None, str | None]:
                 return legacy, "source"
         cluster = story_cluster(item)
     matched, how = _lookup_story(db, cluster_key=cluster)
-    if matched is not None:
+    if matched is not None and (not release_tag or how == "alias" or tagged_or_released(matched)):
         return matched, how
     cluster_matches = _mapped_stories(db, "cluster_key=?", cluster)
-    if isinstance(item, dict) and item.get("kind") == "tag" and cluster.startswith("release:"):
-        cluster_matches = [story for story in cluster_matches
-                           if isinstance(public := saved_object(story["payload"].encode("utf-8")
-                                                                if isinstance(story["payload"], str) else story["payload"]), dict)
-                           and public.get("state") in {"tagged", "released"}]
+    if release_tag:
+        cluster_matches = [story for story in cluster_matches if tagged_or_released(story)]
     if len(cluster_matches) == 1:
         return cluster_matches[0], "item_cluster"
     if len(cluster_matches) > 1:
@@ -704,6 +707,11 @@ def prepare(
     item = json.loads(row["payload"])
     existing, how = associate(db, row)
     cluster = existing["cluster_key"] if existing else (story_cluster(item) if item.get("kind") == "feed" else row["cluster_key"])
+    if (existing is None and item.get("kind") == "tag" and cluster.startswith("release:")
+            and db.execute("SELECT 1 FROM stories WHERE cluster_key=?", (cluster,)).fetchone() is not None):
+        # A legacy response article can occupy this release key without covering
+        # the tag. Review the tag separately while preserving the older article.
+        cluster = "url:" + digest(item_identity(item))
     story_id = existing["id"] if existing else digest(cluster)[:24]
     if existing is None and editorial.retired(db, story_id=story_id, cluster_key=cluster) is not None:
         raise editorial.RetiredStory("Story is retired")

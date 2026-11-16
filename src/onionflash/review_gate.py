@@ -21,7 +21,7 @@ from .analyze import cache_key
 from .llm import AnalysisError, CompletionDeferred, RequestObserver
 from .util import (
     DIRAUTH_GITLAB_USERS, _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, is_dirauth_item,
-    is_hackerone_item, now_iso, release_mentions, saved_object, thread_subject,
+    is_hackerone_item, item_cluster, now_iso, release_mentions, saved_object, thread_subject,
 )
 
 REVIEW_STATE_VERSION = 2
@@ -488,9 +488,12 @@ def _can_route(candidate: dict, prepared: dict, result: dict, target_id) -> bool
         return False
     release_hint = prepared["row"].get("cluster_key") or ""
     if release_hint.startswith("release:") and target.get("state") in {"tagged", "released"}:
-        versions = (release_mentions({"title": target.get("title", "")})
-                    or release_mentions({"content": target.get("summary", "")}))
-        if versions and release_hint not in versions:
+        products = target.get("products") or ()
+        versions = release_mentions({"title": target.get("title", "")})
+        target_release = versions[0] if versions else item_cluster({
+            "kind": "feed", "title": target.get("title", ""), "content": "", "url": "",
+            "product": products[0] if len(products) == 1 else "network"})
+        if target_release != release_hint:
             return False
     cand_products = set(candidate.get("products") or ())
     if isinstance(item.get("product"), str) and item["product"]:

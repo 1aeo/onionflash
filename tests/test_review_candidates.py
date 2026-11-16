@@ -16,8 +16,9 @@ BODY = "The operator reports that old directory-authority keys cannot be trusted
 
 
 def pending(store, incoming=None, observed=DATE, *, target=None):
-    store.ingest(incoming or item(content=BODY), observed)
-    row = store.pending(1, observed)[0]
+    incoming = incoming or item(content=BODY)
+    store.ingest(incoming, observed)
+    row = dict(store.db.execute("SELECT * FROM items WHERE id=?", (incoming["id"],)).fetchone())
     if target is not None:
         # These packet/commit tests start after same-story review selected its target.
         with store.db:
@@ -256,8 +257,7 @@ def test_stable_timeline_identity_cannot_label_new_commit_bytes_with_old_citatio
             changed_row = dict(store.db.execute("SELECT * FROM items WHERE id=?", (timeline["id"],)).fetchone())
             store.record_analysis(changed_row, analysis(), "later-snapshot", LATER)
     tag = item(kind="tag", title="tor-0.4.9.16", url="https://example.org/tag/0.4.9.16", content="", updated_at=LATER)
-    store.ingest(tag, LATER)
-    row = dict(store.db.execute("SELECT * FROM items WHERE id=?", (tag["id"],)).fetchone())
+    row = pending(store, tag, LATER, target=old["id"])
     prepared = store.prepare_candidate(row, tag_update(json.loads(row["payload"]), old), LATER)
     cited_urls = {s["url"] for s in prepared["candidate"]["sources"]}
     assert old_url in cited_urls and new_url not in cited_urls
@@ -369,7 +369,7 @@ def test_kept_prose_keeps_its_writer_window_and_an_incoming_issue_keeps_every_no
         publish(store, release(name, f"Mirror {name} of the announcement. " * 75),
                 update_analysis(update=f"Mirror {name} posted.", confidence="confirmed",
                                 evidence=[f"Mirror {name} of the announcement."]), key=name, target=original["id"])
-    row = pending(store, incoming, LATER)
+    row = pending(store, incoming, LATER, target=original["id"])
     prepared = store.prepare_candidate(row, update_analysis(update="Release tracking notes updated.",
                                                             confidence="confirmed", evidence=["Release tracking notes"]), LATER)
     assert prepared["payload"]["editorial_item"] != row["id"] and not prepared["packet"]["missing_sources"]
