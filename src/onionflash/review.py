@@ -8,7 +8,7 @@ import re
 
 from .analyze import SCHEMA as DRAFT_SCHEMA
 from .llm import (AnalysisError, CompletionClient, apply_label_limits, has_malformed_tor_version,
-                  has_shouting_caps, is_complete_sentence, label_limits, repair_schema, validate_text)
+                  generation_options, has_shouting_caps, is_complete_sentence, label_limits, repair_schema, validate_text)
 from .render import prepare_story
 from .review_evidence import EVIDENCE_POLICY, evidence_context
 from .schema import LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STORY_ID_RE, UPDATE_CHARS
@@ -623,18 +623,28 @@ class ReviewLimitReached(ReviewError):
 
 
 OUTPUT_TOKENS = 2200  # room for every criterion and a repair
+REVIEW_SAMPLING = {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0,
+                   "presence_penalty": 1.5, "repetition_penalty": 1.0}
+NATIVE_SAMPLING = frozenset({"top_k", "min_p", "repetition_penalty"})
 
 
 def _llm(config: dict) -> dict:
     """The writer's endpoint and transport policy, timeout included, with the review model."""
-    return {**config["llm"], "model": config["review"]["model"] or config["llm"]["model"], "max_output_tokens": OUTPUT_TOKENS}
+    settings = {**config["llm"], "model": config["review"]["model"] or config["llm"]["model"],
+                "max_output_tokens": OUTPUT_TOKENS}
+    if not settings["enable_thinking"]:
+        settings.update(REVIEW_SAMPLING)
+        if not settings["send_chat_template_kwargs"]:
+            for name in NATIVE_SAMPLING:
+                settings.pop(name, None)
+    return settings
 
 
 def policy_hash(config: dict) -> str:
     """The prompt, schema and model identity; the source and binding hashes bind the packet and coverage."""
     llm = _llm(config)
-    identity = {key: llm[key] for key in ("model", "base_url", "fallback_base_urls", "max_output_tokens",
-                                         "enable_thinking", "send_chat_template_kwargs")}
+    identity = {key: llm[key] for key in ("model", "base_url", "fallback_base_urls")}
+    identity["generation"] = generation_options(llm)
     return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, ROUTING_PROMPT, UPDATE_SYSTEM_PROMPT,
                    UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT,
                    SCHEMA, UPDATE_REPAIR, VALIDATION_ERRORS, REASON_REPETITION_POLICY,

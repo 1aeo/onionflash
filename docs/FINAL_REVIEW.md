@@ -332,6 +332,13 @@ needs enough context for a full packet. Requests also obey the shared run
 deadline. The coverage background is bounded separately; truncation is explicit
 and never proves the absence of older coverage.
 
+Non-thinking review requests use a fixed sampling profile instead of greedy
+decoding: temperature 0.7, top-p 0.8 and presence penalty 1.5. Endpoints using
+chat-template extensions also receive top-k 20, min-p 0 and repetition penalty 1;
+standard API requests omit those native extensions. Writer and link-check sampling
+remain independent. Every effective review generation option participates in the
+policy identity, so an earlier profile's approvals cannot be reused unchanged.
+
 The controlled evaluation does not collect, open the application database or
 publish. It takes the gate's steps, from the first review through every repair
 and verification, records each review privately, and scores the final candidate
