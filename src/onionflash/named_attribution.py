@@ -10,7 +10,7 @@ from .util import safe_canonical_url
 
 # Advance when extraction or source matching changes; review policy binds this.
 NAMED_ATTRIBUTION_POLICY = {
-    "version": 5, "normalization": "NFC-lower-whole-tokens-optional-at-and-organization-article", "maximum_name_words": 4,
+    "version": 6, "normalization": "NFC-lower-whole-tokens-optional-at-and-organization-article", "maximum_name_words": 4,
     "patterns": "named-reporting-clause-or-according-to", "source_scope": "packet-text-unquoted-reply-author-and-sender-domain",
     "repair_context": "rematerialized-missing-name-literals",
 }
@@ -21,7 +21,7 @@ _REPORTING = re.compile(
 _ACCORDING = re.compile(r"\baccording\s+to\s+", re.I)
 _FENCE = re.compile(r"```.*?(?:```|\Z)", re.S)
 _INLINE_CODE = re.compile(r"`([^`\n]*)`")
-_EMPHASIS_PART = re.compile(r"```.*?(?:```|\Z)|`[^`\n]*`|\*+|_+", re.S)
+_EMPHASIS_PART = re.compile(r"```.*?(?:```|\Z)|`[^`]*`|\*+|_+", re.S)
 _URL = re.compile(r"https?://\S+", re.I)
 _DOCUMENT_REFERENCE = re.compile(r"(?:(?:IETF\s+)?RFC\s*[- ]?\d+\b|(?:CVE|TROVE)-\d{4}-\d+\b)", re.I)
 _NARRATIVE_DASH = re.compile(r"—(?=\s*(?:[\"'“”‘’]|who\b))")
@@ -125,7 +125,8 @@ def _emphasis_text(text: str, *, literal_tokens=()) -> str:
     previous = 0
     for index, part in enumerate(parts):
         marker = part[0]
-        if "\n" in text[previous:part.start()]:
+        gap = text[previous:part.start()].replace("\r\n", "\n").replace("\r", "\n")
+        if re.search(r"\n[ \t]*\n", gap):
             opened.clear()
         previous = part.end()
         if marker.startswith("`"):

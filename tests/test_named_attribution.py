@@ -588,3 +588,25 @@ def test_literal_account_in_source_prose_does_not_prove_its_unwrapped_name():
     assert missing_named_attributions(candidate("Alice reports that the issue remains."), sources)
     assert not missing_named_attributions(candidate("@_Alice_ reports that the issue remains."), sources)
     assert missing_named_attributions(candidate("Alice **Smith** reported that the issue remains."), sources)
+
+
+@pytest.mark.parametrize("marker", ["*", "**", "***", "_", "__", "___"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_balanced_emphasis_preserves_a_name_across_a_soft_line_break(marker, newline):
+    text = f"{marker}Juno{newline}Vale{marker} reported that clients fail."
+    flags = missing_named_attributions(candidate(text), packet(author="other"))
+    assert len(flags) == 1
+    assert flags[0]["name"].split() == ["Juno", "Vale"]
+    assert flags[0]["finding"] == "literal_name_absent_from_source"
+    assert not missing_named_attributions(candidate(text), packet(author="Juno Vale"))
+    rewritten = candidate(text, field="summary")
+    assert missing_named_attributions(rewritten, packet(author="other"), known_names=["Juno Vale"])
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_multiline_backtick_code_does_not_turn_into_an_emphasized_speaker(newline):
+    code = f"`**Juno{newline}Vale** reported that clients fail.`"
+    assert not missing_named_attributions(candidate(code), packet(author="other"))
+    outside = code + f" **Juno{newline}Vale** reported that clients fail."
+    flags = missing_named_attributions(candidate(outside), packet(author="other"))
+    assert len(flags) == 1 and flags[0]["name"].split() == ["Juno", "Vale"]
