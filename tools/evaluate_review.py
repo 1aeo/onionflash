@@ -107,10 +107,11 @@ def draft_cases(corpus: dict) -> list[dict]:
 
 
 def writer_item(source: dict) -> dict:
-    """The stored item a writer drafts from: authored passages are its notes, the rest its content."""
+    """Rebuild writer content and literal sender metadata from the source packet."""
     passages = source["passages"][1:]
-    return {key: source.get(key) for key in ("title", "kind", "authority", "product", "published_at", "updated_at",
+    return {key: source.get(key) for key in ("url", "title", "kind", "authority", "product", "published_at", "updated_at",
                                              "upstream_state")} | {
+        **{key: source[key] for key in ("author", "sender_domain") if source.get(key)},
         "labels": normalize_labels(source.get("labels")),
         "content": "\n\n".join(passage["text"] for passage in passages if "author" not in passage),
         "public_comments": [{"author": passage["author"], "created_at": passage["created_at"], "url": passage["url"],

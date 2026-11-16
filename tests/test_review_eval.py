@@ -7,8 +7,9 @@ import stat
 
 import pytest
 
-from helpers import DATE, ROOT, load_evaluator, scripted_completion, verdict
+from helpers import DATE, ROOT, FakeLLM, analysis, completion, item, load_evaluator, scripted_completion, verdict
 from onionflash import review_gate
+from onionflash.analyze import AnalysisError, Analyzer
 from onionflash.config import DEFAULTS
 from onionflash.review import CRITERIA, RELEASE_ISSUE, _packet_refs, final_holds, validate_review
 from onionflash.source_packet import build_packet
@@ -229,7 +230,7 @@ def test_authored_passages_match_build_packet():
         expanded = next(c for c in MOD.expand(RAW_PUBLIC) if c["packet"]["sources"][0]["url"] == src["url"])["packet"]["sources"][0]
         assert expanded["labels"] == built["sources"][0]["labels"] == expected_labels
         assert [list(p.items()) for p in expanded["passages"]] == [list(p.items()) for p in built["sources"][0]["passages"]]
-        assert MOD.writer_item(expanded) == {k: itm[k] for k in (*fields[1:], "labels", "content", "public_comments")}
+        assert MOD.writer_item(expanded) == {k: itm[k] for k in (*fields, "labels", "content", "public_comments")}
 
     closed_raw = copy.deepcopy(RAW_PUBLIC)
     closed_raw["packets"]["tor-41412-cross-cancellation-edited"]["sources"][0]["closed_at"] = "2026-10-07T17:16:54Z"
@@ -242,6 +243,40 @@ def test_authored_passages_match_build_packet():
     c_exp = next(c for c in MOD.expand(closed_raw) if c["packet"]["sources"][0]["url"] == c_src["url"])["packet"]["sources"][0]
     assert c_exp["closed_at"] == c_built["sources"][0]["closed_at"] == "2026-10-07T17:16:54Z"
     assert "closed_at" not in MOD.writer_item(c_exp)
+
+
+@pytest.mark.parametrize("quoted_only", [False, True])
+def test_draft_evaluation_preserves_native_mailing_list_reply_input(monkeypatch, quoted_only):
+    reply = "The new measurement covers a smaller sample than the earlier report."
+    quoted = "> The earlier participant reported failures across every measured relay."
+    incoming = item(
+        id="a" * 24, kind="feed", authority="project-sender", title="Re: Relay measurements",
+        url="https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev/thread/EXAMPLE/",
+        author="casey", sender_domain="example.org",
+        content=f"{reply}\n\nOn Monday, an earlier participant wrote:\n{quoted}",
+    )
+    packet, _ = build_packet(None, incoming, {"sources": [{"id": incoming["id"], "url": incoming["url"]}]},
+                             {"sources": []}, incoming["id"])
+    evaluated = MOD.writer_item(packet["sources"][0])
+    draft = analysis(title="A reply narrows the measurement sample", summary=reply,
+                     why_it_matters="", evidence=[quoted if quoted_only else reply])
+    config = copy.deepcopy(DEFAULTS)
+    config["llm"].update(base_url="https://model.example/v1", fallback_base_urls=[])
+    monkeypatch.setenv("ONIONFLASH_LLM_API_KEY", "synthetic-fixture-key")
+    payloads = []
+    for supplied in (incoming, evaluated):
+        with Analyzer(config) as writer:
+            writer.client = FakeLLM(completion(draft))
+            if quoted_only:
+                with pytest.raises(AnalysisError) as caught:
+                    writer.analyze(supplied)
+                assert caught.value.code == "writer.quoted_only_evidence"
+            else:
+                assert writer.analyze(supplied)["summary"] == reply
+            payloads.append(json.loads(writer.client.requests[0][1]["messages"][-1]["content"]))
+    assert payloads[0] == payloads[1]
+    assert payloads[1]["author"] == "casey" and payloads[1]["sender_domain"] == "example.org"
+    assert payloads[1]["unquoted_content"] == reply and quoted not in payloads[1]["unquoted_content"]
 
 
 def test_draft_mode_drafts_once_and_isolates_writer_diagnostics(evaluation, tmp_path, monkeypatch):
