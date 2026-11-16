@@ -697,6 +697,11 @@ def _pending_impact(record):
 def _finish_impact(audit, stage, candidate, prepared, record):
     origin = copy.deepcopy(audit["origin"])
     if audit["kind"] == "review":
+        waiting = pending_proposal(record)
+        if waiting is not None:
+            if origin["stage"] != "verification" or origin["candidate_hash"] != waiting["candidate_after_hash"]:
+                raise AnalysisError("Proposal verification identity changed", code="app.damaged_job")
+            waiting["disposition"] = "checked_" + origin["result"]["verdict"]
         record["reviews"].append(origin)
         return next_step(record["reviews"], candidate, prepared, impact_audits=record["impact_audits"])
     effective = _effective_impact_repair(audit, candidate, prepared)
@@ -1390,12 +1395,13 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
     if waiting is not None:
         if entry["stage"] != "verification" or entry["candidate_hash"] != waiting["candidate_after_hash"]:
             raise AnalysisError("Proposal verification identity changed", code="app.damaged_job")
-        waiting["disposition"] = "checked_" + entry["result"]["verdict"]
     entry = {**entry, **_context(prepared, record["policy_hash"])}
     planned = next_step([*record["reviews"], entry], candidate, prepared,
                         impact_audits=record["impact_audits"], plan_impact=True)
     if planned[0] == "impact_audit":
         return _start_impact("review", entry, reviewer, stage, candidate, planned[1], prepared, record, requests)
+    if waiting is not None:
+        waiting["disposition"] = "checked_" + entry["result"]["verdict"]
     record["reviews"].append(entry)
     action, value = planned
     if action in {"verify", "repair"} and digest(value) != digest(candidate) and digest(value) in seen:

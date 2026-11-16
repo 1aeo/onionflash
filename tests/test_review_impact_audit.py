@@ -448,10 +448,12 @@ def test_existing_validation_reask_then_impact_audit_uses_one_correction_slot(co
     assert saved["reviews"][-1]["request"] == 4
 
 
-def test_unsent_audit_admission_rollback_remains_pending_and_resumes_without_spending(context, monkeypatch):
+@pytest.mark.parametrize("waiting_proposal", [False, True])
+def test_unsent_audit_admission_rollback_remains_pending_and_resumes_without_spending(context, monkeypatch, waiting_proposal):
     cfg, store = context
     row = pending(store)
-    checker = reviewer(cfg, proposed("review"))
+    leading = [inconsistent({"summary": SUMMARY})] if waiting_proposal else []
+    checker = reviewer(cfg, *leading, proposed("review"))
     clock = [0]
     checker.clock, checker.deadline = lambda: clock[0], 10
     save = review_gate._save
@@ -466,16 +468,18 @@ def test_unsent_audit_admission_rollback_remains_pending_and_resumes_without_spe
         scoped.setattr(review_gate, "_save", expire_after_reservation)
         deferred = run(cfg, store, row, writer(), checker)
     assert deferred["status"] == "deferred" and deferred["budget_reached"]
-    assert checker.calls == len(checker.client.requests) == 1
+    assert checker.calls == len(checker.client.requests) == 1 + len(leading)
     saved = record(store)
-    assert saved["request_budget"]["reserved"] == 1
+    assert saved["request_budget"]["reserved"] == 1 + len(leading)
+    if waiting_proposal:
+        assert saved["untrusted_proposals"][0]["disposition"] == "pending"
     assert saved["impact_audits"][0]["status"] == "pending"
     assert saved["impact_audits"][0]["request"] is None
     assert saved["impact_audits"][0]["result"] is saved["impact_audits"][0]["error"] is None
     resumed = reviewer(cfg, assessed(), verdict())
     assert run(cfg, store, row, Writer(), resumed)["status"] == "published"
     assert resumed.calls == 2 and schemas(resumed) == ["onionflash_impact_audit", "onionflash_review"]
-    assert saved_audit(store)["request_budget"]["reserved"] == 3
+    assert saved_audit(store)["request_budget"]["reserved"] == 3 + len(leading)
 
 
 def test_latest_update_repair_leaves_prior_impact_outside_audit_scope(context):
@@ -583,3 +587,40 @@ def test_corrupted_impact_audit_holds_without_editing_verifying_or_reasking(cont
     retained = saved.get("candidate", json.loads(job(store)["envelope_json"])["candidate"])
     assert retained["why_it_matters"] == IMPACT and not store.stories()
     assert not review_gate.approval(cfg, store, row["id"])["eligible"]
+
+
+@pytest.mark.parametrize("phase", ["pending", "sent", "complete"])
+def test_pending_proposal_verification_audit_resumes_without_losing_its_origin(context, monkeypatch, phase):
+    cfg, store = context
+    row = pending(store)
+    save = review_gate._save
+
+    def checkpoint(*args, **kwargs):
+        save(*args, **kwargs)
+        audits = args[7].get("impact_audits", [])
+        if audits and audits[-1]["status"] == phase:
+            raise Interrupted(phase)
+
+    first = reviewer(cfg, inconsistent({"summary": SUMMARY}), proposed("review"), assessed(), verdict())
+    with monkeypatch.context() as patch:
+        patch.setattr(review_gate, "_save", checkpoint)
+        with pytest.raises(Interrupted, match=phase):
+            run(cfg, store, row, writer(), first)
+    saved = record(store)
+    assert saved["reviews"] == []
+    assert saved["impact_audits"][0]["origin"]["request"] == 2
+    next_replies = (assessed(), verdict()) if phase == "pending" else (verdict(),) if phase == "complete" else ()
+    resumed = reviewer(cfg, *next_replies)
+    result = run(cfg, store, row, Writer(), resumed)
+    assert result["status"] == ("held" if phase == "sent" else "published")
+    final = record(store) if phase == "sent" else saved_audit(store)
+    assert final["untrusted_proposals"][0]["disposition"] == "checked_revise"
+    assert final["reviews"][0]["request"] == 2
+    assert final["request_budget"]["reserved"] == (3 if phase == "sent" else 4)
+    assert resumed.calls == (2 if phase == "pending" else 1 if phase == "complete" else 0)
+    if phase == "sent":
+        assert not store.stories()
+    else:
+        assert final["reviews"][-1]["stage"] == "verification"
+        assert final["reviews"][-1]["request"] == 4
+        assert store.stories()[0]["why_it_matters"] == IMPACT
