@@ -672,17 +672,10 @@ def _impact_effective_candidate(audit, candidate, result):
 
 def _effective_impact_repair(audit, candidate, prepared):
     repair = _impact_repair(audit)
-    if (audit["before_hash"] != digest(candidate) or not _impact_clear(candidate, repair, prepared)
-            or digest(review.apply_repair(candidate, repair)) != audit["proposed_hash"]
-            or audit["input_hash"] != _impact_input_hash(candidate, prepared, audit["context"])):
+    if not _impact_clear(candidate, repair, prepared):
         raise review.ReviewError("Impact audit target changed")
-    if audit["status"] != "complete" or audit["result"]["outcome"] == "insufficient":
-        return None
-    expected = _impact_effective_candidate(audit, candidate, audit["result"])
-    effective = {key: copy.deepcopy(expected[key]) for key in review.EDITABLE if expected[key] != candidate[key]}
-    if audit["effective_hash"] != digest(expected):
-        raise review.ReviewError("Impact audit effective candidate changed")
-    return effective
+    return review.effective_impact_repair(audit, candidate, prepared["packet"],
+                                          context=_context(prepared, audit["context"]["policy_hash"]))
 
 
 def _pending_impact(record):

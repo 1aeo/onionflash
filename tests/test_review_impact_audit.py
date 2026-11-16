@@ -624,3 +624,67 @@ def test_pending_proposal_verification_audit_resumes_without_losing_its_origin(c
         assert final["reviews"][-1]["stage"] == "verification"
         assert final["reviews"][-1]["request"] == 4
         assert store.stories()[0]["why_it_matters"] == IMPACT
+
+
+@pytest.mark.parametrize("kind", ["review", "proposal"])
+@pytest.mark.parametrize("field", ["title", "summary"])
+def test_audited_effective_edits_keep_new_name_history_through_lowercase_rewrites(context, kind, field):
+    cfg, store = context
+    row = pending(store)
+    lowered = "The juno account remains unconfirmed."
+    repair = {"title": lowered} if field == "title" else {
+        "title": "The report describes the issue", "summary": lowered}
+    checker = reviewer(cfg,
+                       proposed(kind, title="Juno reports that clients fail"), assessed(),
+                       verdict("revise", repair=repair, criterion="actor_and_action"),
+                       verdict(), verdict("hold", criterion="actor_and_action"))
+    assert run(cfg, store, row, writer(), checker)["status"] == "held"
+    assert checker.calls == 5 and not store.stories()
+    saved = record(store)
+    prepared = json.loads(job(store)["envelope_json"])
+    assert review.attribution_names(prepared, saved) == ["Juno"]
+    flags = [{"field": field, "name": "Juno", "finding": "literal_name_absent_from_source"}]
+    assert payloads(checker)[3]["application_attribution_checks"] == flags
+    assert payloads(checker)[4]["application_attribution_checks"] == flags
+    assert saved["request_budget"]["reserved"] == 5
+    assert saved["request_budget"]["validation_reask"]["trigger"] == 4
+
+
+@pytest.mark.parametrize("damage", [None, "discarded", "context", "input", "effective", "origin", "policy"])
+def test_attribution_history_uses_only_observed_bound_impact_effects(context, monkeypatch, damage):
+    cfg, store = context
+    row = pending(store)
+    save = review_gate._save
+    pending_names = []
+
+    def checkpoint(*args, **kwargs):
+        save(*args, **kwargs)
+        prepared, audit_record = args[6], args[7]
+        audits = audit_record.get("impact_audits", [])
+        if audits and audits[-1]["status"] == "complete" and not audit_record["reviews"]:
+            pending_names.append(review.attribution_names(prepared, audit_record))
+        if args[4] == "verify" and audit_record["reviews"]:
+            raise Interrupted("effective edit saved")
+
+    checker = reviewer(cfg, proposed("review", title="Juno reports that clients fail"), assessed())
+    with monkeypatch.context() as patch:
+        patch.setattr(review_gate, "_save", checkpoint)
+        with pytest.raises(Interrupted, match="effective edit saved"):
+            run(cfg, store, row, writer(), checker)
+    assert pending_names == [[]] and checker.calls == 2
+    saved = record(store)
+    prepared = json.loads(job(store)["envelope_json"])
+    audit = saved["impact_audits"][0]
+    if damage == "discarded":
+        audit["status"] = "discarded_context"
+    elif damage == "context":
+        audit["context"]["coverage_hash"] = "0" * 64
+    elif damage == "input":
+        audit["input_hash"] = "0" * 64
+    elif damage == "effective":
+        audit["effective_hash"] = "0" * 64
+    elif damage == "origin":
+        audit["origin"]["result"]["repair"]["title"] = "A different report"
+    elif damage == "policy":
+        saved["policy_hash"] = "0" * 64
+    assert review.attribution_names(prepared, saved) == (["Juno"] if damage is None else [])

@@ -13,7 +13,8 @@ from .llm import (AnalysisError, CompletionClient, apply_label_limits, has_malfo
 from .render import prepare_story
 from .review_evidence import EVIDENCE_POLICY, evidence_context
 from .named_attribution import NAMED_ATTRIBUTION_POLICY, missing_named_attributions
-from .impact_audit import POLICY as IMPACT_AUDIT_POLICY
+from .impact_audit import (POLICY as IMPACT_AUDIT_POLICY, AuditError as ImpactAuditError,
+                          input_identity as impact_input_identity, validate as validate_impact_result)
 from .schema import LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STORY_ID_RE, UPDATE_CHARS
 from .util import canonical_url, digest, normalize_evidence
 
@@ -726,6 +727,47 @@ def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict
     return normalized
 
 
+def effective_impact_repair(audit, candidate, packet, *, context):
+    """Reconstruct only the effective edit bound to this observed audit context."""
+    origin = audit["origin"]
+    repair = origin["result"]["repair"] if audit["kind"] == "review" else origin["repair"]
+    proposed = apply_repair(candidate, repair)
+    if (audit["context"] != context or context["source_hash"] != digest(packet)
+            or audit["before_hash"] != digest(candidate)
+            or not candidate.get("why_it_matters") or repair.get("why_it_matters") != ""
+            or audit["proposed_hash"] != digest(proposed)
+            or audit["input_hash"] != digest([impact_input_identity(candidate, packet), context])):
+        raise ReviewError("Impact audit target changed")
+    if audit["status"] != "complete":
+        return None
+    result = validate_impact_result(audit["result"], packet)
+    if result["outcome"] == "insufficient":
+        return None
+    if result["outcome"] == "supported":
+        proposed["why_it_matters"] = candidate["why_it_matters"]
+    if audit["effective_hash"] != digest(proposed):
+        raise ReviewError("Impact audit effective candidate changed")
+    return {key: copy.deepcopy(proposed[key]) for key in EDITABLE if proposed[key] != candidate[key]}
+
+
+def _attribution_audit_context(prepared, proof, saved):
+    """Use the proof's retained assembly when an operator has newer coverage."""
+    bound = saved if saved.get("packet") == prepared["packet"] else prepared
+    if bound.get("mode", "story") != prepared.get("mode", "story"):
+        raise ReviewError("Attribution audit scope changed")
+    context = {"source_hash": digest(prepared["packet"]), "coverage_hash": digest(bound.get("coverage")),
+               "policy_hash": proof["policy_hash"]}
+    if "binding" in bound:
+        context["binding_hash"] = digest(bound["binding"])
+    elif "row" in bound and "payload" in bound:
+        context["binding_hash"] = digest([bound.get("mode", "story"), bound["row"], bound["payload"]])
+    else:
+        context["binding_hash"] = bound["binding_hash"]
+    if any(key in bound and bound[key] != value for key, value in context.items()):
+        raise ReviewError("Attribution audit binding changed")
+    return context
+
+
 def attribution_names(prepared: dict, record: dict | None = None) -> list[str]:
     """Rematerialize absent names from observed text, never as factual evidence.
 
@@ -766,8 +808,25 @@ def attribution_names(prepared: dict, record: dict | None = None) -> list[str]:
             if not repair or (not entry.get("accepted") if proposal else result.get("verdict") != "revise"):
                 continue
             try:
-                after = apply_repair(current, repair, update=update)
-            except ReviewError:
+                audit = next((a for a in proof.get("impact_audits", [])
+                              if a.get("status") != "discarded_context"
+                              and a.get("kind") == ("proposal" if proposal else "review")
+                              and a.get("origin", {}).get("request") == entry.get("request")), None)
+                if audit is not None:
+                    context = _attribution_audit_context(prepared, proof, saved)
+                    entry_context = entry.get("context") if proposal else {key: entry.get(key) for key in context}
+                    if update or entry_context != context or (not proposal and audit["origin"] != entry):
+                        continue
+                    repair = effective_impact_repair(audit, current, packet, context=context)
+                    if repair is None:
+                        continue
+                    after = apply_repair(current, repair) if repair else current
+                    if proposal and (entry.get("repair") != (repair or None)
+                                     or entry.get("candidate_after_hash") != digest(after)):
+                        continue
+                else:
+                    after = apply_repair(current, repair, update=update)
+            except (ReviewError, ImpactAuditError, KeyError, TypeError, ValueError, AttributeError):
                 continue
             if digest(after) in observed:
                 current = after
