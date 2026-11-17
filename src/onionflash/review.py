@@ -285,7 +285,10 @@ BEFORE setting technical_details's outcome, check candidate.title, summary and w
 for (a) unnormalized ALL-CAPS shouting (3+ consecutive uppercase non-acronym words) and
 (b) malformed C-Tor version claims such as an unattributed 0.3.17 or 0.4.17:
 FAIL technical_details on either defect. {_VERSION_EVIDENCE_RULE}
-news_value: judge the packet, not only the candidate. First, when prior_story is null,
+news_value: judge the event's eligibility from the complete packet and its source
+metadata. Candidate omissions or misstatements alone do not make that event non-news;
+assess material defects under the relevant factual criteria and repair from the packet,
+without requiring every optional triage detail. First, when prior_story is null,
 compare source dates (never the current date): if the newest dated development
 (published_at, merge date, newest public comment, or closing) is more than 14 days before
 updated_at, fail news_value (verdict skip), unless source authority is hackerone, a gitlab_issue in the
@@ -298,7 +301,8 @@ changed default, shipped protocol/defense milestone, merged fix for a remotely t
 security defect, or systematic empirical network measurements. Disclosed
 HackerOne reports (authority=hackerone or a gitlab_issue citing hackerone.com/reports/)
 pass news_value when newly disclosed even if maintainers rate severity low or dispute DoS
-impact, provided maintainer triage is included. GitLab items with authority=dirauth-operator
+impact, provided relevant maintainer triage is supplied in the packet.
+GitLab items with authority=dirauth-operator
 or labeled Directory Authority (dirauth) reporting authority IP/key/host changes,
 consensus/voting anomalies, operational issues or daemon bugs/warnings on authority hosts
 pass news_value, while administrative chores, typo fixes or off-topic remarks fail.

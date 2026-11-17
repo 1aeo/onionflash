@@ -125,6 +125,41 @@ def test_insufficient_impact_can_only_be_cleared_by_a_valid_repair(monkeypatch, 
     assert repaired == {**public, "why_it_matters": ""}
 
 
+@pytest.mark.parametrize("verification", [False, True])
+def test_story_news_eligibility_uses_packet_triage_without_changing_the_candidate(monkeypatch, verification):
+    public = candidate(summary="The report describes a bounded parsing issue.", why_it_matters="")
+    source = packet()
+    source["sources"][0].update(kind="gitlab_issue", authority="development")
+    source["sources"][0]["passages"].append({
+        "id": "S1:P3", "author": "Morgan", "text": "The proposed correction addresses the narrow issue."})
+    original = copy.deepcopy((public, source))
+    checker = reviewer(monkeypatch, completion(verdict()))
+    checker.review(public, source, verification=verification)
+    request = checker.client.requests[0][1]
+    payload = json.loads(request["messages"][1]["content"])
+    prompt = " ".join(request["messages"][0]["content"].split())
+    assert "judge the event's eligibility from the complete packet and its source metadata" in prompt
+    assert "Candidate omissions or misstatements alone do not make that event non-news" in prompt
+    assert "assess material defects under the relevant factual criteria and repair from the packet" in prompt
+    assert "without requiring every optional triage detail" in prompt
+    assert "provided relevant maintainer triage is supplied in the packet" in prompt
+    assert "provided maintainer triage is included" not in prompt
+    assert "more than 14 days before" in prompt
+    assert payload["candidate"] == public and payload["packet"] == source
+    assert (public, source) == original
+    assert payload["packet"]["sources"][0]["authority"] == "development"
+
+
+@pytest.mark.parametrize("verification", [False, True])
+def test_story_triage_clarification_does_not_change_update_eligibility(monkeypatch, verification):
+    _, _, _, body, payload = captured(monkeypatch, update=True, verification=verification)
+    prompt = " ".join(body["messages"][0]["content"].split())
+    assert "provided relevant maintainer triage is supplied in the packet" not in prompt
+    assert 'Keep news_value "pass" whenever the underlying published story remains Tor news' in prompt
+    assert "candidate.title, summary, why_it_matters and updates[:-1] are read-only" in prompt
+    assert payload["review_scope"] == "latest_update"
+
+
 def test_impact_remains_clear_only_and_readonly_for_update_repairs(monkeypatch):
     public, _, _, body, _ = captured(monkeypatch)
     schema = body["response_format"]["json_schema"]["schema"]
