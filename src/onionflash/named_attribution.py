@@ -10,8 +10,8 @@ from .util import safe_canonical_url
 
 # Advance when extraction or source matching changes; review policy binds this.
 NAMED_ATTRIBUTION_POLICY = {
-    "version": 6, "normalization": "NFC-lower-whole-tokens-optional-at-and-organization-article", "maximum_name_words": 4,
-    "patterns": "named-reporting-clause-or-according-to", "source_scope": "packet-text-unquoted-reply-author-and-sender-domain",
+    "version": 7, "normalization": "NFC-lower-whole-tokens-optional-at-and-organization-article", "maximum_name_words": 4,
+    "patterns": "named-reporting-clause-according-to-or-possessive-report", "source_scope": "packet-text-unquoted-reply-author-and-sender-domain",
     "repair_context": "rematerialized-missing-name-literals",
 }
 _REPORTING = re.compile(
@@ -19,8 +19,17 @@ _REPORTING = re.compile(
     r"claims|claimed|explains|explained|warns|warned|confirms|confirmed)\b"
     r"(?:\s+that\b|\s*[:,]|\s+[\"'“”‘’])", re.I)
 _ACCORDING = re.compile(r"\baccording\s+to\s+", re.I)
+_POSSESSIVE_REPORT = re.compile(
+    r"['’]s\s+(?:reports?|comments?|statements?|analysis|analyses)\b|"
+    r"['’]s\s+account(?=\s+(?:of|describes?|states?|says?|explains?|claims?|reports?)\b)", re.I)
+# Calendar possession does not identify a speaker. Keep this ambiguity rule
+# local to possessive reports rather than changing ordinary named clauses.
+_CALENDAR_OWNER = frozenset("""monday tuesday wednesday thursday friday saturday sunday
+january february march april may june july august september october november december""".split())
+_POSSESSIVE_PREFIX = frozenset("""apparently reportedly allegedly presumably possibly perhaps
+following regarding concerning despite considering""".split())
 _FENCE = re.compile(r"```.*?(?:```|\Z)", re.S)
-_INLINE_CODE = re.compile(r"`([^`\n]*)`")
+_INLINE_CODE = re.compile(r"`((?:(?!\n[ \t]*\n)[^`\x00])*)`")
 _EMPHASIS_PART = re.compile(r"```.*?(?:```|\Z)|`[^`]*`|\*+|_+", re.S)
 _URL = re.compile(r"https?://\S+", re.I)
 _DOCUMENT_REFERENCE = re.compile(r"(?:(?:IETF\s+)?RFC\s*[- ]?\d+\b|(?:CVE|TROVE)-\d{4}-\d+\b)", re.I)
@@ -117,8 +126,9 @@ def _emphasis_text(text: str, *, literal_tokens=()) -> str:
     """Remove balanced word-boundary emphasis, retaining code and literal handles."""
     # An exact supplied account token takes precedence over ambiguous italic
     # syntax. Preserve its entire lexical span, never an inferred alias.
+    accounts = {token + suffix for token in literal_tokens for suffix in ("", "'s", "’s")}
     protected = {index for word in _tokens(text)
-                 if _normalized(word.value).lstrip("@") in literal_tokens
+                 if _normalized(word.value).lstrip("@") in accounts
                  for index in range(word.start(), word.end())}
     parts = list(_EMPHASIS_PART.finditer(text))
     opened, removed = [], set()
@@ -191,10 +201,51 @@ def _name_word(value: str) -> bool:
     return first.isupper() or (not first.isascii() and first.isalpha() and first.lower() == first.upper())
 
 
+def _preceding_name(text: str, words: list[_Word], end: int, *, boundaries=(), same_paragraph=False) -> str | None:
+    """Read a bounded whole name immediately before a reporting construction."""
+    prior = [word for word in words if word.end() <= end]
+    if (not prior or not prior[-1].supported or text[prior[-1].end():end].strip()
+            or not (_name_word(prior[-1][0]) or prior[-1][0].casefold() in _ORGANIZATION_WORDS)):
+        return None
+    selected = [prior[-1]]
+    for word in reversed(prior[:-1]):
+        gap = text[word.end():selected[0].start()]
+        if gap.strip() or (same_paragraph and re.search(r"\n[ \t]*\n", gap)):
+            break
+        if word.value.casefold() in boundaries:
+            break
+        if not word.supported:
+            if not _numeric_boundary(word):
+                selected = []
+            break
+        if len(selected) >= NAMED_ATTRIBUTION_POLICY["maximum_name_words"]:
+            if _name_word(word[0]) or word[0].casefold() in _ORGANIZATION_WORDS:
+                selected = []
+            break
+        if not (_name_word(word[0]) or word[0].casefold() in _ORGANIZATION_WORDS or word[0].casefold() in _CONNECTORS):
+            break
+        selected.insert(0, word)
+    while selected and selected[0][0].casefold() in _CONNECTORS:
+        selected.pop(0)
+    if selected:
+        prefix = [word for word in prior if word.end() <= selected[0].start()]
+        article = (prefix and prefix[-1][0].casefold() in {"a", "an", "the"}
+                   and not text[prefix[-1].end():selected[0].start()].strip()
+                   and not (same_paragraph and re.search(r"\n[ \t]*\n", text[prefix[-1].end():selected[0].start()])))
+        if article and selected[-1][0].casefold() not in _ORGANIZATION_WORDS:
+            return None
+    if selected and not _DOCUMENT_REFERENCE.match(text, selected[0].start()) and any(_name_word(word[0]) for word in selected):
+        return text[selected[0].start():selected[-1].end()]
+    return None
+
+
 def _names(text: str, *, literal_tokens=()) -> list[str]:
     # Code examples are not speaker attributions. Quoted prose remains a claim
     # and is checked; a quotation cannot create source evidence for its speaker.
-    text = _FENCE.sub(lambda match: " " * len(match[0]), unicodedata.normalize("NFC", text))
+    text = unicodedata.normalize("NFC", text).replace("\r\n", "\n").replace("\r", "\n")
+    # A fenced block cannot join unmatched inline markers on either side.
+    # Keep a lexical barrier while removing its contents from attribution checks.
+    text = _FENCE.sub(lambda match: "\x00" * len(match[0]), text)
     text = _emphasis_text(text, literal_tokens=literal_tokens)
     text = _INLINE_CODE.sub(lambda match: " " + match[1] + " " if _single_token(match[1])
                             else " " * len(match[0]), text)
@@ -207,35 +258,15 @@ def _names(text: str, *, literal_tokens=()) -> list[str]:
     words = _tokens(text)
     found = []
     for verb in _REPORTING.finditer(triggers):
-        prior = [word for word in words if word.end() <= verb.start()]
-        if (not prior or not prior[-1].supported or text[prior[-1].end():verb.start()].strip()
-                or not (_name_word(prior[-1][0]) or prior[-1][0].casefold() in _ORGANIZATION_WORDS)):
-            continue
-        selected = [prior[-1]]
-        for word in reversed(prior[:-1]):
-            if text[word.end():selected[0].start()].strip():
-                break
-            if not word.supported:
-                if not _numeric_boundary(word):
-                    selected = []
-                break
-            if len(selected) >= NAMED_ATTRIBUTION_POLICY["maximum_name_words"]:
-                if _name_word(word[0]) or word[0].casefold() in _ORGANIZATION_WORDS:
-                    selected = []  # Do not turn a long name into a guessed suffix.
-                break
-            if not (_name_word(word[0]) or word[0].casefold() in _ORGANIZATION_WORDS or word[0].casefold() in _CONNECTORS):
-                break
-            selected.insert(0, word)
-        while selected and selected[0][0].casefold() in _CONNECTORS:
-            selected.pop(0)
-        if selected:
-            prefix = [word for word in prior if word.end() <= selected[0].start()]
-            article = (prefix and prefix[-1][0].casefold() in {"a", "an", "the"}
-                       and not text[prefix[-1].end():selected[0].start()].strip())
-            if article and selected[-1][0].casefold() not in _ORGANIZATION_WORDS:
-                continue
-        if selected and not _DOCUMENT_REFERENCE.match(text, selected[0].start()) and any(_name_word(word[0]) for word in selected):
-            found.append(text[selected[0].start():selected[-1].end()])
+        if name := _preceding_name(text, words, verb.start()):
+            found.append(name)
+    for marker in _POSSESSIVE_REPORT.finditer(triggers):
+        # Tokenize before the possessive suffix, without splitting any internal
+        # apostrophe, account handle or unsupported compound in the name.
+        prefix = text[:marker.start()]
+        name = _preceding_name(prefix, _tokens(prefix), len(prefix), boundaries=_POSSESSIVE_PREFIX, same_paragraph=True)
+        if name and _normalized(name) not in _CALENDAR_OWNER:
+            found.append(name)
     for marker in _ACCORDING.finditer(text):
         following = [word for word in words if word.start() >= marker.end()]
         article = bool(following and following[0][0].casefold() == "the")
