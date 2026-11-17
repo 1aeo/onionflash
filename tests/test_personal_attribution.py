@@ -408,3 +408,84 @@ def test_style_marker_collision_does_not_erase_the_remaining_false_claim(context
     assert result['normalized_input_unchanged'] is True
     # The legacy lexical match can succeed while an unrelated false claim stays.
     assert result['matched'] is True and 'every client is affected' in result['published_candidate']['summary']
+
+
+def _native_style_reviewer(cfg, monkeypatch, *replies):
+    from test_review_request_budget import reviewer
+    cfg=copy.deepcopy(cfg)
+    cfg['llm'].update(base_url='https://model.example/v1',fallback_base_urls=[],api_key_env='STYLE_TEST_KEY')
+    monkeypatch.setenv('STYLE_TEST_KEY','synthetic-native-style-test')
+    return cfg,reviewer(cfg,*replies)
+
+
+def test_native_unresolved_style_issue_is_nonempty_and_disappears_after_repair(context,monkeypatch):
+    cfg,store=context
+    row=pending(store,_named_item())
+    draft=analysis(title='Alice is a developer.',summary='Alice reports measurements.',category='network',tags=['network'])
+    fixed='Alice reports measurements'
+    cfg,checker=_native_style_reviewer(cfg,monkeypatch,verdict('revise',repair={'title':fixed},criterion='actor_and_action'),verdict())
+    result=run_gate(cfg,store,row,Writer(draft),checker)
+    bodies=[json.loads(x['messages'][1]['content'])for x in checker.client.requests]
+    assert result['status']=='published'and result['review_calls']==2
+    assert bodies[0]['application_issue']==review.PERSONAL_STYLE_ISSUE and bodies[0]['application_issue']
+    assert 'application_issue'not in bodies[1]
+    assert bodies[1]['candidate']['title']==fixed
+    assert checker.client.requests[0]['messages'][0]['content']==review.SYSTEM_PROMPT
+    assert checker.client.requests[1]['messages'][0]['content']==review.VERIFY_PROMPT
+    saved=_audit(store)
+    assert saved['reviews'][-1]['candidate_hash']==digest(saved['candidate'])
+    assert saved['request_budget']['reserved']==2
+
+
+def test_style_issue_combines_with_release_issue_and_validation_feedback(context,monkeypatch):
+    from test_validation_reask import unusable
+    cfg,store=context
+    row=pending(store,_named_item())
+    draft=analysis(title='Alice is a developer.',summary='Alice reports measurements.',category='release',state='developing',tags=['release'])
+    repair={'title':'Alice reports measurements','category':'network','tags':['network']}
+    cfg,checker=_native_style_reviewer(cfg,monkeypatch,verdict(),unusable(),verdict('revise',repair=repair,criterion='actor_and_action'),verdict())
+    result=run_gate(cfg,store,row,Writer(draft),checker)
+    bodies=[json.loads(x['messages'][1]['content'])for x in checker.client.requests]
+    assert result['status']=='published'and result['review_calls']==4
+    assert bodies[0]['application_issue']==review.PERSONAL_STYLE_ISSUE
+    assert bodies[1]['application_issue']==review.RELEASE_ISSUE+'\n\n'+review.PERSONAL_STYLE_ISSUE
+    assert bodies[2]=={**bodies[1],'validation_error':review.INCONSISTENT_VERDICT}
+    assert 'application_issue'not in bodies[3]and 'validation_error'not in bodies[3]
+    saved=_audit(store)
+    assert saved['request_budget']['reserved']==4
+    assert any(x.get('issue')=='release_labels'for x in saved['reviews'])
+    assert saved['reviews'][-1]['stage']=='verification'
+
+
+def test_native_style_repair_resume_spends_only_the_next_verification(context,monkeypatch):
+    from test_review_request_budget import inconsistent
+    from onionflash.transport import FetchError
+    cfg,store=context
+    row=pending(store,_named_item())
+    draft=analysis(title='Alice is a developer.',summary='Alice reports measurements.',category='network',tags=['network'])
+    cfg,checker=_native_style_reviewer(cfg,monkeypatch,inconsistent({'title':'Alice reports measurements'}),FetchError('interrupted'))
+    with pytest.raises(AnalysisError):run_gate(cfg,store,row,Writer(draft),checker)
+    saved=json.loads(job(store)['record_json'])
+    assert saved['candidate']['title']=='Alice reports measurements'and saved['request_budget']['reserved']==2
+    cfg,resumed=_native_style_reviewer(cfg,monkeypatch,verdict())
+    writer=Writer();result=run_gate(cfg,store,row,writer,resumed)
+    assert result['status']=='published'and result['review_calls']==1 and writer.calls==[]
+    body=json.loads(resumed.client.requests[0]['messages'][1]['content'])
+    assert 'application_issue'not in body and body['candidate']==saved['candidate']
+    assert _audit(store)['request_budget']['reserved']==3
+
+
+def test_conditional_style_instruction_is_part_of_policy_identity(context,monkeypatch):
+    cfg,_=context;before=review.policy_hash(cfg)
+    monkeypatch.setattr(review,'PERSONAL_STYLE_ISSUE',review.PERSONAL_STYLE_ISSUE+' Different style contract.')
+    assert review.policy_hash(cfg)!=before
+
+
+@pytest.mark.parametrize('text', [
+    'Guard relay operators report new measurements.',
+    'A community operator reports new measurements.',
+    'A trusted relay operator reports new measurements.',
+])
+def test_anonymous_modifier_cannot_be_left_attached_to_person_or_people(text):
+    assert style.normalize_text(text)==text
+    assert style.unresolved_text(text)

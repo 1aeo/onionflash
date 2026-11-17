@@ -204,7 +204,9 @@ def test_editorial_skips_misses_coverage_verification_and_final_checks(evaluatio
         if c["expected"] == "approve"
         and (holds := final_holds(personal_attribution.normalize(c["candidate"], update=c.get("scope") == "latest_update"), {"packet": c["packet"], "mode": "update" if c.get("scope") == "latest_update" else "story", "payload": {"editorial_kind": c["packet"]["sources"][0]["kind"]}}))
     }
-    assert all(audit == "why-it-matters-1" and holds == ["untrusted_operator_claim"] for audit, holds in corpus_holds.values())
+    assert all(audit == "why-it-matters-1" and "untrusted_operator_claim" in holds
+               and set(holds) <= {"untrusted_operator_claim", "personal_attribution"}
+               for audit, holds in corpus_holds.values())
 
     bf = by_id["bugfix-is-not-security-fix"]
     rep = {**bf["candidate"], "title": "Browser update", "summary": "An Android bugfix was released."}

@@ -129,6 +129,11 @@ plural collectives remain literal collective attributions, not an official
 organizational voice. Unqualified reporter/sender references remain available to
 distinguish participants. Unmatched modifiers, complex self-identification and
 possessive-qualified anonymous roles may require repair rather than an unsafe edit.
+For these recognized unresolved forms, the existing review request includes a
+conditional application issue asking for minimal, fact-preserving style repair in
+actor-and-action. It does not add a stage or request budget; any edit still needs
+fresh verification, and an unresolved form still holds before publication. Existing
+release-label issues and validation feedback remain present alongside that issue.
 Only title, summary and impact are editable for a story; an update edits only its
 newest entry. Prior updates and read-only story text remain unchanged. No style
 edit happens after approval: the exact normalized text receives fresh verification,

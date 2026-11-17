@@ -500,6 +500,17 @@ publishes this exact update.
 RELEASE_ISSUE = ("A release category or tag needs state released or tagged: remove the release labels, "
                  "or correct the state, as the packet supports.")
 
+PERSONAL_STYLE_ISSUE = (
+    "actor_and_action includes names-only personal-attribution style, even when the role itself is sourced. "
+    "A recognized unresolved personal-role form remains in the current editable text. Revise it with the "
+    "smallest safe rephrasing, preserving the reporting action, literal identity, anonymous number, "
+    "qualifiers, useful impact and all other facts. Use only names already present or a faithful neutral "
+    "anonymous reference; never invent a name, duties, affiliation or source authority, and never replace "
+    "a personal claim with an official project voice. Preserve genuine quotations, code, role events, "
+    "audiences and qualified organizational collectives. This is a publication-style issue, not a finding "
+    "that the source is false. Fail actor_and_action while it remains; if no safe repair is possible, hold."
+)
+
 
 class ReviewError(AnalysisError):
     """An unusable review reply counts against the item, like an invalid draft."""
@@ -627,7 +638,7 @@ def policy_hash(config: dict) -> str:
     identity = {key: llm[key] for key in ("model", "base_url", "fallback_base_urls")}
     identity["generation"] = generation_options(llm)
     return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, ROUTING_PROMPT, UPDATE_SYSTEM_PROMPT,
-                   UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT,
+                   UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, PERSONAL_STYLE_ISSUE, INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT,
                    SCHEMA, UPDATE_REPAIR, VALIDATION_ERRORS, REASON_REPETITION_POLICY,
                    identity, CompletionClient.REQUEST_POLICY, EVIDENCE_POLICY,
                    NAMED_ATTRIBUTION_POLICY, ATTRIBUTION_CHECK_PROMPT, personal_attribution.PERSONAL_ATTRIBUTION_POLICY])
@@ -1097,8 +1108,11 @@ class Reviewer(CompletionClient):
                 wire_coverage = {**coverage, "prior_story": {
                     key: prior[key] for key in ("id", "state", "confidence", "updated_at", "associated") if key in prior}}
             payload["coverage_background"] = wire_coverage
-        if issue is not None:
-            payload["application_issue"] = issue
+        issues = [issue] if issue is not None else []
+        if personal_attribution.unresolved(candidate_public, update=update):
+            issues.append(PERSONAL_STYLE_ISSUE)
+        if issues:
+            payload["application_issue"] = "\n\n".join(issues)
         if validation_error is not None:
             if validation_error not in VALIDATION_ERRORS:
                 raise ReviewError("Unknown review validation feedback")

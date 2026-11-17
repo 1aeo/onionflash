@@ -12,7 +12,7 @@ import re
 from .named_attribution import _tokens, _GENERIC, _ORGANIZATION_WORDS
 
 PERSONAL_ATTRIBUTION_POLICY = {
-    'version': 1, 'style': 'names-only-personal-attribution',
+    'version': 2, 'style': 'names-only-personal-attribution',
     'grammar': 'role-name-action-or-comma-appositive', 'maximum_name_words': 4,
     'preserve': 'quotes-code-negation-events-organizations-audiences-readonly-history',
     'unresolved': 'hold-without-postapproval-edit', 'anonymous': 'same-cardinality-person-or-people',
@@ -125,6 +125,8 @@ def _unmatched_modifier(context: str, role: str) -> bool:
     if prefix and not _ACTION.search(prefix['extra']) and not re.search(r'\b(?:to|from|by|with|on|in|of|for)\b', prefix['extra'], re.I):
         return True
     word = context.strip()
+    if re.fullmatch(r'\d+|one|two|three|four|five|six|seven|eight|nine|ten|both|several|many|few|some|all', word, re.I):
+        return False
     return bool(re.fullmatch(r'[\w-]+', word) and word.casefold() not in _NONPERSON)
 
 
@@ -213,8 +215,6 @@ def _clauses(text: str):
                 # End immediately before the name, including intervening whitespace.
                 edits.append((start,end,''));continue
         if action and not tail[:action.start()].strip():
-            if re.search(r"['’]s\s*$", context):
-                unresolved.append((role.start(),role.end()));continue
             gap = text[offsets[role.end()-1]+1:offsets[role.end()+action.start()]]
             if gap.strip():
                 unresolved.append((role.start(),role.end()));continue
@@ -230,6 +230,8 @@ def _clauses(text: str):
             if (not plural and action[0].lower() in _BASE_ACTIONS
                     or re.match(r'\s+(?:is|are|was|were|show|shows|suggest|suggests|contain|contains|include|includes|confirm|confirms)\b', tail[action.end():], re.I)):
                 continue
+            if _unmatched_modifier(context, role[0]):
+                unresolved.append((role.start(),role.end()));continue
             article = re.match(r'(a|an|the)\s+', role[0], re.I)
             neutral = 'people' if plural else 'person'
             if article:

@@ -1022,7 +1022,11 @@ def test_trusted_operator_vs_community_list_incidents_in_gate(context):
                              summary="A large relay operator reports a sustained SYN flood across exit relays.",
                              category="dos", tags=["dos"], confidence="reported", state="developing",
                              evidence=["Large relay family observed sustained SYN flood"])
-    assert run(cfg, store, trusted_inc, Writer(trusted_draft), Reviewer(verdict(), verdict()))["status"] == "published"
+    # A qualified anonymous role needs a source-preserving style repair, not
+    # an unsafe "large person" substitution or an override of the incident guard.
+    repair = verdict("revise", criterion="actor_and_action", repair={
+        "summary": "A report from a large relay family describes a sustained SYN flood across exit relays."})
+    assert run(cfg, store, trusted_inc, Writer(trusted_draft), Reviewer(repair, verdict()))["status"] == "published"
 
     untrusted_inc = pending(store, item(url=list_base + "comm1/", kind="feed", authority="community",
                                         content="Single operator claims relays face deanonymization attack."))
