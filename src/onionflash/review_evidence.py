@@ -10,7 +10,7 @@ from .util import parse_utc, safe_canonical_url
 
 
 # Advance when reminder construction changes, so prior approvals cannot reuse it.
-EVIDENCE_POLICY = 3
+EVIDENCE_POLICY = 4
 _WORDS = re.compile(r"\w+", re.UNICODE)
 _STOP = frozenset("a an and are as at be been but by for from has have in is it its of on or that the this to was were with".split())
 _MAX_ANCHORS = 3

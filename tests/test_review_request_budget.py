@@ -361,7 +361,9 @@ def test_legacy_a_new_source_revision_starts_from_its_new_draft_not_the_pending_
     assert run(cfg, store, current, writer, checker)["status"] == "published"
     first = json.loads(checker.client.requests[0]["messages"][1]["content"])
     assert first["candidate"]["summary"] == "A fresh summary of the revised source."
-    assert checker.client.requests[0]["messages"][0]["content"] == review.SYSTEM_PROMPT
+    assert checker.client.requests[0]["messages"][0]["content"] == review.SYSTEM_PROMPT + "\n\n" + review.SOURCE_DATE_CONTEXT_PROMPT
+    date_context, = first["evidence_context"]["source_date_comparisons"]
+    assert date_context["source_updated_at"] == LATER
     assert saved_audit(store)["request_budget"]["reserved"] == 2
     assert not saved_audit(store).get("untrusted_proposals")
 

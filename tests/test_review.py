@@ -156,14 +156,16 @@ def test_review_protocol_fresh_verification_and_application_issue(monkeypatch):
     assert "enum" not in review.REFS["items"]
     first_payload = json.loads(first["messages"][1]["content"])
     first_context = first_payload.pop("evidence_context")
-    date_issue = review.SOURCE_DATE_ISSUE + "\n" + json.dumps(review.source_date_comparisons(packet()), ensure_ascii=False)
-    assert first_payload == {"candidate": public, "packet": packet(), "application_issue": date_issue}
+    assert first_payload == {"candidate": public, "packet": packet()}
+    assert first_context["source_date_comparisons"] == review.source_date_comparisons(packet())
     assert "why_it_matters" in {field["field"] for field in first_context["fields"]}
     assert all(passage in packet()["sources"][0]["passages"] for passage in first_context["passages"])
-    assert len(second["messages"]) == 2 and second["messages"][0]["content"] == review.VERIFY_PROMPT
+    assert len(second["messages"]) == 2
+    assert second["messages"][0]["content"] == review.VERIFY_PROMPT + "\n\n" + review.SOURCE_DATE_CONTEXT_PROMPT
     second_payload = json.loads(second["messages"][1]["content"])
     second_context = second_payload.pop("evidence_context")
-    assert second_payload == {"candidate": repaired, "packet": packet(), "application_issue": date_issue}
+    assert second_payload == {"candidate": repaired, "packet": packet()}
+    assert second_context["source_date_comparisons"] == first_context["source_date_comparisons"]
     assert "why_it_matters" not in {field["field"] for field in second_context["fields"]}
 
     schema = first["response_format"]["json_schema"]["schema"]
@@ -180,11 +182,11 @@ def test_review_protocol_fresh_verification_and_application_issue(monkeypatch):
     rel_chk = reviewer(monkeypatch, completion(verdict()))
     rel_res = rel_chk.review(rel_pub, packet(), issue=review.RELEASE_ISSUE)
     assert rel_res == review.validate_review(verdict(), packet()) and "model_verdict" not in rel_res
-    assert rel_chk.client.requests[0][1]["messages"][0]["content"] == review.SYSTEM_PROMPT
+    assert rel_chk.client.requests[0][1]["messages"][0]["content"] == review.SYSTEM_PROMPT + "\n\n" + review.SOURCE_DATE_CONTEXT_PROMPT
     issue_payload = json.loads(rel_chk.client.requests[0][1]["messages"][1]["content"])
     issue_payload.pop("evidence_context")
     assert issue_payload == {
-        "candidate": rel_pub, "packet": packet(), "application_issue": review.RELEASE_ISSUE + "\n\n" + date_issue}
+        "candidate": rel_pub, "packet": packet(), "application_issue": review.RELEASE_ISSUE}
 
 
 @pytest.mark.parametrize("length", [240, 241, 360])
@@ -378,9 +380,8 @@ def test_prompts_coverage_isolation_repairs_and_transport_settings(monkeypatch):
     for _, req in bg_chk.client.requests:
         payload = json.loads(req["messages"][1]["content"])
         context = payload.pop("evidence_context")
-        date_issue = review.SOURCE_DATE_ISSUE + "\n" + json.dumps(review.source_date_comparisons(packet()), ensure_ascii=False)
-        assert payload == {"candidate": candidate(), "packet": packet(), "coverage_background": bg,
-                           "application_issue": date_issue}
+        assert payload == {"candidate": candidate(), "packet": packet(), "coverage_background": bg}
+        assert context["source_date_comparisons"] == review.source_date_comparisons(packet())
         assert all(passage in packet()["sources"][0]["passages"] for passage in context["passages"])
         fields = req["response_format"]["json_schema"]["schema"]["properties"]["criteria"]["properties"]
         assert set(fields) == set(review.CRITERIA)
@@ -537,8 +538,8 @@ def test_update_scope_confirmed_updates_uncited_notes_and_punctuation_repairs(mo
     rt_chk = reviewer(monkeypatch, completion(verdict()), completion(verdict()))
     rt_chk.review(candidate(), packet(), coverage=recent_cov)
     rt_chk.review(candidate(), packet(), coverage=recent_cov, verification=True)
-    assert rt_chk.client.requests[0][1]["messages"][0]["content"] == review.SYSTEM_PROMPT + review.ROUTING_PROMPT
-    assert rt_chk.client.requests[1][1]["messages"][0]["content"] == review.VERIFY_PROMPT + review.ROUTING_PROMPT
+    assert rt_chk.client.requests[0][1]["messages"][0]["content"] == review.SYSTEM_PROMPT + review.ROUTING_PROMPT + "\n\n" + review.SOURCE_DATE_CONTEXT_PROMPT
+    assert rt_chk.client.requests[1][1]["messages"][0]["content"] == review.VERIFY_PROMPT + review.ROUTING_PROMPT + "\n\n" + review.SOURCE_DATE_CONTEXT_PROMPT
 
     url99 = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/99"
     cand = {

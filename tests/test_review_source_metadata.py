@@ -22,7 +22,8 @@ def packet():
 
 
 def capture(monkeypatch, source, *, update=False, verification=False, response=None, coverage=None, issue=None):
-    public = candidate(title="A source describes a change", summary="The source describes a change.", why_it_matters="")
+    public = candidate(title="A source describes a change", summary="The source describes a change.", why_it_matters="",
+                       confidence="reported", state="developing", category="network", tags=["network"])
     if update:
         public["updates"] = [{"at": public["updated_at"], "text": "The source describes another change.",
                               "sources": copy.deepcopy(public["sources"])}]
@@ -56,13 +57,14 @@ def test_tag_facts_require_actual_metadata_and_preserve_literal_values():
 @pytest.mark.parametrize("verification", [False, True])
 def test_tag_cue_reaches_story_review_and_verification_without_replacing_existing_issue(monkeypatch, verification):
     source = packet()
-    _, _, payload = capture(monkeypatch, source, verification=verification, issue=review.RELEASE_ISSUE)
-    assert payload["application_issue"].startswith(review.RELEASE_ISSUE + "\n\n")
-    assert review.SOURCE_TAG_ISSUE in payload["application_issue"]
-    assert json.loads(payload["application_issue"].rsplit("\n", 1)[1]) == supplied_tag_sources(source)
-    assert "not an eligibility verdict" in review.SOURCE_TAG_ISSUE
-    assert "Check their relation to the event" in review.SOURCE_TAG_ISSUE
-    assert "override exclusions, novelty or fresh verification" in review.SOURCE_TAG_ISSUE
+    _, request, payload = capture(monkeypatch, source, verification=verification, issue=review.RELEASE_ISSUE)
+    assert payload["application_issue"] == review.RELEASE_ISSUE
+    assert review.SOURCE_TAG_CONTEXT_PROMPT in request["messages"][0]["content"]
+    assert payload["evidence_context"]["supplied_tag_sources"] == supplied_tag_sources(source)
+    assert "not candidate defects or an eligibility verdict" in review.SOURCE_TAG_CONTEXT_PROMPT
+    assert "presence alone requires no edit or hold" in review.SOURCE_TAG_CONTEXT_PROMPT
+    assert "Check their relation to the event" in review.SOURCE_TAG_CONTEXT_PROMPT
+    assert "override exclusions, novelty or fresh verification" in review.SOURCE_TAG_CONTEXT_PROMPT
 
 
 @pytest.mark.parametrize("update", [False, True])
@@ -70,8 +72,9 @@ def test_tag_pointer_absence_or_readonly_scope_does_not_create_an_issue(monkeypa
     source = packet()
     if not update:
         source["sources"] = source["sources"][:1]
-    _, _, payload = capture(monkeypatch, source, update=update)
-    assert review.SOURCE_TAG_ISSUE not in payload.get("application_issue", "")
+    _, request, payload = capture(monkeypatch, source, update=update)
+    assert "supplied_tag_sources" not in payload["evidence_context"]
+    assert review.SOURCE_TAG_CONTEXT_PROMPT not in request["messages"][0]["content"]
 
 
 def test_tag_cue_cannot_override_a_news_refusal_or_authorize_an_impact(monkeypatch):
@@ -84,7 +87,7 @@ def test_tag_cue_cannot_override_a_news_refusal_or_authorize_an_impact(monkeypat
 
 def test_tag_cue_instruction_is_bound_to_review_policy(monkeypatch):
     before = review.policy_hash(DEFAULTS)
-    monkeypatch.setattr(review, "SOURCE_TAG_ISSUE", review.SOURCE_TAG_ISSUE + " A different rule.")
+    monkeypatch.setattr(review, "SOURCE_TAG_CONTEXT_PROMPT", review.SOURCE_TAG_CONTEXT_PROMPT + " A different rule.")
     assert review.policy_hash(DEFAULTS) != before
 
 
@@ -169,13 +172,16 @@ def test_mixed_old_issue_and_fresh_release_dates_remain_separate_facts(monkeypat
     source["sources"].append(tag)
     source["sources"].append({**copy.deepcopy(tag), "id": "S3", "kind": "feed", "title": "Release announcement",
                               "passages": [{"id": "S3:P1", "text": "The release is available."}]})
-    result, _, payload = capture(monkeypatch, source, verification=verification)
-    issue = payload["application_issue"]
-    assert review.SOURCE_TAG_ISSUE in issue and review.SOURCE_DATE_ISSUE in issue
-    facts = json.loads(issue.rsplit("\n", 1)[1])
+    result, request, payload = capture(monkeypatch, source, verification=verification)
+    prompt = request["messages"][0]["content"]
+    assert "application_issue" not in payload
+    assert review.SOURCE_TAG_CONTEXT_PROMPT in prompt and review.SOURCE_DATE_CONTEXT_PROMPT in prompt
+    facts = payload["evidence_context"]["source_date_comparisons"]
     assert [(row["source_ref"], row["elapsed_seconds"]) for row in facts] == [("S1", 14 * 86400), ("S2", 0), ("S3", 0)]
-    assert "one older source does not make a newer release or development stale" in issue
-    assert "not an event-level recency verdict" in issue
+    assert "one older source does not make a newer release or development stale" in prompt
+    assert "not candidate defects or an event-level recency verdict" in prompt
+    assert "presence alone requires no edit or hold" in review.SOURCE_DATE_CONTEXT_PROMPT
+    assert "An application_issue, when present, is an application-detected defect" in prompt
     assert result["verdict"] == "approve"
     assert all(not ({"stale", "eligible", "verdict"} & set(row)) for row in facts)
 
@@ -185,11 +191,12 @@ def test_mixed_old_issue_and_fresh_release_dates_remain_separate_facts(monkeypat
 def test_date_cue_retains_disclosure_severity_and_retry_exceptions_without_promoting_source(monkeypatch, authority, labels):
     source = dated_issue(authority=authority, labels=labels)
     source["sources"][0]["passages"].append({"id": "S1:P3", "text": "Reported via https://hackerone.com/reports/12345"})
-    _, _, payload = capture(monkeypatch, source)
-    issue = payload["application_issue"]
-    assert "HackerOne-disclosure" in issue and "high/critical-severity" in issue
-    assert "existing-story and operator-retry exceptions" in issue and "no retry status is inferred" in issue
-    row, = json.loads(issue.rsplit("\n", 1)[1])
+    _, request, payload = capture(monkeypatch, source)
+    prompt = request["messages"][0]["content"]
+    assert "application_issue" not in payload
+    assert "HackerOne-disclosure" in prompt and "high/critical-severity" in prompt
+    assert "existing-story and operator-retry exceptions" in prompt and "no retry status is inferred" in prompt
+    row, = payload["evidence_context"]["source_date_comparisons"]
     assert row["authority"] == authority and row["labels"] == labels
     assert payload["packet"]["sources"][0]["authority"] == authority
 
@@ -197,15 +204,17 @@ def test_date_cue_retains_disclosure_severity_and_retry_exceptions_without_promo
 @pytest.mark.parametrize("update,prior", [(True, False), (False, True)])
 def test_date_cue_is_not_added_to_updates_or_existing_story_context(monkeypatch, update, prior):
     coverage = {"prior_story": candidate(), "recent": [], "truncated": False} if prior else None
-    _, _, payload = capture(monkeypatch, dated_issue(), update=update, coverage=coverage)
-    assert review.SOURCE_DATE_ISSUE not in payload.get("application_issue", "")
+    _, request, payload = capture(monkeypatch, dated_issue(), update=update, coverage=coverage)
+    assert "source_date_comparisons" not in payload["evidence_context"]
+    assert review.SOURCE_DATE_CONTEXT_PROMPT not in request["messages"][0]["content"]
 
 
 def test_equal_source_dates_need_no_cue_and_date_instruction_is_policy_bound(monkeypatch):
     source = dated_issue(updated_at="2026-01-07T00:00:00Z")
     assert source_date_comparisons(source) == []
-    _, _, payload = capture(monkeypatch, source)
-    assert review.SOURCE_DATE_ISSUE not in payload.get("application_issue", "")
+    _, request, payload = capture(monkeypatch, source)
+    assert "source_date_comparisons" not in payload["evidence_context"]
+    assert review.SOURCE_DATE_CONTEXT_PROMPT not in request["messages"][0]["content"]
     before = review.policy_hash(DEFAULTS)
-    monkeypatch.setattr(review, "SOURCE_DATE_ISSUE", review.SOURCE_DATE_ISSUE + " A different rule.")
+    monkeypatch.setattr(review, "SOURCE_DATE_CONTEXT_PROMPT", review.SOURCE_DATE_CONTEXT_PROMPT + " A different rule.")
     assert review.policy_hash(DEFAULTS) != before
