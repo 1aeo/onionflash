@@ -105,6 +105,13 @@ establish that the suspected condition persists after a later fix, release or
 resolution; claim post-event persistence only when supplied later evidence supports
 it. Do not infer that a distinct issue was resolved merely from that later event."""
 
+_VERSION_EVIDENCE_RULE = """Preserve version strings explicitly supplied by the packet, including unfamiliar
+numbering formats; do not delete their affected scope or guess a replacement solely
+to fit an expected convention. Known malformed C-Tor examples such as 0.3.17 or
+0.4.17 do not make every three-part version invalid. If the source itself contains
+an anomalous spelling that must be retained, explicitly attribute it as the source's
+spelling with [sic] or a typo attribution; never silently correct it to an inferred version."""
+
 _SHARED_VERDICT_RULES = f"""Work through all nine criteria in order before choosing verdict. Each reason is an
 evidence comparison written BEFORE its outcome, not a summary of the topic or an
 assertion that claims are supported. Use at most 40 words and 360 characters:
@@ -115,8 +122,8 @@ assertion that claims are supported. Use at most 40 words and 360 characters:
   even if awkward, cautious, or repeated in the summary; never clear it just for
   those reasons. A supported first clause does not support an inferred second
   consequence. Retain source conditions, audience and scope. {_CLAIM_SCOPE_RULE}
-  If why_it_matters is
-  empty, say so and compare the story's most consequential factual assertion.
+  If why_it_matters is empty, say so and compare the story's most consequential
+  factual assertion.
   In latest_update mode compare only the new update, never the readonly why.
 - actor_and_action, status, uncertainty_attribution and scope_timing: quote the
   relevant target phrase beside the exact source wording or metadata that supports
@@ -267,8 +274,8 @@ causal mechanisms, security consequences and text casing must be supported and n
 do not conflate authority signing keys, relay identities or software trust-list updates.
 BEFORE setting technical_details's outcome, check candidate.title, summary and why_it_matters
 for (a) unnormalized ALL-CAPS shouting (3+ consecutive uppercase non-acronym words) and
-(b) nonexistent three-part C-Tor version typos such as 0.4.17 or 0.4.16 (C Tor uses four
-numbers, e.g. 0.4.9.17): FAIL technical_details on either defect so repair normalizes it.
+(b) malformed C-Tor version claims such as an unattributed 0.3.17 or 0.4.17:
+FAIL technical_details on either defect. {_VERSION_EVIDENCE_RULE}
 news_value: judge the packet, not only the candidate. First, when prior_story is null,
 compare source dates (never the current date): if the newest dated development
 (published_at, merge date, newest public comment, or closing) is more than 14 days before
@@ -359,8 +366,8 @@ never add absent impacts, mechanisms or advice). Modify only fields whose own as
 you identify as defective. When why_it_matters is supported, set its repair value to null
 even if source_support fails for the title or summary; clear it only for a defect in the
 impact assertion itself. The only allowed why_it_matters edit is "": never generate,
-rewrite or replace its text. If the packet
-holds a worthwhile uncovered development that the candidate omits or buries behind quoted
+rewrite or replace its text. If the packet holds a worthwhile uncovered development
+that the candidate omits or buries behind quoted
 old text, revise to state the sender's unquoted development from the packet, or hold;
 never skip it. Use "skip" (repair null, news_value or new_information failed) ONLY when
 the packet itself is not news or repeats covered events, preferring skip over polishing
@@ -484,7 +491,7 @@ Evaluate all nine criteria in order before choosing verdict:
    explicit passage in the cited new source directing that audience to act; pass when no advice is stated.
 7. technical_details: Versions, commit hashes, ticket/MR IDs, relays, authorities, CVEs, metrics, counts, mechanisms
    and casing in candidate.updates[-1].text (and classification fields) must match the cited source without ALL-CAPS
-   shouting, nonexistent three-part C-Tor version typos (e.g. 0.4.17), or exaggerated severity.
+   shouting, malformed C-Tor version claims, or exaggerated severity. {_VERSION_EVIDENCE_RULE}
 8. news_value: Keep news_value "pass" whenever the underlying published story remains Tor news, even when skipping a
    redundant follow-up under new_information; fail news_value only for off-topic spam.
 9. new_information (UPDATE NOVELTY GATE — compare candidate.updates[-1] against candidate.title, summary,

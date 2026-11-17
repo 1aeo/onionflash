@@ -107,3 +107,42 @@ def test_impact_remains_clear_only_and_readonly_for_update_repairs(monkeypatch):
     assert repaired["why_it_matters"] == update["why_it_matters"]
     with pytest.raises(review.ReviewError):
         review.apply_repair(update, {"why_it_matters": ""}, update=True)
+
+
+@pytest.mark.parametrize("update", [False, True])
+@pytest.mark.parametrize("verification", [False, True])
+def test_source_version_rule_reaches_both_scopes_without_blanket_format_inference(monkeypatch, update, verification):
+    _, _, _, body, _ = captured(monkeypatch, update=update, verification=verification)
+    prompt = " ".join(body["messages"][0]["content"].split())
+    assert " ".join(review._VERSION_EVIDENCE_RULE.split()) in prompt
+    assert "0.3.17 or 0.4.17" in prompt
+    assert "[sic] or a typo attribution" in prompt
+    assert "do not delete their affected scope or guess a replacement" in prompt
+    assert "C Tor uses four numbers" not in prompt
+
+
+@pytest.mark.parametrize("text,held", [
+    ("The report concerns Tor 2.7.8 relays.", False),
+    ("The report concerns Tor 0.3.17 relays.", True),
+    ("The report concerns Tor 0.4.17 relays.", True),
+    ("The report concerns Tor 0.4.9.17 relays.", False),
+    ("The source writes the version as Tor 0.4.17 [sic].", False),
+    ("The source has a version typo: Tor 0.3.17.", False),
+])
+@pytest.mark.parametrize("update", [False, True])
+def test_source_versions_and_existing_sic_guard_keep_current_scope(text, held, update):
+    from onionflash.llm import has_malformed_tor_version
+
+    assert has_malformed_tor_version(text, ["tor"]) is held
+    public = candidate(title="A source reports a version observation", summary=text, why_it_matters="")
+    source = packet()
+    source["sources"][0].update(kind="feed", authority="official")
+    source["sources"][0]["passages"][0]["text"] = text
+    if update:
+        public["summary"] = "An earlier source wrote Tor 0.4.17."
+        public["updates"] = [{"at": public["updated_at"], "text": text, "sources": copy.deepcopy(public["sources"])}]
+    prepared = {"packet": source, "mode": "update" if update else "story",
+                "payload": {"editorial_kind": "feed"}, "coverage": None}
+    before = copy.deepcopy((public, prepared))
+    assert ("malformed_version" in review.final_holds(public, prepared)) is held
+    assert (public, prepared) == before
