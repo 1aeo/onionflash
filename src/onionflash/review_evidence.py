@@ -10,10 +10,17 @@ from .util import parse_utc, safe_canonical_url
 
 
 # Advance when reminder construction changes, so prior approvals cannot reuse it.
-EVIDENCE_POLICY = 1
+EVIDENCE_POLICY = 2
 _WORDS = re.compile(r"\w+", re.UNICODE)
 _STOP = frozenset("a an and are as at be been but by for from has have in is it its of on or that the this to was were with".split())
 _MAX_ANCHORS = 3
+
+
+def supplied_tag_sources(packet: dict) -> list[dict]:
+    """Point to literal tag metadata without deciding relevance or news value."""
+    return [{"source_ref": source["id"], **{
+        key: copy.deepcopy(source[key]) for key in ("kind", "authority", "title", "published_at") if key in source}}
+        for source in packet["sources"] if source.get("kind") == "tag"]
 
 
 def _words(text: str) -> set[str]:

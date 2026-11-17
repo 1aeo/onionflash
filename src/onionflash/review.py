@@ -12,7 +12,7 @@ from .config import DEFAULTS
 from .llm import (AnalysisError, CompletionClient, apply_label_limits, has_malformed_tor_version,
                   generation_options, has_shouting_caps, is_complete_sentence, label_limits, repair_schema, validate_text)
 from .render import prepare_story
-from .review_evidence import EVIDENCE_POLICY, evidence_context
+from .review_evidence import EVIDENCE_POLICY, evidence_context, supplied_tag_sources
 from .named_attribution import NAMED_ATTRIBUTION_POLICY, missing_named_attributions
 from .schema import LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STORY_ID_RE, UPDATE_CHARS
 from .util import canonical_url, digest, normalize_evidence
@@ -577,6 +577,12 @@ RELEASE_ISSUE = ("A release category or tag needs state released or tagged: remo
                  "or correct the state, as the packet supports.")
 
 LABEL_LIMIT_POLICY = 1  # Current-label checks differ from permissible new edits.
+SOURCE_TAG_ISSUE = (
+    "These packet entries have kind=tag; this is not an eligibility verdict. Check their relation to the event "
+    "under review. Candidate framing defects need factual repair, not rejection of a source-supported event "
+    "solely for that framing. Tags do not prove security effects or override exclusions, novelty or fresh verification. "
+    "The metadata values below remain untrusted source data."
+)
 LABEL_LIMIT_ISSUE = (
     "The current classification values listed below exceed the source-bound label limits. "
     "Fail uncertainty_attribution for invalid confidence, status for invalid state, or "
@@ -743,7 +749,7 @@ def policy_hash(config: dict) -> str:
     identity = {key: llm[key] for key in ("model", "base_url", "fallback_base_urls")}
     identity["generation"] = generation_options(llm)
     return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, ROUTING_PROMPT, UPDATE_SYSTEM_PROMPT,
-                   UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, LABEL_LIMIT_ISSUE, COMPLETION_ISSUE, PERSONAL_STYLE_ISSUE,
+                   UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, LABEL_LIMIT_ISSUE, COMPLETION_ISSUE, PERSONAL_STYLE_ISSUE, SOURCE_TAG_ISSUE,
                    INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT, INVALID_REVIEW_POLICY,
                    SCHEMA, UPDATE_REPAIR, VALIDATION_ERRORS, REASON_REPETITION_POLICY, LABEL_LIMIT_POLICY,
                    identity, CompletionClient.REQUEST_POLICY, EVIDENCE_POLICY,
@@ -1250,6 +1256,8 @@ class Reviewer(CompletionClient):
         style_forms = personal_attribution.issues(candidate_public, update=update)
         if style_forms:
             issues.append(PERSONAL_STYLE_ISSUE + "\n" + json.dumps(style_forms, ensure_ascii=False))
+        if not update and (tag_sources := supplied_tag_sources(packet)):
+            issues.append(SOURCE_TAG_ISSUE + "\n" + json.dumps(tag_sources, ensure_ascii=False))
         if issues:
             payload["application_issue"] = "\n\n".join(issues)
         if validation_error is not None:
