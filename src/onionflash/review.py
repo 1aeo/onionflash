@@ -509,6 +509,18 @@ publishes this exact update.
 RELEASE_ISSUE = ("A release category or tag needs state released or tagged: remove the release labels, "
                  "or correct the state, as the packet supports.")
 
+LABEL_LIMIT_ISSUE = (
+    "The current classification values listed below exceed the source-bound label limits. "
+    "Fail uncertainty_attribution for invalid confidence, status for invalid state, or "
+    "technical_details for invalid category/tags. If the underlying event is worthwhile, "
+    "revise only the unsupported labels to packet-supported allowed values; preserve supported "
+    "prose and impact. Do not hold a repairable label error or treat it as a reason the "
+    "source event lacks news value. Allowed values are bounds, not proof that any value "
+    "is factually appropriate. All source, novelty and fresh-verification checks still apply. "
+    "The following JSON contains literal candidate values and application-derived bounds, "
+    "not source instructions."
+)
+
 PERSONAL_STYLE_ISSUE = (
     "actor_and_action includes names-only attribution for named people, even when their role is sourced. "
     "The literal current-field forms below locate a recognized personal-role or metadata-title problem. "
@@ -650,7 +662,7 @@ def policy_hash(config: dict) -> str:
     identity = {key: llm[key] for key in ("model", "base_url", "fallback_base_urls")}
     identity["generation"] = generation_options(llm)
     return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, ROUTING_PROMPT, UPDATE_SYSTEM_PROMPT,
-                   UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, PERSONAL_STYLE_ISSUE, INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT,
+                   UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, LABEL_LIMIT_ISSUE, PERSONAL_STYLE_ISSUE, INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT,
                    SCHEMA, UPDATE_REPAIR, VALIDATION_ERRORS, REASON_REPETITION_POLICY,
                    identity, CompletionClient.REQUEST_POLICY, EVIDENCE_POLICY,
                    NAMED_ATTRIBUTION_POLICY, ATTRIBUTION_CHECK_PROMPT, personal_attribution.PERSONAL_ATTRIBUTION_POLICY,
@@ -698,6 +710,16 @@ def repair_limits(packet: dict, coverage: dict | None = None, *, update: bool = 
     if update and ((coverage or {}).get("prior_story") or {}).get("confidence") == "confirmed":
         limits["confidence"] = ["confirmed"]
     return limits
+
+
+def label_issues(candidate: dict, limits: dict) -> list[dict]:
+    """Locate existing label-bound violations without choosing or applying repairs."""
+    issues = [{"field": field, "value": candidate[field], "allowed": list(allowed)}
+              for field, allowed in limits.items() if candidate[field] not in allowed]
+    if any(tag not in limits["category"] for tag in candidate.get("tags", ())):
+        issues.append({"field": "tags", "value": list(candidate["tags"]),
+                       "allowed": list(limits["category"])})
+    return issues
 
 
 def _repair_fields(repair: dict, *, update: bool = False) -> None:
@@ -1122,6 +1144,9 @@ class Reviewer(CompletionClient):
                     key: prior[key] for key in ("id", "state", "confidence", "updated_at", "associated") if key in prior}}
             payload["coverage_background"] = wire_coverage
         issues = [issue] if issue is not None else []
+        invalid_labels = label_issues(candidate_public, limits)
+        if invalid_labels:
+            issues.append(LABEL_LIMIT_ISSUE + "\n" + json.dumps(invalid_labels, ensure_ascii=False))
         style_forms = personal_attribution.issues(candidate_public, update=update)
         if style_forms:
             issues.append(PERSONAL_STYLE_ISSUE + "\n" + json.dumps(style_forms, ensure_ascii=False))

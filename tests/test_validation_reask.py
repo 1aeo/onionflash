@@ -438,7 +438,9 @@ def test_correction_keeps_release_label_repair_issue_and_requires_verification(c
     checker = reviewer(cfg, verdict(), unusable(), verdict("revise", repair=fixed, criterion="status"), verdict())
     assert run(cfg, store, row, Writer(draft), checker)["status"] == "published"
     payloads = [json.loads(request["messages"][1]["content"]) for request in checker.client.requests]
-    assert checker.calls == 4 and payloads[1]["application_issue"] == review.RELEASE_ISSUE
+    assert checker.calls == 4
+    assert payloads[1]["application_issue"] == review.RELEASE_ISSUE + "\n\n" + payloads[0]["application_issue"]
+    assert "application_issue" not in payloads[3]
     assert payloads[2] == {**payloads[1], "validation_error": review.INCONSISTENT_VERDICT}
     assert checker.client.requests[1]["response_format"] == checker.client.requests[2]["response_format"]
     audit = saved_audit(store)

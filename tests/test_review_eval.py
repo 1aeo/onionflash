@@ -393,7 +393,10 @@ def test_omissions_holds_model_verdict_release_repairs_and_fix_loop(evaluation, 
         rec = json.loads(o.read_text().splitlines()[0])
         assert (res["matched"], res["holds"], (rec["published_candidate"] or {}).get("title")) == (1, holds, pub)
         assert [e["stage"] for e in rec["reviews"]] == ["review", "review", "verification"][:len(payloads)]
-        assert [p.get("application_issue") for p in payloads] == [None, RELEASE_ISSUE, None][:len(payloads)]
+        initial_issue = payloads[0]["application_issue"]
+        assert {entry["field"] for entry in json.loads(initial_issue.split("\n", 1)[1])} == {"category", "tags"}
+        assert [p.get("application_issue") for p in payloads] == [
+            initial_issue, RELEASE_ISSUE + "\n\n" + initial_issue, None][:len(payloads)]
         assert rec["reviews"][1]["issue"] == "release_labels"
 
 
