@@ -12,7 +12,7 @@ import re
 from .named_attribution import _tokens, _GENERIC, _ORGANIZATION_WORDS
 
 PERSONAL_ATTRIBUTION_POLICY = {
-    'version': 5, 'style': 'names-only-personal-attribution',
+    'version': 6, 'style': 'names-only-personal-attribution',
     'grammar': 'role-name-action-or-comma-appositive', 'maximum_name_words': 4,
     'preserve': 'quotes-code-negation-events-organizations-audiences-readonly-history',
     'unresolved': 'hold-without-postapproval-edit', 'anonymous': 'preserve-source-checked-operational-functions-and-groups',
@@ -248,6 +248,16 @@ def _clauses(text: str):
                 edits.append((role.start(),end,''));continue
         if re.search(r'(?:operators?|maintainers?)$', role[0], re.I) and re.match(r'\s+of\s+', tail, re.I):
             relation = tail[:named_action.start()] if named_action else tail
+            if named_action and named_action[0].casefold() in {'is', 'are', 'was', 'were'}:
+                complement = tail[named_action.end():].strip()
+                words = _tokens(complement)
+                literal_name = bool(words and (words[0].value.startswith('@') or words[0].value[0].isupper()
+                                               or not words[0].value[0].isascii()))
+                if (literal_name and _person(complement) and not _NEGATION.search(complement)
+                        and not _EVENT.search(complement)):
+                    # Keep the relationship and identity assertion intact: a
+                    # name-only rewrite could guess which entity is the person.
+                    unresolved.append((role.start(), role.end()+len(tail)));continue
             if opening:
                 subject = re.split(r'[.!?;]', left[:opening.start()])[-1].strip()
                 prefix = opening['prefix'].strip()

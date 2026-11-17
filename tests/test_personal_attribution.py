@@ -725,3 +725,28 @@ def test_relative_action_involving_another_operator_is_not_a_personal_title():
     text='Alice, who interviewed a relay operator of the authority, reports measurements.'
     assert style.normalize_text(text)==text
     assert not style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('text', [
+    'The operator of the authority is Alice.',
+    'The operator of the relay was Alice Smith.',
+    'The operators of the authority are Alice and Bob.',
+    'The operator of the authority is @alice-handle.',
+])
+def test_named_functional_identity_predicate_is_not_an_anonymous_reference(text):
+    assert style.normalize_text(text)==text
+    assert style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('text', [
+    'The operator of the authority is unreachable.',
+    'The operator of the authority is offline.',
+    'The operator of the authority is reviewing logs.',
+    'The operator of the authority was appointed yesterday.',
+    'The operator of the authority reported a failure.',
+    '"The operator of the authority is Alice."',
+    '`The operator of the authority is Alice.`',
+])
+def test_functional_predicate_keeps_anonymous_status_actions_events_and_quotes(text):
+    assert style.normalize_text(text)==text
+    assert not style.unresolved_text(text)
