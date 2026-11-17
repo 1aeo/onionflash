@@ -638,6 +638,7 @@ a complete review with meaningful reasons consistent with its criteria. Do not i
 to justify a preferred verdict. The rejected reply and its proposed edits are not
 evidence and have not been applied to the candidate.
 """
+INVALID_REVIEW_POLICY = "unchanged-candidate-correction-v1"
 
 
 class CorrectableReviewError(ReviewError):
@@ -730,7 +731,7 @@ def policy_hash(config: dict) -> str:
     identity["generation"] = generation_options(llm)
     return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, ROUTING_PROMPT, UPDATE_SYSTEM_PROMPT,
                    UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, LABEL_LIMIT_ISSUE, COMPLETION_ISSUE, PERSONAL_STYLE_ISSUE,
-                   INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT,
+                   INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT, INVALID_REVIEW_POLICY,
                    SCHEMA, UPDATE_REPAIR, VALIDATION_ERRORS, REASON_REPETITION_POLICY, LABEL_LIMIT_POLICY,
                    identity, CompletionClient.REQUEST_POLICY, EVIDENCE_POLICY,
                    NAMED_ATTRIBUTION_POLICY, ATTRIBUTION_CHECK_PROMPT, personal_attribution.PERSONAL_ATTRIBUTION_POLICY,

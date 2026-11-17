@@ -1053,11 +1053,12 @@ def call_review(reviewer, stage, candidate, prepared, *, requests, correction=Fa
 
 
 def advance_review(reviewer, stage, candidate, prepared, record, requests):
-    """Runtime and evaluation share the same untrusted-proposal transition.
+    """Runtime and evaluation share the same bounded validation correction.
 
-    An untrusted edit still requires its fresh verification. A validation
-    correction keeps the current stage and candidate; invalid criteria never
-    become a disagreement anchor.
+    Invalid replies never edit the candidate or become a disagreement anchor.
+    A correction keeps the current stage and candidate; a valid repair still
+    requires its ordinary fresh verification. Historical proposal proofs remain
+    readable through the existing version-two ledger.
     """
     validate_review_state(record, stage, candidate, prepared)
     correction = _pending_reask(record, stage, candidate, prepared)
@@ -1079,41 +1080,16 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
                  "reask_trigger": False, "reask_response": bool(correction)}
         requests.state["inconsistent_requests"].append(event["request"])
         record.setdefault("untrusted_proposals", []).append(event)
-        try:
-            if not isinstance(error, review.InconsistentReview):
-                raise error
-            if _literal_tag(prepared):
-                event["disposition"] = "literal_tag"
-                raise review.ReviewError("Literal tags cannot use untrusted edits")
-            repaired = review.apply_repair(candidate, error.proposal, update=prepared.get("mode") == "update")
-            event["candidate_after_hash"] = digest(repaired)
-            event["changed_fields"] = sorted(key for key in candidate if repaired.get(key) != candidate[key])
-            event["repair"] = {key: repaired[key] for key in event["changed_fields"] if key != "updates"}
-            if "updates" in event["changed_fields"]:
-                event["repair"]["update"] = repaired["updates"][-1]["text"]
-            if not _allowed_proposal(candidate, repaired, prepared, error.proposal):
-                event["disposition"] = "labels"
-                raise review.ReviewError("Untrusted edit exceeds packet label limits")
-            if event["candidate_after_hash"] in seen:
-                event["disposition"] = "repeated"
-                raise review.ReviewError("Untrusted edit repeats a reviewed candidate")
-        except review.ReviewError:
-            if requests.state["validation_reask"] is None and requests.state["reserved"] < MAX_REVIEW_REQUESTS:
-                event["reask_trigger"] = True
-                requests.state["validation_reask"] = {"trigger": event["request"], "attempts": [],
-                                                       "response": None, "transport_failed": False}
-                requests.persist()
-                # The correction keeps this exact stage and candidate. Invalid
-                # criteria are still absent from the trusted review history.
-                return advance_review(reviewer, stage, candidate, prepared, record, requests)
+        if requests.state["validation_reask"] is None and requests.state["reserved"] < MAX_REVIEW_REQUESTS:
+            event["reask_trigger"] = True
+            requests.state["validation_reask"] = {"trigger": event["request"], "attempts": [],
+                                                   "response": None, "transport_failed": False}
             requests.persist()
-            raise error
-        if waiting is not None:
-            waiting["disposition"] = "superseded_unverified"
-        event.update(accepted=True, disposition="pending")
-        # The caller persists this audit, exact candidate and verify stage before
-        # requesting its next step. No invalid reply is appended to reviews.
-        return "verify", repaired
+            # Rejected criteria and proposed edits are neither review evidence
+            # nor a candidate mutation, even when an edit is structurally valid.
+            return advance_review(reviewer, stage, candidate, prepared, record, requests)
+        requests.persist()
+        raise error
     if waiting is not None:
         if entry["stage"] != "verification" or entry["candidate_hash"] != waiting["candidate_after_hash"]:
             raise AnalysisError("Proposal verification identity changed", code="app.damaged_job")
