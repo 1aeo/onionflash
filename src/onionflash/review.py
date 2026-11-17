@@ -355,8 +355,11 @@ Compare lifecycle states explicitly (a later merge completes an earlier request)
 {_SHARED_VERDICT_RULES}
 Story repair and skip rules: If unsupported wording or labels can be fixed strictly from
 the packet, return "revise" with the smallest edit (prefer deleting unsupported clauses;
-never add absent impacts, mechanisms or advice; set why_it_matters to "" when any
-criterion fails because of it, else null, never writing or rewording it). If the packet
+never add absent impacts, mechanisms or advice). Modify only fields whose own assertions
+you identify as defective. When why_it_matters is supported, set its repair value to null
+even if source_support fails for the title or summary; clear it only for a defect in the
+impact assertion itself. The only allowed why_it_matters edit is "": never generate,
+rewrite or replace its text. If the packet
 holds a worthwhile uncovered development that the candidate omits or buries behind quoted
 old text, revise to state the sender's unquoted development from the packet, or hold;
 never skip it. Use "skip" (repair null, news_value or new_information failed) ONLY when

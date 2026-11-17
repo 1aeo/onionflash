@@ -79,3 +79,31 @@ def test_temporal_rule_is_scoped_to_current_story_or_update(monkeypatch, update,
     else:
         assert "more than 14 days before" in prompt
         assert "updated_at, fail news_value" in prompt
+
+
+@pytest.mark.parametrize("verification", [False, True])
+def test_story_field_local_repair_retains_supported_impact(monkeypatch, verification):
+    response = verdict("revise", criterion="source_support", repair={"summary": "The source reports a qualified observation."})
+    public, _, result, body, _ = captured(monkeypatch, verification=verification, response=response)
+    prompt = " ".join(body["messages"][0]["content"].split())
+    assert "Modify only fields whose own assertions you identify as defective" in prompt
+    assert "set its repair value to null even if source_support fails for the title or summary" in prompt
+    assert 'The only allowed why_it_matters edit is ""' in prompt
+    assert result["repair"] == {"summary": "The source reports a qualified observation."}
+    assert review.apply_repair(public, result["repair"])["why_it_matters"] == public["why_it_matters"]
+
+
+def test_impact_remains_clear_only_and_readonly_for_update_repairs(monkeypatch):
+    public, _, _, body, _ = captured(monkeypatch)
+    schema = body["response_format"]["json_schema"]["schema"]
+    why = schema["properties"]["repair"]["anyOf"][1]["properties"]["why_it_matters"]
+    assert why["anyOf"][0]["enum"] == [""]
+    assert review.apply_repair(public, {"why_it_matters": ""})["why_it_matters"] == ""
+    with pytest.raises(review.ReviewError):
+        review.apply_repair(public, {"why_it_matters": "A newly generated impact sentence."})
+    update, _, _, body, _ = captured(monkeypatch, update=True)
+    assert "why_it_matters" not in body["response_format"]["json_schema"]["schema"]["properties"]["repair"]["anyOf"][1]["properties"]
+    repaired = review.apply_repair(update, {"update": "The report states an additional qualified observation."}, update=True)
+    assert repaired["why_it_matters"] == update["why_it_matters"]
+    with pytest.raises(review.ReviewError):
+        review.apply_repair(update, {"why_it_matters": ""}, update=True)
