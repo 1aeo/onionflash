@@ -100,6 +100,11 @@ claim and the source. Support must concern that same object or property and the
 conditions necessary for the claim actually made; topical similarity is not enough.
 Do not require prerequisites for a stronger impact that the sentence does not assert."""
 
+_TEMPORAL_SUPPORT_RULE = """Keep a dated hypothesis in its original time frame. Its uncertainty does not
+establish that the suspected condition persists after a later fix, release or
+resolution; claim post-event persistence only when supplied later evidence supports
+it. Do not infer that a distinct issue was resolved merely from that later event."""
+
 _SHARED_VERDICT_RULES = f"""Work through all nine criteria in order before choosing verdict. Each reason is an
 evidence comparison written BEFORE its outcome, not a summary of the topic or an
 assertion that claims are supported. Use at most 40 words and 360 characters:
@@ -246,6 +251,7 @@ issue/comment timestamps do not make an old incident new or currently ongoing.
 When later supplied evidence corrects or narrows an earlier observation, state that
 correction in this reason and check that the candidate preserves it. Do not retell a
 withdrawn inference as the current conclusion or resolve disagreement by choosing a speaker.
+{_TEMPORAL_SUPPORT_RULE}
 operational_advice: operator instructions, necessity or urgency require a packet passage
 explicitly directing that actor to take that action; an emergency release, available fix,
 editorial label or benefit description is NOT an operator instruction. Do not invent
@@ -470,6 +476,7 @@ Evaluate all nine criteria in order before choosing verdict:
    or narrows an earlier observation retold by this update, state the correction in this reason and check
    that the new text preserves it; do not retell a withdrawn inference as current or choose a speaker
    to settle an ongoing disagreement.
+   {_TEMPORAL_SUPPORT_RULE}
 6. operational_advice: Any operator instruction or upgrade directive in candidate.updates[-1].text requires an
    explicit passage in the cited new source directing that audience to act; pass when no advice is stated.
 7. technical_details: Versions, commit hashes, ticket/MR IDs, relays, authorities, CVEs, metrics, counts, mechanisms

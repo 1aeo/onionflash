@@ -61,3 +61,21 @@ def test_claim_scope_instruction_does_not_allow_unbound_evidence_or_failed_appro
     response["criteria"]["source_support"]["outcome"] = "fail"
     with pytest.raises(review.ReviewError):
         captured(monkeypatch, response=response)
+
+
+@pytest.mark.parametrize("update", [False, True])
+@pytest.mark.parametrize("verification", [False, True])
+def test_temporal_rule_is_scoped_to_current_story_or_update(monkeypatch, update, verification):
+    public, _, _, body, payload = captured(monkeypatch, update=update, verification=verification)
+    prompt = body["messages"][0]["content"]
+    assert review._TEMPORAL_SUPPORT_RULE in prompt
+    assert "supplied later evidence" in review._TEMPORAL_SUPPORT_RULE
+    assert "Do not infer that a distinct issue was resolved" in review._TEMPORAL_SUPPORT_RULE
+    assert "passage order is not chronology" in prompt
+    if update:
+        assert payload["review_scope"] == "latest_update"
+        assert "candidate.title, summary, why_it_matters and updates[:-1] are read-only" in prompt
+        assert payload["candidate"]["why_it_matters"] == public["why_it_matters"]
+    else:
+        assert "more than 14 days before" in prompt
+        assert "updated_at, fail news_value" in prompt
