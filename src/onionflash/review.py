@@ -552,6 +552,18 @@ LABEL_LIMIT_ISSUE = (
     "not source instructions."
 )
 
+COMPLETION_ISSUE = (
+    "The final source check cannot substantiate the completion words listed below in "
+    "the current review target. They are application-detected wording concerns, not "
+    "source evidence. Compare each with the packet's actual request, plan, observation "
+    "or completed action. Fail status for unsupported completion and make the smallest "
+    "source-supported repair, preserving the useful report, qualifiers and impact. "
+    "A worthwhile request can still be reported as a request; do not skip it merely "
+    "because it has not been completed. Never invent completion evidence or an "
+    "unsupported synonym to evade the check. Hold only if a safe repair is unavailable. "
+    "All factual, significance, novelty and fresh-verification checks still apply."
+)
+
 PERSONAL_STYLE_ISSUE = (
     "actor_and_action includes names-only attribution for named people, even when their role is sourced. "
     "The literal current-field forms below locate a recognized personal-role or metadata-title problem. "
@@ -693,7 +705,8 @@ def policy_hash(config: dict) -> str:
     identity = {key: llm[key] for key in ("model", "base_url", "fallback_base_urls")}
     identity["generation"] = generation_options(llm)
     return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, ROUTING_PROMPT, UPDATE_SYSTEM_PROMPT,
-                   UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, LABEL_LIMIT_ISSUE, PERSONAL_STYLE_ISSUE, INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT,
+                   UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, LABEL_LIMIT_ISSUE, COMPLETION_ISSUE, PERSONAL_STYLE_ISSUE,
+                   INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT,
                    SCHEMA, UPDATE_REPAIR, VALIDATION_ERRORS, REASON_REPETITION_POLICY,
                    identity, CompletionClient.REQUEST_POLICY, EVIDENCE_POLICY,
                    NAMED_ATTRIBUTION_POLICY, ATTRIBUTION_CHECK_PROMPT, personal_attribution.PERSONAL_ATTRIBUTION_POLICY,
@@ -1050,20 +1063,17 @@ def _claimed_done(*texts: str) -> list[str]:
     return claimed
 
 
-def final_holds(candidate: dict, prepared: dict, *, known_attributions=()) -> list[str]:
-    """Why a verified approval may not publish, as review_gate.HOLDS reasons; empty when it may.
+def unsupported_completion_claims(candidate: dict, prepared: dict) -> tuple[str, ...]:
+    """Completion words rejected by the final literal guard, not a semantic verdict.
 
-    The checks read only the candidate, its packet and the kind of source that wrote its
-    text, so every caller reaches the same answer, and none needs a model call."""
+    Updates use only the current entry and its exact citations. The existing
+    merged-request title fallback is retained; requests and plans are not proof
+    of completed work. Callers may expose these words before asking for review.
+    """
     sources = prepared["packet"]["sources"]
-    limits = label_limits(sources)
     merged = _plain("\n".join(source["title"] for source in sources
                               if source.get("kind") == "gitlab_mr" and source.get("upstream_state") == "merged"))
-    all_proof = _plain("\n".join(passage["text"] for source in sources for passage in source["passages"]))
     if prepared.get("mode") == "update":
-        if (((prepared.get("coverage") or {}).get("prior_story") or {}).get("confidence") == "confirmed"
-                and "confirmed" not in limits["confidence"]):
-            limits = {**limits, "confidence": [*limits["confidence"], "confirmed"]}
         entry = candidate["updates"][-1]
         exact_urls = {canonical_url(source["url"]) for source in entry["sources"]}
         cited_urls = {url.split("#", 1)[0] for url in exact_urls}
@@ -1074,13 +1084,31 @@ def final_holds(candidate: dict, prepared: dict, *, known_attributions=()) -> li
         proof = _plain("\n".join(
             passage["text"] for source, source_url in cited_sources for passage in source["passages"]
             if (canonical_url(passage["url"]) if "url" in passage else source_url) in exact_urls))
+    else:
+        claimed = (_claimed_done(candidate["title"], candidate["summary"], candidate["why_it_matters"])
+                   if prepared["payload"]["editorial_kind"] == "gitlab_issue" else [])
+        proof = _plain("\n".join(passage["text"] for source in sources for passage in source["passages"]))
+    return tuple(dict.fromkeys(word for word in claimed
+                              if not (_stated(proof, word) or _stated(merged, DONE[word]))))
+
+
+def final_holds(candidate: dict, prepared: dict, *, known_attributions=()) -> list[str]:
+    """Why a verified approval may not publish, as review_gate.HOLDS reasons; empty when it may.
+
+    The checks read only the candidate, its packet and the kind of source that wrote its
+    text, so every caller reaches the same answer, and none needs a model call."""
+    sources = prepared["packet"]["sources"]
+    limits = label_limits(sources)
+    all_proof = _plain("\n".join(passage["text"] for source in sources for passage in source["passages"]))
+    if prepared.get("mode") == "update":
+        if (((prepared.get("coverage") or {}).get("prior_story") or {}).get("confidence") == "confirmed"
+                and "confirmed" not in limits["confidence"]):
+            limits = {**limits, "confidence": [*limits["confidence"], "confirmed"]}
+        entry = candidate["updates"][-1]
         lead = _plain(entry["text"])
         texts = (entry["text"],)
         untrusted_claim = False
     else:
-        proof = all_proof
-        claimed = (_claimed_done(candidate["title"], candidate["summary"], candidate["why_it_matters"])
-                   if prepared["payload"]["editorial_kind"] == "gitlab_issue" else [])
         lead = _plain(candidate["title"])
         texts = (candidate["title"], candidate["summary"], candidate["why_it_matters"])
         community_list = bool(sources) and all(
@@ -1098,7 +1126,7 @@ def final_holds(candidate: dict, prepared: dict, *, known_attributions=()) -> li
     is_alert = candidate.get("origin") == "network-health"
     products = candidate.get("products", ())
     return [reason for reason, held in (
-        ("completed_action", any(not (_stated(proof, word) or _stated(merged, DONE[word])) for word in claimed)),
+        ("completed_action", bool(unsupported_completion_claims(candidate, prepared))),
         ("compromise_headline", compromise_headline),
         ("confirmed_source", not is_alert and candidate["confidence"] not in limits["confidence"]),
         ("merge_state", not is_alert and limits["state"] == ["merged"] and candidate["state"] != "merged"),

@@ -1036,8 +1036,11 @@ def recovery_status(record):
 def call_review(reviewer, stage, candidate, prepared, *, requests, correction=False) -> dict:
     """Return only a genuinely validated reply; an invalid reply remains an exception."""
     known_attributions = review.attribution_names(prepared, requests.record)
+    issues = [review.RELEASE_ISSUE] if stage == "repair" else []
+    if completion_words := review.unsupported_completion_claims(candidate, prepared):
+        issues.append(review.COMPLETION_ISSUE + "\n" + json.dumps(completion_words, ensure_ascii=False))
     result = reviewer.review(candidate, prepared["packet"], coverage=prepared["coverage"], verification=stage == "verify",
-                             issue=review.RELEASE_ISSUE if stage == "repair" else None,
+                             issue="\n\n".join(issues) if issues else None,
                              on_request=requests.callback(correction=correction),
                              **({"validation_error": correction} if correction else {}),
                              **({"attribution_names": known_attributions} if known_attributions else {}),
