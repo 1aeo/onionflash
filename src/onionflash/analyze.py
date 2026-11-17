@@ -18,6 +18,8 @@ from .util import digest, is_dirauth_item, is_hackerone_item, normalize_evidence
 PROMPT_VERSION = "onionflash-22"
 # Change this when update input filtering changes, independently of prompt prose.
 UPDATE_INPUT_VERSION = 2
+# Bind cached drafts to deterministic validation independently of writer requests.
+VALIDATION_VERSION = 1
 WRITER_REASONING_OPTIONS = {
     "max_output_tokens": 32768, "max_response_bytes": 2097152,
     "enable_thinking": True, "temperature": 1.0,
@@ -336,7 +338,7 @@ def cache_key(row: dict, llm: dict, prior: dict | None = None) -> str:
                 "fallback_base_urls": effective["fallback_base_urls"],
                 "generation": generation_options(effective),
                 "max_response_bytes": effective["max_response_bytes"]}
-    identity = [row["content_hash"], contract, PROMPT_VERSION, prompt,
+    identity = [row["content_hash"], contract, PROMPT_VERSION, VALIDATION_VERSION, prompt,
                 json.dumps(schema, ensure_ascii=False, allow_nan=False)]
     if prior is not None:
         # Category and this source predicate also shape the update grammar.
@@ -357,12 +359,51 @@ _PRERELEASE = (r"[0-9][0-9a-z]*(?:\.[0-9][0-9a-z]*)+-(?:alpha|beta|rc|pre|dev)"
 # Thus 0.4.9 does not match 0.4.9.16, nor 15.0 match 15.0a3, with linear matching.
 _NUMBER = re.compile(_PRERELEASE + r"|[0-9][0-9a-z]*(?:[.,][0-9][0-9a-z]*)*|\b(?:" + "|".join(_NUMBER_WORDS) + r")\b")
 
+# Explicit hour words retain their meaning across quotation/code formatting.
+# Compact h needs preceding wait/delay prose, including a quoted whole scalar.
+# Other code stays opaque: h can also be a version or hexadecimal suffix.
+_HOURS = re.compile(r"(?<![^\s(\[\{\"'`])(?P<count>[0-9]+|" + "|".join(_NUMBER_WORDS)
+                    + r")(?: |-)hours?(?=$|[\s)\]\}\"'`,;!?]|\.(?!\w))")
+_COMPACT_HOURS = re.compile(r"(?<![^\s(])(?P<quote>[\"']|`+)?(?(quote) *)(?P<count>[0-9]+)h"
+                            r"(?(quote) *(?P=quote))(?=$|[\s),;!?]|\.(?!\w))|"
+                            r"(?P<ticks>`+).*?(?:(?P=ticks)`*|$)|"
+                            r"(?P<tildes>~{3,}).*?(?:(?P=tildes)~*|$)")
+_HOUR_BEFORE = re.compile(r"\b(?:wait(?:ing)?(?: (?:another|for|of))?|delay(?: of)?) \(?$")
+
 
 def _numbers(text: str) -> set[str]:
     """The numbers and versions in text; "three", "3" and "03" are one number. Leading zeros
     are stripped as text, because int() refuses the longest digit runs a source can hold."""
     tokens = (_NUMBER_WORDS.get(token, token) for token in _NUMBER.findall(_plain(text)))
     return {(token.lstrip("0") or "0") if token.isdigit() else token for token in tokens}
+
+
+def _numbers_supported(impact: str, context: str) -> bool:
+    """Preserve literal matches; forgive only unmatched occurrences of the same hours."""
+    available = _numbers(context)
+    if _numbers(impact) <= available:
+        return True
+    impact, context = _plain(impact), _plain(context)
+
+    def hours(text: str):
+        for pattern in (_HOURS, _COMPACT_HOURS):
+            for match in pattern.finditer(text):
+                count = match["count"]
+                if count is None or (
+                    pattern is _COMPACT_HOURS
+                    and not _HOUR_BEFORE.search(text, max(0, match.start() - 32), match.start())
+                ):
+                    continue
+                count = _NUMBER_WORDS.get(count, count)
+                yield match.start(), match.end(), count.lstrip("0") or "0"
+
+    source_hours = {count for _, _, count in hours(context)}
+    # Remove supported hour expressions only. A separate occurrence of the same
+    # digits (such as a relay count) must still pass the original literal check.
+    for start, end, count in sorted(hours(impact), reverse=True):
+        if count in source_hours:
+            impact = impact[:start] + " " + impact[end:]
+    return _numbers(impact) <= available
 
 
 def validate_analysis(result: dict, item: dict, schema: dict = SCHEMA) -> dict:
@@ -423,7 +464,7 @@ def validate_analysis(result: dict, item: dict, schema: dict = SCHEMA) -> dict:
     # bodies the writer saw, and is cleared on untrusted list posts, shouting or malformed versions.
     impact = result.get("why_it_matters")
     if impact and (
-        _numbers(impact) - _numbers(impact_context)
+        not _numbers_supported(impact, impact_context)
         or (item.get("authority") == "community" and is_list_item)
         or has_shouting_caps(impact)
         or has_malformed_tor_version(impact, result.get("products") or [item.get("product", "")])
