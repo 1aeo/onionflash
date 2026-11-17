@@ -93,6 +93,38 @@ def test_story_field_local_repair_retains_supported_impact(monkeypatch, verifica
     assert review.apply_repair(public, result["repair"])["why_it_matters"] == public["why_it_matters"]
 
 
+@pytest.mark.parametrize("update", [False, True])
+@pytest.mark.parametrize("verification", [False, True])
+def test_standalone_impact_boundary_reaches_only_story_requests(monkeypatch, update, verification):
+    _, _, _, body, payload = captured(monkeypatch, update=update, verification=verification)
+    prompt = " ".join(body["messages"][0]["content"].split())
+    rules = (
+        "Assess why_it_matters against the supplied source alone: each assertion must be stated or directly entailed.",
+        "title, summary and confidence label cannot supply missing qualifiers, scope or limitations",
+        "including a borderline inference, mark source_support insufficient, not pass",
+        "a hedge in one clause does not automatically qualify a following consequence",
+        "If only why_it_matters is defective and the article is otherwise eligible, return revise and clear it",
+        "leave supported why_it_matters unchanged",
+    )
+    assert all((rule in prompt) is not update for rule in rules)
+    assert "necessary governing context" in prompt
+    if update:
+        assert payload["review_scope"] == "latest_update"
+        assert "why_it_matters and updates[:-1] are read-only" in prompt
+    else:
+        assert "more than 14 days before" in prompt
+
+
+@pytest.mark.parametrize("verification", [False, True])
+def test_insufficient_impact_can_only_be_cleared_by_a_valid_repair(monkeypatch, verification):
+    response = verdict("revise", criterion="source_support", repair={"why_it_matters": ""})
+    response["criteria"]["source_support"]["outcome"] = "insufficient"
+    public, _, result, _, _ = captured(monkeypatch, verification=verification, response=response)
+    assert result["verdict"] == "revise" and result["repair"] == {"why_it_matters": ""}
+    repaired = review.apply_repair(public, result["repair"])
+    assert repaired == {**public, "why_it_matters": ""}
+
+
 def test_impact_remains_clear_only_and_readonly_for_update_repairs(monkeypatch):
     public, _, _, body, _ = captured(monkeypatch)
     schema = body["response_format"]["json_schema"]["schema"]

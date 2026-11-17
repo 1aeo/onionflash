@@ -199,8 +199,17 @@ advice, severity, urgency, cause, number, version or benefit beyond the anchor a
 necessary supplied context. Do not assemble additional consequences from other passages
 or infer impact from a description of what changed. Judge non-empty why_it_matters in
 source_support's reason and fail (clearing why_it_matters) for absent claims, >-quoted
-reply text, unrequested advice, generic boilerplate or casual chat. Fail
-source_support when any field generalizes one sample, treats template checkboxes as proof
+reply text, unrequested advice, generic boilerplate or casual chat.
+Assess why_it_matters against the supplied source alone: each assertion must be stated
+or directly entailed. The candidate's title, summary and confidence label cannot supply
+missing qualifiers, scope or limitations. For a reasonable inference not stated or
+directly entailed, including a borderline inference, mark source_support insufficient,
+not pass. Each separate consequence must preserve
+its own material qualifiers; a hedge in one clause does not automatically qualify a
+following consequence. If only why_it_matters is defective and the article is otherwise
+eligible, return revise and clear it rather than holding the article; leave supported
+why_it_matters unchanged.
+Fail source_support when any field generalizes one sample, treats template checkboxes as proof
 confidential patches shipped, infers developer work, maintainer rulings or fix
 effectiveness beyond the text, omits a material packet disclosure, or labels a bugfix
 release security without a vulnerability.
