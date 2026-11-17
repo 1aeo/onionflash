@@ -540,6 +540,7 @@ publishes this exact update.
 RELEASE_ISSUE = ("A release category or tag needs state released or tagged: remove the release labels, "
                  "or correct the state, as the packet supports.")
 
+LABEL_LIMIT_POLICY = 1  # Current-label checks differ from permissible new edits.
 LABEL_LIMIT_ISSUE = (
     "The current classification values listed below exceed the source-bound label limits. "
     "Fail uncertainty_attribution for invalid confidence, status for invalid state, or "
@@ -707,7 +708,7 @@ def policy_hash(config: dict) -> str:
     return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, ROUTING_PROMPT, UPDATE_SYSTEM_PROMPT,
                    UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, LABEL_LIMIT_ISSUE, COMPLETION_ISSUE, PERSONAL_STYLE_ISSUE,
                    INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT,
-                   SCHEMA, UPDATE_REPAIR, VALIDATION_ERRORS, REASON_REPETITION_POLICY,
+                   SCHEMA, UPDATE_REPAIR, VALIDATION_ERRORS, REASON_REPETITION_POLICY, LABEL_LIMIT_POLICY,
                    identity, CompletionClient.REQUEST_POLICY, EVIDENCE_POLICY,
                    NAMED_ATTRIBUTION_POLICY, ATTRIBUTION_CHECK_PROMPT, personal_attribution.PERSONAL_ATTRIBUTION_POLICY,
                    _LIVE_INCIDENT_CLAIM_RE.pattern])
@@ -759,7 +760,10 @@ def repair_limits(packet: dict, coverage: dict | None = None, *, update: bool = 
 def label_issues(candidate: dict, limits: dict) -> list[dict]:
     """Locate existing label-bound violations without choosing or applying repairs."""
     issues = [{"field": field, "value": candidate[field], "allowed": list(allowed)}
-              for field, allowed in limits.items() if candidate[field] not in allowed]
+              for field, allowed in limits.items() if candidate[field] not in allowed
+              # A retained public state need not be available for a new model
+              # edit. Only the existing merge-only guard forces a current state.
+              if field != "state" or allowed == ["merged"]]
     if any(tag not in limits["category"] for tag in candidate.get("tags", ())):
         issues.append({"field": "tags", "value": list(candidate["tags"]),
                        "allowed": list(limits["category"])})

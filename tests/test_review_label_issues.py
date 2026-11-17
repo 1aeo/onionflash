@@ -76,9 +76,30 @@ def test_merge_only_invalid_labels_are_reported_without_changing_them():
     assert public == original
 
 
+@pytest.mark.parametrize("state", ["no-longer-listed", "tagged"])
+def test_retained_public_state_does_not_require_new_generation_evidence(state):
+    source = packet()
+    source["sources"][0].update(kind="gitlab_issue", authority="development")
+    public = candidate(confidence="reported", category="network", tags=["network"], state=state)
+    limits = review.repair_limits(source)
+    assert state not in limits["state"]
+    assert review.label_issues(public, limits) == []
+    source["sources"][0].update(kind="gitlab_mr", upstream_state="merged")
+    assert review.label_issues(public, review.repair_limits(source)) == [
+        {"field": "state", "value": state, "allowed": ["merged"]}]
+
+
 def test_label_issue_text_participates_in_policy_identity(monkeypatch):
     from onionflash.config import DEFAULTS
 
     before = review.policy_hash(DEFAULTS)
     monkeypatch.setattr(review, "LABEL_LIMIT_ISSUE", "A different instruction.")
+    assert review.policy_hash(DEFAULTS) != before
+
+
+def test_current_label_check_policy_participates_in_cache_identity(monkeypatch):
+    from onionflash.config import DEFAULTS
+
+    before = review.policy_hash(DEFAULTS)
+    monkeypatch.setattr(review, "LABEL_LIMIT_POLICY", review.LABEL_LIMIT_POLICY + 1)
     assert review.policy_hash(DEFAULTS) != before
