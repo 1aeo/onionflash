@@ -768,3 +768,164 @@ def test_functional_status_exception_does_not_hide_handles_or_full_names(name):
     text=f'The operator of the authority is {name}.'
     assert style.normalize_text(text)==text
     assert style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('text', [
+    'However, the reporter subsequently reported the result.',
+    'The sender subsequently reported the result.',
+    'The reporter recently reported the result.',
+    'The sender later reported the result.',
+    'The reporter also reported the result.',
+    'The reporter very recently reported the result.',
+    'The sender clearly and repeatedly stated the condition.',
+    'The reporter subsequently had reported the result.',
+    'The reporter subsequently was investigating the issue.',
+    'The operator currently is unavailable.',
+    'Maintainers recently were investigating the issue.',
+    'The sender recently has reported the result.',
+    'The sender did not report a completed change.',
+    'The reporter, subsequently, reported the result.',
+    'The reporter **subsequently** reported the result.',
+    'The reporter subsequently\nreported the result.',
+    'The operator subsequently reported the result.',
+    'The maintainer recently reported the result.',
+    'Maintainers recently reported the result.',
+    'Two relay operators subsequently reported the result.',
+    'Arti developers recently reported the result.',
+    'Tor Project contributors previously reported the result.',
+])
+def test_preserved_anonymous_subjects_keep_reporting_modifiers(text):
+    assert style.normalize_text(text)==text
+    assert not style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('text,expected', [
+    ('Reporter Kelly reported the result.', 'Kelly reported the result.'),
+    ('The sender Later reported the result.', 'Later reported the result.'),
+    ('The reporter @subsequently reported the result.', '@subsequently reported the result.'),
+    ('The operator @recently reported the result.', '@recently reported the result.'),
+    ('The sender named subsequently reported the result.', 'subsequently reported the result.'),
+    ('The reporter called later reported the result.', 'later reported the result.'),
+    ('The reporter called Later reported the result.', 'Later reported the result.'),
+    ('The reporter called @later reported the result.', '@later reported the result.'),
+    ('The operator known as @subsequently reported the result.', '@subsequently reported the result.'),
+    ('Arti developer Kelly reported the result.', 'Kelly reported the result.'),
+])
+def test_modifier_grammar_keeps_explicit_names_and_introducers(text,expected):
+    assert style.normalize_text(text)==expected
+
+
+@pytest.mark.parametrize('text', [
+    'A project-sender subsequently reported the result.',
+    'A project-sender subsequently has reported the result.',
+    'A project-sender currently is reviewing the issue.',
+    'A project-sender has reported the result.',
+    'An official sender recently was investigating the issue.',
+    'Kelly, a trusted operator, subsequently reported the result.',
+])
+def test_modifier_preservation_does_not_silently_exempt_named_or_metadata_roles(text):
+    assert style.normalize_text(text)==text
+    assert style.unresolved_text(text)
+
+
+def test_neutral_modifier_fix_keeps_protected_text_and_readonly_history():
+    protected='"The sender subsequently reported the result."\n`The reporter subsequently reported the result.`'
+    assert style.normalize_text(protected)==protected
+    before={'title':'Developer Kelly reported the result.', 'summary':'A reporter subsequently reported an earlier result.',
+            'why_it_matters':'The source states a consequence.', 'updates':[{'text':'Developer Kelly reported the old result.'},
+            {'text':'However, the reporter subsequently reported the new result.'}]}
+    assert style.normalize(before,update=True)==before
+    assert not style.issues(before,update=True)
+
+
+@pytest.mark.parametrize('text', [
+    'The reporter "Kelly" subsequently reported the result.',
+    'The sender `kelly` recently reported the result.',
+    'The operator “Kelly” later reported the result.',
+    'The reporter called Kelly to discuss the result.',
+    'The sender named Kelly as maintainer.',
+])
+def test_modifier_and_introducer_boundaries_do_not_erase_protected_names_or_actions(text):
+    assert style.normalize_text(text)==text
+
+
+@pytest.mark.parametrize('text', [
+    'The reporter called later to report the result.',
+    'The sender called back and said the result was available.',
+    'The reporter named the affected version.',
+    'The reporter called Kelly and reported the result.',
+])
+def test_neutral_called_and_named_actions_are_not_identity_introducers(text):
+    assert style.normalize_text(text)==text
+    assert not style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('inconsistent',[False,True])
+def test_repair_keeps_neutral_subject_before_exact_fresh_verification(context,inconsistent):
+    cfg,store=context
+    raw='However, the reporter subsequently reported a different result.'
+    row=pending(store,item(title='A reported observation',content=raw+' The source states a consequence.'))
+    draft=analysis(title='A source reports an observation',summary='The reporter initially reported the result.',
+                   why_it_matters='The source states a consequence.',category='network',tags=['network'])
+    response=verdict('revise',criterion='source_support',repair={'summary':raw})
+    if inconsistent:response['criteria']=verdict()['criteria']
+    checker=Reviewer(response,verdict());writer=Writer(draft)
+    result=run_gate(cfg,store,row,writer,checker)
+    assert result['status']=='published'and result['review_calls']==2
+    assert checker.calls[1][2]is True
+    assert checker.calls[1][0]['summary']==store.stories()[0]['summary']==raw
+    assert checker.calls[1][0]['why_it_matters']==draft['why_it_matters']
+    audit=_audit(store)
+    assert audit['schema_version']==2 and audit['request_budget']['reserved']==2
+    assert audit['reviews'][-1]['candidate_hash']==digest(checker.calls[1][0])
+
+
+def test_modifier_grammar_participates_in_policy_identity_without_a_version_change(monkeypatch):
+    from onionflash.config import DEFAULTS
+    original=review.policy_hash(DEFAULTS)
+    changed=copy.deepcopy(style.PERSONAL_ATTRIBUTION_POLICY)
+    changed['patterns']['anonymous_modifiers']='a different bounded modifier grammar'
+    monkeypatch.setattr(style,'PERSONAL_ATTRIBUTION_POLICY',changed)
+    assert review.policy_hash(DEFAULTS)!=original
+
+
+@pytest.mark.parametrize('text', [
+    'The operator currently is Robin.',
+    'The reporter subsequently was Sam.',
+    'The operator recently was @forest.',
+    'The reporter subsequently was Later.',
+])
+def test_modifier_gap_does_not_exempt_explicit_copular_person_identity(text):
+    assert style.normalize_text(text)==text
+    assert style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('text,expected', [
+    ('The reporter Kelly was investigating the issue.', 'Kelly was investigating the issue.'),
+    ('The sender Later was investigating the issue.', 'Later was investigating the issue.'),
+    ('The operator @subsequently was investigating the issue.', '@subsequently was investigating the issue.'),
+])
+def test_literal_person_before_an_auxiliary_stays_the_subject(text,expected):
+    assert style.normalize_text(text)==expected
+
+
+@pytest.mark.parametrize('text', [
+    '"A project-sender currently is reviewing the issue."',
+    '`A project-sender subsequently has reported the result.`',
+    '> A project-sender currently is reviewing the issue.',
+])
+def test_modified_metadata_labels_inside_protected_text_are_not_actor_claims(text):
+    assert style.normalize_text(text)==text
+    assert not style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('text', [
+    'A project-sender message reports the result.',
+    'The project-sender flag indicates a source classification.',
+    'The metadata uses the label `project-sender`.',
+    'The project-sender is a metadata class.',
+    'The project-sender is an authority value.',
+])
+def test_metadata_noun_and_property_gaps_do_not_claim_a_personal_actor(text):
+    assert style.normalize_text(text)==text
+    assert not style.unresolved_text(text)

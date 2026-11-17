@@ -12,7 +12,7 @@ import re
 from .named_attribution import _tokens, _GENERIC, _ORGANIZATION_WORDS
 
 PERSONAL_ATTRIBUTION_POLICY = {
-    'version': 7, 'style': 'names-only-personal-attribution',
+    'version': 8, 'style': 'names-only-personal-attribution',
     'grammar': 'role-name-action-or-comma-appositive', 'maximum_name_words': 4,
     'preserve': 'quotes-code-negation-events-organizations-audiences-readonly-history',
     'unresolved': 'hold-without-postapproval-edit', 'anonymous': 'preserve-source-checked-operational-functions-and-groups',
@@ -47,6 +47,12 @@ _QUOTE_DELIMITERS = frozenset("\"'“”‘’")
 _METADATA_SENDER = re.compile(r'(?<![\w@])(?:(?:a|an|the)\s+)?(?:project[- ]senders?|(?:Tor(?:\s+Project)?|official|trusted)[- ]senders?)\b', re.I)
 _ROLE_RELATIVE = re.compile(r'(?:(?:who\s+)?(?:is|was|identifies\s+as|identified\s+as|is\s+identified\s+as|was\s+identified\s+as))\s*', re.I)
 _OPERATIONAL_STATUS = frozenset('ok okay online offline available unavailable reachable unreachable operational nonoperational responsive unresponsive healthy unhealthy ready busy up down active inactive'.split())
+_MODIFIER_WORD = (r'(?:[a-z]+ly|again|also|already|still|just|later|now|then|soon|first|next|once|twice|yet|'
+                  r'perhaps|instead|therefore|thus|however|nevertheless|very|quite|rather|almost|even|too|'
+                  r'do|does|did|have|has|had|is|are|was|were|be|been|being|not|never)')
+_MODIFIER_PHRASE = _MODIFIER_WORD + r'(?:\s+(?:and\s+)?' + _MODIFIER_WORD + r'){0,5}'
+# Case-sensitive: a bare modifier is not a literal name or an explicit handle.
+_ANONYMOUS_MODIFIERS = re.compile(r'\s*(?:' + _MODIFIER_PHRASE + r'|,\s*' + _MODIFIER_PHRASE + r'\s*,)\s*')
 
 # The policy binds the literal grammar too, so changing its recognized forms
 # cannot accidentally reuse approvals from the prior grammar.
@@ -54,11 +60,13 @@ PERSONAL_ATTRIBUTION_POLICY.update(patterns={
     'role': _ROLE.pattern, 'action': _ACTION.pattern, 'named_action': _NAMED_ACTION.pattern,
     'negation': _NEGATION.pattern, 'event': _EVENT.pattern, 'markup': _PARTS.pattern, 'quote': _QUOTE.pattern,
     'metadata_sender': _METADATA_SENDER.pattern, 'role_relative': _ROLE_RELATIVE.pattern,
+    'anonymous_modifiers': _ANONYMOUS_MODIFIERS.pattern,
 }, nonperson_tokens=sorted(_NONPERSON), base_actions=sorted(_BASE_ACTIONS),
     operational_status_predicates=sorted(_OPERATIONAL_STATUS),
     clause_boundaries='punctuation-and-but-while-whereas', unnamed_nouns='finite-verb-and-predicate-continuation',
     qualified_collectives='project-qualified-plural-without-named-person',
-    neutral_references='unqualified-anaphoric-reporter-sender',
+    neutral_references='unqualified-anaphoric-reporter-sender-with-modifiers-v2',
+    modifier_names='preserved-subject-single-capitalized-token-or-explicit-name-introducer',
     name_introducers='named-called-known-as-before-finite-action', leading_modifiers='hold-when-unmatched',
     protected_edit_spans='reject-all-crossing-edits-and-incomplete-quote-ambiguity',
     quote_delimiters=sorted(_QUOTE_DELIMITERS), quote_search='mask-only-delimiters-in-protected-spans',
@@ -156,6 +164,14 @@ def _unmatched_modifier(context: str, role: str) -> bool:
     return bool(re.fullmatch(r'[\w-]+', word) and word.casefold() not in _NONPERSON)
 
 
+def _modifier_name(value: str, *, explicit: bool = False) -> bool:
+    """A literal modifier-shaped name needs spelling or an explicit introducer."""
+    words = _tokens(value)
+    return bool(len(words) == 1 and words[0].supported and value == words[0].value
+                and (explicit or value[0].isupper())
+                and _ANONYMOUS_MODIFIERS.fullmatch(value.casefold()))
+
+
 def _clauses(text: str):
     plain, offsets, pairs, protected, incomplete_quote = _view(text)
     edits, unresolved = [], []
@@ -168,8 +184,10 @@ def _clauses(text: str):
         following = plain[label.end():]
         action = _ACTION.search(following[:160])
         before_action = following[:action.start()].strip() if action else None
+        modified_action = _NAMED_ACTION.search(following[:160])
+        modified_actor = modified_action and _ANONYMOUS_MODIFIERS.fullmatch(following[:modified_action.start()])
         if (action and (not before_action or _person(before_action) or re.fullmatch(r',\s*', before_action))
-                or re.match(r"['’]s\b", following)):
+                or modified_actor or re.match(r"['’]s\b", following)):
             unresolved.append((label.start(), label.end()))
     for role in _ROLE.finditer(plain):
         left = plain[:role.start()]
@@ -190,9 +208,19 @@ def _clauses(text: str):
             if not named:
                 continue
         action = _ACTION.search(tail[:160])
+        introducer = re.match(r'\s*(?:named|called|known\s+as)\s+', tail, re.I)
+        introduced_action = introducer and _NAMED_ACTION.search(tail, introducer.end())
         # Reporter/sender without a named person are neutral source references,
         # not occupational titles; preserve their distinction in disagreements.
-        if re.fullmatch(r'(?:(?:a|an|the)\s+)?(?:reporter|sender)', role[0], re.I) and action and not tail[:action.start()].strip():
+        neutral_reference = bool(re.fullmatch(r'(?:(?:a|an|the)\s+)?(?:reporter|sender)', role[0], re.I))
+        anonymous_function = bool(re.search(r'(?:operators?|maintainers?)$', role[0], re.I))
+        qualified_group = bool(re.search(r'(?:developers|maintainers|operators|researchers|engineers|contributors|reporters|senders)$', role[0], re.I)
+                               and re.search(r'\b(?:C[ -]Tor|Tor(?:\s+Project)?|Arti)\b', role[0], re.I))
+        preserved_subject = neutral_reference or anonymous_function or qualified_group
+        introduced_name = tail[introducer.end():introduced_action.start()].strip() if introduced_action else ''
+        introduced_actor = bool(introduced_action and (_person(introduced_name)
+                                or preserved_subject and _modifier_name(introduced_name, explicit=True)))
+        if neutral_reference and action and not tail[:action.start()].strip() and not introduced_actor:
             continue
         named_action = _NAMED_ACTION.search(tail[:160])
         # Resolve a role attached to a literal personal subject before handling
@@ -224,11 +252,11 @@ def _clauses(text: str):
         # an anonymous person. Do not infer its identity from capitalization.
         if role[0][0].isupper() and re.search(r'(?:[A-Z][\w-]*\s+){2,}$', context):
             continue
-        introducer = re.match(r'\s*(?:named|called|known\s+as)\s+', tail, re.I)
         if introducer:
             following = _NAMED_ACTION.search(tail, introducer.end())
             name = tail[introducer.end():following.start()].strip() if following else ''
-            if following and _person(name) and not _unmatched_modifier(context, role[0]):
+            if (following and (_person(name) or preserved_subject and _modifier_name(name, explicit=True))
+                    and not _unmatched_modifier(context, role[0])):
                 middle = tail[introducer.end():following.start()]
                 end = role.end() + introducer.end() + len(middle) - len(middle.lstrip())
                 edits.append((role.start(),end,''));continue
@@ -281,6 +309,23 @@ def _clauses(text: str):
         postnominal = re.search(r'(?P<name>[^.!?;\n,]+?)\s*$', left)
         if re.match(r'the\s+', role[0], re.I) and postnominal and _person(postnominal['name'].strip()):
             unresolved.append((role.start(),role.end()));continue
+        # These subjects are already preserved when the reporting verb follows
+        # directly. A grammatical modifier must not be mistaken for their name.
+        if named_action and preserved_subject:
+            middle = tail[:named_action.start()]
+            if (_ANONYMOUS_MODIFIERS.fullmatch(middle)
+                    and not re.search(r'\band\s*$', context, re.I)
+                    and not any(i in protected for i in offsets[role.end():role.end()+named_action.start()])):
+                complement = tail[named_action.end():].strip()
+                words = _tokens(complement)
+                literal_name = bool(words and (words[0].value.startswith('@') or words[0].value[0].isupper()
+                                               or not words[0].value[0].isascii()))
+                if (named_action[0].casefold() in {'is', 'are', 'was', 'were'} and literal_name
+                        and complement.casefold() not in _OPERATIONAL_STATUS
+                        and (_person(complement) or _modifier_name(complement))
+                        and not _NEGATION.search(complement) and not _EVENT.search(complement)):
+                    unresolved.append((role.start(), role.end()+len(tail)));continue
+                continue
         # Prefix: "a relay operator <literal person> reports ...".
         if named_action:
             middle = tail[:named_action.start()]
@@ -288,7 +333,7 @@ def _clauses(text: str):
             if _ROLE.search(middle) and not re.sub(r'\b(?:and|or)\b|[,\s]', '', role_list, flags=re.I):
                 continue  # A coordinated role audience is not a named person.
             name = middle.strip()
-            if _person(name):
+            if _person(name) or preserved_subject and _modifier_name(name):
                 if _unmatched_modifier(context, role[0]):
                     unresolved.append((role.start(),role.end()));continue
                 if re.search(r'\b(?:\d+|one|two|three|four|both|several|many)\s*$', context, re.I):
