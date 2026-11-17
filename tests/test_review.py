@@ -458,7 +458,7 @@ def test_update_scope_confirmed_updates_uncited_notes_and_punctuation_repairs(mo
     assert checker.review(repaired, pkt, coverage=coverage, verification=True, update=True)["verdict"] == "approve"
     assert checker.client.requests[1][1]["messages"][0]["content"] == review.UPDATE_VERIFY_PROMPT
     assert repaired["title"] == prior["title"] and repaired["summary"] == prior["summary"] and repaired["updates"][0] == prior["updates"][0]
-    assert repaired["updates"][1] == {**prior["updates"][1], "text": "Operators reported verified telemetry."} and repaired["state"] == "developing"
+    assert repaired["updates"][1] == {**prior["updates"][1], "text": "People reported verified telemetry."} and repaired["state"] == "developing"
 
     with pytest.raises(review.ReviewError):
         review._text("Bad\ufffechar", 100)
@@ -495,7 +495,7 @@ def test_update_scope_confirmed_updates_uncited_notes_and_punctuation_repairs(mo
                                 "passages": [{"id": "S1.P1", "text": "Issue body text without completed verbs."},
                                              {"id": "S1.N1", "url": url99 + "#note_1", "text": "We merged and deployed the fix."}]}]},
     }
-    assert review.final_holds(cand, prep) == []
+    assert review.final_holds(review.personal_attribution.normalize(cand, update=prep.get("mode") == "update"), prep) == []
     assert "completed_action" in review.final_holds({**cand, "updates": [{"at": LATER, "text": "Maintainers deployed the fix.",
                                                                           "sources": [{"url": url99, "title": "Issue 99"}]}]}, prep)
     prep_parent_done = {**prep, "packet": {"sources": [{"id": "S1", "url": url99, "authority": "development", "kind": "gitlab_issue",
@@ -534,16 +534,16 @@ def test_final_holds_shouting_malformed_version_and_untrusted_operator_claims():
         "The subject was written as Tor 0.4.17 in the archive.",
         "Maintainers corrected the Tor 0.4.17 typo.",
     ):
-        assert review.final_holds(candidate(summary=annotated, confidence="reported", products=["tor"]), prep_for("trusted-operator")) == []
+        assert review.final_holds(review.personal_attribution.normalize(candidate(summary=annotated, confidence="reported", products=["tor"])), prep_for("trusted-operator")) == []
     arti_story = candidate(summary="Operators tested 0.4.17 relay builds.", confidence="reported", products=["arti"])
     assert review.final_holds(arti_story, prep_for("trusted-operator")) == []
 
     inc_story = candidate(title="Operator reports DDoS flood against exit relays",
                           summary="A mailing-list post describes an ongoing DDoS attack.",
                           category="dos", tags=["dos"], confidence="reported")
-    assert review.final_holds(inc_story, prep_for("community")) == ["untrusted_operator_claim"]
-    assert review.final_holds(inc_story, prep_for("trusted-operator")) == []
-    assert review.final_holds(inc_story, prep_for("project-sender")) == []
+    assert review.final_holds(review.personal_attribution.normalize(inc_story), prep_for("community")) == ["untrusted_operator_claim"]
+    assert review.final_holds(review.personal_attribution.normalize(inc_story), prep_for("trusted-operator")) == []
+    assert review.final_holds(review.personal_attribution.normalize(inc_story), prep_for("project-sender")) == []
     assert "confirmed_source" in review.final_holds({**inc_story, "confidence": "confirmed"}, prep_for("trusted-operator"))
 
     rfc_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/rfc1/"
@@ -616,7 +616,7 @@ def test_final_holds_shouting_malformed_version_and_untrusted_operator_claims():
             category="relay", tags=["relay"], confidence="reported",
         ),
     ):
-        assert review.final_holds(live_inc, prep_for("community", rfc_url)) == ["untrusted_operator_claim"]
+        assert review.final_holds(review.personal_attribution.normalize(live_inc), prep_for("community", rfc_url)) == ["untrusted_operator_claim"]
 
     upd_cand = {
         **rfc_story,
@@ -624,5 +624,5 @@ def test_final_holds_shouting_malformed_version_and_untrusted_operator_claims():
         "updates": [{"at": LATER, "text": "OPERATORS REPORT POST-0.4.17 UPGRADE FAILURE.", "sources": [{"url": list_url, "title": "List"}]}],
     }
     upd_holds = review.final_holds(upd_cand, {"mode": "update", "packet": {"sources": src_for("community")}})
-    assert set(upd_holds) == {"shouting_caps", "malformed_version"}
+    assert set(upd_holds) == {"shouting_caps", "malformed_version", "personal_attribution"}
     assert review.final_holds({**shout_story, "origin": "network-health"}, prep_for("community")) == []

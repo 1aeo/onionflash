@@ -109,14 +109,44 @@ criterion before the verdict:
 
 ### Developer evidence
 
-Calling a named or identifiable person a developer requires supplied evidence of
-code authored by that same person and committed into C Tor or Arti. Contributions
-to either project support generic "developer" attribution when discussing either
-project. A specific "C Tor developer" or "Arti developer" label requires committed
-code in that named project. Another person's work, unrelated repositories,
-self-description, technical fluency, mailing-list participation, sender domains,
-and proposed or unmerged code do not establish the role. A literal role word is
-not required when the supplied commit evidence establishes it.
+Publication attribution uses a person's name without an occupational title, even
+when the occupation is supported. A deterministic style pass runs after drafting
+and before the first review, and again before each proposed repair is verified.
+It removes bounded role/name/action prefixes and comma appositives while keeping
+the name, reporting action, useful impact and other sentence content. Anonymous
+reporting keeps a neutral person/people reference with the original number and
+determiner; it never gains an invented name or source identity. Audiences, genuine
+quotations, code, negation, organization names and occupational events such as
+retirement remain content. Ambiguous recognized personal-role clauses remain
+intact for repair or a final hold, never an unsafe partial rewrite.
+
+The bounded grammar recognizes developer, maintainer, operator, researcher,
+engineer, contributor, reporter and sender labels with common project/role
+qualifiers. It is a style rule, not general natural-language identity recognition.
+Unambiguous named/called/known-as prefixes retain the literal introduced name;
+actual calling or naming actions keep their original actor. Project-qualified
+plural collectives remain literal collective attributions, not an official
+organizational voice. Unqualified reporter/sender references remain available to
+distinguish participants. Unmatched modifiers, complex self-identification and
+possessive-qualified anonymous roles may require repair rather than an unsafe edit.
+Only title, summary and impact are editable for a story; an update edits only its
+newest entry. Prior updates and read-only story text remain unchanged. No style
+edit happens after approval: the exact normalized text receives fresh verification,
+and cached, operator and final commit checks reject a remaining recognized role.
+The style contract is part of review policy identity; old policy approvals are
+not reused, and genuine version-two records restart review from their retained
+draft without a schema migration. Writer prompts, generated responses and their
+cache identities are unchanged. Evaluation retains original input/gold separately
+from the normalized review target. It also records whether final text changed
+relative to that target and whether a style edit removed a lexical error marker.
+Such marker removal is not proof that an unrelated factual flaw was repaired;
+source assessment must compare the original, normalized and final wording.
+
+Contributor eligibility still requires supplied evidence of code authored by the
+same person and committed into C Tor or Arti. Another person's work, unrelated
+repositories, self-description, technical fluency, mailing-list participation,
+sender domains and proposed or unmerged code do not establish that qualification.
+It does not depend on retaining a developer label in the published sentence.
 
 On tor-dev, this verified contribution evidence also makes substantive technical
 critiques, protocol reviews and empirical multi-relay measurements eligible across
@@ -340,7 +370,7 @@ an older policy can justify a fresh budget; older verdict schemas remain readabl
 
 ## Final checks
 
-A verified approval publishes only if eight fixed checks also pass. They read the
+A verified approval publishes only if nine fixed checks also pass. They read the
 exact candidate, its source packet and the kind of source that wrote its text,
 make no model call, and run again when a saved approval is resumed. A failed
 check holds the item for the operator with its own [decision code](DECISIONS.md);
@@ -369,6 +399,9 @@ skips are not checked.
   vulnerability claim (`untrusted_operator_claim`); eligible `tor-dev` `[RFC]`,
   numbered Tor proposal, and IETF Internet-Draft or IETF RFC specifications that
   propose defenses without asserting a live operational incident are allowed.
+
+- Recognized personal attribution must already satisfy names-only publication
+  style (`personal_attribution`). The final check rejects; it never edits approved text.
 
 - An explicit named reporting clause (`named_attribution`) needs its literal name
   in the scoped packet text, author metadata or exact sender domain. Suspected

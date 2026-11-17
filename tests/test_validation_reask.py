@@ -249,7 +249,8 @@ def test_pending_untrusted_edit_is_verified_using_the_current_edited_candidate(c
 def test_update_correction_keeps_scope_readonly_history_and_ordered_inputs(context):
     cfg, _ = context
     case, prepared = update_case()
-    original = copy.deepcopy(case["candidate"])
+    original = review.personal_attribution.normalize(case["candidate"], update=True)
+    prepared = {**prepared, "candidate": original}
     audit = {"candidate": original, "reviews": [], "policy_hash": review.policy_hash(cfg), **review_gate.initial_review_state()}
     requests = review_gate.ReviewRequests(audit)
     checker = reviewer(cfg, untrusted_update({}), verdict(update=True), verdict(update=True))

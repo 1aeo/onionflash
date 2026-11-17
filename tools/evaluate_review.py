@@ -17,6 +17,7 @@ from onionflash.analyze import AnalysisError, Analyzer
 from onionflash.config import load_config
 from onionflash.render import prepare_story
 from onionflash.review import EDITABLE, Reviewer, final_holds, policy_hash
+from onionflash import personal_attribution
 from onionflash.review_gate import ReviewRequests, advance_review, initial_review_state, recovery_status
 from onionflash.source_packet import normalize_labels, number_sources
 from onionflash.util import item_cluster, story_cluster
@@ -256,7 +257,16 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                                 "row": {"url": source["url"], "story_id": prior["id"] if prior else None,
                                         "cluster_key": item_cluster(identity_item),
                                         "payload": json.dumps(item)}}
-                    stage, text, record["reviews"] = "review", candidate, []
+                    text = personal_attribution.normalize(candidate, update=scope == "latest_update")
+                    # Preserve the original input/gold comparison separately from
+                    # the exact publication-style text sent to native review.
+                    record["review_candidate"] = text
+                    record["style_input_changed"] = text != candidate
+                    record["style_unresolved"] = personal_attribution.unresolved(text, update=scope == "latest_update")
+                    record["style_removed_unsupported"] = [marker for marker in kept_unsupported(case, candidate)
+                                                           if marker not in kept_unsupported(case, text)]
+                    prepared["candidate"] = text
+                    stage, record["reviews"] = "review", []
                     while True:
                         action, value = advance_review(reviewer, stage, text, prepared, record, requests)
                         if action not in {"verify", "repair"}:
@@ -313,6 +323,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                             route_ok = False
                     unsafe = published and (case["expected"] in {"skip", "hold"} or bool(record["kept_unsupported"]))
                     published_candidate = text if published else None
+                    record["normalized_input_unchanged"] = bool(published and text == record["review_candidate"])
                     missing = omitted(case, published_candidate) if published else []
                     # not_approve marks news with a flawed draft: hold or a clean repair, never a skip.
                     missed = (final_verdict in {"skip", "route"}) != (case["expected"] == "skip") and case["expected"] != "approve"

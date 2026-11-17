@@ -6,7 +6,7 @@ from collections.abc import Iterable
 import json
 import re
 
-from . import editorial, render, source_packet
+from . import editorial, personal_attribution, render, source_packet
 from .analyze import MIN_EVIDENCE_CHARS
 from .comments import analysis_context, is_budget_clipped_prefix, note_key, prior_notes
 from .llm import strip_unreleased_tag, unquoted_text
@@ -791,7 +791,9 @@ def prepare(
                     published_at=previous["published_at"] if previous else item["published_at"],
                     added_at=previous.get("added_at", previous["published_at"]) if previous else observed,
                     updated_at=effective_updated)
-        public = render.prepare_story(data, editorial=editorial.public_metadata(db, story_id))
+        public = personal_attribution.normalize(
+            render.prepare_story(data, editorial=editorial.public_metadata(db, story_id)), update=mode == "update"
+        )
         # Store exactly the normalized reviewed display fields while retaining
         # collection identities privately for future grouping and source lookup.
         data.update({key: value for key, value in public.items() if key not in {"sources", "editorial"}})

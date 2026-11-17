@@ -127,7 +127,7 @@ def test_cross_project_controls_separate_generic_and_named_project_labels(direct
     assert CASES[prefix + "-update-specific-wrong"]["expected"] == "not_approve"
     assert positive["candidate"]["confidence"] == "reported"
     prepared = {"packet": positive["packet"], "payload": {"editorial_kind": "feed"}}
-    assert review.final_holds(positive["candidate"], prepared) == []
+    assert review.final_holds(review.personal_attribution.normalize(positive["candidate"]), prepared) == []
     confirmed = {**positive["candidate"], "confidence": "confirmed"}
     assert "confirmed_source" in review.final_holds(confirmed, prepared)
 
@@ -151,7 +151,7 @@ def test_prior_committed_code_can_support_substantive_review_of_a_current_unmerg
     assert with_patch["candidate"]["confidence"] == "reported"
     assert with_patch["packet"]["sources"][0]["authority"] == "community"
     assert CASES["role-community-unmerged"]["expected"] == "skip"
-    assert review.final_holds(with_patch["candidate"], {
+    assert review.final_holds(review.personal_attribution.normalize(with_patch["candidate"]), {
         "packet": with_patch["packet"], "payload": {"editorial_kind": "feed"}}) == []
 
 

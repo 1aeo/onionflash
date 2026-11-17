@@ -164,7 +164,8 @@ def test_unknown_inflight_corruption_correction_is_not_reissued(context, monkeyp
 def test_update_corruption_recovery_keeps_prior_text_and_exact_current_scope(context):
     cfg, _ = context
     case, prepared = update_case()
-    original = copy.deepcopy(case["candidate"])
+    original = review.personal_attribution.normalize(case["candidate"], update=True)
+    prepared = {**prepared, "candidate": original}
     audit = {"candidate": original, "reviews": [], "policy_hash": review.policy_hash(cfg),
              **review_gate.initial_review_state()}
     requests = review_gate.ReviewRequests(audit)

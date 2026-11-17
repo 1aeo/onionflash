@@ -60,6 +60,7 @@ HOLDS = {
     "malformed_version": "the candidate cites a nonexistent three-part C-Tor version",
     "untrusted_operator_claim": "an uncorroborated mailing-list incident claim needs a trusted source",
     "named_attribution": "a named attribution has no literal source evidence",
+    "personal_attribution": "personal attribution still needs names-only publication style",
 }
 
 

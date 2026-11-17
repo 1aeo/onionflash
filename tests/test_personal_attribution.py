@@ -1,0 +1,410 @@
+"""Names-only publication style preserves the underlying statement."""
+import pytest
+
+from onionflash import personal_attribution as style
+
+
+@pytest.mark.parametrize('original,expected', [
+    ('Arti developer Alice reports a regression.', 'Alice reports a regression.'),
+    ('Relay operator river says the relay is unavailable.', 'river says the relay is unavailable.'),
+    ('Developer Élodie García found a scheduling bug.', 'Élodie García found a scheduling bug.'),
+    ('Maintainer @river-user explains the change.', '@river-user explains the change.'),
+    ('Alice, an Arti developer, reports a regression.', 'Alice reports a regression.'),
+    ('**Arti developer** Alice reports a regression.', 'Alice reports a regression.'),
+    ('Arti developer **Alice** reports a regression.', '**Alice** reports a regression.'),
+    ('**Arti developer Alice** reports a regression.', '**Alice** reports a regression.'),
+    ('Arti developer Alice\nSmith reports a regression.', 'Alice\nSmith reports a regression.'),
+])
+def test_names_only_attribution(original, expected):
+    assert style.normalize_text(original) == expected
+    assert style.normalize_text(expected) == expected
+    assert not style.unresolved_text(expected)
+
+
+@pytest.mark.parametrize('text', [
+    'Relay operators should upgrade when convenient.',
+    'The project seeks a maintainer.',
+    'Alice retires as maintainer.',
+    'Alice is not a developer.',
+    'Alice said, "A developer reported the issue."',
+    '`developer Alice reports` is an example.',
+    'Developer Tools reports a build failure.',
+])
+def test_content_not_personal_attribution_is_preserved(text):
+    assert style.normalize_text(text) == text
+    assert not style.unresolved_text(text)
+
+
+def test_unsafe_personal_role_claim_is_not_reduced_to_a_name_only_sentence():
+    text = 'Alice is a developer.'
+    assert style.normalize_text(text) == text
+    assert style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('original,expected', [
+    ('An operator reports an outage.', 'A person reports an outage.'),
+    ('The relay operator reports an outage.', 'The person reports an outage.'),
+    ('Two operators reported an outage.', 'Two people reported an outage.'),
+    ('Operators report an outage.', 'People report an outage.'),
+    ('A maintainer said the report was incomplete.', 'A person said the report was incomplete.'),
+])
+def test_anonymous_reports_keep_identity_absence_and_number(original, expected):
+    assert style.normalize_text(original) == expected
+    assert not style.unresolved_text(expected)
+
+
+@pytest.mark.parametrize('text', [
+    'Relay operators should upgrade and report any failures.',
+    'Alice is not a developer and reports an unrelated event.',
+    'The project seeks two maintainers.',
+])
+def test_role_words_do_not_create_blanket_holds(text):
+    assert style.normalize_text(text) == text
+    assert not style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('text', [
+    'Alice is an Arti developer who reports a regression.',
+    'Former developer Alice reports a regression.',
+    'Alice (Arti developer) reports a regression.',
+    'Alice — an Arti developer — reports a regression.',
+    'Alice the developer reports a regression.',
+    'Developer `alice_handle` reports a regression.',
+    'Developer “Alice” reports a regression.',
+    'Arti developer Alice and the maintainer reported a regression.',
+])
+def test_ambiguous_personal_role_preserves_text_and_holds(text):
+    assert style.normalize_text(text) == text
+    assert style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('text', [
+    '    Developer Alice reports a regression.',
+    'Developer mode reports a missing dependency.',
+    'Open Source Maintainers reports its survey results.',
+    'Arti developer\n\nAlice reports a regression.',
+])
+def test_code_organizations_and_paragraph_boundaries(text):
+    assert style.normalize_text(text) == text
+    assert not style.unresolved_text(text)
+
+
+def test_attribution_after_according_to():
+    assert style.normalize_text('According to Arti developer Alice, the queue stalls.') == 'According to Alice, the queue stalls.'
+
+
+# Runtime assertions use the native gate and saved records, not a payload-only adapter.
+import copy
+import json
+from helpers import DATE, LATER, Reviewer, Writer, analysis, item, job, pending, run_gate, verdict, insert_approval, load_evaluator
+from onionflash import review, review_gate
+from onionflash.analyze import AnalysisError
+from onionflash.candidate import ReviewRequired
+from onionflash.util import digest
+
+
+def _named_draft(**changes):
+    return analysis(title='Arti developer Alice reports a scheduling issue',
+                    summary='Relay operator Alice reports that requests wait for a connection.',
+                    why_it_matters='Requests wait for a connection.',
+                    category='network', priority='normal', tags=['network'], **changes)
+
+
+def _named_item():
+    return item(title='Scheduling issue', content='Alice reports that requests wait for a connection.')
+
+
+def _audit(store):
+    return json.loads(store.db.execute('SELECT review_record FROM analyses ORDER BY rowid DESC').fetchone()[0])
+
+
+def test_initial_style_is_reviewed_and_writer_result_is_retained(context):
+    cfg, store = context
+    row = pending(store, _named_item())
+    draft = _named_draft(); writer, checker = Writer(draft), Reviewer(verdict())
+    result = run_gate(cfg, store, row, writer, checker)
+    assert result['status'] == 'published' and result['review_calls'] == 2
+    assert checker.calls[0][0]['title'] == 'Alice reports a scheduling issue'
+    assert checker.calls[0][0]['summary'] == 'Alice reports that requests wait for a connection.'
+    assert checker.calls[0][0]['why_it_matters'] == draft['why_it_matters']
+    assert checker.calls[0][0] == checker.calls[1][0]
+    assert all(checker.calls[1][0][key] == store.stories()[0][key] for key in review.EDITABLE)
+    assert json.loads(store.db.execute('SELECT result FROM analyses').fetchone()[0]) == draft
+    saved = _audit(store)
+    assert saved['schema_version'] == 2
+    assert {x['candidate_hash'] for x in saved['reviews']} == {digest(saved['candidate'])}
+    assert saved['prepared']['candidate'] == saved['candidate']
+
+
+@pytest.mark.parametrize('inconsistent', [False, True])
+def test_model_repairs_are_normalized_before_durable_fresh_verification(context, inconsistent):
+    cfg, store = context
+    row = pending(store, _named_item()); draft = _named_draft()
+    proposed = 'Developer Alice explains that queued requests wait for a connection.'
+    response = verdict('revise', repair={'summary': proposed})
+    if inconsistent:
+        response['criteria'] = verdict()['criteria']
+    first = Reviewer(response, AnalysisError('connection interrupted', retryable=True))
+    with pytest.raises(AnalysisError):
+        run_gate(cfg, store, row, Writer(draft), first)
+    saved = json.loads(job(store)['record_json'])
+    assert job(store)['stage'] == 'verify' and store.stories() == []
+    assert saved['candidate']['summary'] == 'Alice explains that queued requests wait for a connection.'
+    review_gate.validate_review_state(saved, 'verify', saved['candidate'], json.loads(job(store)['envelope_json']))
+    if inconsistent:
+        proposal = saved['untrusted_proposals'][0]
+        assert proposal['repair']['summary'] == saved['candidate']['summary']  # Real v2 receipts retain the effective applied edit.
+        assert proposal['candidate_after_hash'] == digest(saved['candidate'])
+        assert proposal['disposition'] == 'pending'
+    else:
+        assert saved['reviews'][0]['result']['repair']['summary'] == proposed
+    writer, checker = Writer(), Reviewer(verdict())
+    result = run_gate(cfg, store, row, writer, checker)
+    assert result['status'] == 'published' and result['review_calls'] == 1 and writer.calls == []
+    assert checker.calls[0][0] == saved['candidate'] and checker.calls[0][2] is True
+    assert _audit(store)['request_budget']['reserved'] == 3
+
+
+def test_uneditable_style_holds_even_after_two_model_approvals(context):
+    cfg, store = context
+    row = pending(store, _named_item())
+    draft = analysis(title='Alice is a developer.', summary='Alice reports that requests wait.', category='network', tags=['network'])
+    result = run_gate(cfg, store, row, Writer(draft), Reviewer(verdict()))
+    assert result['status'] == 'held' and result['review_calls'] == 2 and store.stories() == []
+    assert json.loads(job(store)['record_json'])['hold_code'] == 'personal_attribution'
+    check = review_gate.approval(cfg, store, row['id'])
+    assert not check['eligible'] and 'names-only' in check['reason']
+
+
+def test_commit_cannot_bypass_style_with_a_matching_cached_receipt(context):
+    cfg, store = context
+    row = pending(store, _named_item())
+    prepared = store.prepare_candidate(row, _named_draft(), LATER)
+    bad = copy.deepcopy(prepared['candidate']);bad['title'] = 'Developer Alice reports a scheduling issue'
+    proof = insert_approval(store, prepared, bad)
+    with pytest.raises(ReviewRequired, match='names-only'):
+        store.commit_candidate(prepared, bad, 'writer-key', LATER, **proof)
+    assert store.stories() == []
+
+
+def test_scope_and_input_immutability_preserve_readonly_history():
+    original = {'title':'Developer Alice reports an earlier event.', 'summary':'Maintainer Alice reports an earlier event.',
+                'why_it_matters':'Operators should review the notes.', 'updates':[
+                    {'text':'Developer Alice reports an earlier event.'},
+                    {'text':'Arti developer Alice reports a new measurement.'}]}
+    snapshot = copy.deepcopy(original)
+    after = style.normalize(original, update=True)
+    assert original == snapshot and after['updates'][0] == original['updates'][0]
+    assert after['updates'][-1]['text'] == 'Alice reports a new measurement.'
+    assert all(after[k] == original[k] for k in ('title','summary','why_it_matters'))
+    assert not style.unresolved(after, update=True)
+    story = style.normalize(original)
+    assert story['updates'] == original['updates']
+
+
+def test_public_evaluator_reviews_style_text_without_relabeling_input(context, tmp_path, monkeypatch):
+    cfg, store = context
+    row = pending(store, _named_item()); prepared = store.prepare_candidate(row, _named_draft(), LATER)
+    original = copy.deepcopy(prepared['candidate']);original['title']='Arti developer Alice reports a scheduling issue'
+    case={'id':'names-only-example','candidate':original,'packet':prepared['packet'],'existing_coverage':prepared['coverage'],
+          'expected':'approve','scope':'story','audit':'wording'}
+    evaluator=load_evaluator(); checker=Reviewer(verdict())
+    monkeypatch.setattr(evaluator,'EvaluationReviewer',lambda *a,**kw:checker)
+    monkeypatch.setattr(evaluator,'Analyzer',lambda *a,**kw:Writer())
+    output=tmp_path/'observations.jsonl';evaluator.evaluate(cfg,[case],output)
+    result=json.loads(output.read_text().splitlines()[0])
+    assert result['candidate'] == original
+    assert result['review_candidate']['title'] == 'Alice reports a scheduling issue'
+    assert result['published_candidate'] == result['review_candidate']
+    assert result['ok'] is False  # Preserve the unchanged-input gold comparator.
+    assert checker.calls[0][0] == result['review_candidate']
+
+
+@pytest.mark.parametrize('text', [
+    'Operators can review the reported changes.',
+    'Developers should report failures to the tracker.',
+    'Maintainers may review and publish the proposal.',
+])
+def test_audience_modal_precedes_any_later_reporting_verb(text):
+    assert style.normalize_text(text) == text
+    assert not style.unresolved_text(text)
+
+
+def test_operator_correction_rejects_new_roles_without_rewriting_history(context):
+    from onionflash import editorial
+    cfg,store=context
+    row=pending(store,_named_item())
+    assert run_gate(cfg,store,row,Writer(_named_draft()),Reviewer(verdict()))['status']=='published'
+    story=store.stories()[0];view=editorial.show(store.db,story['id'])
+    with pytest.raises(ValueError,match='names-only'):
+        editorial.correct(store.db,story['id'],{'summary':'Developer Alice reports a new measurement.'},
+                          reason='Correct attribution',expect_hash=view['hash'])
+    assert editorial.show(store.db,story['id'])['hash']==view['hash']
+
+
+def test_ambiguous_field_is_not_partially_rewritten():
+    text='Arti developer Alice and developer Bob report a regression.'
+    result=style.normalize_text(text)
+    assert result==text and style.unresolved_text(result)
+    assert style.normalize_text(result)==result
+
+
+def test_count_before_named_people_is_not_left_dangling():
+    text='Two operators Alice and Bob report a regression.'
+    assert style.normalize_text(text)==text and style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('text', [
+    'Earlier operator note.',
+    'Survivor operator note.',
+    'Operator reports show an increase.',
+    'Operator notes are available.',
+    'The maintainer comments confirm the report.',
+])
+def test_reporting_nouns_are_not_anonymous_people(text):
+    assert style.normalize_text(text) == text
+    assert not style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('text,expected', [
+    ('Not everyone agrees, Arti developer Alice reports a failure.', 'Not everyone agrees, Alice reports a failure.'),
+    ('After Bob retires, developer Alice reports a failure.', 'After Bob retires, Alice reports a failure.'),
+])
+def test_an_earlier_clause_does_not_exempt_a_new_attribution(text, expected):
+    assert style.normalize_text(text) == expected
+    assert not style.unresolved_text(expected)
+
+
+@pytest.mark.parametrize('text,expected', [
+    ('The issue is not resolved and Arti developer Alice reports measurements.', 'The issue is not resolved and Alice reports measurements.'),
+    ('Bob retired and Arti developer Alice reports measurements.', 'Bob retired and Alice reports measurements.'),
+    ('Arti developer Alice is testing the patch.', 'Alice is testing the patch.'),
+    ('C Tor developer Alice requested review of the change.', 'Alice requested review of the change.'),
+    ('Developer May reports a failure.', 'May reports a failure.'),
+    ('Developer Will reported a failure.', 'Will reported a failure.'),
+])
+def test_clause_boundaries_copula_and_capitalized_modal_names(text, expected):
+    assert style.normalize_text(text) == expected
+    assert not style.unresolved_text(expected)
+
+
+@pytest.mark.parametrize('text', [
+    'Operators May Report Failures.',
+    'OPERATORS MAY REPORT FAILURES.',
+    'Developer mode is testing an experimental feature.',
+    'Alice retired as an Arti maintainer.',
+    'Alice is not an Arti developer.',
+])
+def test_clause_expansion_preserves_audiences_product_terms_and_role_events(text):
+    assert style.normalize_text(text) == text
+    assert not style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('verb', ['argued', 'declined'])
+def test_additional_personal_reporting_actions(verb):
+    text=f'Arti developer Alice {verb} the proposed change.'
+    assert style.normalize_text(text)==f'Alice {verb} the proposed change.'
+    assert not style.unresolved_text(style.normalize_text(text))
+
+
+def test_an_unenumerated_personal_action_cannot_silently_keep_the_role():
+    text='Arti developer Alice investigated the measurement.'
+    assert style.normalize_text(text)==text
+    assert style.unresolved_text(text)
+
+
+def test_literal_grammar_is_part_of_policy_identity(context, monkeypatch):
+    cfg,_=context
+    before=review.policy_hash(cfg)
+    monkeypatch.setitem(style.PERSONAL_ATTRIBUTION_POLICY,'patterns',{'role':'different grammar'})
+    assert review.policy_hash(cfg)!=before
+
+
+@pytest.mark.parametrize('text', [
+    'Directory authority operators and Tor developers are affected by the change.',
+    'Tor Project developers announced a release.',
+    'Arti maintainers reported new measurements.',
+    'The reporter alleges a vulnerability, but the response disputes it.',
+    'The sender does not think a new option is needed.',
+])
+def test_collective_audiences_and_neutral_source_references(text):
+    assert style.normalize_text(text)==text
+    assert not style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('text,expected', [
+    ('A maintainer advised affected operators to use a workaround.', 'A person advised affected operators to use a workaround.'),
+    ('Arti developer Alice (@alice_handle) reports a measurement.', 'Alice (@alice_handle) reports a measurement.'),
+    ('The change was authored by C Tor developer Alice.', 'The change was authored by Alice.'),
+    ('Developer @operator reports a measurement.', '@operator reports a measurement.'),
+    ('Tor developers Alice and Bob reported a measurement.', 'Alice and Bob reported a measurement.'),
+])
+def test_literal_names_handles_and_anonymous_advice(text,expected):
+    assert style.normalize_text(text)==expected
+    assert not style.unresolved_text(expected)
+
+
+@pytest.mark.parametrize('text,expected', [
+    ('In a thread reply, a developer named river asked a user to submit a patch.', 'In a thread reply, river asked a user to submit a patch.'),
+    ('A relay operator named river reports measurements.', 'river reports measurements.'),
+    ('An Arti developer called Alice Smith reports measurements.', 'Alice Smith reports measurements.'),
+    ('A maintainer known as @alice-handle reports measurements.', '@alice-handle reports measurements.'),
+])
+def test_unambiguous_name_introducers_preserve_literal_identity(text,expected):
+    assert style.normalize_text(text)==expected
+    assert not style.unresolved_text(expected)
+
+
+@pytest.mark.parametrize('text', [
+    'A local Arti developer Alice reports a regression.',
+    'An experienced developer Alice reports a regression.',
+    'Local Arti developer Alice reports a regression.',
+    'A developer named `alice_handle` reports a regression.',
+    'A developer named “Alice” reports a regression.',
+])
+def test_ambiguous_introducers_or_unmatched_modifiers_are_not_partially_deleted(text):
+    assert style.normalize_text(text)==text
+    assert style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('text,expected', [
+    ('A developer called Alice to discuss the patch.', 'A person called Alice to discuss the patch.'),
+    ('A developer named Alice as maintainer.', 'A person named Alice as maintainer.'),
+    ('The report rates it low severity and maintainers called it minor.', 'The report rates it low severity and people called it minor.'),
+])
+def test_actual_calling_naming_and_judgment_keep_the_anonymous_actor(text,expected):
+    assert style.normalize_text(text)==expected
+    assert not style.unresolved_text(expected)
+
+
+@pytest.mark.parametrize('text', ["The relay's operator reports measurements.", 'An authority’s operator reports measurements.'])
+def test_possessive_qualification_cannot_turn_into_an_entities_person(text):
+    assert style.normalize_text(text)==text
+    assert style.unresolved_text(text)
+
+
+def test_name_introducer_cannot_borrow_a_verb_from_a_later_sentence():
+    text='Maintainers called it minor. Alice is testing the patch.'
+    assert style.normalize_text(text)=='People called it minor. Alice is testing the patch.'
+    assert not style.unresolved_text(style.normalize_text(text))
+
+
+def test_style_marker_collision_does_not_erase_the_remaining_false_claim(context,tmp_path,monkeypatch):
+    cfg,store=context
+    row=pending(store,_named_item()); prepared=store.prepare_candidate(row,_named_draft(),LATER)
+    original=copy.deepcopy(prepared['candidate'])
+    original['summary']='Developer Alice confirms that every client is affected.'
+    case={'id':'style-marker-example','candidate':original,'packet':prepared['packet'],
+          'existing_coverage':prepared['coverage'],'expected':'not_approve','scope':'story',
+          'unsupported':['Developer Alice']}
+    evaluator=load_evaluator();checker=Reviewer(verdict())
+    monkeypatch.setattr(evaluator,'EvaluationReviewer',lambda *a,**kw:checker)
+    monkeypatch.setattr(evaluator,'Analyzer',lambda *a,**kw:Writer())
+    output=tmp_path/'marker-observations.jsonl';evaluator.evaluate(cfg,[case],output)
+    result=json.loads(output.read_text().splitlines()[0])
+    assert result['candidate']==original
+    assert result['style_removed_unsupported']==['Developer Alice']
+    assert result['published_candidate']['summary']=='Alice confirms that every client is affected.'
+    assert result['normalized_input_unchanged'] is True
+    # The legacy lexical match can succeed while an unrelated false claim stays.
+    assert result['matched'] is True and 'every client is affected' in result['published_candidate']['summary']

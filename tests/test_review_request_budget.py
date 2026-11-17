@@ -292,7 +292,7 @@ def test_legitimate_context_change_discards_proposal_and_preserves_budget(contex
     checker = reviewer(cfg, verdict(), verdict())
     assert run(cfg, store, row, Writer(), checker)["status"] == "published"
     first = json.loads(checker.client.requests[0]["messages"][1]["content"])
-    assert first["candidate"]["summary"] == analysis()["summary"]
+    assert first["candidate"]["summary"] == "The person reported a plausible compromise and stopped trusting the affected keys."
     assert checker.client.requests[0]["messages"][0]["content"] == review.SYSTEM_PROMPT + review.ROUTING_PROMPT
     audit = saved_audit(store)
     assert audit["untrusted_proposals"][0]["disposition"] == "discarded_context"

@@ -800,6 +800,9 @@ class Store:
                     self.db.execute("DELETE FROM review_approvals WHERE key=?", (approval_key,))
                 from .review import attribution_names
                 from .named_attribution import missing_named_attributions
+                from .personal_attribution import unresolved
+                if decision == "approve" and unresolved(approved_candidate, update=mode == "update"):
+                    raise ReviewRequired("Personal attribution needs names-only publication style")
                 if decision == "approve" and missing_named_attributions(
                         approved_candidate, prepared["packet"], update=mode == "update",
                         known_names=attribution_names(prepared, attribution_record)):

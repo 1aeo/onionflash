@@ -6,6 +6,7 @@ import copy
 import json
 import re
 
+from . import personal_attribution
 from .analyze import SCHEMA as DRAFT_SCHEMA
 from .config import DEFAULTS
 from .llm import (AnalysisError, CompletionClient, apply_label_limits, has_malformed_tor_version,
@@ -629,7 +630,7 @@ def policy_hash(config: dict) -> str:
                    UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT,
                    SCHEMA, UPDATE_REPAIR, VALIDATION_ERRORS, REASON_REPETITION_POLICY,
                    identity, CompletionClient.REQUEST_POLICY, EVIDENCE_POLICY,
-                   NAMED_ATTRIBUTION_POLICY, ATTRIBUTION_CHECK_PROMPT])
+                   NAMED_ATTRIBUTION_POLICY, ATTRIBUTION_CHECK_PROMPT, personal_attribution.PERSONAL_ATTRIBUTION_POLICY])
 
 
 def _text(value, maximum: int, *, empty: bool = False) -> None:
@@ -730,7 +731,9 @@ def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict
     else:
         updated.update(copy.deepcopy(repair))
     try:
-        normalized = prepare_story(updated, editorial=updated.get("editorial"))
+        normalized = personal_attribution.normalize(
+            prepare_story(updated, editorial=updated.get("editorial")), update=update
+        )
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
         raise ReviewError("Repair does not form a valid public story") from exc
     if normalized == candidate:
@@ -1025,6 +1028,7 @@ def final_holds(candidate: dict, prepared: dict, *, known_attributions=()) -> li
         ("shouting_caps", not is_alert and any(has_shouting_caps(text) for text in texts)),
         ("malformed_version", not is_alert and any(has_malformed_tor_version(text, products) for text in texts)),
         ("untrusted_operator_claim", not is_alert and untrusted_claim),
+        ("personal_attribution", personal_attribution.unresolved(candidate, update=prepared.get("mode") == "update")),
         ("named_attribution", bool(missing_named_attributions(candidate, prepared["packet"], update=prepared.get("mode") == "update",
                                                               known_names=set(attribution_names(prepared)) | set(known_attributions)))),
     ) if held]

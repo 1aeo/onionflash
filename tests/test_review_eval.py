@@ -8,7 +8,7 @@ import stat
 import pytest
 
 from helpers import DATE, ROOT, FakeLLM, analysis, completion, item, load_evaluator, scripted_completion, verdict
-from onionflash import review_gate
+from onionflash import personal_attribution, review_gate
 from onionflash.analyze import AnalysisError, Analyzer
 from onionflash.config import DEFAULTS
 from onionflash.review import CRITERIA, RELEASE_ISSUE, _packet_refs, final_holds, validate_review
@@ -196,13 +196,13 @@ def test_editorial_skips_misses_coverage_verification_and_final_checks(evaluatio
     assert (rchk["false_approvals"], rchk["matched"], rchk["final_holds"], rchk["published_after_checks"]) == (1, 1, 1, 1)
     recs = {r["case"]: r for r in map(json.loads, chk_out.read_text().splitlines()[:-1])}
     assert recs["bastet-removed-as-done"]["final_holds"] == ["completed_action"] and "final_holds" not in recs["bastet-corrected"]
-    assert not [c["id"] for c in MOD.expand(RAW_PUBLIC) if c["expected"] == "approve" and final_holds(c["candidate"], {
-        "packet": c["packet"], "payload": {"editorial_kind": c["packet"]["sources"][0]["kind"]}})]
+    assert not [c["id"] for c in MOD.expand(RAW_PUBLIC) if c["expected"] == "approve" and final_holds(personal_attribution.normalize(c["candidate"], update=c.get("scope") == "latest_update"), {
+        "packet": c["packet"], "mode": "update" if c.get("scope") == "latest_update" else "story", "payload": {"editorial_kind": c["packet"]["sources"][0]["kind"]}})]
     corpus_holds = {
         c["id"]: (c.get("audit"), holds)
         for c in CORPUS
         if c["expected"] == "approve"
-        and (holds := final_holds(c["candidate"], {"packet": c["packet"], "payload": {"editorial_kind": c["packet"]["sources"][0]["kind"]}}))
+        and (holds := final_holds(personal_attribution.normalize(c["candidate"], update=c.get("scope") == "latest_update"), {"packet": c["packet"], "mode": "update" if c.get("scope") == "latest_update" else "story", "payload": {"editorial_kind": c["packet"]["sources"][0]["kind"]}}))
     }
     assert all(audit == "why-it-matters-1" and holds == ["untrusted_operator_claim"] for audit, holds in corpus_holds.values())
 
