@@ -23,6 +23,31 @@ def candidate(text, field="title"):
     return {"title": "A source report", "summary": "The report describes the issue.", "why_it_matters": "", field: text}
 
 
+@pytest.mark.parametrize("text,names", [
+    ("Example:\n~~~text\nNora's report describes a failure.\n~~~", []),
+    ("Example:\r\n   ~~~~text\r\nNora's report describes a failure.\r\n   ~~~~~\r\n", []),
+    ("~~~text\nNora's report describes a failure.", []),
+    ("~~~~\n```\nNora's report describes a failure.\n~~~\n"
+     "Nora's report describes another failure.\n~~~~\n\nDorian's report describes an observation.", ["Dorian"]),
+    ("~~~\n~~~ trailing text\nNora's report describes a failure.\n~~~\n"
+     "Dorian's report describes an observation.", ["Dorian"]),
+    ("~~~\n\nNora's report describes a failure.\n\n~~~\n\n"
+     "Dorian's report describes an observation.", ["Dorian"]),
+    ("Example ~~~text\n\nNora's report describes a failure.\n~~~", ["Nora"]),
+    ("~~text\nNora's report describes a failure.\n~~", ["Nora"]),
+    ("Nora's report describes a failure.", ["Nora"]),
+    ("```text\nNora's report describes a failure.\n```\n"
+     "Dorian's report describes an observation.", ["Dorian"]),
+])
+def test_fenced_examples_do_not_create_attributions_or_hide_prose(text, names):
+    public = candidate(text, "summary")
+    original = copy.deepcopy(public)
+    findings = missing_named_attributions(public, packet())
+    assert [finding["name"] for finding in findings] == names
+    assert all(finding["field"] == "summary" for finding in findings)
+    assert public == original
+
+
 @pytest.mark.parametrize("text,name", [
     ("Juno reports that clients fail.", "Juno"),
     ("According to Juno, clients fail.", "Juno"),

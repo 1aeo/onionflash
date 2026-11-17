@@ -10,7 +10,7 @@ from .util import safe_canonical_url
 
 # Advance when extraction or source matching changes; review policy binds this.
 NAMED_ATTRIBUTION_POLICY = {
-    "version": 7, "normalization": "NFC-lower-whole-tokens-optional-at-and-organization-article", "maximum_name_words": 4,
+    "version": 8, "normalization": "NFC-lower-whole-tokens-optional-at-and-organization-article", "maximum_name_words": 4,
     "patterns": "named-reporting-clause-according-to-or-possessive-report", "source_scope": "packet-text-unquoted-reply-author-and-sender-domain",
     "repair_context": "rematerialized-missing-name-literals",
 }
@@ -28,7 +28,9 @@ _CALENDAR_OWNER = frozenset("""monday tuesday wednesday thursday friday saturday
 january february march april may june july august september october november december""".split())
 _POSSESSIVE_PREFIX = frozenset("""apparently reportedly allegedly presumably possibly perhaps
 following regarding concerning despite considering""".split())
-_FENCE = re.compile(r"```.*?(?:```|\Z)", re.S)
+_FENCE = re.compile(
+    r"```.*?(?:```|\Z)|(?m:^[ ]{0,3}(?P<tilde>~{3,})[^\n]*(?:\n|\Z)"
+    r".*?(?:^[ ]{0,3}(?P=tilde)~*[ \t]*(?=\n|\Z)|\Z))", re.S)
 _INLINE_CODE = re.compile(r"`((?:(?!\n[ \t]*\n)[^`\x00])*)`")
 _EMPHASIS_PART = re.compile(r"```.*?(?:```|\Z)|`[^`]*`|\*+|_+", re.S)
 _URL = re.compile(r"https?://\S+", re.I)
