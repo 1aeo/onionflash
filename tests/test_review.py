@@ -169,7 +169,7 @@ def test_review_protocol_fresh_verification_and_application_issue(monkeypatch):
     assert list(schema["properties"]) == schema["required"] == ["criteria", "verdict", "same_story", "repair"]
     for check in schema["properties"]["criteria"]["properties"].values():
         assert list(check["properties"]) == check["required"] == ["reason", "source_refs", "outcome"]
-        assert check["properties"]["reason"]["maxLength"] == 240
+        assert check["properties"]["reason"]["maxLength"] == 360
 
     untouched = candidate(confidence="suspected", state="developing", category="security", tags=["security"], why_it_matters="")
     snap = copy.deepcopy(untouched)
@@ -184,6 +184,62 @@ def test_review_protocol_fresh_verification_and_application_issue(monkeypatch):
     issue_payload.pop("evidence_context")
     assert issue_payload == {
         "candidate": rel_pub, "packet": packet(), "application_issue": review.RELEASE_ISSUE}
+
+
+@pytest.mark.parametrize("length", [240, 241, 360])
+def test_evidence_comparison_reason_bound_accepts_existing_and_longer_records(length):
+    response = verdict()
+    response["criteria"]["source_support"]["reason"] = (
+        "The passage supports the claim with the stated audience and conditions. " * 6
+    )[:length]
+    checked = review.validate_review(response, packet())
+    assert checked["criteria"]["source_support"]["reason"] == response["criteria"]["source_support"]["reason"]
+
+
+def test_evidence_comparison_reason_bound_rejects_one_character_over_limit():
+    response = verdict()
+    response["criteria"]["source_support"]["reason"] = (
+        "The passage supports the claim with the stated audience and conditions. " * 6
+    )[:361]
+    with pytest.raises(review.ReviewError):
+        review.validate_review(response, packet())
+
+
+@pytest.mark.parametrize("verification", [False, True])
+@pytest.mark.parametrize("update", [False, True])
+def test_native_review_delivers_evidence_order_without_a_new_response_protocol(monkeypatch, verification, update):
+    public = candidate(why_it_matters="The source describes an effect with stated conditions.")
+    if update:
+        public["updates"] = [{"at": public["updated_at"], "text": "The source reports an additional observation.",
+                              "sources": public["sources"]}]
+    checker = reviewer(monkeypatch, completion(verdict(update=update)))
+    checker.review(public, packet(), update=update, verification=verification)
+    body = checker.client.requests[0][1]
+    prompt = body["messages"][0]["content"]
+    assert review._SHARED_VERDICT_RULES in prompt
+    assert "check a nonempty why_it_matters FIRST" in prompt
+    assert "actual\n  source.authority metadata value" in prompt
+    assert "passage order is not chronology" in prompt
+    assert "retain the underlying-story rule" in prompt
+    schema = body["response_format"]["json_schema"]["schema"]
+    assert list(schema["properties"]) == ["criteria", "verdict", "same_story", "repair"]
+    assert all(check["properties"]["reason"]["maxLength"] == 360
+               for check in schema["properties"]["criteria"]["properties"].values())
+    assert body["max_tokens"] == 2200
+    payload = json.loads(body["messages"][-1]["content"])
+    assert payload["packet"] == packet()
+    assert payload["candidate"] == public
+
+
+def test_evidence_reason_prompt_and_bound_are_both_in_review_policy(monkeypatch):
+    original = review.policy_hash(DEFAULTS)
+    monkeypatch.setattr(review, "SYSTEM_PROMPT", review.SYSTEM_PROMPT + " Additional evidence comparison.")
+    assert review.policy_hash(DEFAULTS) != original
+    monkeypatch.undo()
+    changed = copy.deepcopy(review.SCHEMA)
+    changed["properties"]["criteria"]["properties"]["source_support"]["properties"]["reason"]["maxLength"] = 240
+    monkeypatch.setattr(review, "SCHEMA", changed)
+    assert review.policy_hash(DEFAULTS) != original
 
 
 @pytest.mark.parametrize("bad", [

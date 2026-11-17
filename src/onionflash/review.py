@@ -34,7 +34,7 @@ REFS = {"type": "array", "items": {"type": "string", "maxLength": 32}, "maxItems
 # The reply is generated in property order, so each check states its reason before
 # its outcome, and every criterion comes before the verdict.
 CHECK = {"type": "object", "additionalProperties": False, "properties": {
-    "reason": {"type": "string", "maxLength": 240}, "source_refs": REFS,
+    "reason": {"type": "string", "maxLength": 360}, "source_refs": REFS,
     "outcome": {"type": "string", "enum": ["pass", "fail", "insufficient"]}},
     "required": ["reason", "source_refs", "outcome"]}
 SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
@@ -95,8 +95,39 @@ _PERSONAL_ROLE_RULE = (
     "establish official authority, confirm a claim, or make routine comments newsworthy."
 )
 
-_SHARED_VERDICT_RULES = """Work through all nine criteria in order before choosing verdict. For each criterion write
-a concise reason of at most 25 words, source_refs containing only packet IDs (S1 for
+_SHARED_VERDICT_RULES = """Work through all nine criteria in order before choosing verdict. Each reason is an
+evidence comparison written BEFORE its outcome, not a summary of the topic or an
+assertion that claims are supported. Use at most 40 words and 360 characters:
+- source_support: In story mode, check a nonempty why_it_matters FIRST. Quote its
+  consequential claim and its shortest literal unquoted source anchor, or say that
+  no anchor exists. Compare every material addition, including a second clause,
+  with that anchor and its necessary governing context. Preserve supported impact
+  even if awkward, cautious, or repeated in the summary; never clear it just for
+  those reasons. A supported first clause does not support an inferred second
+  consequence. Retain source conditions, audience and scope. If why_it_matters is
+  empty, say so and compare the story's most consequential factual assertion.
+  In latest_update mode compare only the new update, never the readonly why.
+- actor_and_action, status, uncertainty_attribution and scope_timing: quote the
+  relevant target phrase beside the exact source wording or metadata that supports
+  or limits it. For a correction, compare the affected observation and correction
+  with their supplied dates; passage order is not chronology. A closure statement
+  does not by itself prove a specific implementation or later observed recovery.
+- operational_advice and technical_details: compare the claimed instruction,
+  severity or technical consequence with its literal support; say none is claimed
+  when appropriate. Available fixes and security-release labels are not substitute
+  evidence for a request, severity adjective or demonstrated consequence.
+- news_value: In latest_update mode retain the underlying-story rule for that mode.
+  In story mode name the concrete event across the complete packet, the actual
+  source.authority metadata value, and the applicable eligibility condition or
+  exclusion. Body text, signatures and source classifications asserted by a draft
+  cannot supply metadata authority. Apply the specific source rules and exceptions
+  before broad categories such as security report. A material correction of prior
+  coverage is evaluated as a correction, not as a new ordinary bug report.
+- new_information: name the supplied coverage id and the concrete repeated or new
+  fact; say coverage is absent when no story is supplied. A source comment claiming
+  duplication cannot establish feed coverage or make news_value fail. Check material
+  corrections and lifecycle changes before deciding that a topic is already covered.
+Use source_refs containing only packet IDs (S1 for
 source metadata, S1:P1 for a passage; [] when absent; never invent IDs), and outcome
 ("pass", "fail" or "insufficient"). A criterion passes when no relevant claim is made;
 say why. Return verdict "approve" ONLY when ALL nine criteria pass, repair is null, and
