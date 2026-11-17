@@ -12,10 +12,10 @@ import re
 from .named_attribution import _tokens, _GENERIC, _ORGANIZATION_WORDS
 
 PERSONAL_ATTRIBUTION_POLICY = {
-    'version': 4, 'style': 'names-only-personal-attribution',
+    'version': 5, 'style': 'names-only-personal-attribution',
     'grammar': 'role-name-action-or-comma-appositive', 'maximum_name_words': 4,
     'preserve': 'quotes-code-negation-events-organizations-audiences-readonly-history',
-    'unresolved': 'hold-without-postapproval-edit', 'anonymous': 'same-cardinality-person-or-people',
+    'unresolved': 'hold-without-postapproval-edit', 'anonymous': 'preserve-source-checked-operational-functions-and-groups',
 }
 _ROLES = r'(?:developers?|maintainers?|operators?|researchers?|engineers?|contributors?|reporters?|senders?)'
 _QUALIFIER = r'(?:C[ -]Tor|Tor(?:\s+Project)?|Arti|relay|directory[ -]authority|core|lead|senior|security)'
@@ -44,18 +44,23 @@ _QUOTE = re.compile(
     r'"(?:(?!' + _QUOTE_BOUNDARY + r')[^"])*"|"[^"\r\n]*(?=$|[\r\n])'
     r'|“[^”]*(?:”|$)|‘[^’]*(?:’|$)|(?<!\w)\'(?:(?!' + _QUOTE_BOUNDARY + r')[^\'])*\'(?!\w)')
 _QUOTE_DELIMITERS = frozenset("\"'“”‘’")
+_METADATA_SENDER = re.compile(r'(?<![\w@])(?:(?:a|an|the)\s+)?(?:project[- ]senders?|(?:Tor(?:\s+Project)?|official|trusted)[- ]senders?)\b', re.I)
+_ROLE_RELATIVE = re.compile(r'(?:(?:who\s+)?(?:is|was|identifies\s+as|identified\s+as|is\s+identified\s+as|was\s+identified\s+as))\s*', re.I)
+
 # The policy binds the literal grammar too, so changing its recognized forms
 # cannot accidentally reuse approvals from the prior grammar.
 PERSONAL_ATTRIBUTION_POLICY.update(patterns={
     'role': _ROLE.pattern, 'action': _ACTION.pattern, 'named_action': _NAMED_ACTION.pattern,
     'negation': _NEGATION.pattern, 'event': _EVENT.pattern, 'markup': _PARTS.pattern, 'quote': _QUOTE.pattern,
+    'metadata_sender': _METADATA_SENDER.pattern, 'role_relative': _ROLE_RELATIVE.pattern,
 }, nonperson_tokens=sorted(_NONPERSON), base_actions=sorted(_BASE_ACTIONS),
     clause_boundaries='punctuation-and-but-while-whereas', unnamed_nouns='finite-verb-and-predicate-continuation',
     qualified_collectives='project-qualified-plural-without-named-person',
     neutral_references='unqualified-anaphoric-reporter-sender',
     name_introducers='named-called-known-as-before-finite-action', leading_modifiers='hold-when-unmatched',
     protected_edit_spans='reject-all-crossing-edits-and-incomplete-quote-ambiguity',
-    quote_delimiters=sorted(_QUOTE_DELIMITERS), quote_search='mask-only-delimiters-in-protected-spans')
+    quote_delimiters=sorted(_QUOTE_DELIMITERS), quote_search='mask-only-delimiters-in-protected-spans',
+    issue_locations='literal-current-field-codepoint-spans', anonymous_functions='operator-maintainer-without-attached-name')
 
 
 def _view(text: str):
@@ -152,6 +157,18 @@ def _unmatched_modifier(context: str, role: str) -> bool:
 def _clauses(text: str):
     plain, offsets, pairs, protected, incomplete_quote = _view(text)
     edits, unresolved = [], []
+    # Authority classifications are not substitute people. This only locates
+    # actor-shaped uses; quoted/code labels remain protected by the projection.
+    for label in _METADATA_SENDER.finditer(plain):
+        context = re.split(r'[.!?;,\n]|\b(?:and|but|while|whereas)\b', plain[:label.start()], flags=re.I)[-1]
+        if _NEGATION.search(context) or _EVENT.search(context):
+            continue
+        following = plain[label.end():]
+        action = _ACTION.search(following[:160])
+        before_action = following[:action.start()].strip() if action else None
+        if (action and (not before_action or _person(before_action) or re.fullmatch(r',\s*', before_action))
+                or re.match(r"['’]s\b", following)):
+            unresolved.append((label.start(), label.end()))
     for role in _ROLE.finditer(plain):
         left = plain[:role.start()]
         context = re.split(r'[.!?;,\n]|\b(?:and|but|while|whereas)\b', left, flags=re.I)[-1]
@@ -176,9 +193,27 @@ def _clauses(text: str):
         if re.fullmatch(r'(?:(?:a|an|the)\s+)?(?:reporter|sender)', role[0], re.I) and action and not tail[:action.start()].strip():
             continue
         named_action = _NAMED_ACTION.search(tail[:160])
+        # Resolve a role attached to a literal personal subject before handling
+        # anonymous functional descriptions. Unknown modifiers stay intact for
+        # repair; deleting arbitrary qualifiers could erase an actual fact.
+        opening = re.search(r',(?P<prefix>[^,;.!?]*)$', left)
+        closing = re.match(r'\s*,\s*', tail)
+        if opening and closing and _NAMED_ACTION.match(tail, closing.end()):
+            subject = re.split(r'[.!?;]', left[:opening.start()])[-1].strip()
+            prefix = opening['prefix'].strip()
+            if _person(subject):
+                if not prefix or _ROLE_RELATIVE.fullmatch(prefix):
+                    edits.append((opening.start(), role.end()+closing.end()-1, ''));continue
+                if re.match(r'(?:a|an|the)\b', prefix) or _ROLE_RELATIVE.match(prefix):
+                    # Relative actions involving another person are not a role
+                    # appositive: e.g. a person who interviewed an operator.
+                    if not re.search(r'\b(?:who|which|that|by|to|from|with|for|of)\b', prefix, re.I):
+                        unresolved.append((opening.start(), role.end()+closing.end()));continue
+                    if _ROLE_RELATIVE.match(prefix):
+                        unresolved.append((opening.start(), role.end()+closing.end()));continue
         # Do not delete the complement of a role predicate or only the noun
         # after a temporal qualifier: either change would corrupt its meaning.
-        pred = re.search(r'(?P<name>[^.!?;\n,]+?)\s+(?:is|was|identifies\s+as|describes\s+\w+\s+as)\s*$', left, re.I)
+        pred = re.search(r'(?P<name>[^.!?;\n,]+?)\s+(?:is|was|identifies\s+as|identified\s+as|is\s+identified\s+as|was\s+identified\s+as|describes\s+\w+\s+as)\s*$', left, re.I)
         if pred and (_person(pred['name'].strip()) or re.search(r'\bwho\s+(?:is|was|identifies\s+as)\s*$', left, re.I)):
             unresolved.append((role.start(),role.end()));continue
         if re.search(r'\b(?:former|former[ -]time|acting|interim|alleged|self-described)\s*$', context, re.I):
@@ -211,6 +246,21 @@ def _clauses(text: str):
             if _person(name):
                 end = role.end() + len(tail) - len(tail.lstrip())
                 edits.append((role.start(),end,''));continue
+        if re.search(r'(?:operators?|maintainers?)$', role[0], re.I) and re.match(r'\s+of\s+', tail, re.I):
+            relation = tail[:named_action.start()] if named_action else tail
+            if opening:
+                subject = re.split(r'[.!?;]', left[:opening.start()])[-1].strip()
+                prefix = opening['prefix'].strip()
+                role_description = (not prefix or _ROLE_RELATIVE.fullmatch(prefix)
+                                    or re.match(r'(?:a|an|the)\b', prefix)
+                                    and not re.search(r'\b(?:who|which|that|by|to|from|with|for|of)\b', prefix, re.I))
+                if _person(subject) and role_description:
+                    unresolved.append((opening.start(), role.end()+len(relation)));continue
+            named_after = re.fullmatch(r'\s*of\s+[^,;()]+,\s*(.+?),\s*', relation, re.I)
+            if named_after and _person(named_after[1].strip()):
+                unresolved.append((role.start(), role.end()+len(relation)));continue
+            if not re.search(r'[,()]|\b(?:named|called|known\s+as)\b', relation, re.I):
+                continue  # Preserve the anonymous entity/function relationship.
         # Parenthetical/dash appositives are recognized, but left intact for
         # bounded model repair rather than attempting punctuation surgery.
         if re.search(r'[(—–]\s*$', left) and re.match(r'\s*[)—–]', tail):
@@ -239,7 +289,9 @@ def _clauses(text: str):
                 unresolved.append((role.start(),role.end()));continue
             if re.search(r'\band\s*$', context, re.I):
                 unresolved.append((role.start(),role.end()));continue
-            # Anonymous reporting keeps its number and determiner; no name,
+            if re.search(r'(?:operators?|maintainers?)$', role[0], re.I):
+                continue  # Anonymous operational references are not personal titles.
+            # Other anonymous reporting keeps its number and determiner; no name,
             # source identity, or organizational authority is inferred.
             plural = re.search(r'(?:developers|maintainers|operators|researchers|engineers|contributors|reporters|senders)$', role[0], re.I)
             if plural and re.search(r'\b(?:C[ -]Tor|Tor(?:\s+Project)?|Arti)\b', role[0], re.I):
@@ -270,7 +322,7 @@ def _clauses(text: str):
                 edits.append((comma.start(), role.end()+after.end()-1,''));continue
         # A role that is only an audience/object/event is not narrator attribution.
         # Recognized standalone personal role assertions cannot become "Name.".
-        pred = re.search(r'(?P<name>[^.!?;\n,]+?)\s+(?:is|was|identifies\s+as|describes\s+\w+\s+as)\s*$', left, re.I)
+        pred = re.search(r'(?P<name>[^.!?;\n,]+?)\s+(?:is|was|identifies\s+as|identified\s+as|is\s+identified\s+as|was\s+identified\s+as|describes\s+\w+\s+as)\s*$', left, re.I)
         if pred and _person(pred['name'].strip()):
             unresolved.append((role.start(),role.end()));continue
         if named_action and not re.search(r'[.!?;]', tail[:named_action.start()]) and not re.match(r'\s*(?:should|must|may|might|can|could|will|would|need|have|has)\b', tail, re.I):
@@ -337,6 +389,19 @@ def normalize(candidate: dict, *, update: bool = False) -> dict:
     return result
 
 
+def issues(candidate: dict, *, update: bool = False) -> list[dict]:
+    """Literal current-field forms with code-point offsets, never source evidence."""
+    fields = [('updates[-1].text', candidate['updates'][-1]['text'])] if update and candidate.get('updates') else [] if update else [(key, candidate.get(key, '')) for key in ('title', 'summary', 'why_it_matters')]
+    found = []
+    for field, text in fields:
+        _, offsets, _, edits, unresolved = _clauses(text)
+        spans = set(unresolved) | {(start, end) for start, end, _ in edits}
+        for start, end in sorted(spans):
+            if 0 <= start < end <= len(offsets):
+                begin, finish = offsets[start], offsets[end-1] + 1
+                found.append({'field': field, 'start': begin, 'end': finish, 'text': text[begin:finish]})
+    return found
+
+
 def unresolved(candidate: dict, *, update: bool = False) -> bool:
-    texts = [candidate['updates'][-1]['text']] if update and candidate.get('updates') else [] if update else [candidate.get(k,'') for k in ('title','summary','why_it_matters')]
-    return any(unresolved_text(text) for text in texts)
+    return bool(issues(candidate, update=update))

@@ -491,7 +491,7 @@ def test_relations_tag_citation_locked_hold_upgrade_and_update(context):
                     Writer(upd_draft), Reviewer(verdict(update=True)))["status"] == "published"
     after_upd = store.stories()[0]
     assert after_upd["title"] == "Community note on Tor 0.4.9.20" and len(after_upd["updates"]) == 2
-    assert after_upd["updates"][-1]["text"] == "People report clean upgrades on Debian bookworm."
+    assert after_upd["updates"][-1]["text"] == "Relay operators report clean upgrades on Debian bookworm."
 
     editorial.correct(store.db, after_upd["id"], {"title": after_upd["title"] + " (verified)"},
                       reason="Pin headline", expect_hash=editorial.show(store.db, after_upd["id"])["hash"])

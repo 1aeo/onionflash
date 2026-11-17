@@ -132,7 +132,7 @@ def test_verification_repairs_are_verified_fresh_and_stop_after_five(tmp_path):
         assert json.loads(job(store)["record_json"])["request_budget"]["reserved"] == 7
         shown = rejection.show_item(store, row["id"])["final_review"]
         assert shown["candidate"]["summary"] == "Repair number 5."
-        assert shown["base_candidate"]["summary"] == "The person reported a plausible compromise and stopped trusting the affected keys."
+        assert shown["base_candidate"]["summary"] == "The operator reported a plausible compromise and stopped trusting the affected keys."
         assert [(e["phase"], e["verdict"]) for e in shown["reviews"]] == [("review", "revise")] + [("verification", "revise")] * 5
         assert all(e["failed"] == {"operational_advice": "fail: The source does not support this claim."} for e in shown["reviews"])
         assert [e["repair"]["summary"] for e in shown["reviews"]] == [f"Repair number {n}." for n in range(6)]
@@ -724,7 +724,7 @@ def test_status_retry_reverted_hold_and_rejected_show_views(context, monkeypatch
     snap = list(store.db.iterdump())
     monkeypatch.setattr(review, "CRITERIA", (*review.CRITERIA, "a_later_criterion"))
     shown_h = rejection.show_item(store, row["id"])["final_review"]
-    assert shown_h["stage"] == "held" and shown_h["candidate"]["title"] == "A person reports possible compromise"
+    assert shown_h["stage"] == "held" and shown_h["candidate"]["title"] == "Operator reports possible compromise"
     assert shown_h["latest_review"]["criteria"]["operational_advice"]["outcome"] == "fail"
     assert shown_h["source_packet"]["sources"][0]["passages"][0]["id"] == "S1:P1"
     assert list(store.db.iterdump()) == snap

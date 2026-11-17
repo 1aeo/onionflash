@@ -412,7 +412,7 @@ def test_later_source_change_reviews_normally_and_clears_held_updates_summary(co
 
     upd_hash = rejection.show_item(store, row["id"], config=cfg)["final_review"]["approval"]["hash"]
     rejection.approve_item(cfg, store, row["id"], upd_hash, "Approve follow-up", observed=AFTER_SHOW)
-    assert store.stories()[0]["title"] == "A person reports possible compromise"
+    assert store.stories()[0]["title"] == "Operator reports possible compromise"
     assert store.stories()[0]["updates"][-1]["text"] == "Third revision update."
     assert decisions.summary(store.db, DATE)["awaiting_operator"]["held_updates"] == []
 

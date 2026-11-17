@@ -42,11 +42,11 @@ def test_unsafe_personal_role_claim_is_not_reduced_to_a_name_only_sentence():
 
 
 @pytest.mark.parametrize('original,expected', [
-    ('An operator reports an outage.', 'A person reports an outage.'),
-    ('The relay operator reports an outage.', 'The person reports an outage.'),
-    ('Two operators reported an outage.', 'Two people reported an outage.'),
-    ('Operators report an outage.', 'People report an outage.'),
-    ('A maintainer said the report was incomplete.', 'A person said the report was incomplete.'),
+    ('An operator reports an outage.', 'An operator reports an outage.'),
+    ('The relay operator reports an outage.', 'The relay operator reports an outage.'),
+    ('Two operators reported an outage.', 'Two operators reported an outage.'),
+    ('Operators report an outage.', 'Operators report an outage.'),
+    ('A maintainer said the report was incomplete.', 'A maintainer said the report was incomplete.'),
 ])
 def test_anonymous_reports_keep_identity_absence_and_number(original, expected):
     assert style.normalize_text(original) == expected
@@ -338,7 +338,7 @@ def test_collective_audiences_and_neutral_source_references(text):
 
 
 @pytest.mark.parametrize('text,expected', [
-    ('A maintainer advised affected operators to use a workaround.', 'A person advised affected operators to use a workaround.'),
+    ('A maintainer advised affected operators to use a workaround.', 'A maintainer advised affected operators to use a workaround.'),
     ('Arti developer Alice (@alice_handle) reports a measurement.', 'Alice (@alice_handle) reports a measurement.'),
     ('The change was authored by C Tor developer Alice.', 'The change was authored by Alice.'),
     ('Developer @operator reports a measurement.', '@operator reports a measurement.'),
@@ -375,7 +375,7 @@ def test_ambiguous_introducers_or_unmatched_modifiers_are_not_partially_deleted(
 @pytest.mark.parametrize('text,expected', [
     ('A developer called Alice to discuss the patch.', 'A person called Alice to discuss the patch.'),
     ('A developer named Alice as maintainer.', 'A person named Alice as maintainer.'),
-    ('The report rates it low severity and maintainers called it minor.', 'The report rates it low severity and people called it minor.'),
+    ('The report rates it low severity and maintainers called it minor.', 'The report rates it low severity and maintainers called it minor.'),
 ])
 def test_actual_calling_naming_and_judgment_keep_the_anonymous_actor(text,expected):
     assert style.normalize_text(text)==expected
@@ -385,12 +385,12 @@ def test_actual_calling_naming_and_judgment_keep_the_anonymous_actor(text,expect
 @pytest.mark.parametrize('text', ["The relay's operator reports measurements.", 'An authority’s operator reports measurements.'])
 def test_possessive_qualification_cannot_turn_into_an_entities_person(text):
     assert style.normalize_text(text)==text
-    assert style.unresolved_text(text)
+    assert not style.unresolved_text(text)
 
 
 def test_name_introducer_cannot_borrow_a_verb_from_a_later_sentence():
     text='Maintainers called it minor. Alice is testing the patch.'
-    assert style.normalize_text(text)=='People called it minor. Alice is testing the patch.'
+    assert style.normalize_text(text)==text
     assert not style.unresolved_text(style.normalize_text(text))
 
 
@@ -432,7 +432,10 @@ def test_native_unresolved_style_issue_is_nonempty_and_disappears_after_repair(c
     result=run_gate(cfg,store,row,Writer(draft),checker)
     bodies=[json.loads(x['messages'][1]['content'])for x in checker.client.requests]
     assert result['status']=='published'and result['review_calls']==2
-    assert bodies[0]['application_issue']==review.PERSONAL_STYLE_ISSUE and bodies[0]['application_issue']
+    assert bodies[0]['application_issue'].startswith(review.PERSONAL_STYLE_ISSUE+'\n')
+    forms=json.loads(bodies[0]['application_issue'].split('\n',1)[1])
+    assert forms==style.issues(bodies[0]['candidate'])
+    assert all(bodies[0]['candidate'][x['field']][x['start']:x['end']]==x['text']for x in forms)
     assert 'application_issue'not in bodies[1]
     assert bodies[1]['candidate']['title']==fixed
     assert checker.client.requests[0]['messages'][0]['content']==review.SYSTEM_PROMPT
@@ -452,8 +455,9 @@ def test_style_issue_combines_with_release_issue_and_validation_feedback(context
     result=run_gate(cfg,store,row,Writer(draft),checker)
     bodies=[json.loads(x['messages'][1]['content'])for x in checker.client.requests]
     assert result['status']=='published'and result['review_calls']==4
-    assert bodies[0]['application_issue']==review.PERSONAL_STYLE_ISSUE
-    assert bodies[1]['application_issue']==review.RELEASE_ISSUE+'\n\n'+review.PERSONAL_STYLE_ISSUE
+    assert bodies[0]['application_issue'].startswith(review.PERSONAL_STYLE_ISSUE+'\n')
+    assert bodies[1]['application_issue'].startswith(review.RELEASE_ISSUE+'\n\n'+review.PERSONAL_STYLE_ISSUE+'\n')
+    assert json.loads(bodies[1]['application_issue'].rsplit('\n',1)[1])==style.issues(bodies[1]['candidate'])
     assert bodies[2]=={**bodies[1],'validation_error':review.INCONSISTENT_VERDICT}
     assert 'application_issue'not in bodies[3]and 'validation_error'not in bodies[3]
     saved=_audit(store)
@@ -493,7 +497,7 @@ def test_conditional_style_instruction_is_part_of_policy_identity(context,monkey
 ])
 def test_anonymous_modifier_cannot_be_left_attached_to_person_or_people(text):
     assert style.normalize_text(text)==text
-    assert style.unresolved_text(text)
+    assert not style.unresolved_text(text)
 
 
 @pytest.mark.parametrize('newline', ['\n', '\r\n'])
@@ -619,5 +623,105 @@ def test_code_quote_delimiters_do_not_hide_a_genuine_outside_attribution(opening
 @pytest.mark.parametrize('prefix,suffix', [('> "a','> "b'),('    "a','    "b'),('```\n"a\n```','```\n"b\n```')])
 def test_protected_block_delimiters_do_not_change_prose_pairing(prefix,suffix,newline):
     text=prefix.replace('\n',newline)+newline+'"Developer Alice'+newline+'reports a regression."'+newline+suffix.replace('\n',newline)
+    assert style.normalize_text(text)==text
+    assert not style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('text', [
+    'Alice, a trusted operator, reports measurements.',
+    'Alice, an experienced relay operator, reports measurements.',
+    'A project-sender posted measurements.',
+    'An official sender reports measurements.',
+])
+def test_modified_personal_or_metadata_actor_labels_cannot_silently_publish(text):
+    assert style.normalize_text(text)==text
+    assert style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('description', ['identified as a relay operator', 'who identifies as a relay operator', 'who is a maintainer'])
+def test_named_relative_role_description_keeps_the_name_and_reporting_action(description):
+    text=f'Alice, {description}, reports measurements.'
+    assert style.normalize_text(text)=='Alice reports measurements.'
+    assert not style.unresolved_text(style.normalize_text(text))
+
+
+@pytest.mark.parametrize('text', [
+    "Harbor's operator reports that the machine is plausibly compromised.",
+    'Harbor’s operator reports that its keys cannot be trusted.',
+    'The operator of Harbor reported that the keys cannot be trusted.',
+    'The directory authority operator reports a possible compromise.',
+    'Guard relay operators report measurements.',
+    'The maintainers called the issue minor.',
+    'Two relay operators reported measurements.',
+])
+def test_anonymous_operational_references_preserve_function_and_qualification(text):
+    assert style.normalize_text(text)==text
+    assert not style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('text', [
+    'Alice, not a trusted operator, reported measurements.',
+    'Alice, appointed as maintainer, reported measurements.',
+    'Alice, interviewed by an operator, reported measurements.',
+    'Alice, who spoke to an operator, reported measurements.',
+    '"Alice, a trusted operator, reports measurements."',
+    '`Alice, identified as a relay operator, reports measurements.`',
+    'The source uses the label "project-sender".',
+    'Relay operators should report failures.',
+])
+def test_role_boundary_does_not_erase_events_quotes_code_or_audiences(text):
+    assert style.normalize_text(text)==text
+    assert not style.unresolved_text(text)
+
+
+def test_style_locations_are_literal_and_limited_to_current_editable_fields():
+    candidate={'title':'Alice reports measurements.','summary':'Alice, a trusted operator, reports measurements.',
+               'why_it_matters':'Relay operators may be affected.', 'updates':[{'text':'Developer Bob reports earlier news.'},{'text':'A project-sender posted new measurements.'}]}
+    forms=style.issues(candidate)
+    assert {x['field']for x in forms}=={'summary'}
+    assert all(candidate[x['field']][x['start']:x['end']]==x['text']for x in forms)
+    assert all('Alice'not in x['text']for x in forms)
+    updates=style.issues(candidate,update=True)
+    assert {x['field']for x in updates}=={'updates[-1].text'}
+    assert all(candidate['updates'][-1]['text'][x['start']:x['end']]==x['text']for x in updates)
+    assert not style.issues({'title':'Alice reports measurements.','summary':"Harbor's operator reported measurements.",'why_it_matters':'Maintainers called the issue minor.'})
+
+
+def test_functional_anonymous_report_can_publish_without_a_style_hold(context):
+    cfg,store=context
+    content="Harbor's operator reported that the machine was very plausibly compromised and its keys cannot be trusted."
+    row=pending(store,item(title='Directory authority report',content=content))
+    draft=analysis(title='An authority report describes a possible compromise',summary=content,
+                   why_it_matters='The keys cannot be trusted.',category='security',tags=['security'])
+    checker=Reviewer(verdict())
+    result=run_gate(cfg,store,row,Writer(draft),checker)
+    assert result['status']=='published'and result['review_calls']==2
+    assert store.stories()[0]['summary']==content and store.stories()[0]['why_it_matters']==draft['why_it_matters']
+    assert not style.unresolved(checker.calls[0][0])
+
+
+@pytest.mark.parametrize('summary',['Alice, a trusted operator, reports measurements.','A project-sender posted measurements.'])
+def test_remaining_personal_and_metadata_aliases_cannot_publish_after_model_approval(context,summary):
+    cfg,store=context
+    row=pending(store,_named_item())
+    draft=analysis(title='Alice reports measurements',summary=summary,category='network',tags=['network'])
+    result=run_gate(cfg,store,row,Writer(draft),Reviewer(verdict()))
+    assert result['status']=='held'and store.stories()==[]
+    assert json.loads(job(store)['record_json'])['hold_code']=='personal_attribution'
+    assert not review_gate.approval(cfg,store,row['id'])['eligible']
+
+
+@pytest.mark.parametrize('text', [
+    'Alice, operator of the authority, reports measurements.',
+    'The operator of the authority, Alice, reports measurements.',
+    'Alice, a trusted operator of the authority, reports measurements.',
+])
+def test_anonymous_function_exception_does_not_hide_an_attached_person_name(text):
+    assert style.normalize_text(text)==text
+    assert style.unresolved_text(text)
+
+
+def test_relative_action_involving_another_operator_is_not_a_personal_title():
+    text='Alice, who interviewed a relay operator of the authority, reports measurements.'
     assert style.normalize_text(text)==text
     assert not style.unresolved_text(text)

@@ -458,7 +458,7 @@ def test_update_scope_confirmed_updates_uncited_notes_and_punctuation_repairs(mo
     assert checker.review(repaired, pkt, coverage=coverage, verification=True, update=True)["verdict"] == "approve"
     assert checker.client.requests[1][1]["messages"][0]["content"] == review.UPDATE_VERIFY_PROMPT
     assert repaired["title"] == prior["title"] and repaired["summary"] == prior["summary"] and repaired["updates"][0] == prior["updates"][0]
-    assert repaired["updates"][1] == {**prior["updates"][1], "text": "People reported verified telemetry."} and repaired["state"] == "developing"
+    assert repaired["updates"][1] == {**prior["updates"][1], "text": "Operators reported verified telemetry."} and repaired["state"] == "developing"
 
     with pytest.raises(review.ReviewError):
         review._text("Bad\ufffechar", 100)
@@ -624,5 +624,5 @@ def test_final_holds_shouting_malformed_version_and_untrusted_operator_claims():
         "updates": [{"at": LATER, "text": "OPERATORS REPORT POST-0.4.17 UPGRADE FAILURE.", "sources": [{"url": list_url, "title": "List"}]}],
     }
     upd_holds = review.final_holds(upd_cand, {"mode": "update", "packet": {"sources": src_for("community")}})
-    assert set(upd_holds) == {"shouting_caps", "malformed_version", "personal_attribution"}
+    assert set(upd_holds) == {"shouting_caps", "malformed_version"}
     assert review.final_holds({**shout_story, "origin": "network-health"}, prep_for("community")) == []

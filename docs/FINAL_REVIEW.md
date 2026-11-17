@@ -114,8 +114,11 @@ when the occupation is supported. A deterministic style pass runs after drafting
 and before the first review, and again before each proposed repair is verified.
 It removes bounded role/name/action prefixes and comma appositives while keeping
 the name, reporting action, useful impact and other sentence content. Anonymous
-reporting keeps a neutral person/people reference with the original number and
-determiner; it never gains an invented name or source identity. Audiences, genuine
+operational references and groups retain their source-stated function, entity
+relationship, number and qualifiers. An entity's operator, the operator of an
+authority, or maintainers reporting a judgment do not need an invented personal
+name or a vague person/people substitute. The reviewer still checks their factual
+support and authority; the style pass never establishes either. Audiences, genuine
 quotations, code, negation, organization names and occupational events such as
 retirement remain content. Ambiguous recognized personal-role clauses remain
 intact for repair or a final hold, never an unsafe partial rewrite. Complete
@@ -129,11 +132,17 @@ Unambiguous named/called/known-as prefixes retain the literal introduced name;
 actual calling or naming actions keep their original actor. Project-qualified
 plural collectives remain literal collective attributions, not an official
 organizational voice. Unqualified reporter/sender references remain available to
-distinguish participants. Unmatched modifiers, complex self-identification and
-possessive-qualified anonymous roles may require repair rather than an unsafe edit.
+distinguish participants. Unambiguous personal identified-as appositives omit the
+role while keeping the literal name and reporting action. Unknown personal-role
+modifiers and ambiguous named entity/function appositives remain intact for repair;
+entity relations and their pronoun antecedents must not be discarded. Metadata
+actor labels such as project-sender are not substitute identities and remain
+repair/hold cases.
 For these recognized unresolved forms, the existing review request includes a
-conditional application issue asking for minimal, fact-preserving style repair in
-actor-and-action. It does not add a stage or request budget; any edit still needs
+conditional application issue naming the exact current field, character offsets
+and literal unresolved form as untrusted data. It asks for minimal, fact-preserving
+style repair in actor-and-action, rather than flagging already-correct names or
+anonymous functional references. It does not add a stage or request budget; any edit still needs
 fresh verification, and an unresolved form still holds before publication. Existing
 release-label issues and validation feedback remain present alongside that issue.
 Only title, summary and impact are editable for a story; an update edits only its
