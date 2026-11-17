@@ -95,7 +95,12 @@ _PERSONAL_ROLE_RULE = (
     "establish official authority, confirm a claim, or make routine comments newsworthy."
 )
 
-_SHARED_VERDICT_RULES = """Work through all nine criteria in order before choosing verdict. Each reason is an
+_CLAIM_SCOPE_RULE = """Quote the affected object or property and material qualifier in both the current
+claim and the source. Support must concern that same object or property and the
+conditions necessary for the claim actually made; topical similarity is not enough.
+Do not require prerequisites for a stronger impact that the sentence does not assert."""
+
+_SHARED_VERDICT_RULES = f"""Work through all nine criteria in order before choosing verdict. Each reason is an
 evidence comparison written BEFORE its outcome, not a summary of the topic or an
 assertion that claims are supported. Use at most 40 words and 360 characters:
 - source_support: In story mode, check a nonempty why_it_matters FIRST. Quote its
@@ -104,7 +109,8 @@ assertion that claims are supported. Use at most 40 words and 360 characters:
   with that anchor and its necessary governing context. Preserve supported impact
   even if awkward, cautious, or repeated in the summary; never clear it just for
   those reasons. A supported first clause does not support an inferred second
-  consequence. Retain source conditions, audience and scope. If why_it_matters is
+  consequence. Retain source conditions, audience and scope. {_CLAIM_SCOPE_RULE}
+  If why_it_matters is
   empty, say so and compare the story's most consequential factual assertion.
   In latest_update mode compare only the new update, never the readonly why.
 - actor_and_action, status, uncertainty_attribution and scope_timing: quote the
