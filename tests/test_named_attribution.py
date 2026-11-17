@@ -48,6 +48,47 @@ def test_fenced_examples_do_not_create_attributions_or_hide_prose(text, names):
     assert public == original
 
 
+@pytest.mark.parametrize("double", ["scripted", "approving"])
+@pytest.mark.parametrize("supported", [False, True])
+def test_reviewer_doubles_enforce_retained_names_after_observing_response(double, supported):
+    from helpers import ApprovingReviewer, ScriptedReviewer
+    checker = ScriptedReviewer(verdict()) if double == "scripted" else ApprovingReviewer()
+    public = candidate("The observations mention juno.", "summary")
+    source = packet("Juno shared the observations." if supported else "An unnamed source shared the observations.")
+    names, events = ["Juno"], []
+    class Observer:
+        def __call__(self, delta):
+            events.append(("reserved", delta))
+        def response_received(self):
+            events.append(("response", None))
+    if supported:
+        assert checker.review(public, source, attribution_names=names, on_request=Observer())["verdict"] == "approve"
+    else:
+        with pytest.raises(review.UnsupportedAttributionReview):
+            checker.review(public, source, attribution_names=names, on_request=Observer())
+    names.clear()
+    assert checker.attribution_names == [["Juno"]]
+    assert events == [("reserved", 1), ("response", None)]
+
+
+@pytest.mark.parametrize("double", ["scripted", "approving"])
+def test_reviewer_doubles_cannot_approve_an_absent_name_through_the_gate(context, double):
+    from helpers import ApprovingReviewer, ScriptedReviewer
+    cfg, store = context
+    row = pending(store)
+    draft = analysis(title="Juno reports that the source describes a problem.")
+    checker = ScriptedReviewer(verdict()) if double == "scripted" else ApprovingReviewer()
+    with pytest.raises(review.UnsupportedAttributionReview):
+        run(cfg, store, row, Writer(draft), checker)
+    audit = record(store)
+    assert checker.attribution_names == [["Juno"], ["Juno"]]
+    assert checker.validation_errors == [None, review.UNSUPPORTED_ATTRIBUTION]
+    assert audit["request_budget"]["reserved"] == 2
+    assert audit["request_budget"]["validation_reask"]["response"] == 2
+    assert audit["reviews"] == [] and not store.stories()
+    assert not review_gate.approval(cfg, store, row["id"])["eligible"]
+
+
 @pytest.mark.parametrize("text,name", [
     ("Juno reports that clients fail.", "Juno"),
     ("According to Juno, clients fail.", "Juno"),
