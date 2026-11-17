@@ -750,3 +750,21 @@ def test_named_functional_identity_predicate_is_not_an_anonymous_reference(text)
 def test_functional_predicate_keeps_anonymous_status_actions_events_and_quotes(text):
     assert style.normalize_text(text)==text
     assert not style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('status', [
+    'OK', 'Okay', 'OFFLINE', 'Online', 'UNAVAILABLE', 'Available',
+    'UNREACHABLE', 'Reachable', 'OPERATIONAL', 'Unresponsive',
+    'Responsive', 'HEALTHY', 'Unhealthy', 'READY', 'Busy', 'UP', 'Down',
+])
+def test_functional_status_predicates_are_not_inferred_personal_names(status):
+    text=f'The operator of the authority is {status}.'
+    assert style.normalize_text(text)==text
+    assert not style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('name', ['@OK', '@offline', 'Alice', 'Alice Smith', 'Okay Morgan', 'Élodie'])
+def test_functional_status_exception_does_not_hide_handles_or_full_names(name):
+    text=f'The operator of the authority is {name}.'
+    assert style.normalize_text(text)==text
+    assert style.unresolved_text(text)

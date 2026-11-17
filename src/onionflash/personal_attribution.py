@@ -12,7 +12,7 @@ import re
 from .named_attribution import _tokens, _GENERIC, _ORGANIZATION_WORDS
 
 PERSONAL_ATTRIBUTION_POLICY = {
-    'version': 6, 'style': 'names-only-personal-attribution',
+    'version': 7, 'style': 'names-only-personal-attribution',
     'grammar': 'role-name-action-or-comma-appositive', 'maximum_name_words': 4,
     'preserve': 'quotes-code-negation-events-organizations-audiences-readonly-history',
     'unresolved': 'hold-without-postapproval-edit', 'anonymous': 'preserve-source-checked-operational-functions-and-groups',
@@ -46,6 +46,7 @@ _QUOTE = re.compile(
 _QUOTE_DELIMITERS = frozenset("\"'“”‘’")
 _METADATA_SENDER = re.compile(r'(?<![\w@])(?:(?:a|an|the)\s+)?(?:project[- ]senders?|(?:Tor(?:\s+Project)?|official|trusted)[- ]senders?)\b', re.I)
 _ROLE_RELATIVE = re.compile(r'(?:(?:who\s+)?(?:is|was|identifies\s+as|identified\s+as|is\s+identified\s+as|was\s+identified\s+as))\s*', re.I)
+_OPERATIONAL_STATUS = frozenset('ok okay online offline available unavailable reachable unreachable operational nonoperational responsive unresponsive healthy unhealthy ready busy up down active inactive'.split())
 
 # The policy binds the literal grammar too, so changing its recognized forms
 # cannot accidentally reuse approvals from the prior grammar.
@@ -54,6 +55,7 @@ PERSONAL_ATTRIBUTION_POLICY.update(patterns={
     'negation': _NEGATION.pattern, 'event': _EVENT.pattern, 'markup': _PARTS.pattern, 'quote': _QUOTE.pattern,
     'metadata_sender': _METADATA_SENDER.pattern, 'role_relative': _ROLE_RELATIVE.pattern,
 }, nonperson_tokens=sorted(_NONPERSON), base_actions=sorted(_BASE_ACTIONS),
+    operational_status_predicates=sorted(_OPERATIONAL_STATUS),
     clause_boundaries='punctuation-and-but-while-whereas', unnamed_nouns='finite-verb-and-predicate-continuation',
     qualified_collectives='project-qualified-plural-without-named-person',
     neutral_references='unqualified-anaphoric-reporter-sender',
@@ -253,7 +255,8 @@ def _clauses(text: str):
                 words = _tokens(complement)
                 literal_name = bool(words and (words[0].value.startswith('@') or words[0].value[0].isupper()
                                                or not words[0].value[0].isascii()))
-                if (literal_name and _person(complement) and not _NEGATION.search(complement)
+                if (literal_name and complement.casefold() not in _OPERATIONAL_STATUS
+                        and _person(complement) and not _NEGATION.search(complement)
                         and not _EVENT.search(complement)):
                     # Keep the relationship and identity assertion intact: a
                     # name-only rewrite could guess which entity is the person.
