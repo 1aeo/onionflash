@@ -590,3 +590,34 @@ def test_primary_and_legacy_pairing_keep_their_own_clean_twins(context,tmp_path,
     assert summary['legacy_raw_judged']['invented_impact']['paired']==0
     assert summary['false_alarm_rate']==0 and summary['legacy_raw_false_alarm_rate']==1
     assert summary['catch_rate']==summary['legacy_raw_catch_rate']==1
+
+
+def test_code_quote_delimiters_cannot_consume_a_complete_prose_quote():
+    text='`"a`. "Developer Alice reports a regression." `"b`.'
+    assert style.normalize_text(text)==text
+    assert not style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('opening,closing', [('"','"'), ('“','”'), ('‘','’'), ("'","'")])
+@pytest.mark.parametrize('padding',['',' '])
+def test_protected_delimiters_do_not_pair_with_prose_quote_edges(opening,closing,padding):
+    text=f'`{opening}a`. {opening}{padding}Developer Alice reports a regression.{padding}{closing} `{closing}b`.'
+    assert style.normalize_text(text)==text
+    assert not style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('opening,closing', [('"','"'), ('“','”'), ('‘','’'), ("'","'")])
+def test_code_quote_delimiters_do_not_hide_a_genuine_outside_attribution(opening,closing):
+    prefix=f'`{opening}a`. {opening}Ordinary quoted text.{closing} '
+    suffix=f' `{closing}b`.'
+    text=prefix+'Developer Bob reports a regression.'+suffix
+    assert style.normalize_text(text)==prefix+'Bob reports a regression.'+suffix
+    assert not style.unresolved_text(style.normalize_text(text))
+
+
+@pytest.mark.parametrize('newline',['\n','\r\n'])
+@pytest.mark.parametrize('prefix,suffix', [('> "a','> "b'),('    "a','    "b'),('```\n"a\n```','```\n"b\n```')])
+def test_protected_block_delimiters_do_not_change_prose_pairing(prefix,suffix,newline):
+    text=prefix.replace('\n',newline)+newline+'"Developer Alice'+newline+'reports a regression."'+newline+suffix.replace('\n',newline)
+    assert style.normalize_text(text)==text
+    assert not style.unresolved_text(text)

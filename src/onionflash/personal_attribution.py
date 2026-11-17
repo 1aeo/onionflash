@@ -12,7 +12,7 @@ import re
 from .named_attribution import _tokens, _GENERIC, _ORGANIZATION_WORDS
 
 PERSONAL_ATTRIBUTION_POLICY = {
-    'version': 3, 'style': 'names-only-personal-attribution',
+    'version': 4, 'style': 'names-only-personal-attribution',
     'grammar': 'role-name-action-or-comma-appositive', 'maximum_name_words': 4,
     'preserve': 'quotes-code-negation-events-organizations-audiences-readonly-history',
     'unresolved': 'hold-without-postapproval-edit', 'anonymous': 'same-cardinality-person-or-people',
@@ -43,6 +43,7 @@ _QUOTE_BOUNDARY = r'(?:\r\n|\r(?!\n)|\n)(?:[ \t]*(?:\r\n|\r(?!\n)|\n)| {4}|\t)|`
 _QUOTE = re.compile(
     r'"(?:(?!' + _QUOTE_BOUNDARY + r')[^"])*"|"[^"\r\n]*(?=$|[\r\n])'
     r'|“[^”]*(?:”|$)|‘[^’]*(?:’|$)|(?<!\w)\'(?:(?!' + _QUOTE_BOUNDARY + r')[^\'])*\'(?!\w)')
+_QUOTE_DELIMITERS = frozenset("\"'“”‘’")
 # The policy binds the literal grammar too, so changing its recognized forms
 # cannot accidentally reuse approvals from the prior grammar.
 PERSONAL_ATTRIBUTION_POLICY.update(patterns={
@@ -53,7 +54,8 @@ PERSONAL_ATTRIBUTION_POLICY.update(patterns={
     qualified_collectives='project-qualified-plural-without-named-person',
     neutral_references='unqualified-anaphoric-reporter-sender',
     name_introducers='named-called-known-as-before-finite-action', leading_modifiers='hold-when-unmatched',
-    protected_edit_spans='reject-all-crossing-edits-and-incomplete-quote-ambiguity')
+    protected_edit_spans='reject-all-crossing-edits-and-incomplete-quote-ambiguity',
+    quote_delimiters=sorted(_QUOTE_DELIMITERS), quote_search='mask-only-delimiters-in-protected-spans')
 
 
 def _view(text: str):
@@ -64,8 +66,13 @@ def _view(text: str):
             protected.update(range(match.start(), match.end()))
     for match in re.finditer(r'(?m)^(?:[ \t]*>| {4}|\t)[^\n]*', text):
         protected.update(range(match.start(), match.end()))
+    # Quotes inside code/blockquote cannot open or close a prose quotation.
+    # Mask only delimiters: original offsets, newlines and fence boundaries stay
+    # intact, and all actual edits still use the untouched original text.
+    quote_projection = ''.join(' ' if index in protected and char in _QUOTE_DELIMITERS else char
+                               for index, char in enumerate(text))
     incomplete_quote = False
-    for match in _QUOTE.finditer(text):
+    for match in _QUOTE.finditer(quote_projection):
         if match.start() in protected:
             continue  # A quote inside code/blockquote is not a prose delimiter.
         if match[0].startswith('"') and (len(match[0]) == 1 or not match[0].endswith('"')):
