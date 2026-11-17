@@ -156,13 +156,14 @@ def test_review_protocol_fresh_verification_and_application_issue(monkeypatch):
     assert "enum" not in review.REFS["items"]
     first_payload = json.loads(first["messages"][1]["content"])
     first_context = first_payload.pop("evidence_context")
-    assert first_payload == {"candidate": public, "packet": packet()}
+    date_issue = review.SOURCE_DATE_ISSUE + "\n" + json.dumps(review.source_date_comparisons(packet()), ensure_ascii=False)
+    assert first_payload == {"candidate": public, "packet": packet(), "application_issue": date_issue}
     assert "why_it_matters" in {field["field"] for field in first_context["fields"]}
     assert all(passage in packet()["sources"][0]["passages"] for passage in first_context["passages"])
     assert len(second["messages"]) == 2 and second["messages"][0]["content"] == review.VERIFY_PROMPT
     second_payload = json.loads(second["messages"][1]["content"])
     second_context = second_payload.pop("evidence_context")
-    assert second_payload == {"candidate": repaired, "packet": packet()}
+    assert second_payload == {"candidate": repaired, "packet": packet(), "application_issue": date_issue}
     assert "why_it_matters" not in {field["field"] for field in second_context["fields"]}
 
     schema = first["response_format"]["json_schema"]["schema"]
@@ -183,7 +184,7 @@ def test_review_protocol_fresh_verification_and_application_issue(monkeypatch):
     issue_payload = json.loads(rel_chk.client.requests[0][1]["messages"][1]["content"])
     issue_payload.pop("evidence_context")
     assert issue_payload == {
-        "candidate": rel_pub, "packet": packet(), "application_issue": review.RELEASE_ISSUE}
+        "candidate": rel_pub, "packet": packet(), "application_issue": review.RELEASE_ISSUE + "\n\n" + date_issue}
 
 
 @pytest.mark.parametrize("length", [240, 241, 360])
@@ -377,7 +378,9 @@ def test_prompts_coverage_isolation_repairs_and_transport_settings(monkeypatch):
     for _, req in bg_chk.client.requests:
         payload = json.loads(req["messages"][1]["content"])
         context = payload.pop("evidence_context")
-        assert payload == {"candidate": candidate(), "packet": packet(), "coverage_background": bg}
+        date_issue = review.SOURCE_DATE_ISSUE + "\n" + json.dumps(review.source_date_comparisons(packet()), ensure_ascii=False)
+        assert payload == {"candidate": candidate(), "packet": packet(), "coverage_background": bg,
+                           "application_issue": date_issue}
         assert all(passage in packet()["sources"][0]["passages"] for passage in context["passages"])
         fields = req["response_format"]["json_schema"]["schema"]["properties"]["criteria"]["properties"]
         assert set(fields) == set(review.CRITERIA)

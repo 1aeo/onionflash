@@ -28,7 +28,9 @@ def test_review_identifies_unconfirmable_label_before_repair(monkeypatch, author
                                                    repair={"confidence": "reported"})), completion(verdict()))
     result = check.review(public, source)
     payload = json.loads(check.client.requests[0][1]["messages"][1]["content"])
-    issue = json.loads(payload["application_issue"].split("\n", 1)[1])
+    label_issue = payload["application_issue"].split("\n\n", 1)[0]
+    assert label_issue.startswith(review.LABEL_LIMIT_ISSUE + "\n")
+    issue = json.loads(label_issue.split("\n", 1)[1])
     assert issue == [{"field": "confidence", "value": "confirmed",
                       "allowed": ["reported", "suspected", "observed-anomaly"]}]
     assert public == original == payload["candidate"]
@@ -37,7 +39,7 @@ def test_review_identifies_unconfirmable_label_before_repair(monkeypatch, author
     assert corrected["why_it_matters"] == original["why_it_matters"]
     check.review(corrected, source, verification=True)
     next_payload = json.loads(check.client.requests[1][1]["messages"][1]["content"])
-    assert "application_issue" not in next_payload
+    assert review.LABEL_LIMIT_ISSUE not in next_payload.get("application_issue", "")
 
 
 @pytest.mark.parametrize("authority,kind,state", [
@@ -51,7 +53,7 @@ def test_supported_confidence_does_not_get_a_repair_issue(monkeypatch, authority
     check = reviewer(monkeypatch, completion(verdict()))
     check.review(public, source)
     payload = json.loads(check.client.requests[0][1]["messages"][1]["content"])
-    assert "application_issue" not in payload
+    assert review.LABEL_LIMIT_ISSUE not in payload.get("application_issue", "")
 
 
 def test_update_keeps_established_confirmed_confidence():

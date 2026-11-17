@@ -10,7 +10,7 @@ from .util import parse_utc, safe_canonical_url
 
 
 # Advance when reminder construction changes, so prior approvals cannot reuse it.
-EVIDENCE_POLICY = 2
+EVIDENCE_POLICY = 3
 _WORDS = re.compile(r"\w+", re.UNICODE)
 _STOP = frozenset("a an and are as at be been but by for from has have in is it its of on or that the this to was were with".split())
 _MAX_ANCHORS = 3
@@ -21,6 +21,32 @@ def supplied_tag_sources(packet: dict) -> list[dict]:
     return [{"source_ref": source["id"], **{
         key: copy.deepcopy(source[key]) for key in ("kind", "authority", "title", "published_at") if key in source}}
         for source in packet["sources"] if source.get("kind") == "tag"]
+
+
+def source_date_comparisons(packet: dict) -> list[dict]:
+    """Compare supplied dates without inferring event eligibility or retry state."""
+    comparisons = []
+    for source in packet["sources"]:
+        dates = [{"ref": source["id"], "field": "published_at", "value": source.get("published_at")}]
+        if source.get("kind") == "gitlab_issue":
+            dates.extend({"ref": passage["id"], "field": "created_at", "value": passage["created_at"]}
+                         for passage in source["passages"] if "created_at" in passage)
+            if source.get("upstream_state") == "closed" and "closed_at" in source:
+                dates.append({"ref": source["id"], "field": "closed_at", "value": source["closed_at"]})
+        try:
+            updated = parse_utc(source.get("updated_at"))
+            moments = [parse_utc(date["value"]) for date in dates]
+        except ValueError:
+            continue  # Incomplete or invalid dates cannot establish the newest development.
+        latest = max(moments)
+        elapsed = (updated - latest).total_seconds()
+        comparisons.append({"source_ref": source["id"], "kind": source.get("kind"),
+                            "authority": source.get("authority"), "labels": copy.deepcopy(source.get("labels", [])),
+                            "source_updated_at": source["updated_at"], "date_evidence": dates,
+                            "latest_date_evidence": [copy.deepcopy(date) for date, moment in zip(dates, moments)
+                                                     if moment == latest],
+                            "elapsed_seconds": elapsed, "elapsed_days": elapsed / 86400})
+    return comparisons if any(row["elapsed_seconds"] for row in comparisons) else []
 
 
 def _words(text: str) -> set[str]:
