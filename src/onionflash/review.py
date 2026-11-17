@@ -641,7 +641,8 @@ def policy_hash(config: dict) -> str:
                    UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, PERSONAL_STYLE_ISSUE, INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT,
                    SCHEMA, UPDATE_REPAIR, VALIDATION_ERRORS, REASON_REPETITION_POLICY,
                    identity, CompletionClient.REQUEST_POLICY, EVIDENCE_POLICY,
-                   NAMED_ATTRIBUTION_POLICY, ATTRIBUTION_CHECK_PROMPT, personal_attribution.PERSONAL_ATTRIBUTION_POLICY])
+                   NAMED_ATTRIBUTION_POLICY, ATTRIBUTION_CHECK_PROMPT, personal_attribution.PERSONAL_ATTRIBUTION_POLICY,
+                   _LIVE_INCIDENT_CLAIM_RE.pattern])
 
 
 def _text(value, maximum: int, *, empty: bool = False) -> None:
@@ -901,7 +902,7 @@ _SPEC_CANDIDATE_RE = re.compile(r"\b(?:propos\w*|rfc\b|internet-draft|draft\b|sp
 _LIVE_INCIDENT_CLAIM_RE = re.compile(
     r"\b(?:was|were|is|are|been|being|ongoing|active|actively|observed|experienc\w*|suffer\w*|hit|hitting|under)\s+"
     r"(?:(?:\w+|[-/])\s+){0,3}(?:compromis\w*|hack\w*|breach\w*|tamper\w*|attack\w*|ddos|dos|flood\w*|exploit\w*|overload\w*)"
-    r"|\b(?:operators?|relay\s+operators?|sender|author|post|message|thread)\s+"
+    r"|\b(?:operators?|relay\s+operators?|person|people|sender|author|post|message|thread)\s+"
     r"(?:reports?|reported|alleges?|alleged|claims?|claimed|describes?|described|suspects?|suspected)\s+"
     r"(?:[^.;!?\n]{0,60}\b)?(?:compromis\w*|hack\w*|breach\w*|tamper\w*|attack\w*|ddos|dos|flood\w*|overload\w*|bypass\w*|exploit\w*)"
     r"|\b(?:attackers?|adversar\w+|botnets?)\s+(?:(?:have|had|has|are|were|recently)\s+)?"

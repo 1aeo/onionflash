@@ -216,7 +216,12 @@ def test_public_evaluator_reviews_style_text_without_relabeling_input(context, t
     assert result['candidate'] == original
     assert result['review_candidate']['title'] == 'Alice reports a scheduling issue'
     assert result['published_candidate'] == result['review_candidate']
-    assert result['ok'] is False  # Preserve the unchanged-input gold comparator.
+    assert result['ok'] is True
+    assert result['legacy_raw_ok'] is False  # Retain the original-input comparison explicitly.
+    summary=json.loads(output.read_text().splitlines()[-1])['summary']
+    assert summary['false_alarm_rate']==0
+    assert summary['legacy_raw_false_alarm_rate']==1
+    assert summary['legacy_raw_judged']['clean']['ok']==0
     assert checker.calls[0][0] == result['review_candidate']
 
 
@@ -489,3 +494,99 @@ def test_conditional_style_instruction_is_part_of_policy_identity(context,monkey
 def test_anonymous_modifier_cannot_be_left_attached_to_person_or_people(text):
     assert style.normalize_text(text)==text
     assert style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('newline', ['\n', '\r\n'])
+def test_complete_ascii_quote_across_soft_line_is_untouched(newline):
+    text='"Arti developer Alice'+newline+'reports a regression."'
+    assert style.normalize_text(text)==text
+    assert not style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('name', ['“Élodie” García', '"Élodie" García', '`Élodie` García'])
+@pytest.mark.parametrize('template', [
+    'Developer {name} found a regression.',
+    'According to developer {name}, the queue stalls.',
+    'The patch was written by developer {name}.',
+    'A developer named {name} found a regression.',
+])
+def test_no_edit_branch_can_drop_a_protected_name_fragment(name,template):
+    text=template.format(name=name)
+    assert style.normalize_text(text)==text
+    assert style.unresolved_text(text)
+
+
+@pytest.mark.parametrize('subject', ['Operator', 'Operators'])
+@pytest.mark.parametrize('event', ['a breach', 'a hack', 'tampering', 'an overload'])
+def test_neutral_person_attribution_preserves_incident_holds(subject,event):
+    draft=_named_draft()
+    draft['title']=f'{subject} report{("s" if subject=="Operator" else "")} {event}.'
+    draft['summary']='A mailing-list report describes measurements.'
+    from helpers import STORY
+    candidate={**STORY,**{k:draft[k]for k in review.EDITABLE}}
+    packet={'sources':[{'id':'S1','kind':'feed','authority':'community','product':'network',
+             'url':'https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/EXAMPLE/',
+             'title':'Report','passages':[{'id':'S1:P1','text':candidate['title']}]}]}
+    prepared={'packet':packet,'payload':{'editorial_kind':'feed'}}
+    normalized=style.normalize(candidate)
+    assert 'untrusted_operator_claim'in review.final_holds(candidate,prepared)
+    assert 'untrusted_operator_claim'in review.final_holds(normalized,prepared)
+
+
+@pytest.mark.parametrize('newline',['\n','\r\n'])
+def test_multiline_quote_does_not_hide_an_independent_paragraph(newline):
+    quoted='"Developer Alice'+newline+'reports a regression."'
+    text=quoted+newline+newline+'Developer Bob reports a separate observation.'
+    assert style.normalize_text(text)==quoted+newline+newline+'Bob reports a separate observation.'
+    assert not style.unresolved_text(style.normalize_text(text))
+
+
+@pytest.mark.parametrize('boundary',['\n\n','\n```\nexample\n```\n','\n    example\n'])
+def test_quote_pairing_cannot_cross_paragraph_or_code_boundaries(boundary):
+    text='"Developer Alice reports an issue.'+boundary+'Developer Bob reports an update."'
+    assert style.normalize_text(text)==text
+    assert style.unresolved_text(text)
+
+
+def test_quote_inside_code_does_not_mask_an_independent_attribution():
+    text='`print("example)`\n\nDeveloper Alice reports a regression.'
+    assert style.normalize_text(text)=='`print("example)`\n\nAlice reports a regression.'
+    assert not style.unresolved_text(style.normalize_text(text))
+
+
+def test_primary_clean_score_still_penalizes_a_reviewers_extra_edit(context,tmp_path,monkeypatch):
+    cfg,store=context
+    row=pending(store,_named_item());prepared=store.prepare_candidate(row,_named_draft(),LATER)
+    original=copy.deepcopy(prepared['candidate']);original['title']='Developer Alice reports a scheduling issue'
+    case={'id':'additional-review-edit','candidate':original,'packet':prepared['packet'],
+          'existing_coverage':prepared['coverage'],'expected':'approve','scope':'story','audit':'wording'}
+    evaluator=load_evaluator();checker=Reviewer(verdict('revise',repair={'summary':'Alice reports additional observations.'}),verdict())
+    monkeypatch.setattr(evaluator,'EvaluationReviewer',lambda *a,**kw:checker)
+    monkeypatch.setattr(evaluator,'Analyzer',lambda *a,**kw:Writer())
+    output=tmp_path/'extra-edit.jsonl';evaluator.evaluate(cfg,[case],output)
+    records=[json.loads(line)for line in output.read_text().splitlines()]
+    assert records[0]['ok'] is False and records[0]['legacy_raw_ok'] is False
+    assert records[0]['candidate']==original and records[0]['review_candidate']!=original
+    assert records[-1]['summary']['false_alarm_rate']==1
+    assert records[-1]['summary']['legacy_raw_false_alarm_rate']==1
+
+
+def test_primary_and_legacy_pairing_keep_their_own_clean_twins(context,tmp_path,monkeypatch):
+    cfg,store=context
+    row=pending(store,_named_item());prepared=store.prepare_candidate(row,_named_draft(),LATER)
+    clean=copy.deepcopy(prepared['candidate']);clean['title']='Developer Alice reports a scheduling issue'
+    flawed={**clean,'why_it_matters':'An unsupported consequence.'}
+    common={'packet':prepared['packet'],'existing_coverage':prepared['coverage'],'scope':'story','audit':'pairing'}
+    cases=[{**common,'id':'styled-clean','candidate':clean,'expected':'approve'},
+           {**common,'id':'flawed-impact','candidate':flawed,'expected':'not_approve',
+            'flaw':'invented_impact','unsupported':['An unsupported consequence.']}]
+    def choose(candidate,*args,**kwargs):
+        return verdict('revise',repair={'why_it_matters':''},criterion='source_support') if candidate['why_it_matters']=='An unsupported consequence.' else verdict()
+    evaluator=load_evaluator();checker=Reviewer(choose,choose,choose,choose)
+    monkeypatch.setattr(evaluator,'EvaluationReviewer',lambda *a,**kw:checker)
+    monkeypatch.setattr(evaluator,'Analyzer',lambda *a,**kw:Writer())
+    summary=evaluator.evaluate(cfg,cases,tmp_path/'paired.jsonl')
+    assert summary['judged']['invented_impact']['paired']==1
+    assert summary['legacy_raw_judged']['invented_impact']['paired']==0
+    assert summary['false_alarm_rate']==0 and summary['legacy_raw_false_alarm_rate']==1
+    assert summary['catch_rate']==summary['legacy_raw_catch_rate']==1

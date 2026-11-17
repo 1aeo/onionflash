@@ -12,7 +12,7 @@ import re
 from .named_attribution import _tokens, _GENERIC, _ORGANIZATION_WORDS
 
 PERSONAL_ATTRIBUTION_POLICY = {
-    'version': 2, 'style': 'names-only-personal-attribution',
+    'version': 3, 'style': 'names-only-personal-attribution',
     'grammar': 'role-name-action-or-comma-appositive', 'maximum_name_words': 4,
     'preserve': 'quotes-code-negation-events-organizations-audiences-readonly-history',
     'unresolved': 'hold-without-postapproval-edit', 'anonymous': 'same-cardinality-person-or-people',
@@ -36,7 +36,13 @@ _NEGATION = re.compile(r'\b(?:not|never|no|without|neither|nor)\b', re.I)
 _EVENT = re.compile(r'\b(?:retir\w*|appoint\w*|elect\w*|resign\w*|replace\w*|succeed\w*|'
                     r'becom\w*|became|hire\w*|recruit\w*|seek\w*|sought|serv\w*)\b', re.I)
 _PARTS = re.compile(r'```[^\n]*\n.*?(?:```|\Z)|~~~[^\n]*\n.*?(?:~~~|\Z)|`+[^`\n]*`+|\*+|_+', re.S)
-_QUOTE = re.compile(r'"[^"\n]*(?:"|$)|“[^”]*(?:”|$)|‘[^’]*(?:’|$)|(?<!\w)\'[^\'\n]+\'(?!\w)')
+# A complete ASCII quote may span soft lines, but cannot pair across a
+# paragraph or a fenced/indented code boundary. An incomplete quote fragment
+# remains protected and makes other proposed edits conservative.
+_QUOTE_BOUNDARY = r'(?:\r\n|\r(?!\n)|\n)(?:[ \t]*(?:\r\n|\r(?!\n)|\n)| {4}|\t)|```|~~~'
+_QUOTE = re.compile(
+    r'"(?:(?!' + _QUOTE_BOUNDARY + r')[^"])*"|"[^"\r\n]*(?=$|[\r\n])'
+    r'|“[^”]*(?:”|$)|‘[^’]*(?:’|$)|(?<!\w)\'(?:(?!' + _QUOTE_BOUNDARY + r')[^\'])*\'(?!\w)')
 # The policy binds the literal grammar too, so changing its recognized forms
 # cannot accidentally reuse approvals from the prior grammar.
 PERSONAL_ATTRIBUTION_POLICY.update(patterns={
@@ -46,18 +52,24 @@ PERSONAL_ATTRIBUTION_POLICY.update(patterns={
     clause_boundaries='punctuation-and-but-while-whereas', unnamed_nouns='finite-verb-and-predicate-continuation',
     qualified_collectives='project-qualified-plural-without-named-person',
     neutral_references='unqualified-anaphoric-reporter-sender',
-    name_introducers='named-called-known-as-before-finite-action', leading_modifiers='hold-when-unmatched')
+    name_introducers='named-called-known-as-before-finite-action', leading_modifiers='hold-when-unmatched',
+    protected_edit_spans='reject-all-crossing-edits-and-incomplete-quote-ambiguity')
 
 
 def _view(text: str):
-    """Return prose projection, original offsets, and balanced emphasis spans."""
+    """Return prose projection, offsets, emphasis, and protected quote/code spans."""
     protected = set()
     for match in _PARTS.finditer(text):
         if match[0].startswith(('`', '~')):
             protected.update(range(match.start(), match.end()))
-    for match in _QUOTE.finditer(text):
-        protected.update(range(match.start(), match.end()))
     for match in re.finditer(r'(?m)^(?:[ \t]*>| {4}|\t)[^\n]*', text):
+        protected.update(range(match.start(), match.end()))
+    incomplete_quote = False
+    for match in _QUOTE.finditer(text):
+        if match.start() in protected:
+            continue  # A quote inside code/blockquote is not a prose delimiter.
+        if match[0].startswith('"') and (len(match[0]) == 1 or not match[0].endswith('"')):
+            incomplete_quote = True
         protected.update(range(match.start(), match.end()))
     opened, pairs = [], []
     previous = 0
@@ -82,7 +94,7 @@ def _view(text: str):
     markers = {i for a,b in pairs for m in (a,b) for i in range(m.start(),m.end())}
     offsets = [i for i in range(len(text)) if i not in markers]
     plain = ''.join(' ' if i in protected else text[i] for i in offsets)
-    return plain, offsets, pairs
+    return plain, offsets, pairs, protected, incomplete_quote
 
 
 def _person(value: str) -> bool:
@@ -131,7 +143,7 @@ def _unmatched_modifier(context: str, role: str) -> bool:
 
 
 def _clauses(text: str):
-    plain, offsets, pairs = _view(text)
+    plain, offsets, pairs, protected, incomplete_quote = _view(text)
     edits, unresolved = [], []
     for role in _ROLE.finditer(plain):
         left = plain[:role.start()]
@@ -272,7 +284,13 @@ def _clauses(text: str):
                                or len(words) > 1 and words[1].value.lower().endswith('ed'))
                 if looks_named and (words[0].value.startswith('@') or first.casefold() not in _NONPERSON):
                     unresolved.append((role.start(),role.end()))
-    return plain,offsets,pairs,edits,unresolved
+    safe_edits = []
+    for start, end, replacement in edits:
+        if incomplete_quote or any(index in protected for index in offsets[start:end]):
+            unresolved.append((start, end))
+        else:
+            safe_edits.append((start, end, replacement))
+    return plain,offsets,pairs,safe_edits,unresolved
 
 
 def normalize_text(text: str) -> str:

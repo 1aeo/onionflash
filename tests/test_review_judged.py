@@ -211,8 +211,12 @@ def test_judged_corpus_is_public_and_labeled(tmp_path, monkeypatch, capsys):
     assert sum(row["cases"] for row in judged.values()) == len(cases)
     observations = [json.loads(line) for line in (tmp_path / "private/report.jsonl").read_text().splitlines()]
     clean_ids = {case["id"] for case in cases if "flaw" not in case}
-    # Style edits do not silently relabel the frozen unchanged-input gold.
+    # Primary scores measure reviewer changes; original-input history stays explicit.
     assert judged["clean"]["ok"] == sum(
+        row["matched"] and row["published_candidate"] == row["review_candidate"]
+        for row in observations if row.get("case") in clean_ids
+    )
+    assert summary["legacy_raw_judged"]["clean"]["ok"] == sum(
         row["matched"] and row["published_candidate"] == row["candidate"]
         for row in observations if row.get("case") in clean_ids
     )

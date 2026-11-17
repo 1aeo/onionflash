@@ -206,7 +206,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                                "published_after_checks", "route_cases", "matched_routes", "missed_routes",
                                "false_routes", "wrong_routes", "controlled_mismatches"), 0),
               "holds": {}, "incomplete": False}
-    judged, outcomes, seen = {}, {}, set()
+    judged, legacy_raw_judged, outcomes, legacy_raw_outcomes, seen = {}, {}, {}, {}, set()
     identity = policy_hash(config)
     with (os.fdopen(descriptor, "w", encoding="utf-8") as report, EvaluationReviewer(config, deadline=deadline) as reviewer,
           Analyzer(config, deadline=deadline) as writer):
@@ -339,16 +339,19 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                     totals["impact_cleared"] += bool(scope == "story" and case["expected"] == "approve" and published
                                                      and candidate["why_it_matters"] and not published_candidate["why_it_matters"])
                     if "audit" in case:
-                        # A flagged case is caught when its flaw never publishes and the news is
-                        # not skipped; a clean case must publish unchanged.
-                        record["ok"] = ok = matched and ("flaw" in case or published_candidate == candidate)
-                        row = judged.setdefault(case.get("flaw", "clean"), {"cases": 0, "ok": 0, "unique": 0,
-                                                                            **({"paired": 0} if "flaw" in case else {})})
-                        row["cases"] += 1
-                        row["ok"] += ok
-                        row["unique"] += case["id"] not in seen
+                        # Required publication style is the reviewer's input. Keep the
+                        # old raw-input score explicitly; neither score relabels the gold.
+                        record["ok"] = ok = matched and ("flaw" in case or published_candidate == record["review_candidate"])
+                        record["legacy_raw_ok"] = raw_ok = matched and ("flaw" in case or published_candidate == candidate)
+                        for target, value in ((judged, ok), (legacy_raw_judged, raw_ok)):
+                            row = target.setdefault(case.get("flaw", "clean"), {"cases": 0, "ok": 0, "unique": 0,
+                                                                               **({"paired": 0} if "flaw" in case else {})})
+                            row["cases"] += 1
+                            row["ok"] += value
+                            row["unique"] += case["id"] not in seen
                         seen.add(case["id"])
                         outcomes[iteration, case["id"]] = ok
+                        legacy_raw_outcomes[iteration, case["id"]] = raw_ok
                     else:
                         totals["controlled_mismatches"] += not matched
                 except (AnalysisError, ValueError, TypeError, KeyError) as exc:
@@ -385,17 +388,24 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
         flagged = {case["id"]: (case["flaw"], case["expected"] == "approve",
                                 [twin["id"] for twin in cases if "audit" in twin and "flaw" not in twin
                                  and twin["packet"] == case["packet"]]) for case in cases if "flaw" in case}
-        for (iteration, case_id), ok in outcomes.items():
-            if case_id in flagged:
-                flaw, publishes, twins = flagged[case_id]
-                judged[flaw]["paired"] += ok and (publishes or bool(twins)) and all(
-                    outcomes.get((iteration, twin), False) for twin in twins)
+        for target, scored in ((judged, outcomes), (legacy_raw_judged, legacy_raw_outcomes)):
+            for (iteration, case_id), ok in scored.items():
+                if case_id in flagged:
+                    flaw, publishes, twins = flagged[case_id]
+                    target[flaw]["paired"] += ok and (publishes or bool(twins)) and all(
+                        scored.get((iteration, twin), False) for twin in twins)
         rows = [row for flaw, row in judged.items() if flaw != "clean"]
         clean = judged.get("clean", {"cases": 0, "ok": 0})
         totals.update(judged=judged, target_missed=target_missed(judged),
                       catch_rate=_rate(sum(row["ok"] for row in rows), sum(row["cases"] for row in rows)),
                       paired_catch_rate=_rate(sum(row["paired"] for row in rows), sum(row["cases"] for row in rows)),
                       false_alarm_rate=_rate(clean["cases"] - clean["ok"], clean["cases"]))
+        raw_rows = [row for flaw, row in legacy_raw_judged.items() if flaw != "clean"]
+        raw_clean = legacy_raw_judged.get("clean", {"cases": 0, "ok": 0})
+        totals.update(legacy_raw_judged=legacy_raw_judged,
+                      legacy_raw_catch_rate=_rate(sum(row["ok"] for row in raw_rows), sum(row["cases"] for row in raw_rows)),
+                      legacy_raw_paired_catch_rate=_rate(sum(row["paired"] for row in raw_rows), sum(row["cases"] for row in raw_rows)),
+                      legacy_raw_false_alarm_rate=_rate(raw_clean["cases"] - raw_clean["ok"], raw_clean["cases"]))
         report.write(json.dumps({"summary": totals, "policy_hash": identity}) + "\n")
     print(json.dumps({"summary": totals}), flush=True)
     return totals

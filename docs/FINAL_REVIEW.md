@@ -118,7 +118,9 @@ reporting keeps a neutral person/people reference with the original number and
 determiner; it never gains an invented name or source identity. Audiences, genuine
 quotations, code, negation, organization names and occupational events such as
 retirement remain content. Ambiguous recognized personal-role clauses remain
-intact for repair or a final hold, never an unsafe partial rewrite.
+intact for repair or a final hold, never an unsafe partial rewrite. Complete
+ASCII quotations may span soft line breaks. No edit may cross a protected quote
+or code span; ambiguous quote boundaries keep the original text for review.
 
 The bounded grammar recognizes developer, maintainer, operator, researcher,
 engineer, contributor, reporter and sender labels with common project/role
@@ -500,10 +502,14 @@ explicit `--cases` replaces the default case files and may be repeated.
 Judged cases carry an `audit`, naming a set labeled by independent reviewers,
 and a `flaw` unless the reviewers found the draft clean. A flawed case is caught
 when its flaw never publishes and the news is not skipped; a clean case must
-publish unchanged, and anything else is a false alarm. A catch is paired only
-when every clean case on the same packet was right in the same round, and a
-refusal also needs one such case in the run, so refusing an item never counts as
-catching its flaw. The run fails unless paired catches reach 90% overall and 80%
+publish unchanged from `review_candidate`, the normalized input the reviewer
+actually received. Required style edits are not reviewer false alarms. The
+original `candidate`, gold and unsupported-claim checks remain unchanged;
+`legacy_raw_ok`, `legacy_raw_judged` and the `legacy_raw_*_rate` summary fields
+retain the original-input comparison. A catch is paired only when every clean
+case on the same packet was right in the same round, and a refusal also needs
+one such case in the run, so refusing an item never counts as catching its flaw.
+The legacy paired score uses the legacy raw clean-twin results independently. The run fails unless paired catches reach 90% overall and 80%
 for each flaw with at least 10 distinct cases, with at most 10% false alarms.
 Use `--rounds 2` for acceptance, and add each new audit's labeled set before the
 prompt changes it leads to.
