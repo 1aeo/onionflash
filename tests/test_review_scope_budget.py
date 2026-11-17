@@ -80,23 +80,30 @@ def test_untrusted_update_preserves_history_and_requires_exact_fresh_verificatio
               **review_gate.initial_review_state()}
     requests = review_gate.ReviewRequests(record)
     text = "Operators can use the supplied workaround."
-    checker = reviewer(cfg, untrusted_update({"update": text}), verdict(update=True))
+    checker = reviewer(cfg, untrusted_update({"update": "An unrelated update that has not been validated."}),
+                       verdict("revise", criterion="source_support", repair={"update": text}, update=True),
+                       verdict(update=True))
     action, repaired = review_gate.advance_review(checker, "review", original, prepared, record, requests)
-    assert action == "verify" and record["reviews"] == [] and requests.actual == 1
+    assert action == "verify" and requests.actual == 2
+    assert [(r["request"], r["result"]["verdict"]) for r in record["reviews"]] == [(2, "revise")]
+    assert record["reviews"][0]["reask_response"]
     assert repaired["updates"][-1]["text"] == text
     assert repaired["updates"][:-1] == original["updates"][:-1]
     assert {k:v for k,v in repaired.items() if k != "updates"} == {k:v for k,v in original.items() if k != "updates"}
     assert repaired["updates"][-1]["at"] == original["updates"][-1]["at"]
     assert repaired["updates"][-1]["sources"] == original["updates"][-1]["sources"]
-    assert record["untrusted_proposals"][0]["repair"] == {"update": text}
+    rejected = record["untrusted_proposals"][0]
+    assert rejected["repair"] is None and rejected["candidate_after_hash"] is None and not rejected["accepted"]
     action, approved = review_gate.advance_review(checker, action, repaired, prepared, record, requests)
-    assert action == "approve" and approved == repaired and requests.actual == 2
+    assert action == "approve" and approved == repaired and requests.actual == 3
     wire = [json.loads(r["messages"][1]["content"]) for r in checker.client.requests]
-    assert wire[0]["review_scope"] == wire[1]["review_scope"] == "latest_update"
-    assert json.dumps(wire[0]["packet"]) == json.dumps(wire[1]["packet"])
-    assert json.dumps(wire[0]["coverage_background"]) == json.dumps(wire[1]["coverage_background"])
-    assert wire[1]["candidate"] == repaired
-    assert checker.client.requests[1]["messages"][0]["content"] == review.UPDATE_VERIFY_PROMPT
+    assert wire[1] == {**wire[0], "validation_error": review.INCONSISTENT_VERDICT}
+    assert all(payload["review_scope"] == "latest_update" for payload in wire)
+    assert wire[0]["packet"] == wire[2]["packet"]
+    assert wire[0]["coverage_background"] == wire[2]["coverage_background"]
+    assert wire[2]["candidate"] == repaired
+    assert checker.client.requests[2]["messages"][0]["content"] == review.UPDATE_VERIFY_PROMPT
+    assert record["reviews"][-1]["candidate_hash"] == digest(repaired)
     record.update(candidate=repaired, outcome="approved",
                   approval_key=digest([digest(repaired), digest(prepared["packet"]), record["policy_hash"],
                                        review_gate._context(prepared, record["policy_hash"])["binding_hash"]]))
@@ -104,14 +111,13 @@ def test_untrusted_update_preserves_history_and_requires_exact_fresh_verificatio
 
 
 @pytest.mark.parametrize("damage", ["title", "old-update", "date", "citation", "mode"])
-def test_update_recovery_proof_cannot_be_replayed_for_history_or_another_scope(context, damage):
-    cfg, _ = context
-    case, prepared = update_case()
-    record = {"candidate": case["candidate"], "reviews": [], "policy_hash": review.policy_hash(cfg),
-              **review_gate.initial_review_state()}
-    checker = reviewer(cfg, untrusted_update({"update": "Operators can use the supplied workaround."}))
-    stage, candidate = review_gate.advance_review(checker, "review", case["candidate"], prepared, record,
-                                                  review_gate.ReviewRequests(record))
+def test_update_recovery_proof_cannot_be_replayed_for_history_or_another_scope(damage):
+    from legacy_review_records import legacy_update
+    record, prepared, candidate = legacy_update()
+    prepared, candidate = copy.deepcopy(prepared), copy.deepcopy(candidate)
+    original_record = copy.deepcopy(record)
+    review_gate.validate_review_state(record, "verify", candidate, prepared)
+    assert review_gate.pending_proposal(record)
     if damage == "title":
         candidate["title"] = "A rewritten old headline"
     elif damage == "old-update":
@@ -123,8 +129,8 @@ def test_update_recovery_proof_cannot_be_replayed_for_history_or_another_scope(c
     else:
         prepared["mode"] = "story"
     with pytest.raises(AnalysisError, match="damaged"):
-        review_gate.advance_review(checker, stage, candidate, prepared, record, review_gate.ReviewRequests(record))
-    assert checker.calls == 1
+        review_gate.validate_review_state(record, "verify", candidate, prepared)
+    assert record == original_record
 
 
 def test_invalid_route_identity_never_enters_untrusted_recovery(context):
@@ -143,13 +149,22 @@ def test_invalid_route_identity_never_enters_untrusted_recovery(context):
 def test_untrusted_merge_request_release_tag_is_not_applied_during_correction(context):
     cfg, store = context
     row = pending(store, item(kind="gitlab_mr", upstream_state="merged"))
+    fixed = "A corrected report describes the merged change."
     checker = reviewer(cfg, inconsistent({"summary": "A revised merged change.", "tags": ["release"]}),
-                       verdict("hold", criterion="source_support"))
-    assert run(cfg, store, row, Writer(analysis(state="merged")), checker)["status"] == "held"
-    assert record(store)["untrusted_proposals"][0]["disposition"] == "labels"
-    assert checker.calls == 2 and not store.stories()
+                       verdict("revise", criterion="source_support", repair={"summary": fixed}), verdict())
+    assert run(cfg, store, row, Writer(analysis(state="merged")), checker)["status"] == "published"
+    audit = saved_audit(store)
+    assert audit["untrusted_proposals"][0]["disposition"] == "unusable"
+    assert audit["untrusted_proposals"][0]["repair"] is None
+    assert not audit["untrusted_proposals"][0]["accepted"]
+    assert checker.calls == audit["request_budget"]["reserved"] == 3
     payloads = [json.loads(request["messages"][1]["content"]) for request in checker.client.requests]
-    assert payloads[1]["candidate"] == payloads[0]["candidate"]
+    assert payloads[1] == {**payloads[0], "validation_error": review.INCONSISTENT_VERDICT}
+    assert payloads[2]["candidate"]["summary"] == fixed
+    assert all("release" not in payload["candidate"]["tags"] for payload in payloads)
+    assert store.stories()[0]["summary"] == fixed and "release" not in store.stories()[0]["tags"]
+    assert audit["reviews"][-1]["stage"] == "verification"
+    assert audit["reviews"][-1]["candidate_hash"] == digest(audit["candidate"])
 
 
 def test_route_update_fallbacks_share_one_budget_and_operator_retry_starts_new_review(context):
@@ -279,9 +294,15 @@ def test_untrusted_route_waits_for_fresh_reply_and_carries_journal_into_update(c
                                                                            (row["id"],)).fetchone()[0]))
     assert run(cfg, store, row, Writer(), checker)["status"] == "routed"
     assert associations == [None, None]
-    assert record(store)["request_budget"]["reserved"] == 2
-    assert len(record(store)["reviews"]) == 1
-    assert record(store)["untrusted_proposals"][0]["disposition"] == "checked_approve"
+    before_route = record(store)
+    assert before_route["request_budget"]["reserved"] == 2
+    assert len(before_route["reviews"]) == 1 and before_route["reviews"][0]["request"] == 2
+    assert before_route["reviews"][0]["reask_response"]
+    rejected = before_route["untrusted_proposals"][0]
+    assert rejected["disposition"] == "unusable" and rejected["repair"] is None and not rejected["accepted"]
+    payloads = [json.loads(request["messages"][1]["content"]) for request in checker.client.requests]
+    assert payloads[1] == {**payloads[0], "validation_error": review.INCONSISTENT_VERDICT}
+    assert payloads[0]["candidate"]["summary"] != incoming["content"]
     routed = next(r for r in store.pending(10, LATER) if r["id"] == row["id"])
     update = update_analysis(update=incoming["content"], evidence=[incoming["content"]])
     assert run(cfg, store, routed, Writer(update), reviewer(cfg, verdict(update=True), verdict(update=True)))["status"] == "published"
@@ -290,6 +311,9 @@ def test_untrusted_route_waits_for_fresh_reply_and_carries_journal_into_update(c
     assert audit["untrusted_proposals"][0]["mode"] == "story"
     assert audit["untrusted_proposals"][0]["disposition"] == "discarded_context"
     assert len(audit["reviews"]) == 2 and audit["reviews"][0]["request"] == 3
+    assert audit["request_budget"]["validation_reask"] == before_route["request_budget"]["validation_reask"]
+    assert audit["request_budget"]["validation_reask"]["trigger"] == 1
+    assert audit["reviews"][-1]["stage"] == "verification"
 
 
 def prepared_alert_update(context, tmp_path):
@@ -327,13 +351,20 @@ def test_text_only_alert_update_recovery_preserves_fixed_labels_outside_incoming
     audit = {"candidate": prepared["candidate"], "reviews": [], "policy_hash": review.policy_hash(cfg),
              **review_gate.initial_review_state()}
     requests = review_gate.ReviewRequests(audit)
-    checker = reviewer(cfg, untrusted_update({"update": incoming["content"]}), verdict(update=True))
+    checker = reviewer(cfg, untrusted_update({"update": "An unvalidated update about another observation."}),
+                       verdict("revise", criterion="source_support", repair={"update": incoming["content"]}, update=True),
+                       verdict(update=True))
     stage, after = review_gate.advance_review(checker, "review", prepared["candidate"], prepared, audit, requests)
     assert stage == "verify" and after == expected
     action, after = review_gate.advance_review(checker, stage, after, prepared, audit, requests)
-    assert action == "approve" and checker.calls == 2
+    assert action == "approve" and checker.calls == requests.actual == 3
     assert after["updates"][-1]["text"] == incoming["content"]
     assert all(after[field] == prior[field] for field in candidate.SEMANTIC_FIELDS)
+    payloads = [json.loads(request["messages"][1]["content"]) for request in checker.client.requests]
+    assert payloads[1] == {**payloads[0], "validation_error": review.INCONSISTENT_VERDICT}
+    assert payloads[2]["candidate"] == expected and payloads[2]["review_scope"] == "latest_update"
+    assert not audit["untrusted_proposals"][0]["accepted"]
+    assert [(r["request"], r["stage"]) for r in audit["reviews"]] == [(2, "review"), (3, "verification")]
 
 
 def test_untrusted_alert_label_change_is_rejected_and_cannot_poison_later_proof(context, tmp_path):

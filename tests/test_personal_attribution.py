@@ -142,9 +142,12 @@ def test_model_repairs_are_normalized_before_durable_fresh_verification(context,
     row = pending(store, _named_item()); draft = _named_draft()
     proposed = 'Developer Alice explains that queued requests wait for a connection.'
     response = verdict('revise', repair={'summary': proposed})
+    replies = []
     if inconsistent:
-        response['criteria'] = verdict()['criteria']
-    first = Reviewer(response, AnalysisError('connection interrupted', retryable=True))
+        rejected = verdict('revise', repair={'summary': 'Developer Alice describes an unrelated observation.'})
+        rejected['criteria'] = verdict()['criteria']
+        replies.append(rejected)
+    first = Reviewer(*replies, response, AnalysisError('connection interrupted', retryable=True))
     with pytest.raises(AnalysisError):
         run_gate(cfg, store, row, Writer(draft), first)
     saved = json.loads(job(store)['record_json'])
@@ -153,16 +156,18 @@ def test_model_repairs_are_normalized_before_durable_fresh_verification(context,
     review_gate.validate_review_state(saved, 'verify', saved['candidate'], json.loads(job(store)['envelope_json']))
     if inconsistent:
         proposal = saved['untrusted_proposals'][0]
-        assert proposal['repair']['summary'] == saved['candidate']['summary']  # Real v2 receipts retain the effective applied edit.
-        assert proposal['candidate_after_hash'] == digest(saved['candidate'])
-        assert proposal['disposition'] == 'pending'
-    else:
-        assert saved['reviews'][0]['result']['repair']['summary'] == proposed
+        assert proposal['repair'] is None and proposal['candidate_after_hash'] is None
+        assert not proposal['accepted'] and proposal['disposition'] == 'unusable'
+        assert first.calls[0][0] == first.calls[1][0]
+        assert first.validation_errors == [None, review.INCONSISTENT_VERDICT, None]
+    assert saved['reviews'][0]['result']['repair']['summary'] == proposed
+    assert saved['reviews'][0]['request'] == 1 + inconsistent
+    assert first.calls[-1][0] == saved['candidate'] and first.calls[-1][2] is True
     writer, checker = Writer(), Reviewer(verdict())
     result = run_gate(cfg, store, row, writer, checker)
     assert result['status'] == 'published' and result['review_calls'] == 1 and writer.calls == []
     assert checker.calls[0][0] == saved['candidate'] and checker.calls[0][2] is True
-    assert _audit(store)['request_budget']['reserved'] == 3
+    assert _audit(store)['request_budget']['reserved'] == 3 + inconsistent
 
 
 def test_uneditable_style_holds_even_after_two_model_approvals(context):
@@ -472,16 +477,26 @@ def test_native_style_repair_resume_spends_only_the_next_verification(context,mo
     cfg,store=context
     row=pending(store,_named_item())
     draft=analysis(title='Alice is a developer.',summary='Alice reports measurements.',category='network',tags=['network'])
-    cfg,checker=_native_style_reviewer(cfg,monkeypatch,inconsistent({'title':'Alice reports measurements'}),FetchError('interrupted'))
+    fixed='Alice reports measurements'
+    cfg,checker=_native_style_reviewer(cfg,monkeypatch,
+        inconsistent({'title':'Alice announces a different result'}),
+        verdict('revise',repair={'title':fixed},criterion='actor_and_action'),FetchError('interrupted'))
     with pytest.raises(AnalysisError):run_gate(cfg,store,row,Writer(draft),checker)
     saved=json.loads(job(store)['record_json'])
-    assert saved['candidate']['title']=='Alice reports measurements'and saved['request_budget']['reserved']==2
+    assert saved['candidate']['title']==fixed and saved['request_budget']['reserved']==3
+    bodies=[json.loads(x['messages'][1]['content'])for x in checker.client.requests]
+    assert bodies[1]=={**bodies[0],'validation_error':review.INCONSISTENT_VERDICT}
+    assert bodies[2]['candidate']==saved['candidate'] and 'validation_error'not in bodies[2]
+    assert checker.client.requests[2]['messages'][0]['content']==review.VERIFY_PROMPT
+    assert saved['reviews'][0]['request']==2 and saved['reviews'][0]['reask_response']
+    assert saved['untrusted_proposals'][0]['repair']is None
+    assert not review_gate.pending_proposal(saved)
     cfg,resumed=_native_style_reviewer(cfg,monkeypatch,verdict())
     writer=Writer();result=run_gate(cfg,store,row,writer,resumed)
     assert result['status']=='published'and result['review_calls']==1 and writer.calls==[]
     body=json.loads(resumed.client.requests[0]['messages'][1]['content'])
     assert 'application_issue'not in body and body['candidate']==saved['candidate']
-    assert _audit(store)['request_budget']['reserved']==3
+    assert _audit(store)['request_budget']['reserved']==4
 
 
 def test_conditional_style_instruction_is_part_of_policy_identity(context,monkeypatch):
@@ -868,16 +883,24 @@ def test_repair_keeps_neutral_subject_before_exact_fresh_verification(context,in
     draft=analysis(title='A source reports an observation',summary='The reporter initially reported the result.',
                    why_it_matters='The source states a consequence.',category='network',tags=['network'])
     response=verdict('revise',criterion='source_support',repair={'summary':raw})
-    if inconsistent:response['criteria']=verdict()['criteria']
-    checker=Reviewer(response,verdict());writer=Writer(draft)
+    replies=[]
+    if inconsistent:
+        rejected=verdict('revise',repair={'summary':'The reporter described an unrelated result.'})
+        rejected['criteria']=verdict()['criteria']
+        replies.append(rejected)
+    checker=Reviewer(*replies,response,verdict());writer=Writer(draft)
     result=run_gate(cfg,store,row,writer,checker)
-    assert result['status']=='published'and result['review_calls']==2
-    assert checker.calls[1][2]is True
-    assert checker.calls[1][0]['summary']==store.stories()[0]['summary']==raw
-    assert checker.calls[1][0]['why_it_matters']==draft['why_it_matters']
+    assert result['status']=='published'and result['review_calls']==2+inconsistent
+    if inconsistent:
+        assert checker.calls[0][0]==checker.calls[1][0]
+        assert checker.validation_errors==[None,review.INCONSISTENT_VERDICT,None]
+    assert checker.calls[-1][2]is True
+    assert checker.calls[-1][0]['summary']==store.stories()[0]['summary']==raw
+    assert checker.calls[-1][0]['why_it_matters']==draft['why_it_matters']
     audit=_audit(store)
-    assert audit['schema_version']==2 and audit['request_budget']['reserved']==2
-    assert audit['reviews'][-1]['candidate_hash']==digest(checker.calls[1][0])
+    assert audit['schema_version']==2 and audit['request_budget']['reserved']==2+inconsistent
+    assert audit['reviews'][0]['result']['repair']['summary']==raw
+    assert audit['reviews'][-1]['candidate_hash']==digest(checker.calls[-1][0])
 
 
 def test_modifier_grammar_participates_in_policy_identity_without_a_version_change(monkeypatch):

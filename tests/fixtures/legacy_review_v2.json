@@ -1,0 +1,284 @@
+{
+  "description": "Synthetic historical version-two native review receipts; never produced by the current invalid-reply transition.",
+  "fixtures": {
+    "story": {
+      "row": {
+        "id": "b038d7eb7b1776f338545994",
+        "url": "https://example.org/news/1",
+        "source_id": "test",
+        "content_hash": "77440334510c7ffa6ffafc5d3df8e6ef42bc474c9f779f9b93f9b54ce442fe22",
+        "cluster_key": "url:b038d7eb7b1776f338545994b997386ca9a9a91231ecfdfdcc5c17ebfea0fdfe",
+        "first_seen": "2026-11-08T12:00:00Z",
+        "last_seen": "2026-11-08T12:00:00Z",
+        "status": "pending",
+        "attempts": 0,
+        "rejections": 0,
+        "next_attempt_at": null,
+        "last_error": null,
+        "priority_score": 45,
+        "story_id": null,
+        "payload": "{\"id\": \"b038d7eb7b1776f338545994\", \"source_id\": \"test\", \"url\": \"https://example.org/news/1\", \"title\": \"A reported security incident\", \"content\": \"The operator reported a plausible compromise and said its keys must no longer be trusted.\", \"published_at\": \"2026-11-08T12:00:00Z\", \"updated_at\": \"2026-11-08T12:00:00Z\", \"kind\": \"gitlab_issue\", \"product\": \"tor\", \"authority\": \"development\", \"labels\": [\"Security\"]}"
+      },
+      "job": {
+        "item_id": "b038d7eb7b1776f338545994",
+        "writer_key": "c0fbda16f081727c175a141e529a5ff03526c2e9ee17142621a4268e19c1af7c",
+        "policy_hash": "903a5327d596530d5783b66ebdffeb0a05ffecb453f31f13d8def6d9b46b6f99",
+        "stage": "verify",
+        "draft_json": "{\"category\": \"security\", \"confidence\": \"reported\", \"evidence\": [\"The operator reported a plausible compromise\"], \"priority\": \"high\", \"products\": [\"tor\"], \"publish\": true, \"state\": \"developing\", \"summary\": \"The operator reported a plausible compromise and stopped trusting the affected keys.\", \"tags\": [\"security\"], \"title\": \"Operator reports possible compromise\", \"why_it_matters\": \"The report concerns directory authority trust.\"}",
+        "envelope_json": "{\"binding\": {\"candidate_hash\": \"8c05d7e74303d9c95d8226ebac0958b0ab8fc2bfc9cf9ad329e0319a892e0497\", \"coverage_hash\": \"354907f6cf53e24a383edcb20aed988eec877ab28e3edb61ed30f799c31edc0f\", \"item\": \"13debd0c2625c0e881a0b5aec374ea7ae99eb280560d8d27b994a5658fff4586\", \"lock\": \"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\", \"mode\": \"story\", \"packet_hash\": \"60adf011f81e1fe6ee77231780949b5a3a98fc7627f28ac26cf5f731e259d799\", \"payload_hash\": \"575b0ccaf7e4c1ddbd8d5cfb1b792913efd1809010fba1958d62a6a648823354\", \"prior_story\": \"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\", \"sources\": [{\"hash\": \"5128db6675d7f096a3b5ffbf8292d350bc5aa459dcc6c194f5394e125c636d48\", \"key\": \"b038d7eb7b1776f338545994\", \"table\": \"items\"}]}, \"binding_hash\": \"b39b63e503613b2b9e08d316bff8c3d3f30e2f41ca1b23164dd5b24077ebb91c\", \"candidate\": {\"added_at\": \"2026-11-10T12:00:00Z\", \"category\": \"security\", \"confidence\": \"reported\", \"id\": \"585d1496f48335d3337869c4\", \"priority\": \"high\", \"products\": [\"tor\"], \"published_at\": \"2026-11-08T12:00:00Z\", \"sources\": [{\"title\": \"A reported security incident\", \"url\": \"https://example.org/news/1\"}], \"state\": \"developing\", \"summary\": \"The operator reported a plausible compromise and stopped trusting the affected keys.\", \"tags\": [\"security\"], \"title\": \"Operator reports possible compromise\", \"updated_at\": \"2026-11-08T12:00:00Z\", \"why_it_matters\": \"The report concerns directory authority trust.\"}, \"candidate_hash\": \"8c05d7e74303d9c95d8226ebac0958b0ab8fc2bfc9cf9ad329e0319a892e0497\", \"cluster_key\": \"url:b038d7eb7b1776f338545994b997386ca9a9a91231ecfdfdcc5c17ebfea0fdfe\", \"coverage\": {\"prior_story\": null, \"recent\": [], \"truncated\": false}, \"coverage_hash\": \"354907f6cf53e24a383edcb20aed988eec877ab28e3edb61ed30f799c31edc0f\", \"dirauth_users\": [\"andreas\", \"arma\", \"gman999\", \"linus\", \"micah\", \"sebastian\", \"sina\", \"stefani\", \"usura\", \"weasel\"], \"how\": null, \"locked\": false, \"mode\": \"story\", \"observed\": \"2026-11-10T12:00:00Z\", \"packet\": {\"missing_sources\": [], \"sources\": [{\"authority\": \"development\", \"id\": \"S1\", \"kind\": \"gitlab_issue\", \"labels\": [\"Security\"], \"passages\": [{\"id\": \"S1:P1\", \"text\": \"A reported security incident\"}, {\"id\": \"S1:P2\", \"text\": \"The operator reported a plausible compromise and said its keys must no longer be trusted.\"}], \"product\": \"tor\", \"published_at\": \"2026-11-08T12:00:00Z\", \"snapshot\": \"current\", \"title\": \"A reported security incident\", \"updated_at\": \"2026-11-08T12:00:00Z\", \"upstream_state\": null, \"url\": \"https://example.org/news/1\"}], \"truncated\": false}, \"payload\": {\"added_at\": \"2026-11-10T12:00:00Z\", \"category\": \"security\", \"confidence\": \"reported\", \"editorial_authority\": \"development\", \"editorial_item\": \"b038d7eb7b1776f338545994\", \"editorial_kind\": \"gitlab_issue\", \"id\": \"585d1496f48335d3337869c4\", \"priority\": \"high\", \"products\": [\"tor\"], \"published_at\": \"2026-11-08T12:00:00Z\", \"sources\": [{\"id\": \"b038d7eb7b1776f338545994\", \"published_at\": \"2026-11-08T12:00:00Z\", \"title\": \"A reported security incident\", \"url\": \"https://example.org/news/1\"}], \"state\": \"developing\", \"summary\": \"The operator reported a plausible compromise and stopped trusting the affected keys.\", \"tags\": [\"security\"], \"title\": \"Operator reports possible compromise\", \"updated_at\": \"2026-11-08T12:00:00Z\", \"why_it_matters\": \"The report concerns directory authority trust.\"}, \"result\": {\"category\": \"security\", \"confidence\": \"reported\", \"evidence\": [\"The operator reported a plausible compromise\"], \"priority\": \"high\", \"products\": [\"tor\"], \"publish\": true, \"state\": \"developing\", \"summary\": \"The operator reported a plausible compromise and stopped trusting the affected keys.\", \"tags\": [\"security\"], \"title\": \"Operator reports possible compromise\", \"why_it_matters\": \"The report concerns directory authority trust.\"}, \"row\": {\"attempts\": 0, \"cluster_key\": \"url:b038d7eb7b1776f338545994b997386ca9a9a91231ecfdfdcc5c17ebfea0fdfe\", \"content_hash\": \"77440334510c7ffa6ffafc5d3df8e6ef42bc474c9f779f9b93f9b54ce442fe22\", \"first_seen\": \"2026-11-08T12:00:00Z\", \"id\": \"b038d7eb7b1776f338545994\", \"last_error\": null, \"last_seen\": \"2026-11-08T12:00:00Z\", \"next_attempt_at\": null, \"payload\": \"{\\\"id\\\": \\\"b038d7eb7b1776f338545994\\\", \\\"source_id\\\": \\\"test\\\", \\\"url\\\": \\\"https://example.org/news/1\\\", \\\"title\\\": \\\"A reported security incident\\\", \\\"content\\\": \\\"The operator reported a plausible compromise and said its keys must no longer be trusted.\\\", \\\"published_at\\\": \\\"2026-11-08T12:00:00Z\\\", \\\"updated_at\\\": \\\"2026-11-08T12:00:00Z\\\", \\\"kind\\\": \\\"gitlab_issue\\\", \\\"product\\\": \\\"tor\\\", \\\"authority\\\": \\\"development\\\", \\\"labels\\\": [\\\"Security\\\"]}\", \"priority_score\": 45, \"rejections\": 0, \"source_id\": \"test\", \"status\": \"pending\", \"story_id\": null, \"url\": \"https://example.org/news/1\"}, \"source_hash\": \"60adf011f81e1fe6ee77231780949b5a3a98fc7627f28ac26cf5f731e259d799\", \"story_id\": \"585d1496f48335d3337869c4\"}",
+        "record_json": "{\"candidate\": {\"added_at\": \"2026-11-10T12:00:00Z\", \"category\": \"security\", \"confidence\": \"reported\", \"id\": \"585d1496f48335d3337869c4\", \"priority\": \"high\", \"products\": [\"tor\"], \"published_at\": \"2026-11-08T12:00:00Z\", \"sources\": [{\"title\": \"A reported security incident\", \"url\": \"https://example.org/news/1\"}], \"state\": \"developing\", \"summary\": \"A revised report describes the source's concerns.\", \"tags\": [\"security\"], \"title\": \"Operator reports possible compromise\", \"updated_at\": \"2026-11-08T12:00:00Z\", \"why_it_matters\": \"The report concerns directory authority trust.\"}, \"input_hash\": \"77440334510c7ffa6ffafc5d3df8e6ef42bc474c9f779f9b93f9b54ce442fe22\", \"input_proof\": 1, \"policy_hash\": \"903a5327d596530d5783b66ebdffeb0a05ffecb453f31f13d8def6d9b46b6f99\", \"prepared\": {\"binding_hash\": \"b39b63e503613b2b9e08d316bff8c3d3f30e2f41ca1b23164dd5b24077ebb91c\", \"candidate\": {\"added_at\": \"2026-11-10T12:00:00Z\", \"category\": \"security\", \"confidence\": \"reported\", \"id\": \"585d1496f48335d3337869c4\", \"priority\": \"high\", \"products\": [\"tor\"], \"published_at\": \"2026-11-08T12:00:00Z\", \"sources\": [{\"title\": \"A reported security incident\", \"url\": \"https://example.org/news/1\"}], \"state\": \"developing\", \"summary\": \"The operator reported a plausible compromise and stopped trusting the affected keys.\", \"tags\": [\"security\"], \"title\": \"Operator reports possible compromise\", \"updated_at\": \"2026-11-08T12:00:00Z\", \"why_it_matters\": \"The report concerns directory authority trust.\"}, \"candidate_hash\": \"8c05d7e74303d9c95d8226ebac0958b0ab8fc2bfc9cf9ad329e0319a892e0497\", \"coverage\": {\"prior_story\": null, \"recent\": [], \"truncated\": false}, \"coverage_hash\": \"354907f6cf53e24a383edcb20aed988eec877ab28e3edb61ed30f799c31edc0f\", \"dirauth_users\": [\"andreas\", \"arma\", \"gman999\", \"linus\", \"micah\", \"sebastian\", \"sina\", \"stefani\", \"usura\", \"weasel\"], \"mode\": \"story\", \"packet\": {\"missing_sources\": [], \"sources\": [{\"authority\": \"development\", \"id\": \"S1\", \"kind\": \"gitlab_issue\", \"labels\": [\"Security\"], \"passages\": [{\"id\": \"S1:P1\", \"text\": \"A reported security incident\"}, {\"id\": \"S1:P2\", \"text\": \"The operator reported a plausible compromise and said its keys must no longer be trusted.\"}], \"product\": \"tor\", \"published_at\": \"2026-11-08T12:00:00Z\", \"snapshot\": \"current\", \"title\": \"A reported security incident\", \"updated_at\": \"2026-11-08T12:00:00Z\", \"upstream_state\": null, \"url\": \"https://example.org/news/1\"}], \"truncated\": false}, \"source_hash\": \"60adf011f81e1fe6ee77231780949b5a3a98fc7627f28ac26cf5f731e259d799\"}, \"request_budget\": {\"inconsistent_requests\": [1], \"reserved\": 1, \"validation_reask\": null}, \"reviews\": [], \"schema_version\": 2, \"untrusted_proposals\": [{\"accepted\": true, \"candidate_after_hash\": \"f2e5d8a8379a8db26a96e6c4965999c9475250afa225971db10711de9a821931\", \"candidate_before_hash\": \"8c05d7e74303d9c95d8226ebac0958b0ab8fc2bfc9cf9ad329e0319a892e0497\", \"changed_fields\": [\"summary\"], \"context\": {\"binding_hash\": \"b39b63e503613b2b9e08d316bff8c3d3f30e2f41ca1b23164dd5b24077ebb91c\", \"coverage_hash\": \"354907f6cf53e24a383edcb20aed988eec877ab28e3edb61ed30f799c31edc0f\", \"policy_hash\": \"903a5327d596530d5783b66ebdffeb0a05ffecb453f31f13d8def6d9b46b6f99\", \"source_hash\": \"60adf011f81e1fe6ee77231780949b5a3a98fc7627f28ac26cf5f731e259d799\"}, \"disposition\": \"pending\", \"error\": \"Review refusal requires an explicit failed criterion\", \"mode\": \"story\", \"reask_response\": false, \"reask_trigger\": false, \"repair\": {\"summary\": \"A revised report describes the source's concerns.\"}, \"request\": 1, \"stage\": \"review\"}], \"writer\": {\"key\": \"c0fbda16f081727c175a141e529a5ff03526c2e9ee17142621a4268e19c1af7c\"}}",
+        "approval_key": null,
+        "prepared_at": "2026-11-10T12:00:00Z",
+        "updated_at": "2026-11-10T12:00:00Z"
+      }
+    },
+    "release_labels": {
+      "row": {
+        "id": "b038d7eb7b1776f338545994",
+        "url": "https://example.org/news/1",
+        "source_id": "test",
+        "content_hash": "77440334510c7ffa6ffafc5d3df8e6ef42bc474c9f779f9b93f9b54ce442fe22",
+        "cluster_key": "url:b038d7eb7b1776f338545994b997386ca9a9a91231ecfdfdcc5c17ebfea0fdfe",
+        "first_seen": "2026-11-08T12:00:00Z",
+        "last_seen": "2026-11-08T12:00:00Z",
+        "status": "pending",
+        "attempts": 0,
+        "rejections": 0,
+        "next_attempt_at": null,
+        "last_error": null,
+        "priority_score": 45,
+        "story_id": null,
+        "payload": "{\"id\": \"b038d7eb7b1776f338545994\", \"source_id\": \"test\", \"url\": \"https://example.org/news/1\", \"title\": \"A reported security incident\", \"content\": \"The operator reported a plausible compromise and said its keys must no longer be trusted.\", \"published_at\": \"2026-11-08T12:00:00Z\", \"updated_at\": \"2026-11-08T12:00:00Z\", \"kind\": \"gitlab_issue\", \"product\": \"tor\", \"authority\": \"development\", \"labels\": [\"Security\"]}"
+      },
+      "job": {
+        "item_id": "b038d7eb7b1776f338545994",
+        "writer_key": "c0fbda16f081727c175a141e529a5ff03526c2e9ee17142621a4268e19c1af7c",
+        "policy_hash": "903a5327d596530d5783b66ebdffeb0a05ffecb453f31f13d8def6d9b46b6f99",
+        "stage": "verify",
+        "draft_json": "{\"category\": \"release\", \"confidence\": \"reported\", \"evidence\": [\"The operator reported a plausible compromise\"], \"priority\": \"high\", \"products\": [\"tor\"], \"publish\": true, \"state\": \"merged\", \"summary\": \"The operator reported a plausible compromise and stopped trusting the affected keys.\", \"tags\": [\"release\"], \"title\": \"Operator reports possible compromise\", \"why_it_matters\": \"The report concerns directory authority trust.\"}",
+        "envelope_json": "{\"binding\": {\"candidate_hash\": \"ceacddfa5ef159a454f749ecec9458642c8b743445463d135565cd1fb43cc723\", \"coverage_hash\": \"354907f6cf53e24a383edcb20aed988eec877ab28e3edb61ed30f799c31edc0f\", \"item\": \"13debd0c2625c0e881a0b5aec374ea7ae99eb280560d8d27b994a5658fff4586\", \"lock\": \"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\", \"mode\": \"story\", \"packet_hash\": \"60adf011f81e1fe6ee77231780949b5a3a98fc7627f28ac26cf5f731e259d799\", \"payload_hash\": \"cbbf3408eb48b59c978e39928ed58e9c46b348e553a41763f4662ad258463136\", \"prior_story\": \"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\", \"sources\": [{\"hash\": \"5128db6675d7f096a3b5ffbf8292d350bc5aa459dcc6c194f5394e125c636d48\", \"key\": \"b038d7eb7b1776f338545994\", \"table\": \"items\"}]}, \"binding_hash\": \"b1289ebe9183be8d0a7fa78d642eddfc3e92840da5aafcdfc40a10d5b09c898c\", \"candidate\": {\"added_at\": \"2026-11-10T12:00:00Z\", \"category\": \"release\", \"confidence\": \"reported\", \"id\": \"585d1496f48335d3337869c4\", \"priority\": \"high\", \"products\": [\"tor\"], \"published_at\": \"2026-11-08T12:00:00Z\", \"sources\": [{\"title\": \"A reported security incident\", \"url\": \"https://example.org/news/1\"}], \"state\": \"merged\", \"summary\": \"The operator reported a plausible compromise and stopped trusting the affected keys.\", \"tags\": [\"release\"], \"title\": \"Operator reports possible compromise\", \"updated_at\": \"2026-11-08T12:00:00Z\", \"why_it_matters\": \"The report concerns directory authority trust.\"}, \"candidate_hash\": \"ceacddfa5ef159a454f749ecec9458642c8b743445463d135565cd1fb43cc723\", \"cluster_key\": \"url:b038d7eb7b1776f338545994b997386ca9a9a91231ecfdfdcc5c17ebfea0fdfe\", \"coverage\": {\"prior_story\": null, \"recent\": [], \"truncated\": false}, \"coverage_hash\": \"354907f6cf53e24a383edcb20aed988eec877ab28e3edb61ed30f799c31edc0f\", \"dirauth_users\": [\"andreas\", \"arma\", \"gman999\", \"linus\", \"micah\", \"sebastian\", \"sina\", \"stefani\", \"usura\", \"weasel\"], \"how\": null, \"locked\": false, \"mode\": \"story\", \"observed\": \"2026-11-10T12:00:00Z\", \"packet\": {\"missing_sources\": [], \"sources\": [{\"authority\": \"development\", \"id\": \"S1\", \"kind\": \"gitlab_issue\", \"labels\": [\"Security\"], \"passages\": [{\"id\": \"S1:P1\", \"text\": \"A reported security incident\"}, {\"id\": \"S1:P2\", \"text\": \"The operator reported a plausible compromise and said its keys must no longer be trusted.\"}], \"product\": \"tor\", \"published_at\": \"2026-11-08T12:00:00Z\", \"snapshot\": \"current\", \"title\": \"A reported security incident\", \"updated_at\": \"2026-11-08T12:00:00Z\", \"upstream_state\": null, \"url\": \"https://example.org/news/1\"}], \"truncated\": false}, \"payload\": {\"added_at\": \"2026-11-10T12:00:00Z\", \"category\": \"release\", \"confidence\": \"reported\", \"editorial_authority\": \"development\", \"editorial_item\": \"b038d7eb7b1776f338545994\", \"editorial_kind\": \"gitlab_issue\", \"id\": \"585d1496f48335d3337869c4\", \"priority\": \"high\", \"products\": [\"tor\"], \"published_at\": \"2026-11-08T12:00:00Z\", \"sources\": [{\"id\": \"b038d7eb7b1776f338545994\", \"published_at\": \"2026-11-08T12:00:00Z\", \"title\": \"A reported security incident\", \"url\": \"https://example.org/news/1\"}], \"state\": \"merged\", \"summary\": \"The operator reported a plausible compromise and stopped trusting the affected keys.\", \"tags\": [\"release\"], \"title\": \"Operator reports possible compromise\", \"updated_at\": \"2026-11-08T12:00:00Z\", \"why_it_matters\": \"The report concerns directory authority trust.\"}, \"result\": {\"category\": \"release\", \"confidence\": \"reported\", \"evidence\": [\"The operator reported a plausible compromise\"], \"priority\": \"high\", \"products\": [\"tor\"], \"publish\": true, \"state\": \"merged\", \"summary\": \"The operator reported a plausible compromise and stopped trusting the affected keys.\", \"tags\": [\"release\"], \"title\": \"Operator reports possible compromise\", \"why_it_matters\": \"The report concerns directory authority trust.\"}, \"row\": {\"attempts\": 0, \"cluster_key\": \"url:b038d7eb7b1776f338545994b997386ca9a9a91231ecfdfdcc5c17ebfea0fdfe\", \"content_hash\": \"77440334510c7ffa6ffafc5d3df8e6ef42bc474c9f779f9b93f9b54ce442fe22\", \"first_seen\": \"2026-11-08T12:00:00Z\", \"id\": \"b038d7eb7b1776f338545994\", \"last_error\": null, \"last_seen\": \"2026-11-08T12:00:00Z\", \"next_attempt_at\": null, \"payload\": \"{\\\"id\\\": \\\"b038d7eb7b1776f338545994\\\", \\\"source_id\\\": \\\"test\\\", \\\"url\\\": \\\"https://example.org/news/1\\\", \\\"title\\\": \\\"A reported security incident\\\", \\\"content\\\": \\\"The operator reported a plausible compromise and said its keys must no longer be trusted.\\\", \\\"published_at\\\": \\\"2026-11-08T12:00:00Z\\\", \\\"updated_at\\\": \\\"2026-11-08T12:00:00Z\\\", \\\"kind\\\": \\\"gitlab_issue\\\", \\\"product\\\": \\\"tor\\\", \\\"authority\\\": \\\"development\\\", \\\"labels\\\": [\\\"Security\\\"]}\", \"priority_score\": 45, \"rejections\": 0, \"source_id\": \"test\", \"status\": \"pending\", \"story_id\": null, \"url\": \"https://example.org/news/1\"}, \"source_hash\": \"60adf011f81e1fe6ee77231780949b5a3a98fc7627f28ac26cf5f731e259d799\", \"story_id\": \"585d1496f48335d3337869c4\"}",
+        "record_json": "{\"candidate\": {\"added_at\": \"2026-11-10T12:00:00Z\", \"category\": \"security\", \"confidence\": \"reported\", \"id\": \"585d1496f48335d3337869c4\", \"priority\": \"high\", \"products\": [\"tor\"], \"published_at\": \"2026-11-08T12:00:00Z\", \"sources\": [{\"title\": \"A reported security incident\", \"url\": \"https://example.org/news/1\"}], \"state\": \"merged\", \"summary\": \"An earlier repaired summary.\", \"tags\": [\"security\"], \"title\": \"Operator reports possible compromise\", \"updated_at\": \"2026-11-08T12:00:00Z\", \"why_it_matters\": \"The report concerns directory authority trust.\"}, \"input_hash\": \"77440334510c7ffa6ffafc5d3df8e6ef42bc474c9f779f9b93f9b54ce442fe22\", \"input_proof\": 1, \"policy_hash\": \"903a5327d596530d5783b66ebdffeb0a05ffecb453f31f13d8def6d9b46b6f99\", \"prepared\": {\"binding_hash\": \"b1289ebe9183be8d0a7fa78d642eddfc3e92840da5aafcdfc40a10d5b09c898c\", \"candidate\": {\"added_at\": \"2026-11-10T12:00:00Z\", \"category\": \"release\", \"confidence\": \"reported\", \"id\": \"585d1496f48335d3337869c4\", \"priority\": \"high\", \"products\": [\"tor\"], \"published_at\": \"2026-11-08T12:00:00Z\", \"sources\": [{\"title\": \"A reported security incident\", \"url\": \"https://example.org/news/1\"}], \"state\": \"merged\", \"summary\": \"The operator reported a plausible compromise and stopped trusting the affected keys.\", \"tags\": [\"release\"], \"title\": \"Operator reports possible compromise\", \"updated_at\": \"2026-11-08T12:00:00Z\", \"why_it_matters\": \"The report concerns directory authority trust.\"}, \"candidate_hash\": \"ceacddfa5ef159a454f749ecec9458642c8b743445463d135565cd1fb43cc723\", \"coverage\": {\"prior_story\": null, \"recent\": [], \"truncated\": false}, \"coverage_hash\": \"354907f6cf53e24a383edcb20aed988eec877ab28e3edb61ed30f799c31edc0f\", \"dirauth_users\": [\"andreas\", \"arma\", \"gman999\", \"linus\", \"micah\", \"sebastian\", \"sina\", \"stefani\", \"usura\", \"weasel\"], \"mode\": \"story\", \"packet\": {\"missing_sources\": [], \"sources\": [{\"authority\": \"development\", \"id\": \"S1\", \"kind\": \"gitlab_issue\", \"labels\": [\"Security\"], \"passages\": [{\"id\": \"S1:P1\", \"text\": \"A reported security incident\"}, {\"id\": \"S1:P2\", \"text\": \"The operator reported a plausible compromise and said its keys must no longer be trusted.\"}], \"product\": \"tor\", \"published_at\": \"2026-11-08T12:00:00Z\", \"snapshot\": \"current\", \"title\": \"A reported security incident\", \"updated_at\": \"2026-11-08T12:00:00Z\", \"upstream_state\": null, \"url\": \"https://example.org/news/1\"}], \"truncated\": false}, \"source_hash\": \"60adf011f81e1fe6ee77231780949b5a3a98fc7627f28ac26cf5f731e259d799\"}, \"request_budget\": {\"inconsistent_requests\": [3], \"reserved\": 3, \"validation_reask\": null}, \"reviews\": [{\"binding_hash\": \"b1289ebe9183be8d0a7fa78d642eddfc3e92840da5aafcdfc40a10d5b09c898c\", \"candidate_hash\": \"ceacddfa5ef159a454f749ecec9458642c8b743445463d135565cd1fb43cc723\", \"coverage_hash\": \"354907f6cf53e24a383edcb20aed988eec877ab28e3edb61ed30f799c31edc0f\", \"policy_hash\": \"903a5327d596530d5783b66ebdffeb0a05ffecb453f31f13d8def6d9b46b6f99\", \"request\": 1, \"result\": {\"criteria\": {\"actor_and_action\": {\"outcome\": \"pass\", \"reason\": \"Supported by the supplied source.\", \"source_refs\": [\"S1\"]}, \"new_information\": {\"outcome\": \"pass\", \"reason\": \"Supported by the supplied source.\", \"source_refs\": [\"S1\"]}, \"news_value\": {\"outcome\": \"pass\", \"reason\": \"Supported by the supplied source.\", \"source_refs\": [\"S1\"]}, \"operational_advice\": {\"outcome\": \"fail\", \"reason\": \"The source does not support this claim.\", \"source_refs\": [\"S1\"]}, \"scope_timing\": {\"outcome\": \"pass\", \"reason\": \"Supported by the supplied source.\", \"source_refs\": [\"S1\"]}, \"source_support\": {\"outcome\": \"pass\", \"reason\": \"Supported by the supplied source.\", \"source_refs\": [\"S1\"]}, \"status\": {\"outcome\": \"pass\", \"reason\": \"Supported by the supplied source.\", \"source_refs\": [\"S1\"]}, \"technical_details\": {\"outcome\": \"pass\", \"reason\": \"Supported by the supplied source.\", \"source_refs\": [\"S1\"]}, \"uncertainty_attribution\": {\"outcome\": \"pass\", \"reason\": \"Supported by the supplied source.\", \"source_refs\": [\"S1\"]}}, \"repair\": {\"summary\": \"An earlier repaired summary.\"}, \"same_story\": null, \"verdict\": \"revise\"}, \"source_hash\": \"60adf011f81e1fe6ee77231780949b5a3a98fc7627f28ac26cf5f731e259d799\", \"stage\": \"review\"}, {\"binding_hash\": \"b1289ebe9183be8d0a7fa78d642eddfc3e92840da5aafcdfc40a10d5b09c898c\", \"candidate_hash\": \"28b3d9cdd77e06a4a4a66d98212ce45348380efa037f7090da632b9f64b310c0\", \"coverage_hash\": \"354907f6cf53e24a383edcb20aed988eec877ab28e3edb61ed30f799c31edc0f\", \"policy_hash\": \"903a5327d596530d5783b66ebdffeb0a05ffecb453f31f13d8def6d9b46b6f99\", \"request\": 2, \"result\": {\"criteria\": {\"actor_and_action\": {\"outcome\": \"pass\", \"reason\": \"Supported by the supplied source.\", \"source_refs\": [\"S1\"]}, \"new_information\": {\"outcome\": \"pass\", \"reason\": \"Supported by the supplied source.\", \"source_refs\": [\"S1\"]}, \"news_value\": {\"outcome\": \"pass\", \"reason\": \"Supported by the supplied source.\", \"source_refs\": [\"S1\"]}, \"operational_advice\": {\"outcome\": \"pass\", \"reason\": \"Supported by the supplied source.\", \"source_refs\": [\"S1\"]}, \"scope_timing\": {\"outcome\": \"pass\", \"reason\": \"Supported by the supplied source.\", \"source_refs\": [\"S1\"]}, \"source_support\": {\"outcome\": \"pass\", \"reason\": \"Supported by the supplied source.\", \"source_refs\": [\"S1\"]}, \"status\": {\"outcome\": \"pass\", \"reason\": \"Supported by the supplied source.\", \"source_refs\": [\"S1\"]}, \"technical_details\": {\"outcome\": \"pass\", \"reason\": \"Supported by the supplied source.\", \"source_refs\": [\"S1\"]}, \"uncertainty_attribution\": {\"outcome\": \"pass\", \"reason\": \"Supported by the supplied source.\", \"source_refs\": [\"S1\"]}}, \"repair\": null, \"same_story\": null, \"verdict\": \"approve\"}, \"source_hash\": \"60adf011f81e1fe6ee77231780949b5a3a98fc7627f28ac26cf5f731e259d799\", \"stage\": \"verification\"}], \"schema_version\": 2, \"untrusted_proposals\": [{\"accepted\": true, \"candidate_after_hash\": \"1b2ecc7081ca9f0f7f74325e6a6f8e0589460ec128ec263de2fd2f41e4b039d7\", \"candidate_before_hash\": \"28b3d9cdd77e06a4a4a66d98212ce45348380efa037f7090da632b9f64b310c0\", \"changed_fields\": [\"category\", \"tags\"], \"context\": {\"binding_hash\": \"b1289ebe9183be8d0a7fa78d642eddfc3e92840da5aafcdfc40a10d5b09c898c\", \"coverage_hash\": \"354907f6cf53e24a383edcb20aed988eec877ab28e3edb61ed30f799c31edc0f\", \"policy_hash\": \"903a5327d596530d5783b66ebdffeb0a05ffecb453f31f13d8def6d9b46b6f99\", \"source_hash\": \"60adf011f81e1fe6ee77231780949b5a3a98fc7627f28ac26cf5f731e259d799\"}, \"disposition\": \"pending\", \"error\": \"Review refusal requires an explicit failed criterion\", \"mode\": \"story\", \"reask_response\": false, \"reask_trigger\": false, \"repair\": {\"category\": \"security\", \"tags\": [\"security\"]}, \"request\": 3, \"stage\": \"repair\"}], \"writer\": {\"key\": \"c0fbda16f081727c175a141e529a5ff03526c2e9ee17142621a4268e19c1af7c\"}}",
+        "approval_key": null,
+        "prepared_at": "2026-11-10T12:00:00Z",
+        "updated_at": "2026-11-10T12:00:00Z"
+      }
+    },
+    "update": {
+      "record": {
+        "candidate": {
+          "id": "fd479d57d3c13834ea583286",
+          "title": "Onion services report descriptor upload stalls under heavy circuit load",
+          "summary": "Operators report that onion services under sustained introduction traffic fail to complete descriptor uploads before timeout.",
+          "why_it_matters": "",
+          "category": "dos",
+          "priority": "normal",
+          "confidence": "reported",
+          "state": "mitigation-available",
+          "tags": [
+            "dos"
+          ],
+          "sources": [
+            {
+              "url": "https://example.org/sources/hs-descriptor-stall-issue",
+              "title": "Onion service descriptor uploads stall under introduction flood"
+            }
+          ],
+          "products": [
+            "tor"
+          ],
+          "published_at": "2026-11-08T12:00:00Z",
+          "updated_at": "2026-11-10T11:00:00Z",
+          "added_at": "2026-11-08T12:00:00Z",
+          "updates": [
+            {
+              "at": "2026-11-10T11:00:00Z",
+              "text": "Operators can use the supplied workaround.",
+              "sources": [
+                {
+                  "url": "https://example.org/sources/hs-descriptor-stall-issue#note_6",
+                  "title": "Onion service descriptor uploads stall under introduction flood"
+                }
+              ]
+            }
+          ]
+        },
+        "reviews": [],
+        "policy_hash": "903a5327d596530d5783b66ebdffeb0a05ffecb453f31f13d8def6d9b46b6f99",
+        "request_budget": {
+          "reserved": 1,
+          "inconsistent_requests": [
+            1
+          ],
+          "validation_reask": null
+        },
+        "untrusted_proposals": [
+          {
+            "error": "Review refusal requires an explicit failed criterion",
+            "request": 1,
+            "stage": "review",
+            "mode": "update",
+            "candidate_before_hash": "e173b1446d5b3fa434962b31d09c178a6bbfce2e56c9d853b88118cb203aa0c1",
+            "candidate_after_hash": "f49680a02b6dcbc8e2168ac9a0832fa65a96a019ff6f1c1dcf1ef720f820943b",
+            "context": {
+              "source_hash": "cbd3b3912e3475dac21b45cc6aabd9e31910e3600e15ed03b83b28bdf7d2f371",
+              "coverage_hash": "0424dc7b816b09b17a217b6631751368616b93e8f13de44ebc6a3f86a4e4e621",
+              "binding_hash": "4fea4f2cb2195831c0f406432dbde39d5e5c81e4f850915a462b7574c90b35ce",
+              "policy_hash": "903a5327d596530d5783b66ebdffeb0a05ffecb453f31f13d8def6d9b46b6f99"
+            },
+            "changed_fields": [
+              "updates"
+            ],
+            "repair": {
+              "update": "Operators can use the supplied workaround."
+            },
+            "accepted": true,
+            "disposition": "pending",
+            "reask_trigger": false,
+            "reask_response": false
+          }
+        ]
+      },
+      "prepared": {
+        "candidate": {
+          "id": "fd479d57d3c13834ea583286",
+          "title": "Onion services report descriptor upload stalls under heavy circuit load",
+          "summary": "Operators report that onion services under sustained introduction traffic fail to complete descriptor uploads before timeout.",
+          "why_it_matters": "",
+          "category": "dos",
+          "priority": "normal",
+          "confidence": "reported",
+          "state": "mitigation-available",
+          "tags": [
+            "dos"
+          ],
+          "sources": [
+            {
+              "url": "https://example.org/sources/hs-descriptor-stall-issue",
+              "title": "Onion service descriptor uploads stall under introduction flood"
+            }
+          ],
+          "products": [
+            "tor"
+          ],
+          "published_at": "2026-11-08T12:00:00Z",
+          "updated_at": "2026-11-10T11:00:00Z",
+          "added_at": "2026-11-08T12:00:00Z",
+          "updates": [
+            {
+              "at": "2026-11-10T11:00:00Z",
+              "text": "A maintainer advised affected onion service operators to set HiddenServicePoWDefensesEnabled 1 in torrc as a temporary mitigation while a scheduler fix is prepared.",
+              "sources": [
+                {
+                  "url": "https://example.org/sources/hs-descriptor-stall-issue#note_6",
+                  "title": "Onion service descriptor uploads stall under introduction flood"
+                }
+              ]
+            }
+          ]
+        },
+        "packet": {
+          "sources": [
+            {
+              "url": "https://example.org/sources/hs-descriptor-stall-issue",
+              "title": "Onion service descriptor uploads stall under introduction flood",
+              "kind": "gitlab_issue",
+              "authority": "development",
+              "product": "tor",
+              "published_at": "2026-11-08T12:00:00Z",
+              "updated_at": "2026-11-10T11:00:00Z",
+              "upstream_state": "opened",
+              "passages": [
+                {
+                  "text": "Onion service descriptor uploads stall under introduction flood",
+                  "id": "S1:P1"
+                },
+                {
+                  "author": "maintainer-h",
+                  "created_at": "2026-11-10T11:00:00Z",
+                  "url": "https://example.org/sources/hs-descriptor-stall-issue#note_6",
+                  "text": "Affected onion service operators should set HiddenServicePoWDefensesEnabled 1 in torrc as a temporary mitigation while we prepare a scheduler fix.",
+                  "id": "S1:P2"
+                },
+                {
+                  "text": "Onion services experiencing heavy introduction circuit load fail to finish descriptor uploads before directory connections time out.",
+                  "id": "S1:P3"
+                }
+              ],
+              "labels": [],
+              "id": "S1"
+            }
+          ],
+          "missing_sources": [],
+          "truncated": false
+        },
+        "coverage": {
+          "prior_story": {
+            "id": "fd479d57d3c13834ea583286",
+            "title": "Onion services report descriptor upload stalls under heavy circuit load",
+            "summary": "Operators report that onion services under sustained introduction traffic fail to complete descriptor uploads before timeout.",
+            "why_it_matters": "",
+            "category": "dos",
+            "priority": "normal",
+            "confidence": "reported",
+            "state": "developing",
+            "products": [
+              "tor"
+            ],
+            "tags": [
+              "dos"
+            ],
+            "published_at": "2026-11-08T12:00:00Z",
+            "updated_at": "2026-11-08T12:00:00Z",
+            "added_at": "2026-11-08T12:00:00Z"
+          },
+          "recent": [],
+          "truncated": false
+        },
+        "mode": "update",
+        "payload": {
+          "editorial_kind": "gitlab_issue"
+        },
+        "row": {
+          "payload": "{\"url\": \"https://example.org/sources/hs-descriptor-stall-issue\", \"title\": \"Onion service descriptor uploads stall under introduction flood\", \"kind\": \"gitlab_issue\", \"authority\": \"development\", \"product\": \"tor\", \"published_at\": \"2026-11-08T12:00:00Z\", \"updated_at\": \"2026-11-10T11:00:00Z\", \"upstream_state\": \"opened\", \"labels\": [], \"content\": \"Onion services experiencing heavy introduction circuit load fail to finish descriptor uploads before directory connections time out.\", \"public_comments\": [{\"author\": \"maintainer-h\", \"created_at\": \"2026-11-10T11:00:00Z\", \"url\": \"https://example.org/sources/hs-descriptor-stall-issue#note_6\", \"body\": \"Affected onion service operators should set HiddenServicePoWDefensesEnabled 1 in torrc as a temporary mitigation while we prepare a scheduler fix.\"}]}"
+        }
+      },
+      "candidate": {
+        "id": "fd479d57d3c13834ea583286",
+        "title": "Onion services report descriptor upload stalls under heavy circuit load",
+        "summary": "Operators report that onion services under sustained introduction traffic fail to complete descriptor uploads before timeout.",
+        "why_it_matters": "",
+        "category": "dos",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "mitigation-available",
+        "tags": [
+          "dos"
+        ],
+        "sources": [
+          {
+            "url": "https://example.org/sources/hs-descriptor-stall-issue",
+            "title": "Onion service descriptor uploads stall under introduction flood"
+          }
+        ],
+        "products": [
+          "tor"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T11:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "updates": [
+          {
+            "at": "2026-11-10T11:00:00Z",
+            "text": "Operators can use the supplied workaround.",
+            "sources": [
+              {
+                "url": "https://example.org/sources/hs-descriptor-stall-issue#note_6",
+                "title": "Onion service descriptor uploads stall under introduction flood"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

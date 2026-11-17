@@ -300,13 +300,30 @@ def test_name_introduced_by_applied_edit_is_remembered_across_later_repairs(cont
     from test_review_request_budget import inconsistent
     cfg, store = context
     introduced = {"title": "Juno reports that the source describes a problem."}
-    first = inconsistent(introduced) if untrusted_first else verdict("revise", criterion="actor_and_action", repair=introduced)
-    escaped = verdict("revise", criterion="actor_and_action", repair={"title": "Juno’s account describes the original observations."})
-    checker = reviewer(cfg, first, verdict(), escaped, verdict())
+    first = verdict("revise", criterion="actor_and_action", repair=introduced)
+    # Lower-case prose is outside direct name extraction: this must be caught
+    # using the name from the genuinely applied earlier repair.
+    escaped_title = "juno’s account describes the original observations."
+    assert missing_named_attributions(candidate(escaped_title), packet()) == []
+    escaped = verdict("revise", criterion="actor_and_action", repair={"title": escaped_title})
+    replies = ([inconsistent({"title": "Mira reports an unrelated observation."})] if untrusted_first else [])
+    replies += [first, escaped, verdict()]
+    if not untrusted_first:
+        replies.append(verdict())
+    checker = reviewer(cfg, *replies)
     with pytest.raises(review.UnsupportedAttributionReview):
         run(cfg, store, pending(store), Writer(), checker)
     audit = record(store)
-    assert checker.calls == 4 and audit["request_budget"]["validation_reask"]["trigger"] == 2
+    payloads = [json.loads(request["messages"][1]["content"]) for request in checker.client.requests]
+    if untrusted_first:
+        assert payloads[1] == {**payloads[0], "validation_error": review.INCONSISTENT_VERDICT}
+        assert "Mira" not in json.dumps(payloads[1:])
+        assert audit["untrusted_proposals"][0]["repair"] is None
+    assert payloads[1 + untrusted_first]["candidate"]["title"] == introduced["title"]
+    assert payloads[-1]["candidate"]["title"] == escaped_title
+    assert any(flag["name"] == "Juno" for flag in payloads[-1]["application_attribution_checks"])
+    assert [entry["result"]["verdict"] for entry in audit["reviews"]] == ["revise", "revise"]
+    assert checker.calls == 4 and audit["request_budget"]["validation_reask"]["trigger"] == (1 if untrusted_first else 3)
     assert not store.stories()
 
 

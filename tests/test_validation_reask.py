@@ -232,18 +232,47 @@ def test_later_invalid_verification_cannot_allocate_a_second_correction(context)
     assert resumed.calls == 0 and not store.stories()
 
 
-def test_pending_untrusted_edit_is_verified_using_the_current_edited_candidate(context):
+def test_valid_repair_then_invalid_verification_reasks_the_exact_repaired_candidate(context):
     cfg, store = context
     row = pending(store)
-    checker = reviewer(cfg, inconsistent({"summary": "A changed source-bound summary."}), unusable(), verdict())
+    changed = "A changed source-bound summary."
+    checker = reviewer(cfg, verdict("revise", criterion="source_support", repair={"summary": changed}),
+                       inconsistent({"summary": "An unvalidated replacement summary."}), verdict())
     assert run(cfg, store, row, Writer(), checker)["status"] == "published"
     payloads = [json.loads(request["messages"][1]["content"]) for request in checker.client.requests]
-    assert payloads[1]["candidate"]["summary"] == payloads[2]["candidate"]["summary"] == "A changed source-bound summary."
+    assert payloads[0]["candidate"]["summary"] != changed
+    assert payloads[1]["candidate"]["summary"] == payloads[2]["candidate"]["summary"] == changed
     assert payloads[2] == {**payloads[1], "validation_error": review.INCONSISTENT_VERDICT}
+    assert checker.client.requests[1]["messages"][0]["content"] == review.VERIFY_PROMPT
+    assert checker.client.requests[2]["messages"][0]["content"] == review.VERIFY_PROMPT + review.VALIDATION_REASK_PROMPT
     audit = saved_audit(store)
-    assert len(audit["reviews"]) == 1 and audit["reviews"][0]["stage"] == "verification"
-    assert audit["untrusted_proposals"][0]["disposition"] == "checked_approve"
+    assert [(r["request"], r["stage"]) for r in audit["reviews"]] == [(1, "review"), (3, "verification")]
+    assert audit["candidate"] == payloads[2]["candidate"]
+    assert audit["untrusted_proposals"][0]["disposition"] == "unusable"
+    assert audit["untrusted_proposals"][0]["repair"] is None
+    assert not audit["untrusted_proposals"][0]["accepted"]
     assert correction(audit)["trigger"] == 2 and checker.calls == 3
+
+
+@pytest.mark.parametrize("double", ["scripted", "approving"])
+def test_reviewer_doubles_validate_feedback_before_charging_and_record_it(double):
+    from helpers import ApprovingReviewer, ScriptedReviewer
+    checker = ScriptedReviewer(verdict()) if double == "scripted" else ApprovingReviewer()
+    packet = {"sources": [{"id": "S1", "passages": []}]}
+    events = []
+    class Observer:
+        def __call__(self, delta):
+            events.append(("reserved", delta))
+        def response_received(self):
+            events.append(("response", None))
+    observer = Observer()
+    with pytest.raises(review.ReviewError, match="Unknown review validation feedback"):
+        checker.review({}, packet, validation_error="An unknown error", on_request=observer)
+    assert events == [] and checker.validation_errors == []
+    result = checker.review({}, packet, validation_error=review.INCONSISTENT_VERDICT, on_request=observer)
+    assert result["verdict"] == "approve"
+    assert events == [("reserved", 1), ("response", None)]
+    assert checker.validation_errors == [review.INCONSISTENT_VERDICT]
 
 
 def test_update_correction_keeps_scope_readonly_history_and_ordered_inputs(context):
