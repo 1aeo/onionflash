@@ -68,10 +68,14 @@ generated summaries are never factual evidence.
 Each review also receives deterministic reminders linking the current text fields
 to verbatim passages in that same packet. Matching body text, named speakers,
 whole available comments and later comment context help expose qualifications and
-corrections. The complete packet remains unchanged; reminders never establish
-support, authority, news value or absence of evidence. Update reminders use only
-the newest entry and its cited sources. Reminder construction is part of the
-review policy identity, so changing it invalidates earlier approval reuse.
+corrections. Story reviews can also receive literal tag-source metadata; new story
+reviews can receive signed date arithmetic with the originating source fields and
+passage references. These are informational context, not candidate defect findings,
+recency decisions or approval evidence; actual application issues remain separate.
+The complete packet remains unchanged; reminders never establish support,
+authority, news value or absence of evidence. Update reminders use only the newest
+entry and its cited sources. Reminder construction is part of the review policy
+identity, so changing it invalidates earlier approval reuse.
 
 A separate, bounded coverage background contains the existing article for a
 known update (`prior_story`, never repeated in `recent`) and compact entries

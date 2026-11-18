@@ -1,4 +1,4 @@
-"""Verbatim source reminders for checking the current text, never approval evidence."""
+"""Source reminders and metadata calculations, never candidate findings or approval."""
 
 from __future__ import annotations
 
