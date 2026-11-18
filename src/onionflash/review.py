@@ -228,8 +228,13 @@ relay operator changing configuration. Preserve requested versus actual action.
 When the target names an actor, quote that exact name in this reason and identify its
 matching identity in source text or author metadata. An explicit supplied alias or
 identity link can establish a match; spelling similarity alone cannot. Do not silently
-read a different spelling as the intended name or turn a software name into a person;
-an actor absent from the packet fails even when the remaining claim matches.
+read a different spelling as the intended name; an actor absent from the packet fails
+even when the remaining claim matches. Named software or network entities are not
+people: preserve source-supported entity type and function, allowing only an
+unambiguous standard expansion of a technical abbreviation. If expansion is uncertain,
+retain the source's literal entity type or identifier. This does not waive names-only
+personal attribution or permit inferred personal roles, affiliations, actor spelling
+aliases, or changing an object's role.
 why_it_matters keeps the functional relationships and audience of the source sentence it restates;
 named personal titles follow the names-only style below.
 Check each personal role or affiliation in every target field, including repeated mentions.

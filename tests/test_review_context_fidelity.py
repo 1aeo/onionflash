@@ -67,6 +67,7 @@ def test_consequence_audit_stays_out_of_update_wire(context, native, verificatio
     assert request["messages"][0]["content"] == expected
     assert "name the material prerequisites in source_support's reason" not in prompt(request)
     assert "An attributed assessment must preserve that speaker's degree of commitment" not in prompt(request)
+    assert "Named software or network entities are not people" not in prompt(request)
     assert payload(request)["review_scope"] == "latest_update"
     repair = request["response_format"]["json_schema"]["schema"]["properties"]["repair"]["anyOf"][1]
     assert set(repair["properties"]) == set(review.UPDATE_EDITABLE)
@@ -105,3 +106,33 @@ def test_attributed_commitment_instruction_reaches_complete_story_wire(context, 
     assert (public, evidence) == original
     assert len(request["messages"]) == 2
     assert quote_enum(request) == [""]
+
+
+@pytest.mark.parametrize("verification", [False, True])
+def test_entity_type_instruction_preserves_personal_attribution_boundaries(context, native, verification):
+    cfg, _ = context
+    public = candidate(title="A report describes a network component",
+                       summary="The report identifies a DNS server handling the requests.", why_it_matters="")
+    evidence = source()
+    evidence["sources"][0]["passages"].append(
+        {"id": "S1:P3", "text": "The DNS server handles these requests."})
+    original = copy.deepcopy((public, evidence))
+    checker = native(cfg, verdict("hold", criterion="actor_and_action"))
+    checker.review(public, evidence, verification=verification)
+    request = checker.sent[0]
+    rules = (
+        "Named software or network entities are not people",
+        "preserve source-supported entity type and function",
+        "only an unambiguous standard expansion of a technical abbreviation",
+        "If expansion is uncertain, retain the source's literal entity type or identifier",
+        "does not waive names-only personal attribution",
+        "or permit inferred personal roles, affiliations, actor spelling aliases, or changing an object's role",
+        "spelling similarity alone cannot",
+        "use the literal person's name without an occupational title",
+        "Discussion and sender authority alone do not establish a personal role or affiliation",
+    )
+    assert all(rule in prompt(request) for rule in rules)
+    assert payload(request)["candidate"] == public
+    assert payload(request)["packet"] == evidence
+    assert (public, evidence) == original
+    assert len(request["messages"]) == 2
