@@ -1,11 +1,14 @@
 """Bounded literal source spans; structural provenance never grants approval."""
 import copy
 import re
+from collections import Counter
+from fractions import Fraction
 
 from . import personal_attribution, render
+from .review_evidence import _words
 from .schema import FIELD_LIMITS
 
-POLICY = {"version": 2, "max_choices": 8, "max_rendered_chars": 800,
+POLICY = {"version": 3, "max_choices": 8, "max_rendered_chars": 800,
           "aggregate_rendered_utf8_bytes": 4096, "minimum_words": 6,
           "paragraph_edges": "both-visible-in-one-passage", "cross_passage_join": False,
           "rendering": "whitespace-only-with-neutral-curly-quotation",
@@ -14,6 +17,8 @@ POLICY = {"version": 2, "max_choices": 8, "max_rendered_chars": 800,
           "fence_edges": "unknown-delimiter-keeps-unit-excluded",
           "replacement": "nonempty-to-one-neutral-quote-then-keep-or-clear",
           "normalization": "render-field-and-personal-attribution-exact",
+          "selection": "overflow-only-current-impact-inverse-passage-frequency-exact-rational",
+          "selection_order": "score-descending-source-order-ties-present-in-source-order",
           "context": "full-passage-and-source-metadata-once-per-reference",
           "commit_proof": "stored-receipt-and-held-proof-with-exact-publication-envelope"}
 PREFIX = 'A cited source states: “'
@@ -202,7 +207,40 @@ def available(candidate, packet, *, update=False):
     current = candidate.get('why_it_matters', '')
     if update or not current or current.startswith(PREFIX):
         return []
-    return build(packet, cited_urls={s['url'] for s in candidate.get('sources', [])})['choices']
+    catalog = build(packet, cited_urls={s['url'] for s in candidate.get('sources', [])})
+    unique = {}
+    for index, entry in enumerate(catalog['eligible_spans']):
+        value = entry['rendered']
+        origin = {key: entry[key] for key in ('ref', 'start', 'end')}
+        if value in unique:
+            unique[value]['choice']['origins'].append(origin)
+        else:
+            unique[value] = {'source_order': index, 'raw': entry['raw'],
+                             'choice': {'rendered': value, 'origins': [origin],
+                                        'semantic_grounding': 'NOT_DETERMINED'}}
+    if (len(unique) <= POLICY['max_choices'] and
+            sum(len(value.encode()) for value in unique) <= POLICY['aggregate_rendered_utf8_bytes']):
+        return catalog['choices']
+
+    # Relevance chooses membership only; it does not establish support or usefulness.
+    units = [_words(passage['text'] + ' ' + passage.get('author', ''))
+             for source in packet['sources'] for passage in source['passages']]
+    frequency = Counter(word for unit in units for word in unit)
+    queries = [_words(current), *(_words(part) for part in re.split(r'(?<=[.!?])\s+', current))]
+
+    def score(entry):
+        words = _words(entry['raw'])
+        return max((sum((Fraction(1, frequency[word]) for word in words & query), Fraction()) /
+                    max(sum((Fraction(1, max(frequency[word], 1)) for word in query), Fraction()), Fraction(1))
+                    for query in queries), default=Fraction())
+
+    chosen, size = [], 0
+    for entry in sorted(unique.values(), key=lambda entry: (-score(entry), entry['source_order'])):
+        amount = len(entry['choice']['rendered'].encode())
+        if len(chosen) < POLICY['max_choices'] and size + amount <= POLICY['aggregate_rendered_utf8_bytes']:
+            chosen.append(entry)
+            size += amount
+    return [entry['choice'] for entry in sorted(chosen, key=lambda entry: entry['source_order'])]
 
 
 def validate_replacement(value, packet, candidate=None):
