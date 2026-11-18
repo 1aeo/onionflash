@@ -10,7 +10,7 @@ from .util import parse_utc, safe_canonical_url
 
 
 # Advance when reminder construction changes, so prior approvals cannot reuse it.
-EVIDENCE_POLICY = 6
+EVIDENCE_POLICY = 7
 _WORDS = re.compile(r"\w+", re.UNICODE)
 _STOP = frozenset("a an and are as at be been but by for from has have in is it its of on or that the this to was were with".split())
 _MAX_ANCHORS = 3
@@ -19,6 +19,7 @@ _UNCERTAINTY = re.compile(r"\b(?:apparent(?:ly)?|seem(?:s|ed)?|plausib(?:le|ly)|
 _ATTRIBUTION = re.compile(r"\b(?:reports?|reported(?:ly)?|says?|said|claims?|claimed|"
                          r"according\s+to|alleged(?:ly)?)\b", re.I)
 _HTML_MARKUP = re.compile(r"<(?:/?[a-z][\w:-]*\b|!|\?)", re.I)
+_GROUP_BOUNDARY = re.compile(r"[`~<>]|(?m:^[ \t]+|^On\b)|\bwrote\s*:", re.I)
 _NON_NARRATIVE = re.compile(
     r"(?m:^ {0,3}(?P<backticks>`{3,})(?!`)[^`\n]*(?:\n|\Z).*?"
     r"(?:^ {0,3}(?P=backticks)`*[ \t]*(?=\r?\n|\Z)|\Z))|"
@@ -40,23 +41,23 @@ def _literal_spans(text: str, pattern: re.Pattern) -> list[dict]:
 
 
 def _source_uncertainty(source: dict) -> dict[str, list[dict]]:
-    """Annotate only single-passage notes with a reliable narrative boundary."""
+    """Inspect available passages independently; never reconstruct missing text."""
     groups = {}
     for passage in source["passages"][1:]:
         key = tuple(passage.get(key) for key in ("author", "created_at", "url"))
         groups.setdefault(key, []).append(passage)
     found = {}
     for passages in groups.values():
-        # Packet construction can omit whitespace-only chunks. Without original
-        # offsets, concatenation cannot establish code or quote boundaries.
-        if len(passages) != 1:
+        # Packet construction can omit whitespace-only chunks. Any available
+        # boundary marker makes the whole group's narrative scope ambiguous.
+        if len(passages) > 1 and any(_GROUP_BOUNDARY.search(passage["text"]) for passage in passages):
             continue
-        passage = passages[0]
-        text = passage["text"]
-        # Without an exact reply mapping, omit the cue rather than assign
-        # quoted-parent words to the current sender. The packet stays whole.
-        if "unquoted_content" not in source or text in source["unquoted_content"]:
-            found[passage["id"]] = _literal_spans(text, _UNCERTAINTY)
+        for passage in passages:
+            text = passage["text"]
+            # Without an exact reply mapping, omit the cue rather than assign
+            # quoted-parent words to the current sender. The packet stays whole.
+            if "unquoted_content" not in source or text in source["unquoted_content"]:
+                found[passage["id"]] = _literal_spans(text, _UNCERTAINTY)
     return found
 
 

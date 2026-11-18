@@ -73,12 +73,15 @@ reviews can receive signed date arithmetic with the originating source fields an
 passage references. These are informational context, not candidate defect findings,
 recency decisions or approval evidence; actual application issues remain separate.
 Story reviews can also compare literal attribution and uncertainty words in current
-fields with uncertainty spans in exactly cited matching narrative. These annotations
-use only single-passage source notes; multiple chunks lack reliable continuity after
-packet construction can drop whitespace-only chunks. Text containing HTML-like markup and reply
-passages without an exact mapping into the sender's `unquoted_content` are omitted
-from annotations. Omission has no factual meaning. Qualifier annotations are not
-added to update requests, never require an edit or hold, and never authorize approval.
+fields with uncertainty spans in exactly cited matching narrative. Each available
+passage is inspected independently at its original offsets. Multi-passage
+notes are omitted when any available text carries possible code, quote, HTML or
+indentation boundaries; chunks are never reconstructed and gaps are never inferred.
+Text containing HTML-like markup and replies without an exact mapping into the
+sender's `unquoted_content` are also omitted from annotations. These checks locate
+available unmarked text, not complete Markdown structure; omission has no factual
+meaning. Qualifier annotations are not added to update requests, never require an
+edit or hold, and never authorize approval.
 The complete packet remains unchanged; reminders never establish support,
 authority, news value or absence of evidence. Update reminders use only the newest
 entry and its cited sources. Reminder construction is part of the review policy

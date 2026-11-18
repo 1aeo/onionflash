@@ -178,7 +178,7 @@ def test_html_marked_text_is_omitted_without_guessing_nested_or_unbalanced_scope
 
 @pytest.mark.parametrize("parts", [
     ("<blockquote><blockquote>The cache may lose entries.</blockquote>The cache could lose entries.</blockquote>",),
-    ("The cache could lose entries.", "The cache apparently loses entries."),
+    ("The cache could lose entries.\n`", "The cache apparently loses entries."),
 ])
 @pytest.mark.parametrize("verification", [False, True])
 def test_omitted_scope_adds_no_guidance_or_defect_and_keeps_native_packet(monkeypatch, parts, verification):
@@ -197,7 +197,7 @@ def test_omitted_scope_adds_no_guidance_or_defect_and_keeps_native_packet(monkey
 
 def test_ambiguous_note_does_not_hide_a_distinct_single_passage_narrative_note():
     note = {"author": "Morgan", "created_at": "2026-01-01T00:00:00Z", "url": URL + "#note_1"}
-    source = source_packet({**note, "text": "The cache could lose entries."},
+    source = source_packet({**note, "text": "Cache example: `could"},
                            {**note, "text": "The cache apparently loses entries."},
                            {"author": "Taylor", "created_at": "2026-01-02T00:00:00Z", "url": URL + "#note_2",
                             "text": "The cache plausibly loses entries."})
@@ -244,7 +244,7 @@ def test_indented_fence_example_does_not_hide_following_unindented_narrative(ind
 def test_sender_uncertainty_requires_an_exact_unquoted_passage_mapping():
     sender = "The cache apparently loses entries."
     parent = "The cache possibly loses entries."
-    source = source_packet(parent, sender)
+    source = source_packet("> " + parent, sender)
     source["sources"][0]["unquoted_content"] = sender
     assert qualifiers(evidence_context(public(), source)) is None
     source = source_packet(sender)
@@ -253,6 +253,36 @@ def test_sender_uncertainty_requires_an_exact_unquoted_passage_mapping():
     row, = qualifiers(context)["source_uncertainty"]
     assert row["passage_ref"] == "S1:P2" and words(row["spans"]) == ["apparently"]
     source["sources"][0]["unquoted_content"] = "The sender discusses the cache."
+    assert qualifiers(evidence_context(public(), source)) is None
+
+
+def test_plain_multi_passage_body_keeps_literal_spans_without_joining_text():
+    source = source_packet("The cache plausibly loses entries.", "The cache apparently loses entries.",
+                           "The cache might lose entries.")
+    before = copy.deepcopy(source)
+    context = evidence_context(public(), source)
+    rows = qualifiers(context)["source_uncertainty"]
+    assert rows and any(row["passage_ref"] == "S1:P2" for row in rows)
+    for row in rows:
+        text = next(passage["text"] for passage in source["sources"][0]["passages"] if passage["id"] == row["passage_ref"])
+        assert all(text[span["start"]:span["end"]] == span["text"] for span in row["spans"])
+    assert source == before
+    assert all(passage in context["passages"] for passage in source["sources"][0]["passages"][1:])
+
+
+@pytest.mark.parametrize("marker", ["`", "~~", "<block", ">", "    Code example", "\tCode example",
+                                     "On Monday Morgan", "Morgan wrote:"])
+@pytest.mark.parametrize("marker_first", [False, True])
+def test_any_cross_passage_boundary_marker_omits_the_whole_note(marker, marker_first):
+    plain = "The cache apparently loses entries."
+    source = source_packet(*([marker, plain] if marker_first else [plain, marker]))
+    context = evidence_context(public(), source)
+    assert qualifiers(context) is None
+    assert all(passage in context["passages"] for passage in source["sources"][0]["passages"][1:])
+
+
+def test_plain_passages_never_combine_word_fragments_into_an_annotation():
+    source = source_packet("The cache is poss", "ibly losing entries.")
     assert qualifiers(evidence_context(public(), source)) is None
 
 
