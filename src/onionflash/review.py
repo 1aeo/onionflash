@@ -236,11 +236,25 @@ Never invent titles from metadata (such as "Tor Project sender" or "trusted oper
 substituted (such as relay for directory authority, or operators for software), or when a
 >-quoted mailing-list participant absent from unquoted_content is treated as the main actor.
 status: distinguish an issue/request, merged change, observed tag, announced release,
-deployment and resolution. Closing or updating an issue, or checklists/conditional steps,
-does not prove a patch merged or shipped; an open checklist does not negate an explicit
-official release statement. Fail status if headline or summary states an open issue's
-requested change as completed (removed, fixed, resolved) without a merged MR or release;
-do not fail status merely because state is developing.
+deployment and resolution. Name the actual candidate.state in this reason and compare
+it with the latest relevant same-issue evidence, citing the supporting or limiting
+passage. Developing remains valid when completion is not established; fail status when
+candidate.state remains developing although closure explicitly records a fix or resolution
+and no later actual same-issue reopening or post-fix recurrence contradicts completion.
+Closure alone, including duplicate or wontfix closure, or a tentative workaround does
+not establish a fix. Preserve already supported fixed, resolved, tagged or released
+labels without standardizing them by category; when repairing an unsupported label,
+distinguish a completed code/security fix (fixed) from an operational/tracking resolution
+(resolved). Retain prose qualifications such as listed as fixed. Closing or updating an
+issue, a private-MR reference, a commit or fix listing, or checklists/conditional steps
+does not itself prove a patch actually merged or shipped; an explicit statement of
+actual merge in supplied prose can support merged without MR metadata. Later reports
+about an old binary or an unapplied fix, superseded hypotheses and unrelated issues do
+not establish post-fix recurrence; unresolved or conflicting completion evidence does
+not establish completion. An open checklist does not negate an explicit official
+release statement. Fail status if the headline or summary states an open issue's
+requested change as completed (removed, fixed, resolved) without explicit evidence that
+the change was completed; proposals and instructions are not completion evidence.
 uncertainty_attribution: keep plausible/suspected/reported qualifiers in headline, body
 and why_it_matters. First compare the source's material qualifying words with the
 candidate's actual wording in this reason, quoting both briefly when they differ.
