@@ -614,7 +614,8 @@ RELEASE_ISSUE = ("A release category or tag needs state released or tagged: remo
                  "or correct the state, as the packet supports.")
 
 LABEL_LIMIT_POLICY = 1  # Current-label checks differ from permissible new edits.
-RELEASE_FRAMING_POLICY = 1  # One release-feed prose repair still needs fresh verification.
+# Advance for framing admission or its release-identity grammar changes.
+RELEASE_FRAMING_POLICY = 2
 SOURCE_TAG_CONTEXT_PROMPT = (
     "evidence_context.supplied_tag_sources lists packet metadata, not candidate defects or an eligibility verdict. "
     "Its presence alone requires no edit or hold. Check their relation to the event "

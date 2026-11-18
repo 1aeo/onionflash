@@ -8,7 +8,7 @@ from helpers import DATE, Reviewer, Writer, analysis, job, make_item, make_tag, 
 from onionflash import render, review, review_gate
 from onionflash.config import DEFAULTS
 from onionflash.llm import AnalysisError
-from onionflash.util import digest
+from onionflash.util import digest, release_mentions
 from test_review_request_budget import context, reviewer
 
 
@@ -281,6 +281,20 @@ def test_framing_policy_changes_cache_identity_without_prompt_version_bumps(monk
     before = review.policy_hash(DEFAULTS)
     monkeypatch.setattr(review, "RELEASE_FRAMING_POLICY", review.RELEASE_FRAMING_POLICY + 1)
     assert review.policy_hash(DEFAULTS) != before
+
+
+def test_expanded_release_verbs_invalidate_old_single_identity_admission(prepared, monkeypatch):
+    # The earlier grammar did not recognize the second product/version here.
+    # Its stored framing path must not be reused under the expanded grammar.
+    public = prepared["candidate"]
+    public["title"] += "; Arti releases v2.8.0"
+    assert release_mentions({"title": public["title"]}) == [
+        "release:tor-browser:17.2", "release:arti:2.8.0"]
+    assert review_gate.next_step(chain(prepared), public, prepared) == (
+        "hold", ("verification", "disagreed_news"))
+    current_policy = review.policy_hash(DEFAULTS)
+    monkeypatch.setattr(review, "RELEASE_FRAMING_POLICY", 1)
+    assert review.policy_hash(DEFAULTS) != current_policy
 
 
 @pytest.mark.parametrize("reverse", [False, True])
