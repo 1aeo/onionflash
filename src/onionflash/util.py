@@ -344,7 +344,7 @@ _CLOSING_SPAN = re.compile(
 )
 _ANY_REF = re.compile(_REF_TOKEN, re.I)
 _RELEASE_MENTION = re.compile(
-    rf"\b(tor[- ]browser|arti|tor)[- ](?:v|{_RELEASE_QUALIFIERS})?(\d+\.\d+(?:[\w.-]*\w)?)(?!(?:\w|\.\w))",
+    rf"\b(tor[- ]browser|arti|tor)[- ]{_RELEASE_QUALIFIERS}v?(\d+\.\d+(?:[\w.-]*\w)?)(?!(?:\w|\.\w))",
     re.I,
 )
 

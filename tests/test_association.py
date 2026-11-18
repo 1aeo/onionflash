@@ -66,6 +66,7 @@ def test_pure_reference_release_mention_and_thread_helpers():
     assert release_mentions(item(title="", content="Operators upgraded to Tor 0.4.9.16.")) == ["release:tor:0.4.9.16"]
     assert release_mentions(item(title="", content="Operators upgraded to Tor Browser 16.0.1.")) == ["release:tor-browser:16.0.1"]
     assert release_mentions(item(title="", content="Malformed build Tor 0.4.9.16.1.")) == []
+    assert release_mentions(item(title="Tor v0.4.9.16", content="")) == ["release:tor:0.4.9.16"]
 
     assert thread_subject(item(url=LIST_BASE + "ABC/", title="[tor-relays] Re: re. Guard flag drop across relays")) == (
         "guard flag drop across relays", True
@@ -80,8 +81,13 @@ def test_pure_reference_release_mention_and_thread_helpers():
 @pytest.mark.parametrize("title,product,version", [
     ("Tor releases 0.4.9.16 emergency fix for directory authority thundering herd", "tor", "0.4.9.16"),
     ("Tor releases stable version 0.4.9.17", "tor", "0.4.9.17"),
+    ("Tor releases v0.4.9.16", "tor", "0.4.9.16"),
+    ("Tor releases stable version v0.4.9.17", "tor", "0.4.9.17"),
+    ("Tor v0.4.9.16 released", "tor", "0.4.9.16"),
     ("Arti releases 2.8.0", "arti", "2.8.0"),
+    ("Arti releases v2.8.0", "arti", "2.8.0"),
     ("Tor Browser releases 16.0a14", "tor-browser", "16.0a14"),
+    ("Tor Browser releases v16.0a14", "tor-browser", "16.0a14"),
 ])
 def test_releases_verb_supplies_consistent_hints_without_merging_prose(title, product, version):
     incoming = item(kind="feed", product="network", title=title, content="Release announcement.")
