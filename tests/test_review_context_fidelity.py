@@ -61,6 +61,7 @@ def test_story_context_stays_out_of_update_wire(context, native, verification):
     assert "name the material prerequisites in source_support's reason" not in prompt(request)
     assert "An attributed assessment must preserve that speaker's degree of commitment" not in prompt(request)
     assert "Named software or network entities are not people" not in prompt(request)
+    assert "A concrete report in a project's own upstream tracker" not in prompt(request)
     assert payload(request)["review_scope"] == "latest_update"
     repair = request["response_format"]["json_schema"]["schema"]["properties"]["repair"]["anyOf"][1]
     assert set(repair["properties"]) == set(review.UPDATE_EDITABLE)
@@ -129,3 +130,43 @@ def test_entity_type_instruction_preserves_personal_attribution_boundaries(conte
     assert payload(request)["packet"] == evidence
     assert (public, evidence) == original
     assert len(request["messages"]) == 2
+
+
+@pytest.mark.parametrize("verification", [False, True])
+def test_upstream_trust_event_category_reaches_story_wire_with_its_limits(context, native, verification):
+    cfg, _ = context
+    public = candidate(title="A report proposes replacing a network credential",
+                       summary="The report says an operator reported a possible credential compromise.",
+                       why_it_matters="", confidence="reported")
+    evidence = source()
+    evidence["sources"][0].update(kind="gitlab_issue", authority="community")
+    evidence["sources"][0]["passages"].append({"id": "S1:P3", "text": (
+        "The credential authenticates shared network state. An operator notified the project "
+        "that it may have been compromised. The report proposes replacing the credential.")})
+    original = copy.deepcopy((public, evidence))
+    checker = native(cfg, verdict("hold", criterion="news_value"))
+    checker.review(public, evidence, verification=verification)
+    request = checker.sent[0]
+    rules = (
+        "A concrete report in a project's own upstream tracker is material security news when",
+        "identifies a component or credential with an established role in the network's shared trust",
+        "reports an operator notification about suspected compromise or unexpected loss of trust concerning it",
+        "describes a concrete proposed or initiated response",
+        "can be news before the suspected compromise is confirmed or the response completed",
+        "Keep the article attributed and qualified, at the named component and response's supplied scope",
+        "does not establish official confirmation, broader harm, or unstated operator duties",
+        "Routine rotation/maintenance, unsubstantiated speculation without that basis or response",
+        "unrelated component events, stale resurfacing and duplicate coverage",
+        "remain subject to the existing exclusions",
+        "Explain the actual source event and applicable condition in the news_value reason",
+        "do not replace that analysis with a generic lack-of-authority refusal",
+        "On tor-dev, a post passes news_value in five cases",
+        "uncorroborated operational attack/compromise/DoS/flood/bypass claims on mailing lists from authority=community",
+        "Contributor status does not corroborate an operational attack, compromise or defense-bypass claim",
+    )
+    assert all(rule in prompt(request) for rule in rules)
+    assert payload(request)["candidate"] == public
+    assert payload(request)["packet"] == evidence
+    assert (public, evidence) == original
+    assert len(request["messages"]) == 2
+    assert quote_enum(request) == [""]

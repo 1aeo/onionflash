@@ -323,7 +323,21 @@ Severity::high or Severity::critical (Severity::medium or unlabeled old issues s
 Otherwise require a material security report, authority change, significant availability
 incident, meaningful release/tag, major feature/capability users or operators can now use,
 changed default, shipped protocol/defense milestone, merged fix for a remotely triggerable
-security defect, or systematic empirical network measurements. Disclosed
+security defect, or systematic empirical network measurements.
+A concrete report in a project's own upstream tracker is material security news when
+the supplied evidence identifies a component or credential with an established role
+in the network's shared trust, reports an operator notification about suspected
+compromise or unexpected loss of trust concerning it, and describes a concrete
+proposed or initiated response. The reported trust/response event can be news before
+the suspected compromise is confirmed or the response completed. Keep the article
+attributed and qualified, at the named component and response's supplied scope; this
+eligibility does not establish official confirmation, broader harm, or unstated
+operator duties. Routine rotation/maintenance, unsubstantiated speculation without
+that basis or response, unrelated component events, stale resurfacing and duplicate
+coverage remain subject to the existing exclusions. Explain the actual source event
+and applicable condition in the news_value reason; do not replace that analysis with
+a generic lack-of-authority refusal.
+Disclosed
 HackerOne reports (authority=hackerone or a gitlab_issue citing hackerone.com/reports/)
 pass news_value when newly disclosed even if maintainers rate severity low or dispute DoS
 impact, provided relevant maintainer triage is supplied in the packet.
