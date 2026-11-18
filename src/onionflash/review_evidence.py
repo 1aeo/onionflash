@@ -10,7 +10,7 @@ from .util import parse_utc, safe_canonical_url
 
 
 # Advance when reminder construction changes, so prior approvals cannot reuse it.
-EVIDENCE_POLICY = 5
+EVIDENCE_POLICY = 6
 _WORDS = re.compile(r"\w+", re.UNICODE)
 _STOP = frozenset("a an and are as at be been but by for from has have in is it its of on or that the this to was were with".split())
 _MAX_ANCHORS = 3
@@ -18,6 +18,7 @@ _UNCERTAINTY = re.compile(r"\b(?:apparent(?:ly)?|seem(?:s|ed)?|plausib(?:le|ly)|
                           r"suspect(?:ed)?|potential(?:ly)?|unconfirmed|likely|unlikely|perhaps|may|might|could)\b", re.I)
 _ATTRIBUTION = re.compile(r"\b(?:reports?|reported(?:ly)?|says?|said|claims?|claimed|"
                          r"according\s+to|alleged(?:ly)?)\b", re.I)
+_HTML_MARKUP = re.compile(r"<(?:/?[a-z][\w:-]*\b|!|\?)", re.I)
 _NON_NARRATIVE = re.compile(
     r"(?m:^ {0,3}(?P<backticks>`{3,})(?!`)[^`\n]*(?:\n|\Z).*?"
     r"(?:^ {0,3}(?P=backticks)`*[ \t]*(?=\r?\n|\Z)|\Z))|"
@@ -26,35 +27,36 @@ _NON_NARRATIVE = re.compile(
     r"(?<!`)(?P<inline>`+)(?!`).*?(?<!`)(?P=inline)(?!`)|`[^\n]*|"
     r"(?m:^[ \t]*>[^\n]*(?:\n(?![ \t]*\r?\n)[^\n]*)*|"
     r"^(?: {4}|\t)[^\n]*|^[ \t]*On\b[^\n]*wrote:[\s\S]*)|"
-    r"<(?P<html>code|pre|blockquote)\b[^>]*>.*?(?:</(?P=html)\s*>|\Z)|"
     r"\b(?:https?://|www\.)\S+", re.S | re.I)
 
 
 def _literal_spans(text: str, pattern: re.Pattern) -> list[dict]:
     """Locate words in narrative without classifying their assertion or truth."""
+    if _HTML_MARKUP.search(text):
+        return []  # HTML nesting and incomplete markup have no reliable scope here.
     narrative = _NON_NARRATIVE.sub(lambda match: " " * len(match[0]), text)
     return [{"start": match.start(), "end": match.end(), "text": text[match.start():match.end()]}
             for match in pattern.finditer(narrative)]
 
 
 def _source_uncertainty(source: dict) -> dict[str, list[dict]]:
-    """Keep note boundaries and original offsets, including split code blocks."""
+    """Annotate only single-passage notes with a reliable narrative boundary."""
     groups = {}
     for passage in source["passages"][1:]:
         key = tuple(passage.get(key) for key in ("author", "created_at", "url"))
         groups.setdefault(key, []).append(passage)
     found = {}
     for passages in groups.values():
-        joined = "".join(passage["text"] for passage in passages)
-        spans, offset = _literal_spans(joined, _UNCERTAINTY), 0
-        for passage in passages:
-            text = passage["text"]
-            # Without an exact reply mapping, omit the cue rather than assign
-            # quoted-parent words to the current sender. The packet stays whole.
-            if "unquoted_content" not in source or text in source["unquoted_content"]:
-                found[passage["id"]] = [{**span, "start": span["start"] - offset, "end": span["end"] - offset}
-                                        for span in spans if offset <= span["start"] < span["end"] <= offset + len(text)]
-            offset += len(text)
+        # Packet construction can omit whitespace-only chunks. Without original
+        # offsets, concatenation cannot establish code or quote boundaries.
+        if len(passages) != 1:
+            continue
+        passage = passages[0]
+        text = passage["text"]
+        # Without an exact reply mapping, omit the cue rather than assign
+        # quoted-parent words to the current sender. The packet stays whole.
+        if "unquoted_content" not in source or text in source["unquoted_content"]:
+            found[passage["id"]] = _literal_spans(text, _UNCERTAINTY)
     return found
 
 

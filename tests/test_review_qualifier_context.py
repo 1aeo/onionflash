@@ -9,6 +9,7 @@ from helpers import completion, verdict
 from onionflash import review
 from onionflash.config import DEFAULTS
 from onionflash.review_evidence import evidence_context
+from onionflash.source_packet import _passages
 from test_review import candidate, reviewer
 from test_review_evidence import packet
 
@@ -137,17 +138,75 @@ def test_chunk_boundaries_do_not_invent_a_newline_that_closes_code():
     assert qualifiers(evidence_context(public(), source)) is None
 
 
-def test_fence_delimiters_split_across_note_chunks_still_protect_code():
+def test_split_note_is_omitted_even_when_later_text_looks_like_narrative():
     note = {"author": "Morgan", "created_at": "2026-01-01T00:00:00Z", "url": URL + "#note_1"}
     source = source_packet({**note, "text": "``"},
                            {**note, "text": "`text\nThe cache possibly loses entries.\n``"},
                            {**note, "text": "`\nThe cache apparently loses entries."})
     context = evidence_context(public(), source)
-    cue = qualifiers(context)
-    row, = cue["source_uncertainty"]
-    assert row["passage_ref"] == "S1:P4" and words(row["spans"]) == ["apparently"]
+    assert qualifiers(context) is None
+    assert all(passage in context["passages"] for passage in source["sources"][0]["passages"][1:])
+
+
+def test_dropped_whitespace_chunk_cannot_turn_a_code_line_into_a_fence_closer():
+    first = "~~~text\n" + "x" * 1791 + "\n"
+    original = first + " " * 1800 + "~~~\nThe cache possibly loses entries.\n~~~"
+    chunks = _passages(original, 1800)
+    assert [chunk["text"] for chunk in chunks] == [first, "~~~\nThe cache possibly loses entries.\n~~~"]
+    source = source_packet(*chunks)
+    before = copy.deepcopy(source)
+    context = evidence_context(public(), source)
+    assert qualifiers(context) is None and source == before
+    assert all(passage in context["passages"] for passage in source["sources"][0]["passages"][1:])
+
+
+@pytest.mark.parametrize("text", [
+    "<blockquote><blockquote>The cache may lose entries.</blockquote>The cache could lose entries.</blockquote> The cache apparently loses entries.",
+    "<blockquote>The cache may lose entries.</blockquote> The cache apparently loses entries.",
+    "</blockquote>The cache could lose entries.",
+    "<blockquote>The cache could lose entries.",
+    "<pre><code>The cache may lose entries.</code>The cache could lose entries.</pre>",
+    "<div>The cache apparently loses entries.</div>",
+    "<!-- The cache could lose entries. --> The cache apparently loses entries.",
+])
+def test_html_marked_text_is_omitted_without_guessing_nested_or_unbalanced_scope(text):
+    source = source_packet(text)
+    context = evidence_context(public(), source)
+    assert qualifiers(context) is None
+    assert source["sources"][0]["passages"][1] in context["passages"]
+
+
+@pytest.mark.parametrize("parts", [
+    ("<blockquote><blockquote>The cache may lose entries.</blockquote>The cache could lose entries.</blockquote>",),
+    ("The cache could lose entries.", "The cache apparently loses entries."),
+])
+@pytest.mark.parametrize("verification", [False, True])
+def test_omitted_scope_adds_no_guidance_or_defect_and_keeps_native_packet(monkeypatch, parts, verification):
+    current, source = public(), source_packet(*parts)
+    checker = reviewer(monkeypatch, completion(verdict("hold", criterion="source_support")))
+    result = checker.review(current, source, verification=verification)
+    request = checker.client.requests[0][1]
+    payload = json.loads(request["messages"][1]["content"])
+    assert request["messages"][0]["content"] == (review.VERIFY_PROMPT if verification else review.SYSTEM_PROMPT)
+    assert set(payload) == {"candidate", "packet", "evidence_context"}
+    assert payload["candidate"] == current and payload["packet"] == source
+    assert qualifiers(payload["evidence_context"]) is None
+    assert all(passage in payload["evidence_context"]["passages"] for passage in source["sources"][0]["passages"][1:])
+    assert result["verdict"] == "hold" and checker.calls == 1
+
+
+def test_ambiguous_note_does_not_hide_a_distinct_single_passage_narrative_note():
+    note = {"author": "Morgan", "created_at": "2026-01-01T00:00:00Z", "url": URL + "#note_1"}
+    source = source_packet({**note, "text": "The cache could lose entries."},
+                           {**note, "text": "The cache apparently loses entries."},
+                           {"author": "Taylor", "created_at": "2026-01-02T00:00:00Z", "url": URL + "#note_2",
+                            "text": "The cache plausibly loses entries."})
+    context = evidence_context(public(), source)
+    row, = qualifiers(context)["source_uncertainty"]
+    assert row["passage_ref"] == "S1:P4" and words(row["spans"]) == ["plausibly"]
     span, = row["spans"]
-    assert source["sources"][0]["passages"][3]["text"][span["start"]:span["end"]] == "apparently"
+    assert source["sources"][0]["passages"][3]["text"][span["start"]:span["end"]] == "plausibly"
+    assert all(passage in context["passages"] for passage in source["sources"][0]["passages"][1:])
 
 
 @pytest.mark.parametrize("opening,mixed", [("~~~", "~~~```"), ("```", "```~~~")])
@@ -187,9 +246,12 @@ def test_sender_uncertainty_requires_an_exact_unquoted_passage_mapping():
     parent = "The cache possibly loses entries."
     source = source_packet(parent, sender)
     source["sources"][0]["unquoted_content"] = sender
+    assert qualifiers(evidence_context(public(), source)) is None
+    source = source_packet(sender)
+    source["sources"][0]["unquoted_content"] = sender
     context = evidence_context(public(), source)
     row, = qualifiers(context)["source_uncertainty"]
-    assert row["passage_ref"] == "S1:P3" and words(row["spans"]) == ["apparently"]
+    assert row["passage_ref"] == "S1:P2" and words(row["spans"]) == ["apparently"]
     source["sources"][0]["unquoted_content"] = "The sender discusses the cache."
     assert qualifiers(evidence_context(public(), source)) is None
 
