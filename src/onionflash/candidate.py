@@ -669,7 +669,8 @@ def verify_prepared_binding(db, prepared: dict) -> None:
         raise StaleCandidate("Target story changed before candidate committed")
 
 
-def validate_approved(original: dict, approved: object, mode: str = "story") -> tuple[str, ...]:
+def validate_approved(original: dict, approved: object, mode: str = "story", *,
+                      packet: dict | None = None) -> tuple[str, ...]:
     """Validate an approved public candidate against `original` and return editable fields."""
     editable = UPDATE_FIELDS if mode == "update" else SEMANTIC_FIELDS
     if not isinstance(approved, dict) or set(approved) != set(original):
@@ -692,6 +693,12 @@ def validate_approved(original: dict, approved: object, mode: str = "story") -> 
         raise ReviewRequired("The approved candidate must already be normalized") from exc
     if normalized != approved:
         raise ReviewRequired("The approved candidate must already be normalized")
+    if mode != "update":
+        from . import source_quote
+        try:
+            source_quote.validate_transition(original, approved, packet)
+        except ValueError as exc:
+            raise ReviewRequired(str(exc)) from exc
     return editable
 
 

@@ -267,11 +267,11 @@ def test_null_tombstone_story_alias_removes_story_and_handles_chained_merges(con
     s1 = _publish(store, item(url="https://example.org/s1", title="First incident report",
                               content="First incident details with supporting upstream text."),
                   draft=analysis(title="First incident report", summary="First incident details.",
-                                 category="release", tags=["release"], evidence=["First incident details."]))["id"]
+                                 category="release", state="released", tags=["release"], evidence=["First incident details."]))["id"]
     s2 = _publish(store, item(url="https://example.org/s2", title="Second incident report",
                               content="Second incident details with supporting upstream text."),
                   draft=analysis(title="Second incident report", summary="Second incident details.",
-                                 category="release", tags=["release"], evidence=["Second incident details."]))["id"]
+                                 category="release", state="released", tags=["release"], evidence=["Second incident details."]))["id"]
     publication.build(cfg, store)
     out = Path(cfg["storage"]["output_dir"])
     assert (out / "news" / s1 / "index.html").exists()

@@ -176,6 +176,21 @@ def _identity(prepared):
     return tuple(prepared[key] for key in ("candidate_hash", "source_hash", "binding_hash"))
 
 
+def validate_stored_context(record, prepared):
+    """Bind retained review context to the actual persisted candidate envelope."""
+    snapshot = record.get("prepared")
+    fields = ("mode", "candidate", "packet", "coverage", "candidate_hash", "source_hash", "coverage_hash", "binding_hash")
+    if (not isinstance(snapshot, dict) or any(snapshot.get(key) != prepared.get(key) for key in fields)
+            or digest(prepared["candidate"]) != prepared["candidate_hash"]
+            or digest(prepared["packet"]) != prepared["source_hash"]
+            or digest(prepared["coverage"]) != prepared["coverage_hash"]
+            or digest(prepared["binding"]) != prepared["binding_hash"]
+            or digest(prepared["payload"]) != prepared["binding"].get("payload_hash")
+            or any(prepared["binding"].get(bound) != prepared[value] for bound, value in (
+                ("candidate_hash", "candidate_hash"), ("packet_hash", "source_hash"), ("coverage_hash", "coverage_hash")))):
+        raise ValueError("Stored review context does not match its envelope")
+
+
 def _policy_copies(record, policy):
     """Check retained policy metadata without interpreting older verdict schemas."""
     if not isinstance(policy, str) or not re.fullmatch(r"[0-9a-f]{64}", policy):
@@ -606,7 +621,7 @@ def next_step(reviews, candidate, prepared):
     if len(reviews) > MAX_VERIFY_REPAIRS + 1:
         return "hold", (stage, "repairs_exhausted")
     try:
-        repaired = review.apply_repair(candidate, result["repair"], update=is_update)
+        repaired = review.apply_repair(candidate, result["repair"], update=is_update, packet=prepared["packet"])
     except review.ReviewError:
         # After a disputed official item's first review, the unchanged text goes to its fresh verification.
         return ("verify", candidate) if disputed and not later else ("hold", (stage, "unusable_repair"))
@@ -1446,7 +1461,8 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                 _save(store, row, writer_key, policy, record["outcome"], draft, prepared, record, observed,
                       prepared_at=prepared_at, approval_key=key)
                 committed = store.commit_candidate(prepared, candidate, writer_key, now_iso(), approval_key=key,
-                                                   policy_hash=policy, review_record=record, decision=verdict["verdict"])
+                                                   policy_hash=policy, review_record=record, decision=verdict["verdict"],
+                                                   review_config=config)
                 report.update(status=committed["status"], cache_hit=True)
                 return report
             with store.db:
@@ -1495,7 +1511,8 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                 _save(store, row, writer_key, policy, record["outcome"], draft, prepared, record, observed,
                       prepared_at=prepared_at, approval_key=key, approval_receipt=receipt)
                 committed = store.commit_candidate(prepared, candidate, writer_key, now_iso(), approval_key=key,
-                                                   policy_hash=policy, review_record=record, decision=action)
+                                                   policy_hash=policy, review_record=record, decision=action,
+                                                   review_config=config)
                 if agreed_dup is not None and agreed_dup[1] == prepared["story_id"]:
                     _try_auto_merge(config, store, agreed_dup, propagate=False)
                 return {**report, "status": committed["status"]}
@@ -1521,6 +1538,12 @@ def _new_coverage(old_coverage, current_coverage) -> list[dict]:
 
 
 def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
+    return check_held_approval(store, item_id, review.policy_hash(config),
+                               dirauth_users=_dirauth_users(config, store))
+
+
+def check_held_approval(store, item_id: str, policy: str, *, dirauth_users=None) -> tuple[dict, tuple | None]:
+    """Validate the actual held proof for both inspection and transactional commit."""
     def refuse(reason: str, editorial_failures=(), new_coverage=()):
         """Build an ineligible operator-approval check result with structured diagnostics."""
         return {"eligible": False, "reason": reason, "hash": None,
@@ -1559,8 +1582,8 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
         ]
     except (TypeError, KeyError, AttributeError):
         return refuse("Saved review record cannot be read")
-    policy = review.policy_hash(config)
-    if (job["policy_hash"] != policy or record.get("policy_hash") != policy
+    if (not isinstance(policy, str) or not policy
+            or job["policy_hash"] != policy or record.get("policy_hash") != policy
             or any(entry.get("policy_hash") != policy for entry in reviews)):
         return refuse("An earlier review policy or packet reviewed it; retry it", editorial_failures)
     row = {key: item_row[key] for key in (
@@ -1568,7 +1591,7 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
         "next_attempt_at", "last_error", "story_id", "first_seen", "last_seen", "priority_score")}
     row["payload"] = item_row["payload_blob"].decode("utf-8")
     try:
-        prepared = _prepare_candidate(store, row, draft, job["prepared_at"], _dirauth_users(config, store))
+        prepared = _prepare_candidate(store, row, draft, job["prepared_at"], dirauth_users)
     except Exception:
         return refuse("Its story or sources changed since the review; retry it", editorial_failures)
     if prepared["locked"]:
@@ -1592,6 +1615,10 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
         return refuse("Its story or sources changed since the review; retry it", editorial_failures, new_coverage)
     if any(entry.get("source_hash") != prepared["source_hash"] for entry in reviews):
         return refuse("An earlier review policy or packet reviewed it; retry it", editorial_failures, new_coverage)
+    try:
+        validate_stored_context(record, saved_env)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return refuse("Saved review record cannot be read", editorial_failures, new_coverage)
     is_update = prepared.get("mode") == "update"
     try:
         validated = [review.validate_review(entry["result"], prepared["packet"],
@@ -1603,7 +1630,8 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
         return refuse("A review failed new_information (already covered); dismiss it", editorial_failures, new_coverage)
     candidate = record.get("candidate")
     try:
-        candidate_mod.validate_approved(prepared["candidate"], candidate, "update" if is_update else "story")
+        candidate_mod.validate_approved(prepared["candidate"], candidate, "update" if is_update else "story",
+                                        packet=prepared["packet"])
     except candidate_mod.ReviewRequired as exc:
         msg = ("No fresh verification reviewed this exact text"
                if "complete public candidate" in str(exc) else "Saved review record cannot be read")
@@ -1662,7 +1690,8 @@ def approve(config, store, item_id: str, approval_hash: str, reason: str, stamp:
     audit["operator_approval"] = {"reason": reason, "approved_at": stamp,
                                   "approval_hash": approval_hash, "new_coverage": info["new_coverage"]}
     try:
-        committed = store.commit_candidate(prepared, candidate, writer_key, stamp, review_record=audit, operator=True)
+        committed = store.commit_candidate(prepared, candidate, writer_key, stamp, review_record=audit, operator=True,
+                                            policy_hash=review.policy_hash(config), review_config=config)
     except (candidate_mod.StaleCandidate, candidate_mod.ReviewRequired) as exc:
         raise ValueError(str(exc)) from None
     return {"item_id": item_id, "content_hash": prepared["row"]["content_hash"], "action": "approve",

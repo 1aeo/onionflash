@@ -6,7 +6,7 @@ import copy
 import json
 import re
 
-from . import personal_attribution
+from . import personal_attribution, source_quote
 from .analyze import SCHEMA as DRAFT_SCHEMA
 from .config import DEFAULTS
 from .llm import (AnalysisError, CompletionClient, apply_label_limits, has_malformed_tor_version,
@@ -387,6 +387,29 @@ the packet itself is not news or repeats covered events, preferring skip over po
 non-news; if unsure, or if important new material lacks defensible support, return "hold"
 with repair null.
 """
+SOURCE_QUOTE_REPAIR_RULE = """For a defective CURRENT nonempty why_it_matters, choose either "" to clear it or one
+exact rendered value from evidence_context.source_quote_choices. Null keeps the current
+text. Never generate, alter, combine or restore impact text. Once a source quotation is
+present, only keep or clear it. Choices establish literal provenance only, never truth,
+relevance, usefulness, source authority or approval. Read full governing passages in
+evidence_context.source_quote_passages and the complete packet, including conditions, chronology, corrections and disagreement.
+The neutral prefix does not promote the source or establish any personal role. Apply
+all ordinary criteria to the resulting candidate during fresh verification."""
+SOURCE_QUOTE_CONTEXT_PROMPT = """
+A neutral source quotation in why_it_matters remains a claim under every ordinary
+criterion. Literal membership establishes provenance only, never truth, relevance,
+usefulness or source authority. Quoting a person's role does not waive the role and
+project evidence rules. Check full governing context and later corrections; an exact
+quote can still mislead. Keep supported text unchanged; only clear a defective quote.
+"""
+_SOURCE_QUOTE_REPLACEMENTS = (
+    ('The only allowed why_it_matters edit is "": never generate,\nrewrite or replace its text.',
+     SOURCE_QUOTE_REPAIR_RULE),
+    ('fail (clearing why_it_matters)', 'fail (repairing why_it_matters)'),
+    ('return revise and clear it rather than holding the article;',
+     'return revise and clear it or select an allowed source quotation;'),
+)
+
 VERIFY_PROMPT = """You are performing an adversarial evidence audit, not endorsing a draft.
 Falsify each claim, speaker attribution, role label and classification by locating exact
 support in the packet (when a claim is attributed to a packet source with unquoted_content,
@@ -640,7 +663,8 @@ class ReviewError(AnalysisError):
 INCONSISTENT_VERDICT = "Review refusal requires an explicit failed criterion"
 DEGENERATE_REASONS = "Review reasons contain excessive repeated fragments"
 UNSUPPORTED_ATTRIBUTION = "Review actor criterion passes a named attribution absent from the source"
-VALIDATION_ERRORS = (INCONSISTENT_VERDICT, DEGENERATE_REASONS, UNSUPPORTED_ATTRIBUTION)
+INVALID_SOURCE_QUOTE = "Impact repair must select an available source quotation"
+VALIDATION_ERRORS = (INCONSISTENT_VERDICT, DEGENERATE_REASONS, UNSUPPORTED_ATTRIBUTION, INVALID_SOURCE_QUOTE)
 ATTRIBUTION_CHECK_PROMPT = """
 application_attribution_checks lists literal names in explicit reporting clauses
 that are absent from the supplied source text and author metadata. These locations
@@ -703,6 +727,12 @@ class UnsupportedAttributionReview(CorrectableReviewError):
         super().__init__()
 
 
+class InvalidSourceQuoteReview(CorrectableReviewError):
+    """A forbidden quotation edit never changes the current candidate."""
+
+    validation_error = INVALID_SOURCE_QUOTE
+
+
 def validation_failure(message: str) -> CorrectableReviewError:
     """Reconstruct only the fixed error types recorded in real recovery events."""
     if message == INCONSISTENT_VERDICT:
@@ -711,6 +741,8 @@ def validation_failure(message: str) -> CorrectableReviewError:
         return DegenerateReview()
     if message == UNSUPPORTED_ATTRIBUTION:
         return UnsupportedAttributionReview()
+    if message == INVALID_SOURCE_QUOTE:
+        return InvalidSourceQuoteReview()
     raise ReviewError("Unknown review validation feedback")
 
 
@@ -763,6 +795,7 @@ def policy_hash(config: dict) -> str:
                    INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT, INVALID_REVIEW_POLICY,
                    SCHEMA, UPDATE_REPAIR, VALIDATION_ERRORS, REASON_REPETITION_POLICY, LABEL_LIMIT_POLICY,
                    identity, CompletionClient.REQUEST_POLICY, EVIDENCE_POLICY,
+                   source_quote.POLICY, source_quote.PREFIX, _SOURCE_QUOTE_REPLACEMENTS, SOURCE_QUOTE_CONTEXT_PROMPT,
                    NAMED_ATTRIBUTION_POLICY, ATTRIBUTION_CHECK_PROMPT, personal_attribution.PERSONAL_ATTRIBUTION_POLICY,
                    _LIVE_INCIDENT_CLAIM_RE.pattern])
 
@@ -823,7 +856,8 @@ def label_issues(candidate: dict, limits: dict) -> list[dict]:
     return issues
 
 
-def _repair_fields(repair: dict, *, update: bool = False) -> None:
+def _repair_fields(repair: dict, *, update: bool = False, packet: dict | None = None,
+                   candidate: dict | None = None) -> None:
     """Check editable field shapes and values without granting factual approval."""
     editable = UPDATE_EDITABLE if update else EDITABLE
     rules = UPDATE_FIELDS if update else FIELDS
@@ -831,6 +865,12 @@ def _repair_fields(repair: dict, *, update: bool = False) -> None:
         raise ReviewError("Repair contains unsupported or immutable fields")
     for key, value in repair.items():
         rule = rules[key]
+        if key == "why_it_matters" and value != "":
+            try:
+                source_quote.validate_replacement(value, packet, candidate)
+            except ValueError as exc:
+                raise ReviewError(str(exc)) from exc
+            continue
         if rule["type"] == "string":
             if "enum" in rule:
                 if not isinstance(value, str) or value not in rule["enum"]:
@@ -859,9 +899,9 @@ def untrusted_repair(verdict, repair, *, update: bool = False):
     return edits
 
 
-def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict:
+def apply_repair(candidate: dict, repair: dict, *, update: bool = False, packet: dict | None = None) -> dict:
     """Normalize a minimal semantic repair BEFORE its independent verification."""
-    _repair_fields(repair, update=update)
+    _repair_fields(repair, update=update, packet=packet, candidate=candidate)
     updated = copy.deepcopy(candidate)
     if update:
         if not updated.get("updates"):
@@ -883,6 +923,9 @@ def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict
         )
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
         raise ReviewError("Repair does not form a valid public story") from exc
+    if (not update and repair.get("why_it_matters")
+            and normalized["why_it_matters"] != repair["why_it_matters"]):
+        raise ReviewError("Normalization changed the selected source quotation")
     if normalized == candidate:
         raise ReviewError("Repair does not change the candidate")
     return normalized
@@ -928,7 +971,7 @@ def attribution_names(prepared: dict, record: dict | None = None) -> list[str]:
             if not repair or (not entry.get("accepted") if proposal else result.get("verdict") != "revise"):
                 continue
             try:
-                after = apply_repair(current, repair, update=update)
+                after = apply_repair(current, repair, update=update, packet=None if proposal else packet)
             except ReviewError:
                 continue
             if digest(after) in observed:
@@ -938,7 +981,8 @@ def attribution_names(prepared: dict, record: dict | None = None) -> list[str]:
 
 
 def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool = False,
-              coverage: dict | None = None, attribution_checks: list | None = None) -> dict:
+              coverage: dict | None = None, attribution_checks: list | None = None,
+              packet: dict | None = None, candidate: dict | None = None) -> dict:
     """Validate a complete review. A saved one may also keep model_verdict, the model's
     own verdict where Reviewer.review replaced it."""
     saved = set() if wire else {"model_verdict"}
@@ -993,6 +1037,11 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool 
                 or (wire and set(repair) != set(editable))):
             raise ReviewError("Review repair fields do not match schema")
         repair = {key: value for key, value in repair.items() if value is not None}
+        if not update and repair.get("why_it_matters") != "" and "why_it_matters" in repair:
+            try:
+                _repair_fields({"why_it_matters": repair["why_it_matters"]}, packet=packet, candidate=candidate)
+            except ReviewError as exc:
+                raise InvalidSourceQuoteReview() from exc
     elif repair is not None:
         raise ReviewError("Only a revise verdict can propose repair")
     return {**result, "same_story": same_story, "repair": repair}
@@ -1002,7 +1051,8 @@ def validate_review(result: dict, packet: dict, *, update: bool = False, coverag
                     candidate: dict | None = None, attribution_names=()) -> dict:
     """Validate saved/API responses with the same rubric and source-reference rules."""
     checks = missing_named_attributions(candidate, packet, update=update, known_names=attribution_names) if candidate is not None else None
-    return _validate(result, _packet_refs(packet), update=update, coverage=coverage, attribution_checks=checks)
+    return _validate(result, _packet_refs(packet), update=update, coverage=coverage, attribution_checks=checks,
+                     packet=packet, candidate=candidate)
 
 
 def release_labels_match_state(candidate: dict) -> bool:
@@ -1242,10 +1292,16 @@ class Reviewer(CompletionClient):
         repair = schema["properties"]["repair"]["anyOf"][1]["properties"]
         limits = repair_limits(packet, coverage, update=update)
         apply_label_limits(repair, limits, nullable=True)
+        quote_choices = source_quote.available(candidate_public, packet, update=update)
+        if quote_choices:
+            repair["why_it_matters"]["anyOf"][0]["enum"] = ["", *[choice["rendered"] for choice in quote_choices]]
         # Each call starts with the rubric, exact candidate and bounded context.
         # A prior model response, critique or approval is never part of its history.
         payload = {"candidate": candidate_public, "packet": packet,
                    "evidence_context": evidence_context(candidate_public, packet, update=update)}
+        if quote_choices:
+            payload["evidence_context"]["source_quote_choices"] = quote_choices
+            payload["evidence_context"]["source_quote_passages"] = source_quote.passages(quote_choices, packet)
         attribution_checks = missing_named_attributions(candidate_public, packet, update=update, known_names=attribution_names)
         if attribution_checks:
             payload["application_attribution_checks"] = attribution_checks
@@ -1281,6 +1337,11 @@ class Reviewer(CompletionClient):
             payload["validation_error"] = validation_error
         prompt = ((UPDATE_VERIFY_PROMPT if verification else UPDATE_SYSTEM_PROMPT) if update
                   else (VERIFY_PROMPT if verification else SYSTEM_PROMPT))
+        if quote_choices:
+            for original, replacement in _SOURCE_QUOTE_REPLACEMENTS:
+                prompt = prompt.replace(original, replacement)
+        elif not update and candidate_public.get("why_it_matters", "").startswith(source_quote.PREFIX):
+            prompt += SOURCE_QUOTE_CONTEXT_PROMPT
         if not update and (coverage or {}).get("recent"):
             prompt = prompt + ROUTING_PROMPT
         if context_prompts:
@@ -1291,7 +1352,8 @@ class Reviewer(CompletionClient):
             prompt += VALIDATION_REASK_PROMPT
         result = self.complete(prompt, payload, schema, "onionflash_review",
                                **({"on_request": on_request} if on_request is not None else {}))
-        result = _validate(result, refs, wire=True, update=update, coverage=coverage, attribution_checks=attribution_checks)
+        result = _validate(result, refs, wire=True, update=update, coverage=coverage, attribution_checks=attribution_checks,
+                           packet=packet, candidate=candidate_public)
         if result["repair"] is not None:
             for key, allowed in limits.items():
                 if key in result["repair"] and result["repair"][key] not in allowed:
