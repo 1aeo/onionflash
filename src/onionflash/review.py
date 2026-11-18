@@ -268,8 +268,14 @@ the change was completed; proposals and instructions are not completion evidence
 uncertainty_attribution: keep plausible/suspected/reported qualifiers in headline, body
 and why_it_matters. First compare the source's material qualifying words with the
 candidate's actual wording in this reason, quoting both briefly when they differ.
-Attribution and confidence="reported" do not restore a missing hedge inside a claim;
-a tentative cause or effect must remain tentative in every field asserting it.
+An attributed assessment must preserve that speaker's degree of commitment:
+seems, looks or appears cannot become a categorical assessment through says,
+called or confidence="reported". A tentative cause or effect must remain
+tentative in every field asserting it. Later actions, closure or another speaker
+may update facts but cannot retroactively strengthen an earlier speaker's words;
+report a revised assessment only when that speaker explicitly supplies one.
+When a small correction suffices, preserve the supported speaker and assessment
+with its qualification instead of deleting them.
 A community report or public comment on an official host is not
 project confirmation, and observations, outages, overload, counters or missing responses
 do not confirm an attack, compromise or defense bypass. Include material maintainer

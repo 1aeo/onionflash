@@ -66,7 +66,42 @@ def test_consequence_audit_stays_out_of_update_wire(context, native, verificatio
     expected = review.UPDATE_VERIFY_PROMPT if verification else review.UPDATE_SYSTEM_PROMPT
     assert request["messages"][0]["content"] == expected
     assert "name the material prerequisites in source_support's reason" not in prompt(request)
+    assert "An attributed assessment must preserve that speaker's degree of commitment" not in prompt(request)
     assert payload(request)["review_scope"] == "latest_update"
     repair = request["response_format"]["json_schema"]["schema"]["properties"]["repair"]["anyOf"][1]
     assert set(repair["properties"]) == set(review.UPDATE_EDITABLE)
     assert "why_it_matters" not in repair["properties"]
+
+
+@pytest.mark.parametrize("verification", [False, True])
+def test_attributed_commitment_instruction_reaches_complete_story_wire(context, native, verification):
+    cfg, _ = context
+    public = candidate(title="A report describes a parser condition",
+                       summary="Riley describes the condition as limited.", why_it_matters="",
+                       confidence="reported")
+    evidence = source()
+    evidence["sources"][0]["passages"].extend([
+        {"id": "S1:P3", "author": "Riley", "created_at": "2026-01-02T12:00:00Z",
+         "text": "The parser condition seems limited."},
+        {"id": "S1:P4", "author": "Riley", "created_at": "2026-01-03T12:00:00Z",
+         "text": "The correction is listed as fixed."},
+    ])
+    original = copy.deepcopy((public, evidence))
+    checker = native(cfg, verdict("hold", criterion="uncertainty_attribution"))
+    checker.review(public, evidence, verification=verification)
+    request = checker.sent[0]
+    rules = (
+        "An attributed assessment must preserve that speaker's degree of commitment",
+        "seems, looks or appears cannot become a categorical assessment through says, called",
+        'confidence="reported"',
+        "Later actions, closure or another speaker may update facts",
+        "cannot retroactively strengthen an earlier speaker's words",
+        "report a revised assessment only when that speaker explicitly supplies one",
+        "preserve the supported speaker and assessment with its qualification instead of deleting them",
+    )
+    assert all(rule in prompt(request) for rule in rules)
+    assert payload(request)["candidate"] == public
+    assert payload(request)["packet"] == evidence
+    assert (public, evidence) == original
+    assert len(request["messages"]) == 2
+    assert quote_enum(request) == [""]
