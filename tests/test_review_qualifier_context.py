@@ -9,6 +9,7 @@ from helpers import completion, verdict
 from onionflash import review
 from onionflash.config import DEFAULTS
 from onionflash.review_evidence import evidence_context
+from onionflash.review_evidence import _literal_spans, _UNCERTAINTY
 from onionflash.source_packet import _passages
 from test_review import candidate, reviewer
 from test_review_evidence import packet
@@ -35,6 +36,85 @@ def qualifiers(context, field="title"):
 
 def words(spans):
     return [span["text"] for span in spans]
+
+
+@pytest.mark.parametrize("phrase", ["as soon as possible", "as quickly as possible", "as safely and quickly as possible",
+                                    "as reasonably early as possible", "as much as possible", "AS FAR AS POSSIBLE",
+                                    "as quickly\nas possible", "as quickly\r\nas possible", "not as soon as possible"])
+def test_degree_expressions_do_not_supply_epistemic_uncertainty(phrase):
+    source = source_packet("Respond " + phrase + ".")
+    assert all("qualifier_words" not in field for field in evidence_context(public(), source)["fields"])
+    assert _literal_spans("Respond " + phrase + ".", _UNCERTAINTY) == []
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Respond as much as possible", ["possible"]),
+    ("A possible compromise remains under investigation.", ["possible"]),
+    ("A compromise is possible, but not confirmed.", ["possible"]),
+    ("A compromise is not possible under these conditions.", ["possible"]),
+    ("Respond as quickly as possible; a possible compromise remains under investigation.", ["possible"]),
+    ("Respond as quickly as possible; the host is plausibly compromised.", ["plausibly"]),
+    ("Treat this as an outage as possible compromise remains unconfirmed.", ["possible", "unconfirmed"]),
+    ("Notify us as soon as possible compromises are identified.", ["possible"]),
+    ("Act as soon as possible compromise reports emerge.", ["possible"]),
+    ("Act as soon as possible-compromise reports suggest.", ["possible"]),
+    ("Act as soon as not possible compromise reports suggest.", ["possible"]),
+    ("Act as soon as possibly required.", ["possibly"]),
+    ("A bypass soon as possible compromise is discussed.", ["possible"]),
+    ("A possible-compromise label is discussed as quickly as possible.", ["possible"]),
+    ("Act as soon. As possible compromise reports emerge, investigate.", ["possible"]),
+    ("Act as soon as\n\npossible compromise reports emerge.", ["possible"]),
+    ("Act as soon as\r\n\r\npossible compromise reports emerge.", ["possible"]),
+    ("Act as soon `example` as possible compromise reports emerge.", ["possible"]),
+])
+def test_degree_filter_preserves_other_predicates_and_respects_word_and_context_boundaries(text, expected):
+    spans = _literal_spans(text, _UNCERTAINTY)
+    assert words(spans) == expected
+    assert all(text[span["start"]:span["end"]] == span["text"] for span in spans)
+
+
+def test_source_fragment_end_cannot_terminate_a_degree_phrase():
+    first = "Notify the cache team as soon as possible "
+    continuation = "compromises are identified."
+    chunks = _passages(first + continuation, len(first))
+    assert [chunk["text"] for chunk in chunks] == [first, continuation]
+    source = source_packet(*chunks)
+    context = evidence_context(public(), source)
+    row, = qualifiers(context)["source_uncertainty"]
+    assert row["passage_ref"] == "S1:P2" and words(row["spans"]) == ["possible"]
+    span, = row["spans"]
+    assert first[span["start"]:span["end"]] == "possible"
+    assert all(passage in context["passages"] for passage in source["sources"][0]["passages"][1:])
+
+
+def test_complete_current_field_end_can_terminate_a_degree_phrase():
+    source = source_packet("The cache plausibly loses entries.")
+    current = public()
+    current["title"] = "Respond to the cache report as soon as possible"
+    cue = qualifiers(evidence_context(current, source))
+    assert cue["uncertainty"] == []
+    assert words(cue["source_uncertainty"][0]["spans"]) == ["plausibly"]
+
+
+@pytest.mark.parametrize("verification", [False, True])
+@pytest.mark.parametrize("other_qualifier", [False, True])
+def test_degree_only_cue_and_guidance_disappear_without_hiding_other_uncertainty(monkeypatch, verification, other_qualifier):
+    text = "Respond to the cache report as soon as possible."
+    if other_qualifier:
+        text += " The cache plausibly loses entries."
+    source = source_packet(text)
+    current = public()
+    checker = reviewer(monkeypatch, completion(verdict()))
+    checker.review(current, source, verification=verification)
+    request = checker.client.requests[0][1]
+    payload = json.loads(request["messages"][1]["content"])
+    assert payload["candidate"] == current and payload["packet"] == source
+    assert "application_issue" not in payload
+    cue = qualifiers(payload["evidence_context"])
+    assert bool(cue) == other_qualifier
+    assert (review.QUALIFIER_CONTEXT_PROMPT in request["messages"][0]["content"]) == other_qualifier
+    if cue:
+        assert words(cue["source_uncertainty"][0]["spans"]) == ["plausibly"]
 
 
 def test_literal_attribution_and_uncertainty_are_separate_with_exact_offsets():

@@ -10,7 +10,7 @@ from .util import parse_utc, safe_canonical_url
 
 
 # Advance when reminder construction changes, so prior approvals cannot reuse it.
-EVIDENCE_POLICY = 7
+EVIDENCE_POLICY = 8
 _WORDS = re.compile(r"\w+", re.UNICODE)
 _STOP = frozenset("a an and are as at be been but by for from has have in is it its of on or that the this to was were with".split())
 _MAX_ANCHORS = 3
@@ -18,6 +18,12 @@ _UNCERTAINTY = re.compile(r"\b(?:apparent(?:ly)?|seem(?:s|ed)?|plausib(?:le|ly)|
                           r"suspect(?:ed)?|potential(?:ly)?|unconfirmed|likely|unlikely|perhaps|may|might|could)\b", re.I)
 _ATTRIBUTION = re.compile(r"\b(?:reports?|reported(?:ly)?|says?|said|claims?|claimed|"
                          r"according\s+to|alleged(?:ly)?)\b", re.I)
+_DEGREE_WORD = r"(?:[a-z]+ly|soon|early|late|fast|slow|well|much|little|many|few|far|near|close|long|short|high|low|wide|hard|easy|simple|safe)"
+_DEGREE_SPACE = r"(?:[ \t]+|[ \t]*\r?\n[ \t]*)"
+_DEGREE_POSSIBLE = re.compile(
+    r"\bas" + _DEGREE_SPACE + _DEGREE_WORD
+    + r"(?:" + _DEGREE_SPACE + r"(?:and" + _DEGREE_SPACE + r")?" + _DEGREE_WORD + r"){0,3}"
+    + _DEGREE_SPACE + r"as" + _DEGREE_SPACE + r"(?P<possible>possible)(?=[ \t]*(?P<terminator>[.!?,;:]|$))", re.I)
 _HTML_MARKUP = re.compile(r"<(?:/?[a-z][\w:-]*\b|!|\?)", re.I)
 _GROUP_BOUNDARY = re.compile(r"[`~<>]|(?m:^[ \t]+|^On\b)|\bwrote\s*:", re.I)
 _NON_NARRATIVE = re.compile(
@@ -31,13 +37,18 @@ _NON_NARRATIVE = re.compile(
     r"\b(?:https?://|www\.)\S+", re.S | re.I)
 
 
-def _literal_spans(text: str, pattern: re.Pattern) -> list[dict]:
+def _literal_spans(text: str, pattern: re.Pattern, *, complete_field: bool = False) -> list[dict]:
     """Locate words in narrative without classifying their assertion or truth."""
     if _HTML_MARKUP.search(text):
         return []  # HTML nesting and incomplete markup have no reliable scope here.
     narrative = _NON_NARRATIVE.sub(lambda match: " " * len(match[0]), text)
+    # Exclude only a terminated degree expression; following words can make the
+    # parse ambiguous. Source passage EOF is not phrase completion. Original
+    # text prevents joins across protected material.
+    degree_possible = {match.start("possible") for match in _DEGREE_POSSIBLE.finditer(text)
+                       if match["terminator"] or complete_field}
     return [{"start": match.start(), "end": match.end(), "text": text[match.start():match.end()]}
-            for match in pattern.finditer(narrative)]
+            for match in pattern.finditer(narrative) if match.start() not in degree_possible]
 
 
 def _source_uncertainty(source: dict) -> dict[str, list[dict]]:
@@ -172,8 +183,8 @@ def evidence_context(candidate: dict, packet: dict, *, update: bool = False) -> 
         source_words = [{"source_ref": unit["source"], "passage_ref": unit["passage"]["id"],
                          "spans": unit["uncertainty"]} for unit in anchors if unit["uncertainty"]]
         if source_words:
-            fields[-1]["qualifier_words"] = {"attribution": _literal_spans(text, _ATTRIBUTION),
-                                             "uncertainty": _literal_spans(text, _UNCERTAINTY),
+            fields[-1]["qualifier_words"] = {"attribution": _literal_spans(text, _ATTRIBUTION, complete_field=True),
+                                             "uncertainty": _literal_spans(text, _UNCERTAINTY, complete_field=True),
                                              "source_uncertainty": source_words}
         for unit in anchors:
             if unit not in selected:
