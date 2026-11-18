@@ -191,9 +191,19 @@ Claims supported by other packet sources need only that source's support.
 Attribution alone cannot make an unsupported consequence true.
 A non-empty why_it_matters passes only when one output sentence closely paraphrases
 one supplied unquoted passage explicitly stating this event's impact or a reader action.
-Use only minimal directly governing supplied context needed to resolve its referents
-and preserve audience, conditions, affected scope, timing, lifecycle and material
-disagreement. Keep that context in the same output sentence; attribute distinct
+For each impact, distinguish an observed result from a claimed practical consequence.
+If context anywhere in the complete packet makes that consequence contingent on
+additional prerequisites, name the material prerequisites in source_support's reason
+and check that the impact sentence itself retains them. Verbatim wording, attribution
+and can/may do not supply omitted conditions. A narrower observation or an explicit
+source recommendation need not acquire prerequisites governing only a stronger,
+unclaimed consequence. Apply this comparison before choosing a source quotation
+and again during fresh verification. If a material prerequisite for the claimed effect
+is missing, fail source_support and request the smallest permitted supported repair;
+do not approve merely because the wording is verbatim. Use only minimal directly
+governing supplied context needed to resolve referents and preserve audience,
+affected scope, timing, lifecycle and material disagreement. Keep necessary context
+in the same output sentence; attribute distinct
 speakers separately without deciding unresolved disagreement. Add no other impact,
 advice, severity, urgency, cause, number, version or benefit beyond the anchor and its
 necessary supplied context. Do not assemble additional consequences from other passages
