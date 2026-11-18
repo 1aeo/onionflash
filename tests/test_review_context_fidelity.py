@@ -62,6 +62,7 @@ def test_story_context_stays_out_of_update_wire(context, native, verification):
     assert "An attributed assessment must preserve that speaker's degree of commitment" not in prompt(request)
     assert "Named software or network entities are not people" not in prompt(request)
     assert "A concrete report in a project's own upstream tracker" not in prompt(request)
+    assert "A narrower accurate description need not repeat every supporting fact" not in prompt(request)
     assert payload(request)["review_scope"] == "latest_update"
     repair = request["response_format"]["json_schema"]["schema"]["properties"]["repair"]["anyOf"][1]
     assert set(repair["properties"]) == set(review.UPDATE_EDITABLE)
@@ -170,3 +171,43 @@ def test_upstream_trust_event_category_reaches_story_wire_with_its_limits(contex
     assert (public, evidence) == original
     assert len(request["messages"]) == 2
     assert quote_enum(request) == [""]
+
+
+@pytest.mark.parametrize("verification", [False, True])
+def test_faithful_story_scope_instruction_preserves_claim_checks(context, native, verification):
+    cfg, _ = context
+    public = candidate(title="Version 1.2 is announced",
+                       summary="The announcement describes an optional diagnostic feature.",
+                       why_it_matters="", state="released", confidence="confirmed")
+    evidence = source()
+    evidence["sources"][0]["passages"].append({"id": "S1:P3", "text": (
+        "Version 1.2 is released. The diagnostic feature is available only when enabled.")})
+    original = copy.deepcopy((public, evidence))
+    checker = native(cfg, verdict("hold", criterion="source_support"))
+    checker.review(public, evidence, verification=verification)
+    request = checker.sent[0]
+    instruction = prompt(request)
+    assert "State and confidence can be supported by packet evidence about the same event" in instruction
+    assert "without repeating that evidence in prose" in instruction
+    assert "must remain consistent with the prose's actual claims" in instruction
+    assert "preserves the actual actor, action, affected audience and governing conditions" in instruction
+    assert "Still fail wording or omissions" in instruction
+    assert "material qualifications or corrections, or add unsupported claims" in instruction
+    assert "An attributed assessment must preserve that speaker's degree of commitment" in instruction
+    assert "spelling similarity alone cannot" in instruction
+    assert payload(request)["candidate"] == public
+    assert payload(request)["packet"] == evidence
+    assert (public, evidence) == original
+    assert quote_enum(request) == [""]
+
+
+def test_material_error_guidance_changes_policy_without_changing_update_scope(context, monkeypatch):
+    cfg, _ = context
+    current = review.policy_hash(cfg)
+    update_prompts = review.UPDATE_SYSTEM_PROMPT, review.UPDATE_VERIFY_PROMPT
+    without_guidance = review.SYSTEM_PROMPT.replace(
+        "A narrower accurate description need not repeat every supporting fact.", "")
+    assert without_guidance != review.SYSTEM_PROMPT
+    monkeypatch.setattr(review, "SYSTEM_PROMPT", without_guidance)
+    assert review.policy_hash(cfg) != current
+    assert (review.UPDATE_SYSTEM_PROMPT, review.UPDATE_VERIFY_PROMPT) == update_prompts

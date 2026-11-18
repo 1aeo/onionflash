@@ -170,7 +170,13 @@ recent entries are compact background that may be truncated; similar topics do n
 the same event, do not guess associations or merge unrelated articles, do not infer
 comprehensive archive coverage, and absent or truncated coverage alone is not grounds to skip.
 
-Do not fail or rewrite supported text merely because it is brief or awkward. A supported
+Do not fail or rewrite supported text merely because it is brief, awkward or less detailed
+than the packet. A narrower accurate description need not repeat every supporting fact.
+State and confidence can be supported by packet evidence about the same event without
+repeating that evidence in prose; they must remain consistent with the prose's actual claims.
+Faithful shorthand is valid when it preserves the actual actor, action, affected audience
+and governing conditions. Still fail wording or omissions that change those facts, lose
+material qualifications or corrections, or add unsupported claims. A supported
 why_it_matters may repeat its own summary; an empty why_it_matters is valid. Category and
 priority are editorial labels: flag them only when they materially misrepresent evidence.
 Labels still make claims: a generic bugfix or dependency update is not a security fix
