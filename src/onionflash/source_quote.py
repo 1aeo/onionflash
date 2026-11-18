@@ -5,7 +5,7 @@ import re
 from . import personal_attribution, render
 from .schema import FIELD_LIMITS
 
-POLICY = {"version": 1, "max_choices": 8, "max_rendered_chars": 800,
+POLICY = {"version": 2, "max_choices": 8, "max_rendered_chars": 800,
           "aggregate_rendered_utf8_bytes": 4096, "minimum_words": 6,
           "paragraph_edges": "both-visible-in-one-passage", "cross_passage_join": False,
           "rendering": "whitespace-only-with-neutral-curly-quotation",
@@ -28,6 +28,7 @@ PROCEDURAL_HEADING = re.compile(r'(?m)^ {0,3}#{1,6}\s+[^\n]*\b(?:checklists?|tem
 RAW_MARKUP = re.compile(r'<(?:/?[A-Za-z]|!)|<\Z')
 FINITE = re.compile(r'\b(?:is|are|was|were|has|have|had|can|cannot|could|may|might|will|would|must|shall|should|does|do|did)\b', re.I)
 PERSONAL_VERB = re.compile(r'^(?:I|We|You|They)\s+(?:explicitly\s+)?(?:encourage|recommend|ask|urge|request|advise|report|describe|observe|expect|intend|plan)\b')
+CONCLUSION = re.compile(r'\b(?:therefore|thus|hence|consequently|accordingly|as\s+a\s+(?:result|consequence)|for\s+(?:this|that|these|those)\s+reasons?)\b', re.I)
 
 def flat(text):
     return ' '.join(text.split())
@@ -73,6 +74,8 @@ def rejection(sentence):
         return 'inline_code_or_nested_quote_ambiguity'
     if AMBIGUOUS.search(sentence):
         return 'ambiguous_abbreviation_boundary'
+    if CONCLUSION.search(sentence):
+        return 'explicit_conclusion_requires_context'
     if not FINITE.search(sentence) and not PERSONAL_VERB.search(flat(sentence)):
         return 'no_conservative_finite_clause_witness'
     return None
