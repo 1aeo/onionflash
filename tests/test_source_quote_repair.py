@@ -92,7 +92,10 @@ def test_native_wire_selects_exact_quote_and_retains_real_origins(context, nativ
     assert passage["text"][origin["start"]:origin["end"]] == SENTENCE
     assert result["criteria"]["source_support"]["source_refs"] == ["S1"]
     assert 'The only allowed why_it_matters edit is ""' not in checker.sent[0]["messages"][0]["content"]
-    assert "literal provenance only" in checker.sent[0]["messages"][0]["content"]
+    instruction = " ".join(checker.sent[0]["messages"][0]["content"].split())
+    assert 'Prefer a useful, fully supported choice over ""' in instruction
+    assert 'if no choice satisfies the ordinary criteria, use "" to clear it' in instruction
+    assert "literal provenance only" in instruction
     assert review.FIELDS["why_it_matters"]["enum"] == [""]
 
 
@@ -270,6 +273,18 @@ def test_empty_or_already_quoted_current_why_offers_only_clear(context, native, 
     checker.review(candidate(why_it_matters=why), source())
     assert quote_enum(checker.sent[0]) == [""]
     assert "source_quote_choices" not in payload(checker.sent[0])["evidence_context"]
+    assert review.SOURCE_QUOTE_REPAIR_RULE not in checker.sent[0]["messages"][0]["content"]
+
+
+def test_quote_preference_is_bound_to_policy_identity(context, monkeypatch):
+    cfg, _ = context
+    current = review.policy_hash(cfg)
+    old_rule = review.SOURCE_QUOTE_REPAIR_RULE.replace(
+        'Prefer a useful, fully\nsupported choice over ""', 'Choose freely between a choice and ""')
+    replacements = tuple((original, old_rule if revised == review.SOURCE_QUOTE_REPAIR_RULE else revised)
+                         for original, revised in review._SOURCE_QUOTE_REPLACEMENTS)
+    monkeypatch.setattr(review, "_SOURCE_QUOTE_REPLACEMENTS", replacements)
+    assert review.policy_hash(cfg) != current
 
 
 def test_update_wire_and_immutable_why_stay_outside_quote_permissions(context, native):

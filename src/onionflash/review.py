@@ -426,10 +426,12 @@ the packet itself is not news or repeats covered events, preferring skip over po
 non-news; if unsure, or if important new material lacks defensible support, return "hold"
 with repair null.
 """
-SOURCE_QUOTE_REPAIR_RULE = """For a defective CURRENT nonempty why_it_matters, choose either "" to clear it or one
-exact rendered value from evidence_context.source_quote_choices. Null keeps the current
-text. Never generate, alter, combine or restore impact text. Once a source quotation is
-present, only keep or clear it. Choices establish literal provenance only, never truth,
+SOURCE_QUOTE_REPAIR_RULE = """For a defective CURRENT nonempty why_it_matters, assess the exact rendered values in
+evidence_context.source_quote_choices before clearing it. Prefer a useful, fully
+supported choice over ""; if no choice satisfies the ordinary criteria, use "" to clear
+it. A defect in the current text does not establish that every offered choice is
+defective. Null keeps the current text. Never generate, alter, combine or restore
+impact text. Once a source quotation is present, only keep or clear it. Choices establish literal provenance only, never truth,
 relevance, usefulness, source authority or approval. Read full governing passages in
 evidence_context.source_quote_passages and the complete packet, including conditions, chronology, corrections and disagreement.
 The neutral prefix does not promote the source or establish any personal role. Apply
@@ -446,7 +448,7 @@ _SOURCE_QUOTE_REPLACEMENTS = (
      SOURCE_QUOTE_REPAIR_RULE),
     ('fail (clearing why_it_matters)', 'fail (repairing why_it_matters)'),
     ('return revise and clear it rather than holding the article;',
-     'return revise and clear it or select an allowed source quotation;'),
+     'return revise and select an allowed source quotation if useful and fully supported; otherwise clear it;'),
 )
 
 VERIFY_PROMPT = """You are performing an adversarial evidence audit, not endorsing a draft.
