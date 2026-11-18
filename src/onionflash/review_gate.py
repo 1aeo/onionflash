@@ -587,7 +587,7 @@ def _official_release_anchor(candidate, repaired, prepared, *, current_only=Fals
                     and item_cluster({**source, "content": ""}).startswith("release:")]
         # A release identity is an evidence anchor, not a news-value verdict.
         # Multiple announcement sources or version identities are ambiguous.
-        if (len(releases) != 1 or (current_only and releases[0].get("snapshot") != "current")
+        if (len(releases) != 1 or (current_only and "snapshot" in releases[0] and releases[0]["snapshot"] != "current")
                 or release_mentions({"title": releases[0].get("title")}) != identities
                 or item_cluster({**releases[0], "content": ""}) != identities[0]
                 or not 0 <= (revision - parse_utc(releases[0].get("published_at"))).total_seconds() <= NEW_STORY_DAYS * 86400):

@@ -57,7 +57,7 @@ def test_recovery_requires_another_fresh_full_request(context, prepared):
 
 
 @pytest.mark.parametrize("damage", [
-    "historical", "missing-snapshot", "uncited", "unofficial", "multiple", "different-release",
+    "historical", "unknown-snapshot", "null-snapshot", "uncited", "unofficial", "multiple", "different-release",
     "old", "future", "missing-date", "incomplete", "prior-story", "existing-story", "association",
     "update", "tag", "missing-packet",
 ])
@@ -65,7 +65,8 @@ def test_recovery_does_not_widen_the_release_anchor(prepared, damage):
     entries, repaired = history(prepared)
     feed = prepared["packet"]["sources"][0]
     if damage == "historical": feed["snapshot"] = "historical"
-    elif damage == "missing-snapshot": feed.pop("snapshot")
+    elif damage == "unknown-snapshot": feed["snapshot"] = "unknown"
+    elif damage == "null-snapshot": feed["snapshot"] = None
     elif damage == "uncited": feed["url"] = "https://example.org/uncited"
     elif damage == "unofficial": feed["authority"] = "community"
     elif damage == "multiple": prepared["packet"]["sources"].append(copy.deepcopy(feed))
@@ -81,6 +82,19 @@ def test_recovery_does_not_widen_the_release_anchor(prepared, damage):
     elif damage == "tag": prepared["payload"]["editorial_kind"] = "tag"
     elif damage == "missing-packet": prepared["packet"] = None
     assert review_gate.next_step(entries, repaired, prepared) == ("hold", ("verification", "disagreed_news"))
+
+
+def test_release_anchor_does_not_require_an_optional_snapshot_marker(prepared):
+    original = prepared["candidate"]
+    repaired = review.apply_repair(original, REPAIR, packet=prepared["packet"])
+    prepared["packet"]["sources"][0].pop("snapshot")
+    assert review_gate._official_release_anchor(original, repaired, prepared, current_only=True)
+
+
+def test_optional_marker_admission_has_a_new_policy_identity(monkeypatch):
+    current = review.policy_hash(DEFAULTS)
+    monkeypatch.setattr(review, "RELEASE_FRAMING_POLICY", 3)
+    assert review.policy_hash(DEFAULTS) != current
 
 
 @pytest.mark.parametrize("damage", [

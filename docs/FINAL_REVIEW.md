@@ -298,7 +298,8 @@ their rules.
 
 For the opposite direction, an initial `revise` may fail news value while passing
 new information and make an effective title or summary repair. The same release
-anchor must come from a current source snapshot. The edit may also keep, clear or
+anchor must be bound to the current prepared packet; an explicitly historical
+snapshot cannot supply it. The edit may also keep, clear or
 select an ordinarily valid impact quotation; it cannot change labels, sources or
 dates. If fresh full verification approves that exact repaired candidate, one
 additional fresh full verification checks the same candidate without seeing the
