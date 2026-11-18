@@ -38,7 +38,7 @@ def test_correction_is_fresh_initial_review_then_independent_verification(contex
     assert requests[1]["response_format"] == requests[0]["response_format"]
     assert requests[1]["messages"][0]["content"] == requests[0]["messages"][0]["content"] + review.VALIDATION_REASK_PROMPT
     assert "validation_error" not in payloads[2]
-    assert requests[2]["messages"][0]["content"] == review.VERIFY_PROMPT
+    assert requests[2]["messages"][0]["content"] == review.VERIFY_PROMPT + "\n\n" + review.QUALIFIER_CONTEXT_PROMPT
     assert "UNTRUSTED_PREVIOUS_CRITERIA_SENTINEL" not in json.dumps(requests)
     assert snapshots[1]["reviews"] == []
     assert correction(snapshots[1]) == {"trigger": 1, "attempts": [2], "response": None, "transport_failed": False}
@@ -243,8 +243,8 @@ def test_valid_repair_then_invalid_verification_reasks_the_exact_repaired_candid
     assert payloads[0]["candidate"]["summary"] != changed
     assert payloads[1]["candidate"]["summary"] == payloads[2]["candidate"]["summary"] == changed
     assert payloads[2] == {**payloads[1], "validation_error": review.INCONSISTENT_VERDICT}
-    assert checker.client.requests[1]["messages"][0]["content"] == review.VERIFY_PROMPT
-    assert checker.client.requests[2]["messages"][0]["content"] == review.VERIFY_PROMPT + review.VALIDATION_REASK_PROMPT
+    assert checker.client.requests[1]["messages"][0]["content"] == review.VERIFY_PROMPT + "\n\n" + review.QUALIFIER_CONTEXT_PROMPT
+    assert checker.client.requests[2]["messages"][0]["content"] == review.VERIFY_PROMPT + "\n\n" + review.QUALIFIER_CONTEXT_PROMPT + review.VALIDATION_REASK_PROMPT
     audit = saved_audit(store)
     assert [(r["request"], r["stage"]) for r in audit["reviews"]] == [(1, "review"), (3, "verification")]
     assert audit["candidate"] == payloads[2]["candidate"]

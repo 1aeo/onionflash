@@ -615,6 +615,17 @@ SOURCE_DATE_CONTEXT_PROMPT = (
     "high/critical-severity, existing-story and operator-retry exceptions; no retry status is inferred here. "
     "Dates do not establish that an undated hypothesis persists or a fix worked."
 )
+QUALIFIER_CONTEXT_PROMPT = (
+    "evidence_context.fields[].qualifier_words contains untrusted literal attention data, not candidate defects "
+    "or a verdict; presence alone requires no edit or hold and never authorizes approval. Offsets count characters "
+    "in the named field or referenced whole passage. Compare uncertainty of the same assertion separately from "
+    "who reports it: attribution words and confidence=reported do not replace an explicit material probability "
+    "or modal limitation. Preserve that limitation unless supplied evidence for the same assertion resolves it. "
+    "Read the whole passages, dates and later context; do not transfer uncertainty or confirmation from another "
+    "object, clause or time, interpret a negated word or modal-looking name as a finding, or add uncertainty that "
+    "the source does not express. Literal matches and their absence do not establish support; apply the unchanged "
+    "criteria and fresh verification."
+)
 LABEL_LIMIT_ISSUE = (
     "The current classification values listed below exceed the source-bound label limits. "
     "Fail uncertainty_attribution for invalid confidence, status for invalid state, or "
@@ -791,7 +802,7 @@ def policy_hash(config: dict) -> str:
     identity["generation"] = generation_options(llm)
     return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, ROUTING_PROMPT, UPDATE_SYSTEM_PROMPT,
                    UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, LABEL_LIMIT_ISSUE, COMPLETION_ISSUE, PERSONAL_STYLE_ISSUE,
-                   SOURCE_TAG_CONTEXT_PROMPT, SOURCE_DATE_CONTEXT_PROMPT,
+                   SOURCE_TAG_CONTEXT_PROMPT, SOURCE_DATE_CONTEXT_PROMPT, QUALIFIER_CONTEXT_PROMPT,
                    INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT, INVALID_REVIEW_POLICY,
                    SCHEMA, UPDATE_REPAIR, VALIDATION_ERRORS, REASON_REPETITION_POLICY, LABEL_LIMIT_POLICY,
                    identity, CompletionClient.REQUEST_POLICY, EVIDENCE_POLICY,
@@ -1323,6 +1334,8 @@ class Reviewer(CompletionClient):
         if style_forms:
             issues.append(PERSONAL_STYLE_ISSUE + "\n" + json.dumps(style_forms, ensure_ascii=False))
         context_prompts = []
+        if not update and any("qualifier_words" in field for field in payload["evidence_context"]["fields"]):
+            context_prompts.append(QUALIFIER_CONTEXT_PROMPT)
         if not update and (tag_sources := supplied_tag_sources(packet)):
             payload["evidence_context"]["supplied_tag_sources"] = tag_sources
             context_prompts.append(SOURCE_TAG_CONTEXT_PROMPT)

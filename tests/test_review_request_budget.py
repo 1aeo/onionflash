@@ -102,7 +102,7 @@ def test_invalid_criteria_and_edits_stay_outside_the_corrected_review(context):
     assert payloads[2]["candidate"]["summary"] == REPAIRED
     assert payloads[2]["packet"] == payloads[0]["packet"]
     assert all(p["candidate"]["summary"] != invalid_text for p in payloads)
-    assert checker.client.requests[2]["messages"][0]["content"] == review.VERIFY_PROMPT
+    assert checker.client.requests[2]["messages"][0]["content"] == review.VERIFY_PROMPT + "\n\n" + review.QUALIFIER_CONTEXT_PROMPT
     assert "UNTRUSTED_PREVIOUS_CRITERIA_SENTINEL" not in json.dumps(checker.client.requests)
     audit = saved_audit(store)
     assert [(e["request"], e["stage"]) for e in audit["reviews"]] == [(2, "review"), (3, "verification")]
@@ -249,7 +249,7 @@ def test_legacy_pending_proposal_survives_restart_and_bypasses_matching_cached_a
     assert not review_gate.approval(cfg, store, row["id"])["eligible"]
     checker = reviewer(cfg, verdict())
     assert run(cfg, store, row, Writer(), checker)["status"] == "published" and checker.calls == 1
-    assert checker.client.requests[0]["messages"][0]["content"] == review.VERIFY_PROMPT
+    assert checker.client.requests[0]["messages"][0]["content"] == review.VERIFY_PROMPT + "\n\n" + review.QUALIFIER_CONTEXT_PROMPT
     assert saved_audit(store)["request_budget"]["reserved"] == 2
 
 
@@ -318,7 +318,7 @@ def test_discarded_partial_label_edit_does_not_change_what_the_real_repair_must_
     assert payloads[2]["application_issue"] == review.RELEASE_ISSUE
     assert payloads[3]["candidate"]["category"] == "security" and payloads[3]["candidate"]["tags"] == ["security"]
     assert all(p["candidate"]["title"] != "An unvalidated capability was merged" for p in payloads)
-    assert checker.client.requests[3]["messages"][0]["content"] == review.VERIFY_PROMPT
+    assert checker.client.requests[3]["messages"][0]["content"] == review.VERIFY_PROMPT + "\n\n" + review.QUALIFIER_CONTEXT_PROMPT
     assert "release" not in store.stories()[0]["tags"]
     assert [(e["request"], e["stage"]) for e in saved_audit(store)["reviews"]] == [(2, "review"), (3, "review"), (4, "verification")]
 
@@ -342,7 +342,7 @@ def test_legacy_legitimate_context_change_discards_proposal_and_preserves_budget
     assert run(cfg, store, row, Writer(), checker)["status"] == "published"
     first = json.loads(checker.client.requests[0]["messages"][1]["content"])
     assert first["candidate"]["summary"] == "The operator reported a plausible compromise and stopped trusting the affected keys."
-    assert checker.client.requests[0]["messages"][0]["content"] == review.SYSTEM_PROMPT + review.ROUTING_PROMPT
+    assert checker.client.requests[0]["messages"][0]["content"] == review.SYSTEM_PROMPT + review.ROUTING_PROMPT + "\n\n" + review.QUALIFIER_CONTEXT_PROMPT
     audit = saved_audit(store)
     assert audit["untrusted_proposals"][0]["disposition"] == "discarded_context"
     assert audit["request_budget"]["reserved"] == 3 and checker.calls == 2
@@ -361,7 +361,7 @@ def test_legacy_a_new_source_revision_starts_from_its_new_draft_not_the_pending_
     assert run(cfg, store, current, writer, checker)["status"] == "published"
     first = json.loads(checker.client.requests[0]["messages"][1]["content"])
     assert first["candidate"]["summary"] == "A fresh summary of the revised source."
-    assert checker.client.requests[0]["messages"][0]["content"] == review.SYSTEM_PROMPT + "\n\n" + review.SOURCE_DATE_CONTEXT_PROMPT
+    assert checker.client.requests[0]["messages"][0]["content"] == review.SYSTEM_PROMPT + "\n\n" + review.QUALIFIER_CONTEXT_PROMPT + "\n\n" + review.SOURCE_DATE_CONTEXT_PROMPT
     date_context, = first["evidence_context"]["source_date_comparisons"]
     assert date_context["source_updated_at"] == LATER
     assert saved_audit(store)["request_budget"]["reserved"] == 2
