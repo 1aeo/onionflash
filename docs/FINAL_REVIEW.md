@@ -296,6 +296,17 @@ a second verification news failure holds. Existing targets, updates, literal tag
 notices, duplicate routing, other failures and the normal repair limits retain
 their rules.
 
+For the opposite direction, an initial `revise` may fail news value while passing
+new information and make an effective title or summary repair. The same release
+anchor must come from a current source snapshot. The edit may also keep, clear or
+select an ordinarily valid impact quotation; it cannot change labels, sources or
+dates. If fresh full verification approves that exact repaired candidate, one
+additional fresh full verification checks the same candidate without seeing the
+earlier reviews. Only two such approvals can resolve the initial news disagreement.
+Any refusal on the additional check holds the item. Final checks, label limits
+and the shared seven-request budget still apply; the release anchor does not
+grant approval or waive a failed criterion.
+
 A later review that
 agrees the item is not news may skip it, but a repair it proposes is not applied:
 the item is held. The official items above are always verified before their

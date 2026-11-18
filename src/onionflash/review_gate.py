@@ -560,28 +560,12 @@ def _can_route(candidate: dict, prepared: dict, result: dict, target_id) -> bool
     return bool(item_subj and item_subj == target_subj)
 
 
-def _release_framing_repair(reviews, candidate, prepared):
-    """Allow one prose-only repair anchored to a cited, recent official release feed.
-
-    This only admits an edit to fresh verification. The normal history, repair
-    budget and final checks still decide whether the resulting text can publish.
-    """
-    latest = reviews[-1]
-    result = latest["result"]
-    if (len(reviews) < 2 or latest["stage"] != "verification"
-            or not _news(reviews[0]["result"]) or result["verdict"] != "revise"
-            or result.get("same_story") is not None
-            or prepared.get("mode", "story") != "story" or prepared["row"].get("story_id")
+def _official_release_anchor(candidate, repaired, prepared, *, current_only=False):
+    """Check a cited release identity and recency, without deciding news value."""
+    if (prepared.get("mode", "story") != "story" or prepared["row"].get("story_id")
             or prepared.get("how") is not None
-            or (prepared.get("coverage") or {}).get("prior_story") is not None
-            or any(entry["stage"] == "verification"
-                   and entry["result"]["criteria"]["news_value"]["outcome"] != "pass"
-                   for entry in reviews[:-1])):
-        return None
-    criteria = result["criteria"]
-    if (criteria["news_value"]["outcome"] != "fail"
-            or {name for name, check in criteria.items() if check["outcome"] != "pass"} != {"news_value"}):
-        return None
+            or (prepared.get("coverage") or {}).get("prior_story") is not None):
+        return False
     item = json.loads(prepared["row"]["payload"])
     packet = prepared.get("packet")
     if (item.get("kind") == "tag" or prepared["payload"].get("editorial_kind") == "tag"
@@ -590,22 +574,12 @@ def _release_framing_repair(reviews, candidate, prepared):
             or any(not isinstance(source, dict) or not isinstance(source.get("title"), str)
                    or not isinstance(source.get("passages"), list) or not source["passages"]
                    for source in packet["sources"])):
-        return None
-    repair = result.get("repair")
-    if not isinstance(repair, dict) or not repair or set(repair) - {"title", "summary"}:
-        return None
-    try:
-        repaired = review.apply_repair(candidate, repair, packet=packet)
-        revision = parse_utc(item.get("updated_at"))
-    except (review.ReviewError, ValueError):
-        return None
-    # Normalization must not introduce changes outside the two permitted fields.
-    if {key for key in candidate.keys() | repaired.keys() if candidate.get(key) != repaired.get(key)} - {"title", "summary"}:
-        return None
+        return False
     identities = release_mentions({"title": candidate.get("title")})
     if len(identities) != 1 or release_mentions({"title": repaired.get("title")}) != identities:
-        return None
+        return False
     try:
+        revision = parse_utc(item.get("updated_at"))
         cited = {canonical_url(source["url"]) for source in candidate.get("sources", [])}
         releases = [source for source in packet["sources"]
                     if source.get("kind") == "feed" and source.get("authority") == "official"
@@ -613,13 +587,89 @@ def _release_framing_repair(reviews, candidate, prepared):
                     and item_cluster({**source, "content": ""}).startswith("release:")]
         # A release identity is an evidence anchor, not a news-value verdict.
         # Multiple announcement sources or version identities are ambiguous.
-        if (len(releases) != 1 or release_mentions({"title": releases[0].get("title")}) != identities
+        if (len(releases) != 1 or (current_only and releases[0].get("snapshot") != "current")
+                or release_mentions({"title": releases[0].get("title")}) != identities
                 or item_cluster({**releases[0], "content": ""}) != identities[0]
                 or not 0 <= (revision - parse_utc(releases[0].get("published_at"))).total_seconds() <= NEW_STORY_DAYS * 86400):
-            return None
+            return False
     except (ValueError, TypeError, KeyError):
+        return False
+    return True
+
+
+def _release_framing_repair(reviews, candidate, prepared):
+    """Admit one prose repair after a fresh reviewer disputes release framing."""
+    latest = reviews[-1]
+    result = latest["result"]
+    if (len(reviews) < 2 or latest["stage"] != "verification"
+            or not _news(reviews[0]["result"]) or result["verdict"] != "revise"
+            or result.get("same_story") is not None
+            or any(entry["stage"] == "verification"
+                   and entry["result"]["criteria"]["news_value"]["outcome"] != "pass"
+                   for entry in reviews[:-1])):
+        return None
+    criteria = result["criteria"]
+    if (criteria["news_value"]["outcome"] != "fail"
+            or {name for name, check in criteria.items() if check["outcome"] != "pass"} != {"news_value"}):
+        return None
+    repair = result.get("repair")
+    if not isinstance(repair, dict) or not repair or set(repair) - {"title", "summary"}:
+        return None
+    try:
+        repaired = review.apply_repair(candidate, repair, packet=prepared.get("packet"))
+    except review.ReviewError:
+        return None
+    # Normalization must not introduce changes outside the two permitted fields.
+    if ({key for key in candidate.keys() | repaired.keys() if candidate.get(key) != repaired.get(key)} - {"title", "summary"}
+            or not _official_release_anchor(candidate, repaired, prepared)):
         return None
     return repaired
+
+
+def _release_news_recovery(reviews, candidate, prepared):
+    """Require two fresh full approvals of one repaired release description.
+
+    An initial news refusal is retained. Only this exact three-review history
+    may resolve its disagreement; the feed identity alone approves nothing.
+    """
+    if len(reviews) not in {2, 3}:
+        return False
+    first = reviews[0]
+    result = first["result"]
+    original = prepared.get("candidate")
+    repair = result.get("repair")
+    if (first["stage"] != "review" or first.get("issue") is not None
+            or result["verdict"] != "revise" or result.get("same_story") is not None
+            or result["criteria"]["news_value"]["outcome"] != "fail"
+            or result["criteria"]["new_information"]["outcome"] != "pass"
+            or not isinstance(original, dict) or first["candidate_hash"] != digest(original)
+            or not isinstance(repair, dict) or not repair
+            or set(repair) - {"title", "summary", "why_it_matters"}):
+        return False
+    try:
+        repaired = review.apply_repair(original, repair, packet=prepared.get("packet"))
+    except review.ReviewError:
+        return False
+    changed = {key for key in original.keys() | repaired.keys() if original.get(key) != repaired.get(key)}
+    if (not changed & {"title", "summary"} or changed - {"title", "summary", "why_it_matters"}
+            or digest(repaired) != digest(candidate)
+            or not _official_release_anchor(original, repaired, prepared, current_only=True)):
+        return False
+    policy = first.get("policy_hash")
+    if not isinstance(policy, str) or not re.fullmatch(r"[0-9a-f]{64}", policy):
+        return False
+    context = _context(prepared, policy)
+    if any(any(entry.get(key) != value for key, value in context.items()) for entry in reviews):
+        return False
+    for entry in reviews[1:]:
+        passed = entry["result"]
+        if (entry["stage"] != "verification" or entry.get("issue") is not None
+                or entry["candidate_hash"] != digest(repaired)
+                or passed["verdict"] != "approve" or passed.get("repair") is not None
+                or passed.get("same_story") is not None or set(passed["criteria"]) != set(review.CRITERIA)
+                or any(check["outcome"] != "pass" for check in passed["criteria"].values())):
+            return False
+    return True
 
 
 def next_step(reviews, candidate, prepared):
@@ -633,7 +683,13 @@ def next_step(reviews, candidate, prepared):
     latest = reviews[-1]
     result, stage, later = latest["result"], latest["stage"], len(reviews) > 1
     framing_repair = _release_framing_repair(reviews, candidate, prepared)
-    if later and _news(result) != _news(reviews[0]["result"]) and framing_repair is None:
+    release_recovery = _release_news_recovery(reviews, candidate, prepared)
+    if release_recovery and len(reviews) == 2:
+        return "verify", candidate
+    if (len(reviews) == 3 and not release_recovery
+            and _release_news_recovery(reviews[:2], candidate, prepared)):
+        return "hold", (stage, "disagreed_news")
+    if later and _news(result) != _news(reviews[0]["result"]) and framing_repair is None and not release_recovery:
         return "hold", (stage, "disagreed_news")
     if _can_route(candidate, prepared, result, result.get("same_story")):
         return "route", result["same_story"]
