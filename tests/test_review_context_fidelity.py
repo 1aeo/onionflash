@@ -16,7 +16,7 @@ def prompt(request):
     return " ".join(request["messages"][0]["content"].split())
 
 
-def test_consequence_audit_reaches_quote_choice_and_fresh_native_verification(context, native):
+def test_impact_context_reaches_quote_choice_and_fresh_native_verification(context, native):
     cfg, _ = context
     public, evidence = candidate(), source()
     original = copy.deepcopy((public, evidence))
@@ -27,17 +27,10 @@ def test_consequence_audit_reaches_quote_choice_and_fresh_native_verification(co
     checker.review(repaired, evidence, verification=True)
     assert len(checker.sent) == 2
     rules = (
-        "distinguish an observed result from a claimed practical consequence",
-        "context anywhere in the complete packet",
-        "name the material prerequisites in source_support's reason",
-        "check that the impact sentence itself retains them",
-        "Verbatim wording, attribution and can/may do not supply omitted conditions",
-        "A narrower observation or an explicit source recommendation need not acquire prerequisites",
-        "governing only a stronger, unclaimed consequence",
-        "before choosing a source quotation and again during fresh verification",
-        "If a material prerequisite for the claimed effect is missing, fail source_support",
-        "request the smallest permitted supported repair",
-        "do not approve merely because the wording is verbatim",
+        "Use only minimal directly governing supplied context needed to resolve its referents",
+        "preserve audience, conditions, affected scope, timing, lifecycle and material disagreement",
+        "Keep that context in the same output sentence",
+        "Each separate consequence must preserve its own material qualifiers",
     )
     for request, target in zip(checker.sent, (public, repaired)):
         assert all(rule in prompt(request) for rule in rules)
@@ -55,7 +48,7 @@ def test_consequence_audit_reaches_quote_choice_and_fresh_native_verification(co
 
 
 @pytest.mark.parametrize("verification", [False, True])
-def test_consequence_audit_stays_out_of_update_wire(context, native, verification):
+def test_story_context_stays_out_of_update_wire(context, native, verification):
     cfg, _ = context
     public, evidence = candidate(), source()
     public["updates"] = [{"at": public["updated_at"], "text": "The report describes the optional setting.",
