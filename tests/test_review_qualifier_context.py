@@ -52,8 +52,8 @@ def test_degree_expressions_do_not_supply_epistemic_uncertainty(phrase):
     ("A possible compromise remains under investigation.", ["possible"]),
     ("A compromise is possible, but not confirmed.", ["possible"]),
     ("A compromise is not possible under these conditions.", ["possible"]),
-    ("Respond as quickly as possible; a possible compromise remains under investigation.", ["possible"]),
-    ("Respond as quickly as possible; the host is plausibly compromised.", ["plausibly"]),
+    ("Respond as quickly as possible. A possible compromise remains under investigation.", ["possible"]),
+    ("Respond as quickly as possible. The host is plausibly compromised.", ["plausibly"]),
     ("Treat this as an outage as possible compromise remains unconfirmed.", ["possible", "unconfirmed"]),
     ("Notify us as soon as possible compromises are identified.", ["possible"]),
     ("Act as soon as possible compromise reports emerge.", ["possible"]),
@@ -71,6 +71,28 @@ def test_degree_filter_preserves_other_predicates_and_respects_word_and_context_
     spans = _literal_spans(text, _UNCERTAINTY)
     assert words(spans) == expected
     assert all(text[span["start"]:span["end"]] == span["text"] for span in spans)
+
+
+@pytest.mark.parametrize("modifier", ["yet unproven", "previously undetected"])
+def test_comma_parenthetical_cannot_turn_a_possible_compromise_into_a_degree_expression(modifier):
+    text = f"Notify the cache team as soon as possible, {modifier}, compromises are reported."
+    source, current = source_packet(text), public()
+    before = copy.deepcopy((source, current))
+    context = evidence_context(current, source)
+    for field in ("title", "summary"):
+        row, = qualifiers(context, field)["source_uncertainty"]
+        span, = row["spans"]
+        assert row["passage_ref"] == "S1:P2"
+        assert span == {"start": text.index("possible"), "end": text.index("possible") + len("possible"),
+                        "text": "possible"}
+    assert (source, current) == before
+    assert source["sources"][0]["passages"][1] in context["passages"]
+
+
+@pytest.mark.parametrize("punctuation", [",", ":", ";"])
+def test_clause_punctuation_does_not_decide_degree_completion(punctuation):
+    text = f"Respond as quickly as possible{punctuation} investigation continues."
+    assert words(_literal_spans(text, _UNCERTAINTY)) == ["possible"]
 
 
 def test_source_fragment_end_cannot_terminate_a_degree_phrase():
