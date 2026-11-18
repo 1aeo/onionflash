@@ -8,7 +8,9 @@ from . import personal_attribution, render
 from .review_evidence import _words
 from .schema import FIELD_LIMITS
 
-POLICY = {"version": 3, "max_choices": 8, "max_rendered_chars": 800,
+MODAL_RELATIVE = re.compile(r',\s*which\s+(?:can|could|may|might|must|shall|should|will|would)\b', re.I)
+
+POLICY = {"version": 4, "max_choices": 8, "max_rendered_chars": 800,
           "aggregate_rendered_utf8_bytes": 4096, "minimum_words": 6,
           "paragraph_edges": "both-visible-in-one-passage", "cross_passage_join": False,
           "rendering": "whitespace-only-with-neutral-curly-quotation",
@@ -19,6 +21,8 @@ POLICY = {"version": 3, "max_choices": 8, "max_rendered_chars": 800,
           "normalization": "render-field-and-personal-attribution-exact",
           "selection": "overflow-only-current-impact-inverse-passage-frequency-exact-rational",
           "selection_order": "score-descending-source-order-ties-present-in-source-order",
+          "menu_filter": {"pattern": MODAL_RELATIVE.pattern, "case_sensitive": False,
+                          "stage": "after-selection-no-refill", "unit": "whole-choice"},
           "context": "full-passage-and-source-metadata-once-per-reference",
           "commit_proof": "stored-receipt-and-held-proof-with-exact-publication-envelope"}
 PREFIX = 'A cited source states: “'
@@ -202,6 +206,11 @@ def preserves_rendered(value):
             and personal_attribution.normalize_text(value) == value)
 
 
+def _filter_selected_choices(choices):
+    """Remove whole repair options after selection; syntax does not establish truth."""
+    return [choice for choice in choices if not MODAL_RELATIVE.search(choice['rendered'])]
+
+
 def available(candidate, packet, *, update=False):
     """Offer at most one quote transition; an existing quote gets keep or clear."""
     current = candidate.get('why_it_matters', '')
@@ -220,7 +229,7 @@ def available(candidate, packet, *, update=False):
                                         'semantic_grounding': 'NOT_DETERMINED'}}
     if (len(unique) <= POLICY['max_choices'] and
             sum(len(value.encode()) for value in unique) <= POLICY['aggregate_rendered_utf8_bytes']):
-        return catalog['choices']
+        return _filter_selected_choices(catalog['choices'])
 
     # Relevance chooses membership only; it does not establish support or usefulness.
     units = [_words(passage['text'] + ' ' + passage.get('author', ''))
@@ -240,7 +249,8 @@ def available(candidate, packet, *, update=False):
         if len(chosen) < POLICY['max_choices'] and size + amount <= POLICY['aggregate_rendered_utf8_bytes']:
             chosen.append(entry)
             size += amount
-    return [entry['choice'] for entry in sorted(chosen, key=lambda entry: entry['source_order'])]
+    return _filter_selected_choices(
+        [entry['choice'] for entry in sorted(chosen, key=lambda entry: entry['source_order'])])
 
 
 def validate_replacement(value, packet, candidate=None):
