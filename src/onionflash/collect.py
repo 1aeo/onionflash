@@ -6,6 +6,7 @@ import calendar
 from collections.abc import Iterable
 import re
 from datetime import datetime, timedelta
+from html import unescape
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from xml.parsers import expat
 
@@ -28,6 +29,24 @@ PROJECT_SENDER = re.compile(r"[a-z0-9._+-]+@torproject\.org")
 SENDER_DOMAIN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
 SENDER_ADDRESS = re.compile(rf"[a-z0-9._+-]+@({SENDER_DOMAIN.pattern})")
 _GITLAB_AUTHOR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
+DISCOURSE_NAMESPACE = "http://www.discourse.org/"
+_DISCOURSE_FOOTER = re.compile(
+    r"<p>\s*<small>\s*[0-9]+ posts? - [0-9]+ participants?\s*</small>\s*</p>\s*"
+    r"<p>\s*<a\s+href\s*=\s*(?P<quote>[\"'])(?P<url>[^\"'<>\r\n]{1,4096})(?P=quote)\s*>"
+    r"Read full topic</a>\s*</p>\s*\Z", re.I,
+)
+
+
+def _without_discourse_footer(value: str, entry_url: str) -> str:
+    """Remove only Discourse's complete generated trailer for this exact topic."""
+    match = _DISCOURSE_FOOTER.search(value)
+    if match is not None:
+        try:
+            if canonical_url(unescape(match["url"])) == canonical_url(entry_url):
+                return value[:match.start()].rstrip()
+        except ValueError:
+            pass
+    return value
 
 
 def _hyperkitty_address(author: object) -> str | None:
@@ -217,6 +236,7 @@ def _feed(
     feed = feedparser.parse(response.body, sanitize_html=False, resolve_relative_uris=False)
     if not feed.get("version") or feed.get("bozo"):
         raise CollectionError("Invalid RSS/Atom document")
+    discourse_feed = feed.version == "rss20" and DISCOURSE_NAMESPACE in feed.get("namespaces", {}).values()
     archive_senders = (
         source["authority"] != "official"
         and urlsplit(response.url).hostname == LIST_ARCHIVE_HOST
@@ -244,10 +264,10 @@ def _feed(
         if updated < cutoff:
             continue
         content_parts = entry.get("content") or []
-        text = plain_text(
-            content_parts[0].get("value", "") if content_parts else entry.get("summary", ""),
-            settings["content_chars"],
-        )
+        content = content_parts[0].get("value", "") if content_parts else entry.get("summary", "")
+        if discourse_feed and isinstance(content, str) and isinstance(entry.get("link"), str):
+            content = _without_discourse_footer(content, entry["link"])
+        text = plain_text(content, settings["content_chars"])
         # Only an explicit text/plain title keeps its angle brackets; HTML/XHTML titles are stripped.
         title_html = (entry.get("title_detail") or {}).get("type", "text/html") != "text/plain"
         # Some curated feeds put their complete description in an Atom title.

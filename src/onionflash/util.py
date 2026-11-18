@@ -331,7 +331,7 @@ def is_dirauth_item(item: dict, dirauth_users: Iterable[str] | None = None) -> b
 
 _PRODUCT_NAMES = {"tor-browser": r"tor[- ]browser", "arti": "arti", "tor": "tor"}
 _VERSION = re.compile(r"\d+\.\d+(?:\.\d+){0,2}(?:[-.]?(?:alpha|beta|rc|a)\.?\d*)?")
-_RELEASE_QUALIFIERS = r"(?:(?:new|stable|alpha|beta|security|bugfix|release|version)\s+)*"
+_RELEASE_QUALIFIERS = r"(?:(?:new|stable|alpha|beta|security|bugfix|releases?|version)\s+)*"
 _RELEASE_AFTER = re.compile(r"\s+(?:is\s+)?(?:now\s+)?available\b")
 _RELEASE_EOL = re.compile(r"\b(?:end[- ]of[- ]life|eol|out of support|no longer supported)\b")
 _GITLAB_OWN = re.compile(r"^(https://[^/?#]+)/(.+?)/-/(?:issues|work_items|merge_requests|tags|blob)/\S+")
@@ -344,7 +344,7 @@ _CLOSING_SPAN = re.compile(
 )
 _ANY_REF = re.compile(_REF_TOKEN, re.I)
 _RELEASE_MENTION = re.compile(
-    r"\b(tor[- ]browser|arti|tor)[- ](?:v|(?:(?:new|stable|alpha|beta|security|bugfix|release|version)\s+)*)?(\d+\.\d+(?:[\w.-]*\w)?)(?!(?:\w|\.\w))",
+    rf"\b(tor[- ]browser|arti|tor)[- ](?:v|{_RELEASE_QUALIFIERS})?(\d+\.\d+(?:[\w.-]*\w)?)(?!(?:\w|\.\w))",
     re.I,
 )
 
@@ -370,7 +370,7 @@ def item_cluster(item: dict) -> str:
             and _VERSION.fullmatch(match.group(1))
             and (
                 item.get("kind") == "tag"
-                or re.search(r"\breleas(?:e|ed|ing)\b", title)
+                or re.search(r"\breleas(?:e|es|ed|ing)\b", title)
                 or _RELEASE_AFTER.match(title[match.end() :])
             )
             and (

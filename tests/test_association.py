@@ -77,6 +77,35 @@ def test_pure_reference_release_mention_and_thread_helpers():
     assert thread_subject(item(url="https://blog.torproject.org/post/", title="Re: Guard flag drop across relays")) == (None, False)
 
 
+@pytest.mark.parametrize("title,product,version", [
+    ("Tor releases 0.4.9.16 emergency fix for directory authority thundering herd", "tor", "0.4.9.16"),
+    ("Tor releases stable version 0.4.9.17", "tor", "0.4.9.17"),
+    ("Arti releases 2.8.0", "arti", "2.8.0"),
+    ("Tor Browser releases 16.0a14", "tor-browser", "16.0a14"),
+])
+def test_releases_verb_supplies_consistent_hints_without_merging_prose(title, product, version):
+    incoming = item(kind="feed", product="network", title=title, content="Release announcement.")
+    key = f"release:{product}:{version}"
+    assert item_cluster(incoming) == key
+    assert release_mentions(incoming) == [key]
+    assert story_cluster(incoming).startswith("url:")
+
+
+@pytest.mark.parametrize("title,mentions", [
+    ("Tor releases 0.4.9.16 delayed", ["release:tor:0.4.9.16"]),
+    ("Tor releases 0.4.9.16 postponed", ["release:tor:0.4.9.16"]),
+    ("Tor releases 0.4.9.16 end-of-life notice", ["release:tor:0.4.9.16"]),
+    ("Tor releases 0.4.9.16.1", []),
+    ("Tor releases 0.4.9.16-unknown", []),
+    ("Tor releases an advisory about 0.4.9.16", []),
+    ("Tails 7.16 bundles Tor releases 0.4.9.16", ["release:tor:0.4.9.16"]),
+])
+def test_releases_verb_retains_conservative_release_identity_guards(title, mentions):
+    incoming = item(kind="feed", product="tor", title=title, content="")
+    assert item_cluster(incoming).startswith("url:")
+    assert release_mentions(incoming) == mentions
+
+
 def test_gitlab_refs_ignore_malformed_urls_and_normalize_project_case():
     closing, mentioned = gitlab_refs({
         "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/1",
@@ -273,15 +302,19 @@ def test_tag_explicit_mapping_and_retirement_alias_preserve_existing_lifecycle(s
     assert matched["id"] == prior["id"] and how == "alias"
 
 
-@pytest.mark.parametrize("title", ["Tor 0.4.9.17 released", "Security Release 0.4.9.17"])
-def test_announcement_repost_routes_to_reviewed_release_and_adds_only_citation(context, title):
+@pytest.mark.parametrize("title,version", [
+    ("Tor 0.4.9.17 released", "0.4.9.17"),
+    ("Security Release 0.4.9.17", "0.4.9.17"),
+    ("Tor releases 0.4.9.16 emergency fix for directory authority thundering herd", "0.4.9.16"),
+])
+def test_announcement_repost_routes_to_reviewed_release_and_adds_only_citation(context, title, version):
     cfg, store = context
     release = item(kind="feed", authority="official", product="tor", title=title,
-                   url="https://example.org/release", content="Tor 0.4.9.17 is available with security fixes.")
+                   url="https://example.org/release", content=f"Tor {version} is available with security fixes.")
     draft = analysis(title=release["title"], summary=release["content"], why_it_matters="", category="release",
                      tags=["release"], state="released", confidence="confirmed", evidence=[release["content"]])
     original = _publish(store, release, draft)
-    repost = item(kind="feed", authority="official", product="tor", title="Security Release 0.4.9.17",
+    repost = item(kind="feed", authority="official", product="tor", title=f"Security Release {version}",
                   url="https://example.org/repost", content=release["content"])
     reply = verdict("skip", criterion="new_information", same_story=original["id"])
     reply["criteria"]["new_information"]["reason"] = f"The release is already covered by {original['id']}."
@@ -289,7 +322,7 @@ def test_announcement_repost_routes_to_reviewed_release_and_adds_only_citation(c
     row = next(r for r in store.pending(20, LATER) if r["id"] == repost["id"])
     skip = verdict("skip", criterion="new_information", update=True)
     skip["criteria"]["new_information"]["reason"] = reply["criteria"]["new_information"]["reason"]
-    update = update_analysis(update="Another announcement reports Tor 0.4.9.17 is available.",
+    update = update_analysis(update=f"Another announcement reports Tor {version} is available.",
                              state="released", confidence="confirmed", evidence=[release["content"]])
     assert run_gate(cfg, store, row, Writer(update), Reviewer(skip))["status"] == "ignored"
     assert len(store.stories()) == 1
@@ -301,7 +334,8 @@ def test_announcement_repost_routes_to_reviewed_release_and_adds_only_citation(c
 
 @pytest.mark.parametrize("summary", ["Tor 0.4.9.18 is available.", "Tor 0.4.9.18 supersedes Tor 0.4.9.17."])
 @pytest.mark.parametrize("title", ["Tor 0.4.9.18 released", "Security Release 0.4.9.18",
-                                   "Tor 0.4.9.18 released after Tor 0.4.9.17", "Tor security update"])
+                                   "Tor 0.4.9.18 released after Tor 0.4.9.17", "Tor security update",
+                                   "Tor releases 0.4.9.18 after Tor 0.4.9.17"])
 def test_release_announcement_cannot_route_to_a_different_released_version(context, summary, title):
     cfg, store = context
     older = item(kind="feed", authority="official", title=title,
@@ -323,7 +357,7 @@ def test_release_announcement_cannot_route_to_a_different_released_version(conte
 @pytest.mark.parametrize("hint_stage", ["initial-approve", "late-approve", "late-revise"])
 def test_material_official_announcement_stays_separate_despite_release_routing_hint(context, hint_stage):
     cfg, store = context
-    release = item(kind="feed", authority="official", title="Tor 0.4.9.17 released",
+    release = item(kind="feed", authority="official", title="Tor releases 0.4.9.17",
                    url="https://example.org/release", content="Tor 0.4.9.17 is available with security fixes.")
     original = _publish(store, release, analysis(title=release["title"], summary=release["content"],
                         why_it_matters="", category="release", tags=["release"], state="released",
