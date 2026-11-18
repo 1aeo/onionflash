@@ -43,7 +43,9 @@ def test_story_status_instructions_reach_native_review_without_new_evidence(monk
     prompt = " ".join(body["messages"][0]["content"].split())
     rules = (
         "Name the actual candidate.state in this reason",
-        "latest relevant same-issue evidence, citing the supporting or limiting passage",
+        "latest relevant same-issue evidence",
+        "the reason must resolve that observation against any subsequent supplied clarification of the same observation",
+        "comparing dates and the affected version or configuration and citing both passages when present",
         "Developing remains valid when completion is not established",
         "fail status when candidate.state remains developing",
         "closure explicitly records a fix or resolution",
@@ -134,3 +136,56 @@ def test_lifecycle_prompt_is_part_of_policy_identity_without_version_or_budget_c
     assert analyze.PROMPT_VERSION == "onionflash-22"
     assert review.REVIEW_VERSION == "onionflash-review-18"
     assert review_gate.MAX_REVIEW_REQUESTS == 7
+
+
+@pytest.mark.parametrize("verification", [False, True])
+@pytest.mark.parametrize("clarification,state", [
+    ("The affected process still used the previous configuration; the corrected configuration was not applied.", "fixed"),
+    ("The corrected configuration was applied before this same failure recurred.", "developing"),
+    ("Another reporter disputes the cause; the available observations remain inconclusive.", "developing"),
+])
+def test_recurrence_reason_contract_retains_contrasting_source_observations(
+        monkeypatch, verification, clarification, state):
+    public, evidence = public_story(), source()
+    public["state"] = state
+    evidence["sources"][0]["passages"] += [
+        {"id": "S1:P2", "text": clarification, "created_at": "2026-01-03T12:05:00Z"},
+        {"id": "S1:P3", "text": "The same failure happened again.", "created_at": "2026-01-03T12:00:00Z"},
+        {"id": "S1:P4", "text": "Does this diagnostic log line indicate a problem?", "created_at": "2026-01-04T12:00:00Z"},
+    ]
+    original = copy.deepcopy((public, evidence))
+    checker = reviewer(monkeypatch, completion(verdict("hold", criterion="status")))
+    checker.review(public, evidence, verification=verification)
+    body, payload = request(checker)
+    prompt = " ".join(body["messages"][0]["content"].split())
+    assert "the reason must resolve that observation against any subsequent supplied clarification" in prompt
+    assert "citing both passages when present" in prompt
+    assert "a later unrelated comment, or a diagnostic question alone does not establish that the same failure persists" in prompt
+    assert "unresolved or conflicting completion evidence does not establish completion" in prompt
+    assert "do not demand extra detail when the candidate already states the observation and its limits accurately" in prompt
+    assert payload["packet"] == evidence and payload["candidate"] == public
+    assert [p["id"] for p in payload["packet"]["sources"][0]["passages"]] == ["S1:P1", "S1:P2", "S1:P3", "S1:P4"]
+    assert (public, evidence) == original
+    assert len(checker.client.requests) == 1
+
+
+@pytest.mark.parametrize("verification", [False, True])
+def test_story_date_reason_uses_packet_without_inventing_missing_chronology(monkeypatch, verification):
+    public, evidence = public_story(), source()
+    evidence["sources"][0]["passages"].append({
+        "id": "S1:P2", "text": "Correction to that observation: the previous configuration was still active."})
+    original = copy.deepcopy((public, evidence))
+    checker = reviewer(monkeypatch, completion(verdict("hold", criterion="news_value")))
+    checker.review(public, evidence, verification=verification)
+    body, payload = request(checker)
+    prompt = " ".join(body["messages"][0]["content"].split())
+    assert "Missing dates alone establish neither a chronology nor a defect" in prompt
+    assert "use an explicit supplied relationship when available, otherwise preserve uncertainty" in prompt
+    assert "In the news_value reason, state the newest dated development" in prompt
+    assert "or the applicable existing exception, before the materiality category" in prompt
+    assert "an older background source does not make a newer development stale" in prompt
+    assert "Missing or incomparable dates alone do not establish staleness" in prompt
+    assert "more than 14 days before updated_at" in prompt
+    assert payload["evidence_context"]["source_date_comparisons"] == review.source_date_comparisons(evidence)
+    assert payload["packet"] == evidence and payload["candidate"] == public
+    assert (public, evidence) == original

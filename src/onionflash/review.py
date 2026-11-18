@@ -248,8 +248,15 @@ substituted (such as relay for directory authority, or operators for software), 
 >-quoted mailing-list participant absent from unquoted_content is treated as the main actor.
 status: distinguish an issue/request, merged change, observed tag, announced release,
 deployment and resolution. Name the actual candidate.state in this reason and compare
-it with the latest relevant same-issue evidence, citing the supporting or limiting
-passage. Developing remains valid when completion is not established; fail status when
+it with the latest relevant same-issue evidence. If a reported recurrence or reopening
+is used to support that state, the reason must resolve that observation against any
+subsequent supplied clarification of the same observation, comparing dates and the
+affected version or configuration and citing both passages when present. Passage
+placement, a later unrelated comment, or a diagnostic question alone does not establish
+that the same failure persists. Missing dates alone establish neither a chronology nor
+a defect: use an explicit supplied relationship when available, otherwise preserve
+uncertainty. Require only distinctions that materially change the claim; do not demand
+extra detail when the candidate already states the observation and its limits accurately. Developing remains valid when completion is not established; fail status when
 candidate.state remains developing although closure explicitly records a fix or resolution
 and no later actual same-issue reopening or post-fix recurrence contradicts completion.
 Closure alone, including duplicate or wontfix closure, or a tentative workaround does
@@ -320,7 +327,11 @@ news_value: judge the event's eligibility from the complete packet and its sourc
 metadata. Candidate omissions or misstatements alone do not make that event non-news;
 assess material defects under the relevant factual criteria and repair from the packet,
 without requiring every optional triage detail. First, when prior_story is null,
-compare source dates (never the current date): if the newest dated development
+compare source dates (never the current date). In the news_value reason, state the
+newest dated development and its comparison with that source's updated_at, or the
+applicable existing exception, before the materiality category. Assess the complete
+packet: an older background source does not make a newer development stale. Missing
+or incomparable dates alone do not establish staleness. If the newest dated development
 (published_at, merge date, newest public comment, or closing) is more than 14 days before
 updated_at, fail news_value (verdict skip), unless source authority is hackerone, a gitlab_issue in the
 packet cites hackerone.com/reports/ or "Reported via HackerOne" (confidential HackerOne
