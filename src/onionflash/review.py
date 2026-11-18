@@ -600,6 +600,7 @@ RELEASE_ISSUE = ("A release category or tag needs state released or tagged: remo
                  "or correct the state, as the packet supports.")
 
 LABEL_LIMIT_POLICY = 1  # Current-label checks differ from permissible new edits.
+RELEASE_FRAMING_POLICY = 1  # One release-feed prose repair still needs fresh verification.
 SOURCE_TAG_CONTEXT_PROMPT = (
     "evidence_context.supplied_tag_sources lists packet metadata, not candidate defects or an eligibility verdict. "
     "Its presence alone requires no edit or hold. Check their relation to the event "
@@ -805,6 +806,7 @@ def policy_hash(config: dict) -> str:
                    SOURCE_TAG_CONTEXT_PROMPT, SOURCE_DATE_CONTEXT_PROMPT, QUALIFIER_CONTEXT_PROMPT,
                    INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT, INVALID_REVIEW_POLICY,
                    SCHEMA, UPDATE_REPAIR, VALIDATION_ERRORS, REASON_REPETITION_POLICY, LABEL_LIMIT_POLICY,
+                   RELEASE_FRAMING_POLICY,
                    identity, CompletionClient.REQUEST_POLICY, EVIDENCE_POLICY,
                    source_quote.POLICY, source_quote.PREFIX, _SOURCE_QUOTE_REPLACEMENTS, SOURCE_QUOTE_CONTEXT_PROMPT,
                    NAMED_ATTRIBUTION_POLICY, ATTRIBUTION_CHECK_PROMPT, personal_attribution.PERSONAL_ATTRIBUTION_POLICY,

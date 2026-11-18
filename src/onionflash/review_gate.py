@@ -22,7 +22,7 @@ from .comments import analysis_context
 from .llm import AnalysisError, CompletionDeferred, RequestObserver
 from .util import (
     DIRAUTH_GITLAB_USERS, _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, is_dirauth_item,
-    is_hackerone_item, item_cluster, now_iso, release_mentions, saved_object, thread_subject,
+    is_hackerone_item, item_cluster, now_iso, parse_utc, release_mentions, saved_object, thread_subject,
 )
 
 REVIEW_STATE_VERSION = 2
@@ -560,6 +560,68 @@ def _can_route(candidate: dict, prepared: dict, result: dict, target_id) -> bool
     return bool(item_subj and item_subj == target_subj)
 
 
+def _release_framing_repair(reviews, candidate, prepared):
+    """Allow one prose-only repair anchored to a cited, recent official release feed.
+
+    This only admits an edit to fresh verification. The normal history, repair
+    budget and final checks still decide whether the resulting text can publish.
+    """
+    latest = reviews[-1]
+    result = latest["result"]
+    if (len(reviews) < 2 or latest["stage"] != "verification"
+            or not _news(reviews[0]["result"]) or result["verdict"] != "revise"
+            or result.get("same_story") is not None
+            or prepared.get("mode", "story") != "story" or prepared["row"].get("story_id")
+            or prepared.get("how") is not None
+            or (prepared.get("coverage") or {}).get("prior_story") is not None
+            or any(entry["stage"] == "verification"
+                   and entry["result"]["criteria"]["news_value"]["outcome"] != "pass"
+                   for entry in reviews[:-1])):
+        return None
+    criteria = result["criteria"]
+    if (criteria["news_value"]["outcome"] != "fail"
+            or {name for name, check in criteria.items() if check["outcome"] != "pass"} != {"news_value"}):
+        return None
+    item = json.loads(prepared["row"]["payload"])
+    packet = prepared.get("packet")
+    if (item.get("kind") == "tag" or prepared["payload"].get("editorial_kind") == "tag"
+            or not isinstance(packet, dict) or packet.get("truncated") is not False
+            or packet.get("missing_sources") != [] or not isinstance(packet.get("sources"), list)
+            or any(not isinstance(source, dict) or not isinstance(source.get("title"), str)
+                   or not isinstance(source.get("passages"), list) or not source["passages"]
+                   for source in packet["sources"])):
+        return None
+    repair = result.get("repair")
+    if not isinstance(repair, dict) or not repair or set(repair) - {"title", "summary"}:
+        return None
+    try:
+        repaired = review.apply_repair(candidate, repair, packet=packet)
+        revision = parse_utc(item.get("updated_at"))
+    except (review.ReviewError, ValueError):
+        return None
+    # Normalization must not introduce changes outside the two permitted fields.
+    if {key for key in candidate.keys() | repaired.keys() if candidate.get(key) != repaired.get(key)} - {"title", "summary"}:
+        return None
+    identities = release_mentions({"title": candidate.get("title")})
+    if len(identities) != 1 or release_mentions({"title": repaired.get("title")}) != identities:
+        return None
+    try:
+        cited = {canonical_url(source["url"]) for source in candidate.get("sources", [])}
+        releases = [source for source in packet["sources"]
+                    if source.get("kind") == "feed" and source.get("authority") == "official"
+                    and canonical_url(source["url"]) in cited
+                    and item_cluster({**source, "content": ""}).startswith("release:")]
+        # A release identity is an evidence anchor, not a news-value verdict.
+        # Multiple announcement sources or version identities are ambiguous.
+        if (len(releases) != 1 or release_mentions({"title": releases[0].get("title")}) != identities
+                or item_cluster({**releases[0], "content": ""}) != identities[0]
+                or not 0 <= (revision - parse_utc(releases[0].get("published_at"))).total_seconds() <= NEW_STORY_DAYS * 86400):
+            return None
+    except (ValueError, TypeError, KeyError):
+        return None
+    return repaired
+
+
 def next_step(reviews, candidate, prepared):
     """What follows the latest review of `candidate`, decided from the chain of reviews alone.
 
@@ -570,7 +632,8 @@ def next_step(reviews, candidate, prepared):
     """
     latest = reviews[-1]
     result, stage, later = latest["result"], latest["stage"], len(reviews) > 1
-    if later and _news(result) != _news(reviews[0]["result"]):
+    framing_repair = _release_framing_repair(reviews, candidate, prepared)
+    if later and _news(result) != _news(reviews[0]["result"]) and framing_repair is None:
         return "hold", (stage, "disagreed_news")
     if _can_route(candidate, prepared, result, result.get("same_story")):
         return "route", result["same_story"]
@@ -591,7 +654,7 @@ def next_step(reviews, candidate, prepared):
     # verification has passed its facts; a duplicate still skips.
     disputed = official and failed & review.EDITORIAL_CRITERIA == {"news_value"}
     if disputed:
-        if stage == "verification" and failed == {"news_value"}:
+        if stage == "verification" and failed == {"news_value"} and framing_repair is None:
             return "hold", (stage, "official_not_news")
         if verdict != "revise":
             return ("hold", (stage, "model_hold")) if later else ("verify", candidate)
@@ -613,7 +676,7 @@ def next_step(reviews, candidate, prepared):
                 return "hold", (stage, "release_labels")
             return "repair", candidate
         return ("verify" if stage == "review" else "approve"), candidate
-    if verdict != "revise" or (later and failed & review.EDITORIAL_CRITERIA and not disputed):
+    if verdict != "revise" or (later and failed & review.EDITORIAL_CRITERIA and not disputed and framing_repair is None):
         return "hold", (stage, "release_labels" if latest.get("issue") else "model_hold")
     is_update = prepared.get("mode") == "update"
     if (item.get("kind") == "tag") if is_update else (prepared["payload"]["editorial_kind"] == "tag"):
@@ -621,7 +684,8 @@ def next_step(reviews, candidate, prepared):
     if len(reviews) > MAX_VERIFY_REPAIRS + 1:
         return "hold", (stage, "repairs_exhausted")
     try:
-        repaired = review.apply_repair(candidate, result["repair"], update=is_update, packet=prepared["packet"])
+        repaired = framing_repair if framing_repair is not None else review.apply_repair(
+            candidate, result["repair"], update=is_update, packet=prepared["packet"])
     except review.ReviewError:
         # After a disputed official item's first review, the unchanged text goes to its fresh verification.
         return ("verify", candidate) if disputed and not later else ("hold", (stage, "unusable_repair"))

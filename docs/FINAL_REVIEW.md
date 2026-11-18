@@ -284,7 +284,19 @@ story; see [merging duplicate stories](EDITORIAL.md#merge-a-duplicate-story).
   value can be approved as reviewed.
 
 A later review that disagrees with the first on whether news value and new
-information both pass holds the item, whatever its verdict. A later review that
+information both pass normally holds the item. A new story may instead receive
+one title/summary repair when the first review passed both editorial checks and
+a verification explicitly fails only news value while proposing a real prose edit.
+The current and repaired titles must name the same single release identity as
+one cited official release feed, identified by the existing release classifier.
+Its publication date must fall within the 14 days before the incoming item's
+revision date, and the packet must have no missing or truncated source context.
+This admits only a fresh full verification, never an approval or released state;
+a second verification news failure holds. Existing targets, updates, literal tag
+notices, duplicate routing, other failures and the normal repair limits retain
+their rules.
+
+A later review that
 agrees the item is not news may skip it, but a repair it proposes is not applied:
 the item is held. The official items above are always verified before their
 hold: a later review's repair of their facts is applied and verified, and when
