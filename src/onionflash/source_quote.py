@@ -11,10 +11,10 @@ from .schema import FIELD_LIMITS
 MODAL_RELATIVE = re.compile(r',\s*which\s+(?:can|could|may|might|must|shall|should|will|would)\b', re.I)
 ASSERTION_IMPERATIVE = re.compile(
     r"^(?:This|That|The)\s+[a-z][a-z'-]*(?:\s+[a-z][a-z'-]*){0,2}\s+"
-    r"(?:[a-z]+ly\s+)?[a-z][a-z'-]{1,}s\s+[^,;:.!?()]+\s+so\s+please\s+"
+    r"(?:[a-z]+ly\s+)?[a-z][a-z'-]{1,}s\s+[A-Za-z0-9][^,;:.!?()]*\s+so\s+please\s+"
     r"(?!(?:the|a|an|my|your|his|her|its|our|their|this|that|these|those)\b)[a-z][a-z'-]*\b")
 
-POLICY = {"version": 5, "max_choices": 8, "max_rendered_chars": 800,
+POLICY = {"version": 6, "max_choices": 8, "max_rendered_chars": 800,
           "aggregate_rendered_utf8_bytes": 4096, "minimum_words": 6,
           "paragraph_edges": "both-visible-in-one-passage", "cross_passage_join": False,
           "rendering": "whitespace-only-with-neutral-curly-quotation",
@@ -28,7 +28,8 @@ POLICY = {"version": 5, "max_choices": 8, "max_rendered_chars": 800,
           "menu_filter": {"pattern": MODAL_RELATIVE.pattern, "case_sensitive": False,
                           "stage": "after-selection-no-refill", "unit": "whole-choice"},
           "assertion_imperative": {"pattern": ASSERTION_IMPERATIVE.pattern,
-                                   "connectives": 1, "case_sensitive": True},
+                                   "connectives": 1, "case_sensitive": True,
+                                   "whitespace": "render-normalized-before-witness"},
           "context": "full-passage-and-source-metadata-once-per-reference",
           "commit_proof": "stored-receipt-and-held-proof-with-exact-publication-envelope"}
 PREFIX = 'A cited source states: “'
@@ -93,8 +94,9 @@ def rejection(sentence):
         return 'explicit_conclusion_requires_context'
     # This bounded shape admits a whole assertion followed by its explicit
     # request. It is a grammar witness, not evidence of relevance or truth.
-    imperative = (len(re.findall(r'\bso\s+please\b', sentence)) == 1
-                  and ASSERTION_IMPERATIVE.search(sentence))
+    normalized = flat(sentence)
+    imperative = (len(re.findall(r'\bso\s+please\b', normalized)) == 1
+                  and ASSERTION_IMPERATIVE.search(normalized))
     if not FINITE.search(sentence) and not PERSONAL_VERB.search(flat(sentence)) and not imperative:
         return 'no_conservative_finite_clause_witness'
     return None

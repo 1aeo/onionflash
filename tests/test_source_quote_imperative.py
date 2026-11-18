@@ -50,6 +50,35 @@ def test_navigation_fragments_and_unrecognized_clause_shapes_stay_excluded(sente
     assert source_quote.available(public, packet) == []
 
 
+@pytest.mark.parametrize("spacing", [" ", "   ", "\t", "\n", "\u00a0", " \t\n\u00a0 "])
+@pytest.mark.parametrize("before", ["The release notes", "The update reduces"])
+def test_spacing_cannot_supply_the_missing_assertion_object(before, spacing):
+    sentence = before + spacing + "so please restart workers."
+    assert source_quote.rejection(sentence) == "no_conservative_finite_clause_witness"
+    public, packet = fixture("Introduction.\n\n" + sentence + "\n\nFollowing context.")
+    assert source_quote.available(public, packet) == []
+
+
+@pytest.mark.parametrize("object_text", ["\u200b", "\u200c", "\ufeff", "\u0301", "\u200b\u0301\ufeff"])
+@pytest.mark.parametrize("before", ["The release notes", "The update reduces"])
+def test_invisible_or_mark_only_text_cannot_supply_an_assertion_object(before, object_text):
+    sentence = before + " " + object_text + " so please restart workers."
+    assert source_quote.rejection(sentence) == "no_conservative_finite_clause_witness"
+    public, packet = fixture("Introduction.\n\n" + sentence + "\n\nFollowing context.")
+    assert source_quote.available(public, packet) == []
+
+
+@pytest.mark.parametrize("spacing", [" ", "   ", "\t", "\n", "\u00a0", " \t\n\u00a0 "])
+def test_valid_request_spacing_matches_its_rendered_sentence(spacing):
+    sentence = SENTENCE.replace(" so please", spacing + "so please")
+    public, packet = fixture("Introduction.\n\n" + sentence + "\n\nFollowing context.")
+    choices = source_quote.available(public, packet)
+    assert [choice["rendered"] for choice in choices] == [QUOTE]
+    origin = choices[0]["origins"][0]
+    passage = packet["sources"][0]["passages"][1]["text"]
+    assert passage[origin["start"]:origin["end"]] == sentence
+
+
 @pytest.mark.parametrize("transform", [
     lambda text: text[:-1] + "?",
     lambda text: text.replace("workers", "`workers`"),
