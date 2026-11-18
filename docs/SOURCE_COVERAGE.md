@@ -57,6 +57,11 @@ The category RSS feed was checked on November 15, 2026. Each entry contains the
 topic's opening announcement, publication date and topic permalink; replies are
 not included, even when the topic has multiple posts. The existing RSS collector
 keeps the announcement body, including operational context and future plans.
+For Discourse RSS, it removes the generated trailing post/participant counter and
+matching topic-navigation link before normalizing the body. Counts within the
+announcement and real body edits remain source content. Previously stored items
+may receive one ordinary revision when first collected without the trailer;
+historical source snapshots and saved review bindings are not rewritten.
 `official` describes this selected release-announcement stream, not the forum as
 a whole, a display name, or community replies. The stream is separate from
 `tor-announce` because announcements need not have identical text across channels.
