@@ -8,7 +8,7 @@ from .util import normalize_evidence, safe_canonical_url
 
 
 # Advance when claim recognition, citation scope or evidence availability changes.
-POLICY = {"version": 11, "scope": "current-story-citations", "update": "unchanged",
+POLICY = {"version": 12, "scope": "current-story-citations", "update": "unchanged",
           "uncertain_language": "defer-to-semantic-review",
           "own_text": "raw-mapping-before-nonnarrative-masking",
           "raw_markup": "defer-completion-language-without-parsing"}
@@ -22,6 +22,10 @@ _DENIED = re.compile(rf"\b(?:{_NEGATIVE_OR_MODAL})\b(?:\s+\w+){{0,6}}\s*$|"
                      r"\bto\b(?:\s+(?!(?:is|are|was|were|has|have|had|got)\b)\w+){0,6}\s*$", re.I)
 _PURPOSE_COORDINATION = re.compile(
     r"\bto\b(?:\s+(?!(?:be|get|have|been|being|and)\b)\w+){1,6}\s+and\s+"
+    r"(?:(?:even|yet|ever|actually|finally|\w+ly)\s+)*$", re.I)
+_PARTICIPIAL_COMPLEMENT = re.compile(
+    r"\b(?:[a-z]+(?:ed|en)|built|done|read|set)\s+"
+    r"(?:(?:even|yet|now|already|ever|actually|finally|well|\w+ly)\s+)*and\s+"
     r"(?:(?:even|yet|ever|actually|finally|\w+ly)\s+)*$", re.I)
 _DIRECT_DENIED = re.compile(
     r"\b(?:not|never|cannot|should|must|will|would|could|may|might|to|no)\s+"
@@ -76,7 +80,10 @@ def _denied_completion(prefix):
         return False
     # A bare past predicate may follow a non-passive purpose clause. Preserve
     # enclosing negation/modal scope and infinitives such as "to be reviewed".
-    if not _PURPOSE_COORDINATION.fullmatch(denied[0]):
+    # A possible object complement withholds this exception. Its morphology
+    # does not establish grammar or completion, even with trailing adverbs.
+    if (not _PURPOSE_COORDINATION.fullmatch(denied[0])
+            or _PARTICIPIAL_COMPLEMENT.search(denied[0])):
         return True
     return bool(_EARLIER_DENIAL.search(prefix[:denied.start()]))
 

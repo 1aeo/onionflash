@@ -33,6 +33,7 @@ def test_plural_purpose_clause_keeps_affirmative_completion(field):
 @pytest.mark.parametrize("text", [
     "We worked to improve parsing and merged the fix.",
     "We worked to improve parsing\nand finally merged the fix.",
+    "We worked to improve reviewed code and merged the fix.",
 ])
 def test_coordinated_past_completion_is_outside_a_nonpassive_purpose(field, text):
     public = target()
@@ -40,6 +41,31 @@ def test_coordinated_past_completion_is_outside_a_nonpassive_purpose(field, text
     assert merge_evidence.claim_fields(public) == [field]
     check(packet(), True, public)
     check(packet(text), False, public)
+
+
+@pytest.mark.parametrize("text", [
+    "We want to see the fix reviewed and merged.",
+    "We want to see the fix reviewed carefully and merged.",
+    "We want to see the fix approved and merged.",
+    "We want to see the fix written and merged.",
+    "We want to see the fix built and merged.",
+    "We want to see the fix done and merged.",
+    "We want to see the fix read and merged.",
+    "We want to see the fix set and merged.",
+])
+def test_prospective_object_complements_do_not_receive_the_coordination_exception(text):
+    public = target()
+    public.update(state="developing", summary=text)
+    assert merge_evidence.claim_fields(public) == []
+    check(packet(), False, public)
+
+
+@pytest.mark.parametrize("field", ["title", "why_it_matters"])
+def test_prospective_object_complement_remains_nonaffirmative_in_other_fields(field):
+    public = target()
+    public.update(state="developing", **{field: "We want to see the fix reviewed and merged."})
+    assert merge_evidence.claim_fields(public) == []
+    check(packet(), False, public)
 
 
 @pytest.mark.parametrize("text", [
@@ -84,6 +110,21 @@ def test_native_coordinated_future_intent_is_not_an_asserted_merge(context):
     config, store = context
     text = "The patch is to be reviewed and merged."
     row, writer = pending_merge(store, evidence=text + "\n\n" + IMPACT, prose=True)
+    writer.result["summary"] = text
+    checker = reviewer(config, verdict(), verdict())
+    result = run_gate(config, store, row, writer, checker)
+    assert checker.calls == 2 and result["status"] == "published"
+    assert store.stories()[0]["why_it_matters"] == IMPACT
+
+
+@pytest.mark.parametrize("text", [
+    "We want to see the fix reviewed and merged.",
+    "We want to see the fix reviewed carefully and merged.",
+])
+def test_native_object_complement_does_not_add_a_false_completion_hold(context, text):
+    config, store = context
+    evidence = "The maintainers request a completed review and integration of the fix.\n\n" + IMPACT
+    row, writer = pending_merge(store, evidence=evidence, prose=True)
     writer.result["summary"] = text
     checker = reviewer(config, verdict(), verdict())
     result = run_gate(config, store, row, writer, checker)
