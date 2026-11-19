@@ -9,12 +9,16 @@ from .review_evidence import _words
 from .schema import FIELD_LIMITS
 
 MODAL_RELATIVE = re.compile(r',\s*which\s+(?:can|could|may|might|must|shall|should|will|would)\b', re.I)
+# The optional witness needs a direct nominal complement. A prepositional
+# phrase can instead continue the subject, leaving only a request fragment.
+CLAUSE_LINKER = r'(?:about|above|across|after|against|along|among|around|as|at|before|behind|below|between|beyond|by|despite|during|for|from|in|into|of|off|on|onto|over|through|to|toward|under|until|upon|via|with|within|without|and|or|but|so)'
+SUBJECT_WORD = rf"(?!(?:{CLAUSE_LINKER}|the|a|an|this|that|these|those)\b)[a-z][a-z'-]*"
 ASSERTION_IMPERATIVE = re.compile(
-    r"^(?:This|That|The)\s+[a-z][a-z'-]*(?:\s+[a-z][a-z'-]*){0,2}\s+"
-    r"(?:[a-z]+ly\s+)?[a-z][a-z'-]{1,}s\s+[A-Za-z0-9][^,;:.!?()]*\s+so\s+please\s+"
+    rf"^(?:This|That|The)\s+{SUBJECT_WORD}(?:\s+{SUBJECT_WORD}){{0,2}}\s+"
+    rf"(?:[a-z]+ly\s+)?[a-z][a-z'-]{{1,}}s\s+(?!{CLAUSE_LINKER}\b)[A-Za-z0-9][^,;:.!?()]*\s+so\s+please\s+"
     r"(?!(?:the|a|an|my|your|his|her|its|our|their|this|that|these|those)\b)[a-z][a-z'-]*\b")
 
-POLICY = {"version": 6, "max_choices": 8, "max_rendered_chars": 800,
+POLICY = {"version": 7, "max_choices": 8, "max_rendered_chars": 800,
           "aggregate_rendered_utf8_bytes": 4096, "minimum_words": 6,
           "paragraph_edges": "both-visible-in-one-passage", "cross_passage_join": False,
           "rendering": "whitespace-only-with-neutral-curly-quotation",
