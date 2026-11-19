@@ -42,7 +42,8 @@ packet-date check, since confidential HackerOne reports are routinely made publi
 months after filing; on `tor-dev`, `trusted-operator` senders share `project-sender`
 eligibility for formal `[Proposal]` posts as well as substantive technical
 critiques, protocol reviews, and empirical multi-relay measurements while keeping
-`confidence` `reported`). That development is the post, creation, merge, tag or timeline event date, a
+`confidence` `reported`; the additional [contributor eligibility](#developer-evidence)
+does not waive recency). That development is the post, creation, merge, tag or timeline event date, a
 verified public comment, or the date an issue was closed; an upstream
 `updated_at`, which an edit, a label or a visibility change also moves, never
 counts. Updates of existing stories, locked ones included, still go to review,
@@ -64,6 +65,28 @@ come before its description, so a long description is cut first. Comment passage
 name their author, so comment text cannot pose as another comment. Previous
 generated summaries are never factual evidence.
 
+Each review also receives deterministic reminders linking the current text fields
+to verbatim passages in that same packet. Matching body text, named speakers,
+whole available comments and later comment context help expose qualifications and
+corrections. Story reviews can also receive literal tag-source metadata; new story
+reviews can receive signed date arithmetic with the originating source fields and
+passage references. These are informational context, not candidate defect findings,
+recency decisions or approval evidence; actual application issues remain separate.
+Story reviews can also compare literal attribution and uncertainty words in current
+fields with uncertainty spans in exactly cited matching narrative. Each available
+passage is inspected independently at its original offsets. Multi-passage
+notes are omitted when any available text carries possible code, quote, HTML or
+indentation boundaries; chunks are never reconstructed and gaps are never inferred.
+Text containing HTML-like markup and replies without an exact mapping into the
+sender's `unquoted_content` are also omitted from annotations. These checks locate
+available unmarked text, not complete Markdown structure; omission has no factual
+meaning. Qualifier annotations are not added to update requests, never require an
+edit or hold, and never authorize approval.
+The complete packet remains unchanged; reminders never establish support,
+authority, news value or absence of evidence. Update reminders use only the newest
+entry and its cited sources. Reminder construction is part of the review policy
+identity, so changing it invalidates earlier approval reuse.
+
 A separate, bounded coverage background contains the existing article for a
 known update (`prior_story`, never repeated in `recent`) and compact entries
 ordered by recent story activity (`updated_at` or `added_at`). Up to six active
@@ -78,8 +101,8 @@ character bound (or unreadable). Coverage is used only to compare novelty, and
 it alone decides duplication: a source's own claim that an item is a duplicate,
 already covered or unimportant is attributed to that source. The review prompt
 marks the background as data, not an instruction, and forbids using it as
-evidence; validation checks the structure of a verdict, not the reasoning behind
-it. The background reads committed stories, so an article accepted earlier in
+evidence; validation checks verdict structure and obvious generation loops, not
+factual correctness of the reasoning. The background reads committed stories, so an article accepted earlier in
 the same run is visible before the site rebuild.
 
 The reviewer evaluates nine independent criteria. Its reply gives each
@@ -98,18 +121,92 @@ criterion before the verdict:
 | News value | Require a concrete development worth publishing, judged from the sources, not only the draft. |
 | New information | Require meaningful new facts, not quoted history; only existing coverage shows a duplicate, and a correction of the existing article is new. |
 
+### Developer evidence
+
+Publication attribution uses a person's name without an occupational title, even
+when the occupation is supported. A deterministic style pass runs after drafting
+and before the first review, and again before each proposed repair is verified.
+It removes bounded role/name/action prefixes and comma appositives while keeping
+the name, reporting action, useful impact and other sentence content. Anonymous
+operational references and groups retain their source-stated function, entity
+relationship, number and qualifiers. An entity's operator, the operator of an
+authority, or maintainers reporting a judgment do not need an invented personal
+name or a vague person/people substitute. The reviewer still checks their factual
+support and authority; the style pass never establishes either. Audiences, genuine
+quotations, code, negation, organization names and occupational events such as
+retirement remain content. Ambiguous recognized personal-role clauses remain
+intact for repair or a final hold, never an unsafe partial rewrite. Complete
+ASCII quotations may span soft line breaks. No edit may cross a protected quote
+or code span; ambiguous quote boundaries keep the original text for review.
+
+The bounded grammar recognizes developer, maintainer, operator, researcher,
+engineer, contributor, reporter and sender labels with common project/role
+qualifiers. It is a style rule, not general natural-language identity recognition.
+Unambiguous named/called/known-as prefixes retain the literal introduced name;
+actual calling or naming actions keep their original actor. Project-qualified
+plural collectives remain literal collective attributions, not an official
+organizational voice. Unqualified reporter/sender references remain available to
+distinguish participants. Unambiguous personal identified-as appositives omit the
+role while keeping the literal name and reporting action. Unknown personal-role
+modifiers and ambiguous named entity/function appositives remain intact for repair;
+entity relations and their pronoun antecedents must not be discarded. Metadata
+actor labels such as project-sender are not substitute identities and remain
+repair/hold cases.
+For these recognized unresolved forms, the existing review request includes a
+conditional application issue naming the exact current field, character offsets
+and literal unresolved form as untrusted data. It asks for minimal, fact-preserving
+style repair in actor-and-action, rather than flagging already-correct names or
+anonymous functional references. It does not add a stage or request budget; any edit still needs
+fresh verification, and an unresolved form still holds before publication. Existing
+release-label issues and validation feedback remain present alongside that issue.
+Only title, summary and impact are editable for a story; an update edits only its
+newest entry. Prior updates and read-only story text remain unchanged. No style
+edit happens after approval: the exact normalized text receives fresh verification,
+and cached, operator and final commit checks reject a remaining recognized role.
+The style contract is part of review policy identity; old policy approvals are
+not reused, and genuine version-two records restart review from their retained
+draft without a schema migration. Writer prompts, generated responses and their
+cache identities are unchanged. Evaluation retains original input/gold separately
+from the normalized review target. It also records whether final text changed
+relative to that target and whether a style edit removed a lexical error marker.
+Such marker removal is not proof that an unrelated factual flaw was repaired;
+source assessment must compare the original, normalized and final wording.
+
+Contributor eligibility still requires supplied evidence of code authored by the
+same person and committed into C Tor or Arti. Another person's work, unrelated
+repositories, self-description, technical fluency, mailing-list participation,
+sender domains and proposed or unmerged code do not establish that qualification.
+It does not depend on retaining a developer label in the published sentence.
+
+On tor-dev, this verified contribution evidence also makes substantive technical
+critiques, protocol reviews and empirical multi-relay measurements eligible across
+the two projects, even from a `community` source. It does not make routine comments
+news, change source authority, establish `confirmed` confidence, corroborate an
+operational attack claim, or waive significance, staleness and factual checks.
+Existing source classifications and deterministic incident guards remain unchanged;
+there is no identity lookup or inferred contributor metadata.
+An otherwise substantive review may discuss a current unmerged patch when prior
+committed code establishes the contributor; keep that patch's proposed status.
+
 A draft has a concise factual summary and may have one `why_it_matters` sentence:
-a close, attributed restatement of one source sentence that states the event's
-impact or an action it asks its readers to take, with that sentence's audience,
-hedges and scope. Most drafts leave it empty. Validation clears a sentence with a
+a close, attributed restatement of one explicit source impact or reader-action
+anchor. Minimal directly governing supplied context may resolve referents and
+preserve audience, conditions, scope, timing, lifecycle and disagreement; it does
+not permit assembling additional consequences from other passages. Most drafts
+leave it empty. Validation clears a sentence with a
 number or version absent from the title, unquoted reply text or content and comment
 bodies the writer saw (source metadata does not count), on an untrusted `community`
 `lists.torproject.org` post, or when it contains unnormalized all-caps shouting
 or a nonexistent three-part C-Tor version; drafts with unnormalized all-caps
 shouting in the headline, summary or update, or mailing-list reply evidence quoting
 only `>`-quoted history are refused.
-Historical impact text remains readable. A review repair may clear it, but cannot
-create or rewrite an impact paragraph; operator corrections remain separate.
+Historical impact text remains readable. Story review may keep or clear the
+impact field. For a defective nonempty field, it may instead select one eligible
+exact source quotation; once quoted, the field may only be kept or cleared.
+Review cannot freely rewrite impact text or populate an empty field. Literal
+provenance alone does not establish support or usefulness: the [ordinary full
+verification](#decisions-and-calls) must check the exact repaired candidate
+before publication. Operator corrections remain separate.
 Automatic approvals also require consistent metadata: a `release` category or
 tag needs state `released` or `tagged`. An approval of inconsistent labels gets a
 repair request that names the problem, then a fresh verification of the repaired
@@ -192,7 +289,33 @@ story; see [merging duplicate stories](EDITORIAL.md#merge-a-duplicate-story).
   value can be approved as reviewed.
 
 A later review that disagrees with the first on whether news value and new
-information both pass holds the item, whatever its verdict. A later review that
+information both pass normally holds the item. A new story may instead receive
+one title/summary repair when the first review passed both editorial checks and
+a verification explicitly fails only news value while proposing a real prose edit.
+The current and repaired titles must name the same single release identity as
+one cited official release feed, identified by the existing release classifier.
+Its publication date must fall within the 14 days before the incoming item's
+revision date, and the packet must have no missing or truncated source context.
+This admits only a fresh full verification, never an approval or released state;
+a second verification news failure holds. Existing targets, updates, literal tag
+notices, duplicate routing, other failures and the normal repair limits retain
+their rules.
+
+For the opposite direction, an initial `revise` may fail news value while passing
+new information and make an effective title or summary repair. The same release
+anchor must be bound to the current prepared packet; an explicitly historical
+snapshot cannot supply it. The edit may also keep, clear or
+select an ordinarily valid impact quotation; it cannot change labels, sources or
+dates. If fresh full verification approves that exact repaired candidate, one
+additional fresh full verification checks the same candidate without seeing the
+earlier reviews. Only two such approvals can resolve the initial news disagreement.
+Any refusal on the additional check holds the item. Final checks, label limits
+and the shared seven-request budget still apply; the release anchor does not
+grant approval or waive a failed criterion. Invalid release labels at the end of
+this recovery hold the item without requesting a label edit that would fall
+outside its exact two-approval history.
+
+A later review that
 agrees the item is not news may skip it, but a repair it proposes is not applied:
 the item is held. The official items above are always verified before their
 hold: a later review's repair of their facts is applied and verified, and when
@@ -210,20 +333,49 @@ and an update-scope skip that names an overlapping published duplicate in
 it starts others.
 
 A refusal whose criteria all pass remains an invalid reply, never an approval.
-Only a complete, structurally valid `revise` edit may become an **untrusted
-proposal**. It must change the text, obey the packet's label limits, avoid a
-previously reviewed candidate, and leave literal tag notices untouched. The
-application saves its error, edits, candidate hashes and disposition separately
-from validated reviews, then requires a fresh verification of that exact text.
-The previous reply is never included in the verifier's input. Pending proposals
-bypass cached approvals and cannot borrow facts verified for an earlier text.
-
-If that invalid reply has no usable edit, the ledger permits one logical
-validation-correction request. It reviews the same candidate, packet, scope and
-coverage, with only a fixed corrective instruction and the application's quoted
-validation error added. The rejected criteria and proposed edits are not input or
-approval evidence. A valid correction enters the ordinary review stage: an initial
-approval still needs its fresh verification, and an existing valid review remains
+Reasons dominated by tandem repetition in multiple criteria are also invalid.
+Repeated spans are counted once each and summed, including repetition interrupted
+by other fragments; overlapping matches cannot inflate the repeated coverage.
+The same minimum repeated-character count and coverage threshold apply
+regardless of verdict or proposed edits. This language-neutral check does not assess
+the factual quality of otherwise readable reasons. A corrupted reply supplies no
+trusted rejection or untrusted edit. It may use the same single durable correction
+slot as an inconsistent verdict, with only its fixed validation error as feedback;
+it never receives a second slot or a fresh request budget. Repeated corruption is
+logged separately as `failed.review.degenerate_reasons`. Private evaluation counts
+raw corrupted replies separately from verdict inconsistencies and successful recovery.
+An explicit named reporting clause also cannot pass `actor_and_action` when its
+literal name is absent from the relevant packet text and actual author metadata.
+The narrow initial check recognizes short capitalized names, explicit account
+handles and names in scripts without letter case in reporting clauses and
+"according to" forms, ignoring generic source/role/pronoun subjects and code examples. It performs no
+fuzzy spelling, transliteration or identity lookup. Source-name presence is not
+proof that the person made a statement and never establishes approval.
+Combining marks stay with the complete token. Unsupported joined-name syntax is
+skipped whole, never reduced to a suffix; formal document identifiers are not
+classified as people. Source URLs remain excluded from personal-name evidence.
+Missing-name locations are supplied only when found, as application data beside
+the unchanged packet. An invalid actor pass may use the same single correction
+slot, without using the rejected reply's edits. Repairs must preserve the report
+and use neutral public attribution rather than guess a replacement identity.
+Within the review context, absent names are rematerialized from the original
+prepared candidate and applied edits in the existing history. Their presence in
+any current target field remains a failure after a case, grammar, quoting or field
+change. These earlier texts supply suspected names, never factual evidence; each
+name's absence is checked against the packet again. No additional state or budget
+is created, and discarded review contexts do not supply names.
+Fresh verification remains mandatory. The matching final and commit-boundary
+check also protects cached approvals and operator publication; update checks
+apply only to the newest update and its cited source scope, never prior text.
+An invalid reply never edits the candidate, even when its proposed edit is
+structurally valid. The application records the error and request identity
+separately from validated reviews, with no applied proposal. The ledger permits
+one logical validation-correction request at the same stage, with the unchanged
+candidate, packet, scope and coverage. Only a fixed corrective instruction and
+the application's quoted validation error are added. The rejected criteria and
+proposed edits are not input or approval evidence. A valid correction enters the
+ordinary review flow: an initial approval still needs its fresh verification,
+and an existing valid review remains
 the only possible disagreement anchor. Literal tags and fixed labels are not edited
 to make a rejected proposal usable.
 
@@ -235,14 +387,16 @@ correction. An unknown in-flight reservation fails closed; a known unsent deadli
 can refund its physical reservation. Automatic context changes abandon stale
 feedback while retaining the correction slot and spent requests.
 
-For untrusted-edit recovery after an invalid initial reply, the first valid
-verification is the first trusted news decision. Later trusted decisions still obey the ordinary
-disagreement rule. A changed source context discards the pending proposal and
-starts again from a freshly assembled candidate. Raw inconsistencies, accepted
-proposals and unresolved recovery outcomes remain distinct in the private
-evaluation; a hold caused by an unusable or repeated repair is not a successful
-recovery. Malformed or no-op edits are never applied. Damaged saved recovery state
-always fails closed.
+Historical compatibility retains replay of saved **untrusted proposals** from
+earlier policies; current invalid replies never create an accepted proposal.
+Those historical proposals require fresh verification of their exact text and
+bypass cached approvals. After an invalid initial reply in such a history, the
+first valid verification supplies the first trusted news decision. Later trusted
+decisions obey the ordinary disagreement rule. A changed source context discards
+the pending proposal and starts from a freshly assembled candidate. Raw
+inconsistencies, historical accepted proposals and unresolved recovery outcomes
+remain distinct in the private evaluation; a hold caused by an unusable or repeated
+repair is not a successful recovery. Damaged saved recovery state fails closed.
 
 Every endpoint attempt, including invalid replies and fallback attempts, spends
 the same seven-request budget. Reservations are saved before sending, so an
@@ -274,7 +428,7 @@ an older policy can justify a fresh budget; older verdict schemas remain readabl
 
 ## Final checks
 
-A verified approval publishes only if seven fixed checks also pass. They read the
+A verified approval publishes only if nine fixed checks also pass. They read the
 exact candidate, its source packet and the kind of source that wrote its text,
 make no model call, and run again when a saved approval is resumed. A failed
 check holds the item for the operator with its own [decision code](DECISIONS.md);
@@ -291,6 +445,14 @@ skips are not checked.
   against its own cited source (and any merged merge requests in the packet). A
   contraction such as "wasn't" counts as a negation, and a word the story itself
   marks as requested, planned or not done claims nothing.
+- A current story's `merged` state or affirmative merge wording needs a cited
+  merged-request record or its own unquoted completion statement. A commit,
+  closed issue, private-request reference or fixed-version listing alone does
+  not establish integration. Clear landed or branch-application statements are
+  also available evidence; ambiguous wording remains with semantic review.
+  This check guides an ordinary minimal repair before fresh verification and
+  also holds an ignored unsupported claim. It does not recheck UPDATE context
+  or turn an evidence candidate into approval.
 - When a source hedges a compromise ("plausibly compromised", "may have been
   hacked"), a new headline or update entry about the compromise keeps a qualifier.
 - Public story text (`title`, `summary`, `why_it_matters`) or a new update entry
@@ -304,6 +466,14 @@ skips are not checked.
   numbered Tor proposal, and IETF Internet-Draft or IETF RFC specifications that
   propose defenses without asserting a live operational incident are allowed.
 
+- Recognized personal attribution must already satisfy names-only publication
+  style (`personal_attribution`). The final check rejects; it never edits approved text.
+
+- An explicit named reporting clause (`named_attribution`) needs its literal name
+  in the scoped packet text, author metadata or exact sender domain. Suspected
+  names are rebuilt from observed, applied edits in saved review history, so a
+  case, grammar, quotation or field change cannot hide a previously absent name.
+
 The writer's request and every review's repair offer only the confidence,
 state and category labels that these checks allow (and `tagged` only when a
 source is a version tag), and a draft outside them is refused like any other
@@ -313,9 +483,12 @@ invalid draft.
 
 Decisions bind the normalized candidate, source packet, coverage background,
 review policy, and current source/story/editorial state. A job resumed in a
-later run starts a new review if any of them changed. A candidate is prepared
-and committed in the same run, under the run lock, so the commit does not
-recheck them; publication never remerges different wording afterward.
+later run starts a new review if any of them changed. At commit, the application
+checks the receipt against the candidate, source, policy and binding hashes,
+verifies the prepared binding, and validates the saved decision. These are
+integrity checks on the publication proof; they do not request another model
+review or rewrite the candidate. Publication never remerges different wording
+afterward.
 
 Private review jobs keep unfinished work, and a decision's receipt lasts until
 that decision commits. The analysis audit keeps the source, packet, coverage and
@@ -337,6 +510,19 @@ bounds, the reply length and the repair limit are fixed, so the model endpoint
 needs enough context for a full packet. Requests also obey the shared run
 deadline. The coverage background is bounded separately; truncation is explicit
 and never proves the absence of older coverage.
+
+Non-thinking review requests retain the general generation settings, except that
+Nemotron 3 uses its supported temperature 1 and top-p 0.95 profile. Standard API
+requests omit native sampling extensions. Writer and link-check sampling remain independent.
+Every effective review generation option participates in the
+policy identity, so an earlier profile's approvals cannot be reused unchanged.
+
+`review.reasoning = true` enables a separate full-thinking profile for final reviews
+and verification, with a larger completion allowance. The default model family uses
+xhigh effort; Nemotron 3 uses its full-thinking template. The endpoint must support
+chat-template extensions. This setting does not change writer or link-check reasoning.
+`review.model` continues to select both the final reviewer and link-check model, so
+changing that model requires validating both uses.
 
 The controlled evaluation does not collect, open the application database or
 publish. It takes the gate's steps, from the first review through every repair
@@ -378,10 +564,14 @@ explicit `--cases` replaces the default case files and may be repeated.
 Judged cases carry an `audit`, naming a set labeled by independent reviewers,
 and a `flaw` unless the reviewers found the draft clean. A flawed case is caught
 when its flaw never publishes and the news is not skipped; a clean case must
-publish unchanged, and anything else is a false alarm. A catch is paired only
-when every clean case on the same packet was right in the same round, and a
-refusal also needs one such case in the run, so refusing an item never counts as
-catching its flaw. The run fails unless paired catches reach 90% overall and 80%
+publish unchanged from `review_candidate`, the normalized input the reviewer
+actually received. Required style edits are not reviewer false alarms. The
+original `candidate`, gold and unsupported-claim checks remain unchanged;
+`legacy_raw_ok`, `legacy_raw_judged` and the `legacy_raw_*_rate` summary fields
+retain the original-input comparison. A catch is paired only when every clean
+case on the same packet was right in the same round, and a refusal also needs
+one such case in the run, so refusing an item never counts as catching its flaw.
+The legacy paired score uses the legacy raw clean-twin results independently. The run fails unless paired catches reach 90% overall and 80%
 for each flaw with at least 10 distinct cases, with at most 10% false alarms.
 Use `--rounds 2` for acceptance, and add each new audit's labeled set before the
 prompt changes it leads to.

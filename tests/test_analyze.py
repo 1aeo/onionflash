@@ -127,6 +127,104 @@ def test_impact_versions_keep_their_prerelease_qualifier(source_version, sentenc
         **draft, "why_it_matters": sentence if kept else ""}
 
 
+@pytest.mark.parametrize("source_value", ["wait of 48h", "waited 48h", "48h wait", "waits 48h", "wait `48h`"])
+@pytest.mark.parametrize("impact_value", ["wait of 48h", "waited 48h", "48h wait", "waits 48h", 'wait "48h"'])
+def test_literal_hour_values_keep_existing_acceptance_across_prose(source_value, impact_value):
+    source = f"The report describes a {source_value} before service resumes."
+    draft = analysis(why_it_matters=f"The report describes a {impact_value} before service resumes.", evidence=[source])
+    assert validate_analysis(copy.deepcopy(draft), item(title="Reported waiting interval", content=source)) == draft
+
+
+@pytest.mark.parametrize("source_value, impact_value", [
+    ("wait another 48h", "wait 48 hours"),
+    ("wait 48 hours", "wait 48h"),
+    ("wait 1h", "wait 1 hour"),
+    ("wait 2h", "wait two hours"),
+    ("wait two hours", "wait 2h"),
+    ("wait 0048h", "wait 48 hours"),
+    ("wait 48 hours", "wait 0048h"),
+    ("wait (48h)", "wait 48 hours"),
+    ("wait of 48-hour", "wait 48h"),
+    ('wait another "48h"', "wait 48 hours"),
+    ("wait another `48h`", "wait 48 hours"),
+    ("wait 48 hours", "wait `48h`"),
+    ("wait `48 hours`", "wait 48h"),
+    ("wait of ```text 48 hours ```", "wait 48h"),
+    ("wait of ```text 48 hours ````", "wait 48h"),
+    ("wait 48 hours", 'wait of "48 hours"'),
+])
+def test_unmatched_hour_spelling_can_use_the_same_source_duration(source_value, impact_value):
+    source = f"The operator reports a {source_value} before retrying."
+    draft = analysis(why_it_matters=f"The report describes a {impact_value} before retrying.", evidence=[source])
+    assert validate_analysis(copy.deepcopy(draft), item(title="Reported waiting interval", content=source)) == draft
+
+
+@pytest.mark.parametrize("source_value, impact_value", [
+    ("wait 48h", "wait 49 hours"),
+    ("wait 48h", "wait 48 minutes"),
+    ("wait 48m", "wait 48 hours"),
+    ("wait 2 days", "wait 48 hours"),
+    ("wait 48h", "wait 48 hours while 48 relays reconnect"),
+    ("wait 48h", "wait 48 hours and then 48 minutes"),
+    ("wait 48h", "48 relays reconnect and wait 48 hours"),
+    ("wait 48h", "wait 48 hours and then 48"),
+    ("wait 48h", "wait 48 hours using version 1.2.3"),
+    ("wait 48 hours", "version 48h"),
+    ("wait 48 hours", "version 48h wait"),
+    ("wait 48 hours", "`wait 48h`"),
+    ("version 48h", "wait 48 hours"),
+    ("version 48h wait", "wait 48 hours"),
+    ("hex value 48h", "wait 48 hours"),
+    ("value 48h", "wait 48 hours"),
+    ("`wait 48h`", "wait 48 hours"),
+    ("```asm wait 48h ```", "wait 48 hours"),
+    ("```asm `opcode` wait 48h ````", "wait 48 hours"),
+    ("~~~asm wait 48h ~~~~", "wait 48 hours"),
+    ("wait 48h-rc1", "wait 48 hours"),
+    ("wait 48h+build1", "wait 48 hours"),
+    ("wait 48h_id", "wait 48 hours"),
+    ("wait v48h", "wait 48 hours"),
+    ("wait 1.48h", "wait 48 hours"),
+    ("wait 48h.1", "wait 48 hours"),
+    ("wait 0x48h", "wait 48 hours"),
+    ("wait 48h", "wait 48 hours and 48 relays using `48h`"),
+])
+def test_hour_aliases_do_not_forgive_other_unsupported_occurrences(source_value, impact_value):
+    source = f"The report specifies {source_value}."
+    draft = analysis(why_it_matters=f"The report specifies {impact_value}.", evidence=[source])
+    assert validate_analysis(draft, item(title="Reported waiting interval", content=source))["why_it_matters"] == ""
+
+
+def test_duration_alias_does_not_expand_the_existing_literal_guard():
+    # Existing numeric acceptance is preserved; this guard does not judge units
+    # when the same literal number was already present in the source.
+    source = "The operator reports a wait of 48 hours."
+    draft = analysis(why_it_matters="The report specifies 48 minutes.", evidence=[source])
+    assert validate_analysis(copy.deepcopy(draft), item(title="Reported waiting interval", content=source)) == draft
+
+
+def test_hour_alias_preserves_prerelease_suffix_checks():
+    source = "The operator reports a wait of 48h using version 1.2.3-rc1."
+    draft = analysis(why_it_matters="The report describes a wait of 48 hours using version 1.2.3.", evidence=[source])
+    assert validate_analysis(draft, item(title="Reported waiting interval", content=source))["why_it_matters"] == ""
+
+
+def test_validation_policy_changes_cache_identity_without_changing_writer_requests(monkeypatch):
+    from onionflash import analyze as module
+
+    source = item(content="The operator reports a wait of 48h.")
+    draft = analysis(why_it_matters="The report describes a wait of 48 hours.", evidence=[source["content"]])
+    row = {"content_hash": "example-content"}
+    key = cache_key(row, DEFAULTS["llm"])
+    first = analyzer(monkeypatch, completion(draft))
+    assert first.analyze(source)["why_it_matters"] == draft["why_it_matters"] and first.clears == 0
+    monkeypatch.setattr(module, "VALIDATION_VERSION", module.VALIDATION_VERSION + 1)
+    assert cache_key(row, DEFAULTS["llm"]) != key
+    second = analyzer(monkeypatch, completion(draft))
+    second.analyze(source)
+    assert first.client.requests == second.client.requests
+
+
 def test_prerelease_words_in_prose_do_not_change_a_count():
     """Keep spelled-out prose counts distinct from prerelease version tokens."""
     source = "The developers corrected 3 connection failures. A separate release candidate is under review."

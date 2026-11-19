@@ -10,7 +10,7 @@ from onionflash.transport import FetchError
 from helpers import seed_source_story as _publish
 from helpers import analysis, make_item as item
 from helpers import LATER, Writer, job, pending, run_gate as run
-from test_review_request_budget import (context, inconsistent, pause_cached_after_reset, pause_proposal,
+from test_review_request_budget import (context, inconsistent, pause_cached_after_reset, load_legacy_proposal,
                                         record, reviewer, saved_audit)
 
 
@@ -153,7 +153,7 @@ def test_outer_policy_spoof_cannot_hide_retained_policy_evidence(context, monkey
     else:
         row = pending(store)
         if retained == "proposal":
-            pause_proposal(cfg, store, row, monkeypatch)
+            load_legacy_proposal(cfg, store, row, monkeypatch)
         else:
             if retained == "cached-proposal":
                 with pytest.raises(AnalysisError):
@@ -173,11 +173,20 @@ def test_outer_policy_spoof_cannot_hide_retained_policy_evidence(context, monkey
         store.db.execute("UPDATE review_jobs SET policy_hash=?,record_json=? WHERE item_id=?",
                          (spoofed, json.dumps(audit), row["id"]))
     before = job(store)
+    checked = []
+    original = review_gate._policy_copies
+
+    def checked_policy(record, policy):
+        checked.append(policy)
+        return original(record, policy)
+
+    monkeypatch.setattr(review_gate, "_policy_copies", checked_policy)
     current = next(r for r in store.pending(10, LATER) if r["id"] == row["id"])
     writer, checker = Writer(update_analysis()), reviewer(cfg)
     with pytest.raises(AnalysisError, match="damaged"):
         run(cfg, store, current, writer, checker)
     assert not writer.calls and checker.calls == 0 and job(store) == before
+    assert checked == [spoofed]
 
 
 def test_genuine_policy_change_accepts_coherent_nested_old_proof(context, monkeypatch):

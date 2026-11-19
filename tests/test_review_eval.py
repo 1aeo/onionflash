@@ -7,8 +7,9 @@ import stat
 
 import pytest
 
-from helpers import DATE, ROOT, load_evaluator, scripted_completion, verdict
-from onionflash import review_gate
+from helpers import DATE, ROOT, FakeLLM, analysis, completion, item, load_evaluator, scripted_completion, verdict
+from onionflash import personal_attribution, review_gate
+from onionflash.analyze import AnalysisError, Analyzer
 from onionflash.config import DEFAULTS
 from onionflash.review import CRITERIA, RELEASE_ISSUE, _packet_refs, final_holds, validate_review
 from onionflash.source_packet import build_packet
@@ -195,15 +196,17 @@ def test_editorial_skips_misses_coverage_verification_and_final_checks(evaluatio
     assert (rchk["false_approvals"], rchk["matched"], rchk["final_holds"], rchk["published_after_checks"]) == (1, 1, 1, 1)
     recs = {r["case"]: r for r in map(json.loads, chk_out.read_text().splitlines()[:-1])}
     assert recs["bastet-removed-as-done"]["final_holds"] == ["completed_action"] and "final_holds" not in recs["bastet-corrected"]
-    assert not [c["id"] for c in MOD.expand(RAW_PUBLIC) if c["expected"] == "approve" and final_holds(c["candidate"], {
-        "packet": c["packet"], "payload": {"editorial_kind": c["packet"]["sources"][0]["kind"]}})]
+    assert not [c["id"] for c in MOD.expand(RAW_PUBLIC) if c["expected"] == "approve" and final_holds(personal_attribution.normalize(c["candidate"], update=c.get("scope") == "latest_update"), {
+        "packet": c["packet"], "mode": "update" if c.get("scope") == "latest_update" else "story", "payload": {"editorial_kind": c["packet"]["sources"][0]["kind"]}})]
     corpus_holds = {
         c["id"]: (c.get("audit"), holds)
         for c in CORPUS
         if c["expected"] == "approve"
-        and (holds := final_holds(c["candidate"], {"packet": c["packet"], "payload": {"editorial_kind": c["packet"]["sources"][0]["kind"]}}))
+        and (holds := final_holds(personal_attribution.normalize(c["candidate"], update=c.get("scope") == "latest_update"), {"packet": c["packet"], "mode": "update" if c.get("scope") == "latest_update" else "story", "payload": {"editorial_kind": c["packet"]["sources"][0]["kind"]}}))
     }
-    assert all(audit == "why-it-matters-1" and holds == ["untrusted_operator_claim"] for audit, holds in corpus_holds.values())
+    assert all(audit == "why-it-matters-1" and "untrusted_operator_claim" in holds
+               and set(holds) <= {"untrusted_operator_claim", "personal_attribution"}
+               for audit, holds in corpus_holds.values())
 
     bf = by_id["bugfix-is-not-security-fix"]
     rep = {**bf["candidate"], "title": "Browser update", "summary": "An Android bugfix was released."}
@@ -223,7 +226,7 @@ def test_authored_passages_match_build_packet():
         expanded = next(c for c in MOD.expand(RAW_PUBLIC) if c["packet"]["sources"][0]["url"] == src["url"])["packet"]["sources"][0]
         assert expanded["labels"] == built["sources"][0]["labels"] == expected_labels
         assert [list(p.items()) for p in expanded["passages"]] == [list(p.items()) for p in built["sources"][0]["passages"]]
-        assert MOD.writer_item(expanded) == {k: itm[k] for k in (*fields[1:], "labels", "content", "public_comments")}
+        assert MOD.writer_item(expanded) == {k: itm[k] for k in (*fields, "labels", "content", "public_comments")}
 
     closed_raw = copy.deepcopy(RAW_PUBLIC)
     closed_raw["packets"]["tor-41412-cross-cancellation-edited"]["sources"][0]["closed_at"] = "2026-10-07T17:16:54Z"
@@ -236,6 +239,40 @@ def test_authored_passages_match_build_packet():
     c_exp = next(c for c in MOD.expand(closed_raw) if c["packet"]["sources"][0]["url"] == c_src["url"])["packet"]["sources"][0]
     assert c_exp["closed_at"] == c_built["sources"][0]["closed_at"] == "2026-10-07T17:16:54Z"
     assert "closed_at" not in MOD.writer_item(c_exp)
+
+
+@pytest.mark.parametrize("quoted_only", [False, True])
+def test_draft_evaluation_preserves_native_mailing_list_reply_input(monkeypatch, quoted_only):
+    reply = "The new measurement covers a smaller sample than the earlier report."
+    quoted = "> The earlier participant reported failures across every measured relay."
+    incoming = item(
+        id="a" * 24, kind="feed", authority="project-sender", title="Re: Relay measurements",
+        url="https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev/thread/EXAMPLE/",
+        author="casey", sender_domain="example.org",
+        content=f"{reply}\n\nOn Monday, an earlier participant wrote:\n{quoted}",
+    )
+    packet, _ = build_packet(None, incoming, {"sources": [{"id": incoming["id"], "url": incoming["url"]}]},
+                             {"sources": []}, incoming["id"])
+    evaluated = MOD.writer_item(packet["sources"][0])
+    draft = analysis(title="A reply narrows the measurement sample", summary=reply,
+                     why_it_matters="", evidence=[quoted if quoted_only else reply])
+    config = copy.deepcopy(DEFAULTS)
+    config["llm"].update(base_url="https://model.example/v1", fallback_base_urls=[])
+    monkeypatch.setenv("ONIONFLASH_LLM_API_KEY", "synthetic-fixture-key")
+    payloads = []
+    for supplied in (incoming, evaluated):
+        with Analyzer(config) as writer:
+            writer.client = FakeLLM(completion(draft))
+            if quoted_only:
+                with pytest.raises(AnalysisError) as caught:
+                    writer.analyze(supplied)
+                assert caught.value.code == "writer.quoted_only_evidence"
+            else:
+                assert writer.analyze(supplied)["summary"] == reply
+            payloads.append(json.loads(writer.client.requests[0][1]["messages"][-1]["content"]))
+    assert payloads[0] == payloads[1]
+    assert payloads[1]["author"] == "casey" and payloads[1]["sender_domain"] == "example.org"
+    assert payloads[1]["unquoted_content"] == reply and quoted not in payloads[1]["unquoted_content"]
 
 
 def test_draft_mode_drafts_once_and_isolates_writer_diagnostics(evaluation, tmp_path, monkeypatch):
@@ -356,7 +393,10 @@ def test_omissions_holds_model_verdict_release_repairs_and_fix_loop(evaluation, 
         rec = json.loads(o.read_text().splitlines()[0])
         assert (res["matched"], res["holds"], (rec["published_candidate"] or {}).get("title")) == (1, holds, pub)
         assert [e["stage"] for e in rec["reviews"]] == ["review", "review", "verification"][:len(payloads)]
-        assert [p.get("application_issue") for p in payloads] == [None, RELEASE_ISSUE, None][:len(payloads)]
+        initial_issue = payloads[0]["application_issue"]
+        assert {entry["field"] for entry in json.loads(initial_issue.split("\n", 1)[1])} == {"category", "tags"}
+        assert [p.get("application_issue") for p in payloads] == [
+            initial_issue, RELEASE_ISSUE + "\n\n" + initial_issue, None][:len(payloads)]
         assert rec["reviews"][1]["issue"] == "release_labels"
 
 

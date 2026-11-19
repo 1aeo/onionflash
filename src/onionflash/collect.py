@@ -263,11 +263,18 @@ def _feed(
         updated = _entry_time(entry, "updated", published)
         if updated < cutoff:
             continue
+        try:
+            entry_url = canonical_url(entry.get("link", ""))
+        except ValueError:
+            continue
         content_parts = entry.get("content") or []
         content = content_parts[0].get("value", "") if content_parts else entry.get("summary", "")
-        if discourse_feed and isinstance(content, str) and isinstance(entry.get("link"), str):
-            content = _without_discourse_footer(content, entry["link"])
-        text = plain_text(content, settings["content_chars"])
+        if discourse_feed and isinstance(content, str):
+            content = _without_discourse_footer(content, entry_url)
+        text = plain_text(
+            content, settings["content_chars"],
+            mark_blockquotes=urlsplit(entry_url).hostname == LIST_ARCHIVE_HOST,
+        )
         # Only an explicit text/plain title keeps its angle brackets; HTML/XHTML titles are stripped.
         title_html = (entry.get("title_detail") or {}).get("type", "text/html") != "text/plain"
         # Some curated feeds put their complete description in an Atom title.

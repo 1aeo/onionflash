@@ -799,8 +799,7 @@ def test_commit_candidate_lock_recheck_and_unverified_route_isolation_and_cleanu
     skip_prep = store.prepare_candidate(unrel_row, upd_draft, "2026-11-10T13:10:00Z")
     skip_rev = verdict("skip", criterion="new_information", update=True)
     skip_receipt = insert_approval(
-        store, skip_prep, key=digest(["sk", unrel_row["id"]]), policy=pol, result=skip_rev,
-        record={"reviews": [{"stage": "review", "result": skip_rev}]}, created_at=LATER,
+        store, skip_prep, policy=pol, result=skip_rev, created_at=LATER,
     )
     store.commit_candidate(skip_prep, skip_prep["candidate"], "wk-skip", "2026-11-10T13:10:00Z",
                            decision="skip", **skip_receipt)

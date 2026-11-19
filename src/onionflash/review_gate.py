@@ -22,7 +22,7 @@ from .comments import analysis_context
 from .llm import AnalysisError, CompletionDeferred, RequestObserver
 from .util import (
     DIRAUTH_GITLAB_USERS, _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, is_dirauth_item,
-    is_hackerone_item, item_cluster, now_iso, release_mentions, saved_object, thread_subject,
+    is_hackerone_item, item_cluster, now_iso, parse_utc, release_mentions, saved_object, thread_subject,
 )
 
 REVIEW_STATE_VERSION = 2
@@ -59,6 +59,8 @@ HOLDS = {
     "shouting_caps": "the candidate contains unnormalized all-caps shouting",
     "malformed_version": "the candidate cites a nonexistent three-part C-Tor version",
     "untrusted_operator_claim": "an uncorroborated mailing-list incident claim needs a trusted source",
+    "named_attribution": "a named attribution has no literal source evidence",
+    "personal_attribution": "personal attribution still needs names-only publication style",
 }
 
 
@@ -105,6 +107,8 @@ def _record_input_hash(record: object) -> str | None:
 
 def initial_review_state():
     """Only newly created chains initialize these fields; saved chains require them."""
+    # Keep the real version-two ledger shape: this legacy-named index covers all
+    # rejected-response events; each event's fixed error distinguishes its type.
     return {"request_budget": {"reserved": 0, "inconsistent_requests": [], "validation_reask": None},
             "untrusted_proposals": []}
 
@@ -170,6 +174,21 @@ def _save(store, row, writer_key, policy_hash, stage, draft, prepared, record, o
 
 def _identity(prepared):
     return tuple(prepared[key] for key in ("candidate_hash", "source_hash", "binding_hash"))
+
+
+def validate_stored_context(record, prepared):
+    """Bind retained review context to the actual persisted candidate envelope."""
+    snapshot = record.get("prepared")
+    fields = ("mode", "candidate", "packet", "coverage", "candidate_hash", "source_hash", "coverage_hash", "binding_hash")
+    if (not isinstance(snapshot, dict) or any(snapshot.get(key) != prepared.get(key) for key in fields)
+            or digest(prepared["candidate"]) != prepared["candidate_hash"]
+            or digest(prepared["packet"]) != prepared["source_hash"]
+            or digest(prepared["coverage"]) != prepared["coverage_hash"]
+            or digest(prepared["binding"]) != prepared["binding_hash"]
+            or digest(prepared["payload"]) != prepared["binding"].get("payload_hash")
+            or any(prepared["binding"].get(bound) != prepared[value] for bound, value in (
+                ("candidate_hash", "candidate_hash"), ("packet_hash", "source_hash"), ("coverage_hash", "coverage_hash")))):
+        raise ValueError("Stored review context does not match its envelope")
 
 
 def _policy_copies(record, policy):
@@ -541,6 +560,118 @@ def _can_route(candidate: dict, prepared: dict, result: dict, target_id) -> bool
     return bool(item_subj and item_subj == target_subj)
 
 
+def _official_release_anchor(candidate, repaired, prepared, *, current_only=False):
+    """Check a cited release identity and recency, without deciding news value."""
+    if (prepared.get("mode", "story") != "story" or prepared["row"].get("story_id")
+            or prepared.get("how") is not None
+            or (prepared.get("coverage") or {}).get("prior_story") is not None):
+        return False
+    item = json.loads(prepared["row"]["payload"])
+    packet = prepared.get("packet")
+    if (item.get("kind") == "tag" or prepared["payload"].get("editorial_kind") == "tag"
+            or not isinstance(packet, dict) or packet.get("truncated") is not False
+            or packet.get("missing_sources") != [] or not isinstance(packet.get("sources"), list)
+            or any(not isinstance(source, dict) or not isinstance(source.get("title"), str)
+                   or not isinstance(source.get("passages"), list) or not source["passages"]
+                   for source in packet["sources"])):
+        return False
+    identities = release_mentions({"title": candidate.get("title")})
+    if len(identities) != 1 or release_mentions({"title": repaired.get("title")}) != identities:
+        return False
+    try:
+        revision = parse_utc(item.get("updated_at"))
+        cited = {canonical_url(source["url"]) for source in candidate.get("sources", [])}
+        releases = [source for source in packet["sources"]
+                    if source.get("kind") == "feed" and source.get("authority") == "official"
+                    and canonical_url(source["url"]) in cited
+                    and item_cluster({**source, "content": ""}).startswith("release:")]
+        # A release identity is an evidence anchor, not a news-value verdict.
+        # Multiple announcement sources or version identities are ambiguous.
+        if (len(releases) != 1 or (current_only and "snapshot" in releases[0] and releases[0]["snapshot"] != "current")
+                or release_mentions({"title": releases[0].get("title")}) != identities
+                or item_cluster({**releases[0], "content": ""}) != identities[0]
+                or not 0 <= (revision - parse_utc(releases[0].get("published_at"))).total_seconds() <= NEW_STORY_DAYS * 86400):
+            return False
+    except (ValueError, TypeError, KeyError):
+        return False
+    return True
+
+
+def _release_framing_repair(reviews, candidate, prepared):
+    """Admit one prose repair after a fresh reviewer disputes release framing."""
+    latest = reviews[-1]
+    result = latest["result"]
+    if (len(reviews) < 2 or latest["stage"] != "verification"
+            or not _news(reviews[0]["result"]) or result["verdict"] != "revise"
+            or result.get("same_story") is not None
+            or any(entry["stage"] == "verification"
+                   and entry["result"]["criteria"]["news_value"]["outcome"] != "pass"
+                   for entry in reviews[:-1])):
+        return None
+    criteria = result["criteria"]
+    if (criteria["news_value"]["outcome"] != "fail"
+            or {name for name, check in criteria.items() if check["outcome"] != "pass"} != {"news_value"}):
+        return None
+    repair = result.get("repair")
+    if not isinstance(repair, dict) or not repair or set(repair) - {"title", "summary"}:
+        return None
+    try:
+        repaired = review.apply_repair(candidate, repair, packet=prepared.get("packet"))
+    except review.ReviewError:
+        return None
+    # Normalization must not introduce changes outside the two permitted fields.
+    if ({key for key in candidate.keys() | repaired.keys() if candidate.get(key) != repaired.get(key)} - {"title", "summary"}
+            or not _official_release_anchor(candidate, repaired, prepared)):
+        return None
+    return repaired
+
+
+def _release_news_recovery(reviews, candidate, prepared):
+    """Require two fresh full approvals of one repaired release description.
+
+    An initial news refusal is retained. Only this exact three-review history
+    may resolve its disagreement; the feed identity alone approves nothing.
+    """
+    if len(reviews) not in {2, 3}:
+        return False
+    first = reviews[0]
+    result = first["result"]
+    original = prepared.get("candidate")
+    repair = result.get("repair")
+    if (first["stage"] != "review" or first.get("issue") is not None
+            or result["verdict"] != "revise" or result.get("same_story") is not None
+            or result["criteria"]["news_value"]["outcome"] != "fail"
+            or result["criteria"]["new_information"]["outcome"] != "pass"
+            or not isinstance(original, dict) or first["candidate_hash"] != digest(original)
+            or not isinstance(repair, dict) or not repair
+            or set(repair) - {"title", "summary", "why_it_matters"}):
+        return False
+    try:
+        repaired = review.apply_repair(original, repair, packet=prepared.get("packet"))
+    except review.ReviewError:
+        return False
+    changed = {key for key in original.keys() | repaired.keys() if original.get(key) != repaired.get(key)}
+    if (not changed & {"title", "summary"} or changed - {"title", "summary", "why_it_matters"}
+            or digest(repaired) != digest(candidate)
+            or not _official_release_anchor(original, repaired, prepared, current_only=True)):
+        return False
+    policy = first.get("policy_hash")
+    if not isinstance(policy, str) or not re.fullmatch(r"[0-9a-f]{64}", policy):
+        return False
+    context = _context(prepared, policy)
+    if any(any(entry.get(key) != value for key, value in context.items()) for entry in reviews):
+        return False
+    for entry in reviews[1:]:
+        passed = entry["result"]
+        if (entry["stage"] != "verification" or entry.get("issue") is not None
+                or entry["candidate_hash"] != digest(repaired)
+                or passed["verdict"] != "approve" or passed.get("repair") is not None
+                or passed.get("same_story") is not None or set(passed["criteria"]) != set(review.CRITERIA)
+                or any(check["outcome"] != "pass" for check in passed["criteria"].values())):
+            return False
+    return True
+
+
 def next_step(reviews, candidate, prepared):
     """What follows the latest review of `candidate`, decided from the chain of reviews alone.
 
@@ -551,7 +682,14 @@ def next_step(reviews, candidate, prepared):
     """
     latest = reviews[-1]
     result, stage, later = latest["result"], latest["stage"], len(reviews) > 1
-    if later and _news(result) != _news(reviews[0]["result"]):
+    framing_repair = _release_framing_repair(reviews, candidate, prepared)
+    release_recovery = _release_news_recovery(reviews, candidate, prepared)
+    if release_recovery and len(reviews) == 2:
+        return "verify", candidate
+    if (len(reviews) == 3 and not release_recovery
+            and _release_news_recovery(reviews[:2], candidate, prepared)):
+        return "hold", (stage, "disagreed_news")
+    if later and _news(result) != _news(reviews[0]["result"]) and framing_repair is None and not release_recovery:
         return "hold", (stage, "disagreed_news")
     if _can_route(candidate, prepared, result, result.get("same_story")):
         return "route", result["same_story"]
@@ -572,7 +710,7 @@ def next_step(reviews, candidate, prepared):
     # verification has passed its facts; a duplicate still skips.
     disputed = official and failed & review.EDITORIAL_CRITERIA == {"news_value"}
     if disputed:
-        if stage == "verification" and failed == {"news_value"}:
+        if stage == "verification" and failed == {"news_value"} and framing_repair is None:
             return "hold", (stage, "official_not_news")
         if verdict != "revise":
             return ("hold", (stage, "model_hold")) if later else ("verify", candidate)
@@ -589,12 +727,13 @@ def next_step(reviews, candidate, prepared):
         if stage == "verification" and (held := review.final_holds(candidate, prepared)):
             return "hold", ("final_check", held[0])
         if not review.release_labels_match_state(candidate):
-            # A review told the problem may repair it, if the repair can still be verified within the limit.
-            if latest.get("issue") or len(reviews) > MAX_VERIFY_REPAIRS:
+            # Recovery's two approvals bind this exact text; a later label edit
+            # cannot extend that history. Ordinary reviews may still repair it.
+            if release_recovery or latest.get("issue") or len(reviews) > MAX_VERIFY_REPAIRS:
                 return "hold", (stage, "release_labels")
             return "repair", candidate
         return ("verify" if stage == "review" else "approve"), candidate
-    if verdict != "revise" or (later and failed & review.EDITORIAL_CRITERIA and not disputed):
+    if verdict != "revise" or (later and failed & review.EDITORIAL_CRITERIA and not disputed and framing_repair is None):
         return "hold", (stage, "release_labels" if latest.get("issue") else "model_hold")
     is_update = prepared.get("mode") == "update"
     if (item.get("kind") == "tag") if is_update else (prepared["payload"]["editorial_kind"] == "tag"):
@@ -602,7 +741,8 @@ def next_step(reviews, candidate, prepared):
     if len(reviews) > MAX_VERIFY_REPAIRS + 1:
         return "hold", (stage, "repairs_exhausted")
     try:
-        repaired = review.apply_repair(candidate, result["repair"], update=is_update)
+        repaired = framing_repair if framing_repair is not None else review.apply_repair(
+            candidate, result["repair"], update=is_update, packet=prepared["packet"])
     except review.ReviewError:
         # After a disputed official item's first review, the unchanged text goes to its fresh verification.
         return ("verify", candidate) if disputed and not later else ("hold", (stage, "unusable_repair"))
@@ -784,7 +924,7 @@ def _pending_reask(record, stage, candidate, prepared):
         return False
     correction = record["request_budget"]["validation_reask"]
     if correction is None or correction["trigger"] != latest["request"]:
-        raise review.InconsistentReview()
+        raise review.validation_failure(latest["error"])
     if (latest["stage"] != stage or latest["mode"] != prepared.get("mode", "story")
             or latest["candidate_before_hash"] != digest(candidate)
             or latest["context"] != _context(prepared, record["policy_hash"])):
@@ -793,7 +933,7 @@ def _pending_reask(record, stage, candidate, prepared):
         raise review.ReviewError("Validation correction did not yield a usable review")
     if correction["attempts"] and not correction["transport_failed"]:
         raise review.ReviewError("Interrupted validation correction cannot be repeated")
-    return True
+    return latest["error"]
 
 
 def validate_review_state(record, stage, candidate, prepared, *, allow_cached=True):
@@ -824,7 +964,7 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                                    update=prepared.get("mode") == "update", coverage=prepared.get("coverage"))
         for proposal in proposals:
             if (not isinstance(proposal, dict) or set(proposal) != fields
-                    or proposal["error"] != review.INCONSISTENT_VERDICT
+                    or proposal["error"] not in review.VALIDATION_ERRORS
                     or type(proposal["request"]) is not int or not 1 <= proposal["request"] <= budget["reserved"]
                     or proposal["stage"] not in {"review", "verify", "repair"}
                     or proposal["mode"] not in {"story", "update"}
@@ -840,6 +980,10 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                     or set(proposal["changed_fields"]) - set(candidate_mod.UPDATE_FIELDS if proposal["mode"] == "update" else review.EDITABLE)):
                 raise ValueError()
             accepted = proposal["accepted"]
+            if proposal["error"] != review.INCONSISTENT_VERDICT and (
+                    accepted or proposal["repair"] is not None or proposal["candidate_after_hash"] is not None
+                    or proposal["changed_fields"] or proposal["disposition"] not in {"unusable", "discarded_context"}):
+                raise ValueError()
             if (proposal["repair"] is not None and not isinstance(proposal["repair"], dict)):
                 raise ValueError()
             if proposal["repair"] is not None:
@@ -889,6 +1033,8 @@ def _validate_candidate_path(record, stage, candidate, prepared, *, allow_cached
     """Reconstruct the exact edited text; removing a pending flag cannot bless it."""
     context = _context(prepared, record["policy_hash"])
     current = prepared.get("candidate", record.get("candidate"))
+    known_attributions = {flag["name"] for flag in review.missing_named_attributions(
+        current, prepared["packet"], update=prepared.get("mode") == "update")}
     expected_stage, trusted, seen = "review", [], {digest(current)}
     last_action, last_value = None, None
     events = [(entry.get("request"), False, entry) for entry in record["reviews"]]
@@ -912,12 +1058,16 @@ def _validate_candidate_path(record, stage, candidate, prepared, *, allow_cached
                         or not _allowed_proposal(current, after, prepared, entry["repair"])):
                     raise ValueError()
                 current, expected_stage = after, "verify"
+                known_attributions.update(flag["name"] for flag in review.missing_named_attributions(
+                    current, prepared["packet"], update=prepared.get("mode") == "update"))
                 seen.add(digest(current))
         else:
             actual_stage = "repair" if entry.get("issue") == "release_labels" else "verify" if entry["stage"] == "verification" else "review"
             if (actual_stage != expected_stage or entry["candidate_hash"] != digest(current)
                     or any(entry.get(key) != value for key, value in context.items())):
                 raise ValueError()
+            review.validate_review(entry["result"], prepared["packet"], update=prepared.get("mode") == "update",
+                                   coverage=prepared.get("coverage"), candidate=current, attribution_names=known_attributions)
             trusted.append(entry)
             action, value = next_step(trusted, current, prepared)
             last_action, last_value = action, value
@@ -926,6 +1076,8 @@ def _validate_candidate_path(record, stage, candidate, prepared, *, allow_cached
                     expected_stage = "held"
                 else:
                     current, expected_stage = value, action
+                    known_attributions.update(flag["name"] for flag in review.missing_named_attributions(
+                        current, prepared["packet"], update=prepared.get("mode") == "update"))
                     seen.add(digest(current))
             else:
                 expected_stage = {"approve": "approved", "skip": "skipped", "hold": "held", "route": "routed"}[action]
@@ -1008,16 +1160,28 @@ def recovery_status(record):
     terminal = record.get("outcome") in {"approved", "skipped", "held", "locked", "routed"}
     unresolved = bool(proposals) and (proposal_needs_check(record) or not terminal
         or record.get("hold_code") in {"unusable_repair", "repeated_repair", "repairs_exhausted", "release_labels"})
-    return {"raw_inconsistency_count": len(proposals), "accepted_proposal_count": sum(p["accepted"] for p in proposals),
-            "unresolved_inconsistency": unresolved}
+    inconsistent = sum(p["error"] == review.INCONSISTENT_VERDICT for p in proposals)
+    degenerate = sum(p["error"] == review.DEGENERATE_REASONS for p in proposals)
+    attribution = sum(p["error"] == review.UNSUPPORTED_ATTRIBUTION for p in proposals)
+    return {"raw_inconsistency_count": inconsistent, "raw_degenerate_count": degenerate, "raw_attribution_count": attribution,
+            "accepted_proposal_count": sum(p["accepted"] for p in proposals),
+            "unresolved_inconsistency": bool(inconsistent and unresolved),
+            "unresolved_degenerate": bool(degenerate and unresolved), "unresolved_attribution": bool(attribution and unresolved)}
 
 
 def call_review(reviewer, stage, candidate, prepared, *, requests, correction=False) -> dict:
     """Return only a genuinely validated reply; an invalid reply remains an exception."""
+    known_attributions = review.attribution_names(prepared, requests.record)
+    issues = [review.RELEASE_ISSUE] if stage == "repair" else []
+    if completion_words := review.unsupported_completion_claims(candidate, prepared):
+        issues.append(review.COMPLETION_ISSUE + "\n" + json.dumps(completion_words, ensure_ascii=False))
+        if "merged" in completion_words:
+            issues.append(review.MERGE_COMPLETION_ISSUE)
     result = reviewer.review(candidate, prepared["packet"], coverage=prepared["coverage"], verification=stage == "verify",
-                             issue=review.RELEASE_ISSUE if stage == "repair" else None,
+                             issue="\n\n".join(issues) if issues else None,
                              on_request=requests.callback(correction=correction),
-                             **({"validation_error": review.INCONSISTENT_VERDICT} if correction else {}),
+                             **({"validation_error": correction} if correction else {}),
+                             **({"attribution_names": known_attributions} if known_attributions else {}),
                              **({"update": True} if prepared.get("mode") == "update" else {}))
     if correction and requests.state["validation_reask"]["response"] != requests.state["reserved"]:
         raise AnalysisError("Validation response was not observed", code="app.damaged_job")
@@ -1027,11 +1191,12 @@ def call_review(reviewer, stage, candidate, prepared, *, requests, correction=Fa
 
 
 def advance_review(reviewer, stage, candidate, prepared, record, requests):
-    """Runtime and evaluation share the same untrusted-proposal transition.
+    """Runtime and evaluation share the same bounded validation correction.
 
-    An untrusted edit still requires its fresh verification. A validation
-    correction keeps the current stage and candidate; invalid criteria never
-    become a disagreement anchor.
+    Invalid replies never edit the candidate or become a disagreement anchor.
+    A correction keeps the current stage and candidate; a valid repair still
+    requires its ordinary fresh verification. Historical proposal proofs remain
+    readable through the existing version-two ledger.
     """
     validate_review_state(record, stage, candidate, prepared)
     correction = _pending_reask(record, stage, candidate, prepared)
@@ -1040,52 +1205,29 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
     before = requests.actual
     try:
         entry = call_review(reviewer, stage, candidate, prepared, requests=requests, correction=correction)
-    except review.InconsistentReview as error:
+    except review.CorrectableReviewError as error:
         if requests.actual == before:
             raise
         if correction and requests.state["validation_reask"]["response"] != requests.state["reserved"]:
             raise AnalysisError("Validation response was not observed", code="app.damaged_job")
-        event = {"error": review.INCONSISTENT_VERDICT, "request": requests.state["reserved"], "stage": stage,
+        event = {"error": error.validation_error, "request": requests.state["reserved"], "stage": stage,
                  "mode": prepared.get("mode", "story"),
                  "candidate_before_hash": digest(candidate), "candidate_after_hash": None,
                  "context": _context(prepared, record["policy_hash"]), "changed_fields": [],
                  "repair": None, "accepted": False, "disposition": "unusable",
-                 "reask_trigger": False, "reask_response": correction}
+                 "reask_trigger": False, "reask_response": bool(correction)}
         requests.state["inconsistent_requests"].append(event["request"])
         record.setdefault("untrusted_proposals", []).append(event)
-        try:
-            if _literal_tag(prepared):
-                event["disposition"] = "literal_tag"
-                raise review.ReviewError("Literal tags cannot use untrusted edits")
-            repaired = review.apply_repair(candidate, error.proposal, update=prepared.get("mode") == "update")
-            event["candidate_after_hash"] = digest(repaired)
-            event["changed_fields"] = sorted(key for key in candidate if repaired.get(key) != candidate[key])
-            event["repair"] = {key: repaired[key] for key in event["changed_fields"] if key != "updates"}
-            if "updates" in event["changed_fields"]:
-                event["repair"]["update"] = repaired["updates"][-1]["text"]
-            if not _allowed_proposal(candidate, repaired, prepared, error.proposal):
-                event["disposition"] = "labels"
-                raise review.ReviewError("Untrusted edit exceeds packet label limits")
-            if event["candidate_after_hash"] in seen:
-                event["disposition"] = "repeated"
-                raise review.ReviewError("Untrusted edit repeats a reviewed candidate")
-        except review.ReviewError:
-            if requests.state["validation_reask"] is None and requests.state["reserved"] < MAX_REVIEW_REQUESTS:
-                event["reask_trigger"] = True
-                requests.state["validation_reask"] = {"trigger": event["request"], "attempts": [],
-                                                       "response": None, "transport_failed": False}
-                requests.persist()
-                # The correction keeps this exact stage and candidate. Invalid
-                # criteria are still absent from the trusted review history.
-                return advance_review(reviewer, stage, candidate, prepared, record, requests)
+        if requests.state["validation_reask"] is None and requests.state["reserved"] < MAX_REVIEW_REQUESTS:
+            event["reask_trigger"] = True
+            requests.state["validation_reask"] = {"trigger": event["request"], "attempts": [],
+                                                   "response": None, "transport_failed": False}
             requests.persist()
-            raise error
-        if waiting is not None:
-            waiting["disposition"] = "superseded_unverified"
-        event.update(accepted=True, disposition="pending")
-        # The caller persists this audit, exact candidate and verify stage before
-        # requesting its next step. No invalid reply is appended to reviews.
-        return "verify", repaired
+            # Rejected criteria and proposed edits are neither review evidence
+            # nor a candidate mutation, even when an edit is structurally valid.
+            return advance_review(reviewer, stage, candidate, prepared, record, requests)
+        requests.persist()
+        raise error
     if waiting is not None:
         if entry["stage"] != "verification" or entry["candidate_hash"] != waiting["candidate_after_hash"]:
             raise AnalysisError("Proposal verification identity changed", code="app.damaged_job")
@@ -1423,25 +1565,27 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         if cached is not None:
             try:
                 verdict = review.validate_review(json.loads(cached["result_json"]), prepared["packet"],
-                                                 update=prepared.get("mode") == "update", coverage=prepared["coverage"])
+                                                 update=prepared.get("mode") == "update", coverage=prepared["coverage"], candidate=candidate,
+                                                 attribution_names=review.attribution_names(prepared, json.loads(cached["review_record_json"])))
                 proof = json.loads(cached["review_record_json"])
                 if not isinstance(proof, dict) or proof.get("policy_hash") != policy:
                     raise AnalysisError("Cached review policy is damaged", code="app.damaged_job")
                 validate_review_state(proof, "approved" if verdict["verdict"] == "approve" else "skipped", candidate, prepared, allow_cached=False)
                 valid = verdict["verdict"] in {"approve", "skip"} and verdict.get("same_story") is None
-            except (AnalysisError, ValueError, TypeError, KeyError):
+            except (AnalysisError, ValueError, TypeError, KeyError, AttributeError):
                 valid = False
             if valid:
                 record["approval"] = proof
                 record["approval_key"] = key
-                if verdict["verdict"] == "approve" and (held := review.final_holds(candidate, prepared)):
+                if verdict["verdict"] == "approve" and (held := review.final_holds(candidate, prepared, known_attributions=review.attribution_names(prepared, proof))):
                     _hold(store, row, draft, writer_key, record, observed, "final_check", held[0])
                     return {**report, "status": "held", "cache_hit": True}
                 record["outcome"] = "skipped" if verdict["verdict"] == "skip" else "approved"
                 _save(store, row, writer_key, policy, record["outcome"], draft, prepared, record, observed,
                       prepared_at=prepared_at, approval_key=key)
                 committed = store.commit_candidate(prepared, candidate, writer_key, now_iso(), approval_key=key,
-                                                   policy_hash=policy, review_record=record, decision=verdict["verdict"])
+                                                   policy_hash=policy, review_record=record, decision=verdict["verdict"],
+                                                   review_config=config)
                 report.update(status=committed["status"], cache_hit=True)
                 return report
             with store.db:
@@ -1490,7 +1634,8 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                 _save(store, row, writer_key, policy, record["outcome"], draft, prepared, record, observed,
                       prepared_at=prepared_at, approval_key=key, approval_receipt=receipt)
                 committed = store.commit_candidate(prepared, candidate, writer_key, now_iso(), approval_key=key,
-                                                   policy_hash=policy, review_record=record, decision=action)
+                                                   policy_hash=policy, review_record=record, decision=action,
+                                                   review_config=config)
                 if agreed_dup is not None and agreed_dup[1] == prepared["story_id"]:
                     _try_auto_merge(config, store, agreed_dup, propagate=False)
                 return {**report, "status": committed["status"]}
@@ -1516,6 +1661,12 @@ def _new_coverage(old_coverage, current_coverage) -> list[dict]:
 
 
 def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
+    return check_held_approval(store, item_id, review.policy_hash(config),
+                               dirauth_users=_dirauth_users(config, store))
+
+
+def check_held_approval(store, item_id: str, policy: str, *, dirauth_users=None) -> tuple[dict, tuple | None]:
+    """Validate the actual held proof for both inspection and transactional commit."""
     def refuse(reason: str, editorial_failures=(), new_coverage=()):
         """Build an ineligible operator-approval check result with structured diagnostics."""
         return {"eligible": False, "reason": reason, "hash": None,
@@ -1554,8 +1705,8 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
         ]
     except (TypeError, KeyError, AttributeError):
         return refuse("Saved review record cannot be read")
-    policy = review.policy_hash(config)
-    if (job["policy_hash"] != policy or record.get("policy_hash") != policy
+    if (not isinstance(policy, str) or not policy
+            or job["policy_hash"] != policy or record.get("policy_hash") != policy
             or any(entry.get("policy_hash") != policy for entry in reviews)):
         return refuse("An earlier review policy or packet reviewed it; retry it", editorial_failures)
     row = {key: item_row[key] for key in (
@@ -1563,7 +1714,7 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
         "next_attempt_at", "last_error", "story_id", "first_seen", "last_seen", "priority_score")}
     row["payload"] = item_row["payload_blob"].decode("utf-8")
     try:
-        prepared = _prepare_candidate(store, row, draft, job["prepared_at"], _dirauth_users(config, store))
+        prepared = _prepare_candidate(store, row, draft, job["prepared_at"], dirauth_users)
     except Exception:
         return refuse("Its story or sources changed since the review; retry it", editorial_failures)
     if prepared["locked"]:
@@ -1587,6 +1738,10 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
         return refuse("Its story or sources changed since the review; retry it", editorial_failures, new_coverage)
     if any(entry.get("source_hash") != prepared["source_hash"] for entry in reviews):
         return refuse("An earlier review policy or packet reviewed it; retry it", editorial_failures, new_coverage)
+    try:
+        validate_stored_context(record, saved_env)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return refuse("Saved review record cannot be read", editorial_failures, new_coverage)
     is_update = prepared.get("mode") == "update"
     try:
         validated = [review.validate_review(entry["result"], prepared["packet"],
@@ -1598,7 +1753,8 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
         return refuse("A review failed new_information (already covered); dismiss it", editorial_failures, new_coverage)
     candidate = record.get("candidate")
     try:
-        candidate_mod.validate_approved(prepared["candidate"], candidate, "update" if is_update else "story")
+        candidate_mod.validate_approved(prepared["candidate"], candidate, "update" if is_update else "story",
+                                        packet=prepared["packet"])
     except candidate_mod.ReviewRequired as exc:
         msg = ("No fresh verification reviewed this exact text"
                if "complete public candidate" in str(exc) else "Saved review record cannot be read")
@@ -1618,16 +1774,16 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
             or any(not result["criteria"]["source_support"]["source_refs"] for _, result in reviews_of_text)):
         return refuse("No fresh verification with cited sources approved the facts; retry or dismiss it",
                       editorial_failures, new_coverage)
-    if held := review.final_holds(candidate, prepared):
+    try:
+        validate_review_state(record, "held", record.get("candidate", saved_env.get("candidate")), saved_env)
+    except (AnalysisError, ValueError, TypeError, KeyError):
+        return refuse("Saved proposal or review state cannot be read")
+    if held := review.final_holds(candidate, prepared, known_attributions=review.attribution_names(prepared, record)):
         return refuse("Final review held: " + HOLDS[held[0]], editorial_failures, new_coverage)
     if not review.release_labels_match_state(candidate):
         return refuse("Final review held: " + HOLDS["release_labels"], editorial_failures, new_coverage)
     if not editorial_failures:
         return refuse("Only a held news-value dispute can be approved", editorial_failures, new_coverage)
-    try:
-        validate_review_state(record, "held", record.get("candidate", saved_env.get("candidate")), saved_env)
-    except (AnalysisError, ValueError, TypeError, KeyError):
-        return refuse("Saved proposal or review state cannot be read")
     if proposal_needs_check(record):
         return refuse("An untrusted proposal still needs a fresh valid review")
     exact_entries = [entry for entry, _ in reviews_of_text]
@@ -1657,7 +1813,8 @@ def approve(config, store, item_id: str, approval_hash: str, reason: str, stamp:
     audit["operator_approval"] = {"reason": reason, "approved_at": stamp,
                                   "approval_hash": approval_hash, "new_coverage": info["new_coverage"]}
     try:
-        committed = store.commit_candidate(prepared, candidate, writer_key, stamp, review_record=audit, operator=True)
+        committed = store.commit_candidate(prepared, candidate, writer_key, stamp, review_record=audit, operator=True,
+                                            policy_hash=review.policy_hash(config), review_config=config)
     except (candidate_mod.StaleCandidate, candidate_mod.ReviewRequired) as exc:
         raise ValueError(str(exc)) from None
     return {"item_id": item_id, "content_hash": prepared["row"]["content_hash"], "action": "approve",

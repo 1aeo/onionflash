@@ -1,5 +1,5 @@
 {
-  "description": "Controlled synthetic role-evidence cases. Names, source passages and events are fictional; these are not news or publications. Person-role labels require the specified evidence, while neutral attribution and source-stated operator roles remain usable.",
+  "description": "Controlled synthetic role-evidence cases. Names, source passages and events are fictional; these are not news or publications. Person-role labels require the specified evidence, while neutral attribution and source-stated operator roles remain usable. Generic developer roles and substantive tor-dev contributor eligibility accept same-person committed C Tor or Arti code across both topics; project-specific labels require that named project. Existing controls retain their expectations; added controls distinguish role permission from news value and authority.",
   "defaults": {
     "why_it_matters": "",
     "category": "network",
@@ -149,6 +149,178 @@
           "passages": [
             "Sam posted the following empirical multi-relay report to tor-dev. Systematic measurements across independently operated relays show sustained directory-stream bursts, high CPU use and failed circuit requests. The report states that sustained stream bursts leave relays unable to serve new circuits.",
             "Sam posts under account @river-sam. The supplied C Tor repository commit record identifies @river-sam as the author of committed stream-accounting code merged into C Tor; it explicitly links that author identity to this report's Sam. The report asks developers to inspect stream scheduling; it does not state that the reported overload has been fixed."
+          ]
+        }
+      ]
+    },
+    "role-cross-ctor-on-arti": {
+      "sources": [
+        {
+          "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/ROLE-ECD701589B8142F0269A384C/",
+          "title": "[tor-dev] Arti stream scheduling review",
+          "kind": "feed",
+          "authority": "community",
+          "product": "arti",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "Sam posts a substantive protocol review on tor-dev about Arti stream scheduling. The review compares scheduling behavior with traces from independently operated clients and explains that queued requests wait until active connections finish. No fix, adoption or attack is reported.",
+            "Sam posts under account @river-sam. The supplied C Tor repository commit record identifies @river-sam as the author of code committed and merged into C Tor; it explicitly links that author identity to this report's Sam. This prior contribution does not establish a fix for the current topic."
+          ]
+        }
+      ]
+    },
+    "role-cross-arti-on-ctor": {
+      "sources": [
+        {
+          "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/ROLE-1C2ED2AF400BF7362CA886B7/",
+          "title": "[tor-dev] C Tor stream scheduling review",
+          "kind": "feed",
+          "authority": "community",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "Sam posts a substantive protocol review on tor-dev about C Tor stream scheduling. The review compares scheduling behavior with traces from independently operated clients and explains that queued requests wait until active connections finish. No fix, adoption or attack is reported.",
+            "Sam posts under account @river-sam. The supplied Arti repository commit record identifies @river-sam as the author of code committed and merged into Arti; it explicitly links that author identity to this report's Sam. This prior contribution does not establish a fix for the current topic."
+          ]
+        }
+      ]
+    },
+    "role-community-self-claimed": {
+      "sources": [
+        {
+          "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/ROLE-B863A74D1A7D1EF47576B8D7/",
+          "title": "[tor-dev] Arti stream scheduling review",
+          "kind": "feed",
+          "authority": "community",
+          "product": "arti",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "Sam posts a substantive protocol review on tor-dev about Arti stream scheduling. The review compares scheduling behavior with traces from independently operated clients and explains that queued requests wait until active connections finish. No fix, adoption or attack is reported.",
+            "Sam writes, \"I am a developer.\" No committed-code record is supplied."
+          ]
+        }
+      ]
+    },
+    "role-community-unmerged": {
+      "sources": [
+        {
+          "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/ROLE-1C347AE009E7456E17428BA9/",
+          "title": "[tor-dev] Arti stream scheduling review",
+          "kind": "feed",
+          "authority": "community",
+          "product": "arti",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "Sam posts a substantive protocol review on tor-dev about Arti stream scheduling. The review compares scheduling behavior with traces from independently operated clients and explains that queued requests wait until active connections finish. No fix, adoption or attack is reported.",
+            "Sam supplies a proposed Arti patch for discussion. It has not been committed or merged into the project."
+          ]
+        }
+      ]
+    },
+    "role-community-other-author": {
+      "sources": [
+        {
+          "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/ROLE-9EA0491719923CF3EABA8985/",
+          "title": "[tor-dev] Arti stream scheduling review",
+          "kind": "feed",
+          "authority": "community",
+          "product": "arti",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "Sam posts a substantive protocol review on tor-dev about Arti stream scheduling. The review compares scheduling behavior with traces from independently operated clients and explains that queued requests wait until active connections finish. No fix, adoption or attack is reported.",
+            "The supplied Arti repository commit record identifies Jordan, account @delta-jordan, as the author of committed code. Sam discusses that change; the record does not credit Sam."
+          ]
+        }
+      ]
+    },
+    "role-community-unrelated-project": {
+      "sources": [
+        {
+          "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/ROLE-5C7C2D7095E0E1366DFC9FD2/",
+          "title": "[tor-dev] Arti stream scheduling review",
+          "kind": "feed",
+          "authority": "community",
+          "product": "arti",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "Sam posts a substantive protocol review on tor-dev about Arti stream scheduling. The review compares scheduling behavior with traces from independently operated clients and explains that queued requests wait until active connections finish. No fix, adoption or attack is reported.",
+            "The supplied commit record credits @river-sam with code in an unrelated packet-visualization application, not C Tor or Arti."
+          ]
+        }
+      ]
+    },
+    "role-community-contributor-routine": {
+      "sources": [
+        {
+          "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/ROLE-AE6FDB3110F14B57D0D9BF20/",
+          "title": "[tor-dev] Arti stream scheduling review",
+          "kind": "feed",
+          "authority": "community",
+          "product": "arti",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "Sam replies on tor-dev: \"Thanks for the discussion. I may inspect scheduling next week.\"",
+            "Sam posts under account @river-sam. The supplied C Tor repository commit record identifies @river-sam as the author of code committed and merged into C Tor; it explicitly links that author identity to this report's Sam. This prior contribution does not establish a fix for the current topic."
+          ]
+        }
+      ]
+    },
+    "role-community-contributor-unconfirmed-attack": {
+      "sources": [
+        {
+          "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/ROLE-FFCF2B6DC74CEFC112993895/",
+          "title": "[tor-dev] Arti stream scheduling review",
+          "kind": "feed",
+          "authority": "community",
+          "product": "arti",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "Sam claims the live Tor network is under an ongoing attack. No corroboration or independent observations are supplied.",
+            "Sam posts under account @river-sam. The supplied Arti repository commit record identifies @river-sam as the author of code committed and merged into Arti; it explicitly links that author identity to this report's Sam. This prior contribution does not establish a fix for the current topic."
+          ]
+        }
+      ]
+    },
+    "role-cross-ctor-on-arti-current-unmerged": {
+      "sources": [
+        {
+          "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/ROLE-ECD701589B8142F0269A384C-CURRENT-PATCH/",
+          "title": "[tor-dev] Arti stream scheduling review",
+          "kind": "feed",
+          "authority": "community",
+          "product": "arti",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "Sam posts a substantive protocol review on tor-dev about Arti stream scheduling. The review compares scheduling behavior with traces from independently operated clients and explains that queued requests wait until active connections finish. No fix, adoption or attack is reported.",
+            "Sam posts under account @river-sam. The supplied C Tor repository commit record identifies @river-sam as the author of code committed and merged into C Tor; it explicitly links that author identity to this report's Sam. This prior contribution does not establish a fix for the current topic.",
+            "Sam also supplies a proposed Arti patch for this topic. It is still unmerged; no fix for this topic has been committed."
+          ]
+        }
+      ]
+    },
+    "role-cross-arti-on-ctor-current-unmerged": {
+      "sources": [
+        {
+          "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/ROLE-1C2ED2AF400BF7362CA886B7-CURRENT-PATCH/",
+          "title": "[tor-dev] C Tor stream scheduling review",
+          "kind": "feed",
+          "authority": "community",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "passages": [
+            "Sam posts a substantive protocol review on tor-dev about C Tor stream scheduling. The review compares scheduling behavior with traces from independently operated clients and explains that queued requests wait until active connections finish. No fix, adoption or attack is reported.",
+            "Sam posts under account @river-sam. The supplied Arti repository commit record identifies @river-sam as the author of code committed and merged into Arti; it explicitly links that author identity to this report's Sam. This prior contribution does not establish a fix for the current topic.",
+            "Sam also supplies a proposed C Tor patch for this topic. It is still unmerged; no fix for this topic has been committed."
           ]
         }
       ]
@@ -537,6 +709,514 @@
       "unsupported": [
         "Developer Taylor"
       ]
+    },
+    {
+      "id": "role-cross-ctor-on-arti-generic",
+      "packet": "role-cross-ctor-on-arti",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "b027c323f82d28f2deb83f93",
+        "title": "Developer Sam reviews Arti stream scheduling",
+        "summary": "Developer Sam compares Arti stream scheduling with traces from independently operated clients and explains that queued requests wait until active connections finish.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "arti"
+        ]
+      }
+    },
+    {
+      "id": "role-cross-ctor-on-arti-specific-matched",
+      "packet": "role-cross-ctor-on-arti",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "6af78a1071915e2982cc15c8",
+        "title": "C Tor developer Sam reviews Arti stream scheduling",
+        "summary": "C Tor developer Sam compares Arti stream scheduling with traces from independently operated clients and explains that queued requests wait until active connections finish.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "arti"
+        ]
+      }
+    },
+    {
+      "id": "role-cross-ctor-on-arti-specific-wrong",
+      "packet": "role-cross-ctor-on-arti",
+      "expected": "not_approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "e5dfafeba4a9e8cc0a282ba4",
+        "title": "Arti developer Sam reviews Arti stream scheduling",
+        "summary": "Arti developer Sam compares Arti stream scheduling with traces from independently operated clients and explains that queued requests wait until active connections finish.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "arti"
+        ]
+      },
+      "unsupported": [
+        "Arti developer Sam"
+      ]
+    },
+    {
+      "id": "role-cross-ctor-on-arti-update-generic",
+      "scope": "latest_update",
+      "packet": "role-cross-ctor-on-arti",
+      "coverage_set": "role-prior-ctor-on-arti",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "new_information"
+      ],
+      "candidate": {
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "arti"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "id": "9bb87d7e4fb34d1ec9dcc30b",
+        "title": "Arti stream scheduling observations",
+        "summary": "An earlier report describes queued Arti requests; the scheduling relationship remains under investigation.",
+        "updates": [
+          {
+            "at": "2026-11-10T12:00:00Z",
+            "text": "Developer Sam reports traces from independent Arti clients showing queued requests waiting until active connections finish.",
+            "sources": [
+              {
+                "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/ROLE-ECD701589B8142F0269A384C/",
+                "title": "[tor-dev] Arti stream scheduling review"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "role-cross-ctor-on-arti-update-specific-wrong",
+      "scope": "latest_update",
+      "packet": "role-cross-ctor-on-arti",
+      "coverage_set": "role-prior-ctor-on-arti",
+      "expected": "not_approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "new_information"
+      ],
+      "candidate": {
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "arti"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "id": "9bb87d7e4fb34d1ec9dcc30b",
+        "title": "Arti stream scheduling observations",
+        "summary": "An earlier report describes queued Arti requests; the scheduling relationship remains under investigation.",
+        "updates": [
+          {
+            "at": "2026-11-10T12:00:00Z",
+            "text": "Arti developer Sam reports traces from independent Arti clients showing queued requests waiting until active connections finish.",
+            "sources": [
+              {
+                "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/ROLE-ECD701589B8142F0269A384C/",
+                "title": "[tor-dev] Arti stream scheduling review"
+              }
+            ]
+          }
+        ]
+      },
+      "unsupported": [
+        "Arti developer Sam"
+      ]
+    },
+    {
+      "id": "role-cross-arti-on-ctor-generic",
+      "packet": "role-cross-arti-on-ctor",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "8999f08182063d11662edf6c",
+        "title": "Developer Sam reviews C Tor stream scheduling",
+        "summary": "Developer Sam compares C Tor stream scheduling with traces from independently operated clients and explains that queued requests wait until active connections finish.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "tor"
+        ]
+      }
+    },
+    {
+      "id": "role-cross-arti-on-ctor-specific-matched",
+      "packet": "role-cross-arti-on-ctor",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "84bb9f972be87e09053bb43c",
+        "title": "Arti developer Sam reviews C Tor stream scheduling",
+        "summary": "Arti developer Sam compares C Tor stream scheduling with traces from independently operated clients and explains that queued requests wait until active connections finish.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "tor"
+        ]
+      }
+    },
+    {
+      "id": "role-cross-arti-on-ctor-specific-wrong",
+      "packet": "role-cross-arti-on-ctor",
+      "expected": "not_approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "2725912c3cbb296063296c38",
+        "title": "C Tor developer Sam reviews C Tor stream scheduling",
+        "summary": "C Tor developer Sam compares C Tor stream scheduling with traces from independently operated clients and explains that queued requests wait until active connections finish.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "tor"
+        ]
+      },
+      "unsupported": [
+        "C Tor developer Sam"
+      ]
+    },
+    {
+      "id": "role-cross-arti-on-ctor-update-generic",
+      "scope": "latest_update",
+      "packet": "role-cross-arti-on-ctor",
+      "coverage_set": "role-prior-arti-on-ctor",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "new_information"
+      ],
+      "candidate": {
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "id": "ce495901ca253f77cb251a86",
+        "title": "C Tor stream scheduling observations",
+        "summary": "An earlier report describes queued C Tor requests; the scheduling relationship remains under investigation.",
+        "updates": [
+          {
+            "at": "2026-11-10T12:00:00Z",
+            "text": "Developer Sam reports traces from independent C Tor clients showing queued requests waiting until active connections finish.",
+            "sources": [
+              {
+                "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/ROLE-1C2ED2AF400BF7362CA886B7/",
+                "title": "[tor-dev] C Tor stream scheduling review"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "role-cross-arti-on-ctor-update-specific-wrong",
+      "scope": "latest_update",
+      "packet": "role-cross-arti-on-ctor",
+      "coverage_set": "role-prior-arti-on-ctor",
+      "expected": "not_approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "new_information"
+      ],
+      "candidate": {
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-10T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "id": "ce495901ca253f77cb251a86",
+        "title": "C Tor stream scheduling observations",
+        "summary": "An earlier report describes queued C Tor requests; the scheduling relationship remains under investigation.",
+        "updates": [
+          {
+            "at": "2026-11-10T12:00:00Z",
+            "text": "C Tor developer Sam reports traces from independent C Tor clients showing queued requests waiting until active connections finish.",
+            "sources": [
+              {
+                "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/ROLE-1C2ED2AF400BF7362CA886B7/",
+                "title": "[tor-dev] C Tor stream scheduling review"
+              }
+            ]
+          }
+        ]
+      },
+      "unsupported": [
+        "C Tor developer Sam"
+      ]
+    },
+    {
+      "id": "role-community-self-claimed",
+      "packet": "role-community-self-claimed",
+      "expected": "skip",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "b863a74d1a7d1ef47576b8d7",
+        "title": "Sam reviews Arti stream scheduling",
+        "summary": "Sam compares Arti stream scheduling with traces from independently operated clients and explains that queued requests wait until active connections finish.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "arti"
+        ]
+      }
+    },
+    {
+      "id": "role-community-unmerged",
+      "packet": "role-community-unmerged",
+      "expected": "skip",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "1c347ae009e7456e17428ba9",
+        "title": "Sam reviews Arti stream scheduling",
+        "summary": "Sam compares Arti stream scheduling with traces from independently operated clients and explains that queued requests wait until active connections finish.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "arti"
+        ]
+      }
+    },
+    {
+      "id": "role-community-other-author",
+      "packet": "role-community-other-author",
+      "expected": "skip",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "9ea0491719923cf3eaba8985",
+        "title": "Sam reviews Arti stream scheduling",
+        "summary": "Sam compares Arti stream scheduling with traces from independently operated clients and explains that queued requests wait until active connections finish.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "arti"
+        ]
+      }
+    },
+    {
+      "id": "role-community-unrelated-project",
+      "packet": "role-community-unrelated-project",
+      "expected": "skip",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "5c7c2d7095e0e1366dfc9fd2",
+        "title": "Sam reviews Arti stream scheduling",
+        "summary": "Sam compares Arti stream scheduling with traces from independently operated clients and explains that queued requests wait until active connections finish.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "arti"
+        ]
+      }
+    },
+    {
+      "id": "role-community-contributor-routine",
+      "packet": "role-community-contributor-routine",
+      "expected": "skip",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "ae6fdb3110f14b57d0d9bf20",
+        "title": "Developer Sam acknowledges an Arti discussion",
+        "summary": "Developer Sam thanks the participants and says scheduling may be inspected next week.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "arti"
+        ]
+      }
+    },
+    {
+      "id": "role-community-contributor-unconfirmed-attack",
+      "packet": "role-community-contributor-unconfirmed-attack",
+      "expected": "skip",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "ffcf2b6dc74cefc112993895",
+        "title": "Developer Sam reports an ongoing Tor network attack",
+        "summary": "Developer Sam says the live Tor network is under an ongoing attack.",
+        "why_it_matters": "",
+        "category": "dos",
+        "tags": [
+          "dos"
+        ],
+        "products": [
+          "tor"
+        ]
+      }
+    },
+    {
+      "id": "role-cross-ctor-on-arti-current-unmerged",
+      "packet": "role-cross-ctor-on-arti-current-unmerged",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "e950dce092faf4e8fbf1d091",
+        "title": "Developer Sam reviews Arti stream scheduling",
+        "summary": "Developer Sam compares Arti stream scheduling with traces from independently operated clients and explains that queued requests wait until active connections finish. Sam also supplies an unmerged Arti patch for discussion.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "arti"
+        ],
+        "state": "developing"
+      }
+    },
+    {
+      "id": "role-cross-arti-on-ctor-current-unmerged",
+      "packet": "role-cross-arti-on-ctor-current-unmerged",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "2fc5f412a81e6d3b512dcd7d",
+        "title": "Developer Sam reviews C Tor stream scheduling",
+        "summary": "Developer Sam compares C Tor stream scheduling with traces from independently operated clients and explains that queued requests wait until active connections finish. Sam also supplies an unmerged C Tor patch for discussion.",
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "products": [
+          "tor"
+        ],
+        "state": "developing"
+      }
     }
   ],
   "coverage_sets": {
@@ -559,6 +1239,52 @@
         "id": "d38bc1f612365a53ab7ee380",
         "title": "Directory-stream failures reported on relays",
         "summary": "A report describes failed circuit requests on relays; their relationship to directory-stream load remains under investigation."
+      },
+      "recent": [],
+      "truncated": false
+    },
+    "role-prior-ctor-on-arti": {
+      "prior_story": {
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "arti"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "id": "9bb87d7e4fb34d1ec9dcc30b",
+        "title": "Arti stream scheduling observations",
+        "summary": "An earlier report describes queued Arti requests; the scheduling relationship remains under investigation."
+      },
+      "recent": [],
+      "truncated": false
+    },
+    "role-prior-arti-on-ctor": {
+      "prior_story": {
+        "why_it_matters": "",
+        "category": "protocol",
+        "tags": [
+          "protocol"
+        ],
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "published_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-08T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "id": "ce495901ca253f77cb251a86",
+        "title": "C Tor stream scheduling observations",
+        "summary": "An earlier report describes queued C Tor requests; the scheduling relationship remains under investigation."
       },
       "recent": [],
       "truncated": false

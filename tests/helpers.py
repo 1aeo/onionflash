@@ -285,6 +285,8 @@ class ScriptedReviewer:
 
     def __init__(self, *responses):
         self.responses, self.calls, self.coverages, self.issues = list(responses), CallLog(), [], []
+        self.validation_errors = []
+        self.attribution_names = []
         if len(responses) == 1 and (callable(responses[0]) or
                 isinstance(responses[0], dict) and responses[0].get("verdict") == "approve"):
             self.responses.append(verdict())
@@ -295,12 +297,17 @@ class ScriptedReviewer:
     def __exit__(self, *args):
         pass
 
-    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False, on_request=None):
+    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False,
+               validation_error=None, attribution_names=(), on_request=None):
+        if validation_error is not None and validation_error not in review.VALIDATION_ERRORS:
+            raise review.ReviewError("Unknown review validation feedback")
         if on_request is not None:
             on_request(1)
         self.calls.append((copy.deepcopy(candidate), copy.deepcopy(packet), verification))
         self.coverages.append(copy.deepcopy(coverage))
         self.issues.append(issue)
+        self.validation_errors.append(validation_error)
+        self.attribution_names.append(list(attribution_names))
         reply = self.responses.pop(0)
         if isinstance(reply, Exception):
             raise reply
@@ -313,7 +320,8 @@ class ScriptedReviewer:
             raw = copy.deepcopy(reply)
         if hasattr(on_request, "response_received"):
             on_request.response_received()
-        return review.validate_review(raw, packet, update=update, coverage=coverage)
+        return review.validate_review(raw, packet, update=update, coverage=coverage,
+                                      candidate=candidate, attribution_names=attribution_names)
 
     @classmethod
     def factory(cls, *responses):
@@ -330,7 +338,8 @@ class ApprovingReviewer:
     last_decoded = None
 
     def __init__(self, *args, **kwargs):
-        pass
+        self.validation_errors = []
+        self.attribution_names = []
 
     def __enter__(self):
         return self
@@ -338,12 +347,18 @@ class ApprovingReviewer:
     def __exit__(self, *args):
         pass
 
-    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False, on_request=None):
+    def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, update=False,
+               validation_error=None, attribution_names=(), on_request=None):
+        if validation_error is not None and validation_error not in review.VALIDATION_ERRORS:
+            raise review.ReviewError("Unknown review validation feedback")
         if on_request is not None:
             on_request(1)
+        self.validation_errors.append(validation_error)
+        self.attribution_names.append(list(attribution_names))
         if hasattr(on_request, "response_received"):
             on_request.response_received()
-        return approved_result(packet, update=update, coverage=coverage)
+        return review.validate_review(verdict(update=update), packet, update=update, coverage=coverage,
+                                      candidate=candidate, attribution_names=attribution_names)
 
 
 def insert_approval(store, prepared=None, candidate=None, *, key=None, candidate_hash=None, source_hash=None,

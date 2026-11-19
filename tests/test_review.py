@@ -54,7 +54,8 @@ ISSUE = unit("gitlab_issue", "dirauth: Remove bastet from list",
              "Last night, bastet's operator notified us that the machine is very plausibly compromised.",
              "In any kind of scenario here, the keys can’t be trusted anymore and bastet will generate a new identity soon.",
              "In the meantime, remove bastet from source as we can't trust it anymore.", state="opened")
-MERGED = unit("gitlab_mr", "Remove bastet's keys from default dirauth list", state="merged")
+MERGED = {**unit("gitlab_mr", "Remove bastet's keys from default dirauth list", state="merged"),
+          "url": STORY["sources"][0]["url"]}
 FEED = unit("feed", "Tor Browser 16.0.2 is released", "Tor Browser 16.0.2 is now available for Android.", authority="official")
 CRASH = unit("gitlab_issue", "Fix the crash in the parser", state="opened")
 COMPROMISED = unit("gitlab_issue", "Bastet", "The machine was compromised.", state="opened")
@@ -94,7 +95,7 @@ FINAL_CASES = [
     ("unhedged-source", "gitlab_issue", [COMPROMISED], {"title": "Bastet compromised"}, []),
     ("issue-confirmed", "gitlab_issue", [ISSUE], {"confidence": "confirmed"}, CONFIRMED),
     ("tag-and-issue-confirmed", "gitlab_issue", [unit("tag", "arti-v2.7.0", authority="official"), ISSUE], {"confidence": "confirmed"}, CONFIRMED),
-    ("unmerged-request-confirmed", "gitlab_mr", [{**MERGED, "upstream_state": ""}], {"confidence": "confirmed", "state": "merged"}, CONFIRMED),
+    ("unmerged-request-confirmed", "gitlab_mr", [{**MERGED, "upstream_state": ""}], {"confidence": "confirmed", "state": "merged"}, DONE + CONFIRMED),
     ("merged-request-confirmed", "gitlab_mr", [MERGED], {"confidence": "confirmed", "state": "merged"}, []),
     ("official-feed-confirmed", "feed", [FEED], {"confidence": "confirmed", "state": "released"}, []),
     ("official-feed-and-issue-confirmed", "feed", [FEED, ISSUE], {"confidence": "confirmed"}, []),
@@ -111,8 +112,8 @@ COVERAGE = {"prior_story": None, "recent": [{"id": COVERED, "title": "Earlier co
 PRIOR = {"prior_story": {"id": COVERED, "title": "Earlier coverage"}, "recent": [], "truncated": False}
 
 
-def test_review_keeps_only_its_model_and_rejects_unknown_settings(tmp_path):
-    """Accept review.model overrides while rejecting unknown review settings."""
+def test_review_preserves_legacy_model_config_and_rejects_unknown_settings(tmp_path):
+    """Accept supported review settings while rejecting unknown keys."""
     def configured(name, extra):
         """Load a temporary TOML configuration with extra settings."""
         p = tmp_path / name
@@ -120,7 +121,7 @@ def test_review_keeps_only_its_model_and_rejects_unknown_settings(tmp_path):
         return load_config(p)
 
     cfg = configured("c1.toml", '[llm]\ntimeout_seconds=45\n[review]\nmodel="critic-model"\n')
-    assert cfg["review"] == {"model": "critic-model"}
+    assert cfg["review"] == {"model": "critic-model", "reasoning": False}
     with review.Reviewer(cfg) as rev:
         assert rev.llm["model"] == "critic-model" and rev.llm["max_output_tokens"] == review.OUTPUT_TOKENS
         assert (rev.http_settings["timeout_seconds"], rev.http_settings["total_timeout_seconds"]) == (45, 180)
@@ -154,15 +155,25 @@ def test_review_protocol_fresh_verification_and_application_issue(monkeypatch):
     for check in first["response_format"]["json_schema"]["schema"]["properties"]["criteria"]["properties"].values():
         assert check["properties"]["source_refs"]["items"]["enum"] == sorted(review._packet_refs(packet()))
     assert "enum" not in review.REFS["items"]
-    assert json.loads(first["messages"][1]["content"]) == {"candidate": public, "packet": packet()}
-    assert len(second["messages"]) == 2 and second["messages"][0]["content"] == review.VERIFY_PROMPT
-    assert json.loads(second["messages"][1]["content"]) == {"candidate": repaired, "packet": packet()}
+    first_payload = json.loads(first["messages"][1]["content"])
+    first_context = first_payload.pop("evidence_context")
+    assert first_payload == {"candidate": public, "packet": packet()}
+    assert first_context["source_date_comparisons"] == review.source_date_comparisons(packet())
+    assert "why_it_matters" in {field["field"] for field in first_context["fields"]}
+    assert all(passage in packet()["sources"][0]["passages"] for passage in first_context["passages"])
+    assert len(second["messages"]) == 2
+    assert second["messages"][0]["content"] == review.VERIFY_PROMPT + "\n\n" + review.SOURCE_DATE_CONTEXT_PROMPT
+    second_payload = json.loads(second["messages"][1]["content"])
+    second_context = second_payload.pop("evidence_context")
+    assert second_payload == {"candidate": repaired, "packet": packet()}
+    assert second_context["source_date_comparisons"] == first_context["source_date_comparisons"]
+    assert "why_it_matters" not in {field["field"] for field in second_context["fields"]}
 
     schema = first["response_format"]["json_schema"]["schema"]
     assert list(schema["properties"]) == schema["required"] == ["criteria", "verdict", "same_story", "repair"]
     for check in schema["properties"]["criteria"]["properties"].values():
         assert list(check["properties"]) == check["required"] == ["reason", "source_refs", "outcome"]
-        assert check["properties"]["reason"]["maxLength"] == 240
+        assert check["properties"]["reason"]["maxLength"] == 360
 
     untouched = candidate(confidence="suspected", state="developing", category="security", tags=["security"], why_it_matters="")
     snap = copy.deepcopy(untouched)
@@ -172,9 +183,67 @@ def test_review_protocol_fresh_verification_and_application_issue(monkeypatch):
     rel_chk = reviewer(monkeypatch, completion(verdict()))
     rel_res = rel_chk.review(rel_pub, packet(), issue=review.RELEASE_ISSUE)
     assert rel_res == review.validate_review(verdict(), packet()) and "model_verdict" not in rel_res
-    assert rel_chk.client.requests[0][1]["messages"][0]["content"] == review.SYSTEM_PROMPT
-    assert json.loads(rel_chk.client.requests[0][1]["messages"][1]["content"]) == {
+    assert rel_chk.client.requests[0][1]["messages"][0]["content"] == review.SYSTEM_PROMPT + "\n\n" + review.SOURCE_DATE_CONTEXT_PROMPT
+    issue_payload = json.loads(rel_chk.client.requests[0][1]["messages"][1]["content"])
+    issue_payload.pop("evidence_context")
+    assert issue_payload == {
         "candidate": rel_pub, "packet": packet(), "application_issue": review.RELEASE_ISSUE}
+
+
+@pytest.mark.parametrize("length", [240, 241, 360])
+def test_evidence_comparison_reason_bound_accepts_existing_and_longer_records(length):
+    response = verdict()
+    response["criteria"]["source_support"]["reason"] = (
+        "The passage supports the claim with the stated audience and conditions. " * 6
+    )[:length]
+    checked = review.validate_review(response, packet())
+    assert checked["criteria"]["source_support"]["reason"] == response["criteria"]["source_support"]["reason"]
+
+
+def test_evidence_comparison_reason_bound_rejects_one_character_over_limit():
+    response = verdict()
+    response["criteria"]["source_support"]["reason"] = (
+        "The passage supports the claim with the stated audience and conditions. " * 6
+    )[:361]
+    with pytest.raises(review.ReviewError):
+        review.validate_review(response, packet())
+
+
+@pytest.mark.parametrize("verification", [False, True])
+@pytest.mark.parametrize("update", [False, True])
+def test_native_review_delivers_evidence_order_without_a_new_response_protocol(monkeypatch, verification, update):
+    public = candidate(why_it_matters="The source describes an effect with stated conditions.")
+    if update:
+        public["updates"] = [{"at": public["updated_at"], "text": "The source reports an additional observation.",
+                              "sources": public["sources"]}]
+    checker = reviewer(monkeypatch, completion(verdict(update=update)))
+    checker.review(public, packet(), update=update, verification=verification)
+    body = checker.client.requests[0][1]
+    prompt = body["messages"][0]["content"]
+    assert review._SHARED_VERDICT_RULES in prompt
+    assert "check a nonempty why_it_matters FIRST" in prompt
+    assert "actual\n  source.authority metadata value" in prompt
+    assert "passage order is not chronology" in prompt
+    assert "retain the underlying-story rule" in prompt
+    schema = body["response_format"]["json_schema"]["schema"]
+    assert list(schema["properties"]) == ["criteria", "verdict", "same_story", "repair"]
+    assert all(check["properties"]["reason"]["maxLength"] == 360
+               for check in schema["properties"]["criteria"]["properties"].values())
+    assert body["max_tokens"] == 2200
+    payload = json.loads(body["messages"][-1]["content"])
+    assert payload["packet"] == packet()
+    assert payload["candidate"] == public
+
+
+def test_evidence_reason_prompt_and_bound_are_both_in_review_policy(monkeypatch):
+    original = review.policy_hash(DEFAULTS)
+    monkeypatch.setattr(review, "SYSTEM_PROMPT", review.SYSTEM_PROMPT + " Additional evidence comparison.")
+    assert review.policy_hash(DEFAULTS) != original
+    monkeypatch.undo()
+    changed = copy.deepcopy(review.SCHEMA)
+    changed["properties"]["criteria"]["properties"]["source_support"]["properties"]["reason"]["maxLength"] = 240
+    monkeypatch.setattr(review, "SCHEMA", changed)
+    assert review.policy_hash(DEFAULTS) != original
 
 
 @pytest.mark.parametrize("bad", [
@@ -289,9 +358,9 @@ def test_policy_hash_changes_on_model_endpoint_and_prompt_mutations(monkeypatch,
 def test_prompts_coverage_isolation_repairs_and_transport_settings(monkeypatch):
     """Check prompt invariants, coverage isolation, UTF-8/JSON errors, and endpoint failover."""
     assert "unnumbered [Proposal]) whose packet source has authority=project-sender" in review.SYSTEM_PROMPT
-    assert "When\nauthority=community, posts without an explicit [RFC] tag" in review.SYSTEM_PROMPT
+    assert "When authority=community and case (5) does not apply" in review.SYSTEM_PROMPT
     for prompt in (review.SYSTEM_PROMPT, review.UPDATE_SYSTEM_PROMPT):
-        assert "committed into C Tor's codebase" in prompt
+        assert "committed into C Tor or Arti" in " ".join(prompt.split())
         assert "including project-sender and official" in prompt
         assert "unquoted_content" in prompt
     for prompt in (review.SYSTEM_PROMPT, review.VERIFY_PROMPT):
@@ -310,7 +379,11 @@ def test_prompts_coverage_isolation_repairs_and_transport_settings(monkeypatch):
     bg_chk.review(candidate(), packet(), coverage=bg)
     bg_chk.review(candidate(), packet(), coverage=bg, verification=True)
     for _, req in bg_chk.client.requests:
-        assert json.loads(req["messages"][1]["content"]) == {"candidate": candidate(), "packet": packet(), "coverage_background": bg}
+        payload = json.loads(req["messages"][1]["content"])
+        context = payload.pop("evidence_context")
+        assert payload == {"candidate": candidate(), "packet": packet(), "coverage_background": bg}
+        assert context["source_date_comparisons"] == review.source_date_comparisons(packet())
+        assert all(passage in packet()["sources"][0]["passages"] for passage in context["passages"])
         fields = req["response_format"]["json_schema"]["schema"]["properties"]["criteria"]["properties"]
         assert set(fields) == set(review.CRITERIA)
         assert all(c["properties"]["source_refs"]["items"]["enum"] == ["S1", "S1:P1"] for c in fields.values())
@@ -466,8 +539,8 @@ def test_update_scope_confirmed_updates_uncited_notes_and_punctuation_repairs(mo
     rt_chk = reviewer(monkeypatch, completion(verdict()), completion(verdict()))
     rt_chk.review(candidate(), packet(), coverage=recent_cov)
     rt_chk.review(candidate(), packet(), coverage=recent_cov, verification=True)
-    assert rt_chk.client.requests[0][1]["messages"][0]["content"] == review.SYSTEM_PROMPT + review.ROUTING_PROMPT
-    assert rt_chk.client.requests[1][1]["messages"][0]["content"] == review.VERIFY_PROMPT + review.ROUTING_PROMPT
+    assert rt_chk.client.requests[0][1]["messages"][0]["content"] == review.SYSTEM_PROMPT + review.ROUTING_PROMPT + "\n\n" + review.SOURCE_DATE_CONTEXT_PROMPT
+    assert rt_chk.client.requests[1][1]["messages"][0]["content"] == review.VERIFY_PROMPT + review.ROUTING_PROMPT + "\n\n" + review.SOURCE_DATE_CONTEXT_PROMPT
 
     url99 = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/99"
     cand = {
@@ -483,7 +556,7 @@ def test_update_scope_confirmed_updates_uncited_notes_and_punctuation_repairs(mo
                                 "passages": [{"id": "S1.P1", "text": "Issue body text without completed verbs."},
                                              {"id": "S1.N1", "url": url99 + "#note_1", "text": "We merged and deployed the fix."}]}]},
     }
-    assert review.final_holds(cand, prep) == []
+    assert review.final_holds(review.personal_attribution.normalize(cand, update=prep.get("mode") == "update"), prep) == []
     assert "completed_action" in review.final_holds({**cand, "updates": [{"at": LATER, "text": "Maintainers deployed the fix.",
                                                                           "sources": [{"url": url99, "title": "Issue 99"}]}]}, prep)
     prep_parent_done = {**prep, "packet": {"sources": [{"id": "S1", "url": url99, "authority": "development", "kind": "gitlab_issue",
@@ -522,16 +595,16 @@ def test_final_holds_shouting_malformed_version_and_untrusted_operator_claims():
         "The subject was written as Tor 0.4.17 in the archive.",
         "Maintainers corrected the Tor 0.4.17 typo.",
     ):
-        assert review.final_holds(candidate(summary=annotated, confidence="reported", products=["tor"]), prep_for("trusted-operator")) == []
+        assert review.final_holds(review.personal_attribution.normalize(candidate(summary=annotated, confidence="reported", products=["tor"])), prep_for("trusted-operator")) == []
     arti_story = candidate(summary="Operators tested 0.4.17 relay builds.", confidence="reported", products=["arti"])
     assert review.final_holds(arti_story, prep_for("trusted-operator")) == []
 
     inc_story = candidate(title="Operator reports DDoS flood against exit relays",
                           summary="A mailing-list post describes an ongoing DDoS attack.",
                           category="dos", tags=["dos"], confidence="reported")
-    assert review.final_holds(inc_story, prep_for("community")) == ["untrusted_operator_claim"]
-    assert review.final_holds(inc_story, prep_for("trusted-operator")) == []
-    assert review.final_holds(inc_story, prep_for("project-sender")) == []
+    assert review.final_holds(review.personal_attribution.normalize(inc_story), prep_for("community")) == ["untrusted_operator_claim"]
+    assert review.final_holds(review.personal_attribution.normalize(inc_story), prep_for("trusted-operator")) == []
+    assert review.final_holds(review.personal_attribution.normalize(inc_story), prep_for("project-sender")) == []
     assert "confirmed_source" in review.final_holds({**inc_story, "confidence": "confirmed"}, prep_for("trusted-operator"))
 
     rfc_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/rfc1/"
@@ -604,7 +677,7 @@ def test_final_holds_shouting_malformed_version_and_untrusted_operator_claims():
             category="relay", tags=["relay"], confidence="reported",
         ),
     ):
-        assert review.final_holds(live_inc, prep_for("community", rfc_url)) == ["untrusted_operator_claim"]
+        assert review.final_holds(review.personal_attribution.normalize(live_inc), prep_for("community", rfc_url)) == ["untrusted_operator_claim"]
 
     upd_cand = {
         **rfc_story,

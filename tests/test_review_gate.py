@@ -132,7 +132,7 @@ def test_verification_repairs_are_verified_fresh_and_stop_after_five(tmp_path):
         assert json.loads(job(store)["record_json"])["request_budget"]["reserved"] == 7
         shown = rejection.show_item(store, row["id"])["final_review"]
         assert shown["candidate"]["summary"] == "Repair number 5."
-        assert shown["base_candidate"]["summary"] == analysis()["summary"]
+        assert shown["base_candidate"]["summary"] == "The operator reported a plausible compromise and stopped trusting the affected keys."
         assert [(e["phase"], e["verdict"]) for e in shown["reviews"]] == [("review", "revise")] + [("verification", "revise")] * 5
         assert all(e["failed"] == {"operational_advice": "fail: The source does not support this claim."} for e in shown["reviews"])
         assert [e["repair"]["summary"] for e in shown["reviews"]] == [f"Repair number {n}." for n in range(6)]
@@ -694,6 +694,39 @@ def test_cache_reviews_again_unless_the_receipt_is_a_complete_decision(context, 
     assert result["review_calls"] == 2 and not result["cache_hit"]
 
 
+@pytest.mark.parametrize("bad_review", [None, "damaged", []])
+def test_malformed_cached_review_is_removed_before_fresh_review_without_changing_history(context, bad_review):
+    cfg, store = context
+    prior = pending(store, item(url="https://example.org/prior", content="Earlier independent report."))
+    prior_prepared = store.prepare_candidate(prior, analysis(evidence=["Earlier independent report."]), DATE)
+    assert run(cfg, store, prior, Writer(analysis(evidence=["Earlier independent report."])), Reviewer(verdict()))["status"] == "published"
+    approve(store, prior_prepared, policy=review.policy_hash(cfg))
+    history = {table: [tuple(row) for row in store.db.execute(f"SELECT * FROM {table}")]
+               for table in ("stories", "analyses", "review_approvals")}
+    assert history["review_approvals"]
+    row = pending(store)
+    with pytest.raises(AnalysisError):
+        run(cfg, store, row, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
+    saved = job(store, row["id"])
+    receipt = approve(store, json.loads(saved["envelope_json"]), policy=saved["policy_hash"])
+    with store.db:
+        store.db.execute("UPDATE review_approvals SET review_record_json=? WHERE key=?",
+                         (json.dumps({"reviews": [bad_review]}), receipt["approval_key"]))
+
+    paused = Reviewer()
+    result = run(cfg, store, row, Writer(), paused, allow_network=False)
+    assert result["status"] == "deferred" and not result["cache_hit"] and not paused.calls
+    assert store.db.execute("SELECT 1 FROM review_approvals WHERE key=?", (receipt["approval_key"],)).fetchone() is None
+    assert history == {table: [tuple(row) for row in store.db.execute(f"SELECT * FROM {table}")]
+                       for table in history}
+    fresh = Reviewer(verdict())
+    result = run(cfg, store, row, Writer(), fresh)
+    assert result["status"] == "published" and result["review_calls"] == 2 and not result["cache_hit"]
+    assert [call[2] for call in fresh.calls] == [False, True]
+    assert all(old in [tuple(row) for row in store.db.execute(f"SELECT * FROM {table}")]
+               for table, rows in history.items() for old in rows)
+
+
 def test_status_retry_reverted_hold_and_rejected_show_views(context, monkeypatch):
     cfg, store = context
     assert review_gate.status(store) == {"stages": {}, "approval_cache_entries": 0}
@@ -724,7 +757,7 @@ def test_status_retry_reverted_hold_and_rejected_show_views(context, monkeypatch
     snap = list(store.db.iterdump())
     monkeypatch.setattr(review, "CRITERIA", (*review.CRITERIA, "a_later_criterion"))
     shown_h = rejection.show_item(store, row["id"])["final_review"]
-    assert shown_h["stage"] == "held" and shown_h["candidate"]["title"] == analysis()["title"]
+    assert shown_h["stage"] == "held" and shown_h["candidate"]["title"] == "Operator reports possible compromise"
     assert shown_h["latest_review"]["criteria"]["operational_advice"]["outcome"] == "fail"
     assert shown_h["source_packet"]["sources"][0]["passages"][0]["id"] == "S1:P1"
     assert list(store.db.iterdump()) == snap
@@ -1022,7 +1055,11 @@ def test_trusted_operator_vs_community_list_incidents_in_gate(context):
                              summary="A large relay operator reports a sustained SYN flood across exit relays.",
                              category="dos", tags=["dos"], confidence="reported", state="developing",
                              evidence=["Large relay family observed sustained SYN flood"])
-    assert run(cfg, store, trusted_inc, Writer(trusted_draft), Reviewer(verdict(), verdict()))["status"] == "published"
+    # A qualified anonymous role needs a source-preserving style repair, not
+    # an unsafe "large person" substitution or an override of the incident guard.
+    repair = verdict("revise", criterion="actor_and_action", repair={
+        "summary": "A report from a large relay family describes a sustained SYN flood across exit relays."})
+    assert run(cfg, store, trusted_inc, Writer(trusted_draft), Reviewer(repair, verdict()))["status"] == "published"
 
     untrusted_inc = pending(store, item(url=list_base + "comm1/", kind="feed", authority="community",
                                         content="Single operator claims relays face deanonymization attack."))

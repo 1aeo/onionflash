@@ -58,6 +58,19 @@ def assert_unapprovable(cfg, store, item_id: str, expected_reason: str):
     assert dump_sql(store) == before
 
 
+@pytest.mark.parametrize("proposals", [None, {}, 1, [None], ["invalid"], [1]])
+def test_malformed_held_proposals_are_refused_without_changing_saved_state(context, proposals):
+    cfg, store = context
+    row = hold_news_dispute(cfg, store)
+    assert review_gate.approval(cfg, store, row["id"])["eligible"] is True
+    record = json.loads(job(store, row["id"])["record_json"])
+    record["untrusted_proposals"] = proposals
+    with store.db:
+        store.db.execute("UPDATE review_jobs SET record_json=? WHERE item_id=?",
+                         (json.dumps(record), row["id"]))
+    assert_unapprovable(cfg, store, row["id"], "Saved proposal or review state cannot be read")
+
+
 def test_a_held_news_judgment_publishes_exactly_as_reviewed_without_model_calls(context):
     cfg, store = context
     row = hold_news_dispute(cfg, store)
@@ -160,7 +173,8 @@ def test_verified_repair_mirror_official_and_repeat_holds_publish_exact_reviewed
     pytest.param(_TAG_ITEM, tag_notice(_TAG_ITEM), [verdict("revise", criterion="news_value", repair={"title": "Edited tag"})], "No fresh verification reviewed this exact text", id="tag_repair"),
     pytest.param(None, None, [*[verdict("revise", criterion="status", repair={"title": f"Attempt {idx}"}) for idx in range(review_gate.MAX_VERIFY_REPAIRS + 1)],
                               verdict("revise", criterion="status", repair={"title": "Final attempt"})], "A review failed status; dismiss or retry it", id="repairs_exhausted"),
-    pytest.param(None, analysis(category="release", state="merged", tags=["tor", "release"]),
+    pytest.param(item(content=item()["content"] + " The repair was merged."),
+                 analysis(category="release", state="merged", tags=["tor", "release"]),
                  [verdict("revise", criterion="actor_and_action", repair={"title": "Merged release branch"}), verdict("hold", criterion="news_value")],
                  "release labels need a released or tagged state", id="release_merged_news_hold"),
     pytest.param(item(kind="gitlab_issue", content="Operators report a bug in relay descriptor parsing that needs investigation."),

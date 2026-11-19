@@ -375,6 +375,14 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
             if retracted:
                 raise ValueError("Restore a retracted story before correcting it")
             clean = _validated_patch(patch)
+            from .personal_attribution import unresolved_text
+            changed_text = [clean[field] for field in ("title", "summary", "why_it_matters")
+                            if field in clean and clean[field] != current["public"].get(field)]
+            old_updates = current["public"].get("updates", [])
+            changed_text += [entry["text"] for index, entry in enumerate(clean.get("updates", []))
+                             if index >= len(old_updates) or entry["text"] != old_updates[index]["text"]]
+            if any(unresolved_text(text) for text in changed_text):
+                raise ValueError("Correction needs names-only personal attribution")
             if "category" in clean and "tags" not in clean and clean["category"] != current["public"]["category"]:
                 public["tags"] = [t for t in public.get("tags", []) if t != current["public"]["category"]]
             public.update(clean)

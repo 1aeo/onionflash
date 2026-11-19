@@ -209,6 +209,18 @@ def test_judged_corpus_is_public_and_labeled(tmp_path, monkeypatch, capsys):
     judged = summary["judged"]
     assert summary["errors"] == 0 and not summary["incomplete"]
     assert sum(row["cases"] for row in judged.values()) == len(cases)
-    assert judged["clean"]["ok"] == judged["clean"]["cases"]
+    observations = [json.loads(line) for line in (tmp_path / "private/report.jsonl").read_text().splitlines()]
+    clean_ids = {case["id"] for case in cases if "flaw" not in case}
+    # Primary scores measure reviewer changes; original-input history stays explicit.
+    assert judged["clean"]["ok"] == sum(
+        row["matched"] and row["published_candidate"] == row["review_candidate"]
+        for row in observations if row.get("case") in clean_ids
+    )
+    assert summary["legacy_raw_judged"]["clean"]["ok"] == sum(
+        row["matched"] and row["published_candidate"] == row["candidate"]
+        for row in observations if row.get("case") in clean_ids
+    )
     assert judged.get("stale_fact", {"ok": 0, "cases": 0})["ok"] == judged.get("stale_fact", {"cases": 0})["cases"]
-    assert all(row["ok"] == 0 for flaw, row in judged.items() if flaw not in {"clean", "stale_fact"})
+    flagged = {case["id"] for case in cases if case.get("flaw") not in {None, "stale_fact"}}
+    assert all(not row["ok"] or row["published_candidate"] != row["candidate"]
+               for row in observations if row.get("case") in flagged)

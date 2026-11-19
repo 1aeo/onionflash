@@ -17,6 +17,7 @@ from onionflash.analyze import AnalysisError, Analyzer
 from onionflash.config import load_config
 from onionflash.render import prepare_story
 from onionflash.review import EDITABLE, Reviewer, final_holds, policy_hash
+from onionflash import personal_attribution
 from onionflash.review_gate import ReviewRequests, advance_review, initial_review_state, recovery_status
 from onionflash.source_packet import normalize_labels, number_sources
 from onionflash.util import item_cluster, story_cluster
@@ -107,10 +108,11 @@ def draft_cases(corpus: dict) -> list[dict]:
 
 
 def writer_item(source: dict) -> dict:
-    """The stored item a writer drafts from: authored passages are its notes, the rest its content."""
+    """Rebuild writer content and literal sender metadata from the source packet."""
     passages = source["passages"][1:]
-    return {key: source.get(key) for key in ("title", "kind", "authority", "product", "published_at", "updated_at",
+    return {key: source.get(key) for key in ("url", "title", "kind", "authority", "product", "published_at", "updated_at",
                                              "upstream_state")} | {
+        **{key: source[key] for key in ("author", "sender_domain") if source.get(key)},
         "labels": normalize_labels(source.get("labels")),
         "content": "\n\n".join(passage["text"] for passage in passages if "author" not in passage),
         "public_comments": [{"author": passage["author"], "created_at": passage["created_at"], "url": passage["url"],
@@ -204,7 +206,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                                "published_after_checks", "route_cases", "matched_routes", "missed_routes",
                                "false_routes", "wrong_routes", "controlled_mismatches"), 0),
               "holds": {}, "incomplete": False}
-    judged, outcomes, seen = {}, {}, set()
+    judged, legacy_raw_judged, outcomes, legacy_raw_outcomes, seen = {}, {}, {}, {}, set()
     identity = policy_hash(config)
     with (os.fdopen(descriptor, "w", encoding="utf-8") as report, EvaluationReviewer(config, deadline=deadline) as reviewer,
           Analyzer(config, deadline=deadline) as writer):
@@ -255,19 +257,30 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                                 "row": {"url": source["url"], "story_id": prior["id"] if prior else None,
                                         "cluster_key": item_cluster(identity_item),
                                         "payload": json.dumps(item)}}
-                    stage, text, record["reviews"] = "review", candidate, []
+                    text = personal_attribution.normalize(candidate, update=scope == "latest_update")
+                    # Preserve the original input/gold comparison separately from
+                    # the exact publication-style text sent to native review.
+                    record["review_candidate"] = text
+                    record["style_input_changed"] = text != candidate
+                    record["style_unresolved"] = personal_attribution.unresolved(text, update=scope == "latest_update")
+                    record["style_removed_unsupported"] = [marker for marker in kept_unsupported(case, candidate)
+                                                           if marker not in kept_unsupported(case, text)]
+                    prepared["candidate"] = text
+                    stage, record["reviews"] = "review", []
                     while True:
                         action, value = advance_review(reviewer, stage, text, prepared, record, requests)
                         if action not in {"verify", "repair"}:
                             break
                         stage, text = action, value
-                    first = record["reviews"][0]["result"]
+                    first = record["reviews"][0]["result"] if record["reviews"] else {}
                     last = next((entry["result"] for entry in reversed(record["reviews"]) if entry["stage"] == "verification"), None)
                     actual_route = (value if action == "route" and isinstance(value, str) else
                                     next((entry["result"].get("same_story") for entry in record["reviews"]
                                           if entry["result"]["verdict"] in {"approve", "revise", "skip"}
                                           and entry["result"].get("same_story")), None))
-                    record.update(result=first, same_story=actual_route, kept_unsupported=kept_unsupported(case, text))
+                    record.update(same_story=actual_route, kept_unsupported=kept_unsupported(case, text))
+                    if first:
+                        record["result"] = first
                     if last:
                         record["verification"] = last
                     for field, reply in (("model_verdict", first), ("verification_model_verdict", last or {})):
@@ -289,7 +302,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                     record["verification_repairs"] = sum(entry["stage"] == "verification" and entry["result"]["verdict"] == "revise"
                                                          for entry in record["reviews"][:-1])
                     totals["verification_repairs"] += record["verification_repairs"]
-                    if record["result"]["verdict"] == "revise":
+                    if first.get("verdict") == "revise":
                         totals["repairs_verified" if published else "repairs_skipped" if action in {"skip", "route"} else "repairs_held"] += 1
                     final_verdict = "approve" if published else action
                     route_ok = True
@@ -310,6 +323,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                             route_ok = False
                     unsafe = published and (case["expected"] in {"skip", "hold"} or bool(record["kept_unsupported"]))
                     published_candidate = text if published else None
+                    record["normalized_input_unchanged"] = bool(published and text == record["review_candidate"])
                     missing = omitted(case, published_candidate) if published else []
                     # not_approve marks news with a flawed draft: hold or a clean repair, never a skip.
                     missed = (final_verdict in {"skip", "route"}) != (case["expected"] == "skip") and case["expected"] != "approve"
@@ -325,16 +339,19 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                     totals["impact_cleared"] += bool(scope == "story" and case["expected"] == "approve" and published
                                                      and candidate["why_it_matters"] and not published_candidate["why_it_matters"])
                     if "audit" in case:
-                        # A flagged case is caught when its flaw never publishes and the news is
-                        # not skipped; a clean case must publish unchanged.
-                        record["ok"] = ok = matched and ("flaw" in case or published_candidate == candidate)
-                        row = judged.setdefault(case.get("flaw", "clean"), {"cases": 0, "ok": 0, "unique": 0,
-                                                                            **({"paired": 0} if "flaw" in case else {})})
-                        row["cases"] += 1
-                        row["ok"] += ok
-                        row["unique"] += case["id"] not in seen
+                        # Required publication style is the reviewer's input. Keep the
+                        # old raw-input score explicitly; neither score relabels the gold.
+                        record["ok"] = ok = matched and ("flaw" in case or published_candidate == record["review_candidate"])
+                        record["legacy_raw_ok"] = raw_ok = matched and ("flaw" in case or published_candidate == candidate)
+                        for target, value in ((judged, ok), (legacy_raw_judged, raw_ok)):
+                            row = target.setdefault(case.get("flaw", "clean"), {"cases": 0, "ok": 0, "unique": 0,
+                                                                               **({"paired": 0} if "flaw" in case else {})})
+                            row["cases"] += 1
+                            row["ok"] += value
+                            row["unique"] += case["id"] not in seen
                         seen.add(case["id"])
                         outcomes[iteration, case["id"]] = ok
+                        legacy_raw_outcomes[iteration, case["id"]] = raw_ok
                     else:
                         totals["controlled_mismatches"] += not matched
                 except (AnalysisError, ValueError, TypeError, KeyError) as exc:
@@ -348,6 +365,10 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                 record["review_request_count"] = requests.actual
                 record.update(recovery_status(record))
                 totals["raw_inconsistencies"] = totals.get("raw_inconsistencies", 0) + record["raw_inconsistency_count"]
+                totals["raw_degenerate_reviews"] = totals.get("raw_degenerate_reviews", 0) + record["raw_degenerate_count"]
+                totals["raw_attribution_failures"] = totals.get("raw_attribution_failures", 0) + record["raw_attribution_count"]
+                totals["unresolved_attribution_failures"] = totals.get("unresolved_attribution_failures", 0) + int(record["unresolved_attribution"])
+                totals["unresolved_degenerate_reviews"] = totals.get("unresolved_degenerate_reviews", 0) + int(record["unresolved_degenerate"])
                 totals["unresolved_inconsistencies"] = totals.get("unresolved_inconsistencies", 0) + int(record["unresolved_inconsistency"])
                 record["seconds"] = round(time.monotonic() - started, 2)
                 encoded = json.dumps(record, ensure_ascii=False, allow_nan=False)
@@ -367,17 +388,24 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
         flagged = {case["id"]: (case["flaw"], case["expected"] == "approve",
                                 [twin["id"] for twin in cases if "audit" in twin and "flaw" not in twin
                                  and twin["packet"] == case["packet"]]) for case in cases if "flaw" in case}
-        for (iteration, case_id), ok in outcomes.items():
-            if case_id in flagged:
-                flaw, publishes, twins = flagged[case_id]
-                judged[flaw]["paired"] += ok and (publishes or bool(twins)) and all(
-                    outcomes.get((iteration, twin), False) for twin in twins)
+        for target, scored in ((judged, outcomes), (legacy_raw_judged, legacy_raw_outcomes)):
+            for (iteration, case_id), ok in scored.items():
+                if case_id in flagged:
+                    flaw, publishes, twins = flagged[case_id]
+                    target[flaw]["paired"] += ok and (publishes or bool(twins)) and all(
+                        scored.get((iteration, twin), False) for twin in twins)
         rows = [row for flaw, row in judged.items() if flaw != "clean"]
         clean = judged.get("clean", {"cases": 0, "ok": 0})
         totals.update(judged=judged, target_missed=target_missed(judged),
                       catch_rate=_rate(sum(row["ok"] for row in rows), sum(row["cases"] for row in rows)),
                       paired_catch_rate=_rate(sum(row["paired"] for row in rows), sum(row["cases"] for row in rows)),
                       false_alarm_rate=_rate(clean["cases"] - clean["ok"], clean["cases"]))
+        raw_rows = [row for flaw, row in legacy_raw_judged.items() if flaw != "clean"]
+        raw_clean = legacy_raw_judged.get("clean", {"cases": 0, "ok": 0})
+        totals.update(legacy_raw_judged=legacy_raw_judged,
+                      legacy_raw_catch_rate=_rate(sum(row["ok"] for row in raw_rows), sum(row["cases"] for row in raw_rows)),
+                      legacy_raw_paired_catch_rate=_rate(sum(row["paired"] for row in raw_rows), sum(row["cases"] for row in raw_rows)),
+                      legacy_raw_false_alarm_rate=_rate(raw_clean["cases"] - raw_clean["ok"], raw_clean["cases"]))
         report.write(json.dumps({"summary": totals, "policy_hash": identity}) + "\n")
     print(json.dumps({"summary": totals}), flush=True)
     return totals

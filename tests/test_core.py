@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 
-from helpers import (DAMAGE, DATE, ApprovingReviewer, FakeClient, ScriptedAnalyzer, analysis, config,
+from helpers import (DAMAGE, DATE, ApprovingReviewer, FakeClient, FakeLLM, ScriptedAnalyzer, analysis, completion, config,
                      damage_item, damaged, finish_reviewed, item, patch_cli_pipeline, response, source,
                      tag, update_analysis)
 from onionflash import cli, collect, review, review_gate
@@ -20,7 +20,7 @@ from onionflash.analyze import AnalysisError, Analyzer, tag_notice, validate_ana
 from onionflash.cli import build, main, run_lock
 from onionflash.collect import CollectionError, _item, collect_source
 from onionflash.config import DEFAULT_TRUSTED_OPERATOR_DOMAINS, DEFAULTS, load_config
-from onionflash.llm import json_object
+from onionflash.llm import json_object, unquoted_mail_text
 from onionflash.store import Store, after as store_after, backup_database
 from onionflash.transport import DeadlineReached, FetchError, HttpClient, Response
 from onionflash.util import (MAX_SAVED_DEPTH, after, backoff_seconds, canonical_url, format_utc,
@@ -43,6 +43,172 @@ EXAMPLE_TOML = (Path(__file__).parents[1] / "config.example.toml").read_text()
 def test_plain_text_and_unicode_normalization(raw, expected):
     """Strip hidden HTML elements, control characters, and lone surrogates in plain_text."""
     assert plain_text(raw, 100) == expected
+
+
+@pytest.mark.parametrize("quoted,expected", [
+    ("Quoted <b>claim</b>.<br>Second line.", "> Quoted claim.\n> Second line."),
+    ("Outer <i>claim</i>.<blockquote>Inner claim.</blockquote>Outer continuation.",
+     "> Outer claim.\n>> Inner claim.\n> Outer continuation."),
+    ("First line.\nSecond line.\r\nThird line.\u2028Fourth line.",
+     "> First line.\n> Second line.\n> Third line.\u2028> Fourth line."),
+    ("Quoted <span>claim</span><script>hidden()</script><style>hidden</style>"
+     "<noscript>hidden</noscript><template><blockquote>hidden</blockquote></template> remains.",
+     "> Quoted claim remains."),
+])
+def test_opt_in_blockquote_markers_preserve_visible_quote_boundaries(quoted, expected):
+    raw = ("<p>Own reply.</p><template><blockquote>Hidden claim.</blockquote></template>"
+           f"<blockquote>{quoted}</blockquote><p>Own follow-up.</p>")
+    marked = plain_text(raw, 2000, mark_blockquotes=True)
+    assert marked == f"Own reply.\n\n{expected}\n\nOwn follow-up."
+    assert unquoted_mail_text(marked) == "Own reply.\n\nOwn follow-up."
+    assert "hidden" not in marked.lower()
+    assert "> " not in plain_text(raw, 2000)
+
+
+def test_blockquote_marking_keeps_literal_quotes_and_plain_text_defaults():
+    raw = "<p>Own reply.</p>&gt; Existing quoted line.<br>&gt; Another quoted line."
+    assert plain_text(raw, 2000, mark_blockquotes=True) == plain_text(raw, 2000)
+    assert unquoted_mail_text(plain_text(raw, 2000, mark_blockquotes=True)) == "Own reply."
+    literal = "<blockquote>Literal markup in a text field.</blockquote>"
+    assert plain_text(literal, 2000, html=False, mark_blockquotes=True) == literal
+    assert plain_text(literal, 2000) == "Literal markup in a text field."
+
+
+@pytest.mark.parametrize("limit", [200, 20_000])
+def test_blockquote_prefix_materialization_stays_proportional_to_output_limit(monkeypatch, limit):
+    from onionflash import util
+
+    class BoundedParts(list):
+        characters = 0
+
+        def append(self, text):
+            self.characters += len(text)
+            assert self.characters <= 6 * limit
+            super().append(text)
+
+    original = util._TextParser
+
+    class InspectingParser(original):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.parts = BoundedParts()
+
+    monkeypatch.setattr(util, "_TextParser", InspectingParser)
+    depth = limit // 5
+    lines = (4 * limit - len("<blockquote>") * depth) // 2
+    raw = "<blockquote>" * depth + "x\n" * lines
+    expected = (">" * depth + " x\n") * (limit // depth + 1)
+    assert plain_text(raw, limit, mark_blockquotes=True) == expected[:limit]
+
+
+@pytest.mark.parametrize("raw,limit,expected", [
+    (" \t\x00" + "<blockquote>" * 5 + "\t\x00\n \t\nx\n\nY \t", 20,
+     ">>>>> \n>>>>> \n>>>>> "),
+    (" " * 40 + "<blockquote>" * 3 + "\x00\n" * 10, 24,
+     ">>> \n>>> \n>>> \n>>> \n>>> "),
+    ("<blockquote>" * 4 + " \t\u2028\x00\n\tA\t\tB\nZ \x85 " * 2, 20,
+     ">>>> \u2028>>>> \n>>>> A B"),
+])
+def test_quote_budget_preserves_truncation_after_whitespace_and_control_cleanup(raw, limit, expected):
+    assert plain_text(raw, limit, mark_blockquotes=True) == expected
+
+
+def _quoted_reply_feed(entry_url, authority="community"):
+    body = ("<p>The current reply narrows the measurement to a smaller sample.</p>"
+            "<blockquote>The earlier author reported failures across every measured relay.</blockquote>")
+    xml = ("<rss version='2.0'><channel><title>Replies</title><link>https://example.org/</link>"
+           "<description>Replies</description><item><title>Re: Measurements</title>"
+           f"<link>{entry_url}</link><description><![CDATA[{body}]]></description>"
+           "<pubDate>Sun, 08 Nov 2026 12:00:00 GMT</pubDate></item></channel></rss>").encode()
+    return collect_source(FakeClient([response(xml, url=LIST_URL)]),
+                          source(url=LIST_URL, authority=authority), {}, DEFAULTS["collection"], DATE)["items"]
+
+
+@pytest.mark.parametrize("entry_url,authority,marked", [
+    ("https://lists.torproject.org/thread/EXAMPLE/", "community", True),
+    ("https://lists.torproject.org/thread/EXAMPLE/", "official", True),
+    ("https://LISTS.TORPROJECT.ORG/thread/EXAMPLE/", "community", True),
+    ("https://example.org/thread/EXAMPLE/", "official", False),
+    ("https://lists.torproject.org.example.org/thread/EXAMPLE/", "community", False),
+    ("https://example.org/lists.torproject.org/?host=lists.torproject.org", "community", False),
+])
+def test_feed_marks_blockquotes_only_for_the_exact_entry_hostname(entry_url, authority, marked):
+    [collected] = _quoted_reply_feed(entry_url, authority)
+    assert collected["content"].startswith("The current reply narrows")
+    assert ("\n> The earlier author" in collected["content"]) is marked
+
+
+@pytest.mark.parametrize("entry_url", [
+    "https://lists.torproject.org@invalid.example/thread/", "https://[invalid/thread/",
+])
+def test_quote_marking_still_skips_invalid_entry_urls(entry_url):
+    assert _quoted_reply_feed(entry_url) == []
+
+
+@pytest.mark.parametrize("tail", ["é" * 700, "x" * 4096])
+def test_citation_length_limit_applies_to_the_saved_representation(tail):
+    url = "https://example.org/?q=" + tail
+    with pytest.raises(ValueError, match="source URL"):
+        canonical_url(url)
+    assert _quoted_reply_feed(url) == []
+
+
+@pytest.mark.parametrize("character", ["a", "é"])
+def test_citation_canonical_length_boundary_is_inclusive(character):
+    prefix = "https://example.org/?q="
+    raw = prefix + character * 600
+    raw += "x" * (4096 - len(canonical_url(raw)))
+    canonical = canonical_url(raw)
+    assert len(canonical) == 4096 and canonical_url(canonical) == canonical
+    assert _quoted_reply_feed(raw)[0]["url"] == canonical
+    with pytest.raises(ValueError, match="source URL"):
+        canonical_url(raw + "x")
+    assert _quoted_reply_feed(raw + "x") == []
+
+
+@pytest.mark.parametrize("host", ["example.org", "LISTS.TORPROJECT.ORG"])
+def test_collected_encoded_citations_remain_valid_through_packet_construction(store, host):
+    from onionflash.source_packet import build_packet
+
+    raw = f"https://{host}/?q=" + "é" * 600
+    [collected] = _quoted_reply_feed(raw)
+    expected = canonical_url(raw)
+    assert collected["url"] == canonical_url(expected) == expected
+    assert len(expected) < 4096
+    assert ("\n> The earlier author" in collected["content"]) is (host.lower() == "lists.torproject.org")
+    store.ingest(collected, DATE)
+    row = store.pending(1, DATE)[0]
+    references = {"sources": [{"id": row["id"], "url": expected}]}
+    packet, _ = build_packet(store.db, json.loads(row["payload"]), references, references, row["id"])
+    assert packet["missing_sources"] == [] and packet["sources"][0]["url"] == expected
+
+
+@pytest.mark.parametrize("quoted_only", [False, True])
+def test_collected_html_quotes_stay_outside_writer_and_packet_reply_evidence(monkeypatch, quoted_only):
+    from onionflash.source_packet import build_packet
+
+    [collected] = _quoted_reply_feed("https://lists.torproject.org/thread/EXAMPLE/")
+    collected["id"] = "a" * 24
+    own = "The current reply narrows the measurement to a smaller sample."
+    quoted = "The earlier author reported failures across every measured relay."
+    packet, _ = build_packet(None, collected, {"sources": [{"id": collected["id"], "url": collected["url"]}]},
+                             {"sources": []}, collected["id"])
+    assert packet["sources"][0]["unquoted_content"] == own
+    draft = analysis(title="A reply narrows the measured sample", summary=own, why_it_matters="",
+                     evidence=[quoted if quoted_only else own])
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["llm"].update(base_url="https://model.example/v1", fallback_base_urls=[])
+    monkeypatch.setenv("ONIONFLASH_LLM_API_KEY", "synthetic-fixture-key")
+    with Analyzer(cfg) as writer:
+        writer.client = FakeLLM(completion(draft))
+        if quoted_only:
+            with pytest.raises(AnalysisError) as caught:
+                writer.analyze(collected)
+            assert caught.value.code == "writer.quoted_only_evidence"
+        else:
+            assert writer.analyze(collected)["summary"] == own
+        payload = json.loads(writer.client.requests[0][1]["messages"][-1]["content"])
+    assert payload["unquoted_content"] == own and quoted not in payload["unquoted_content"]
 
 
 def test_tag_notice_clean_text_and_surrogate_json_rejection():
@@ -601,6 +767,16 @@ def test_base_url_is_normalized_to_a_clean_directory(tmp_path, base):
     path = tmp_path / "config.toml"
     path.write_text(f'[site]\nbase_url = "{base}"\n[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
     assert load_config(path)["site"]["base_url"] == "https://example.com/news/"
+
+
+@pytest.mark.parametrize("authority", ["user:private-value＠example.org", "[user:private-value", "example.org:private-value"])
+def test_base_url_parser_failures_use_only_the_redacted_diagnostic(tmp_path, authority):
+    path = tmp_path / "config.toml"
+    path.write_text(f'[site]\nbase_url = "https://{authority}/"\n[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
+    with pytest.raises(ValueError) as caught:
+        load_config(path)
+    assert str(caught.value) == "site.base_url must be a clean absolute HTTP(S) URL (invalid value [redacted])"
+    assert "private-value" not in str(caught.value)
 
 
 def test_story_precedence_legacy_stories_and_added_at(tmp_path):

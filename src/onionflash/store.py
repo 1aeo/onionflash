@@ -750,7 +750,7 @@ class Store:
     def commit_candidate(self, prepared: dict, approved_candidate: dict | None, cache_key: str, observed: str, *,
                          approval_key: str | None = None, policy_hash: str | None = None,
                          review_record: dict | None = None, decision: str = "approve",
-                         operator: bool = False) -> dict:
+                         operator: bool = False, review_config: dict | None = None) -> dict:
         """Apply an exact reviewed publication or skip decision and delete its receipt."""
         with immediate_transaction(self.db, "Candidate commit requires a fresh transaction"):
             row, result, story_id, locked = prepared["row"], prepared["result"], prepared["story_id"], prepared["locked"]
@@ -760,9 +760,37 @@ class Store:
                 raise ReviewRequired("Its story is editorially locked")
             if not locked:
                 mode = prepared.get("mode", "story")
-                editable_fields = candidate.validate_approved(prepared["candidate"], approved_candidate, mode)
+                if (digest(prepared["candidate"]) != prepared["candidate_hash"]
+                        or digest(prepared["packet"]) != prepared["source_hash"]
+                        or digest(prepared["binding"]) != prepared["binding_hash"]
+                        or prepared["binding"].get("candidate_hash") != prepared["candidate_hash"]
+                        or prepared["binding"].get("packet_hash") != prepared["source_hash"]
+                        or digest(prepared["payload"]) != prepared["binding"].get("payload_hash")
+                        or prepared.get("mode", "story") != prepared["binding"].get("mode", "story")):
+                    raise ReviewRequired("Prepared candidate and source bindings do not match")
+                editable_fields = candidate.validate_approved(prepared["candidate"], approved_candidate, mode,
+                                                               packet=prepared["packet"])
+                from . import source_quote
+                # The marker protects a caller-rebased original; actual stored
+                # history keeps that protection after a quotation is cleared.
+                stored_job = self.db.execute("SELECT CAST(record_json AS BLOB) FROM review_jobs WHERE item_id=?",
+                                             (row["id"],)).fetchone()
+                stored_record = saved_object(stored_job[0]) if stored_job is not None else None
+                quote_proof = (mode == "story" and (
+                    source_quote.used_in_review(stored_record)
+                    or (stored_job is not None and stored_record is None)
+                    or (bool(approved_candidate.get("why_it_matters"))
+                        and (approved_candidate["why_it_matters"] != prepared["candidate"]["why_it_matters"]
+                             or approved_candidate["why_it_matters"].startswith(source_quote.PREFIX)))))
+                if quote_proof:
+                    from . import review, review_gate
+                    if not isinstance(review_config, dict) or policy_hash != review.policy_hash(review_config):
+                        raise ReviewRequired("Impact replacement requires the current review policy")
                 if prepared["packet"]["missing_sources"]:
                     raise ReviewRequired("Required source material is unavailable")
+                from .personal_attribution import unresolved
+                if decision == "approve" and unresolved(approved_candidate, update=mode == "update"):
+                    raise ReviewRequired("Personal attribution needs names-only publication style")
                 if operator:
                     approval_meta = review_record.get("operator_approval") if isinstance(review_record, dict) else None
                     if (decision != "approve" or not isinstance(approval_meta, dict)
@@ -773,29 +801,96 @@ class Store:
                     current = candidate.prepare(
                         self.db, row, result, prepared["observed"], dirauth_users=effective_users
                     )
-                    held_job = self.db.execute("SELECT stage FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
+                    held_job = self.db.execute("SELECT stage,record_json,CAST(envelope_json AS BLOB) AS envelope "
+                                               "FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
                     item_state = self.db.execute("SELECT status FROM items WHERE id=?", (row["id"],)).fetchone()
                     if (current["locked"] or current["binding_hash"] != prepared["binding_hash"]
                             or held_job is None or held_job["stage"] != "held"
                             or item_state is None or item_state["status"] != "rejected"):
                         raise candidate.StaleCandidate("Item or coverage changed before approval committed")
                     operator_reason = approval_meta["reason"]
+                    attribution_record = json.loads(held_job["record_json"])
+                    held_envelope = saved_object(held_job["envelope"])
+                    actual_held = attribution_record.get("candidate", (held_envelope or {}).get("candidate"))
+                    if actual_held != approved_candidate:
+                        raise ReviewRequired("Operator approval does not match the held candidate and its proof")
                 else:
                     receipt = self.db.execute("SELECT * FROM review_approvals WHERE key=?", (approval_key,)).fetchone()
                     if receipt is None or any(receipt[key] != expected for key, expected in (
                             ("candidate_hash", digest(approved_candidate)), ("source_hash", prepared["source_hash"]),
                             ("policy_hash", policy_hash), ("binding_hash", prepared["binding_hash"]))):
                         raise ReviewRequired("Review decision does not match this candidate and its context")
+                    candidate.verify_prepared_binding(self.db, prepared)
                     from .review import validate_review
-
+                    attribution_record = json.loads(receipt["review_record_json"])
+                    from .review import attribution_names
                     verdict = validate_review(json.loads(receipt["result_json"]), prepared["packet"],
-                                              update=mode == "update", coverage=prepared["coverage"])
+                                              update=mode == "update", coverage=prepared["coverage"], candidate=approved_candidate,
+                                              attribution_names=attribution_names(prepared, attribution_record))
                     if verdict["verdict"] != decision:
                         raise ReviewRequired("Final review did not authorize this decision")
+                    from . import review, review_gate
+                    try:
+                        if attribution_record.get("policy_hash") != policy_hash:
+                            raise ValueError()
+                        review_gate.validate_review_state(
+                            attribution_record, "approved" if decision == "approve" else "skipped",
+                            approved_candidate, prepared, allow_cached=False
+                        )
+                    except (review.AnalysisError, ValueError, TypeError, KeyError, AttributeError):
+                        raise ReviewRequired("Publication requires its stored exact-text review proof") from None
+                    quote_proof = quote_proof or (mode == "story" and source_quote.used_in_review(attribution_record))
+                    if quote_proof:
+                        if not isinstance(review_config, dict) or policy_hash != review.policy_hash(review_config):
+                            raise ReviewRequired("Impact replacement requires the current review policy")
+                        try:
+                            job, saved_draft, envelope, durable_record, same_source = review_gate._saved_job(self, row, review_config)
+                            current = candidate.prepare(
+                                self.db, row, saved_draft, envelope["observed"],
+                                dirauth_users=self.dirauth_users if self.dirauth_users is not None else prepared.get("dirauth_users"),
+                            )
+                            if (job is None or not same_source or job["policy_hash"] != policy_hash
+                                    or job["stage"] != ("approved" if decision == "approve" else "skipped")
+                                    or job["approval_key"] != approval_key or job["writer_key"] != cache_key
+                                    or attribution_record.get("policy_hash") != policy_hash
+                                    or durable_record.get("candidate") != approved_candidate
+                                    or envelope != prepared or current != prepared):
+                                raise ValueError()
+                            review_gate.validate_stored_context(attribution_record, envelope)
+                            review_gate.validate_stored_context(durable_record, envelope)
+                            if decision == "approve" and (
+                                    review.final_holds(approved_candidate, current,
+                                                       known_attributions=attribution_names(current, attribution_record))
+                                    or not review.release_labels_match_state(approved_candidate)):
+                                raise ValueError()
+                        except (review.AnalysisError, ValueError, TypeError, KeyError, AttributeError):
+                            raise ReviewRequired("Impact replacement requires its stored exact-text review proof") from None
+                        review_record = durable_record
                     if review_record is None:
-                        review_record = json.loads(receipt["review_record_json"])
+                        review_record = attribution_record
                     self.db.execute("DELETE FROM review_approvals WHERE key=?", (approval_key,))
-            if not operator:
+                from .review import attribution_names
+                from .named_attribution import missing_named_attributions
+                if decision == "approve" and missing_named_attributions(
+                        approved_candidate, prepared["packet"], update=mode == "update",
+                        known_names=attribution_names(prepared, attribution_record)):
+                    raise ReviewRequired("Named attribution needs literal source evidence")
+                if operator:
+                    from . import review, review_gate
+                    if not isinstance(review_config, dict) or policy_hash != review.policy_hash(review_config):
+                        raise ReviewRequired("Operator approval requires the current review policy")
+                    info, handle = review_gate.check_held_approval(
+                        self, row["id"], policy_hash, dirauth_users=effective_users
+                    )
+                    if not info["eligible"]:
+                        raise ReviewRequired(info["reason"])
+                    held_prepared, held_candidate, writer_key, held_record = handle
+                    if (held_candidate != approved_candidate or held_prepared != prepared
+                            or writer_key != cache_key or approval_meta.get("approval_hash") != info["hash"]
+                            or approval_meta.get("new_coverage") != info["new_coverage"]):
+                        raise ReviewRequired("Operator approval does not match the held candidate and its proof")
+                    review_record = {**held_record, "outcome": "operator_approved", "operator_approval": approval_meta}
+            if not operator and locked:
                 candidate.verify_prepared_binding(self.db, prepared)
             cited_on_skip = False
             if not locked:

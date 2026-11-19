@@ -15,9 +15,11 @@ from .llm import (
 from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, STATES, UPDATE_CHARS
 from .util import digest, is_dirauth_item, is_hackerone_item, normalize_evidence as _plain
 
-PROMPT_VERSION = "onionflash-21"
+PROMPT_VERSION = "onionflash-22"
 # Change this when update input filtering changes, independently of prompt prose.
 UPDATE_INPUT_VERSION = 2
+# Bind cached drafts to deterministic validation independently of writer requests.
+VALIDATION_VERSION = 1
 WRITER_REASONING_OPTIONS = {
     "max_output_tokens": 32768, "max_response_bytes": 2097152,
     "enable_thinking": True, "temperature": 1.0,
@@ -148,15 +150,23 @@ generally available fix; preserve that limited scope.
 Use developing for observations, discussions and unresolved reports. Reserve merged
 for an explicitly completed code merge, not a measurement report mentioning software.
 A mailing-list proposal, [RFC] or Internet-Draft is its author's proposal for
-comment: attribute it to a proposal posted to the list, name an author or role only
-when the source text states one, keep confidence reported and state developing, and
+comment: attribute it to a proposal posted to the list, name an author only when
+the supplied evidence identifies them, and use a role only when stated or established
+by the developer-evidence rule below. Keep confidence reported and state developing, and
 do not call it adopted, accepted or a Tor Project decision unless the source says so.
-Call a named or identifiable person a developer only when the supplied evidence
-identifies code authored by that same person and committed into C Tor's codebase.
+Call a named or identifiable person a developer only when supplied commit evidence
+identifies code authored by that same person and committed into C Tor or Arti.
+Either contribution supports the generic role "developer" in news about either
+project; the source need not literally use that role word. A project-specific label
+such as "C Tor developer" or "Arti developer" requires that person's committed code
+in the named project, not just the other one.
 A mailing-list post, sender domain or authority, technical fluency, self-description,
 request for a merge request, or proposed/unmerged code does not establish that role.
 Quoting or attributing a developer self-description does not waive this requirement.
-Another person's commit or a contribution to another project is not evidence for it.
+Another person's commit or contributions only to an unrelated project do not qualify.
+Developer status does not establish official authority, confirm a claim, or make a
+routine comment newsworthy. Preserve the supplied topic and substantive report;
+do not invent extra importance from the role.
 Without that evidence, use the person's name alone or a source-stated role such as
 relay operator. Do not infer another personal role or affiliation from technical
 discussion or internal sender tags. Preserve the person's actual report or request.
@@ -207,7 +217,8 @@ do not repeat only the initial allegation. A later comment or timestamp does not
 make an old event current.""",
     claim_check="""Across title, summary, why_it_matters and update, trace each claim to the supplied
 passage that states it and identifies its speaker or entity. Keep entity names and
-stated role terms; do not substitute an unstated role for a name. Use each
+supported role terms, including developer roles established by the commit-evidence
+rule; never guess a role from a name. Use each
 statement's own author field or source text for attribution; assignment, source
 hosting and apparent expertise do not establish a role. Check the claim against
 those passages and its governing context before returning: preserve its actor,
@@ -287,7 +298,7 @@ announcement or merged gitlab_mr (or when prior_story is already confirmed); oth
 prior_story's confidence. Evidence must support the update.
 """
 UPDATE_PROMPT = _writer_prompt(
-    comments="""material maintainer disagreement or limitations; do not repeat only the initial
+    comments="""material disagreement or limitations from the supplied comments; do not repeat only the initial
 allegation. A later comment or timestamp does not make an old event current.""",
     impact="""why_it_matters is optional and conservative. Fill it only by closely
 paraphrasing one sentence of the supplied title, content or a comment body that
@@ -297,7 +308,8 @@ report saying a malformed file "causes the daemon to exit at startup". Attribute
 that sentence to its source ("The announcement asks ...", "The report says ...")
 and keep its audience, hedges and scope. Attribution does not replace uncertainty:
 retain the source's belief, possibility or conditional language in the claim itself.
-Keep entity names and stated role terms; do not substitute an unstated role for a name.
+Keep entity names and supported role terms; the commit-evidence rule may establish
+developer, but no other unstated role may be inferred from a name.
 Read all supplied comments before selecting the sentence. If another passage disputes
 or materially narrows its impact, leave this field empty unless the selected sentence
 itself carries that qualification. Add nothing it does not say: no severity,
@@ -326,7 +338,7 @@ def cache_key(row: dict, llm: dict, prior: dict | None = None) -> str:
                 "fallback_base_urls": effective["fallback_base_urls"],
                 "generation": generation_options(effective),
                 "max_response_bytes": effective["max_response_bytes"]}
-    identity = [row["content_hash"], contract, PROMPT_VERSION, prompt,
+    identity = [row["content_hash"], contract, PROMPT_VERSION, VALIDATION_VERSION, prompt,
                 json.dumps(schema, ensure_ascii=False, allow_nan=False)]
     if prior is not None:
         # Category and this source predicate also shape the update grammar.
@@ -347,12 +359,51 @@ _PRERELEASE = (r"[0-9][0-9a-z]*(?:\.[0-9][0-9a-z]*)+-(?:alpha|beta|rc|pre|dev)"
 # Thus 0.4.9 does not match 0.4.9.16, nor 15.0 match 15.0a3, with linear matching.
 _NUMBER = re.compile(_PRERELEASE + r"|[0-9][0-9a-z]*(?:[.,][0-9][0-9a-z]*)*|\b(?:" + "|".join(_NUMBER_WORDS) + r")\b")
 
+# Explicit hour words retain their meaning across quotation/code formatting.
+# Compact h needs preceding wait/delay prose, including a quoted whole scalar.
+# Other code stays opaque: h can also be a version or hexadecimal suffix.
+_HOURS = re.compile(r"(?<![^\s(\[\{\"'`])(?P<count>[0-9]+|" + "|".join(_NUMBER_WORDS)
+                    + r")(?: |-)hours?(?=$|[\s)\]\}\"'`,;!?]|\.(?!\w))")
+_COMPACT_HOURS = re.compile(r"(?<![^\s(])(?P<quote>[\"']|`+)?(?(quote) *)(?P<count>[0-9]+)h"
+                            r"(?(quote) *(?P=quote))(?=$|[\s),;!?]|\.(?!\w))|"
+                            r"(?P<ticks>`+).*?(?:(?P=ticks)`*|$)|"
+                            r"(?P<tildes>~{3,}).*?(?:(?P=tildes)~*|$)")
+_HOUR_BEFORE = re.compile(r"\b(?:wait(?:ing)?(?: (?:another|for|of))?|delay(?: of)?) \(?$")
+
 
 def _numbers(text: str) -> set[str]:
     """The numbers and versions in text; "three", "3" and "03" are one number. Leading zeros
     are stripped as text, because int() refuses the longest digit runs a source can hold."""
     tokens = (_NUMBER_WORDS.get(token, token) for token in _NUMBER.findall(_plain(text)))
     return {(token.lstrip("0") or "0") if token.isdigit() else token for token in tokens}
+
+
+def _numbers_supported(impact: str, context: str) -> bool:
+    """Preserve literal matches; forgive only unmatched occurrences of the same hours."""
+    available = _numbers(context)
+    if _numbers(impact) <= available:
+        return True
+    impact, context = _plain(impact), _plain(context)
+
+    def hours(text: str):
+        for pattern in (_HOURS, _COMPACT_HOURS):
+            for match in pattern.finditer(text):
+                count = match["count"]
+                if count is None or (
+                    pattern is _COMPACT_HOURS
+                    and not _HOUR_BEFORE.search(text, max(0, match.start() - 32), match.start())
+                ):
+                    continue
+                count = _NUMBER_WORDS.get(count, count)
+                yield match.start(), match.end(), count.lstrip("0") or "0"
+
+    source_hours = {count for _, _, count in hours(context)}
+    # Remove supported hour expressions only. A separate occurrence of the same
+    # digits (such as a relay count) must still pass the original literal check.
+    for start, end, count in sorted(hours(impact), reverse=True):
+        if count in source_hours:
+            impact = impact[:start] + " " + impact[end:]
+    return _numbers(impact) <= available
 
 
 def validate_analysis(result: dict, item: dict, schema: dict = SCHEMA) -> dict:
@@ -413,7 +464,7 @@ def validate_analysis(result: dict, item: dict, schema: dict = SCHEMA) -> dict:
     # bodies the writer saw, and is cleared on untrusted list posts, shouting or malformed versions.
     impact = result.get("why_it_matters")
     if impact and (
-        _numbers(impact) - _numbers(impact_context)
+        not _numbers_supported(impact, impact_context)
         or (item.get("authority") == "community" and is_list_item)
         or has_shouting_caps(impact)
         or has_malformed_tor_version(impact, result.get("products") or [item.get("product", "")])

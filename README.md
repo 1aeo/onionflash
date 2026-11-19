@@ -77,7 +77,7 @@ The API key is read only from the `ONIONFLASH_LLM_API_KEY` environment variable.
 | `storage` | Private SQLite path and owned public output directory |
 | `comments` | Optional anonymous GitLab discussion enrichment (`enabled`) |
 | `llm` | Base URL and fallback URLs, model, private-network allowlist (`allowed_networks`, `allow_http`), request timeout, items per run, chat-template flag, writer reasoning |
-| `review` | Reviewer model override |
+| `review` | Reviewer model override and optional full reasoning |
 | `sources` | Stream ID, display name, public website URL, kind, collection URL, fallback URLs, product, authority, optional interval/page/item overrides |
 
 `llm.writer_reasoning` opts only the writer into an xhigh reasoning profile. It
@@ -85,6 +85,12 @@ requires `send_chat_template_kwargs = true` and an endpoint that accepts the
 profile's reasoning and sampling parameters. The request timeout remains an
 explicit operator setting; enabling reasoning does not change it. Review and
 link-check generation settings are unchanged.
+
+`review.reasoning` separately opts the final reviewer into full reasoning. The
+default model family receives xhigh effort; other supported reasoning models use
+their full-thinking template. This requires `send_chat_template_kwargs = true`.
+Writer and link-check reasoning settings remain independent, and request timeouts
+do not change. See [final review configuration](docs/FINAL_REVIEW.md#configuration-and-evaluation).
 
 `llm.timeout_seconds` accepts 1–3600 seconds. The run budget controls admission
 of new model requests; an admitted request receives its full transport allowance.
