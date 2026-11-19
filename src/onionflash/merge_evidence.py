@@ -8,7 +8,7 @@ from .util import normalize_evidence, safe_canonical_url
 
 
 # Advance when claim recognition, citation scope or evidence availability changes.
-POLICY = {"version": 9, "scope": "current-story-citations", "update": "unchanged",
+POLICY = {"version": 10, "scope": "current-story-citations", "update": "unchanged",
           "uncertain_language": "defer-to-semantic-review",
           "own_text": "raw-mapping-before-nonnarrative-masking",
           "raw_markup": "defer-completion-language-without-parsing"}
@@ -26,6 +26,8 @@ _CONDITION = re.compile(r"^\s*(?:if|unless)\b", re.I)
 _TEMPORAL = re.compile(r"^\s*(?:once|when|before|after)\b|\bnot\s+only\b", re.I)
 _PROSPECTIVE = re.compile(r"^\s*before\b[^,;.!?]*\b(?:is|are|(?:can|will|must|should|may)\s+be)\s+"
                           r"(?:(?:being|now|already|\w+ly)\s+)*$", re.I)
+_REPORTED_QUESTION = re.compile(r"\bwhether\b", re.I)
+_POSSIBLE_ANSWER = re.compile(r"\bconfirm(?:ed|s)?\b|\b(?:answer|reply|response)\s+(?:was|is)\s+(?:yes|affirmative)\b", re.I)
 _OTHER = re.compile(r"\b(?:unrelated|separate|another|different|other)\b", re.I)
 _ARTIFACT = re.compile(r"\b(?:patch|fix|change|changes|commit|code|MR|PR|refactor|merge request|pull request)\b", re.I)
 _BRANCH = re.compile(r"\b(?:main|master|trunk|branch|branches)\b", re.I)
@@ -64,6 +66,18 @@ def _completion_matches(clause):
         yield match, prefix, denied
 
 
+def _possible_answer(text):
+    # A possible answer only prevents a new absence hold; it proves no merge.
+    for clause in _CLAUSE.split(text):
+        if clause.rstrip().endswith("?"):
+            continue
+        for answer in _POSSIBLE_ANSWER.finditer(clause):
+            prefix = normalize_evidence(clause[:answer.start()]).replace("n't", " not") + " "
+            if _TEMPORAL.search(clause) or not (_DIRECT_DENIED.search(prefix) or _DENIED.search(prefix)):
+                return True
+    return False
+
+
 def claim_fields(candidate):
     """Locate a current merge label or a narrowly affirmative prose claim."""
     fields = ["state"] if candidate.get("state") == "merged" else []
@@ -76,7 +90,9 @@ def claim_fields(candidate):
             clause = normalize_evidence(part).replace("n't", " not")
             if clause.endswith("?") or _CONDITION.search(clause) or _TEMPORAL.search(clause):
                 continue
+            question = _REPORTED_QUESTION.search(clause)
             if any(_MERGED.fullmatch(match[0]) and not denied and not _DENIED.search(prefix)
+                   and not (question and question.end() <= match.start())
                    for match, prefix, denied in _completion_matches(clause)):
                 fields.append(field)
                 break
@@ -136,8 +152,22 @@ def missing_completion(candidate, packet, *, update=False):
                 if _ACTION.search(text) or re.search(r"\bapplied\b", text, re.I):
                     deferred = True
                 continue
+            question_seen = False
             for clause in _CLAUSE.split(text):
+                if question_seen and _possible_answer(clause):
+                    deferred = True
+                question = _REPORTED_QUESTION.search(clause)
+                question_end = None
                 for match, prefix, denied in _completion_matches(clause):
+                    if question and question.end() <= match.start():
+                        # Questions supply no completion. A same-passage answer
+                        # or ambiguous continuation stays with semantic review.
+                        ambiguous = ("," in clause[question.end():match.start()] if question_end is None
+                                     else not _COORDINATION.fullmatch(clause[question_end:match.start()]))
+                        deferred = deferred or ambiguous or _possible_answer(clause[match.end():])
+                        question_seen = True
+                        question_end = match.end()
+                        continue
                     if _PROSPECTIVE.search(prefix):
                         continue
                     elif _TEMPORAL.search(clause):

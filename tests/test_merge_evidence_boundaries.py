@@ -42,6 +42,35 @@ def test_future_intent_and_negation_remain_nonaffirmative(text):
     check(packet(), False, public)
 
 
+def test_reported_completion_question_is_not_a_claim_or_witness():
+    question = "The note asks us to check whether the patch was merged."
+    public = target()
+    public.update(state="developing", summary=question)
+    assert merge_evidence.claim_fields(public) == []
+    check(packet("The maintainer requested confirmation of integration status."), False, public)
+    check(packet(question), True)
+
+
+@pytest.mark.parametrize("text", [
+    "The note asks whether the patch was merged, landed, or backported.",
+    "We checked whether the patch was merged; the answer was no.",
+    "We checked whether the patch was merged; they will confirm later.",
+    "We checked whether the patch was merged; they have not confirmed the result.",
+])
+def test_unanswered_reported_question_does_not_supply_completion(text):
+    check(packet(text), True)
+
+
+@pytest.mark.parametrize("text", [
+    "We checked whether the patch was merged and confirmed that it was.",
+    "We checked whether the patch was merged; the answer was yes.",
+    "The note asks whether the patch was merged; the patch was merged yesterday.",
+    "The note asks whether the patch was merged, but the patch was merged yesterday.",
+])
+def test_possible_answer_or_independent_completion_prevents_false_absence(text):
+    check(packet(text), False)
+
+
 def chunks(*texts):
     evidence = packet()
     evidence["sources"][0]["passages"] = [
