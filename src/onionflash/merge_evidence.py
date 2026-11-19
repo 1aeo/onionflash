@@ -8,7 +8,7 @@ from .util import normalize_evidence, safe_canonical_url
 
 
 # Advance when claim recognition, citation scope or evidence availability changes.
-POLICY = {"version": 4, "scope": "current-story-citations", "update": "unchanged",
+POLICY = {"version": 5, "scope": "current-story-citations", "update": "unchanged",
           "uncertain_language": "defer-to-semantic-review",
           "own_text": "raw-mapping-before-nonnarrative-masking",
           "raw_markup": "defer-completion-language-without-parsing"}
@@ -27,7 +27,12 @@ _TEMPORAL = re.compile(r"^\s*(?:once|when|before|after)\b|\bnot\s+only\b", re.I)
 _OTHER = re.compile(r"\b(?:unrelated|separate|another|different|other)\b", re.I)
 _ARTIFACT = re.compile(r"\b(?:patch|fix|change|changes|commit|code|MR|PR|refactor|merge request|pull request)\b", re.I)
 _BRANCH = re.compile(r"\b(?:main|master|trunk|branch|branches)\b", re.I)
-_CLAUSE = re.compile(r"(?<=[.!?;])\s+|\n+|\s+but\s+", re.I)
+_CLAUSE = re.compile(r"(?<=[.!?;])\s+|\n[ \t\r]*\n|\s+but\s+", re.I)
+
+
+def _mask(text):
+    # Keep paragraph and block boundaries while hiding non-narrative words.
+    return re.sub(r"[^\r\n]", " ", text)
 
 
 def claim_fields(candidate):
@@ -37,9 +42,9 @@ def claim_fields(candidate):
         raw = candidate.get(field, "")
         if source_quote.RAW_MARKUP.search(raw):
             continue
-        raw = review_evidence._NON_NARRATIVE.sub(lambda match: " " * len(match[0]), raw)
-        text = normalize_evidence(raw).replace("n't", " not")
-        for clause in _CLAUSE.split(text):
+        raw = review_evidence._NON_NARRATIVE.sub(lambda match: _mask(match[0]), raw)
+        for part in _CLAUSE.split(raw):
+            clause = normalize_evidence(part).replace("n't", " not")
             if clause.endswith("?") or _CONDITION.search(clause) or _TEMPORAL.search(clause):
                 continue
             if any(not _DENIED.search(clause[max(0, match.start() - 100):match.start()])
@@ -99,8 +104,8 @@ def missing_completion(candidate, packet, *, update=False):
             ranges, opened = source_quote.code_ranges(text, opened)
             masked = list(text)
             for start, end in ranges:
-                masked[start:end] = " " * (end - start)
-            text = review_evidence._NON_NARRATIVE.sub(lambda match: " " * len(match[0]), "".join(masked))
+                masked[start:end] = _mask(text[start:end])
+            text = review_evidence._NON_NARRATIVE.sub(lambda match: _mask(match[0]), "".join(masked))
             for clause in _CLAUSE.split(text):
                 for match in (*_ACTION.finditer(clause), *_APPLIED.finditer(clause)):
                     prefix = normalize_evidence(clause[max(0, match.start() - 100):match.start()]).replace("n't", " not") + " "

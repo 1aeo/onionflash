@@ -53,3 +53,30 @@ def test_fence_closes_in_markup_passage_before_subsequent_narrative():
 def test_markup_remains_unparsed_and_its_completion_language_still_defers():
     check(chunks("```html\n<div data-state='merged'>example</div>\n", "example\n```\n"), False)
     check(chunks("<div>example</div>\n", "The fix is now merged."), False)
+
+
+@pytest.mark.parametrize("text", [
+    "The patch was not\nmerged.", "The patch was not\r\nmerged.",
+    "The patch has\nnot yet been\nmerged.", "The patch will\nbe merged.",
+    "The patch wasn't\nmerged.", "The patch was not `yet` merged.",
+])
+def test_soft_wraps_preserve_denial_and_future_intent(text):
+    check(packet(text), True)
+    public = target()
+    public.update(state="developing", summary=text)
+    check(packet(), False, public)
+
+
+@pytest.mark.parametrize("separator", [
+    "\n\n", "\n \t\n", "\r\n\r\n", "\n```text\nexample\n```\n", "\n    example\n",
+])
+def test_paragraph_and_code_boundaries_do_not_extend_an_earlier_denial(separator):
+    text = "The patch was not" + separator + "Merged."
+    check(packet(text), False)
+    public = target()
+    public.update(state="developing", summary=text)
+    check(packet(), True, public)
+
+
+def test_soft_wrapped_affirmative_completion_remains_available():
+    check(packet("The patch has now\nbeen merged."), False)
