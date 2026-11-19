@@ -8,17 +8,21 @@ from .util import normalize_evidence, safe_canonical_url
 
 
 # Advance when claim recognition, citation scope or evidence availability changes.
-POLICY = {"version": 10, "scope": "current-story-citations", "update": "unchanged",
+POLICY = {"version": 11, "scope": "current-story-citations", "update": "unchanged",
           "uncertain_language": "defer-to-semantic-review",
           "own_text": "raw-mapping-before-nonnarrative-masking",
           "raw_markup": "defer-completion-language-without-parsing"}
 _ACTION = re.compile(r"\b(?:merged|landed|integrated|cherry[- ]picked|backported)\b", re.I)
 _MERGED = re.compile(r"\bmerged\b", re.I)
 _APPLIED = re.compile(r"\bapplied\b.{0,45}\b(?:main|master|trunk|branch)\b", re.I)
-_DENIED = re.compile(r"\b(?:not|never|cannot|can't|isn't|wasn't|hasn't|haven't|hadn't|should|must|"
-                     r"will|would|could|may|might|no)\b(?:\s+\w+){0,6}\s*$|"
+_NEGATIVE_OR_MODAL = r"not|never|cannot|can't|isn't|wasn't|hasn't|haven't|hadn't|should|must|will|would|could|may|might|no"
+_EARLIER_DENIAL = re.compile(rf"\b(?:{_NEGATIVE_OR_MODAL})\b", re.I)
+_DENIED = re.compile(rf"\b(?:{_NEGATIVE_OR_MODAL})\b(?:\s+\w+){{0,6}}\s*$|"
                      # A purpose infinitive does not govern a later finite predicate.
-                     r"\bto\b(?:\s+(?!(?:is|are|was|were|has|have|had)\b)\w+){0,6}\s*$", re.I)
+                     r"\bto\b(?:\s+(?!(?:is|are|was|were|has|have|had|got)\b)\w+){0,6}\s*$", re.I)
+_PURPOSE_COORDINATION = re.compile(
+    r"\bto\b(?:\s+(?!(?:be|get|have|been|being|and)\b)\w+){1,6}\s+and\s+"
+    r"(?:(?:even|yet|ever|actually|finally|\w+ly)\s+)*$", re.I)
 _DIRECT_DENIED = re.compile(
     r"\b(?:not|never|cannot|should|must|will|would|could|may|might|to|no)\s+"
     r"(?:(?:have|been|be|being|yet|now|already|ever|actually|finally|\w+ly)\s+)*$", re.I)
@@ -66,6 +70,17 @@ def _completion_matches(clause):
         yield match, prefix, denied
 
 
+def _denied_completion(prefix):
+    denied = _DENIED.search(prefix)
+    if not denied:
+        return False
+    # A bare past predicate may follow a non-passive purpose clause. Preserve
+    # enclosing negation/modal scope and infinitives such as "to be reviewed".
+    if not _PURPOSE_COORDINATION.fullmatch(denied[0]):
+        return True
+    return bool(_EARLIER_DENIAL.search(prefix[:denied.start()]))
+
+
 def _possible_answer(text):
     # A possible answer only prevents a new absence hold; it proves no merge.
     for clause in _CLAUSE.split(text):
@@ -91,7 +106,7 @@ def claim_fields(candidate):
             if clause.endswith("?") or _CONDITION.search(clause) or _TEMPORAL.search(clause):
                 continue
             question = _REPORTED_QUESTION.search(clause)
-            if any(_MERGED.fullmatch(match[0]) and not denied and not _DENIED.search(prefix)
+            if any(_MERGED.fullmatch(match[0]) and not denied and not _denied_completion(prefix)
                    and not (question and question.end() <= match.start())
                    for match, prefix, denied in _completion_matches(clause)):
                 fields.append(field)
@@ -174,7 +189,7 @@ def missing_completion(candidate, packet, *, update=False):
                         deferred = True
                     elif clause.rstrip().endswith("?") or _CONDITION.search(clause) or denied:
                         continue
-                    elif _DENIED.search(prefix):
+                    elif _denied_completion(prefix):
                         # A distant modal may govern another clause, not this
                         # assertion. Do not turn uncertain scope into a hold.
                         deferred = True

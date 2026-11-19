@@ -11,7 +11,7 @@ from test_review_request_budget import context, reviewer, saved_audit
 
 
 @pytest.mark.parametrize("field", ["title", "summary", "why_it_matters"])
-@pytest.mark.parametrize("predicate", ["is now", "was", "has been", "had already been"])
+@pytest.mark.parametrize("predicate", ["is now", "was", "has been", "had already been", "got"])
 def test_purpose_infinitive_does_not_hide_a_later_affirmative_predicate(field, predicate):
     public = target()
     public.update(state="developing", **{field: f"The patch to improve the parser {predicate} merged."})
@@ -29,17 +29,66 @@ def test_plural_purpose_clause_keeps_affirmative_completion(field):
     check(packet("The patches have been merged."), False, public)
 
 
+@pytest.mark.parametrize("field", ["title", "summary", "why_it_matters"])
+@pytest.mark.parametrize("text", [
+    "We worked to improve parsing and merged the fix.",
+    "We worked to improve parsing\nand finally merged the fix.",
+])
+def test_coordinated_past_completion_is_outside_a_nonpassive_purpose(field, text):
+    public = target()
+    public.update(state="developing", **{field: text})
+    assert merge_evidence.claim_fields(public) == [field]
+    check(packet(), True, public)
+    check(packet(text), False, public)
+
+
 @pytest.mark.parametrize("text", [
     "The patch is to be merged.", "The patch is to get merged.",
     "The patch is expected to have been merged.", "The patch to improve parsing will be merged.",
     "The patches are expected to have been merged.",
     "The patch to improve parsing was not merged.", "The patch to improve parsing has never been merged.",
+    "The patch is to be reviewed and merged.",
+    "The patch is to get reviewed and merged.",
+    "We might have worked for several days to improve parsing and merged the fix.",
+    "We never worked to improve parsing and merged the fix.",
 ])
 def test_future_intent_and_negation_remain_nonaffirmative(text):
     public = target()
     public.update(state="developing", summary=text)
     assert merge_evidence.claim_fields(public) == []
     check(packet(), False, public)
+
+
+@pytest.mark.parametrize("text", [
+    "The patch to improve the parser got merged.",
+    "We worked to improve parsing and merged the fix.",
+])
+@pytest.mark.parametrize("supported", [False, True])
+def test_native_purpose_completion_needs_actual_evidence(context, text, supported):
+    config, store = context
+    evidence = (text if supported else "The parser work remains under discussion.") + "\n\n" + IMPACT
+    row, writer = pending_merge(store, evidence=evidence, prose=True)
+    writer.result["summary"] = text
+    checker = reviewer(config, verdict(), verdict())
+    result = run_gate(config, store, row, writer, checker)
+    assert checker.calls == 2
+    assert result["status"] == ("published" if supported else "held")
+    if supported:
+        assert store.stories()[0]["why_it_matters"] == IMPACT
+    else:
+        assert store.stories() == []
+        assert saved_audit(store)["hold_code"] == "completed_action"
+
+
+def test_native_coordinated_future_intent_is_not_an_asserted_merge(context):
+    config, store = context
+    text = "The patch is to be reviewed and merged."
+    row, writer = pending_merge(store, evidence=text + "\n\n" + IMPACT, prose=True)
+    writer.result["summary"] = text
+    checker = reviewer(config, verdict(), verdict())
+    result = run_gate(config, store, row, writer, checker)
+    assert checker.calls == 2 and result["status"] == "published"
+    assert store.stories()[0]["why_it_matters"] == IMPACT
 
 
 def test_reported_completion_question_is_not_a_claim_or_witness():
