@@ -72,7 +72,7 @@ def _source_uncertainty(source: dict) -> dict[str, list[dict]]:
                 # cut inside a word or omit chunks. With no original boundary
                 # metadata, only visible boundaries inside this passage count.
                 found[passage["id"]] = [span for span in _literal_spans(text, _UNCERTAINTY)
-                                        if 0 < span["start"] and span["end"] < len(text)]
+                                        if span["start"] > 0 and span["end"] < len(text)]
     return found
 
 
