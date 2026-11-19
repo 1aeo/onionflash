@@ -120,6 +120,7 @@ def build(packet, *, cited_urls=None):
         if PROCEDURAL.search(source.get('title', '')):
             result['excluded'].append({'source_ref': source['id'], 'reason': 'procedural_source_title'})
             continue
+        unquoted = flat(source['unquoted_content']) if 'unquoted_content' in source else None
         opened, previous_group, procedural = None, None, False
         for index, passage in enumerate(source['passages']):
             ref, text = passage['id'], passage['text']
@@ -170,7 +171,7 @@ def build(packet, *, cited_urls=None):
                               'paragraph_start': start, 'paragraph_end': end, 'passage': text,
                               'author': passage.get('author'), 'created_at': passage.get('created_at')}
                     why = rejection(sentence)
-                    if not why and 'unquoted_content' in source and flat(sentence) not in flat(source['unquoted_content']):
+                    if not why and unquoted is not None and flat(sentence) not in unquoted:
                         why = 'not_in_supplied_unquoted_content'
                     rendered = PREFIX + flat(sentence) + '”'
                     if not why and len(rendered) > POLICY['max_rendered_chars']:
