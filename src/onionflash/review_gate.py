@@ -1774,16 +1774,16 @@ def check_held_approval(store, item_id: str, policy: str, *, dirauth_users=None)
             or any(not result["criteria"]["source_support"]["source_refs"] for _, result in reviews_of_text)):
         return refuse("No fresh verification with cited sources approved the facts; retry or dismiss it",
                       editorial_failures, new_coverage)
+    try:
+        validate_review_state(record, "held", record.get("candidate", saved_env.get("candidate")), saved_env)
+    except (AnalysisError, ValueError, TypeError, KeyError):
+        return refuse("Saved proposal or review state cannot be read")
     if held := review.final_holds(candidate, prepared, known_attributions=review.attribution_names(prepared, record)):
         return refuse("Final review held: " + HOLDS[held[0]], editorial_failures, new_coverage)
     if not review.release_labels_match_state(candidate):
         return refuse("Final review held: " + HOLDS["release_labels"], editorial_failures, new_coverage)
     if not editorial_failures:
         return refuse("Only a held news-value dispute can be approved", editorial_failures, new_coverage)
-    try:
-        validate_review_state(record, "held", record.get("candidate", saved_env.get("candidate")), saved_env)
-    except (AnalysisError, ValueError, TypeError, KeyError):
-        return refuse("Saved proposal or review state cannot be read")
     if proposal_needs_check(record):
         return refuse("An untrusted proposal still needs a fresh valid review")
     exact_entries = [entry for entry, _ in reviews_of_text]

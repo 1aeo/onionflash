@@ -58,6 +58,19 @@ def assert_unapprovable(cfg, store, item_id: str, expected_reason: str):
     assert dump_sql(store) == before
 
 
+@pytest.mark.parametrize("proposals", [None, {}, 1, [None], ["invalid"], [1]])
+def test_malformed_held_proposals_are_refused_without_changing_saved_state(context, proposals):
+    cfg, store = context
+    row = hold_news_dispute(cfg, store)
+    assert review_gate.approval(cfg, store, row["id"])["eligible"] is True
+    record = json.loads(job(store, row["id"])["record_json"])
+    record["untrusted_proposals"] = proposals
+    with store.db:
+        store.db.execute("UPDATE review_jobs SET record_json=? WHERE item_id=?",
+                         (json.dumps(record), row["id"]))
+    assert_unapprovable(cfg, store, row["id"], "Saved proposal or review state cannot be read")
+
+
 def test_a_held_news_judgment_publishes_exactly_as_reviewed_without_model_calls(context):
     cfg, store = context
     row = hold_news_dispute(cfg, store)
