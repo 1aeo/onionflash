@@ -5,9 +5,7 @@ from onionflash import source_quote
 from onionflash.source_quote import POLICY
 from unittest.mock import patch
 
-def build(candidate, packet, *, mode="story", preserve_rendered=None):
-    if mode != "story" or not candidate.get("why_it_matters"):
-        return {"choices": []}
+def build(candidate, packet, *, preserve_rendered=None):
     if preserve_rendered is not None:
         with patch.object(source_quote, "preserves_rendered", preserve_rendered):
             return source_quote.build(packet, cited_urls={s["url"] for s in candidate["sources"]})
@@ -27,10 +25,6 @@ class Catalog(unittest.TestCase):
   before=copy.deepcopy((c,p));out=build(c,p);self.assertEqual((c,p),before);self.assertEqual(len(out['choices']),1)
   e=out['eligible_spans'][0];self.assertEqual(p['sources'][0]['passages'][1]['text'][e['start']:e['end']],e['raw'])
   self.assertIn('51 of 52',e['rendered']);self.assertIn('when the optional setting is enabled.',e['rendered'])
- def test_empty_disabled(self):
-  c,p=fixture();c['why_it_matters']='';self.assertFalse(choices(c,p))
- def test_update_disabled(self):
-  c,p=fixture();self.assertFalse(choices(c,p,mode='latest_update'))
  def test_uncited_disabled(self):
   c,p=fixture();c['sources']=[];self.assertFalse(choices(c,p))
  def test_truncated_disabled(self):
