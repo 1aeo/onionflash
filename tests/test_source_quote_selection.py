@@ -119,7 +119,8 @@ def test_only_current_impact_supplies_queries_and_sentence_matches_are_used():
     public.update(title="Numbered output 7", summary="Numbered output 7 is enabled.",
                   updates=[{"text": "Numbered output 7 is enabled."}], tags=["numbered", "output"])
     assert source_quote.available(public, packet) == expected
-    public["why_it_matters"] = " ".join(f"unrelated{number}" for number in range(100)) + ". Zirconium records."
+    public["why_it_matters"] = (" ".join(f"unrelated{number}" for number in range(100))
+                               + " Users can inspect numbered output when the option is enabled. Zirconium records.")
     assert source_quote.available(public, packet)[-1]["rendered"] == rendered(SENTENCES[-1])
     public["why_it_matters"] = "Numbered output 7 is enabled."
     assert [choice["rendered"] for choice in source_quote.available(public, packet)] == [
