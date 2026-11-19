@@ -1,9 +1,13 @@
 """Opposite controls for the narrow missing-completion evidence check."""
 
+import json
+
 import pytest
 
-from onionflash import merge_evidence
-from test_merge_completion_evidence import check, packet, target
+from helpers import run_gate, verdict
+from onionflash import merge_evidence, review
+from test_merge_completion_evidence import IMPACT, check, packet, pending_merge, target
+from test_review_request_budget import context, reviewer, saved_audit
 
 
 @pytest.mark.parametrize("field", ["title", "summary", "why_it_matters"])
@@ -51,8 +55,75 @@ def test_fence_closes_in_markup_passage_before_subsequent_narrative():
 
 
 def test_markup_remains_unparsed_and_its_completion_language_still_defers():
-    check(chunks("```html\n<div data-state='merged'>example</div>\n", "example\n```\n"), False)
+    check(chunks("<div data-state='merged'>example</div>\n"), False)
     check(chunks("<div>example</div>\n", "The fix is now merged."), False)
+
+
+@pytest.mark.parametrize("text", [
+    "```text\nThe patch was merged.\n```\n",
+    "```html\n<p>The patch was merged.</p>\n```\n",
+    "~~~html\n<p>The patch was merged.</p>\n~~~\n",
+    "> <p>The patch was merged.</p>",
+    "    <p>The patch was merged.</p>",
+    "`<p>The patch was merged.</p>`",
+    '<a href="https://example.org/merged">The issue is under discussion.</a>',
+    '<a href="https://example.org/details">https://example.org/merged</a>',
+])
+def test_known_exclusions_precede_unknown_markup_deferral(text):
+    check(packet(text), True)
+    check(packet(text + "\n\nThe patch was merged."), False)
+
+
+def test_markup_completion_inside_a_split_fence_is_still_excluded():
+    check(chunks("```html\n<div data-state='merged'>example</div>\n", "example\n```\n"), True)
+    check(chunks("```html\n<div>example</div>\n", "<p>The patch was merged.</p>\n```\n"), True)
+
+
+@pytest.mark.parametrize("text", [
+    "<p>The patch was merged.</p>", "<blockquote>The patch was merged.</blockquote>",
+    '<div data-state="merged">The issue is under discussion.</div>',
+    '<a href="https://example.org/details">Merged.</a>',
+    "<a href='https://example.org/details'>Merged.</a>",
+    '<p>https://example.org/details</p><p>The patch was merged.</p>',
+    '<span title="`">The patch was merged into main.</span>',
+])
+def test_unparsed_own_markup_still_defers(text):
+    check(packet(text), False)
+
+
+@pytest.mark.parametrize("text,missing", [
+    ("<p>The patch was merged.</p>", False),
+    ("<p>The patch was applied\nto the branch.</p>", False),
+    ('<a href="https://example.org/details">Merged.</a>', False),
+    ('<span title="`">The patch was merged into main.</span>', False),
+    ("> <p>The patch was merged.</p>", True),
+    ("`<p>The patch was merged.</p>`", True),
+    ('<a href="https://example.org/merged">The issue is under discussion.</a>', True),
+])
+def test_uncertain_closing_boundary_preserves_only_possible_narrative_completion(text, missing):
+    check(chunks("```html\nexample\n", "```\n" + text), missing)
+
+
+@pytest.mark.parametrize("text,missing", [
+    ("```text\nThe patch was merged.\n```\n", True),
+    ("```html\n<p>The patch was merged.</p>\n```\n", True),
+    ("> <p>The patch was merged.</p>", True),
+    ("<p>The patch was merged.</p>", False),
+])
+def test_native_markup_exclusions_survive_two_unchanged_approvals(context, text, missing):
+    config, store = context
+    row, writer = pending_merge(store, evidence="The issue is closed and listed as fixed.\n\n" + text + "\n\n" + IMPACT)
+    checker = reviewer(config, verdict(), verdict())
+    result = run_gate(config, store, row, writer, checker)
+    assert checker.calls == 2
+    assert result["status"] == ("held" if missing else "published")
+    wires = [json.loads(request["messages"][1]["content"]) for request in checker.client.requests]
+    assert all((review.MERGE_COMPLETION_ISSUE in wire.get("application_issue", "")) is missing for wire in wires)
+    if missing:
+        assert store.stories() == []
+        assert saved_audit(store)["hold_code"] == "completed_action"
+    else:
+        assert store.stories()[0]["why_it_matters"] == IMPACT
 
 
 @pytest.mark.parametrize("text", [

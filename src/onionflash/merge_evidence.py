@@ -8,7 +8,7 @@ from .util import normalize_evidence, safe_canonical_url
 
 
 # Advance when claim recognition, citation scope or evidence availability changes.
-POLICY = {"version": 7, "scope": "current-story-citations", "update": "unchanged",
+POLICY = {"version": 8, "scope": "current-story-citations", "update": "unchanged",
           "uncertain_language": "defer-to-semantic-review",
           "own_text": "raw-mapping-before-nonnarrative-masking",
           "raw_markup": "defer-completion-language-without-parsing"}
@@ -37,6 +37,21 @@ _COORDINATION = re.compile(r"\s*(?:,\s*(?:(?:and|or|nor)\s+)?|(?:and|or|nor)\s+)
 def _mask(text):
     # Keep paragraph and block boundaries while hiding non-narrative words.
     return re.sub(r"[^\r\n]", " ", text)
+
+
+def _narrative(text):
+    markup = source_quote.RAW_MARKUP.search(text)
+    if markup:
+        # Bound URLs at attribute/tag delimiters before the broader whitespace
+        # mask, so following HTML remains unparsed possible narrative.
+        text = re.sub(r'''\b(?:https?://|www\.)[^\s<>"']*''', lambda match: _mask(match[0]), text, flags=re.I)
+    def exclude(match):
+        if markup and match.start() > markup.start() and match[0].startswith("`"):
+            # Without parsing HTML, a later inline marker may be attribute text.
+            return match[0]
+        return _mask(match[0])
+
+    return review_evidence._NON_NARRATIVE.sub(exclude, text)
 
 
 def _completion_matches(clause):
@@ -98,19 +113,13 @@ def missing_completion(candidate, packet, *, update=False):
             if key != previous:
                 opened = None
             previous = key
-            if source_quote.RAW_MARKUP.search(text):
-                _, opened = source_quote.code_ranges(text, opened)
-                # Markup can enclose narrative, a quotation, code or attributes.
-                # It is not a witness, but skipping possible completion language
-                # cannot establish its absence either. Do not parse it here.
-                if _ACTION.search(text) or re.search(r"\bapplied\b", text, re.I):
-                    deferred = True
-                continue
             first_line, _, remainder = text.partition("\n")
             boundary = source_quote.FENCE.fullmatch(first_line)
+            remainder = _narrative(remainder)
             if (opened and boundary and not boundary[2].strip()
                     and boundary[1][0] == opened[0] and len(boundary[1]) >= opened[1]
-                    and (_ACTION.search(remainder) or _APPLIED.search(remainder))):
+                    and (_ACTION.search(remainder) or _APPLIED.search(remainder)
+                         or (source_quote.RAW_MARKUP.search(remainder) and re.search(r"\bapplied\b", remainder, re.I)))):
                 # Optional quotation extraction deliberately distrusts a fence
                 # at a chunk boundary. That uncertainty cannot prove absence
                 # of a subsequent narrative statement for this hard check.
@@ -119,7 +128,14 @@ def missing_completion(candidate, packet, *, update=False):
             masked = list(text)
             for start, end in ranges:
                 masked[start:end] = _mask(text[start:end])
-            text = review_evidence._NON_NARRATIVE.sub(lambda match: _mask(match[0]), "".join(masked))
+            text = _narrative("".join(masked))
+            if source_quote.RAW_MARKUP.search(text):
+                # Known Markdown exclusions cannot supply completion language.
+                # Remaining markup may enclose narrative, quotations or attributes;
+                # defer its possible completion language without parsing the HTML.
+                if _ACTION.search(text) or re.search(r"\bapplied\b", text, re.I):
+                    deferred = True
+                continue
             for clause in _CLAUSE.split(text):
                 for match, prefix, denied in _completion_matches(clause):
                     if _PROSPECTIVE.search(prefix):

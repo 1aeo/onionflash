@@ -82,7 +82,6 @@ def test_ambiguous_language_stays_with_semantic_review(text):
     "The patch was merged into main.<br>", "<p>The fix is now merged.</p>",
     "<blockquote>The fix is now merged.</blockquote>", "<code>The fix is now merged.</code>",
     '<div data-state="merged">The issue is under discussion.</div>',
-    '<a href="https://example.org/merged">The issue is under discussion.</a>',
     "<p>The patch landed in main.</p>", "The patch was applied<br>to the branch.",
     "<p>The patch was applied\nto the branch.</p>",
 ])
