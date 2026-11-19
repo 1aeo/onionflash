@@ -10,7 +10,7 @@ from .util import parse_utc, safe_canonical_url
 
 
 # Advance when reminder construction changes, so prior approvals cannot reuse it.
-EVIDENCE_POLICY = 9
+EVIDENCE_POLICY = 10
 _WORDS = re.compile(r"\w+", re.UNICODE)
 _STOP = frozenset("a an and are as at be been but by for from has have in is it its of on or that the this to was were with".split())
 _MAX_ANCHORS = 3
@@ -68,7 +68,11 @@ def _source_uncertainty(source: dict) -> dict[str, list[dict]]:
             # Without an exact reply mapping, omit the cue rather than assign
             # quoted-parent words to the current sender. The packet stays whole.
             if "unquoted_content" not in source or text in source["unquoted_content"]:
-                found[passage["id"]] = _literal_spans(text, _UNCERTAINTY)
+                # Passage boundaries are not word boundaries: the producer can
+                # cut inside a word or omit chunks. With no original boundary
+                # metadata, only visible boundaries inside this passage count.
+                found[passage["id"]] = [span for span in _literal_spans(text, _UNCERTAINTY)
+                                        if 0 < span["start"] and span["end"] < len(text)]
     return found
 
 

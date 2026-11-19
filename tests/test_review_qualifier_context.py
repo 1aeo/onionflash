@@ -195,7 +195,7 @@ def test_later_context_and_dates_stay_whole_without_deciding_which_assertion_is_
     ("The index possibly loses entries, while the cache has confirmed losses.", ["possibly"]),
     ("A possible outage follows confirmed cache entry loss.", ["possible"]),
     ("The cache is no longer suspected of losing entries.", ["suspected"]),
-    ("May and Will report that the cache loses entries.", ["May"]),
+    ("Both May and Will report that the cache loses entries.", ["May"]),
     ('The note says, "The cache apparently loses entries."', ["apparently"]),
 ])
 def test_objects_negation_names_and_genuine_speech_remain_ungraded_literal_context(text, expected):
@@ -386,6 +386,52 @@ def test_any_cross_passage_boundary_marker_omits_the_whole_note(marker, marker_f
 def test_plain_passages_never_combine_word_fragments_into_an_annotation():
     source = source_packet("The cache is poss", "ibly losing entries.")
     assert qualifiers(evidence_context(public(), source)) is None
+
+
+@pytest.mark.parametrize("parts", [
+    ("The cache behavior is im", "possible to reproduce."),
+    ("The cache seems", "ingly loses entries."),
+    ("The cache may", "be loses entries."),
+    ("Possible cache entry loss.",),
+    ("The cache loss is possible",),
+])
+def test_unknown_passage_edges_never_certify_complete_qualifier_words(parts):
+    source = source_packet(*parts)
+    original = copy.deepcopy(source)
+    context = evidence_context(public(), source)
+    assert qualifiers(context) is None
+    assert source == original
+    assert all(passage in context["passages"] for passage in source["sources"][0]["passages"][1:])
+
+
+def test_literal_interior_boundaries_preserve_qualifiers_and_offsets():
+    text = "(Possibly) the cache loses entries; it seems."
+    source = source_packet(text)
+    cue = qualifiers(evidence_context(public(), source))
+    spans = cue["source_uncertainty"][0]["spans"]
+    assert words(spans) == ["Possibly", "seems"]
+    assert all(text[span["start"]:span["end"]] == span["text"] for span in spans)
+
+
+def test_title_body_and_distinct_notes_do_not_supply_each_others_word_boundaries():
+    source = source_packet(
+        "possible cache loss.",
+        {"text": "The cache loss is possible", "author": "Riley", "created_at": "2026-01-01T00:00:00Z", "url": URL + "#note_1"},
+        {"text": "The cache apparently loses entries.", "author": "Sam", "created_at": "2026-01-02T00:00:00Z", "url": URL + "#note_2"})
+    source["sources"][0]["passages"][0]["text"] = "Cache report. "
+    context = evidence_context(public(), source)
+    row, = qualifiers(context)["source_uncertainty"]
+    assert row["passage_ref"] == "S1:P4" and words(row["spans"]) == ["apparently"]
+
+
+def test_producer_chunk_split_keeps_original_passages_without_a_fragment_cue():
+    first = "The cache " + "x" * 1788 + "im"
+    assert len(first) == 1800
+    chunks = _passages(first + "possible cache behavior.", 1800)
+    source = source_packet(*chunks)
+    context = evidence_context(public(), source)
+    assert qualifiers(context) is None
+    assert all(passage in context["passages"] for passage in source["sources"][0]["passages"][1:])
 
 
 def test_only_exact_citations_can_supply_qualifier_words():
