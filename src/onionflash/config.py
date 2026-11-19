@@ -275,7 +275,7 @@ def load_config(path: str | Path) -> dict:
         _expand(config["site"]["base_url"]),
         allow_http=True,
         trailing_slash=True,
-        error="site.base_url must be a clean absolute HTTP(S) URL",
+        error="site.base_url must be a clean absolute HTTP(S) URL (invalid value [redacted])",
     )
     config["site"]["repository_url"] = canonical_url(config["site"]["repository_url"])
 
