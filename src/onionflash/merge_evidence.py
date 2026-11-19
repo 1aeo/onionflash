@@ -8,7 +8,7 @@ from .util import normalize_evidence, safe_canonical_url
 
 
 # Advance when claim recognition, citation scope or evidence availability changes.
-POLICY = {"version": 6, "scope": "current-story-citations", "update": "unchanged",
+POLICY = {"version": 7, "scope": "current-story-citations", "update": "unchanged",
           "uncertain_language": "defer-to-semantic-review",
           "own_text": "raw-mapping-before-nonnarrative-masking",
           "raw_markup": "defer-completion-language-without-parsing"}
@@ -24,6 +24,8 @@ _DIRECT_DENIED = re.compile(
     r"(?:(?:have|been|be|being|yet|now|already|ever|actually|finally|\w+ly)\s+)*$", re.I)
 _CONDITION = re.compile(r"^\s*(?:if|unless)\b", re.I)
 _TEMPORAL = re.compile(r"^\s*(?:once|when|before|after)\b|\bnot\s+only\b", re.I)
+_PROSPECTIVE = re.compile(r"^\s*before\b[^,;.!?]*\b(?:is|are|(?:can|will|must|should|may)\s+be)\s+"
+                          r"(?:(?:being|now|already|\w+ly)\s+)*$", re.I)
 _OTHER = re.compile(r"\b(?:unrelated|separate|another|different|other)\b", re.I)
 _ARTIFACT = re.compile(r"\b(?:patch|fix|change|changes|commit|code|MR|PR|refactor|merge request|pull request)\b", re.I)
 _BRANCH = re.compile(r"\b(?:main|master|trunk|branch|branches)\b", re.I)
@@ -120,7 +122,9 @@ def missing_completion(candidate, packet, *, update=False):
             text = review_evidence._NON_NARRATIVE.sub(lambda match: _mask(match[0]), "".join(masked))
             for clause in _CLAUSE.split(text):
                 for match, prefix, denied in _completion_matches(clause):
-                    if _TEMPORAL.search(clause):
+                    if _PROSPECTIVE.search(prefix):
+                        continue
+                    elif _TEMPORAL.search(clause):
                         deferred = True
                     elif clause.rstrip().endswith("?") or _CONDITION.search(clause) or denied:
                         continue

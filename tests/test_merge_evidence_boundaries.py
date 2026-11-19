@@ -108,3 +108,22 @@ def test_completion_lists_share_denial_or_future_intent(text):
 ])
 def test_new_affirmative_predicates_do_not_inherit_denial(text):
     check(packet(text), False)
+
+
+@pytest.mark.parametrize("predicate", ["is", "is finally", "can be", "will be", "must be", "should be"])
+def test_prospective_prerequisites_are_not_completion_evidence(predicate):
+    text = f"The patch has not yet been merged. Before the patch {predicate} merged, it must pass CI."
+    check(packet(text), True)
+    check(packet(text, kind="gitlab_mr", upstream_state="merged"), False)
+
+
+@pytest.mark.parametrize("text", [
+    "Before the patch was merged, it passed CI.",
+    "Before we merged the patch, the tests passed.",
+    "When the patch is merged, the tests run.",
+    "Once merged, the patch changes the parser.",
+    "After the patch was merged, the tests passed.",
+    "Before the patch is merged, a separate fix was backported.",
+])
+def test_retrospective_and_ambiguous_temporal_language_still_defers(text):
+    check(packet(text), False)
