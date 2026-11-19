@@ -6,7 +6,7 @@ import copy
 import json
 import re
 
-from . import personal_attribution, source_quote
+from . import merge_evidence, personal_attribution, source_quote
 from .analyze import SCHEMA as DRAFT_SCHEMA
 from .config import DEFAULTS
 from .llm import (AnalysisError, CompletionClient, apply_label_limits, has_malformed_tor_version,
@@ -710,6 +710,15 @@ COMPLETION_ISSUE = (
     "All factual, significance, novelty and fresh-verification checks still apply."
 )
 
+MERGE_COMPLETION_ISSUE = (
+    "The current story's state label is also a claim. A merge claim needs cited "
+    "merged-request metadata or an explicit statement of actual integration; closure, "
+    "a private-request reference, a commit or a fixed-version listing alone does not "
+    "establish a merge. Correct unsupported merge labels or prose from the packet, "
+    "preserving supported facts and useful impact. Do not prescribe the same replacement "
+    "state for every story or hold worthwhile news merely because its label needs repair."
+)
+
 PERSONAL_STYLE_ISSUE = (
     "actor_and_action includes names-only attribution for named people, even when their role is sourced. "
     "The literal current-field forms below locate a recognized personal-role or metadata-title problem. "
@@ -861,11 +870,12 @@ def policy_hash(config: dict) -> str:
     identity = {key: llm[key] for key in ("model", "base_url", "fallback_base_urls")}
     identity["generation"] = generation_options(llm)
     return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, ROUTING_PROMPT, UPDATE_SYSTEM_PROMPT,
-                   UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, LABEL_LIMIT_ISSUE, COMPLETION_ISSUE, PERSONAL_STYLE_ISSUE,
+                   UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, LABEL_LIMIT_ISSUE, COMPLETION_ISSUE, MERGE_COMPLETION_ISSUE,
+                   PERSONAL_STYLE_ISSUE,
                    SOURCE_TAG_CONTEXT_PROMPT, SOURCE_DATE_CONTEXT_PROMPT, QUALIFIER_CONTEXT_PROMPT,
                    INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT, INVALID_REVIEW_POLICY,
                    SCHEMA, UPDATE_REPAIR, VALIDATION_ERRORS, REASON_REPETITION_POLICY, LABEL_LIMIT_POLICY,
-                   RELEASE_FRAMING_POLICY,
+                   RELEASE_FRAMING_POLICY, merge_evidence.POLICY,
                    identity, CompletionClient.REQUEST_POLICY, EVIDENCE_POLICY,
                    source_quote.POLICY, source_quote.PREFIX, _SOURCE_QUOTE_REPLACEMENTS, SOURCE_QUOTE_CONTEXT_PROMPT,
                    NAMED_ATTRIBUTION_POLICY, ATTRIBUTION_CHECK_PROMPT, personal_attribution.PERSONAL_ATTRIBUTION_POLICY,
@@ -1267,8 +1277,10 @@ def unsupported_completion_claims(candidate: dict, prepared: dict) -> tuple[str,
         claimed = (_claimed_done(candidate["title"], candidate["summary"], candidate["why_it_matters"])
                    if prepared["payload"]["editorial_kind"] == "gitlab_issue" else [])
         proof = _plain("\n".join(passage["text"] for source in sources for passage in source["passages"]))
-    return tuple(dict.fromkeys(word for word in claimed
-                              if not (_stated(proof, word) or _stated(merged, DONE[word]))))
+    missing = [word for word in claimed if not (_stated(proof, word) or _stated(merged, DONE[word]))]
+    if prepared.get("mode", "story") == "story" and merge_evidence.missing_completion(candidate, prepared["packet"]):
+        missing.append("merged")
+    return tuple(dict.fromkeys(missing))
 
 
 def final_holds(candidate: dict, prepared: dict, *, known_attributions=()) -> list[str]:

@@ -53,6 +53,11 @@ def _install_recorded_job(cfg, store, row, *, label_repair=False):
 
 def install_legacy_pending(cfg, store, row, monkeypatch, *, label_repair=False):
     """Install a real old receipt and explicitly select its reader-only contract."""
+    if label_repair:
+        # This historical contract predates the merge-evidence backstop. Keep
+        # its recorded text and policy intact while testing that old path.
+        # Real policy-upgrade tests retain the current guard and fingerprint.
+        monkeypatch.setattr(review.merge_evidence, "missing_completion", lambda *args, **kwargs: False)
     record = _install_recorded_job(cfg, store, row, label_repair=label_repair)
     # Keep every recorded identity intact. This explicitly exercises the old
     # reader contract, not an upgrade or the current invalid-response producer.

@@ -54,7 +54,8 @@ ISSUE = unit("gitlab_issue", "dirauth: Remove bastet from list",
              "Last night, bastet's operator notified us that the machine is very plausibly compromised.",
              "In any kind of scenario here, the keys can’t be trusted anymore and bastet will generate a new identity soon.",
              "In the meantime, remove bastet from source as we can't trust it anymore.", state="opened")
-MERGED = unit("gitlab_mr", "Remove bastet's keys from default dirauth list", state="merged")
+MERGED = {**unit("gitlab_mr", "Remove bastet's keys from default dirauth list", state="merged"),
+          "url": STORY["sources"][0]["url"]}
 FEED = unit("feed", "Tor Browser 16.0.2 is released", "Tor Browser 16.0.2 is now available for Android.", authority="official")
 CRASH = unit("gitlab_issue", "Fix the crash in the parser", state="opened")
 COMPROMISED = unit("gitlab_issue", "Bastet", "The machine was compromised.", state="opened")
@@ -94,7 +95,7 @@ FINAL_CASES = [
     ("unhedged-source", "gitlab_issue", [COMPROMISED], {"title": "Bastet compromised"}, []),
     ("issue-confirmed", "gitlab_issue", [ISSUE], {"confidence": "confirmed"}, CONFIRMED),
     ("tag-and-issue-confirmed", "gitlab_issue", [unit("tag", "arti-v2.7.0", authority="official"), ISSUE], {"confidence": "confirmed"}, CONFIRMED),
-    ("unmerged-request-confirmed", "gitlab_mr", [{**MERGED, "upstream_state": ""}], {"confidence": "confirmed", "state": "merged"}, CONFIRMED),
+    ("unmerged-request-confirmed", "gitlab_mr", [{**MERGED, "upstream_state": ""}], {"confidence": "confirmed", "state": "merged"}, DONE + CONFIRMED),
     ("merged-request-confirmed", "gitlab_mr", [MERGED], {"confidence": "confirmed", "state": "merged"}, []),
     ("official-feed-confirmed", "feed", [FEED], {"confidence": "confirmed", "state": "released"}, []),
     ("official-feed-and-issue-confirmed", "feed", [FEED, ISSUE], {"confidence": "confirmed"}, []),

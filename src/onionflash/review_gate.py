@@ -1174,6 +1174,8 @@ def call_review(reviewer, stage, candidate, prepared, *, requests, correction=Fa
     issues = [review.RELEASE_ISSUE] if stage == "repair" else []
     if completion_words := review.unsupported_completion_claims(candidate, prepared):
         issues.append(review.COMPLETION_ISSUE + "\n" + json.dumps(completion_words, ensure_ascii=False))
+        if "merged" in completion_words:
+            issues.append(review.MERGE_COMPLETION_ISSUE)
     result = reviewer.review(candidate, prepared["packet"], coverage=prepared["coverage"], verification=stage == "verify",
                              issue="\n\n".join(issues) if issues else None,
                              on_request=requests.callback(correction=correction),

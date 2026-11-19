@@ -441,6 +441,14 @@ skips are not checked.
   against its own cited source (and any merged merge requests in the packet). A
   contraction such as "wasn't" counts as a negation, and a word the story itself
   marks as requested, planned or not done claims nothing.
+- A current story's `merged` state or affirmative merge wording needs a cited
+  merged-request record or its own unquoted completion statement. A commit,
+  closed issue, private-request reference or fixed-version listing alone does
+  not establish integration. Clear landed or branch-application statements are
+  also available evidence; ambiguous wording remains with semantic review.
+  This check guides an ordinary minimal repair before fresh verification and
+  also holds an ignored unsupported claim. It does not recheck UPDATE context
+  or turn an evidence candidate into approval.
 - When a source hedges a compromise ("plausibly compromised", "may have been
   hacked"), a new headline or update entry about the compromise keeps a qualifier.
 - Public story text (`title`, `summary`, `why_it_matters`) or a new update entry
