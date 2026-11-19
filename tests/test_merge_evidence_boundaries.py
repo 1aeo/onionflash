@@ -80,3 +80,31 @@ def test_paragraph_and_code_boundaries_do_not_extend_an_earlier_denial(separator
 
 def test_soft_wrapped_affirmative_completion_remains_available():
     check(packet("The patch has now\nbeen merged."), False)
+
+
+@pytest.mark.parametrize("text", [
+    "The fix was not merged, landed, or backported.",
+    "The fix was never landed or merged.",
+    "The fix was not merged, integrated, nor even backported.",
+    "The fix has not been landed, cherry-picked, or merged.",
+    "The fix was not merged or applied to the stable branch.",
+    "The fix was not applied to the stable branch or merged.",
+    "The fix will be merged, landed, and backported.",
+])
+def test_completion_lists_share_denial_or_future_intent(text):
+    check(packet(text), True)
+    public = target()
+    public.update(state="developing", summary=text)
+    check(packet(), False, public)
+
+
+@pytest.mark.parametrize("text", [
+    "The fix was not merged, but it was backported.",
+    "The fix was not backported but it was merged.",
+    "The fix was not merged; it was backported.",
+    "The fix was not merged. It was backported.",
+    "The fix was not merged, and the change was backported.",
+    "The fix was merged, landed, and backported.",
+])
+def test_new_affirmative_predicates_do_not_inherit_denial(text):
+    check(packet(text), False)

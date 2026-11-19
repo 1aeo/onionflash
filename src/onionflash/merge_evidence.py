@@ -8,7 +8,7 @@ from .util import normalize_evidence, safe_canonical_url
 
 
 # Advance when claim recognition, citation scope or evidence availability changes.
-POLICY = {"version": 5, "scope": "current-story-citations", "update": "unchanged",
+POLICY = {"version": 6, "scope": "current-story-citations", "update": "unchanged",
           "uncertain_language": "defer-to-semantic-review",
           "own_text": "raw-mapping-before-nonnarrative-masking",
           "raw_markup": "defer-completion-language-without-parsing"}
@@ -28,11 +28,23 @@ _OTHER = re.compile(r"\b(?:unrelated|separate|another|different|other)\b", re.I)
 _ARTIFACT = re.compile(r"\b(?:patch|fix|change|changes|commit|code|MR|PR|refactor|merge request|pull request)\b", re.I)
 _BRANCH = re.compile(r"\b(?:main|master|trunk|branch|branches)\b", re.I)
 _CLAUSE = re.compile(r"(?<=[.!?;])\s+|\n[ \t\r]*\n|\s+but\s+", re.I)
+_COORDINATION = re.compile(r"\s*(?:,\s*(?:(?:and|or|nor)\s+)?|(?:and|or|nor)\s+)"
+                           r"(?:(?:even|yet|ever|actually|finally|\w+ly)\s+)*", re.I)
 
 
 def _mask(text):
     # Keep paragraph and block boundaries while hiding non-narrative words.
     return re.sub(r"[^\r\n]", " ", text)
+
+
+def _completion_matches(clause):
+    end, denied = 0, False
+    for match in sorted((*_ACTION.finditer(clause), *_APPLIED.finditer(clause)), key=lambda item: item.start()):
+        prefix = normalize_evidence(clause[max(0, match.start() - 100):match.start()]).replace("n't", " not") + " "
+        # Share denial only through a bare predicate list, never a new subject.
+        denied = bool(_DIRECT_DENIED.search(prefix) or (denied and _COORDINATION.fullmatch(clause[end:match.start()])))
+        end = match.end()
+        yield match, prefix, denied
 
 
 def claim_fields(candidate):
@@ -47,8 +59,8 @@ def claim_fields(candidate):
             clause = normalize_evidence(part).replace("n't", " not")
             if clause.endswith("?") or _CONDITION.search(clause) or _TEMPORAL.search(clause):
                 continue
-            if any(not _DENIED.search(clause[max(0, match.start() - 100):match.start()])
-                   for match in _MERGED.finditer(clause)):
+            if any(_MERGED.fullmatch(match[0]) and not denied and not _DENIED.search(prefix)
+                   for match, prefix, denied in _completion_matches(clause)):
                 fields.append(field)
                 break
     return fields
@@ -107,11 +119,10 @@ def missing_completion(candidate, packet, *, update=False):
                 masked[start:end] = _mask(text[start:end])
             text = review_evidence._NON_NARRATIVE.sub(lambda match: _mask(match[0]), "".join(masked))
             for clause in _CLAUSE.split(text):
-                for match in (*_ACTION.finditer(clause), *_APPLIED.finditer(clause)):
-                    prefix = normalize_evidence(clause[max(0, match.start() - 100):match.start()]).replace("n't", " not") + " "
+                for match, prefix, denied in _completion_matches(clause):
                     if _TEMPORAL.search(clause):
                         deferred = True
-                    elif clause.rstrip().endswith("?") or _CONDITION.search(clause) or _DIRECT_DENIED.search(prefix):
+                    elif clause.rstrip().endswith("?") or _CONDITION.search(clause) or denied:
                         continue
                     elif _DENIED.search(prefix):
                         # A distant modal may govern another clause, not this
