@@ -145,6 +145,44 @@ def test_quote_marking_still_skips_invalid_entry_urls(entry_url):
     assert _quoted_reply_feed(entry_url) == []
 
 
+@pytest.mark.parametrize("tail", ["é" * 700, "x" * 4096])
+def test_citation_length_limit_applies_to_the_saved_representation(tail):
+    url = "https://example.org/?q=" + tail
+    with pytest.raises(ValueError, match="source URL"):
+        canonical_url(url)
+    assert _quoted_reply_feed(url) == []
+
+
+@pytest.mark.parametrize("character", ["a", "é"])
+def test_citation_canonical_length_boundary_is_inclusive(character):
+    prefix = "https://example.org/?q="
+    raw = prefix + character * 600
+    raw += "x" * (4096 - len(canonical_url(raw)))
+    canonical = canonical_url(raw)
+    assert len(canonical) == 4096 and canonical_url(canonical) == canonical
+    assert _quoted_reply_feed(raw)[0]["url"] == canonical
+    with pytest.raises(ValueError, match="source URL"):
+        canonical_url(raw + "x")
+    assert _quoted_reply_feed(raw + "x") == []
+
+
+@pytest.mark.parametrize("host", ["example.org", "LISTS.TORPROJECT.ORG"])
+def test_collected_encoded_citations_remain_valid_through_packet_construction(store, host):
+    from onionflash.source_packet import build_packet
+
+    raw = f"https://{host}/?q=" + "é" * 600
+    [collected] = _quoted_reply_feed(raw)
+    expected = canonical_url(raw)
+    assert collected["url"] == canonical_url(expected) == expected
+    assert len(expected) < 4096
+    assert ("\n> The earlier author" in collected["content"]) is (host.lower() == "lists.torproject.org")
+    store.ingest(collected, DATE)
+    row = store.pending(1, DATE)[0]
+    references = {"sources": [{"id": row["id"], "url": expected}]}
+    packet, _ = build_packet(store.db, json.loads(row["payload"]), references, references, row["id"])
+    assert packet["missing_sources"] == [] and packet["sources"][0]["url"] == expected
+
+
 @pytest.mark.parametrize("quoted_only", [False, True])
 def test_collected_html_quotes_stay_outside_writer_and_packet_reply_evidence(monkeypatch, quoted_only):
     from onionflash.source_packet import build_packet

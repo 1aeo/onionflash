@@ -287,7 +287,7 @@ def _feed(
         # link exists; an RSS guid that is not a permalink is never a citation.
         try:
             item = make_item(
-                source, entry_url, title, text, published, updated,
+                source, entry.get("link", ""), title, text, published, updated,
                 title_html=title_html, observed=started,
             )
         except ValueError:

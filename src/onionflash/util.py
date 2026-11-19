@@ -244,7 +244,12 @@ def canonical_url(value: str) -> str:
     if host == "gitlab.torproject.org":
         path = re.sub(r"/-/issues/(\d+)/?\Z", r"/-/work_items/\1", path)
     query = urlencode([(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if not k.lower().startswith("utm_")])
-    return urlunsplit(("https", authority, path, query, parsed.fragment))
+    canonical = urlunsplit(("https", authority, path, query, parsed.fragment))
+    # Saved citations must remain valid when packet and publication readers
+    # validate them again; query escaping can expand a shorter supplied URL.
+    if len(canonical) > 4096:
+        raise ValueError("Invalid source URL")
+    return canonical
 
 
 def safe_canonical_url(url: object) -> str:
