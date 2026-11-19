@@ -8,7 +8,7 @@ from .util import normalize_evidence, safe_canonical_url
 
 
 # Advance when claim recognition, citation scope or evidence availability changes.
-POLICY = {"version": 8, "scope": "current-story-citations", "update": "unchanged",
+POLICY = {"version": 9, "scope": "current-story-citations", "update": "unchanged",
           "uncertain_language": "defer-to-semantic-review",
           "own_text": "raw-mapping-before-nonnarrative-masking",
           "raw_markup": "defer-completion-language-without-parsing"}
@@ -18,7 +18,7 @@ _APPLIED = re.compile(r"\bapplied\b.{0,45}\b(?:main|master|trunk|branch)\b", re.
 _DENIED = re.compile(r"\b(?:not|never|cannot|can't|isn't|wasn't|hasn't|haven't|hadn't|should|must|"
                      r"will|would|could|may|might|no)\b(?:\s+\w+){0,6}\s*$|"
                      # A purpose infinitive does not govern a later finite predicate.
-                     r"\bto\b(?:\s+(?!(?:is|are|was|were|has|had)\b)\w+){0,6}\s*$", re.I)
+                     r"\bto\b(?:\s+(?!(?:is|are|was|were|has|have|had)\b)\w+){0,6}\s*$", re.I)
 _DIRECT_DENIED = re.compile(
     r"\b(?:not|never|cannot|should|must|will|would|could|may|might|to|no)\s+"
     r"(?:(?:have|been|be|being|yet|now|already|ever|actually|finally|\w+ly)\s+)*$", re.I)

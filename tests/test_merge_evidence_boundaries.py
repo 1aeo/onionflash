@@ -20,9 +20,19 @@ def test_purpose_infinitive_does_not_hide_a_later_affirmative_predicate(field, p
     check(packet("The parser patch has been merged."), False, public)
 
 
+@pytest.mark.parametrize("field", ["title", "summary", "why_it_matters"])
+def test_plural_purpose_clause_keeps_affirmative_completion(field):
+    public = target()
+    public.update(state="developing", **{field: "The patches to improve parsing have been merged."})
+    assert merge_evidence.claim_fields(public) == [field]
+    check(packet(), True, public)
+    check(packet("The patches have been merged."), False, public)
+
+
 @pytest.mark.parametrize("text", [
     "The patch is to be merged.", "The patch is to get merged.",
     "The patch is expected to have been merged.", "The patch to improve parsing will be merged.",
+    "The patches are expected to have been merged.",
     "The patch to improve parsing was not merged.", "The patch to improve parsing has never been merged.",
 ])
 def test_future_intent_and_negation_remain_nonaffirmative(text):
