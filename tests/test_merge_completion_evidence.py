@@ -49,7 +49,7 @@ def check(evidence, missing, public=None):
     "If the patch is merged, the tests can run.", "Unless the patch is merged, the tests cannot run.",
     "Was the patch merged?", "Please merge the patch.", "The merge request contains a fix.",
     "> The fix is merged.", "`The fix is merged.`", "```\nThe fix is merged.\n```\n",
-    "See https://example.org/merged for the report.", "<div>The fix is merged.</div>",
+    "See https://example.org/merged for the report.", "<div>The fix is listed as fixed.</div>",
 ])
 def test_references_plans_and_non_narrative_material_are_not_completion(text):
     check(packet(text), True)
@@ -76,6 +76,34 @@ def test_explicit_completion_language_does_not_require_merge_request_metadata(te
 def test_ambiguous_language_stays_with_semantic_review(text):
     # Absence of this additional concern is not a same-object or truth verdict.
     check(packet(text), False)
+
+
+@pytest.mark.parametrize("text", [
+    "The patch was merged into main.<br>", "<p>The fix is now merged.</p>",
+    "<blockquote>The fix is now merged.</blockquote>", "<code>The fix is now merged.</code>",
+    '<div data-state="merged">The issue is under discussion.</div>',
+    '<a href="https://example.org/merged">The issue is under discussion.</a>',
+    "<p>The patch landed in main.</p>", "The patch was applied<br>to the branch.",
+    "<p>The patch was applied\nto the branch.</p>",
+])
+def test_unknown_markup_with_completion_language_defers_without_interpreting_it(text):
+    # Paragraphs, parent quotations, code and attributes have different meanings.
+    # The additional absence check cannot decide them by skipping the markup.
+    check(packet(text), False)
+
+
+@pytest.mark.parametrize("text", [
+    "<p>The issue is closed.</p>", "Fix in private/project!12.<br>",
+    '<div data-state="closed">Listed as fixed.</div>',
+])
+def test_markup_without_completion_language_does_not_supply_a_witness(text):
+    check(packet(text), True)
+
+
+def test_markup_deferral_does_not_bypass_the_supplied_own_text_boundary():
+    text = "<p>The fix is now merged.</p>"
+    check(packet(text, unquoted_content=text), False)
+    check(packet(text, unquoted_content="I will inspect the report."), True)
 
 
 def test_metadata_needs_an_exact_cited_merged_request_and_no_merge_word_in_title():
@@ -235,7 +263,52 @@ def test_actual_prose_completion_needs_no_repair_or_extra_review(context):
                for body in checker.client.requests)
 
 
+@pytest.mark.parametrize("body,refused", [
+    ("The patch was merged into main.<br>", False),
+    ("<p>The fix is now merged.</p>", False),
+    ("<blockquote>The fix is now merged.</blockquote>", True),
+    ('<div data-state="merged">The fix is under discussion.</div>', True),
+])
+def test_native_public_comment_markup_reaches_fresh_semantic_review(context, body, refused):
+    from helpers import DATE, FakeClient
+    from onionflash import comments
+    from test_comments import gql_response, issue, issue_source, note, payload
+
+    config, store = context
+    incoming = issue(title="Parser repair", authority="hackerone", upstream_state="closed",
+                     content="The issue is closed and listed as fixed. " + IMPACT)
+    source = issue_source()
+    notes = comments.fetch_comments(FakeClient([gql_response(payload([note("123", body=body)]))]),
+                                    source, incoming)
+    assert notes[0]["body"] == body
+    enriched = comments._compose(incoming, notes, DATE, source_key=comments._source_key(source))
+    row = pending(store, enriched)
+    draft = analysis(title="Parser repair recorded", summary="The issue is closed and listed as fixed.",
+                     why_it_matters=IMPACT, state="merged", confidence="reported", evidence=[IMPACT])
+    replies = [verdict(), verdict("hold", criterion="status") if refused else verdict()]
+    checker = reviewer(config, *replies)
+    result = run_gate(config, store, row, Writer(draft), checker)
+    wires = [json.loads(request["messages"][1]["content"]) for request in checker.client.requests]
+    assert checker.calls == 2
+    assert any(body in passage["text"] for source in wires[0]["packet"]["sources"] for passage in source["passages"])
+    assert all("application_issue" not in wire for wire in wires)
+    assert checker.client.requests[-1]["messages"][0]["content"].startswith(review.VERIFY_PROMPT)
+    assert result["status"] == ("held" if refused else "published")
+    if refused:
+        assert store.stories() == []
+    else:
+        assert store.stories()[0]["state"] == "merged"
+        assert store.stories()[0]["why_it_matters"] == IMPACT
+
+
 def test_guard_policy_is_fingerprinted(monkeypatch):
     before = review.policy_hash(DEFAULTS)
     monkeypatch.setattr(merge_evidence, "POLICY", {**merge_evidence.POLICY, "version": 0})
+    assert review.policy_hash(DEFAULTS) != before
+
+
+def test_markup_deferral_has_a_new_policy_identity(monkeypatch):
+    before = review.policy_hash(DEFAULTS)
+    monkeypatch.setattr(merge_evidence, "POLICY", {"version": 1, "scope": "current-story-citations", "update": "unchanged",
+        "uncertain_language": "defer-to-semantic-review", "own_text": "raw-mapping-before-nonnarrative-masking"})
     assert review.policy_hash(DEFAULTS) != before

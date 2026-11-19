@@ -8,9 +8,10 @@ from .util import normalize_evidence, safe_canonical_url
 
 
 # Advance when claim recognition, citation scope or evidence availability changes.
-POLICY = {"version": 1, "scope": "current-story-citations", "update": "unchanged",
+POLICY = {"version": 2, "scope": "current-story-citations", "update": "unchanged",
           "uncertain_language": "defer-to-semantic-review",
-          "own_text": "raw-mapping-before-nonnarrative-masking"}
+          "own_text": "raw-mapping-before-nonnarrative-masking",
+          "raw_markup": "defer-completion-language-without-parsing"}
 _ACTION = re.compile(r"\b(?:merged|landed|integrated|cherry[- ]picked|backported)\b", re.I)
 _MERGED = re.compile(r"\bmerged\b", re.I)
 _APPLIED = re.compile(r"\bapplied\b.{0,45}\b(?:main|master|trunk|branch)\b", re.I)
@@ -77,6 +78,11 @@ def missing_completion(candidate, packet, *, update=False):
                 opened = None
             previous = key
             if source_quote.RAW_MARKUP.search(text):
+                # Markup can enclose narrative, a quotation, code or attributes.
+                # It is not a witness, but skipping possible completion language
+                # cannot establish its absence either. Do not parse it here.
+                if _ACTION.search(text) or re.search(r"\bapplied\b", text, re.I):
+                    deferred = True
                 continue
             first_line, _, remainder = text.partition("\n")
             boundary = source_quote.FENCE.fullmatch(first_line)
