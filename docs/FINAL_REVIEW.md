@@ -311,7 +311,9 @@ additional fresh full verification checks the same candidate without seeing the
 earlier reviews. Only two such approvals can resolve the initial news disagreement.
 Any refusal on the additional check holds the item. Final checks, label limits
 and the shared seven-request budget still apply; the release anchor does not
-grant approval or waive a failed criterion.
+grant approval or waive a failed criterion. Invalid release labels at the end of
+this recovery hold the item without requesting a label edit that would fall
+outside its exact two-approval history.
 
 A later review that
 agrees the item is not news may skip it, but a repair it proposes is not applied:
@@ -365,20 +367,15 @@ is created, and discarded review contexts do not supply names.
 Fresh verification remains mandatory. The matching final and commit-boundary
 check also protects cached approvals and operator publication; update checks
 apply only to the newest update and its cited source scope, never prior text.
-Only a complete, structurally valid `revise` edit may become an **untrusted
-proposal**. It must change the text, obey the packet's label limits, avoid a
-previously reviewed candidate, and leave literal tag notices untouched. The
-application saves its error, edits, candidate hashes and disposition separately
-from validated reviews, then requires a fresh verification of that exact text.
-The previous reply is never included in the verifier's input. Pending proposals
-bypass cached approvals and cannot borrow facts verified for an earlier text.
-
-If that invalid reply has no usable edit, the ledger permits one logical
-validation-correction request. It reviews the same candidate, packet, scope and
-coverage, with only a fixed corrective instruction and the application's quoted
-validation error added. The rejected criteria and proposed edits are not input or
-approval evidence. A valid correction enters the ordinary review stage: an initial
-approval still needs its fresh verification, and an existing valid review remains
+An invalid reply never edits the candidate, even when its proposed edit is
+structurally valid. The application records the error and request identity
+separately from validated reviews, with no applied proposal. The ledger permits
+one logical validation-correction request at the same stage, with the unchanged
+candidate, packet, scope and coverage. Only a fixed corrective instruction and
+the application's quoted validation error are added. The rejected criteria and
+proposed edits are not input or approval evidence. A valid correction enters the
+ordinary review flow: an initial approval still needs its fresh verification,
+and an existing valid review remains
 the only possible disagreement anchor. Literal tags and fixed labels are not edited
 to make a rejected proposal usable.
 
@@ -390,14 +387,16 @@ correction. An unknown in-flight reservation fails closed; a known unsent deadli
 can refund its physical reservation. Automatic context changes abandon stale
 feedback while retaining the correction slot and spent requests.
 
-For untrusted-edit recovery after an invalid initial reply, the first valid
-verification is the first trusted news decision. Later trusted decisions still obey the ordinary
-disagreement rule. A changed source context discards the pending proposal and
-starts again from a freshly assembled candidate. Raw inconsistencies, accepted
-proposals and unresolved recovery outcomes remain distinct in the private
-evaluation; a hold caused by an unusable or repeated repair is not a successful
-recovery. Malformed or no-op edits are never applied. Damaged saved recovery state
-always fails closed.
+Historical compatibility retains replay of saved **untrusted proposals** from
+earlier policies; current invalid replies never create an accepted proposal.
+Those historical proposals require fresh verification of their exact text and
+bypass cached approvals. After an invalid initial reply in such a history, the
+first valid verification supplies the first trusted news decision. Later trusted
+decisions obey the ordinary disagreement rule. A changed source context discards
+the pending proposal and starts from a freshly assembled candidate. Raw
+inconsistencies, historical accepted proposals and unresolved recovery outcomes
+remain distinct in the private evaluation; a hold caused by an unusable or repeated
+repair is not a successful recovery. Damaged saved recovery state fails closed.
 
 Every endpoint attempt, including invalid replies and fallback attempts, spends
 the same seven-request budget. Reservations are saved before sending, so an
@@ -484,9 +483,12 @@ invalid draft.
 
 Decisions bind the normalized candidate, source packet, coverage background,
 review policy, and current source/story/editorial state. A job resumed in a
-later run starts a new review if any of them changed. A candidate is prepared
-and committed in the same run, under the run lock, so the commit does not
-recheck them; publication never remerges different wording afterward.
+later run starts a new review if any of them changed. At commit, the application
+checks the receipt against the candidate, source, policy and binding hashes,
+verifies the prepared binding, and validates the saved decision. These are
+integrity checks on the publication proof; they do not request another model
+review or rewrite the candidate. Publication never remerges different wording
+afterward.
 
 Private review jobs keep unfinished work, and a decision's receipt lasts until
 that decision commits. The analysis audit keeps the source, packet, coverage and
