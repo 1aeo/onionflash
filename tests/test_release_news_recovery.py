@@ -91,9 +91,9 @@ def test_release_anchor_does_not_require_an_optional_snapshot_marker(prepared):
     assert review_gate._official_release_anchor(original, repaired, prepared, current_only=True)
 
 
-def test_optional_marker_admission_has_a_new_policy_identity(monkeypatch):
+def test_recovery_admission_has_a_new_policy_identity(monkeypatch):
     current = review.policy_hash(DEFAULTS)
-    monkeypatch.setattr(review, "RELEASE_FRAMING_POLICY", 3)
+    monkeypatch.setattr(review, "RELEASE_FRAMING_POLICY", 4)
     assert review.policy_hash(DEFAULTS) != current
 
 
@@ -180,7 +180,23 @@ def test_recovery_keeps_final_checks_and_release_label_checks(context, prepared)
             value["payload"]["editorial_kind"] = "gitlab_issue"
         entries, repaired = history(value, count=3, repair={**REPAIR, **changes})
         action = review_gate.next_step(entries, repaired, value)
-        assert action == (expected or ("repair", repaired))
+        assert action == (expected or ("hold", ("verification", "release_labels")))
+
+
+@pytest.mark.parametrize("labels", [dict(category="release"), dict(tags=["release"])])
+def test_native_recovery_with_invalid_labels_holds_without_a_fourth_request(context, labels):
+    cfg, store = context
+    row = pending(store, incoming())
+    original = {**draft(), **labels}
+    checker = reviewer(cfg, first_reply(), verdict(), verdict(),
+                       verdict("revise", criterion="status", repair={"state": "released"}))
+    result = run_gate(cfg, store, row, Writer(original), checker)
+    assert result["status"] == "held" and result["review_calls"] == 3
+    assert len(checker.client.requests) == 3 and not store.stories()
+    proof = json.loads(store.db.execute("SELECT review_record FROM analyses").fetchone()[0])
+    assert proof["hold_code"] == "release_labels"
+    assert proof["request_budget"]["reserved"] == 3
+    assert len(proof["reviews"]) == 3
 
 
 @pytest.mark.parametrize("impact", ["keep", "clear", "quote"])

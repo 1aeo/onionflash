@@ -727,8 +727,9 @@ def next_step(reviews, candidate, prepared):
         if stage == "verification" and (held := review.final_holds(candidate, prepared)):
             return "hold", ("final_check", held[0])
         if not review.release_labels_match_state(candidate):
-            # A review told the problem may repair it, if the repair can still be verified within the limit.
-            if latest.get("issue") or len(reviews) > MAX_VERIFY_REPAIRS:
+            # Recovery's two approvals bind this exact text; a later label edit
+            # cannot extend that history. Ordinary reviews may still repair it.
+            if release_recovery or latest.get("issue") or len(reviews) > MAX_VERIFY_REPAIRS:
                 return "hold", (stage, "release_labels")
             return "repair", candidate
         return ("verify" if stage == "review" else "approve"), candidate
