@@ -26,3 +26,30 @@ def test_future_intent_and_negation_remain_nonaffirmative(text):
     public.update(state="developing", summary=text)
     assert merge_evidence.claim_fields(public) == []
     check(packet(), False, public)
+
+
+def chunks(*texts):
+    evidence = packet()
+    evidence["sources"][0]["passages"] = [
+        {"id": f"S1:P{index}", "url": "https://example.org/note", "text": text}
+        for index, text in enumerate(texts, 1)]
+    return evidence
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~~"])
+def test_fence_opened_in_markup_passage_still_excludes_following_code(fence):
+    evidence = chunks(fence + "html\n<div>example</div>\n", "The fix is now merged.\n" + fence + "\n")
+    check(evidence, True)
+    # A different source unit must not inherit the example's fence state.
+    evidence["sources"][0]["passages"][1]["url"] = "https://example.org/another-note"
+    evidence["sources"][0]["passages"][1]["text"] = "The fix is now merged."
+    check(evidence, False)
+
+
+def test_fence_closes_in_markup_passage_before_subsequent_narrative():
+    check(chunks("```html\nexample\n", "<div>example</div>\n```\n", "The fix is now merged."), False)
+
+
+def test_markup_remains_unparsed_and_its_completion_language_still_defers():
+    check(chunks("```html\n<div data-state='merged'>example</div>\n", "example\n```\n"), False)
+    check(chunks("<div>example</div>\n", "The fix is now merged."), False)
