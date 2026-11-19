@@ -200,8 +200,13 @@ bodies the writer saw (source metadata does not count), on an untrusted `communi
 or a nonexistent three-part C-Tor version; drafts with unnormalized all-caps
 shouting in the headline, summary or update, or mailing-list reply evidence quoting
 only `>`-quoted history are refused.
-Historical impact text remains readable. A review repair may clear it, but cannot
-create or rewrite an impact paragraph; operator corrections remain separate.
+Historical impact text remains readable. Story review may keep or clear the
+impact field. For a defective nonempty field, it may instead select one eligible
+exact source quotation; once quoted, the field may only be kept or cleared.
+Review cannot freely rewrite impact text or populate an empty field. Literal
+provenance alone does not establish support or usefulness: the [ordinary full
+verification](#decisions-and-calls) must check the exact repaired candidate
+before publication. Operator corrections remain separate.
 Automatic approvals also require consistent metadata: a `release` category or
 tag needs state `released` or `tagged`. An approval of inconsistent labels gets a
 repair request that names the problem, then a fresh verification of the repaired
