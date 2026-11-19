@@ -1571,7 +1571,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                     raise AnalysisError("Cached review policy is damaged", code="app.damaged_job")
                 validate_review_state(proof, "approved" if verdict["verdict"] == "approve" else "skipped", candidate, prepared, allow_cached=False)
                 valid = verdict["verdict"] in {"approve", "skip"} and verdict.get("same_story") is None
-            except (AnalysisError, ValueError, TypeError, KeyError):
+            except (AnalysisError, ValueError, TypeError, KeyError, AttributeError):
                 valid = False
             if valid:
                 record["approval"] = proof

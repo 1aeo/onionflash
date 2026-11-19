@@ -694,6 +694,39 @@ def test_cache_reviews_again_unless_the_receipt_is_a_complete_decision(context, 
     assert result["review_calls"] == 2 and not result["cache_hit"]
 
 
+@pytest.mark.parametrize("bad_review", [None, "damaged", []])
+def test_malformed_cached_review_is_removed_before_fresh_review_without_changing_history(context, bad_review):
+    cfg, store = context
+    prior = pending(store, item(url="https://example.org/prior", content="Earlier independent report."))
+    prior_prepared = store.prepare_candidate(prior, analysis(evidence=["Earlier independent report."]), DATE)
+    assert run(cfg, store, prior, Writer(analysis(evidence=["Earlier independent report."])), Reviewer(verdict()))["status"] == "published"
+    approve(store, prior_prepared, policy=review.policy_hash(cfg))
+    history = {table: [tuple(row) for row in store.db.execute(f"SELECT * FROM {table}")]
+               for table in ("stories", "analyses", "review_approvals")}
+    assert history["review_approvals"]
+    row = pending(store)
+    with pytest.raises(AnalysisError):
+        run(cfg, store, row, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
+    saved = job(store, row["id"])
+    receipt = approve(store, json.loads(saved["envelope_json"]), policy=saved["policy_hash"])
+    with store.db:
+        store.db.execute("UPDATE review_approvals SET review_record_json=? WHERE key=?",
+                         (json.dumps({"reviews": [bad_review]}), receipt["approval_key"]))
+
+    paused = Reviewer()
+    result = run(cfg, store, row, Writer(), paused, allow_network=False)
+    assert result["status"] == "deferred" and not result["cache_hit"] and not paused.calls
+    assert store.db.execute("SELECT 1 FROM review_approvals WHERE key=?", (receipt["approval_key"],)).fetchone() is None
+    assert history == {table: [tuple(row) for row in store.db.execute(f"SELECT * FROM {table}")]
+                       for table in history}
+    fresh = Reviewer(verdict())
+    result = run(cfg, store, row, Writer(), fresh)
+    assert result["status"] == "published" and result["review_calls"] == 2 and not result["cache_hit"]
+    assert [call[2] for call in fresh.calls] == [False, True]
+    assert all(old in [tuple(row) for row in store.db.execute(f"SELECT * FROM {table}")]
+               for table, rows in history.items() for old in rows)
+
+
 def test_status_retry_reverted_hold_and_rejected_show_views(context, monkeypatch):
     cfg, store = context
     assert review_gate.status(store) == {"stages": {}, "approval_cache_entries": 0}
