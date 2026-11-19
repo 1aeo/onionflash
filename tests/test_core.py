@@ -731,6 +731,16 @@ def test_base_url_is_normalized_to_a_clean_directory(tmp_path, base):
     assert load_config(path)["site"]["base_url"] == "https://example.com/news/"
 
 
+@pytest.mark.parametrize("authority", ["user:private-value＠example.org", "[user:private-value", "example.org:private-value"])
+def test_base_url_parser_failures_use_only_the_redacted_diagnostic(tmp_path, authority):
+    path = tmp_path / "config.toml"
+    path.write_text(f'[site]\nbase_url = "https://{authority}/"\n[[sources]]\nid = "a"\nurl = "https://example.org/feed.xml"\n')
+    with pytest.raises(ValueError) as caught:
+        load_config(path)
+    assert str(caught.value) == "site.base_url must be a clean absolute HTTP(S) URL (invalid value [redacted])"
+    assert "private-value" not in str(caught.value)
+
+
 def test_story_precedence_legacy_stories_and_added_at(tmp_path):
     """Preserve story source-tier upgrades, dated updates, and chronological ordering."""
     def known_update(store, url):

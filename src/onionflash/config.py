@@ -173,8 +173,8 @@ def _expand(value: str) -> str:
 
 
 def _clean_endpoint_url(url: str, *, allow_http: bool, trailing_slash: bool, error: str) -> str:
-    parsed = urlsplit(url)
     try:
+        parsed = urlsplit(url)
         port = parsed.port
     except ValueError:
         raise ValueError(error) from None
