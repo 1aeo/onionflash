@@ -1,46 +1,119 @@
-"""Draft schema/evidence, shared transport, retained baseline checks and rejection."""
-
-from __future__ import annotations
+"""Draft schema/evidence, writer cache identity, reasoning profile, and update input checks."""
 
 import copy
 import json
 
+import httpx
 import pytest
 
 from helpers import (
-    DATE, ApprovingReviewer, FakeLLM, Reviewer, ScriptedAnalyzer, analysis, completion,
-    finish_reviewed, item, patch_cli_pipeline, pending, run_gate, update_analysis, verdict,
+    DATE, LATER, NON_RELEASE_CATEGORIES, NON_TAG_STATES, ApprovingReviewer, FakeClient, Reviewer,
+    Writer, analysis, completion, decision_rows, finish_reviewed, item, list_rss, make_note,
+    patch_cli_pipeline, pending, public_dns, response, run_gate, seed_story, source, update_analysis,
+    verdict, wire_analyzer, write_toml,
 )
-from onionflash import cli, decisions, rejection
+from onionflash import analyze, candidate, cli, collect, decisions, rejection, source_packet
 from onionflash.analyze import (
     MAX_EVIDENCE_CHOICES, MIN_EVIDENCE_CHARS, SCHEMA, UPDATE_PROMPT, UPDATE_SCHEMA,
     AnalysisError, Analyzer, _writer_schema, cache_key, tag_update, validate_analysis,
 )
-from onionflash.comments import INPUT_CHARS
-from onionflash.config import DEFAULTS
+from onionflash.comments import INPUT_CHARS, analysis_context
+from onionflash.config import DEFAULTS, load_config
+from onionflash.doctor import LinkChecker
 from onionflash.llm import (
-    has_malformed_tor_version, has_shouting_caps, json_object, unquoted_mail_text,
+    has_malformed_tor_version, has_shouting_caps, json_object, unquoted_mail_text, validate_schema_field,
 )
+from onionflash.review import Reviewer as RealReviewer
 from onionflash.schema import CATEGORIES, CONFIDENCES, STATES
-from onionflash.store import Store
-from onionflash.transport import DeadlineReached, FetchError, Response
+from onionflash.store import Store, item_hash
+from onionflash.transport import DeadlineReached, FetchError, HttpClient, Response
+from onionflash.util import digest, plain_text
 
-NON_TAG_STATES = [value for value in STATES if value != "tagged"]
-NON_RELEASE_CATEGORIES = [value for value in CATEGORIES if value != "release"]
 NUMBERED = item(
     title="Tor 0.4.8.20 and 0.4.9.16 are released",
     content="Upgrade to 0.4.9.16 now. Tor Browser 15.0a3 is affected. 3 authorities voted. Release 2026-11-09. " + "7" * 5000,
 )
+REASONING_PROMPT = "Summarize only supplied evidence."
+REASONING_PAYLOAD = {"source": "The report states a bounded effect."}
+REASONING_SCHEMA = {"type": "object"}
 
 
-def analyzer(monkeypatch, *responses, fallbacks=()):
-    """Instantiate an Analyzer backed by scripted FakeLLM responses."""
-    monkeypatch.setenv("ONIONFLASH_LLM_API_KEY", "test-key")
+def _prior_story(**overrides):
+    base = {
+        "id": "a" * 24,
+        "title": "Distinct prior headline",
+        "summary": "Distinct prior summary that must never enter evidence choices.",
+        "why_it_matters": "Distinct prior consequence.",
+        "category": "network",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "released",
+        "products": ["tor"],
+        "tags": ["network"],
+        "published_at": DATE,
+        "updated_at": DATE,
+        "added_at": DATE,
+        "sources": [{"url": "https://source.example/project/-/merge_requests/1", "title": "Source"}],
+        "updates": [{"at": DATE, "text": "Earlier update."}],
+    }
+    return {**base, **overrides}
+
+
+def _cache_source(**overrides):
+    defaults = {
+        "title": "A concrete source report",
+        "content": "A source describes a supported change.",
+        "labels": [],
+        "upstream_state": "opened",
+        "published_at": "2020-01-01T00:00:00Z",
+        "updated_at": "2020-01-02T00:00:00Z",
+    }
+    return item(**{**defaults, **overrides})
+
+
+def _cache_key_for(incoming=None, previous=None, **llm_overrides):
+    settings = {**copy.deepcopy(DEFAULTS["llm"]), "model": "writer-model", **llm_overrides}
+    return cache_key({"content_hash": item_hash(incoming or _cache_source())}, settings, previous)
+
+
+def _reasoning_settings(enabled=False):
     cfg = copy.deepcopy(DEFAULTS)
-    cfg["llm"].update(base_url="https://llm.example/v1", fallback_base_urls=list(fallbacks))
-    result = Analyzer(cfg)
-    result.client = FakeLLM(*responses)
-    return result
+    cfg["llm"].update(base_url="https://model.example/v1", model="writer-model",
+                      api_key_env="NATIVE_WRITER_TEST_KEY", writer_reasoning=enabled, timeout_seconds=3600)
+    cfg["review"]["model"] = "review-model"
+    return cfg
+
+
+def _saved_item(description, *, legacy, notes, updated_at):
+    value = item(content=description, public_comments=notes, updated_at=updated_at)
+    if legacy:
+        value["source_content"] = description
+        value["content"] = "Previously composed description and comment text."
+    return value
+
+
+@pytest.fixture
+def capture(monkeypatch):
+    """Yield a runner capturing wire HTTP requests and effective LLM settings for a stage class."""
+    monkeypatch.setenv("NATIVE_WRITER_TEST_KEY", "synthetic-fixture-value")
+
+    def _run(cls, settings):
+        observed = []
+        client = cls(settings)
+
+        def _reply(request):
+            observed.append(request)
+            return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": "{}"}}]})
+
+        client.client = HttpClient(client.http_settings, transport=httpx.MockTransport(_reply), resolver=public_dns)
+        try:
+            assert client.complete(REASONING_PROMPT, REASONING_PAYLOAD, REASONING_SCHEMA, "profile_probe") == {}
+            assert len(observed) == client.calls == 1
+            return observed[0], copy.deepcopy(client.llm), copy.deepcopy(client.http_settings)
+        finally:
+            client.close()
+
+    return _run
 
 
 @pytest.mark.parametrize("text", ['{"publish": false, "priority": NaN}', '{"publish": false, "x": 1e999}', "[" * 10000 + "]" * 10000])
@@ -54,15 +127,15 @@ def test_historical_impact_and_mandatory_draft(monkeypatch):
     """Accept source-grounded drafts and reject publish=false responses."""
     saved = analysis(why_it_matters="The report concerns directory authority trust.")
     assert validate_analysis(saved, item()) == saved
-    assert analyzer(monkeypatch, completion(analysis(why_it_matters=""))).analyze(item())["why_it_matters"] == ""
+    assert wire_analyzer(monkeypatch, analysis(why_it_matters="")).analyze(item())["why_it_matters"] == ""
 
     claim = "Operators must update their configurations to exclude the node."
     draft = analysis(summary=claim, why_it_matters="", confidence="reported", state="fixed")
-    llm = analyzer(monkeypatch, completion(draft))
+    llm = wire_analyzer(monkeypatch, draft)
     assert llm.analyze(item()) == draft and len(llm.client.requests) == 1
 
     ignore = analysis(publish=False, title="", summary="", why_it_matters="", evidence=[], products=[], tags=[])
-    llm_ig = analyzer(monkeypatch, completion(ignore))
+    llm_ig = wire_analyzer(monkeypatch, ignore)
     with pytest.raises(AnalysisError, match="draft for publication review") as caught:
         llm_ig.analyze(item())
     assert not caught.value.retryable and len(llm_ig.client.requests) == 1
@@ -73,8 +146,8 @@ def test_writer_keeps_a_source_stated_impact_sentence(monkeypatch, use_fallback)
     """Retain a source-supported why_it_matters sentence across primary and fallback endpoints."""
     responses = [FetchError("network request failed", retryable=True)] if use_fallback else []
     sentence = "The report says the keys must no longer be trusted."
-    responses.append(completion(analysis(why_it_matters=f" {sentence} ")))
-    llm = analyzer(monkeypatch, *responses, fallbacks=["https://fallback.example/v1"])
+    responses.append(analysis(why_it_matters=f" {sentence} "))
+    llm = wire_analyzer(monkeypatch, *responses, fallbacks=["https://fallback.example/v1"])
     assert llm.analyze(item())["why_it_matters"] == sentence and llm.clears == 0
     assert len(llm.client.requests) == llm.calls == 1 + use_fallback
     assert all("enum" not in req[1]["response_format"]["json_schema"]["schema"]["properties"]["why_it_matters"]
@@ -120,28 +193,26 @@ def test_impact_sentence_numbers_and_versions_must_appear_in_the_source(sentence
 ])
 def test_impact_versions_keep_their_prerelease_qualifier(source_version, sentence_version, kept):
     """Require prerelease suffixes in why_it_matters versions to match the source."""
-    source = f"Version {source_version} includes the reported correction."
+    src_text = f"Version {source_version} includes the reported correction."
     sentence = f"The report says version {sentence_version} includes the correction."
-    draft = analysis(why_it_matters=sentence, evidence=[source])
-    assert validate_analysis(copy.deepcopy(draft), item(title="Software correction", content=source)) == {
+    draft = analysis(why_it_matters=sentence, evidence=[src_text])
+    assert validate_analysis(copy.deepcopy(draft), item(title="Software correction", content=src_text)) == {
         **draft, "why_it_matters": sentence if kept else ""}
 
 
 def test_prerelease_words_in_prose_do_not_change_a_count():
     """Keep spelled-out prose counts distinct from prerelease version tokens."""
-    source = "The developers corrected 3 connection failures. A separate release candidate is under review."
+    src_text = "The developers corrected 3 connection failures. A separate release candidate is under review."
     sentence = "The report says developers corrected three connection failures."
-    draft = analysis(why_it_matters=sentence, evidence=[source])
-    assert validate_analysis(copy.deepcopy(draft), item(title="Connection correction", content=source)) == draft
+    draft = analysis(why_it_matters=sentence, evidence=[src_text])
+    assert validate_analysis(copy.deepcopy(draft), item(title="Connection correction", content=src_text)) == draft
 
 
 def test_impact_clears_across_comments_decisions_retries_and_approvals(context, monkeypatch):
     """Track writer_clears across comment bodies, retries, operator approvals, and decision summaries."""
-    note = {"id": "gid://gitlab/DiscussionNote/1", "url": "https://example.org/issue#note_1",
-            "title": "Public comment by @operator", "author": "operator", "created_at": DATE,
-            "body": "Relays running 0.4.8.17 must upgrade."}
+    note = make_note(1, "Relays running 0.4.8.17 must upgrade.", url="https://example.org/issue", kind="DiscussionNote")
     kept, dated = "A comment says relays running 0.4.8.17 must upgrade.", "The report was filed in 2026."
-    llm = analyzer(monkeypatch, completion(analysis(why_it_matters=kept)), completion(analysis(why_it_matters=dated)))
+    llm = wire_analyzer(monkeypatch, analysis(why_it_matters=kept), analysis(why_it_matters=dated))
     assert llm.analyze(item(public_comments=[note]))["why_it_matters"] == kept and llm.clears == 0
     assert llm.analyze(item(public_comments=[note]))["why_it_matters"] == "" and llm.clears == 1
     assert llm.analyze(item(kind="tag", title="tor-0.4.9.16", content=""))["why_it_matters"] == "" and llm.clears == 0
@@ -150,13 +221,13 @@ def test_impact_clears_across_comments_decisions_retries_and_approvals(context, 
     cfg, store = context
     cleared = "The report says relays running 0.4.8.17 must upgrade."
     for url, sentence in (("https://example.org/news/1", cleared), ("https://example.org/news/2", "The report says the keys must no longer be trusted.")):
-        w = analyzer(monkeypatch, completion(analysis(why_it_matters=sentence)))
+        w = wire_analyzer(monkeypatch, analysis(why_it_matters=sentence))
         assert run_gate(cfg, store, pending(store, item(url=url)), w, Reviewer(verdict()))["status"] == "published"
-    assert [json.loads(r[0]).get("writer_clears") for r in store.db.execute("SELECT detail_json FROM decision_log ORDER BY id")] == [1, None]
+    assert [r["detail"].get("writer_clears") for r in decision_rows(store)] == [1, None]
     assert decisions.summary(store.db, DATE)["writer_clears"] == 1
 
     store.db.execute("DELETE FROM decision_log")
-    w1 = analyzer(monkeypatch, completion(analysis(why_it_matters=cleared)))
+    w1 = wire_analyzer(monkeypatch, analysis(why_it_matters=cleared))
     r1 = pending(store, item(url="https://example.org/news/retry-clear"))
     assert run_gate(cfg, store, r1, w1, Reviewer(verdict(), verdict("hold", criterion="news_value")))["status"] == "held"
     with store.db:
@@ -166,19 +237,19 @@ def test_impact_clears_across_comments_decisions_retries_and_approvals(context, 
     rejection.retry_item(store, r1["id"], r1["content_hash"], "Retry kept draft", observed=DATE)
     assert run_gate(cfg, store, store.pending(1, DATE)[0], w1, Reviewer(verdict()))["status"] == "published"
 
-    w2 = analyzer(monkeypatch, completion(analysis(why_it_matters=cleared, evidence=["Second distinct report body."])))
+    w2 = wire_analyzer(monkeypatch, analysis(why_it_matters=cleared, evidence=["Second distinct report body."]))
     r2 = pending(store, item(url="https://example.org/news/approve-clear", content="Second distinct report body. " * 5))
     assert run_gate(cfg, store, r2, w2, Reviewer(verdict(), verdict("hold", criterion="news_value")))["status"] == "held"
     shown = rejection.show_item(store, r2["id"], config=cfg)
     rejection.approve_item(cfg, store, r2["id"], shown["final_review"]["approval"]["hash"], "Worth publishing", observed=DATE)
 
-    w3 = analyzer(monkeypatch, completion(analysis(why_it_matters=cleared, evidence=["Third distinct report body."])))
+    w3 = wire_analyzer(monkeypatch, analysis(why_it_matters=cleared, evidence=["Third distinct report body."]))
     r3 = pending(store, item(url="https://example.org/news/skip-clear", content="Third distinct report body. " * 5))
     assert run_gate(cfg, store, r3, w3, Reviewer(verdict("skip", criterion="news_value")))["status"] == "ignored"
     store.reject(pending(store, item(url="https://example.org/news/fail-clear", content="Fourth distinct report body. " * 5))["id"],
                  "Invalid review reply", "failed.review.invalid_reply", DATE)
 
-    rows = [(code, json.loads(d).get("writer_clears")) for code, d in store.db.execute("SELECT code, detail_json FROM decision_log ORDER BY id")]
+    rows = [(r["code"], r["detail"].get("writer_clears")) for r in decision_rows(store)]
     assert rows == [
         ("held.verification.disagreed_news", 1), ("held.gate.repeat_hold", 1), ("operator.retried", None),
         ("published.new", None), ("held.verification.disagreed_news", 1), ("operator.approved", None),
@@ -194,7 +265,7 @@ def test_impact_clears_across_comments_decisions_retries_and_approvals(context, 
 ], ids=["issue", "merged-request", "official-feed"])
 def test_writer_schema_limits_labels_by_source(monkeypatch, src_item, confidence, state, categories):
     """Restrict writer schema label enums according to source kind and authority."""
-    llm = analyzer(monkeypatch, completion(analysis(why_it_matters="", state=state[0])))
+    llm = wire_analyzer(monkeypatch, analysis(why_it_matters="", state=state[0]))
     llm.analyze(src_item)
     fields = llm.client.requests[0][1]["response_format"]["json_schema"]["schema"]["properties"]
     assert (fields["confidence"]["enum"], fields["state"]["enum"]) == (confidence, state)
@@ -213,8 +284,8 @@ def test_writer_schema_limits_labels_by_source(monkeypatch, src_item, confidence
 def test_writer_rejects_labels_outside_source_limits(monkeypatch, use_fallback, src_item, labels):
     """Refuse writer responses whose labels exceed source-derived limits."""
     responses = [FetchError("network request failed", retryable=True)] if use_fallback else []
-    responses.append(completion(analysis(why_it_matters="", **labels)))
-    llm = analyzer(monkeypatch, *responses, fallbacks=["https://fallback.example/v1"])
+    responses.append(analysis(why_it_matters="", **labels))
+    llm = wire_analyzer(monkeypatch, *responses, fallbacks=["https://fallback.example/v1"])
     with pytest.raises(AnalysisError, match="labels exceed") as caught:
         llm.analyze(src_item)
     assert not caught.value.retryable and len(llm.client.requests) == llm.calls == 1 + use_fallback
@@ -240,11 +311,11 @@ def test_label_normalization_schema_limits_and_release_tag_stripping(monkeypatch
     """Deduplicate array labels, enforce length caps, and strip unannounced release tags."""
     merged_mr = item(kind="gitlab_mr", upstream_state="merged")
     draft = analysis(why_it_matters="", state="merged", category="feature", tags=["feature", "release"])
-    assert analyzer(monkeypatch, completion(draft)).analyze(merged_mr)["tags"] == ["feature"]
+    assert wire_analyzer(monkeypatch, draft).analyze(merged_mr)["tags"] == ["feature"]
     released = analysis(why_it_matters="", state="released", category="feature", tags=["feature", "release"])
-    assert analyzer(monkeypatch, completion(released)).analyze(item(kind="feed", authority="official"))["tags"] == ["feature", "release"]
+    assert wire_analyzer(monkeypatch, released).analyze(item(kind="feed", authority="official"))["tags"] == ["feature", "release"]
     misclassified = analysis(why_it_matters="", state="developing", category="release", tags=["release"])
-    assert analyzer(monkeypatch, completion(misclassified)).analyze(item())["tags"] == ["release"]
+    assert wire_analyzer(monkeypatch, misclassified).analyze(item())["tags"] == ["release"]
     assert validate_analysis(draft, merged_mr)["tags"] == ["feature", "release"]
 
     quote = "The operator\nreported a plausible\tcompromise"
@@ -264,35 +335,31 @@ def test_label_normalization_schema_limits_and_release_tag_stripping(monkeypatch
 
 
 @pytest.mark.parametrize("sent", [0, 1])
-def test_endpoint_deadlines_retries_and_malformed_completions(monkeypatch, sent):
-    """Distinguish retryable transport/auth failures from terminal truncation and evidence errors."""
+def test_endpoint_deadlines_bound_retries(monkeypatch, sent):
+    """Stop retrying across fallback endpoints once `DeadlineReached` fires."""
     responses = [FetchError("network request failed", retryable=True)] * sent + [DeadlineReached()] * (3 - sent)
-    llm = analyzer(monkeypatch, *responses, fallbacks=["https://fallback.example/v1", "https://third.example/v1"])
+    llm = wire_analyzer(monkeypatch, *responses, fallbacks=["https://fallback.example/v1", "https://third.example/v1"])
     with pytest.raises(AnalysisError, match="LLM request failed") as caught:
         llm.analyze(item())
     assert caught.value.retryable and llm.calls == sent and len(llm.client.requests) == sent + 1
 
-    llm401 = analyzer(monkeypatch, FetchError("HTTP 401", status=401))
-    with pytest.raises(AnalysisError, match="HTTP 401") as c401:
-        llm401.analyze(item())
-    assert c401.value.retryable
 
-    llm_ev = analyzer(monkeypatch, completion(analysis(evidence=["words the source never says"])), fallbacks=["https://fallback.example/v1"])
-    with pytest.raises(AnalysisError, match="evidence") as cev:
-        llm_ev.analyze(item())
-    assert not cev.value.retryable and len(llm_ev.client.requests) == 1
-
-    llm_ok = analyzer(monkeypatch, FetchError("network request failed", retryable=True),
-                      completion(analysis(why_it_matters="")), fallbacks=["https://fallback.example/v1"])
+def test_endpoint_failover_and_malformed_completions(monkeypatch):
+    """Distinguish retryable transport/auth failures from terminal truncation and evidence errors."""
+    llm_ok = wire_analyzer(monkeypatch, FetchError("network request failed", retryable=True),
+                           analysis(why_it_matters=""), fallbacks=["https://fallback.example/v1"])
     assert llm_ok.analyze(item())["title"] == analysis()["title"] and llm_ok.client.requests[0][0].startswith("https://llm.example")
 
-    with pytest.raises(AnalysisError, match="truncated") as ctr:
-        analyzer(monkeypatch, completion(analysis(), finish_reason="length")).analyze(item())
-    assert not ctr.value.retryable
-
-    with pytest.raises(AnalysisError, match="unexpected response") as cun:
-        analyzer(monkeypatch, Response(200, b'{"error": "busy"}', {}, "https://llm.example/v1")).analyze(item())
-    assert cun.value.retryable
+    for reply, fallbacks, match, retryable in (
+        (FetchError("HTTP 401", status=401), (), "HTTP 401", True),
+        (analysis(evidence=["words the source never says"]), ("https://fallback.example/v1",), "evidence", False),
+        (completion(analysis(), finish_reason="length"), (), "truncated", False),
+        (Response(200, b'{"error": "busy"}', {}, "https://llm.example/v1"), (), "unexpected response", True),
+    ):
+        client = wire_analyzer(monkeypatch, reply, fallbacks=fallbacks)
+        with pytest.raises(AnalysisError, match=match) as caught:
+            client.analyze(item())
+        assert caught.value.retryable is retryable and len(client.client.requests) == 1
 
 
 @pytest.mark.parametrize("body,quotes,match", [
@@ -332,7 +399,7 @@ def test_writer_schema_rejects_short_nfkc_titles(text):
 
 def test_evidence_matching_diagnostics_and_grammar_bounds(monkeypatch):
     """Bound evidence enum choices to MAX_EVIDENCE_CHOICES across descriptions and comments."""
-    llm = analyzer(monkeypatch, completion(analysis(why_it_matters="")))
+    llm = wire_analyzer(monkeypatch, analysis(why_it_matters=""))
     llm.analyze(item())
     fields = llm.client.requests[0][1]["response_format"]["json_schema"]["schema"]["properties"]
     assert fields["publish"]["enum"] == [True] and "enum" not in fields["why_it_matters"]
@@ -346,11 +413,9 @@ def test_evidence_matching_diagnostics_and_grammar_bounds(monkeypatch):
     assert all((c in supplied["title"] or c in supplied["content"]) and MIN_EVIDENCE_CHARS <= len(c) <= 500 for c in choices)
 
     note_body = 'The later **clarification** retains "quoted text".'
-    with_note = item(content="Original description", public_comments=[{
-        "id": "gid://gitlab/DiscussionNote/1", "url": "https://example.org/issue#note_1",
-        "title": "Public comment by @operator", "author": "operator", "created_at": DATE, "body": note_body,
-    }])
-    llm_n = analyzer(monkeypatch, completion(analysis(why_it_matters="", evidence=[note_body])))
+    with_note = item(content="Original description",
+                     public_comments=[make_note(1, note_body, url="https://example.org/issue", kind="DiscussionNote")])
+    llm_n = wire_analyzer(monkeypatch, analysis(why_it_matters="", evidence=[note_body]))
     assert llm_n.analyze(with_note)["evidence"] == [note_body]
     req_n = llm_n.client.requests[0][1]
     sent_n = json.loads(req_n["messages"][1]["content"])
@@ -364,7 +429,7 @@ def test_evidence_matching_diagnostics_and_grammar_bounds(monkeypatch):
     short_choices = _writer_schema({"title": "Ack", "content": "one\ntwo\nthree\nend"})["properties"]["evidence"]["items"]["enum"]
     assert short_choices and any(c.endswith("end") for c in short_choices)
 
-    llm_empty = analyzer(monkeypatch)
+    llm_empty = wire_analyzer(monkeypatch)
     with pytest.raises(AnalysisError, match="no qualifying literal evidence"):
         llm_empty.analyze(item(title="Ack", content="OK"))
     assert llm_empty.client.requests == []
@@ -381,8 +446,7 @@ def test_rejection_strikes_run_endpoint_circuit_breaker_and_source_snapshot(tmp_
     llm_cfg = DEFAULTS["llm"]
     with Store(tmp_path / "state.db") as store:
         src = item()
-        store.ingest(src, DATE)
-        row = store.pending(1, DATE)[0]
+        row = pending(store, src, at=DATE, ready=DATE)
         finish_reviewed(store, row, analysis(), "first-analysis", DATE)
         src["content"] += " A later source correction."
         store.ingest(src, DATE)
@@ -403,14 +467,13 @@ def test_rejection_strikes_run_endpoint_circuit_breaker_and_source_snapshot(tmp_
     calls = []
     failing_endpoint = False
 
-    def step(payload):
-        """Simulate per-item writer success or retryable HTTP failure."""
+    def _step(payload):
         calls.append(payload["url"])
         if payload["url"].endswith("/bad") or failing_endpoint:
             raise AnalysisError("LLM request failed (HTTP 400)", retryable=True)
         return analysis()
 
-    patch_cli_pipeline(monkeypatch, analyzer=lambda *a, **kw: ScriptedAnalyzer(step), reviewer=ApprovingReviewer)
+    patch_cli_pipeline(monkeypatch, analyzer=Writer.factory(_step), reviewer=ApprovingReviewer)
     cfg = {**copy.deepcopy(DEFAULTS), "sources": []}
     for failing_endpoint, expected in [(False, 3), (True, 2)]:
         calls.clear()
@@ -440,20 +503,18 @@ def test_validate_update_analysis_rejects_invalid_payloads(bad_update):
 
 def test_update_mode_sends_prior_context_narrows_schema_and_validates(monkeypatch):
     """Bound prior_story updates, narrow update state/confidence enums, and bind cache keys."""
-    prior = {
-        "id": "a" * 24, "title": "Distinct prior headline",
-        "summary": "Distinct prior summary that must never enter evidence choices.",
-        "why_it_matters": "Distinct prior consequence.", "category": "release", "priority": "normal",
-        "confidence": "confirmed", "state": "released", "products": ["tor"], "tags": ["release"],
-        "published_at": DATE, "updated_at": DATE, "added_at": DATE,
-        "sources": [{"url": "https://example.org/release", "title": "Release"}],
-        "updates": [{"at": f"2026-11-08T12:{n:02d}:00Z", "text": f"Update {n}.",
-                     "sources": [{"url": "https://example.org/release", "title": "Release"}]} for n in range(12)],
-    }
+    prior = _prior_story(
+        category="release",
+        confidence="confirmed",
+        tags=["release"],
+        sources=[{"url": "https://example.org/release", "title": "Release"}],
+        updates=[{"at": f"2026-11-08T12:{n:02d}:00Z", "text": f"Update {n}.",
+                  "sources": [{"url": "https://example.org/release", "title": "Release"}]} for n in range(12)],
+    )
     src_item = item(authority="community", kind="feed")
     draft = update_analysis(update="Packages for Debian are now published.", confidence="confirmed",
                             state="released", evidence=[src_item["title"]])
-    llm = analyzer(monkeypatch, completion(draft))
+    llm = wire_analyzer(monkeypatch, draft)
     assert llm.analyze(src_item, prior=prior) == draft
     _, body = llm.client.requests[0]
     assert body["messages"][0]["content"] == UPDATE_PROMPT and body["response_format"]["json_schema"]["name"] == "onionflash_update"
@@ -461,22 +522,22 @@ def test_update_mode_sends_prior_context_narrows_schema_and_validates(monkeypatc
     assert set(schema["properties"]) == {"publish", "update", "confidence", "state", "evidence"}
     assert (schema["properties"]["state"]["enum"], schema["properties"]["confidence"]["enum"]) == (["released"], ["confirmed"])
 
-    tagged_llm = analyzer(monkeypatch, completion(draft))
+    tagged_llm = wire_analyzer(monkeypatch, draft)
     tagged_llm.analyze(src_item, prior={**prior, "state": "tagged"})
     assert tagged_llm.client.requests[0][1]["response_format"]["json_schema"]["schema"]["properties"]["state"]["enum"] == ["released", "tagged"]
 
     dev_prior = {**prior, "category": "security", "confidence": "reported", "state": "developing", "tags": ["security"]}
-    dev_llm = analyzer(monkeypatch, completion({**draft, "confidence": "reported", "state": "developing"}))
+    dev_llm = wire_analyzer(monkeypatch, {**draft, "confidence": "reported", "state": "developing"})
     dev_llm.analyze(src_item, prior=dev_prior)
     assert dev_llm.client.requests[0][1]["response_format"]["json_schema"]["schema"]["properties"]["state"]["enum"] == NON_TAG_STATES
     with pytest.raises(AnalysisError, match="limits"):
-        analyzer(monkeypatch, completion({**draft, "confidence": "reported", "state": "tagged"})).analyze(src_item, prior=dev_prior)
+        wire_analyzer(monkeypatch, {**draft, "confidence": "reported", "state": "tagged"}).analyze(src_item, prior=dev_prior)
     assert all("Distinct prior" not in c for c in schema["properties"]["evidence"]["items"]["enum"])
     sent = json.loads(body["messages"][1]["content"])
     assert len(sent["prior_story"]["updates"]) == 10 and sent["prior_story"]["updates"][0]["text"] == "Update 2."
 
     tag = item(kind="tag", title="tor-0.4.9.16", content="")
-    tag_llm = analyzer(monkeypatch)
+    tag_llm = wire_analyzer(monkeypatch)
     literal = tag_llm.analyze(tag, prior=prior)
     assert literal == tag_update(tag, prior) and literal["update"] == "The upstream feed lists the tag “tor-0.4.9.16”."
     assert (literal["confidence"], literal["state"]) == ("confirmed", "released")
@@ -526,26 +587,24 @@ def test_shouting_caps_and_malformed_tor_version_helpers_and_validation(monkeypa
 
     src = item(content="Operators reported a relay issue on 0.4.17 and 0.4.9.17.")
     ev = ["Operators reported a relay issue"]
-    with pytest.raises(AnalysisError, match="all-caps shouting"):
-        validate_analysis(analysis(title="DO NOT UPGRADE NOW", evidence=ev), src)
-    with pytest.raises(AnalysisError, match="all-caps shouting"):
-        validate_analysis(analysis(summary="Relays are AT RISK FOR DEANONYMIZATION.", evidence=ev), src)
-    with pytest.raises(AnalysisError, match="all-caps shouting"):
-        validate_analysis(update_analysis(update="OPERATORS MUST UPGRADE NOW.", evidence=ev), src, UPDATE_SCHEMA)
+    for draft, schema in (
+        (analysis(title="DO NOT UPGRADE NOW", evidence=ev), SCHEMA),
+        (analysis(summary="Relays are AT RISK FOR DEANONYMIZATION.", evidence=ev), SCHEMA),
+        (update_analysis(update="OPERATORS MUST UPGRADE NOW.", evidence=ev), UPDATE_SCHEMA),
+    ):
+        with pytest.raises(AnalysisError, match="all-caps shouting"):
+            validate_analysis(draft, src, schema)
 
     list_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/abc/"
     impact = "The post says operators should monitor relay load."
-    comm_item = item(url=list_url, authority="community", content="Operators should monitor relay load.")
-    trusted_item = item(url=list_url, authority="trusted-operator", content="Operators should monitor relay load.")
-    proj_item = item(url=list_url, authority="project-sender", content="Operators should monitor relay load.")
-    assert validate_analysis(analysis(why_it_matters=impact, evidence=["Operators should monitor relay load."]), comm_item)["why_it_matters"] == ""
-    assert validate_analysis(analysis(why_it_matters=impact, evidence=["Operators should monitor relay load."]), trusted_item)["why_it_matters"] == impact
-    assert validate_analysis(analysis(why_it_matters=impact, evidence=["Operators should monitor relay load."]), proj_item)["why_it_matters"] == impact
+    for auth, expected in (("community", ""), ("trusted-operator", impact), ("project-sender", impact)):
+        mail_item = item(url=list_url, authority=auth, content="Operators should monitor relay load.")
+        assert validate_analysis(analysis(why_it_matters=impact, evidence=["Operators should monitor relay load."]), mail_item)["why_it_matters"] == expected
 
-    llm_clear = analyzer(
+    llm_clear = wire_analyzer(
         monkeypatch,
-        completion(analysis(why_it_matters="The report warns DO NOT UPGRADE NOW.", evidence=ev)),
-        completion(analysis(why_it_matters="The report warns about a post-0.4.17 upgrade.", evidence=ev)),
+        analysis(why_it_matters="The report warns DO NOT UPGRADE NOW.", evidence=ev),
+        analysis(why_it_matters="The report warns about a post-0.4.17 upgrade.", evidence=ev),
     )
     assert llm_clear.analyze(src)["why_it_matters"] == "" and llm_clear.clears == 1
     assert llm_clear.analyze(src)["why_it_matters"] == "" and llm_clear.clears == 1
@@ -553,17 +612,11 @@ def test_shouting_caps_and_malformed_tor_version_helpers_and_validation(monkeypa
 
 def test_mailing_list_blockquote_unquoted_mail_text_and_sender_domain_guards(monkeypatch, tmp_path):
     """Preserve blockquote breaks and isolate unquoted mail text, sender_domain, and reply evidence."""
-    from helpers import FakeClient, response, source
-    from onionflash import collect, source_packet
-    from onionflash.store import item_hash
-    from onionflash.util import plain_text
-
     html_reply = (
         "<p>Hi Adam,</p><p>Three corrections follow.</p>"
         "<blockquote>&gt; Please create a merge request.<br>&gt; Many relays are falling.</blockquote>"
     )
-    parsed_html = plain_text(html_reply, 2000, html=True)
-    assert "\n> Please create a merge request.\n> Many relays are falling." in parsed_html
+    assert "\n> Please create a merge request.\n> Many relays are falling." in plain_text(html_reply, 2000, html=True)
 
     sample_reply = (
         "Hi Adam,\n\n"
@@ -581,151 +634,537 @@ def test_mailing_list_blockquote_unquoted_mail_text_and_sender_domain_guards(mon
     )
     stripped = unquoted_mail_text(sample_reply)
     assert "[1] Our measurements:\nhttps://1aeo.com/blog/tor-begindir-hsdir-mitigation-pressure.html" in stripped
-    assert "On Friday, November 13th" not in stripped
-    assert "forest" not in stripped
-    assert "keevesadam98" not in stripped
+    assert all(tok not in stripped for tok in ("On Friday, November 13th", "forest", "keevesadam98"))
+    assert unquoted_mail_text("Top reply text.\n\n-----Original Message-----\nFrom: someone@example.org\n\n> Quoted line") == "Top reply text."
 
-    orig_msg = "Top reply text.\n\n-----Original Message-----\nFrom: someone@example.org\n\n> Quoted line"
-    assert unquoted_mail_text(orig_msg) == "Top reply text."
-
-    # Verify collect._feed extracts verified sender_domain for trusted-operator and project-sender only.
-    rss_xml = b"""<?xml version="1.0" encoding="utf-8"?>
-<rss version="2.0"><channel><title>tor-dev</title>
-<item>
-  <title>[tor-dev] Re: BEGIN_DIR buffer behavior</title>
-  <link>https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/MSG1/</link>
-  <author>tor\xef\xbc\xa01aeo.com (Tor at 1AEO)</author>
-  <pubDate>Sun, 15 Nov 2026 12:00:00 +0000</pubDate>
-  <description>Unquoted operator clarification.</description>
-</item>
-<item>
-  <title>[tor-dev] Core update</title>
-  <link>https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/MSG2/</link>
-  <author>nickm\xef\xbc\xa0torproject.org (Nick Mathewson)</author>
-  <pubDate>Sun, 15 Nov 2026 12:01:00 +0000</pubDate>
-  <description>Project sender note.</description>
-</item>
-<item>
-  <title>[tor-dev] Community question</title>
-  <link>https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/MSG3/</link>
-  <author>forest\xef\xbc\xa0example.net (forest)</author>
-  <pubDate>Sun, 15 Nov 2026 12:02:00 +0000</pubDate>
-  <description>Community note.</description>
-</item>
-</channel></rss>"""
+    msg_base = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message"
+    rss_xml = list_rss(
+        {"title": "[tor-dev] Re: BEGIN_DIR buffer behavior", "link": f"{msg_base}/MSG1/",
+         "author": "tor\uff201aeo.com (Tor at 1AEO)", "description": "Unquoted operator clarification."},
+        {"title": "[tor-dev] Core update", "link": f"{msg_base}/MSG2/",
+         "author": "nickm\uff20torproject.org (Nick Mathewson)", "description": "Project sender note."},
+        {"title": "[tor-dev] Community question", "link": f"{msg_base}/MSG3/",
+         "author": "forest\uff20example.net (forest)", "description": "Community note."},
+    )
     feed_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/feed/"
     list_src = source(id="tor-dev", url=feed_url, kind="feed", authority="community", product="tor")
     settings = {**DEFAULTS["collection"], "trusted_operator_domains": ["1aeo.com"]}
-    collected = collect.collect_source(
-        FakeClient([response(rss_xml, url=feed_url)]), list_src, {}, settings, "2026-11-15T12:05:00Z"
-    )
+    collected = collect.collect_source(FakeClient([response(rss_xml, url=feed_url)]), list_src, {}, settings, "2026-11-15T12:05:00Z")
     by_msg = {entry["url"].rstrip("/").rsplit("/", 1)[-1]: entry for entry in collected["items"]}
     assert by_msg["MSG1"]["authority"] == "trusted-operator" and by_msg["MSG1"]["sender_domain"] == "1aeo.com"
     assert by_msg["MSG2"]["authority"] == "project-sender" and by_msg["MSG2"]["sender_domain"] == "torproject.org"
     assert by_msg["MSG3"]["authority"] == "community" and "sender_domain" not in by_msg["MSG3"]
 
-    assert item_hash(by_msg["MSG1"]) != item_hash({k: v for k, v in by_msg["MSG1"].items() if k != "sender_domain"})
-    assert source_packet.source_fingerprint(by_msg["MSG1"]) != source_packet.source_fingerprint(
-        {k: v for k, v in by_msg["MSG1"].items() if k != "sender_domain"}
-    )
+    without_domain = {k: v for k, v in by_msg["MSG1"].items() if k != "sender_domain"}
+    assert item_hash(by_msg["MSG1"]) != item_hash(without_domain)
+    assert source_packet.source_fingerprint(by_msg["MSG1"]) != source_packet.source_fingerprint(without_domain)
 
-    reply_item = {
-        **by_msg["MSG1"],
-        "content": sample_reply,
-    }
+    reply_item = {**by_msg["MSG1"], "content": sample_reply}
     valid_draft = analysis(
         title="Relay operator clarifies BEGIN_DIR buffer allocation on tor-dev",
         summary="A relay operator at 1aeo.com clarifies that buf_new() allocates an empty buffer structure.",
-        why_it_matters="",
-        confidence="reported",
-        evidence=["buf_new() allocates an empty buffer structure."],
+        why_it_matters="", confidence="reported", evidence=["buf_new() allocates an empty buffer structure."],
     )
     with Store(tmp_path / "reply.sqlite3") as store:
-        store.ingest(dict(reply_item), "2026-11-15T12:05:00Z")
-        [row] = store.pending(1, "2026-11-15T12:05:00Z")
-        prep = store.prepare_candidate(row, valid_draft, "2026-11-15T12:05:00Z")
-        pkt_src = prep["packet"]["sources"][0]
+        row = pending(store, dict(reply_item), at="2026-11-15T12:05:00Z", ready="2026-11-15T12:05:00Z")
+        pkt_src = store.prepare_candidate(row, valid_draft, "2026-11-15T12:05:00Z")["packet"]["sources"][0]
         assert pkt_src["sender_domain"] == "1aeo.com"
         assert "buf_new() allocates an empty buffer structure." in pkt_src["unquoted_content"]
         assert "forest" not in pkt_src["unquoted_content"]
 
-    writer = analyzer(monkeypatch, completion(valid_draft))
+    writer = wire_analyzer(monkeypatch, valid_draft)
     writer.analyze(dict(reply_item))
     sent_payload = json.loads(writer.client.requests[0][1]["messages"][1]["content"])
-    assert sent_payload["sender_domain"] == "1aeo.com"
-    assert "forest" not in sent_payload["unquoted_content"]
+    assert sent_payload["sender_domain"] == "1aeo.com" and "forest" not in sent_payload["unquoted_content"]
 
-    # Quoted-only evidence is rejected with writer.quoted_only_evidence.
-    with pytest.raises(AnalysisError, match="unquoted author text") as quoted_err:
-        validate_analysis(
-            analysis(
-                title="Relay operator replies on tor-dev",
-                summary="A relay operator replied to the thread.",
-                evidence=["> Please do. Many of our 42 relays are falling due to this continued attack."],
-            ),
-            reply_item,
-        )
-    assert quoted_err.value.code == "writer.quoted_only_evidence"
-    assert "failed." + quoted_err.value.code in decisions.CODES
-
-    # Numbers present only in >-quoted lines clear why_it_matters; unquoted numbers survive.
-    cleared_num = validate_analysis(
-        analysis(
-            title="Relay operator clarifies BEGIN_DIR buffer allocation",
-            summary="A relay operator clarifies buf_new() behavior.",
-            why_it_matters="The post notes 42 relays are falling.",
-            evidence=["buf_new() allocates an empty buffer structure."],
-        ),
-        reply_item,
-    )
-    assert cleared_num["why_it_matters"] == ""
-    kept_num = validate_analysis(
-        analysis(
-            title="Relay operator clarifies BEGIN_DIR buffer allocation",
-            summary="A relay operator clarifies buf_new() behavior.",
-            why_it_matters="The post gives three corrections on buffer allocation.",
-            evidence=["buf_new() allocates an empty buffer structure."],
-        ),
-        reply_item,
-    )
-    assert kept_num["why_it_matters"] == "The post gives three corrections on buffer allocation."
-
-    # Short unquoted replies (< MIN_EVIDENCE_CHARS) still reject quoted-only evidence.
     short_reply = {**reply_item, "content": "ACK.\n> Our 42 relays are failing right now."}
-    with pytest.raises(AnalysisError, match="unquoted author text") as short_err:
-        validate_analysis(
-            analysis(
-                title="Relay operator replies on tor-dev",
-                summary="A relay operator acknowledged the message.",
-                evidence=["> Our 42 relays are failing right now."],
-            ),
-            short_reply,
-        )
-    assert short_err.value.code == "writer.quoted_only_evidence"
+    subject_reply = {**reply_item, "title": "Re: 42 relays are failing right now",
+                     "content": "That count is incorrect and should not be cited.\n> 42 relays are failing right now."}
+    assert "failed.writer.quoted_only_evidence" in decisions.CODES
+    for target_item, quote in (
+        (reply_item, "> Please do. Many of our 42 relays are falling due to this continued attack."),
+        (short_reply, "> Our 42 relays are failing right now."),
+        (subject_reply, "Re: 42 relays are failing right now"),
+    ):
+        with pytest.raises(AnalysisError, match="unquoted author text") as err:
+            validate_analysis(analysis(title="Relay operator replies on tor-dev",
+                                       summary="A relay operator replied to the thread.", evidence=[quote]), target_item)
+        assert err.value.code == "writer.quoted_only_evidence"
 
-    # Inherited reply subjects neither satisfy unquoted author evidence nor license quoted numbers.
-    subject_reply = {
-        **reply_item,
-        "title": "Re: 42 relays are failing right now",
-        "content": "That count is incorrect and should not be cited.\n> 42 relays are failing right now.",
+    for target_item, impact, quote, expected in (
+        (reply_item, "The post notes 42 relays are falling.", "buf_new() allocates an empty buffer structure.", ""),
+        (reply_item, "The post gives three corrections on buffer allocation.", "buf_new() allocates an empty buffer structure.",
+         "The post gives three corrections on buffer allocation."),
+        (subject_reply, "The post says 42 relays are failing.", "That count is incorrect and should not be cited.", ""),
+    ):
+        checked = validate_analysis(analysis(title="Relay operator clarifies BEGIN_DIR buffer allocation",
+                                             summary="A relay operator clarifies buf_new() behavior.",
+                                             why_it_matters=impact, evidence=[quote]), target_item)
+        assert checked["why_it_matters"] == expected
+
+
+@pytest.mark.parametrize("update", [False, True])
+def test_active_prompt_and_base_schema_changes_invalidate_writer_cache(monkeypatch, update):
+    """Invalidate `cache_key` whenever the active prompt text or schema bounds change."""
+    previous = _prior_story() if update else None
+    before = _cache_key_for(previous=previous)
+    prompt = "UPDATE_PROMPT" if update else "SYSTEM_PROMPT"
+    schema = analyze.UPDATE_SCHEMA if update else analyze.SCHEMA
+    with monkeypatch.context() as changed:
+        changed.setattr(analyze, prompt, getattr(analyze, prompt) + "\nA changed writer instruction.")
+        assert _cache_key_for(previous=previous) != before
+    field = "update" if update else "title"
+    with monkeypatch.context() as changed:
+        changed.setitem(schema["properties"][field], "maxLength", schema["properties"][field]["maxLength"] - 1)
+        assert _cache_key_for(previous=previous) != before
+    assert _cache_key_for(previous=previous) == before
+
+
+@pytest.mark.parametrize("update", [False, True])
+def test_schema_property_order_is_part_of_writer_identity(monkeypatch, update):
+    """Include JSON-schema property order in `cache_key` even when canonical `digest` matches."""
+    previous = _prior_story() if update else None
+    schema = analyze.UPDATE_SCHEMA if update else analyze.SCHEMA
+    before, canonical = _cache_key_for(previous=previous), digest(schema)
+    monkeypatch.setitem(schema, "properties", dict(reversed(list(schema["properties"].items()))))
+    assert digest(schema) == canonical and _cache_key_for(previous=previous) != before
+
+
+def test_update_input_policy_invalidates_only_update_drafts(monkeypatch):
+    """Invalidate update-mode `cache_key` values without affecting story-mode keys."""
+    ordinary, update = _cache_key_for(), _cache_key_for(previous=_prior_story())
+    monkeypatch.setattr(analyze, "UPDATE_INPUT_VERSION", analyze.UPDATE_INPUT_VERSION + 1)
+    assert _cache_key_for() == ordinary and _cache_key_for(previous=_prior_story()) != update
+
+
+def test_unchanged_inputs_hit_and_existing_content_model_version_components_remain(monkeypatch):
+    """Hit on identical inputs while invalidating on content, model, or `PROMPT_VERSION` changes."""
+    original = _cache_key_for()
+    assert _cache_key_for(_cache_source()) == original
+    assert _cache_key_for(_cache_source(content="A different supported source change.")) != original
+    assert _cache_key_for(model="another-writer-model") != original
+    monkeypatch.setattr(analyze, "PROMPT_VERSION", analyze.PROMPT_VERSION + "-next")
+    assert _cache_key_for() != original
+
+
+@pytest.mark.parametrize("field,value", [
+    ("title", "Changed title"), ("summary", "Changed summary."), ("why_it_matters", "Changed impact."),
+    ("confidence", "confirmed"), ("state", "fixed"), ("updated_at", "2020-01-03T00:00:00Z"),
+    ("updates", [{"at": "2020-01-02T00:00:00Z", "text": "Another prior update."}]),
+])
+def test_prior_prompt_context_remains_in_cache_identity(field, value):
+    """Bind every writer-visible `prior_story` field into update `cache_key` identity."""
+    before = _prior_story()
+    after = {**copy.deepcopy(before), field: value}
+    assert _cache_key_for(previous=before) != _cache_key_for(previous=after)
+    assert _cache_key_for(previous=before) != _cache_key_for()
+
+
+@pytest.mark.parametrize("incoming,before,after", [
+    (_cache_source(), _prior_story(), {**_prior_story(), "category": "release"}),
+    (_cache_source(kind="gitlab_mr", upstream_state="merged"), _prior_story(state="merged"),
+     {**_prior_story(state="merged"), "sources": [{"url": "https://source.example/project/-/issues/1", "title": "Source"}]}),
+])
+def test_prior_grammar_dependencies_are_bound_without_changing_prompt_context(incoming, before, after):
+    """Bind grammar-driving `prior_story` category and merge-source predicates into `cache_key`."""
+    assert analyze.prior_context(before) == analyze.prior_context(after)
+    assert _writer_schema(incoming, analyze.UPDATE_SCHEMA, prior=before) != _writer_schema(incoming, analyze.UPDATE_SCHEMA, prior=after)
+    assert _cache_key_for(incoming, before) != _cache_key_for(incoming, after)
+
+
+def test_closed_at_and_prior_source_metadata_do_not_invalidate_writer_cache():
+    """Ignore `closed_at` and non-grammar source metadata in `item_hash` and `cache_key`."""
+    incoming, before = _cache_source(), _prior_story()
+    after = copy.deepcopy(before)
+    after["closed_at"] = "2020-02-01T00:00:00Z"
+    after["sources"][0].update(closed_at="2020-02-01T00:00:00Z", title="Changed caption", id="extra-metadata")
+    changed = {**incoming, "closed_at": "2020-02-01T00:00:00Z"}
+    assert item_hash(incoming) == item_hash(changed)
+    assert _cache_key_for(changed) == _cache_key_for(incoming)
+    assert _cache_key_for(changed, after) == _cache_key_for(incoming, before)
+    after["sources"][0]["url"] = "https://source.example/project/-/merge_requests/99"
+    assert _cache_key_for(changed, after) == _cache_key_for(incoming, before)
+
+
+@pytest.mark.parametrize("mutate,invalidates", [
+    (lambda d: d["public_comments"][0].update(author="other-author"), True),
+    (lambda d: d["public_comments"][0].update(created_at="2020-01-03T00:00:00Z"), True),
+    (lambda d: d["public_comments"][0].update(body="A changed public observation."), True),
+    (lambda d: (d.update(comments_checked_at="2020-01-04T00:00:00Z", comments_source_key="poll-marker"),
+                d["public_comments"][0].update(id="another-id", url="https://source.example/other", edited_at="2020-01-04T00:00:00Z")), False),
+])
+def test_writer_comment_cache_invalidation_and_polling_exclusions(mutate, invalidates):
+    """Invalidate `cache_key` on writer-visible comment changes while ignoring polling metadata."""
+    note = make_note(1, "A public source observation.", author="author", created_at="2020-01-02T00:00:00Z",
+                     url="https://source.example/note#note_1", note_id="note-1")
+    incoming = _cache_source(public_comments=[note])
+    changed = copy.deepcopy(incoming)
+    mutate(changed)
+    assert (_cache_key_for(incoming) != _cache_key_for(changed)) is invalidates
+
+
+@pytest.mark.parametrize("field,value", [
+    ("model", "another-model"), ("base_url", "https://another.example/v1"),
+    ("fallback_base_urls", ["https://fallback.example/v1"]),
+    ("temperature", 0.4), ("top_p", 0.9), ("top_k", 15), ("min_p", 0.2),
+    ("presence_penalty", 0.2), ("repetition_penalty", 1.2), ("reasoning_effort", "medium"),
+    ("max_output_tokens", 4096), ("max_response_bytes", 131072),
+    ("enable_thinking", True), ("send_chat_template_kwargs", False), ("writer_reasoning", True),
+])
+@pytest.mark.parametrize("update", [False, True])
+def test_effective_generation_contract_changes_invalidate_writer_cache(field, value, update):
+    """Invalidate `cache_key` whenever any effective LLM generation parameter changes."""
+    previous = _prior_story() if update else None
+    assert _cache_key_for(previous=previous, **{field: value}) != _cache_key_for(previous=previous)
+
+
+def test_writer_cache_uses_effective_options_and_excludes_credentials(monkeypatch):
+    """Hash effective reasoning-profile options while ignoring overridden scalars and API keys."""
+    before = _cache_key_for(writer_reasoning=True)
+    overrides = dict(writer_reasoning=True, temperature=0, max_output_tokens=7, enable_thinking=False,
+                     api_key_env="ANOTHER_PRIVATE_KEY_NAME", credential="not-part-of-generation")
+    monkeypatch.setenv("ANOTHER_PRIVATE_KEY_NAME", "synthetic-private-value")
+    assert _cache_key_for(**overrides) == before
+    assert _cache_key_for(previous=_prior_story(), **overrides) != before
+
+
+def test_fallback_order_is_part_of_writer_identity():
+    """Treat `fallback_base_urls` ordering as part of `cache_key` identity."""
+    urls = ["https://first.example/v1", "https://second.example/v1"]
+    assert _cache_key_for(fallback_base_urls=urls) != _cache_key_for(fallback_base_urls=list(reversed(urls)))
+
+
+def test_enabled_writer_sends_the_declared_profile_exactly(capture):
+    """Send the exact `writer_reasoning` sampling and thinking wire payload without mutating config."""
+    config = _reasoning_settings(True)
+    before = copy.deepcopy(config)
+    sent, effective, transport = capture(Analyzer, config)
+    expected = {
+        "model": "writer-model",
+        "messages": [{"role": "system", "content": REASONING_PROMPT},
+                     {"role": "user", "content": json.dumps(REASONING_PAYLOAD, ensure_ascii=False, allow_nan=False)}],
+        "temperature": 1.0, "max_tokens": 32768,
+        "response_format": {"type": "json_schema", "json_schema": {"name": "profile_probe", "strict": True, "schema": REASONING_SCHEMA}},
+        "top_p": 0.95, "top_k": 20, "min_p": 0.0,
+        "presence_penalty": 0.0, "repetition_penalty": 1.0, "reasoning_effort": "xhigh",
+        "chat_template_kwargs": {"enable_thinking": True},
     }
-    with pytest.raises(AnalysisError, match="unquoted author text") as subj_err:
-        validate_analysis(
-            analysis(
-                title="Relay operator disputes count",
-                summary="A relay operator says the count is incorrect.",
-                evidence=["Re: 42 relays are failing right now"],
-            ),
-            subject_reply,
-        )
-    assert subj_err.value.code == "writer.quoted_only_evidence"
-    subj_checked = validate_analysis(
-        analysis(
-            title="Relay operator disputes count",
-            summary="A relay operator says the count is incorrect.",
-            why_it_matters="The post says 42 relays are failing.",
-            evidence=["That count is incorrect and should not be cited."],
-        ),
-        subject_reply,
+    assert sent.content == httpx.Request("POST", "https://model.example/v1/chat/completions", json=expected).content
+    assert transport["max_response_bytes"] == 2097152
+    assert transport["timeout_seconds"] == effective["timeout_seconds"] == 3600
+    assert transport["total_timeout_seconds"] == 3610
+    assert config == before
+
+
+@pytest.mark.parametrize("cls", [RealReviewer, LinkChecker])
+def test_writer_option_does_not_change_other_stages(capture, cls):
+    """Keep `Reviewer` and `LinkChecker` wire profiles isolated from `writer_reasoning`."""
+    off = _reasoning_settings(False)
+    before, effective_before, transport_before = capture(cls, off)
+    enabled = _reasoning_settings(True)
+    original = copy.deepcopy(enabled)
+    capture(Analyzer, enabled)
+    after, effective_after, transport_after = capture(cls, enabled)
+    assert before.content == after.content and transport_before == transport_after and enabled == original
+    assert json.loads(after.content)["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "reasoning_effort" not in json.loads(after.content)
+    assert effective_before["max_output_tokens"] == effective_after["max_output_tokens"]
+
+
+@pytest.mark.parametrize("template", [False, True])
+def test_disabled_writer_keeps_existing_wire_semantics(capture, template):
+    """Preserve non-reasoning `Analyzer` wire defaults when `writer_reasoning` is disabled."""
+    config = _reasoning_settings(False)
+    config["llm"]["send_chat_template_kwargs"] = template
+    sent, effective, transport = capture(Analyzer, config)
+    body = json.loads(sent.content)
+    assert body["temperature"] == 0 and body["max_tokens"] == 1200
+    assert transport["max_response_bytes"] == 65536 and not effective["enable_thinking"]
+    assert ("chat_template_kwargs" in body) is template
+    assert not {"top_p", "top_k", "min_p", "presence_penalty", "repetition_penalty", "reasoning_effort"} & body.keys()
+
+
+def test_profile_does_not_override_the_configured_timeout(capture):
+    """Honor custom `llm.timeout_seconds` values when `writer_reasoning` is enabled."""
+    config = _reasoning_settings(True)
+    config["llm"]["timeout_seconds"] = 45
+    _, effective, transport = capture(Analyzer, config)
+    assert effective["timeout_seconds"] == transport["timeout_seconds"] == 45
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_writer_reasoning_is_a_validated_operator_setting(tmp_path, enabled):
+    """Load boolean `llm.writer_reasoning` values cleanly from TOML."""
+    path = write_toml(tmp_path, f"[llm]\nwriter_reasoning = {str(enabled).lower()}", name="app.toml")
+    assert load_config(path)["llm"]["writer_reasoning"] is enabled
+
+
+def test_reasoning_requires_the_declared_chat_template_contract():
+    """Reject `writer_reasoning = true` when `send_chat_template_kwargs` is disabled in `Analyzer`."""
+    config = _reasoning_settings(True)
+    config["llm"]["send_chat_template_kwargs"] = False
+    with pytest.raises(ValueError, match="writer_reasoning requires"):
+        Analyzer(config)
+
+
+@pytest.mark.parametrize("toml_body,match", [
+    ("[llm]\nwriter_reasoning=true\nsend_chat_template_kwargs=false", "writer_reasoning requires"),
+    *[(f"[llm]\nwriter_reasoning={v}", "writer_reasoning must be a boolean") for v in ('"true"', "1", "[]")],
+])
+def test_writer_reasoning_rejects_invalid_toml_settings(tmp_path, toml_body, match):
+    """Reject incompatible or non-boolean `llm.writer_reasoning` TOML configurations."""
+    with pytest.raises(ValueError, match=match):
+        load_config(write_toml(tmp_path, toml_body, name="app.toml"))
+
+
+@pytest.mark.parametrize("prior_legacy", [False, True])
+@pytest.mark.parametrize("current_legacy", [False, True])
+@pytest.mark.parametrize("body_changed", [False, True])
+def test_update_writer_receives_only_effective_new_description_and_notes(
+        store, monkeypatch, prior_legacy, current_legacy, body_changed):
+    """Filter unchanged/quoted descriptions and old notes across legacy and modern item formats."""
+    description = "The original report describes a circuit allocation defect."
+    old_note = make_note("1", "The original reporter is investigating the defect.", author="reporter",
+                         created_at=DATE, url="https://example.org/news/1", note_id="1")
+    original = _saved_item(description, legacy=prior_legacy, notes=[old_note], updated_at=DATE)
+    seed_story(store, original, analysis(summary=description, evidence=[description]), key="first")
+    added = "The reporter has prepared a patch for the allocation defect."
+    new_note = make_note("2", added, author="reporter", created_at=LATER, url="https://example.org/news/1", note_id="2")
+    changed = "The updated description identifies the affected allocation path."
+    latest_body = changed + "\n> An old quoted claim must not be new evidence." if body_changed else description
+    incoming = _saved_item(latest_body, legacy=current_legacy, notes=[new_note, old_note], updated_at=LATER)
+    row = pending(store, incoming, at=LATER, ready=LATER)
+    original_payload = json.loads(row["payload"])
+    untouched = copy.deepcopy(original_payload)
+    mode, filtered = candidate.own_update_input(store.db, row, original_payload)
+    assert mode == "update" and original_payload == untouched
+    assert "source_content" not in filtered
+    assert filtered["content"] == (changed if body_changed else "")
+    assert filtered["public_comments"] == [new_note]
+    captured = {}
+
+    def _complete(self, _prompt, payload, schema, schema_name):
+        captured.update(payload=payload, schema=schema, name=schema_name)
+        return update_analysis(update=added, evidence=[added])
+
+    monkeypatch.setattr(Analyzer, "complete", _complete)
+    with Analyzer(DEFAULTS) as writer:
+        writer.analyze(filtered, candidate.update_target(store.db, row))
+    assert captured["name"] == "onionflash_update"
+    assert captured["payload"]["content"] == (changed if body_changed else "")
+    assert captured["payload"]["public_comments"] == [{key: new_note[key] for key in ("author", "created_at", "body")}]
+    choices = captured["schema"]["properties"]["evidence"]["items"]["enum"]
+    assert added in choices and description not in choices
+    assert not any("old quoted claim" in choice for choice in choices)
+
+
+def test_legacy_reply_description_cannot_restore_quoted_history(store):
+    """Strip quoted reply history from legacy `source_content` during `own_update_input`."""
+    seed_story(store, item(), analysis(), key="first")
+    existing = dict(store.db.execute("SELECT * FROM stories").fetchone())
+    reply = item(id="reply", kind="feed", url="https://example.org/reply", title="Re: Allocation defect",
+                 content="An obsolete composed body.", source_content="A new patch was proposed.\n> Old quoted history.",
+                 updated_at=LATER)
+    mode, filtered = candidate.own_update_input(store.db, {"id": "reply"}, reply, existing=existing)
+    assert mode == "update" and filtered["content"] == "A new patch was proposed."
+    assert analysis_context(filtered)[0] == "A new patch was proposed."
+    assert "source_content" not in filtered and reply["source_content"].endswith("Old quoted history.")
+
+
+def test_description_format_does_not_change_identity_but_effective_body_does():
+    """Compute identical `item_hash` values across legacy and modern description representations."""
+    description = "The original report describes a circuit allocation defect."
+    modern = _saved_item(description, legacy=False, notes=[], updated_at=DATE)
+    legacy = _saved_item(description, legacy=True, notes=[], updated_at=DATE)
+    assert item_hash(legacy) == item_hash(modern)
+    assert item_hash({**legacy, "content": "Different obsolete composed text."}) == item_hash(legacy)
+    changed = {**legacy, "source_content": "The updated report describes a second affected allocation path."}
+    assert item_hash(changed) != item_hash(legacy)
+
+
+def test_legacy_description_edit_alone_is_queued_and_reaches_update_writer(store):
+    """Queue a legacy `source_content` edit and pass its updated text into update mode."""
+    original = _saved_item("The original report describes a circuit allocation defect.",
+                           legacy=True, notes=[], updated_at=DATE)
+    seed_story(store, original, analysis(evidence=[original["source_content"]]), key="first")
+    changed = "The updated report identifies another affected allocation path."
+    incoming = {**original, "source_content": changed, "updated_at": LATER}
+    row = pending(store, incoming, at=LATER, ready=LATER)
+    mode, filtered = candidate.own_update_input(store.db, row, json.loads(row["payload"]))
+    assert mode == "update" and analysis_context(filtered) == (changed, [])
+
+
+def test_unquoted_mail_text_preserves_dated_headings_eof_from_and_strips_wrapped_on_wrote():
+    """Preserve dated author timelines and EOF `From:` prose while stripping wrapped `On ... wrote:` headers."""
+    assert unquoted_mail_text("2026-11-15 status update:\nOn 2026-11-14, Bob wrote:\n> Any update on CPU load?") == "2026-11-15 status update:"
+    multi_dated = "2026-11-14 rollout started:\n2026-11-15 CPU load stabilized:\nOn 2026-11-13, Bob wrote:\n> Status?"
+    assert unquoted_mail_text(multi_dated) == "2026-11-14 rollout started:\n2026-11-15 CPU load stabilized:"
+    assert unquoted_mail_text("On Wednesday,\n2026-11-16 at 10:00 UTC, Alice wrote:\n> Any update on CPU load?") == ""
+    eof_from = "We tested the patch on 3 relays.\nFrom: our Prometheus metrics, CPU dropped 40%."
+    assert unquoted_mail_text(eof_from) == eof_from
+    assert unquoted_mail_text("From: Alice\n> Any update on CPU load?") == ""
+
+    author_on = (
+        "On Tor 0.4.8.19, our relay crashed at startup.\n"
+        "On Mon, Nov 16, 2026 at 10:00 AM Alice wrote:\n"
+        "> Did anyone else see this?"
     )
-    assert subj_checked["why_it_matters"] == ""
+    assert unquoted_mail_text(author_on) == "On Tor 0.4.8.19, our relay crashed at startup."
+    list_item = item(
+        url="https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/M1/",
+        kind="feed",
+        authority="community",
+        title="[tor-relays] Re: Relay startup crash",
+        content=author_on,
+    )
+    valid_draft = analysis(
+        title="Relay operator reports startup crash on Tor 0.4.8.19",
+        summary="A relay operator reports a startup crash on Tor 0.4.8.19.",
+        why_it_matters="",
+        category="relay",
+        tags=["relay"],
+        confidence="reported",
+        state="developing",
+        evidence=["On Tor 0.4.8.19, our relay crashed at startup."],
+    )
+    assert validate_analysis(copy.deepcopy(valid_draft), list_item)["evidence"] == [
+        "On Tor 0.4.8.19, our relay crashed at startup."
+    ]
+    for wrapped in (
+        "Am 16.11.2026 um 10:00 schrieb Alice Example\n<alice@torproject.org>:\n> Quote",
+        "Le 16/11/2026 à 10:00, Alice Example\n<alice@torproject.org> a écrit :\n> Quote",
+        "On Mon, Nov 16, 2026 at 10:00 AM Alice wrote :\n> Quote",
+        "On Mon, Nov 16, 2026 at 10:00 AM\nAlice Example <alice@torproject.org>\nwrote:\n> Quote",
+    ):
+        assert unquoted_mail_text(wrapped) == ""
+
+
+def test_writer_schema_separates_short_quoted_lines_and_fails_fast_on_ack_only_replies(monkeypatch):
+    """Prevent short `>`-quoted lines from poisoning unquoted excerpts and fail fast before HTTP on ack-only replies."""
+    list_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/M2/"
+    short_quote_body = "> Hi,\nWe saw the exact same relay crash on Tor 0.4.8.19 today."
+    post = item(
+        url=list_url,
+        kind="feed",
+        authority="community",
+        title="[tor-relays] Relay crash",
+        content=short_quote_body,
+    )
+    schema = _writer_schema(post)
+    expected_exc = "We saw the exact same relay crash on Tor 0.4.8.19 today."
+    assert expected_exc in schema["properties"]["evidence"]["items"]["enum"]
+
+    reply_draft = analysis(
+        title="Operator reports relay crash on Tor 0.4.8.19",
+        summary="An operator reports seeing the same relay crash on Tor 0.4.8.19.",
+        why_it_matters="",
+        category="relay",
+        tags=["relay"],
+        confidence="reported",
+        state="developing",
+        evidence=[expected_exc],
+    )
+    writer = wire_analyzer(monkeypatch, reply_draft)
+    out = writer.analyze(post)
+    assert out["evidence"] == [expected_exc] and writer.calls == 1
+
+    for ack_body in (
+        "On Mon, Nov 16, 2026 at 10:00 AM Alice wrote:\n> Our relay crashed on Tor 0.4.8.19.\n\n+1",
+        "On Mon, Nov 16, 2026 at 10:00 AM Alice wrote:\n> Our relay crashed on Tor 0.4.8.19.",
+    ):
+        ack_writer = wire_analyzer(monkeypatch, reply_draft)
+        with pytest.raises(AnalysisError) as err:
+            ack_writer.analyze({**post, "content": ack_body})
+        assert err.value.code == "writer.quoted_only_evidence" and ack_writer.calls == 0
+
+
+def test_validate_schema_field_enforces_booleans_unsupported_types_and_clean_evidence():
+    """Validate boolean types, reject unknown schema rule types, and reject control/noncharacter evidence."""
+    assert validate_schema_field(True, {"type": "boolean"}, error=AnalysisError) is True
+    assert validate_schema_field(False, {"type": "boolean"}, error=AnalysisError) is False
+    for bad_bool in (1, 0, "true", None):
+        with pytest.raises(AnalysisError):
+            validate_schema_field(bad_bool, {"type": "boolean"}, error=AnalysisError)
+    with pytest.raises(ValueError, match="Unsupported schema rule type"):
+        validate_schema_field(1, {"type": "integer"}, error=AnalysisError)
+
+    src = item(content="Tor 0.4.8.13 fixes relay bug now.")
+    for bad_char in ("\x00", "\x1f", "\ufffe"):
+        bad_draft = analysis(
+            title="Tor 0.4.8.13 fixes relay bug",
+            summary="Tor 0.4.8.13 fixes relay bug now.",
+            evidence=[f"Tor 0.4.8.13 fixes relay bug{bad_char} now."],
+        )
+        with pytest.raises(AnalysisError, match="evidence"):
+            validate_analysis(bad_draft, src)
+
+
+def test_unquoted_mail_text_preserves_on_prose_before_wrapped_and_dated_quote_intros(monkeypatch):
+    """Preserve unquoted 'On ...' author prose above wrapped multi-line or dated quote headers."""
+    list_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/M3/"
+    wrapped_intro = (
+        "On Tor 0.4.8.19, our relay crashed at startup\n"
+        "On Mon, Nov 16, 2026 Alice Example\n"
+        "wrote:\n"
+        "> Did anyone else see this?"
+    )
+    assert unquoted_mail_text(wrapped_intro) == "On Tor 0.4.8.19, our relay crashed at startup"
+
+    dated_intro = (
+        "On Tor 0.4.8.19 we saw a regression\n"
+        "2026-11-16 10:00 Alice wrote:\n"
+        "> Did anyone else see this?"
+    )
+    assert unquoted_mail_text(dated_intro) == "On Tor 0.4.8.19 we saw a regression"
+    assert unquoted_mail_text("On Wednesday,\n2026-11-16 at 10:00 UTC,\nAlice wrote:\n> Any update on CPU load?") == ""
+
+    for body, quote in (
+        (wrapped_intro, "On Tor 0.4.8.19, our relay crashed at startup"),
+        (dated_intro, "On Tor 0.4.8.19 we saw a regression"),
+    ):
+        post = item(url=list_url, kind="feed", authority="community", title="[tor-relays] Re: Crash", content=body)
+        draft = analysis(
+            title="Relay operator reports crash on Tor 0.4.8.19",
+            summary=f"{quote}.",
+            why_it_matters="",
+            category="relay",
+            tags=["relay"],
+            confidence="reported",
+            state="developing",
+            evidence=[quote],
+        )
+        writer = wire_analyzer(monkeypatch, draft)
+        assert writer.analyze(post)["evidence"] == [quote] and writer.calls == 1
+
+
+def test_unquoted_mail_text_strips_time_colon_initial_abbrev_and_nfd_headers_and_fails_fast(monkeypatch):
+    """Strip wrapped HH:MM:, initial/month-abbreviation, and NFD quote headers while keeping author prose."""
+    list_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/M4/"
+    headers = (
+        "On Mon, Nov 16, 2026 at 10:00:\nAlice Example wrote:\n> Our relay crashed on Tor 0.4.8.19.",
+        "On Mon, 16 Nov. 2026, J.\nDoe wrote:\n> Our relay crashed on Tor 0.4.8.19.",
+        "Am 16.11.2026 um 10:00\nUhr schrieb J.\nDoe:\n> Our relay crashed on Tor 0.4.8.19.",
+        "Le 16/11/2026 à 10:00, Alice a e\u0301crit :\n> Our relay crashed on Tor 0.4.8.19.",
+        "Le 16 nov.\n2026 à 10:00, Alice a e\u0301crit :\n> Our relay crashed on Tor 0.4.8.19.",
+    )
+    for body in headers:
+        assert unquoted_mail_text(body) == ""
+        ack_post = item(
+            url=list_url,
+            kind="feed",
+            authority="community",
+            title="[tor-relays] Re: Crash",
+            content=f"{body}\n\n+1",
+        )
+        writer = wire_analyzer(monkeypatch, analysis())
+        with pytest.raises(AnalysisError) as err:
+            writer.analyze(ack_post)
+        assert err.value.code == "writer.quoted_only_evidence" and writer.calls == 0
+
+    for prose_body, expected in (
+        ("On Tor 0.4.8.19, our relay crashed.\nOn 2026-11-16 Alice wrote:\n> Quote", "On Tor 0.4.8.19, our relay crashed."),
+        ("On Tor 0.4.8.19, status update:\nOn 2026-11-16 Alice wrote:\n> Quote", "On Tor 0.4.8.19, status update:"),
+        ("On Tor 0.4.8.19, we tested Tor.\nOn 2026-11-16 Alice wrote:\n> Quote", "On Tor 0.4.8.19, we tested Tor."),
+        ("On Tor 0.4.8.19, our relay crashed.\nwrote:\n> Quote", "On Tor 0.4.8.19, our relay crashed.\nwrote:"),
+    ):
+        assert unquoted_mail_text(prose_body) == expected

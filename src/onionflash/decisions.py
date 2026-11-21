@@ -7,12 +7,11 @@ docs/DECISIONS.md, which lists every code.
 
 from __future__ import annotations
 
-import json
 import re
 from collections import Counter, defaultdict
 
 from .schema import FIELD_LIMITS
-from .util import after, format_utc, parse_utc, saved_object
+from .util import after, saved_object, strict_json, timestamp
 
 CODES = frozenset({
     "published.new", "published.update", "published.network.new", "published.network.update",
@@ -76,16 +75,17 @@ def _clean_extra(extra: dict) -> dict:
     return {k: (v[:300] if isinstance(v, str) else v) for k, v in extra.items() if v is not None}
 
 
+def failed_criteria(criteria: dict) -> dict[str, str]:
+    """Format non-passing review criteria as `{name: 'outcome: reason'}`."""
+    return {name: f"{check['outcome']}: {check['reason']}" for name, check in criteria.items() if check["outcome"] != "pass"}
+
+
 def _detail(row, code: str, review, extra: dict) -> dict:
     detail = {"title": _title(row["payload"]), "url": row["url"]} if row else {"title": None, "url": None}
     try:
         reviews = _reviews(review)
         verdicts = [f"{entry['stage']}:{entry['result']['verdict']}" for entry in reviews]
-        criteria = {
-            name: f"{check['outcome']}: {check['reason']}"
-            for name, check in reviews[-1]["result"]["criteria"].items()
-            if check["outcome"] != "pass"
-        } if reviews and code.startswith(("skipped.", "held.")) else None
+        criteria = failed_criteria(reviews[-1]["result"]["criteria"]) if reviews and code.startswith(("skipped.", "held.")) else None
     except (TypeError, KeyError, AttributeError):
         verdicts, criteria = [], None
     if verdicts:
@@ -105,8 +105,7 @@ def _detail(row, code: str, review, extra: dict) -> dict:
 def _write_decision(db, observed: str, subject: str, item_id: str | None, content_hash: str | None,
                     source_id: str | None, story_id: str | None, code: str, detail_fn) -> None:
     try:
-        detail = json.dumps(detail_fn(), ensure_ascii=False, sort_keys=True, allow_nan=False)
-        detail.encode("utf-8")
+        detail = strict_json(detail_fn())
     except Exception:  # never let the log's own detail stop the outcome
         detail = "{}"
     db.execute(
@@ -156,7 +155,7 @@ def window(text: str, observed: str | None = None) -> str:
     if match:
         return after(-int(match[1]) * (3600 if match[2] == "h" else 86400), observed)
     try:
-        return format_utc(parse_utc(text))
+        return timestamp(text)
     except ValueError:
         raise ValueError("--since must be hours or days, such as 7d, or a timestamp with a time zone") from None
 
@@ -167,20 +166,30 @@ def _entry(row) -> dict:
     return entry
 
 
+def paginate_rows(rows, limit: int, key: str, mapper) -> dict:
+    """Validate `limit` and format up to `limit` mapped rows with an `id` continuation cursor."""
+    if type(limit) is not int or not 1 <= limit <= MAX_LIMIT:
+        raise ValueError(f"List limit must be between 1 and {MAX_LIMIT}")
+    fetched = rows(limit + 1)
+    shown = fetched[:limit]
+    return {key: [mapper(row) for row in shown], "next_cursor": shown[-1]["id"] if len(fetched) > limit else None}
+
+
 def list_entries(db, since: str, *, code: str | None = None, source: str | None = None,
                  limit: int = 50, after: int | None = None) -> dict:
     """Decisions since `since`, newest first, by code or dotted code prefix and source, with a cursor."""
-    if type(limit) is not int or not 1 <= limit <= MAX_LIMIT:
-        raise ValueError(f"List limit must be between 1 and {MAX_LIMIT}")
-    if code is not None and not _PREFIX.fullmatch(code):
+    if code is not None and (not isinstance(code, str) or not _PREFIX.fullmatch(code)):
         raise ValueError("Code must be a decision code or its dotted prefix, such as held.review")
+    if source is not None and not isinstance(source, str):
+        raise ValueError("Source ID must be a string")
     if after is not None and (type(after) is not int or after < 1):
         raise ValueError("Cursor must be the next_cursor of the previous list")
-    rows = db.execute(f"""SELECT {_COLUMNS} FROM decision_log WHERE decided_at>=?1
-        AND (?2 IS NULL OR code=?2 OR substr(code,1,length(?2)+1)=?2||'.') AND (?3 IS NULL OR source_id=?3)
-        AND (?4 IS NULL OR id<?4) ORDER BY id DESC LIMIT ?5""", (since, code, source, after, limit + 1)).fetchall()
-    shown = rows[:limit]
-    return {"decisions": [_entry(row) for row in shown], "next_cursor": shown[-1]["id"] if len(rows) > limit else None}
+    return paginate_rows(
+        lambda cap: db.execute(f"""SELECT {_COLUMNS} FROM decision_log WHERE decided_at>=?1
+            AND (?2 IS NULL OR code=?2 OR substr(code,1,length(?2)+1)=?2||'.') AND (?3 IS NULL OR source_id=?3)
+            AND (?4 IS NULL OR id<?4) ORDER BY id DESC LIMIT ?5""", (since, code, source, after, cap)).fetchall(),
+        limit, "decisions", _entry,
+    )
 
 
 def for_item(db, item_id: str) -> list[dict]:
@@ -201,15 +210,21 @@ def summary(db, since: str) -> dict:
     """Decisions since `since` with examples, what awaits the operator, and the feed size."""
     outcomes, codes, sources, examples, clears = Counter(), Counter(), defaultdict(Counter), defaultdict(list), 0
     for row in db.execute(f"SELECT {_COLUMNS} FROM decision_log WHERE decided_at>=? ORDER BY id DESC", (since,)):
-        code, detail = row["code"], _entry(row)["detail"] or {}
+        code, detail = row["code"], saved_object(row["detail"]) or {}
         outcome = code.split(".", 1)[0]
         outcomes[outcome] += 1
         codes[code] += 1
         if row["source_id"] is not None:
             sources[row["source_id"]][outcome] += 1
         if len(examples[code]) < EXAMPLES:
-            examples[code].append({"item_id": row["item_id"], "decided_at": row["decided_at"], **detail})
-        clears += detail.get("writer_clears", 0)
+            examples[code].append({
+                "item_id": row["item_id"],
+                "decided_at": row["decided_at"],
+                **{k: v for k, v in detail.items() if k not in {"item_id", "decided_at"}},
+            })
+        wc = detail.get("writer_clears")
+        if type(wc) is int and wc > 0:
+            clears += wc
     rejected = [{"item_id": item_id, "title": _title(payload), "code": code, "decided_at": decided_at, "reason": reason}
                 for item_id, payload, code, decided_at, reason in db.execute(
                     """SELECT i.id,CASE WHEN typeof(i.payload)='text' THEN CAST(i.payload AS BLOB) END,d.code,d.decided_at,i.last_error FROM items i

@@ -14,21 +14,18 @@ import feedparser
 
 from .transport import FetchError, HttpClient
 from .util import (
-    UTC, after, canonical_url, format_utc, is_dirauth_item, is_hackerone_item, parse_utc, plain_text, timestamp,
+    LIST_ARCHIVE_HOST, UTC, after, canonical_url, effective_authority, format_utc,
+    is_valid_domain, is_valid_gitlab_user, parse_utc, plain_text, timestamp,
 )
 
 
 MAX_FEED_ELEMENTS, MAX_FEED_DEPTH, MAX_FEED_BASE_CHARS = 50000, 128, 8_000_000
 # "scheme://..." or "//...": resolving it replaces the inherited base instead of extending it.
 ABSOLUTE_BASE = re.compile(r"(?:[A-Za-z][A-Za-z0-9+.-]*:)?//")
-LIST_ARCHIVE_HOST = "lists.torproject.org"
 # HyperKitty's RSS <author> writes the archived From address with @ as U+FF20,
 # optionally followed by the display name in parentheses; only that address counts.
 HYPERKITTY_AUTHOR = re.compile(r"[^@\s()＠]+＠[^@\s()＠]+(?: \(.*\))?\Z", re.DOTALL)
-PROJECT_SENDER = re.compile(r"[a-z0-9._+-]+@torproject\.org")
-SENDER_DOMAIN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
-SENDER_ADDRESS = re.compile(rf"[a-z0-9._+-]+@({SENDER_DOMAIN.pattern})")
-_GITLAB_AUTHOR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
+_SENDER_LOCAL_RE = re.compile(r"[a-z0-9._+-]+")
 DISCOURSE_NAMESPACE = "http://www.discourse.org/"
 _DISCOURSE_FOOTER = re.compile(
     r"<p>\s*<small>\s*[0-9]+ posts? - [0-9]+ participants?\s*</small>\s*</p>\s*"
@@ -55,12 +52,10 @@ def _hyperkitty_address(author: object) -> str | None:
     return author.partition(" (")[0].replace("＠", "@")
 
 
-def _sender_authority(author: object, trusted_domains: list[str] | tuple[str, ...] = ()) -> str | None:
+def _sender_authority(author: object, trusted_domains: Iterable[str] = ()) -> str | None:
     address = _hyperkitty_address(author)
-    if address is None or not address.isascii():
-        return None
-    match = SENDER_ADDRESS.fullmatch(address.lower())
-    if match is None or len(domain := match.group(1)) > 253 or not SENDER_DOMAIN.fullmatch(domain):
+    local, _, domain = address.lower().partition("@") if address and address.isascii() else ("", "", "")
+    if not _SENDER_LOCAL_RE.fullmatch(local) or not is_valid_domain(domain):
         return None
     if domain == "torproject.org":
         return "project-sender"
@@ -71,10 +66,6 @@ def _sender_authority(author: object, trusted_domains: list[str] | tuple[str, ..
             if domain == td or domain.endswith("." + td):
                 return "trusted-operator"
     return None
-
-
-def _project_sender(author: object) -> bool:
-    return _sender_authority(author) == "project-sender"
 
 
 class CollectionError(Exception):
@@ -137,13 +128,9 @@ def make_item(
         "upstream_state": upstream_state if upstream_state in {"opened", "closed", "merged"} else "",
     }
     clean_author = plain_text(author, 100, html=False)
-    if clean_author and _GITLAB_AUTHOR_RE.fullmatch(clean_author) and ".." not in clean_author and not clean_author.endswith("."):
+    if is_valid_gitlab_user(clean_author):
         item["author"] = clean_author
-    if item["authority"] == "development":
-        if is_hackerone_item(item):
-            item["authority"] = "hackerone"
-        elif is_dirauth_item(item, dirauth_users):
-            item["authority"] = "dirauth-operator"
+    item["authority"] = effective_authority(item, dirauth_users)
     return item
 
 
@@ -158,8 +145,12 @@ def fetch_cached(client: HttpClient, url: str, state: dict):
     return client.request("GET", url, headers=headers)
 
 
-_item = make_item
-_get = fetch_cached
+def cached_result(url: str, response, state: dict, items: Iterable[dict] = (), **extra) -> dict:
+    """Build a collection result preserving validators on HTTP 304 or updating from headers."""
+    hit = response.status == 304
+    return {"items": [] if hit else list(items), "url": url,
+            "etag": state.get("etag") if hit else response.headers.get("etag"),
+            "last_modified": state.get("last_modified") if hit else response.headers.get("last-modified"), **extra}
 
 
 def _scan_feed_xml(body: bytes) -> list[str | None]:
@@ -231,7 +222,7 @@ def _feed(
 ) -> dict:
     response = fetch_cached(client, url, state)
     if response.status == 304:
-        return {"items": [], "url": url, "etag": state.get("etag"), "last_modified": state.get("last_modified")}
+        return cached_result(url, response, state)
     rss_authors = _scan_feed_xml(response.body)
     feed = feedparser.parse(response.body, sanitize_html=False, resolve_relative_uris=False)
     if not feed.get("version") or feed.get("bozo"):
@@ -244,7 +235,7 @@ def _feed(
         and len(rss_authors) == len(feed.entries) > 0
         and all(
             raw is not None
-            and [raw] == [a.get("name") for a in (entry.get("authors") or ()) if set(a) == {"name"}]
+            and entry.get("authors") == [{"name": raw}]
             and _hyperkitty_address(raw) is not None
             for raw, entry in zip(rss_authors, feed.entries)
         )
@@ -263,10 +254,25 @@ def _feed(
         updated = _entry_time(entry, "updated", published)
         if updated < cutoff:
             continue
+        alternate_href = next(
+            (
+                link_obj["href"]
+                for link_obj in (entry.get("links") or ())
+                if isinstance(link_obj, dict)
+                and link_obj.get("rel", "alternate") == "alternate"
+                and str(link_obj.get("type") if "type" in link_obj else "text/html").partition(";")[0].strip().lower()
+                in {"text/html", "application/xhtml+xml", "html", "xhtml"}
+                and isinstance(link_obj.get("href"), str)
+                and bool(link_obj["href"])
+            ),
+            None,
+        )
+        has_alternate = alternate_href is not None
         content_parts = entry.get("content") or []
         content = content_parts[0].get("value", "") if content_parts else entry.get("summary", "")
-        if discourse_feed and isinstance(content, str) and isinstance(entry.get("link"), str):
-            content = _without_discourse_footer(content, entry["link"])
+        footer_url = alternate_href or entry.get("link", "")
+        if discourse_feed and isinstance(content, str) and isinstance(footer_url, str) and footer_url:
+            content = _without_discourse_footer(content, footer_url)
         text = plain_text(content, settings["content_chars"])
         # Only an explicit text/plain title keeps its angle brackets; HTML/XHTML titles are stripped.
         title_html = (entry.get("title_detail") or {}).get("type", "text/html") != "text/plain"
@@ -280,7 +286,7 @@ def _feed(
         # link exists; an RSS guid that is not a permalink is never a citation.
         try:
             item = make_item(
-                source, entry.get("link", ""), title, text, published, updated,
+                source, alternate_href if has_alternate else entry.get("link", ""), title, text, published, updated,
                 title_html=title_html, observed=started,
             )
         except ValueError:
@@ -291,20 +297,9 @@ def _feed(
             sender_auth := _sender_authority(rss_authors[index], settings.get("trusted_operator_domains", ()))
         ) is not None:
             item["authority"] = sender_auth
-            if sender_auth in {"project-sender", "trusted-operator"} and (
-                sender_addr := _hyperkitty_address(rss_authors[index])
-            ):
-                item["sender_domain"] = sender_addr.lower().partition("@")[2]
+            item["sender_domain"] = _hyperkitty_address(rss_authors[index]).lower().partition("@")[2]
         # Some Atom archives omit alternate links and reuse an ID for distinct
         # events. Do not silently choose one event when that fallback is ambiguous.
-        has_alternate = any(
-            isinstance(link_obj, dict)
-            and link_obj.get("rel", "alternate") == "alternate"
-            and str(link_obj.get("type") if "type" in link_obj else "text/html").lower()
-            in {"text/html", "application/xhtml+xml", "html", "xhtml"}
-            and bool(link_obj.get("href"))
-            for link_obj in (entry.get("links") or ())
-        )
         fallback_key = None
         if feed.version.startswith("atom") and not has_alternate and entry.get("id"):
             fallback_key = (item["url"], item["updated_at"])
@@ -316,13 +311,7 @@ def _feed(
     skipped += len(staged) - len(items)
     # An archive feed is bounded by its newest entries, whatever order it lists them in.
     items = sorted(items, key=lambda item: item["updated_at"], reverse=True)[: source["max_items"]]
-    return {
-        "items": items,
-        "skipped": skipped,
-        "url": url,
-        "etag": response.headers.get("etag"),
-        "last_modified": response.headers.get("last-modified"),
-    }
+    return cached_result(url, response, state, items, skipped=skipped)
 
 
 def _gitlab(
@@ -356,6 +345,7 @@ def _gitlab(
         "page": "1",
     })
     items, start = [], params["updated_after"]
+    upper = parse_utc(started)
     for _ in range(min(source["max_pages"], max(1, source["max_items"] // page_size))):
         request_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(params), ""))
         # A failed request keeps the rows already read, and a later run resumes where it began.
@@ -366,6 +356,17 @@ def _gitlab(
             raise CollectionError(str(exc), items, resume) from exc
         if not isinstance(records, list) or any(not isinstance(r, dict) for r in records) or len(records) > page_size:
             raise CollectionError("GitLab returned an unexpected response", items, resume)
+        stamps = []
+        if records:
+            try:
+                stamps = [parse_utc(r.get("updated_at")) for r in records]
+                floor = parse_utc(params["updated_after"])
+            except (TypeError, ValueError):
+                raise CollectionError("GitLab returned an invalid timestamp", items, resume) from None
+            if stamps[0] < floor or any(b < a for a, b in zip(stamps, stamps[1:])):
+                raise CollectionError("GitLab returned out-of-order timestamps", items, resume)
+            if stamps[-1] > upper:
+                raise CollectionError("GitLab returned an out-of-range timestamp", items, resume)
         for record in records:
             if source["kind"] == "gitlab_mr" and record.get("state") != "merged":
                 continue
@@ -404,13 +405,9 @@ def _gitlab(
                 items.append(item)
         if len(records) < page_size:
             return {"items": items, "url": url, "watermark": after(-settings["overlap_seconds"], started)}
-        last = records[-1].get("updated_at")
-        try:
-            moved = parse_utc(last) > parse_utc(params["updated_after"])
-        except (TypeError, ValueError):
-            raise CollectionError("GitLab returned an invalid timestamp", items, resume) from None
+        moved = stamps[-1] > floor
         # A full page that shares one timestamp is a tie group: step through it by page.
-        params.update({"updated_after": last, "page": "1"} if moved else {"page": str(int(params["page"]) + 1)})
+        params.update({"updated_after": records[-1]["updated_at"], "page": "1"} if moved else {"page": str(int(params["page"]) + 1)})
     if params["page"] != "1" and params["updated_after"] == start:
         # The whole budget stayed inside one timestamp, so the next run would restart
         # this tie at page 1 forever: skip the rest of it (GitLab dates carry milliseconds).
@@ -424,7 +421,7 @@ def collect_source(
     client: HttpClient, source: dict, state: dict, settings: dict, started: str
 ) -> dict:
     """Collect items from a source URL or its fallbacks within configured bounds."""
-    errors: list[str] = []
+    last_error = ""
     partial: list[dict] = []
     watermark = None
     catching_up = False
@@ -437,20 +434,17 @@ def collect_source(
                 return collect_timeline(client, source, url, state, settings, started)
             return _gitlab(client, source, url, state, settings, started)
         except CollectionError as exc:
-            errors.append(str(exc))
+            last_error = str(exc)
             partial.extend(exc.items)
             if exc.watermark:
                 watermark = exc.watermark
             catching_up = exc.catching_up
-            if exc.catching_up:
+            if exc.catching_up or getattr(client, "deadline_reached", False):
                 # Another mirror cannot make this bounded scan finish faster.
                 break
         except FetchError as exc:
             # Transport error strings are sanitized; do not expose request headers/body.
-            errors.append(str(exc))
-    raise CollectionError(
-        errors[-1] if errors else "All source endpoints failed",
-        partial,
-        watermark,
-        catching_up=catching_up,
-    )
+            last_error = str(exc)
+            if getattr(client, "deadline_reached", False):
+                break
+    raise CollectionError(last_error, partial, watermark, catching_up=catching_up)

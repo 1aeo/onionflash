@@ -9,43 +9,38 @@ import sqlite3
 import pytest
 
 from helpers import (
-    DAMAGE, DATE, LATER, Reviewer, Writer, analysis, approve as seed_receipt, config, damaged,
-    finish_reviewed, item, job, pending, run_gate, seed_legacy, seed_story, update_analysis, verdict,
+    DAMAGE, DATE, LATER, Reviewer, Writer, analysis, damaged, editorial_act, insert_approval as seed_receipt,
+    invoke_cli, item, item_row, job, job_record, make_config, patch_job, pending, run_gate, saved_audit, seed_legacy,
+    seed_story, update_analysis, verdict, write_toml,
 )
 from onionflash import cli, decisions, editorial, rejection, review_gate
 from onionflash.analyze import AnalysisError, tag_notice
 from onionflash.candidate import ReviewRequired, StaleCandidate
 from onionflash.store import Store
+from onionflash.util import DIRAUTH_GITLAB_USERS
 
 AFTER_SHOW = "2026-11-10T15:30:00Z"
 _TAG_ITEM = item(kind="tag", title="tor-0.4.9.5", content="",
                  url="https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-0.4.9.5")
 
 
-def hold_news_dispute(cfg, store, incoming=None, draft=None):
+def _hold_news_dispute(cfg, store, incoming=None, draft=None):
     row = pending(store, incoming)
     is_update = isinstance(draft, dict) and "update" in draft
     report = run_gate(
-        cfg, store, row, Writer(draft) if draft else Writer(),
+        cfg, store, row, Writer(draft),
         Reviewer(verdict(update=is_update), verdict("hold", criterion="news_value", update=is_update)),
     )
     assert report["status"] == "held"
     return row
 
 
-def dump_sql(store) -> list[str]:
+def _dump_sql(store) -> list[str]:
     return list(store.db.iterdump())
 
 
-def patched_verdict(action="hold", criterion="news_value", **criteria_updates):
-    reply = verdict(action, criterion=criterion)
-    for name, fields in criteria_updates.items():
-        reply["criteria"][name].update(fields)
-    return reply
-
-
-def assert_unapprovable(cfg, store, item_id: str, expected_reason: str):
-    before = dump_sql(store)
+def _assert_unapprovable(cfg, store, item_id: str, expected_reason: str):
+    before = _dump_sql(store)
     shown = rejection.show_item(store, item_id, config=cfg)
     if shown["final_review"] is not None and "approval" in shown["final_review"]:
         info = shown["final_review"]["approval"]
@@ -55,12 +50,13 @@ def assert_unapprovable(cfg, store, item_id: str, expected_reason: str):
     assert expected_reason in info["reason"]
     with pytest.raises(ValueError, match=re.escape(expected_reason)):
         rejection.approve_item(cfg, store, item_id, "a" * 64, "Attempt override", observed=AFTER_SHOW)
-    assert dump_sql(store) == before
+    assert _dump_sql(store) == before
 
 
 def test_a_held_news_judgment_publishes_exactly_as_reviewed_without_model_calls(context):
+    """Publish a verified news-value hold directly via `approve_item` without extra LLM calls."""
     cfg, store = context
-    row = hold_news_dispute(cfg, store)
+    row = _hold_news_dispute(cfg, store)
     shown = rejection.show_item(store, row["id"], config=cfg)
     info = shown["final_review"]["approval"]
     assert info["eligible"] is True and info["reason"] is None
@@ -87,11 +83,11 @@ def test_a_held_news_judgment_publishes_exactly_as_reviewed_without_model_calls(
         "published", story["id"], None
     )
 
-    audit_row = store.db.execute(
-        "SELECT cache_key,review_record FROM analyses WHERE source_item_id=? ORDER BY rowid DESC LIMIT 1", (row["id"],),
-    ).fetchone()
-    assert audit_row["cache_key"] == result["analysis_key"]
-    audit = json.loads(audit_row["review_record"])
+    cache_key_val = store.db.execute(
+        "SELECT cache_key FROM analyses WHERE source_item_id=? ORDER BY rowid DESC LIMIT 1", (row["id"],),
+    ).fetchone()[0]
+    assert cache_key_val == result["analysis_key"]
+    audit = saved_audit(store, row["id"])
     assert audit["outcome"] == "operator_approved"
     assert [entry["stage"] for entry in audit["reviews"]] == ["review", "verification"]
     assert audit["operator_approval"] == {
@@ -115,17 +111,20 @@ def test_a_held_news_judgment_publishes_exactly_as_reviewed_without_model_calls(
             assert b"Concrete development worth publishing" not in path.read_bytes()
 
 
-@pytest.mark.parametrize("case,src,replies,expected_title,expected_failures", [
+@pytest.mark.parametrize("case,src,replies,expected_patch,expected_failures", [
     ("repaired", {}, [verdict("revise", criterion="actor_and_action", repair={"title": "Repaired release report"}),
-                      verdict("hold", criterion="news_value")], "Repaired release report", ["verification:news_value"]),
+                      verdict("hold", criterion="news_value")], {"title": "Repaired release report"}, ["verification:news_value"]),
+    ("source_repaired", {}, [verdict("revise", criterion="source_support", repair={"summary": "Supported summary."}),
+                             verdict("hold", criterion="news_value")], {"summary": "Supported summary."}, ["verification:news_value"]),
     ("mirror", {}, [verdict("revise", criterion="news_value", repair={"title": "Mirror repaired report"}), verdict()],
-     "Mirror repaired report", ["review:news_value"]),
+     {"title": "Mirror repaired report"}, ["review:news_value"]),
     ("official", {"authority": "official"}, [verdict("skip", criterion="news_value"), verdict("skip", criterion="news_value")],
-     None, ["review:news_value", "verification:news_value"]),
+     {}, ["review:news_value", "verification:news_value"]),
 ])
 def test_verified_repair_mirror_official_and_repeat_holds_publish_exact_reviewed_text(
-    context, case, src, replies, expected_title, expected_failures,
+    context, case, src, replies, expected_patch, expected_failures,
 ):
+    """Allow operator approval across verified repairs, mirror holds, official skips, and repeat holds."""
     cfg, store = context
     row = pending(store, item(**src) if src else None)
     run_gate(cfg, store, row, Writer(), Reviewer(*replies))
@@ -137,21 +136,29 @@ def test_verified_repair_mirror_official_and_repeat_holds_publish_exact_reviewed
     shown = rejection.show_item(store, row["id"], config=cfg)["final_review"]
     if case == "official":
         assert shown["hold_code"] == "repeat_hold"
-    if expected_title:
-        assert shown["candidate"]["title"] == expected_title != shown["base_candidate"]["title"]
+    for field, value in expected_patch.items():
+        assert shown["candidate"][field] == value != shown["base_candidate"][field]
     info = shown["approval"]
     assert info["eligible"] is True and info["editorial_failures"] == expected_failures
     rejection.approve_item(cfg, store, row["id"], info["hash"], f"{case} dispute resolved")
-    assert len(store.stories()) == 1 and (not expected_title or store.stories()[0]["title"] == expected_title)
+    assert len(store.stories()) == 1
+    for field, value in expected_patch.items():
+        assert store.stories()[0][field] == value
 
 
 @pytest.mark.parametrize("incoming,draft,replies,expected_reason", [
     pytest.param(None, None, [verdict("hold", criterion="news_value")], "No fresh verification reviewed this exact text", id="first_review_hold"),
     pytest.param(None, None, [verdict(), verdict("hold", criterion="status")], "A review failed status; dismiss or retry it", id="verify_status_fail"),
-    pytest.param(None, None, [verdict(), patched_verdict(source_support={"outcome": "fail"})], "A review failed source_support; dismiss or retry it", id="verify_source_and_news_fail"),
-    pytest.param(None, None, [verdict(), patched_verdict(technical_details={"outcome": "insufficient"})], "A review failed technical_details; dismiss or retry it", id="verify_insufficient_fact"),
-    pytest.param(None, None, [verdict(), patched_verdict(source_support={"source_refs": []})], "No fresh verification with cited sources approved the facts", id="empty_source_refs_verify"),
-    pytest.param(item(authority="official"), None, [patched_verdict("skip", "news_value", source_support={"source_refs": []}), verdict("skip", criterion="news_value")],
+    pytest.param(None, None, [verdict(), verdict("hold", criterion="source_support")], "A review failed source_support; dismiss or retry it", id="verify_source_support_fail"),
+    pytest.param(None, None, [verdict(), verdict("hold", criterion="news_value", criteria={"source_support": {"outcome": "fail"}})],
+                 "A review failed source_support; dismiss or retry it", id="verify_source_and_news_fail"),
+    pytest.param(None, None, [verdict(), verdict("hold", criterion="news_value", criteria={"technical_details": {"outcome": "insufficient"}})],
+                 "A review failed technical_details; dismiss or retry it", id="verify_insufficient_fact"),
+    pytest.param(None, None, [verdict(), verdict("hold", criterion="news_value", criteria={"source_support": {"source_refs": []}})],
+                 "No fresh verification with cited sources approved the facts", id="empty_source_refs_verify"),
+    pytest.param(item(authority="official"), None,
+                 [verdict("skip", criterion="news_value", criteria={"source_support": {"source_refs": []}}),
+                  verdict("skip", criterion="news_value")],
                  "No fresh verification with cited sources approved the facts", id="empty_source_refs_base"),
     pytest.param(None, None, [verdict(), verdict("hold", criterion="new_information")], "A review failed new_information (already covered); dismiss it", id="verify_new_information_fail"),
     pytest.param(None, None, [verdict("revise", criterion="new_information", repair={"title": "Edited duplicate"}), verdict()],
@@ -173,70 +180,47 @@ def test_verified_repair_mirror_official_and_repeat_holds_publish_exact_reviewed
                  [verdict(), verdict("hold", criterion="news_value")], "the headline drops the sources' doubt about a compromise", id="final_hold_compromise_headline"),
 ])
 def test_unverified_or_fact_failed_holds_cannot_be_approved(context, incoming, draft, replies, expected_reason):
+    """Refuse operator approval when facts lack fresh verification, fail factual criteria, or trip final holds."""
     cfg, store = context
     row = pending(store, incoming)
-    run_gate(cfg, store, row, Writer(draft) if draft else Writer(), Reviewer(*replies))
-    assert_unapprovable(cfg, store, row["id"], expected_reason)
+    run_gate(cfg, store, row, Writer(draft), Reviewer(*replies))
+    _assert_unapprovable(cfg, store, row["id"], expected_reason)
 
 
-def _setup_missing_sources_gate_hold(cfg, store):
-    seeded, _ = seed_legacy(store, incoming=item(url="https://example.org/release", title="Tor 0.4.9.5 released"))
-    with store.db:
-        store.db.execute("DELETE FROM items WHERE url=?", (seeded["url"],))
-    row = pending(store, item(url="https://example.org/followup", title="Tor 0.4.9.5 released",
-                              content="Follow-up details on Tor 0.4.9.5."))
-    assert run_gate(cfg, store, row, Writer(update_analysis(evidence=["Follow-up details on Tor 0.4.9.5."])),
-                    Reviewer())["status"] == "held"
-    return row["id"]
-
-
-def _setup_missing_retained_source(cfg, store):
-    seed_row = pending(store, item(url="https://example.org/release", title="Tor 0.4.9.5 released"), at=DATE, ready=LATER)
-    finish_reviewed(store, seed_row, analysis(title="Tor 0.4.9.5 released"), "seed", DATE)
+def _setup_missing_source(cfg, store, *, after_hold):
+    release = item(url="https://example.org/release", title="Tor 0.4.9.5 released")
     followup = item(url="https://example.org/followup", title="Tor 0.4.9.5 released",
                     content="Follow-up details on Tor 0.4.9.5.")
-    row = hold_news_dispute(cfg, store, incoming=followup,
-                            draft=update_analysis(evidence=["Follow-up details on Tor 0.4.9.5."]))
+    draft = update_analysis(evidence=["Follow-up details on Tor 0.4.9.5."])
+    if after_hold:
+        seeded_id = seed_story(store, release, analysis(title=release["title"]), key="seed", at=DATE)["editorial_item"]
+        row = _hold_news_dispute(cfg, store, incoming=followup, draft=draft)
+        with store.db:
+            store.db.execute("DELETE FROM items WHERE id=?", (seeded_id,))
+            store.db.execute("UPDATE analyses SET source_payload=NULL WHERE source_item_id=?", (seeded_id,))
+        return row["id"]
+    seeded, _ = seed_legacy(store, incoming=release)
     with store.db:
-        store.db.execute("DELETE FROM items WHERE id=?", (seed_row["id"],))
-        store.db.execute("UPDATE analyses SET source_payload=NULL WHERE source_item_id=?", (seed_row["id"],))
+        store.db.execute("DELETE FROM items WHERE url=?", (seeded["url"],))
+    row = pending(store, followup)
+    assert run_gate(cfg, store, row, Writer(draft), Reviewer())["status"] == "held"
     return row["id"]
 
 
-def _setup_legacy_pre_bump_issues(cfg, store):
-    row = hold_news_dispute(cfg, store)
-    legacy = json.loads(job(store, row["id"])["record_json"])
-    legacy["policy_hash"] = "0" * 64
-    for entry in legacy["reviews"]:
-        entry["policy_hash"] = "0" * 64
-        entry["result"]["issues"] = ["legacy field"]
-    with store.db:
-        store.db.execute("UPDATE review_jobs SET policy_hash=?,record_json=? WHERE item_id=?",
-                         ("0" * 64, json.dumps(legacy), row["id"]))
-    return row["id"]
-
-
-@pytest.mark.parametrize(
-    "setup_fn,expected_reason",
-    [
-        pytest.param(_setup_missing_sources_gate_hold, "required source material is unavailable",
-                     id="missing_sources_gate_hold"),
-        pytest.param(_setup_missing_retained_source, "required source material is unavailable",
-                     id="missing_retained_source"),
-        pytest.param(_setup_legacy_pre_bump_issues, "An earlier review policy or packet reviewed it; retry it",
-                     id="legacy_pre_bump_issues"),
-    ],
-)
-def test_missing_source_and_legacy_policy_holds_cannot_be_approved(context, setup_fn, expected_reason):
+@pytest.mark.parametrize("after_hold", [False, True])
+def test_missing_source_and_legacy_policy_holds_cannot_be_approved(context, after_hold):
+    """Refuse approval when required sources are missing before or after holding."""
     cfg, store = context
-    assert_unapprovable(cfg, store, setup_fn(cfg, store), expected_reason)
+    _assert_unapprovable(cfg, store, _setup_missing_source(cfg, store, after_hold=after_hold),
+                         "required source material is unavailable")
 
 
 @pytest.mark.parametrize("state", ["strike_rejected", "ignored", "dismissed", "pending"])
 def test_non_held_items_cannot_be_approved(context, state):
+    """Refuse approval for strike-rejected, ignored, dismissed, or still-pending items."""
     cfg, store = context
     if state == "dismissed":
-        row = hold_news_dispute(cfg, store)
+        row = _hold_news_dispute(cfg, store)
         rejection.dismiss_item(store, row["id"], row["content_hash"], "Not news", observed=LATER)
     else:
         row = pending(store)
@@ -247,109 +231,102 @@ def test_non_held_items_cannot_be_approved(context, state):
                 store.defer(row["id"], "Invalid review", cfg["llm"], LATER, terminal=True)
         elif state == "ignored":
             run_gate(cfg, store, row, Writer(), Reviewer(verdict("skip", criterion="news_value")))
-    assert_unapprovable(cfg, store, row["id"], "Only a held final review can be approved")
+    _assert_unapprovable(cfg, store, row["id"], "Only a held final review can be approved")
 
 
-def test_the_approval_binds_inspected_text_coverage_story_lock_and_policy(tmp_path):
-    cfg = config(tmp_path / "coverage")
-    with Store(cfg["storage"]["database"]) as store:
-        existing = seed_story(store, item(url="https://example.org/existing", title="Existing coverage",
-                                          content="Distinct existing story body. " * 4),
-                              analysis(title="Existing coverage", evidence=["Distinct existing story body."]),
-                              key="seed1", at=DATE)
-        row = hold_news_dispute(cfg, store,
-                                incoming=item(url="https://example.org/held", content="Held candidate distinct body. " * 4),
-                                draft=analysis(title="Held story", evidence=["Held candidate distinct body."]))
-        first_hash = rejection.show_item(store, row["id"], config=cfg)["final_review"]["approval"]["hash"]
+def test_approval_binds_inspected_new_coverage(context):
+    """Invalidate `approval_hash` when existing or new stories publish until re-inspected."""
+    cfg, store = context
+    existing = seed_story(store, item(url="https://example.org/existing", title="Existing coverage",
+                                      content="Distinct existing story body. " * 4),
+                          analysis(title="Existing coverage", evidence=["Distinct existing story body."]),
+                          key="seed1", at=DATE)
+    row = _hold_news_dispute(cfg, store,
+                             incoming=item(url="https://example.org/held", content="Held candidate distinct body. " * 4),
+                             draft=analysis(title="Held story", evidence=["Held candidate distinct body."]))
+    first_hash = rejection.show_item(store, row["id"], config=cfg)["final_review"]["approval"]["hash"]
 
-        seed_story(store, item(url="https://example.org/existing", title="Existing coverage",
-                               content="Distinct existing story body with follow-up. " * 4,
-                               updated_at="2026-11-10T13:00:00Z"),
-                   analysis(title="Existing coverage updated",
-                            evidence=["Distinct existing story body with follow-up."]),
-                   key="seed2", at="2026-11-10T13:00:00Z")
-        with pytest.raises(ValueError, match="Approval hash does not match"):
-            rejection.approve_item(cfg, store, row["id"], first_hash, "Stale coverage", observed=AFTER_SHOW)
+    seed_story(store, item(url="https://example.org/existing", title="Existing coverage",
+                           content="Distinct existing story body with follow-up. " * 4,
+                           updated_at="2026-11-10T13:00:00Z"),
+               analysis(title="Existing coverage updated",
+                        evidence=["Distinct existing story body with follow-up."]),
+               key="seed2", at="2026-11-10T13:00:00Z")
+    with pytest.raises(ValueError, match="Approval hash does not match"):
+        rejection.approve_item(cfg, store, row["id"], first_hash, "Stale coverage", observed=AFTER_SHOW)
 
-        reshown = rejection.show_item(store, row["id"], config=cfg)["final_review"]["approval"]
-        assert reshown["eligible"] is True and [entry["id"] for entry in reshown["new_coverage"]] == [existing["id"]]
+    reshown = rejection.show_item(store, row["id"], config=cfg)["final_review"]["approval"]
+    assert reshown["eligible"] is True and [entry["id"] for entry in reshown["new_coverage"]] == [existing["id"]]
 
-        seed_story(store, item(url="https://example.org/other", title="Other story",
-                               content="Completely separate announcement text. " * 4),
-                   analysis(title="Other story", evidence=["Completely separate announcement text."]),
-                   key="seed3", at="2026-11-10T14:00:00Z")
-        with pytest.raises(ValueError, match="Approval hash does not match"):
-            rejection.approve_item(cfg, store, row["id"], reshown["hash"], "Stale again", observed=AFTER_SHOW)
+    seed_story(store, item(url="https://example.org/other", title="Other story",
+                           content="Completely separate announcement text. " * 4),
+               analysis(title="Other story", evidence=["Completely separate announcement text."]),
+               key="seed3", at="2026-11-10T14:00:00Z")
+    with pytest.raises(ValueError, match="Approval hash does not match"):
+        rejection.approve_item(cfg, store, row["id"], reshown["hash"], "Stale again", observed=AFTER_SHOW)
 
-        third = rejection.show_item(store, row["id"], config=cfg)["final_review"]["approval"]
-        assert len(third["new_coverage"]) == 2
-        assert rejection.approve_item(cfg, store, row["id"], third["hash"], "Checked new coverage",
-                                      observed=AFTER_SHOW)["status"] == "published"
+    third = rejection.show_item(store, row["id"], config=cfg)["final_review"]["approval"]
+    assert len(third["new_coverage"]) == 2
+    assert rejection.approve_item(cfg, store, row["id"], third["hash"], "Checked new coverage",
+                                  observed=AFTER_SHOW)["status"] == "published"
 
-    cfg = config(tmp_path / "prior_unlocked")
-    with Store(cfg["storage"]["database"]) as store:
-        shared_body = "Shared cluster body for grouped story updates. " * 4
-        seed_story(store, item(url="https://example.org/s1", content=shared_body),
-                   analysis(evidence=["Shared cluster body for grouped story updates."]), key="s1", at=DATE)
-        held_row = hold_news_dispute(cfg, store,
-                                     incoming=item(url="https://example.org/s2", content=shared_body,
-                                                   updated_at="2026-11-10T01:00:00Z"),
-                                     draft=analysis(title="Held update",
-                                                    evidence=["Shared cluster body for grouped story updates."]))
-        old_hash = rejection.show_item(store, held_row["id"], config=cfg)["final_review"]["approval"]["hash"]
+
+@pytest.mark.parametrize("locked,expected_err", [
+    (False, "Its story or sources changed since the review; retry it"),
+    (True, "Its story is editorially locked"),
+])
+def test_approval_refuses_changed_or_locked_prior_story(context, locked, expected_err):
+    """Refuse approval when the target story updates concurrently or becomes editorially locked."""
+    cfg, store = context
+    sentence = "Shared cluster body for testing grouped updates."
+    shared_body = (sentence + " ") * 4
+    seeded = seed_story(store, item(url="https://example.org/s1", content=shared_body),
+                        analysis(evidence=[sentence]), key="s1", at=DATE)
+    held_row = _hold_news_dispute(
+        cfg, store,
+        incoming=item(url="https://example.org/s2", content=shared_body, updated_at="2026-11-10T01:00:00Z"),
+        draft=analysis(title="Held update", evidence=[sentence]),
+    )
+    old_hash = rejection.show_item(store, held_row["id"], config=cfg)["final_review"]["approval"]["hash"]
+    if locked:
+        editorial_act(editorial.correct, store, seeded["id"], {"title": "Corrected title"}, reason="Manual fix")
+    else:
         seed_story(store, item(url="https://example.org/s3", content=shared_body, updated_at="2026-11-10T02:00:00Z"),
-                   analysis(title="Concurrent update", evidence=["Shared cluster body for grouped story updates."]),
-                   key="s3", at="2026-11-10T02:00:00Z")
-        with pytest.raises(ValueError, match="Its story or sources changed since the review; retry it"):
-            rejection.approve_item(cfg, store, held_row["id"], old_hash, "Stale prior", observed=AFTER_SHOW)
+                   analysis(title="Concurrent update", evidence=[sentence]), key="s3", at="2026-11-10T02:00:00Z")
+    with pytest.raises(ValueError, match=expected_err):
+        rejection.approve_item(cfg, store, held_row["id"], old_hash, "Stale story", observed=AFTER_SHOW)
 
-    cfg = config(tmp_path / "locked")
-    with Store(cfg["storage"]["database"]) as store:
-        shared_body = "Locked story cluster body for testing grouped updates. " * 4
-        seeded = seed_story(store, item(url="https://example.org/l1", content=shared_body),
-                            analysis(evidence=["Locked story cluster body for testing grouped updates."]),
-                            key="l1", at=DATE)
-        held_row = hold_news_dispute(cfg, store,
-                                     incoming=item(url="https://example.org/l2", content=shared_body,
-                                                   updated_at="2026-11-10T01:00:00Z"),
-                                     draft=analysis(title="Held update",
-                                                    evidence=["Locked story cluster body for testing grouped updates."]))
-        old_hash = rejection.show_item(store, held_row["id"], config=cfg)["final_review"]["approval"]["hash"]
-        editorial.correct(store.db, seeded["id"], {"title": "Corrected title"}, reason="Manual fix",
-                          expect_hash=editorial.show(store.db, seeded["id"])["hash"])
-        with pytest.raises(ValueError, match="Its story is editorially locked"):
-            rejection.approve_item(cfg, store, held_row["id"], old_hash, "Locked story", observed=AFTER_SHOW)
 
-    cfg = config(tmp_path / "policy_and_retry")
-    with Store(cfg["storage"]["database"]) as store:
-        row = hold_news_dispute(cfg, store)
-        old_hash = rejection.show_item(store, row["id"], config=cfg)["final_review"]["approval"]["hash"]
-        changed_cfg = {**copy.deepcopy(cfg), "review": {**cfg["review"], "model": "other-reviewer-model"}}
-        with pytest.raises(ValueError, match="An earlier review policy or packet reviewed it; retry it"):
-            rejection.approve_item(changed_cfg, store, row["id"], old_hash, "Changed model", observed=AFTER_SHOW)
-        with pytest.raises(ValueError, match="64-character lowercase hexadecimal"):
-            rejection.approve_item(cfg, store, row["id"], "not-a-hash", "Bad format", observed=AFTER_SHOW)
-        with pytest.raises(ValueError, match="Approval hash does not match"):
-            rejection.approve_item(cfg, store, row["id"], "0" * 64, "Wrong hash", observed=AFTER_SHOW)
+def test_approval_binds_policy_hash_format_and_retried_review(context):
+    """Bind `approve_item` to review policy, 64-hex hash format, and current review run."""
+    cfg, store = context
+    row = _hold_news_dispute(cfg, store)
+    old_hash = rejection.show_item(store, row["id"], config=cfg)["final_review"]["approval"]["hash"]
+    changed_cfg = {**copy.deepcopy(cfg), "review": {**cfg["review"], "model": "other-reviewer-model"}}
+    with pytest.raises(ValueError, match="An earlier review policy or packet reviewed it; retry it"):
+        rejection.approve_item(changed_cfg, store, row["id"], old_hash, "Changed model", observed=AFTER_SHOW)
+    with pytest.raises(ValueError, match="64-character lowercase hexadecimal"):
+        rejection.approve_item(cfg, store, row["id"], "not-a-hash", "Bad format", observed=AFTER_SHOW)
+    with pytest.raises(ValueError, match="Approval hash does not match"):
+        rejection.approve_item(cfg, store, row["id"], "0" * 64, "Wrong hash", observed=AFTER_SHOW)
 
-        rejection.retry_item(store, row["id"], row["content_hash"], "Retry review", observed=LATER)
-        later_verdict = patched_verdict(news_value={"reason": "Different review wording after retry."})
-        run_gate(cfg, store, store.pending(1, LATER)[0], Writer(), Reviewer(verdict(), later_verdict))
-        with pytest.raises(ValueError, match="Approval hash does not match"):
-            rejection.approve_item(cfg, store, row["id"], old_hash, "Voided hash", observed=AFTER_SHOW)
+    rejection.retry_item(store, row["id"], row["content_hash"], "Retry review", observed=LATER)
+    later_verdict = verdict("hold", criterion="news_value", reason="Different review wording after retry.")
+    run_gate(cfg, store, store.pending(1, LATER)[0], Writer(), Reviewer(verdict(), later_verdict))
+    with pytest.raises(ValueError, match="Approval hash does not match"):
+        rejection.approve_item(cfg, store, row["id"], old_hash, "Voided hash", observed=AFTER_SHOW)
 
 
 def test_commit_candidate_guards_and_untouched_receipts(context):
+    """Require `operator=True` and valid `operator_approval` metadata without touching `review_approvals`."""
     cfg, store = context
     other_row = pending(store, item(url="https://example.org/other", content="Unrelated receipt item body. " * 4))
     seed_receipt(store, store.prepare_candidate(other_row, analysis(evidence=["Unrelated receipt item body."]), DATE))
     receipts_before = store.db.execute("SELECT * FROM review_approvals").fetchall()
     assert len(receipts_before) == 1
 
-    row = hold_news_dispute(cfg, store)
-    prepared = store.prepare_candidate(
-        dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()), analysis(), DATE,
-    )
+    row = _hold_news_dispute(cfg, store)
+    prepared = store.prepare_candidate(item_row(store, row), analysis(), DATE)
     fake_audit = {
         "outcome": "operator_approved",
         "operator_approval": {"reason": "Attempt bypass", "approved_at": AFTER_SHOW, "approval_hash": "a" * 64, "new_coverage": []},
@@ -370,28 +347,29 @@ def test_commit_candidate_guards_and_untouched_receipts(context):
 
 
 def test_a_failed_write_rolls_back_the_entire_approval(context):
+    """Roll back story creation and review-job deletion if logging `operator.approved` fails."""
     cfg, store = context
-    row = hold_news_dispute(cfg, store)
+    row = _hold_news_dispute(cfg, store)
     approval_hash = rejection.show_item(store, row["id"], config=cfg)["final_review"]["approval"]["hash"]
     store.db.execute(
         "CREATE TRIGGER fail_operator_decision BEFORE INSERT ON decision_log "
         "WHEN NEW.code='operator.approved' BEGIN SELECT RAISE(ABORT, 'simulated failure'); END"
     )
-    before = dump_sql(store)
+    before = _dump_sql(store)
     with pytest.raises(sqlite3.IntegrityError, match="simulated failure"):
         rejection.approve_item(cfg, store, row["id"], approval_hash, "Should roll back", observed=AFTER_SHOW)
-    assert dump_sql(store) == before
+    assert _dump_sql(store) == before
     assert store.stories() == [] and job(store)["stage"] == "held"
 
 
 def test_later_source_change_reviews_normally_and_clears_held_updates_summary(context):
+    """Process subsequent source revisions normally after operator approval and clear `held_updates`."""
     cfg, store = context
-    row = hold_news_dispute(cfg, store)
+    row = _hold_news_dispute(cfg, store)
     approval_hash = rejection.show_item(store, row["id"], config=cfg)["final_review"]["approval"]["hash"]
     story_id = rejection.approve_item(cfg, store, row["id"], approval_hash, "Initial approval", observed=LATER)["story_id"]
 
-    locked = editorial.correct(store.db, story_id, {"summary": "Corrected summary."}, reason="Fix wording",
-                               expect_hash=editorial.show(store.db, story_id)["hash"])
+    editorial_act(editorial.correct, store, story_id, {"summary": "Corrected summary."}, reason="Fix wording")
     assert store.ingest(item(content="Second upstream revision after approval. " * 4, updated_at="2026-11-10T13:00:00Z"),
                         "2026-11-10T13:00:00Z") is True
     writer2 = Writer(analysis(evidence=["Second upstream revision after approval."]))
@@ -401,7 +379,7 @@ def test_later_source_change_reviews_normally_and_clears_held_updates_summary(co
         {"story_id": story_id, "held_updates": 1, "locked": True}
     ]
 
-    editorial.unlock(store.db, story_id, reason="Resume updates", expect_hash=locked["hash"])
+    editorial_act(editorial.unlock, store, story_id, reason="Resume updates")
     assert store.ingest(item(content="Third upstream revision disputed on news value. " * 4, updated_at="2026-11-10T14:00:00Z"),
                         "2026-11-10T14:00:00Z") is True
     writer3 = Writer(update_analysis(update="Third revision update.",
@@ -423,33 +401,19 @@ def test_later_source_change_reviews_normally_and_clears_held_updates_summary(co
     {"record_json": '{"reviews": [], "policy_hash": "x", "prepared": {"coverage": "bad"}}'}, {"writer_key": ""},
 ])
 def test_show_with_approval_stays_read_only_and_survives_damaged_records(context, mutator):
+    """Keep `show_item(..., config=cfg)` read-only and report ineligible reasons on damaged records."""
     cfg, store = context
-    row = hold_news_dispute(cfg, store)
+    row = _hold_news_dispute(cfg, store)
     if mutator is not None:
         column, value = next(iter(mutator.items()))
         if column == "damage":
             column, value = "record_json", damaged(job(store, row["id"])["record_json"], value)
         with store.db:
             store.db.execute(f"UPDATE review_jobs SET {column}=? WHERE item_id=?", (value, row["id"]))
-    before = dump_sql(store)
+    before = _dump_sql(store)
     info = rejection.show_item(store, row["id"], config=cfg)["final_review"]["approval"]
-    assert dump_sql(store) == before
+    assert _dump_sql(store) == before
     assert info["eligible"] is (mutator is None) and (mutator is None or (isinstance(info["reason"], str) and bool(info["reason"])))
-
-
-@pytest.mark.parametrize("draft_overrides,responses,expected_eligible", [
-    ({}, [verdict("revise", criterion="source_support", repair={"summary": "Supported summary."}), verdict("hold", criterion="news_value")], True),
-    ({}, [verdict("revise", criterion="news_value", repair={"title": "Qualified report"}), verdict()], True),
-    ({}, [verdict(), verdict("hold", criterion="status")], False),
-    ({}, [verdict(), verdict("hold", criterion="source_support")], False),
-    ({"category": "release", "state": "merged", "tags": ["tor", "release"]},
-     [verdict("revise", criterion="actor_and_action", repair={"summary": "Merged branch."}), verdict("hold", criterion="news_value")], False),
-])
-def test_deterministic_replay_of_saved_dispute_shapes(context, draft_overrides, responses, expected_eligible):
-    cfg, store = context
-    row = pending(store)
-    assert run_gate(cfg, store, row, Writer(analysis(**draft_overrides)), Reviewer(*responses))["status"] == "held"
-    assert rejection.show_item(store, row["id"], config=cfg)["final_review"]["approval"]["eligible"] is expected_eligible
 
 
 @pytest.mark.parametrize("mirror,mutate,expected_reason", [
@@ -458,8 +422,16 @@ def test_deterministic_replay_of_saved_dispute_shapes(context, draft_overrides, 
     (False, lambda env, rec: env["binding"].update(prior_story="0" * 64), "Its story or sources changed since the review; retry it"),
     (False, lambda env, rec: rec.update(verified_facts=False), "No fresh verification with cited sources approved the facts; retry or dismiss it"),
     (True, lambda env, rec: rec.update(candidate=copy.deepcopy(rec["prepared"]["candidate"])), "No fresh verification reviewed this exact text"),
+    pytest.param(
+        False,
+        lambda _env, rec: (rec.update(policy_hash="0" * 64),
+                           [e.update(policy_hash="0" * 64) or e["result"].update(issues=["legacy field"]) for e in rec["reviews"]]),
+        "An earlier review policy or packet reviewed it; retry it",
+        id="legacy_pre_bump_issues",
+    ),
 ])
 def test_single_field_record_and_binding_tampering_refuses(context, mirror, mutate, expected_reason):
+    """Reject tampered policy, source, binding, `verified_facts`, or unverified candidate fields."""
     cfg, store = context
     if mirror:
         row = pending(store)
@@ -467,24 +439,22 @@ def test_single_field_record_and_binding_tampering_refuses(context, mirror, muta
             verdict("revise", criterion="news_value", repair={"title": "Repaired title"}), verdict(),
         ))["status"] == "held"
     else:
-        row = hold_news_dispute(cfg, store)
+        row = _hold_news_dispute(cfg, store)
     saved = job(store, row["id"])
     envelope, record = json.loads(saved["envelope_json"]), json.loads(saved["record_json"])
     mutate(envelope, record)
-    with store.db:
-        store.db.execute("UPDATE review_jobs SET envelope_json=?,record_json=? WHERE item_id=?",
-                         (json.dumps(envelope), json.dumps(record), row["id"]))
-    info = review_gate.approval(cfg, store, row["id"])
-    assert info["eligible"] is False and expected_reason in info["reason"]
+    patch_job(store, row, policy_hash=record["policy_hash"], envelope=envelope, record=record)
+    _assert_unapprovable(cfg, store, row["id"], expected_reason)
 
 
 @pytest.mark.parametrize("bad_updates", [[{}], ["malformed"], "not-a-list", [{"at": LATER}]])
 def test_malformed_saved_update_entries_refuse_without_raising(context, bad_updates):
+    """Return an unreadable-record refusal without raising when saved `updates` entries are malformed."""
     cfg, store = context
     seed_story(store, item(url="https://example.org/orig", title="Initial relay report",
                            content="Initial relay report on directory fetch behavior."),
                analysis(), key="seed-orig", at=DATE)
-    row = hold_news_dispute(
+    row = _hold_news_dispute(
         cfg, store,
         incoming=item(url="https://example.org/orig", title="Initial relay report",
                       content="Initial relay report on directory fetch behavior. Later maintainer confirmation.",
@@ -492,9 +462,90 @@ def test_malformed_saved_update_entries_refuse_without_raising(context, bad_upda
         draft=update_analysis(update="Maintainers confirmed the directory fetch behavior.",
                               evidence=["Later maintainer confirmation."]),
     )
-    record = json.loads(job(store, row["id"])["record_json"])
+    record = job_record(store, row["id"])
     record["candidate"]["updates"] = bad_updates
-    with store.db:
-        store.db.execute("UPDATE review_jobs SET record_json=? WHERE item_id=?", (json.dumps(record), row["id"]))
+    patch_job(store, row, record=record)
     info = review_gate.approval(cfg, store, row["id"])
     assert info["eligible"] is False and info["reason"] == "Saved review record cannot be read"
+
+
+def test_rejected_cli_approve_requires_flags_honors_lock_and_publishes(context, tmp_path, capsys):
+    """Require `--approval-hash` and `--reason` on `rejected approve`, honor `run_lock`, and publish."""
+    cfg, store = context
+    config_path = write_toml(tmp_path)
+    row = _hold_news_dispute(
+        cfg, store,
+        incoming=item(url="https://example.org/held-cli", content="Held CLI news development text. " * 4),
+        draft=analysis(title="CLI approved story", evidence=["Held CLI news development text."]),
+    )
+    approval = invoke_cli(capsys, "rejected", "show", "--config", config_path, "--item", row["id"])["final_review"]["approval"]
+    assert approval["eligible"] is True and approval["hash"]
+    for missing in (
+        ("rejected", "approve", "--config", config_path, "--item", row["id"], "--reason", "Missing hash"),
+        ("rejected", "approve", "--config", config_path, "--item", row["id"], "--approval-hash", approval["hash"]),
+    ):
+        with pytest.raises(SystemExit) as caught:
+            cli.main(list(map(str, missing)))
+        assert caught.value.code == 2
+        capsys.readouterr()
+    with cli.run_lock(cfg["storage"]["database"]) as locked:
+        assert locked
+        busy = invoke_cli(capsys, "rejected", "approve", "--config", config_path, "--item", row["id"],
+                          "--approval-hash", approval["hash"], "--reason", "Busy check", expected=75)
+    assert busy["status"] == "already-running"
+    approved = invoke_cli(capsys, "rejected", "approve", "--config", config_path, "--item", row["id"],
+                          "--approval-hash", approval["hash"], "--reason", "Approved via CLI")
+    assert approved["status"] == "published" and approved["publication_pending"] is True
+    invoke_cli(capsys, "build", "--config", config_path)
+    article = Path(cfg["storage"]["output_dir"]) / "news" / approved["story_id"] / "story.json"
+    assert json.loads(article.read_text())["title"] == "CLI approved story"
+
+
+def test_approve_item_validates_identifier_and_config_before_hash(store):
+    """Preserve `item_id` and `config is None` error precedence ahead of `approval_hash` validation."""
+    with pytest.raises(ValueError, match="24-character lowercase hexadecimal"):
+        rejection.approve_item(None, store, "bad-id", "bad-hash", "reason")
+    with pytest.raises(ValueError, match="Configuration is required to approve a held item"):
+        rejection.approve_item(None, store, "0" * 24, "bad-hash", "reason")
+
+
+@pytest.mark.parametrize("cfg_users,author", [
+    ([*DIRAUTH_GITLAB_USERS, "custom_authority_op"], "custom_authority_op"),
+    ([], "arma"),
+])
+def test_approve_item_honors_config_dirauth_users_precedence_over_store_defaults(tmp_path, cfg_users, author):
+    """Verify `commit_candidate(operator=True)` binds `prepared['dirauth_users']` ahead of `store.dirauth_users`."""
+    cfg = make_config(tmp_path, collection={"dirauth_gitlab_users": cfg_users})
+    with Store(cfg["storage"]["database"], dirauth_users=DIRAUTH_GITLAB_USERS) as store:
+        seed_story(
+            store,
+            item(url="https://example.org/recent-story", title="Recent active report",
+                 content="Recent active report body text for coverage context."),
+            analysis(title="Recent active report", summary="Recent active report body text for coverage context.",
+                     evidence=["Recent active report body text for coverage context."]),
+            key="recent-seed", at=DATE,
+        )
+        held_issue = item(
+            url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/49500",
+            kind="gitlab_issue",
+            author=author,
+            authority="development",
+            labels=[],
+            title="Consensus parameter adjustment proposal",
+            content="Detailed proposal from directory operator regarding consensus voting thresholds.",
+        )
+        draft = analysis(
+            title="Consensus parameter adjustment proposed",
+            summary="Detailed proposal from directory operator regarding consensus voting thresholds.",
+            evidence=["Detailed proposal from directory operator regarding consensus voting thresholds."],
+        )
+        store.ingest(held_issue, DATE, dirauth_users=cfg_users)
+        row = store.pending(1, LATER)[0]
+        assert run_gate(
+            cfg, store, row, Writer(draft),
+            Reviewer(verdict(), verdict("hold", criterion="news_value")),
+        )["status"] == "held"
+        info = review_gate.approval(cfg, store, row["id"])
+        assert info["eligible"] is True and info["hash"]
+        approved = rejection.approve_item(cfg, store, row["id"], info["hash"], "Operator approved", observed=AFTER_SHOW)
+        assert approved["status"] == "published" and len(store.stories()) == 2

@@ -5,7 +5,10 @@ import json
 
 import pytest
 
-from helpers import LATER, STORY, FakeLLM, completion, item, verdict
+from helpers import (
+    LATER, NON_RELEASE_CATEGORIES, NON_TAG_STATES, STORY, FakeLLM, completion, verdict, wire_reviewer,
+    write_toml,
+)
 from onionflash import analyze, review
 from onionflash.analyze import AnalysisError
 from onionflash.config import DEFAULTS, load_config
@@ -13,20 +16,21 @@ from onionflash.render import prepare_story
 from onionflash.transport import FetchError, Response
 
 
-def cfg_llm():
-    """Return default configuration with a placeholder LLM endpoint URL."""
+def _cfg_llm():
     result = copy.deepcopy(DEFAULTS)
     result["llm"]["base_url"] = "https://llm.example/v1"
     return result
 
 
-def candidate(**changes):
-    """Build a normalized public story candidate with optional overrides."""
+def _reviewer(monkeypatch, *replies, cfg=None):
+    return wire_reviewer(cfg or _cfg_llm(), *replies, monkeypatch=monkeypatch)
+
+
+def _candidate(**changes):
     return prepare_story({**copy.deepcopy(STORY), **changes})
 
 
-def packet():
-    """Return a minimal single-source numbered review packet."""
+def _packet():
     return {
         "sources": [{"id": "S1", "url": STORY["sources"][0]["url"], "title": "Release notes",
                      "kind": "rss", "authority": "official", "product": "tor",
@@ -36,28 +40,19 @@ def packet():
     }
 
 
-def reviewer(monkeypatch, *responses, settings=None):
-    """Instantiate a Reviewer wired to scripted FakeLLM responses."""
-    monkeypatch.setenv("ONIONFLASH_LLM_API_KEY", "unit-test-secret")
-    result = review.Reviewer(settings or cfg_llm())
-    result.client = FakeLLM(*responses)
-    return result
-
-
-def unit(kind, *texts, authority="development", state=""):
-    """Construct an unnumbered source packet unit with passage texts."""
+def _unit(kind, *texts, authority="development", state=""):
     return {"kind": kind, "authority": authority, "upstream_state": state, "title": texts[0],
             "passages": [{"text": text} for text in texts]}
 
 
-ISSUE = unit("gitlab_issue", "dirauth: Remove bastet from list",
-             "Last night, bastet's operator notified us that the machine is very plausibly compromised.",
-             "In any kind of scenario here, the keys can’t be trusted anymore and bastet will generate a new identity soon.",
-             "In the meantime, remove bastet from source as we can't trust it anymore.", state="opened")
-MERGED = unit("gitlab_mr", "Remove bastet's keys from default dirauth list", state="merged")
-FEED = unit("feed", "Tor Browser 16.0.2 is released", "Tor Browser 16.0.2 is now available for Android.", authority="official")
-CRASH = unit("gitlab_issue", "Fix the crash in the parser", state="opened")
-COMPROMISED = unit("gitlab_issue", "Bastet", "The machine was compromised.", state="opened")
+ISSUE = _unit("gitlab_issue", "dirauth: Remove bastet from list",
+              "Last night, bastet's operator notified us that the machine is very plausibly compromised.",
+              "In any kind of scenario here, the keys can’t be trusted anymore and bastet will generate a new identity soon.",
+              "In the meantime, remove bastet from source as we can't trust it anymore.", state="opened")
+MERGED = _unit("gitlab_mr", "Remove bastet's keys from default dirauth list", state="merged")
+FEED = _unit("feed", "Tor Browser 16.0.2 is released", "Tor Browser 16.0.2 is now available for Android.", authority="official")
+CRASH = _unit("gitlab_issue", "Fix the crash in the parser", state="opened")
+COMPROMISED = _unit("gitlab_issue", "Bastet", "The machine was compromised.", state="opened")
 DONE, HEADLINE, CONFIRMED, MERGE = ["completed_action"], ["compromise_headline"], ["confirmed_source"], ["merge_state"]
 FINAL_CASES = [
     ("removed-headline", "gitlab_issue", [ISSUE], {"title": "Tor Directory Authority 'bastet' Removed Following Suspected Compromise"}, DONE),
@@ -68,17 +63,17 @@ FINAL_CASES = [
     ("ships", "gitlab_issue", [CRASH], {"summary": "Tor ships a fix for the reported crash."}, DONE),
     ("patched", "gitlab_issue", [CRASH], {"summary": "Developers patched the crash."}, DONE),
     ("impact-patched", "gitlab_issue", [CRASH], {"why_it_matters": "Developers patched the crash."}, DONE),
-    ("planned-deployment", "gitlab_issue", [unit("gitlab_issue", "Crash", "The fix will be deployed next week.")], {"summary": "The fix was deployed."}, DONE),
-    ("negated-in-source", "gitlab_issue", [unit("gitlab_issue", "Crash", "This wasn’t fixed in 2.7.0.")], {"summary": "The crash was fixed in 2.7.0."}, DONE),
-    ("compound-in-source", "gitlab_issue", [unit("gitlab_issue", "Crash", "The parser uses a fixed-size buffer and crashes on long input.")], {"summary": "The crash was fixed."}, DONE),
+    ("planned-deployment", "gitlab_issue", [_unit("gitlab_issue", "Crash", "The fix will be deployed next week.")], {"summary": "The fix was deployed."}, DONE),
+    ("negated-in-source", "gitlab_issue", [_unit("gitlab_issue", "Crash", "This wasn’t fixed in 2.7.0.")], {"summary": "The crash was fixed in 2.7.0."}, DONE),
+    ("compound-in-source", "gitlab_issue", [_unit("gitlab_issue", "Crash", "The parser uses a fixed-size buffer and crashes on long input.")], {"summary": "The crash was fixed."}, DONE),
     ("requested", "gitlab_issue", [ISSUE], {"title": "Tor authority bastet to be removed from source after reported compromise"}, []),
     ("asked", "gitlab_issue", [ISSUE], {"summary": "The issue asks that bastet be removed."}, []),
     ("not-yet", "gitlab_issue", [ISSUE], {"summary": "Bastet has not been removed yet."}, []),
     ("contractions", "gitlab_issue", [ISSUE], {"summary": "Bastet wasn't removed yet, and its keys haven’t been rotated."}, []),
     ("no-fixed-release", "gitlab_issue", [ISSUE], {"summary": "No fixed release has been identified."}, []),
     ("adjective", "gitlab_issue", [ISSUE], {"summary": "The parser uses a fixed-size buffer."}, []),
-    ("stated-elsewhere", "gitlab_issue", [unit("gitlab_issue", "Fix the crash in the parser", "The crash is fixed in main.")], {"summary": "Developers fixed the crash."}, []),
-    ("stated-in-comment", "gitlab_issue", [unit("gitlab_issue", "Protover parser differential", "This was fixed in 2.7.0. Closing.")], {"summary": "This was fixed in Arti 2.7.0."}, []),
+    ("stated-elsewhere", "gitlab_issue", [_unit("gitlab_issue", "Fix the crash in the parser", "The crash is fixed in main.")], {"summary": "Developers fixed the crash."}, []),
+    ("stated-in-comment", "gitlab_issue", [_unit("gitlab_issue", "Protover parser differential", "This was fixed in 2.7.0. Closing.")], {"summary": "This was fixed in Arti 2.7.0."}, []),
     ("noun", "gitlab_issue", [ISSUE], {"title": "Arti 2.8.0 released with low-severity security fixes"}, []),
     ("not-issue-written", "feed", [ISSUE], {"summary": "Tor removes bastet from the authority list."}, []),
     ("merged-title", "gitlab_issue", [ISSUE, MERGED], {"summary": "Bastet's keys were removed from the default authority list."}, []),
@@ -87,48 +82,54 @@ FINAL_CASES = [
     ("compromised", "gitlab_issue", [ISSUE], {"title": "Bastet directory authority compromised"}, HEADLINE),
     ("hacked", "gitlab_issue", [ISSUE], {"title": "Tor directory authority bastet hacked"}, HEADLINE),
     ("breach", "gitlab_issue", [ISSUE], {"title": "Bastet authority breach forces key change"}, HEADLINE),
-    ("possibly", "gitlab_issue", [unit("gitlab_issue", "Bastet", "It was possibly compromised.")], {"title": "Bastet compromised"}, HEADLINE),
-    ("hedged-by-second-source", "gitlab_issue", [COMPROMISED, unit("feed", "Bastet", "It may have been compromised.")], {"title": "Bastet compromised"}, HEADLINE),
+    ("possibly", "gitlab_issue", [_unit("gitlab_issue", "Bastet", "It was possibly compromised.")], {"title": "Bastet compromised"}, HEADLINE),
+    ("hedged-by-second-source", "gitlab_issue", [COMPROMISED, _unit("feed", "Bastet", "It may have been compromised.")], {"title": "Bastet compromised"}, HEADLINE),
     ("qualified", "gitlab_issue", [ISSUE], {"title": "Bastet reported plausibly compromised"}, []),
     ("may-have-been", "gitlab_issue", [ISSUE], {"title": "Bastet may have been compromised"}, []),
     ("unhedged-source", "gitlab_issue", [COMPROMISED], {"title": "Bastet compromised"}, []),
     ("issue-confirmed", "gitlab_issue", [ISSUE], {"confidence": "confirmed"}, CONFIRMED),
-    ("tag-and-issue-confirmed", "gitlab_issue", [unit("tag", "arti-v2.7.0", authority="official"), ISSUE], {"confidence": "confirmed"}, CONFIRMED),
+    ("tag-and-issue-confirmed", "gitlab_issue", [_unit("tag", "arti-v2.7.0", authority="official"), ISSUE], {"confidence": "confirmed"}, CONFIRMED),
     ("unmerged-request-confirmed", "gitlab_mr", [{**MERGED, "upstream_state": ""}], {"confidence": "confirmed", "state": "merged"}, CONFIRMED),
     ("merged-request-confirmed", "gitlab_mr", [MERGED], {"confidence": "confirmed", "state": "merged"}, []),
     ("official-feed-confirmed", "feed", [FEED], {"confidence": "confirmed", "state": "released"}, []),
     ("official-feed-and-issue-confirmed", "feed", [FEED, ISSUE], {"confidence": "confirmed"}, []),
-    ("release-shape-confirmed", "feed", [unit("tag", "tor-0.4.9.16", authority="official"), FEED,
-                                         unit("metrics_timeline", "Relay versions", authority="telemetry")], {"confidence": "confirmed", "state": "released"}, []),
+    ("release-shape-confirmed", "feed", [_unit("tag", "tor-0.4.9.16", authority="official"), FEED,
+                                         _unit("metrics_timeline", "Relay versions", authority="telemetry")], {"confidence": "confirmed", "state": "released"}, []),
     ("merge-request-released", "gitlab_mr", [MERGED], {"title": "Tor releases a parser fix", "state": "released"}, MERGE),
     ("merge-request-and-issue-fixed", "gitlab_mr", [MERGED, ISSUE], {"state": "fixed"}, []),
     ("operator-only-state", "gitlab_issue", [ISSUE], {"state": "no-longer-listed"}, []),
 ]
-NON_TAG_STATES = [v for v in analyze.STATES if v != "tagged"]
-NON_RELEASE_CATEGORIES = [v for v in analyze.CATEGORIES if v != "release"]
 COVERED = "0123456789abcdef01234567"
 COVERAGE = {"prior_story": None, "recent": [{"id": COVERED, "title": "Earlier coverage"}], "truncated": False}
 PRIOR = {"prior_story": {"id": COVERED, "title": "Earlier coverage"}, "recent": [], "truncated": False}
 
+_BAD_APPROVALS = {
+    "source-ref": lambda r: r["criteria"]["source_support"].update(source_refs=["S2:P99"]),
+    "issues": lambda r: r.update(issues=[]),
+    "model-verdict": lambda r: r.update(model_verdict="hold"),
+    "failed-criterion": lambda r: r["criteria"]["source_support"].update(outcome="fail"),
+    "changed-text": lambda r: r.update(repair={k: None for k in review.EDITABLE}),
+    "missing-criterion": lambda r: r["criteria"].pop("new_information"),
+    "missing-refs": lambda r: r["criteria"]["source_support"].update(source_refs=[]),
+    "score": lambda r: r.update(score=10),
+    "unknown-verdict": lambda r: r.update(verdict="probably"),
+    "failed-news-value-approve": lambda r: r["criteria"]["news_value"].update(outcome="fail"),
+    "failed-new-information-approve": lambda r: r["criteria"]["new_information"].update(outcome="fail"),
+}
+
 
 def test_review_keeps_only_its_model_and_rejects_unknown_settings(tmp_path):
     """Accept review.model overrides while rejecting unknown review settings."""
-    def configured(name, extra):
-        """Load a temporary TOML configuration with extra settings."""
-        p = tmp_path / name
-        p.write_text('[[sources]]\nid="test"\nurl="https://example.org/feed.xml"\n' + extra)
-        return load_config(p)
-
-    cfg = configured("c1.toml", '[llm]\ntimeout_seconds=45\n[review]\nmodel="critic-model"\n')
+    cfg = load_config(write_toml(tmp_path, '[llm]\ntimeout_seconds=45\n[review]\nmodel="critic-model"', name="c1.toml"))
     assert cfg["review"] == {"model": "critic-model"}
     with review.Reviewer(cfg) as rev:
         assert rev.llm["model"] == "critic-model" and rev.llm["max_output_tokens"] == review.OUTPUT_TOKENS
         assert (rev.http_settings["timeout_seconds"], rev.http_settings["total_timeout_seconds"]) == (45, 180)
     with pytest.raises(ValueError, match="review.model"):
-        configured("c2.toml", "[review]\nmodel=[]\n")
+        load_config(write_toml(tmp_path, "[review]\nmodel=[]", name="c2.toml"))
     for unknown_key in ("max_passages=1", "max_repairs=0", "timeout_seconds=300"):
         with pytest.raises(ValueError, match="Unknown review settings"):
-            configured("c3.toml", f"[review]\n{unknown_key}\n")
+            load_config(write_toml(tmp_path, f"[review]\n{unknown_key}", name="c3.toml"))
     inh = copy.deepcopy(DEFAULTS)
     inh["llm"]["model"] = "configured-local-model"
     with review.Reviewer(inh) as rev:
@@ -139,24 +140,24 @@ def test_review_keeps_only_its_model_and_rejects_unknown_settings(tmp_path):
 @pytest.mark.parametrize("ver", [False, True])
 def test_released_and_tagged_candidates_pass_review_and_verification(monkeypatch, st, ver):
     """Approve released and tagged candidates in both review and verification stages."""
-    assert reviewer(monkeypatch, completion(verdict())).review(candidate(state=st), packet(), verification=ver)["verdict"] == "approve"
+    assert _reviewer(monkeypatch, verdict()).review(_candidate(state=st), _packet(), verification=ver)["verdict"] == "approve"
 
 
 def test_review_protocol_fresh_verification_and_application_issue(monkeypatch):
     """Verify schema constraints, repair application, fresh verification, and application_issue payloads."""
-    public = candidate(why_it_matters="Operators must edit their configuration to exclude the compromised node.")
-    checker = reviewer(monkeypatch, completion(verdict("revise", repair={"why_it_matters": ""})), completion(verdict()))
-    result = checker.review(public, packet())
+    public = _candidate(why_it_matters="Operators must edit their configuration to exclude the compromised node.")
+    checker = _reviewer(monkeypatch, verdict("revise", repair={"why_it_matters": ""}), verdict())
+    result = checker.review(public, _packet())
     assert result["repair"] == {"why_it_matters": ""}
     repaired = review.apply_repair(public, result["repair"])
-    assert checker.review(repaired, packet(), verification=True)["verdict"] == "approve"
-    first, second = (body for _, body in checker.client.requests)
+    assert checker.review(repaired, _packet(), verification=True)["verdict"] == "approve"
+    first, second = checker.client.bodies
     for check in first["response_format"]["json_schema"]["schema"]["properties"]["criteria"]["properties"].values():
-        assert check["properties"]["source_refs"]["items"]["enum"] == sorted(review._packet_refs(packet()))
+        assert check["properties"]["source_refs"]["items"]["enum"] == sorted(review._packet_refs(_packet()))
     assert "enum" not in review.REFS["items"]
-    assert json.loads(first["messages"][1]["content"]) == {"candidate": public, "packet": packet()}
+    assert json.loads(first["messages"][1]["content"]) == {"candidate": public, "packet": _packet()}
     assert len(second["messages"]) == 2 and second["messages"][0]["content"] == review.VERIFY_PROMPT
-    assert json.loads(second["messages"][1]["content"]) == {"candidate": repaired, "packet": packet()}
+    assert json.loads(second["messages"][1]["content"]) == {"candidate": repaired, "packet": _packet()}
 
     schema = first["response_format"]["json_schema"]["schema"]
     assert list(schema["properties"]) == schema["required"] == ["criteria", "verdict", "same_story", "repair"]
@@ -164,53 +165,37 @@ def test_review_protocol_fresh_verification_and_application_issue(monkeypatch):
         assert list(check["properties"]) == check["required"] == ["reason", "source_refs", "outcome"]
         assert check["properties"]["reason"]["maxLength"] == 240
 
-    untouched = candidate(confidence="suspected", state="developing", category="security", tags=["security"], why_it_matters="")
+    untouched = _candidate(confidence="suspected", state="developing", category="security", tags=["security"], why_it_matters="")
     snap = copy.deepcopy(untouched)
-    assert reviewer(monkeypatch, completion(verdict())).review(untouched, packet())["verdict"] == "approve" and untouched == snap
+    assert _reviewer(monkeypatch, verdict()).review(untouched, _packet())["verdict"] == "approve"
+    assert untouched == snap
 
-    rel_pub = candidate(state="merged", category="release", tags=["release"])
-    rel_chk = reviewer(monkeypatch, completion(verdict()))
-    rel_res = rel_chk.review(rel_pub, packet(), issue=review.RELEASE_ISSUE)
-    assert rel_res == review.validate_review(verdict(), packet()) and "model_verdict" not in rel_res
-    assert rel_chk.client.requests[0][1]["messages"][0]["content"] == review.SYSTEM_PROMPT
-    assert json.loads(rel_chk.client.requests[0][1]["messages"][1]["content"]) == {
-        "candidate": rel_pub, "packet": packet(), "application_issue": review.RELEASE_ISSUE}
+    rel_pub = _candidate(state="merged", category="release", tags=["release"])
+    rel_chk = _reviewer(monkeypatch, verdict())
+    rel_res = rel_chk.review(rel_pub, _packet(), issue=review.RELEASE_ISSUE)
+    assert rel_res == review.validate_review(verdict(), _packet()) and "model_verdict" not in rel_res
+    assert rel_chk.client.bodies[0]["messages"][0]["content"] == review.SYSTEM_PROMPT
+    assert json.loads(rel_chk.client.bodies[0]["messages"][1]["content"]) == {
+        "candidate": rel_pub, "packet": _packet(), "application_issue": review.RELEASE_ISSUE}
 
 
-@pytest.mark.parametrize("bad", [
-    "source-ref", "issues", "model-verdict", "failed-criterion", "changed-text",
-    "missing-criterion", "missing-refs", "score", "unknown-verdict",
-    "failed-news-value-approve", "failed-new-information-approve",
-])
+@pytest.mark.parametrize("bad", list(_BAD_APPROVALS))
 def test_malformed_or_ambiguous_approval_is_rejected(monkeypatch, bad):
     """Reject malformed, extra-field, or inconsistent approval responses."""
     resp = verdict()
-    if bad == "source-ref": resp["criteria"]["source_support"]["source_refs"] = ["S2:P99"]
-    elif bad == "issues": resp["issues"] = []
-    elif bad == "model-verdict": resp["model_verdict"] = "hold"
-    elif bad == "failed-criterion": resp["criteria"]["source_support"]["outcome"] = "fail"
-    elif bad == "changed-text": resp["repair"] = {k: None for k in review.EDITABLE}
-    elif bad == "missing-criterion": del resp["criteria"]["new_information"]
-    elif bad == "missing-refs": resp["criteria"]["source_support"]["source_refs"] = []
-    elif bad == "score": resp["score"] = 10
-    elif bad == "failed-news-value-approve":
-        resp = verdict("skip", criterion="news_value"); resp["verdict"] = "approve"
-    elif bad == "failed-new-information-approve":
-        resp = verdict("skip", criterion="new_information"); resp["verdict"] = "approve"
-    else:
-        resp["verdict"] = "probably"
-    checker = reviewer(monkeypatch, completion(resp))
+    _BAD_APPROVALS[bad](resp)
+    checker = _reviewer(monkeypatch, resp)
     with pytest.raises(review.ReviewError):
-        checker.review(candidate(), packet())
+        checker.review(_candidate(), _packet())
     assert len(checker.client.requests) == 1
 
 
 @pytest.mark.parametrize("writer,sources,fields,expected", [c[1:] for c in FINAL_CASES], ids=[c[0] for c in FINAL_CASES])
 def test_final_holds_on_real_cases(writer, sources, fields, expected):
     """Verify deterministic final_holds reasons across issue, MR, and feed cases."""
-    story = candidate(**{"title": "Bastet reported plausibly compromised", "why_it_matters": "", "category": "security",
-                         "tags": ["security"], "summary": "A public issue reports that bastet's machine is very plausibly compromised.",
-                         "confidence": "reported", "state": "developing", **fields})
+    story = _candidate(**{"title": "Bastet reported plausibly compromised", "why_it_matters": "", "category": "security",
+                          "tags": ["security"], "summary": "A public issue reports that bastet's machine is very plausibly compromised.",
+                          "confidence": "reported", "state": "developing", **fields})
     assert review.final_holds(story, {"packet": {"sources": sources}, "payload": {"editorial_kind": writer}}) == expected
 
 
@@ -218,16 +203,16 @@ def test_final_holds_on_real_cases(writer, sources, fields, expected):
     ([ISSUE], ["reported", "suspected", "observed-anomaly"], NON_TAG_STATES, analyze.CATEGORIES),
     ([MERGED], analyze.CONFIDENCES, ["merged"], NON_RELEASE_CATEGORIES),
     ([FEED], analyze.CONFIDENCES, NON_TAG_STATES, analyze.CATEGORIES),
-    ([unit("tag", "tor-0.4.9.16", authority="official"), FEED], analyze.CONFIDENCES, analyze.STATES, analyze.CATEGORIES),
+    ([_unit("tag", "tor-0.4.9.16", authority="official"), FEED], analyze.CONFIDENCES, analyze.STATES, analyze.CATEGORIES),
 ], ids=["issue", "merged-request", "official-feed", "tagged-release"])
 def test_repair_schema_offers_only_labels_the_packet_allows(monkeypatch, sources, confidence, state, categories):
     """Constrain repair enum choices to packet-supported confidence, state, and category labels."""
     evidence = {"sources": [{**s, "id": f"S{i}", "passages": [{"id": f"S{i}:P1", **s["passages"][0]}]}
                             for i, s in enumerate(sources, 1)], "missing_sources": [], "truncated": False}
-    checker = reviewer(monkeypatch, completion(verdict()), completion(verdict()))
-    checker.review(candidate(), evidence)
-    checker.review(candidate(), evidence, verification=True)
-    for _, req in checker.client.requests:
+    checker = _reviewer(monkeypatch, verdict(), verdict())
+    checker.review(_candidate(), evidence)
+    checker.review(_candidate(), evidence, verification=True)
+    for req in checker.client.bodies:
         rep = req["response_format"]["json_schema"]["schema"]["properties"]["repair"]["anyOf"][1]["properties"]
         assert (rep["confidence"]["anyOf"][0]["enum"], rep["state"]["anyOf"][0]["enum"]) == (confidence, state)
         assert rep["category"]["anyOf"][0]["enum"] == rep["tags"]["anyOf"][0]["items"]["enum"] == categories
@@ -235,10 +220,10 @@ def test_repair_schema_offers_only_labels_the_packet_allows(monkeypatch, sources
             review.FIELDS["category"]["enum"]) == (analyze.CONFIDENCES, analyze.STATES, analyze.CATEGORIES)
     if "tagged" not in state:
         with pytest.raises(review.ReviewError, match="limits"):
-            reviewer(monkeypatch, completion(verdict("revise", repair={"state": "tagged"}, criterion="status"))).review(candidate(), evidence)
+            _reviewer(monkeypatch, verdict("revise", repair={"state": "tagged"}, criterion="status")).review(_candidate(), evidence)
     if "release" not in categories:
         with pytest.raises(review.ReviewError, match="limits"):
-            reviewer(monkeypatch, completion(verdict("revise", repair={"tags": ["release"]}, criterion="status"))).review(candidate(), evidence)
+            _reviewer(monkeypatch, verdict("revise", repair={"tags": ["release"]}, criterion="status")).review(_candidate(), evidence)
 
 
 @pytest.mark.parametrize("patch,is_upd,match", [
@@ -256,8 +241,8 @@ def test_repair_schema_offers_only_labels_the_packet_allows(monkeypatch, sources
 ])
 def test_apply_repair_rejects_immutable_noop_and_invalid_patches(patch, is_upd, match):
     """Refuse immutable-field, no-op, empty, or unpunctuated repairs."""
-    base = candidate(updates=[{"at": "2026-11-08T14:00:00Z", "text": "Maintainers opened a tracking ticket.",
-                               "sources": [{"url": STORY["sources"][0]["url"], "title": "Release notes"}]}])
+    base = _candidate(updates=[{"at": "2026-11-08T14:00:00Z", "text": "Maintainers opened a tracking ticket.",
+                                "sources": [{"url": STORY["sources"][0]["url"], "title": "Release notes"}]}])
     with pytest.raises(review.ReviewError, match=match):
         review.apply_repair(base, patch, update=is_upd)
 
@@ -271,19 +256,20 @@ def test_apply_repair_rejects_immutable_noop_and_invalid_patches(patch, is_upd, 
     ("attr", "UPDATE_SYSTEM_PROMPT", None),
     ("attr", "UPDATE_VERIFY_PROMPT", None),
     ("attr", "ROUTING_PROMPT", None),
+    ("attr", "VALIDATION_REASK_PROMPT", None),
 ])
 def test_policy_hash_changes_on_model_endpoint_and_prompt_mutations(monkeypatch, kind, target, val):
     """Change policy_hash when model, endpoint, or prompt constants change, ignoring API keys."""
-    initial = review.policy_hash(cfg_llm())
+    initial = review.policy_hash(_cfg_llm())
     monkeypatch.setenv("ONIONFLASH_LLM_API_KEY", "a-different-secret")
-    assert review.policy_hash(cfg_llm()) == initial
+    assert review.policy_hash(_cfg_llm()) == initial
     if kind == "cfg":
-        changed = copy.deepcopy(cfg_llm())
+        changed = copy.deepcopy(_cfg_llm())
         changed[target[0]][target[1]] = val
         assert review.policy_hash(changed) != initial
     else:
         monkeypatch.setattr(review, target, getattr(review, target) + "!")
-        assert review.policy_hash(cfg_llm()) != initial
+        assert review.policy_hash(_cfg_llm()) != initial
 
 
 def test_prompts_coverage_isolation_repairs_and_transport_settings(monkeypatch):
@@ -296,80 +282,78 @@ def test_prompts_coverage_isolation_repairs_and_transport_settings(monkeypatch):
         assert "unquoted_content" in prompt
     for prompt in (review.SYSTEM_PROMPT, review.VERIFY_PROMPT):
         assert "Claims supported by other packet sources need only that source's support." in prompt
-    assert reviewer(monkeypatch, completion(verdict("skip", criterion="news_value"))).review(candidate(state="merged"), packet())["verdict"] == "skip"
+    assert _reviewer(monkeypatch, verdict("skip", criterion="news_value")).review(_candidate(state="merged"), _packet())["verdict"] == "skip"
 
-    public = candidate(why_it_matters="Existing commentary")
+    public = _candidate(why_it_matters="Existing commentary")
     assert review.apply_repair(public, {"why_it_matters": ""})["why_it_matters"] == ""
-    chk = reviewer(monkeypatch, completion(verdict()))
-    chk.review(public, packet())
-    wim = chk.client.requests[0][1]["response_format"]["json_schema"]["schema"]["properties"]["repair"]["anyOf"][1]["properties"]["why_it_matters"]
+    chk = _reviewer(monkeypatch, verdict())
+    chk.review(public, _packet())
+    wim = chk.client.bodies[0]["response_format"]["json_schema"]["schema"]["properties"]["repair"]["anyOf"][1]["properties"]["why_it_matters"]
     assert wim["anyOf"][0]["enum"] == [""] and wim["anyOf"][1] == {"type": "null"}
 
     bg = {"prior_story": None, "recent": [{"id": "B1", "title": "Earlier coverage"}], "truncated": False}
-    bg_chk = reviewer(monkeypatch, completion(verdict()), completion(verdict()))
-    bg_chk.review(candidate(), packet(), coverage=bg)
-    bg_chk.review(candidate(), packet(), coverage=bg, verification=True)
-    for _, req in bg_chk.client.requests:
-        assert json.loads(req["messages"][1]["content"]) == {"candidate": candidate(), "packet": packet(), "coverage_background": bg}
+    bg_chk = _reviewer(monkeypatch, verdict(), verdict())
+    bg_chk.review(_candidate(), _packet(), coverage=bg)
+    bg_chk.review(_candidate(), _packet(), coverage=bg, verification=True)
+    for req in bg_chk.client.bodies:
+        assert json.loads(req["messages"][1]["content"]) == {"candidate": _candidate(), "packet": _packet(), "coverage_background": bg}
         fields = req["response_format"]["json_schema"]["schema"]["properties"]["criteria"]["properties"]
         assert set(fields) == set(review.CRITERIA)
         assert all(c["properties"]["source_refs"]["items"]["enum"] == ["S1", "S1:P1"] for c in fields.values())
     with pytest.raises(review.ReviewError, match="source reference"):
-        reviewer(monkeypatch, completion(verdict("skip", criterion="new_information", ref="B1"))).review(candidate(), packet(), coverage=bg)
+        _reviewer(monkeypatch, verdict("skip", criterion="new_information", ref="B1")).review(_candidate(), _packet(), coverage=bg)
 
-    skip_ok = verdict("skip", criterion="new_information")
-    skip_ok["criteria"]["source_support"]["outcome"] = "fail"
-    assert review.validate_review(skip_ok, packet())["verdict"] == "skip"
+    skip_ok = verdict("skip", criterion="new_information", criteria={"source_support": {"outcome": "fail"}})
+    assert review.validate_review(skip_ok, _packet())["verdict"] == "skip"
     with pytest.raises(review.ReviewError, match="Only a revise"):
-        review.validate_review(verdict("skip", criterion="news_value", repair={"summary": "Different text"}), packet())
+        review.validate_review(verdict("skip", criterion="news_value", repair={"summary": "Different text"}), _packet())
 
-    norm = review.apply_repair(candidate(), {"summary": "  More   precise source wording.  ", "why_it_matters": ""})
+    norm = review.apply_repair(_candidate(), {"summary": "  More   precise source wording.  ", "why_it_matters": ""})
     assert norm["summary"] == "More precise source wording." and norm["why_it_matters"] == ""
-    assert all(norm[k] == v for k, v in candidate().items() if k not in review.EDITABLE)
+    assert all(norm[k] == v for k, v in _candidate().items() if k not in review.EDITABLE)
 
-    assert reviewer(monkeypatch, completion(verdict("revise", repair={"why_it_matters": ""}))).review(candidate(), packet(), verification=True)["verdict"] == "revise"
-    held = reviewer(monkeypatch, completion(verdict("hold"))).review(candidate(), packet(), verification=True)
+    assert _reviewer(monkeypatch, verdict("revise", repair={"why_it_matters": ""})).review(_candidate(), _packet(), verification=True)["verdict"] == "revise"
+    held = _reviewer(monkeypatch, verdict("hold")).review(_candidate(), _packet(), verification=True)
     assert held["verdict"] == "hold" and held["repair"] is None
 
-    sparse = verdict("revise", repair={"why_it_matters": ""})
-    sparse["repair"] = {"why_it_matters": ""}
-    assert review.validate_review(sparse, packet())["repair"] == {"why_it_matters": ""}
+    sparse = {**verdict("revise", repair={"why_it_matters": ""}), "repair": {"why_it_matters": ""}}
+    assert review.validate_review(sparse, _packet())["repair"] == {"why_it_matters": ""}
     sparse["criteria"]["operational_advice"]["source_refs"] = ["S9"]
     with pytest.raises(review.ReviewError, match="source reference"):
-        review.validate_review(sparse, packet())
+        review.validate_review(sparse, _packet())
 
-    ev_cr = packet()
+    ev_cr = _packet()
     ev_cr["sources"][0]["passages"][0]["text"] += "\r\nA second line."
-    assert reviewer(monkeypatch, completion(verdict())).review(candidate(), ev_cr)["verdict"] == "approve"
+    assert _reviewer(monkeypatch, verdict()).review(_candidate(), ev_cr)["verdict"] == "approve"
     ev_cr["sources"][0]["passages"][0]["text"] = "\ud800"
-    sur_chk = reviewer(monkeypatch)
+    sur_chk = _reviewer(monkeypatch)
     with pytest.raises(AnalysisError, match="UTF-8"):
-        sur_chk.review(candidate(), ev_cr)
+        sur_chk.review(_candidate(), ev_cr)
     assert sur_chk.client.requests == []
 
     dup_enc = json.dumps(verdict()).replace('"verdict":', '"verdict":"hold","verdict":', 1)
     dup_raw = {"choices": [{"finish_reason": "stop", "message": {"content": dup_enc}}]}
     with pytest.raises(AnalysisError, match="invalid JSON") as cdup:
-        reviewer(monkeypatch, Response(200, json.dumps(dup_raw).encode(), {}, "https://llm.example/v1")).review(candidate(), packet())
+        _reviewer(monkeypatch, Response(200, json.dumps(dup_raw).encode(), {}, "https://llm.example/v1")).review(_candidate(), _packet())
     assert not cdup.value.retryable
     with pytest.raises(AnalysisError, match="truncated") as ctr:
-        reviewer(monkeypatch, completion(verdict(), finish_reason="length")).review(candidate(), packet())
+        _reviewer(monkeypatch, completion(verdict(), finish_reason="length")).review(_candidate(), _packet())
     assert not ctr.value.retryable
 
-    fb_cfg = cfg_llm()
+    fb_cfg = _cfg_llm()
     fb_cfg["llm"].update(fallback_base_urls=["https://fallback.example/v1"], timeout_seconds=180)
     fb_cfg["review"]["model"] = "review-model"
-    fb_chk = reviewer(monkeypatch, FetchError("unavailable", status=503), completion(verdict()), settings=fb_cfg)
-    assert fb_chk.review(candidate(), packet())["verdict"] == "approve"
+    fb_chk = _reviewer(monkeypatch, FetchError("unavailable", status=503), verdict(), cfg=fb_cfg)
+    assert fb_chk.review(_candidate(), _packet())["verdict"] == "approve"
     assert [u for u, _ in fb_chk.client.requests] == ["https://llm.example/v1/chat/completions", "https://fallback.example/v1/chat/completions"]
-    assert fb_chk.client.requests[-1][1]["model"] == "review-model" and fb_chk.client.requests[-1][1]["max_tokens"] == review.OUTPUT_TOKENS
+    assert fb_chk.client.bodies[-1]["model"] == "review-model" and fb_chk.client.bodies[-1]["max_tokens"] == review.OUTPUT_TOKENS
     assert (fb_chk.http_settings["timeout_seconds"], fb_chk.http_settings["total_timeout_seconds"], fb_chk.http_settings["retry_attempts"]) == (180, 190, 1)
 
-    fake = FakeLLM(completion(verdict()))
+    fake = FakeLLM(verdict())
     monkeypatch.setattr("onionflash.llm.HttpClient", lambda *a, **kw: fake)
-    with review.Reviewer(cfg_llm(), deadline=123.5) as dl_chk:
+    with review.Reviewer(_cfg_llm(), deadline=123.5) as dl_chk:
         dl_chk.clock = lambda: 100.0
-        dl_chk.review(candidate(), packet())
+        dl_chk.review(_candidate(), _packet())
         assert dl_chk.deadline == 123.5 and getattr(fake, "deadline", None) is None
 
 
@@ -381,15 +365,14 @@ def test_prompts_coverage_isolation_repairs_and_transport_settings(monkeypatch):
 @pytest.mark.parametrize("verification", [False, True])
 def test_a_skip_stands_only_on_a_failed_editorial_criterion(monkeypatch, criterion, outcome, expected, verification):
     """Convert skips without a failed editorial criterion into holds while recording model_verdict."""
-    reply = verdict("skip", criterion=criterion)
-    reply["criteria"][criterion].update(outcome=outcome, reason=f"Story {COVERED} reports the same event.")
-    res = reviewer(monkeypatch, completion(reply)).review(candidate(), packet(), coverage=COVERAGE, verification=verification)
+    reply = verdict("skip", criterion=criterion, criteria={criterion: {"outcome": outcome, "reason": f"Story {COVERED} reports the same event."}})
+    res = _reviewer(monkeypatch, reply).review(_candidate(), _packet(), coverage=COVERAGE, verification=verification)
     assert (res["verdict"], res["repair"], res["criteria"]) == (expected, None, reply["criteria"])
     assert res.get("model_verdict") == (None if expected == "skip" else "skip")
-    assert review.validate_review(res, packet()) == res
+    assert review.validate_review(res, _packet()) == res
     if expected == "hold":
         with pytest.raises(review.ReviewError, match="editorial criterion"):
-            review.validate_review(reply, packet())
+            review.validate_review(reply, _packet())
 
 
 @pytest.mark.parametrize("coverage,reason,expected", [
@@ -400,16 +383,15 @@ def test_a_skip_stands_only_on_a_failed_editorial_criterion(monkeypatch, criteri
 ], ids=["unnamed", "recent", "prior", "no-coverage"])
 def test_a_skip_for_new_information_alone_names_a_story_from_coverage(monkeypatch, coverage, reason, expected):
     """Require skips on new_information alone to cite a story ID from coverage."""
-    reply = verdict("skip", criterion="new_information")
-    reply["criteria"]["new_information"]["reason"] = reason
-    assert reviewer(monkeypatch, completion(reply)).review(candidate(), packet(), coverage=coverage)["verdict"] == expected
+    reply = verdict("skip", criterion="new_information", reason=reason)
+    assert _reviewer(monkeypatch, reply).review(_candidate(), _packet(), coverage=coverage)["verdict"] == expected
     reply["criteria"]["news_value"]["outcome"] = "fail"
-    assert reviewer(monkeypatch, completion(reply)).review(candidate(), packet(), coverage=coverage)["verdict"] == "skip"
+    assert _reviewer(monkeypatch, reply).review(_candidate(), _packet(), coverage=coverage)["verdict"] == "skip"
 
 
 def test_update_scope_confirmed_updates_uncited_notes_and_punctuation_repairs(monkeypatch):
     """Validate latest_update review prompts, repair limits, and per-note completed-action checks."""
-    prior = candidate(
+    prior = _candidate(
         title="Relay compromise confirmed by maintainer", summary="The release fixed the issue before this follow-up.",
         updates=[{"at": "2026-11-08T14:00:00Z", "text": "Maintainers opened a tracking ticket.",
                   "sources": [{"url": STORY["sources"][0]["url"], "title": "Release notes"}]},
@@ -422,21 +404,21 @@ def test_update_scope_confirmed_updates_uncited_notes_and_punctuation_repairs(mo
         "recent": [], "truncated": False,
     }
     pkt = {
-        "sources": [packet()["sources"][0],
+        "sources": [_packet()["sources"][0],
                     {"id": "S2", "url": "https://gitlab.torproject.org/tpo/core/tor/-/issues/41400", "title": "Issue",
                      "kind": "gitlab_issue", "authority": "development", "product": "tor", "upstream_state": "opened",
                      "published_at": STORY["published_at"], "updated_at": STORY["updated_at"], "labels": [],
                      "passages": [{"id": "S2:P1", "text": "Operators reported new telemetry."}]}],
         "missing_sources": [], "truncated": False,
     }
-    checker = reviewer(
+    checker = _reviewer(
         monkeypatch,
-        completion(verdict("revise", repair={"update": "Operators reported verified telemetry.", "state": "developing"}, update=True)),
-        completion(verdict(update=True)),
+        verdict("revise", repair={"update": "Operators reported verified telemetry.", "state": "developing"}, update=True),
+        verdict(update=True),
     )
     res = checker.review(prior, pkt, coverage=coverage, update=True)
     assert res["repair"] == {"update": "Operators reported verified telemetry.", "state": "developing"}
-    _, body = checker.client.requests[0]
+    body = checker.client.bodies[0]
     assert body["messages"][0]["content"] == review.UPDATE_SYSTEM_PROMPT
     assert tuple(body["response_format"]["json_schema"]["schema"]["properties"]["repair"]["anyOf"][1]["properties"]) == review.UPDATE_EDITABLE
     sent = json.loads(body["messages"][1]["content"])
@@ -444,7 +426,7 @@ def test_update_scope_confirmed_updates_uncited_notes_and_punctuation_repairs(mo
 
     repaired = review.apply_repair(prior, res["repair"], update=True)
     assert checker.review(repaired, pkt, coverage=coverage, verification=True, update=True)["verdict"] == "approve"
-    assert checker.client.requests[1][1]["messages"][0]["content"] == review.UPDATE_VERIFY_PROMPT
+    assert checker.client.bodies[1]["messages"][0]["content"] == review.UPDATE_VERIFY_PROMPT
     assert repaired["title"] == prior["title"] and repaired["summary"] == prior["summary"] and repaired["updates"][0] == prior["updates"][0]
     assert repaired["updates"][1] == {**prior["updates"][1], "text": "Operators reported verified telemetry."} and repaired["state"] == "developing"
 
@@ -457,17 +439,17 @@ def test_update_scope_confirmed_updates_uncited_notes_and_punctuation_repairs(mo
     assert "compromise_headline" in review.final_holds(review.apply_repair(prior, {"update": "The compromised authority remained offline."}, update=True),
                                                        {"mode": "update", "packet": hedged_pkt})
 
-    conf_chk = reviewer(monkeypatch, completion(verdict(update=True)))
+    conf_chk = _reviewer(monkeypatch, verdict(update=True))
     conf_chk.review({**prior, "confidence": "confirmed"}, pkt,
                     coverage={**coverage, "prior_story": {**coverage["prior_story"], "confidence": "confirmed"}}, update=True)
-    assert conf_chk.client.requests[0][1]["response_format"]["json_schema"]["schema"]["properties"]["repair"]["anyOf"][1]["properties"]["confidence"]["anyOf"][0]["enum"] == ["confirmed"]
+    assert conf_chk.client.bodies[0]["response_format"]["json_schema"]["schema"]["properties"]["repair"]["anyOf"][1]["properties"]["confidence"]["anyOf"][0]["enum"] == ["confirmed"]
 
     recent_cov = {"prior_story": None, "recent": [{"id": "a" * 24, "title": "Prior", "retracted": False}], "truncated": False}
-    rt_chk = reviewer(monkeypatch, completion(verdict()), completion(verdict()))
-    rt_chk.review(candidate(), packet(), coverage=recent_cov)
-    rt_chk.review(candidate(), packet(), coverage=recent_cov, verification=True)
-    assert rt_chk.client.requests[0][1]["messages"][0]["content"] == review.SYSTEM_PROMPT + review.ROUTING_PROMPT
-    assert rt_chk.client.requests[1][1]["messages"][0]["content"] == review.VERIFY_PROMPT + review.ROUTING_PROMPT
+    rt_chk = _reviewer(monkeypatch, verdict(), verdict())
+    rt_chk.review(_candidate(), _packet(), coverage=recent_cov)
+    rt_chk.review(_candidate(), _packet(), coverage=recent_cov, verification=True)
+    assert rt_chk.client.bodies[0]["messages"][0]["content"] == review.SYSTEM_PROMPT + review.ROUTING_PROMPT
+    assert rt_chk.client.bodies[1]["messages"][0]["content"] == review.VERIFY_PROMPT + review.ROUTING_PROMPT
 
     url99 = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/99"
     cand = {
@@ -491,10 +473,6 @@ def test_update_scope_confirmed_updates_uncited_notes_and_punctuation_repairs(mo
                                                                      {"id": "S1.N2", "url": url99 + "#note_2", "text": "Still investigating this regression."}]}]}}
     assert "completed_action" in review.final_holds({**cand, "updates": [{"at": LATER, "text": "Maintainers fixed the regression.",
                                                                           "sources": [{"url": url99 + "#note_2", "title": "Comment"}]}]}, prep_parent_done)
-    with pytest.raises(AnalysisError):
-        analyze.validate_analysis({"publish": True, "update": ".", "confidence": "reported", "state": "developing",
-                                   "evidence": ["exact words here"]}, item(content="Some exact words here in the item."),
-                                  schema=analyze.UPDATE_SCHEMA)
 
 
 def test_final_holds_shouting_malformed_version_and_untrusted_operator_claims():
@@ -504,17 +482,19 @@ def test_final_holds_shouting_malformed_version_and_untrusted_operator_claims():
                                            "passages": [{"id": "S1:P1", "text": "Relay telemetry report."}]}]
     prep_for = lambda auth, url=list_url: {"packet": {"sources": src_for(auth, url)}, "payload": {"editorial_kind": "feed"}}
 
-    shout_story = candidate(title="Relays AT RISK FOR DEANONYMIZATION", confidence="reported")
+    shout_story = _candidate(title="Relays AT RISK FOR DEANONYMIZATION", confidence="reported")
     assert "shouting_caps" in review.final_holds(shout_story, prep_for("trusted-operator"))
-    acronym_story = candidate(title="TLS SNI ALPN changes in relay connections", confidence="reported")
-    assert review.final_holds(acronym_story, prep_for("trusted-operator")) == []
+    assert review.final_holds(_candidate(title="TLS SNI ALPN changes in relay connections", confidence="reported"),
+                              prep_for("trusted-operator")) == []
 
-    bad_ver_story = candidate(summary="Operators reported issues after a post-0.4.17 upgrade.", confidence="reported", products=["tor"])
-    assert "malformed_version" in review.final_holds(bad_ver_story, prep_for("trusted-operator"))
-    written_bad_story = candidate(summary="Tor 0.4.17 release notes were written today.", confidence="reported", products=["tor"])
-    assert "malformed_version" in review.final_holds(written_bad_story, prep_for("trusted-operator"))
-    written_prefix_bad = candidate(summary="The post written yesterday cites Tor 0.4.17.", confidence="reported", products=["tor"])
-    assert "malformed_version" in review.final_holds(written_prefix_bad, prep_for("trusted-operator"))
+    for bad_summary in (
+        "Operators reported issues after a post-0.4.17 upgrade.",
+        "Tor 0.4.17 release notes were written today.",
+        "The post written yesterday cites Tor 0.4.17.",
+    ):
+        assert "malformed_version" in review.final_holds(
+            _candidate(summary=bad_summary, confidence="reported", products=["tor"]), prep_for("trusted-operator")
+        )
     for annotated in (
         "An operator wrote Tor 0.4.17 [sic] in the message.",
         "An operator wrote Tor 0.4.17 (sic) in the message.",
@@ -522,22 +502,22 @@ def test_final_holds_shouting_malformed_version_and_untrusted_operator_claims():
         "The subject was written as Tor 0.4.17 in the archive.",
         "Maintainers corrected the Tor 0.4.17 typo.",
     ):
-        assert review.final_holds(candidate(summary=annotated, confidence="reported", products=["tor"]), prep_for("trusted-operator")) == []
-    arti_story = candidate(summary="Operators tested 0.4.17 relay builds.", confidence="reported", products=["arti"])
-    assert review.final_holds(arti_story, prep_for("trusted-operator")) == []
+        assert review.final_holds(_candidate(summary=annotated, confidence="reported", products=["tor"]), prep_for("trusted-operator")) == []
+    assert review.final_holds(_candidate(summary="Operators tested 0.4.17 relay builds.", confidence="reported", products=["arti"]),
+                              prep_for("trusted-operator")) == []
 
-    inc_story = candidate(title="Operator reports DDoS flood against exit relays",
-                          summary="A mailing-list post describes an ongoing DDoS attack.",
-                          category="dos", tags=["dos"], confidence="reported")
+    inc_story = _candidate(title="Operator reports DDoS flood against exit relays",
+                           summary="A mailing-list post describes an ongoing DDoS attack.",
+                           category="dos", tags=["dos"], confidence="reported")
     assert review.final_holds(inc_story, prep_for("community")) == ["untrusted_operator_claim"]
     assert review.final_holds(inc_story, prep_for("trusted-operator")) == []
     assert review.final_holds(inc_story, prep_for("project-sender")) == []
     assert "confirmed_source" in review.final_holds({**inc_story, "confidence": "confirmed"}, prep_for("trusted-operator"))
 
     rfc_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/rfc1/"
-    rfc_story = candidate(title="[RFC] Relay congestion signaling extension",
-                          summary="A proposal on tor-dev outlines congestion signaling frames.",
-                          category="protocol", tags=["protocol"], confidence="reported")
+    rfc_story = _candidate(title="[RFC] Relay congestion signaling extension",
+                           summary="A proposal on tor-dev outlines congestion signaling frames.",
+                           category="protocol", tags=["protocol"], confidence="reported")
     assert review.final_holds(rfc_story, prep_for("community", rfc_url)) == []
 
     prop_sources = [{
@@ -545,13 +525,13 @@ def test_final_holds_shouting_malformed_version_and_untrusted_operator_claims():
         "title": "[tor-dev] Proposal 375: Rate-limiting circuit flooding",
         "passages": [{"id": "S1:P1", "text": "Proposal 375 specifies rate limits to defend against circuit flooding and DoS attacks."}],
     }]
-    prop_story = candidate(
+    prop_story = _candidate(
         title="Proposal 375: Rate-limiting circuit flooding",
         summary="Proposal 375 on tor-dev specifies rate limits to defend against circuit flooding and DoS attacks.",
         category="protocol", tags=["protocol", "dos"], confidence="reported",
     )
     assert review.final_holds(prop_story, {"packet": {"sources": prop_sources}, "payload": {"editorial_kind": "feed"}}) == []
-    prop_with_incident = candidate(
+    prop_with_incident = _candidate(
         title="Attackers flooded exit relays yesterday",
         summary="Proposal 375 proposes rate limits after the flood disrupted exit relays.",
         category="dos", tags=["dos"], confidence="reported",
@@ -560,50 +540,33 @@ def test_final_holds_shouting_malformed_version_and_untrusted_operator_claims():
         prop_with_incident, {"packet": {"sources": prop_sources}, "payload": {"editorial_kind": "feed"}}
     ) == ["untrusted_operator_claim"]
 
-    defense_framing = candidate(
+    defense_framing = _candidate(
         title="Rate-limit proposal for directory requests",
         summary="A tor-dev post proposes a rate-limit defense against directory flooding.",
         category="protocol", tags=["protocol"], confidence="reported",
     )
     assert review.final_holds(defense_framing, prep_for("community", rfc_url)) == []
 
-    for live_inc in (
-        candidate(
-            title="Operator reports suspected VPS provider tampering and connection flood on exit relay",
-            summary="A mailing-list post describes suspected host tampering and a connection flood.",
-            category="relay", tags=["relay"], confidence="reported",
+    live_incidents = [
+        prop_with_incident,
+        *(
+            _candidate(title=title, summary=summary, category=cat, tags=[cat], confidence="reported")
+            for title, summary, cat in (
+                ("Operator reports suspected VPS provider tampering and connection flood on exit relay",
+                 "A mailing-list post describes suspected host tampering and a connection flood.", "relay"),
+                ("Operator reports HSDir-targeted circuit overload and attack",
+                 "A mailing-list post reports an HSDir circuit attack on relays.", "relay"),
+                ("Post claims rate-limit defense bypass on relays",
+                 "A mailing-list post reports a rate-limit defense bypass.", "relay"),
+                ("[RFC] Operator reports active DDoS flood hitting exit relays",
+                 "A post marked RFC reports an active DDoS flood on exit relays.", "dos"),
+                ("Rate-limit discussion on relay list",
+                 "Operators propose rate limits after attackers flooded exit relays.", "relay"),
+                ("Relay defense measures", "An attack targets exit relays.", "relay"),
+            )
         ),
-        candidate(
-            title="Operator reports HSDir-targeted circuit overload and attack",
-            summary="A mailing-list post reports an HSDir circuit attack on relays.",
-            category="relay", tags=["relay"], confidence="reported",
-        ),
-        candidate(
-            title="Post claims rate-limit defense bypass on relays",
-            summary="A mailing-list post reports a rate-limit defense bypass.",
-            category="relay", tags=["relay"], confidence="reported",
-        ),
-        candidate(
-            title="[RFC] Operator reports active DDoS flood hitting exit relays",
-            summary="A post marked RFC reports an active DDoS flood on exit relays.",
-            category="dos", tags=["dos"], confidence="reported",
-        ),
-        candidate(
-            title="Attackers flooded exit relays yesterday",
-            summary="Proposal 375 proposes rate limits after the flood disrupted exit relays.",
-            category="dos", tags=["dos"], confidence="reported",
-        ),
-        candidate(
-            title="Rate-limit discussion on relay list",
-            summary="Operators propose rate limits after attackers flooded exit relays.",
-            category="relay", tags=["relay"], confidence="reported",
-        ),
-        candidate(
-            title="Relay defense measures",
-            summary="An attack targets exit relays.",
-            category="relay", tags=["relay"], confidence="reported",
-        ),
-    ):
+    ]
+    for live_inc in live_incidents:
         assert review.final_holds(live_inc, prep_for("community", rfc_url)) == ["untrusted_operator_claim"]
 
     upd_cand = {
@@ -614,3 +577,101 @@ def test_final_holds_shouting_malformed_version_and_untrusted_operator_claims():
     upd_holds = review.final_holds(upd_cand, {"mode": "update", "packet": {"sources": src_for("community")}})
     assert set(upd_holds) == {"shouting_caps", "malformed_version"}
     assert review.final_holds({**shout_story, "origin": "network-health"}, prep_for("community")) == []
+
+
+def test_apply_repair_deduplicates_enum_arrays_and_rejects_duplicate_only_product_repairs():
+    """Deduplicate repaired `products` and reject duplicate-only `['tor', 'tor']` no-op repairs."""
+    cand = _candidate(products=["tor"])
+    with pytest.raises(review.ReviewError, match="does not change"):
+        review.apply_repair(cand, {"products": ["tor", "tor"]})
+    repaired = review.apply_repair(cand, {"products": ["tor", "arti", "tor"]})
+    assert repaired["products"] == ["tor", "arti"]
+
+
+@pytest.mark.parametrize("bad_repair", [
+    {"tags": 123},
+    {"tags": True},
+    {"tags": [123]},
+    {"confidence": ["confirmed"]},
+])
+def test_within_label_limits_and_wire_reviewer_reject_non_iterable_or_non_string_repairs(monkeypatch, bad_repair):
+    """Return `False` in `within_label_limits` and raise `ReviewError` on malformed wire `repair` values."""
+    limits = analyze.label_limits([ISSUE])
+    assert review.within_label_limits(bad_repair, limits) is False
+    checker = _reviewer(monkeypatch, verdict("revise", criterion="status", repair=bad_repair))
+    with pytest.raises(review.ReviewError):
+        checker.review(_candidate(), _packet())
+
+
+def test_apply_repair_cleans_stale_category_and_release_tags_unless_explicit():
+    """Drop stale category and `release` tags on category/state repairs while honoring explicit `tags` edits."""
+    sec_cand = _candidate(category="security", tags=["security"])
+    repaired_relay = review.apply_repair(sec_cand, {"category": "relay"})
+    assert repaired_relay["category"] == "relay" and repaired_relay["tags"] == ["relay"]
+
+    rel_cand = _candidate(category="release", state="developing", tags=["release"])
+    assert review.release_labels_match_state(rel_cand) is False
+    repaired_feat = review.apply_repair(rel_cand, {"category": "feature"})
+    assert repaired_feat["category"] == "feature" and repaired_feat["tags"] == ["feature"]
+    assert review.release_labels_match_state(repaired_feat) is True
+
+    explicit_rel = review.apply_repair(rel_cand, {"category": "feature", "tags": ["feature", "release"]})
+    assert explicit_rel["tags"] == ["feature", "release"]
+    assert review.release_labels_match_state(explicit_rel) is False
+
+
+def test_update_repair_limits_and_final_holds_honor_established_prior_story_state():
+    """Allow non-`merged` states in update mode when `prior_story` or public sources establish them."""
+    mr_units = [
+        {
+            "id": f"S{i}",
+            "url": f"https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/{100 + i}",
+            "title": f"Merge request {i}",
+            "kind": "gitlab_mr",
+            "authority": "development",
+            "upstream_state": "merged",
+            "passages": [{"id": f"S{i}:P1", "text": f"Follow-up merge {i} completed."}],
+        }
+        for i in range(1, 9)
+    ]
+    packet = {"sources": mr_units, "missing_sources": [], "truncated": True}
+    tag_url = "https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-0.4.9.6"
+    coverage_tagged = {"prior_story": {"id": "a" * 24, "confidence": "confirmed", "state": "tagged"}, "recent": []}
+    limits_tagged = review.repair_limits(packet, coverage_tagged, update=True)
+    assert "tagged" in limits_tagged["state"]
+
+    cand_tagged = _candidate(
+        confidence="confirmed",
+        state="tagged",
+        category="release",
+        tags=["release"],
+        sources=[
+            *[{"url": u["url"], "title": u["title"]} for u in mr_units],
+            {"url": tag_url, "title": "tor-0.4.9.6"},
+        ],
+        updates=[{
+            "at": LATER,
+            "text": "Follow-up merge 8 completed.",
+            "sources": [{"url": mr_units[-1]["url"], "title": mr_units[-1]["title"]}],
+        }],
+    )
+    assert review.final_holds(cand_tagged, {"mode": "update", "packet": packet, "coverage": coverage_tagged}) == []
+
+    coverage_fixed = {"prior_story": {"id": "b" * 24, "confidence": "confirmed", "state": "fixed"}, "recent": []}
+    limits_fixed = review.repair_limits({"sources": mr_units[:2]}, coverage_fixed, update=True)
+    assert "fixed" in limits_fixed["state"] and "tagged" not in limits_fixed["state"]
+    cand_fixed = _candidate(
+        confidence="confirmed",
+        state="fixed",
+        category="security",
+        tags=["security"],
+        sources=[{"url": u["url"], "title": u["title"]} for u in mr_units[:2]],
+        updates=[{
+            "at": LATER,
+            "text": "Follow-up merge 2 completed.",
+            "sources": [{"url": mr_units[1]["url"], "title": mr_units[1]["title"]}],
+        }],
+    )
+    assert review.final_holds(
+        cand_fixed, {"mode": "update", "packet": {"sources": mr_units[:2]}, "coverage": coverage_fixed}
+    ) == []

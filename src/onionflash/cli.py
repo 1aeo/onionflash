@@ -15,10 +15,10 @@ import traceback
 
 from . import __version__, decisions, doctor, editorial, rejection
 from .analyze import AnalysisError, Analyzer
-from .llm import CompletionDeferred
 from .collect import CollectionError, collect_source
 from .comments import RUN_BUDGET_SECONDS as COMMENTS_BUDGET, enrich_comments, merge_cached_comments, status as comments_status
-from .config import DEFAULTS, load_config
+from .config import enabled_consensus_sources, load_config
+from .llm import CompletionDeferred
 from .publication import build
 from .review import Reviewer, ReviewLimitReached
 from .review_gate import process_item, status as review_status
@@ -26,11 +26,12 @@ from .store import Store, source_due
 from .transport import HttpClient
 from .util import now_iso
 
-OPERATOR_ACTIONS = {
-    "story": {"show", "history", "correct", "retract", "restore", "unlock", "merge"},
-    "rejected": {"list", "show", "retry", "dismiss", "approve"},
-    "decisions": {"summary", "list"},
+_OPERATOR_ACTION_ORDER = {
+    "story": ("show", "history", "correct", "retract", "restore", "unlock", "merge"),
+    "rejected": ("list", "show", "retry", "dismiss", "approve"),
+    "decisions": ("summary", "list"),
 }
+OPERATOR_ACTIONS = {k: set(v) for k, v in _OPERATOR_ACTION_ORDER.items()}
 READ_ONLY_ACTIONS = {"show", "history", "list", "summary"}
 
 
@@ -65,7 +66,7 @@ def _operator_parsers(commands, cfg_parent: argparse.ArgumentParser) -> None:
 
     story = commands.add_parser("story", help="Inspect, correct, merge, or retract a published story")
     actions = story.add_subparsers(dest="action", required=True)
-    for name in ("show", "history", "correct", "retract", "restore", "unlock", "merge"):
+    for name in _OPERATOR_ACTION_ORDER["story"]:
         parents = [cfg_parent] if name in READ_ONLY_ACTIONS else [cfg_parent, guarded]
         action = actions.add_parser(name, parents=parents)
         action.add_argument("--story", required=True, help="Stable story ID")
@@ -78,7 +79,7 @@ def _operator_parsers(commands, cfg_parent: argparse.ArgumentParser) -> None:
 
     rejected = commands.add_parser("rejected", help="Inspect, retry, dismiss or approve held analyses")
     actions = rejected.add_subparsers(dest="action", required=True)
-    for name in ("list", "show", "retry", "dismiss", "approve"):
+    for name in _OPERATOR_ACTION_ORDER["rejected"]:
         parents = [cfg_parent, guarded] if name in {"retry", "dismiss"} else [cfg_parent]
         action = actions.add_parser(name, parents=parents)
         if name == "list":
@@ -93,7 +94,7 @@ def _operator_parsers(commands, cfg_parent: argparse.ArgumentParser) -> None:
 
     log = commands.add_parser("decisions", help="Summarize or list recent private decisions")
     actions = log.add_subparsers(dest="action", required=True)
-    for name in ("summary", "list"):
+    for name in _OPERATOR_ACTION_ORDER["decisions"]:
         action = actions.add_parser(name, parents=[cfg_parent])
         action.add_argument("--since", default="7d", help="Hours or days before now, such as 7d, or a timestamp")
         if name == "list":
@@ -103,7 +104,7 @@ def _operator_parsers(commands, cfg_parent: argparse.ArgumentParser) -> None:
             action.add_argument("--after", type=int, help="Continuation cursor returned by the previous list")
 
 
-def _operator_command(args, store: Store, config: dict | None = None) -> dict:
+def _operator_command(args, store: Store, config: dict) -> dict:
     """Dispatch one inspection, or one operator action with its required hash and reason."""
     if args.command == "story":
         if args.action == "show":
@@ -112,8 +113,7 @@ def _operator_command(args, store: Store, config: dict | None = None) -> dict:
             return editorial.history(store.db, args.story)
         options = {"reason": args.reason, "expect_hash": args.expect_hash}
         if args.action == "merge":
-            base_url = (config or {}).get("site", {}).get("base_url", DEFAULTS["site"]["base_url"])
-            result = editorial.merge(store.db, args.story, args.into_story, base_url=base_url, **options)
+            result = editorial.merge(store.db, args.story, args.into_story, base_url=config["site"]["base_url"], **options)
         elif args.action == "correct":
             result = editorial.correct(store.db, args.story, json.loads(args.patch.read_text(encoding="utf-8")), **options)
         elif args.action == "restore":
@@ -137,10 +137,9 @@ def _operator_command(args, store: Store, config: dict | None = None) -> dict:
 
 def run(config: dict, store: Store) -> dict:
     """Collect and review pending items within one deadline, then build the site."""
-    consensus_sources = [s for s in config["sources"] if s.get("alert_format") == "consensus" and s["enabled"]]
-    if len(consensus_sources) > 1:
-        raise ValueError("At most one enabled consensus alert source is supported")
+    consensus_sources = enabled_consensus_sources(config["sources"], check_single=True)
     observed = now_iso()
+    first = decisions.latest_id(store.db)
     report = {
         "sources_ok": 0, "sources_failed": 0, "items_changed": 0, "analyzed": 0,
         "analysis_failed": 0, "budget_reached": False, "entries_skipped": 0,
@@ -211,7 +210,6 @@ def run(config: dict, store: Store) -> dict:
         }
     run_deadline = started + budget
     endpoint_failures = 0
-    first = decisions.latest_id(store.db)
     with (
         Analyzer(config, deadline=run_deadline) as analyzer,
         Reviewer(config, deadline=run_deadline) as reviewer,
@@ -223,6 +221,8 @@ def run(config: dict, store: Store) -> dict:
                     config, store, consensus_source, linker, now_iso(), allow_network=endpoint_failures < 2,
                 )
                 endpoint_failures += evaluated.pop("endpoint_failures", 0)
+                if evaluated.pop("budget_reached", False):
+                    report["budget_reached"] = True
                 report["network"] = {**network_ingested, **evaluated}
             except sqlite3.Error:
                 raise
@@ -257,20 +257,18 @@ def run(config: dict, store: Store) -> dict:
             except CompletionDeferred:
                 report["budget_reached"] = True
                 break
-            except AnalysisError as exc:
-                deferred = store.defer(row["id"], str(exc), config["llm"], now_iso(), terminal=not exc.retryable,
-                                       code=exc.code, expected_row=row)
-                report["analysis_failed"] += deferred
-                report["review_stale"] += not deferred
-                if exc.retryable:
-                    endpoint_failures += 1
             except sqlite3.Error:
                 raise
             except Exception as exc:
-                deferred = store.defer(row["id"], _unexpected_error(exc), config["llm"], now_iso(),
-                                       terminal=True, expected_row=row)
+                is_analysis = isinstance(exc, AnalysisError)
+                retryable = is_analysis and exc.retryable
+                deferred = store.defer(
+                    row["id"], str(exc) if is_analysis else _unexpected_error(exc), config["llm"], now_iso(),
+                    terminal=not retryable, code=exc.code if is_analysis else "app.unexpected", expected_row=row,
+                )
                 report["analysis_failed"] += deferred
                 report["review_stale"] += not deferred
+                endpoint_failures += retryable
         report["model_calls"] = analyzer.calls + reviewer.calls + linker.calls
     report["decisions"] = decisions.codes_after(store.db, first)
     report["pending_analysis"] = store.pending_count()
@@ -278,20 +276,6 @@ def run(config: dict, store: Store) -> dict:
     report["final_review"] = review_status(store)
     report.update(build(config, store))
     return report
-
-
-def _status_report(config: dict, store: Store) -> dict:
-    published = store.get_meta("published_stories")
-    return {
-        "pending_analysis": store.pending_count(),
-        "rejected_analysis": store.rejected_count(),
-        "published_stories": int(published) if published is not None else None,
-        "comments": {"enabled": config["comments"]["enabled"], **comments_status(store)},
-        "final_review": review_status(store),
-        "network_health": doctor.status(store.db, config["sources"]),
-        "decisions_24h": decisions.recent(store.db, now_iso()),
-        "sources": store.health(config["sources"], config["collection"]["stale_after_seconds"], now_iso()),
-    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -328,17 +312,26 @@ def main(argv: list[str] | None = None) -> int:
         database = config["storage"]["database"]
         dirauth_users = config["collection"]["dirauth_gitlab_users"]
         operator = args.command in OPERATOR_ACTIONS
-        if args.command == "status" or (operator and args.action in READ_ONLY_ACTIONS):
-            with Store(database, dirauth_users=dirauth_users) as store:
-                payload = _status_report(config, store) if args.command == "status" else _operator_command(args, store, config)
-            print(json.dumps(payload, ensure_ascii=operator))
-            return 0
-        with run_lock(database) as acquired:
+        read_only = args.command == "status" or (operator and args.action in READ_ONLY_ACTIONS)
+        guard = contextlib.nullcontext(True) if read_only else run_lock(database)
+        with guard as acquired:
             if not acquired:
                 print(json.dumps({"status": "already-running"}))
                 return 0 if args.command == "run" else 75
             with Store(database, dirauth_users=dirauth_users) as store:
-                if operator:
+                if args.command == "status":
+                    observed, published = now_iso(), store.get_meta("published_stories")
+                    result = {
+                        "pending_analysis": store.pending_count(),
+                        "rejected_analysis": store.rejected_count(),
+                        "published_stories": int(published) if published is not None else None,
+                        "comments": {"enabled": config["comments"]["enabled"], **comments_status(store)},
+                        "final_review": review_status(store),
+                        "network_health": doctor.status(store.db, config["sources"]),
+                        "decisions_24h": decisions.recent(store.db, observed),
+                        "sources": store.health(config["sources"], config["collection"]["stale_after_seconds"], observed),
+                    }
+                elif operator:
                     result = _operator_command(args, store, config)
                 elif args.command == "run":
                     result = run(config, store)

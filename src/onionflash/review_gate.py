@@ -11,18 +11,19 @@ also prove their source before a mismatch can reset automatic review work.
 
 from __future__ import annotations
 
-import contextlib
 import copy
 import json
 import re
 
 from . import candidate as candidate_mod, decisions, editorial, review, source_packet
 from .analyze import cache_key
-from .comments import analysis_context
 from .llm import AnalysisError, CompletionDeferred, RequestObserver
+from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, SHA256_RE, STATES
+from .store import ITEM_SAFE_COLUMNS, decode_item_row, item_hash, item_hash_fields, set_job_stage
 from .util import (
-    DIRAUTH_GITLAB_USERS, _GITLAB_OWN, after, canonical_url, digest, gitlab_refs, is_dirauth_item,
-    is_hackerone_item, item_cluster, now_iso, release_mentions, saved_object, thread_subject,
+    _GITLAB_OWN, after, digest, dirauth_user_set, folded_labels, gitlab_refs, has_invalid_text_chars,
+    is_dirauth_item, is_hackerone_item, item_cluster, now_iso, parse_utc, release_mentions,
+    safe_canonical_url, saved_object, strict_json, thread_subject,
 )
 
 REVIEW_STATE_VERSION = 2
@@ -35,9 +36,8 @@ HIGH_SECURITY_SEVERITIES = frozenset({"severity::high", "severity::critical"})
 # checked by another fresh verification: an item gets at most MAX_VERIFY_REPAIRS + 2 review requests.
 MAX_VERIFY_REPAIRS = 5
 MAX_REVIEW_REQUESTS = MAX_VERIFY_REPAIRS + 2
-# An item from these sources, other than a version tag, that fails only news value is held for the
-# operator, never skipped.
 OFFICIAL_AUTHORITIES = frozenset({"official", "project-sender", "hackerone", "dirauth-operator"})
+OUTCOME_STAGES = {"approve": "approved", "skip": "skipped", "hold": "held", "route": "routed"}
 # Each hold reason and its operator text, which follows "Final review held: " in last_error. A hold
 # is logged as held.<stage>.<reason>, the stage being gate, review, verification or final_check.
 HOLDS = {
@@ -62,51 +62,39 @@ HOLDS = {
 }
 
 
-def _json(value):
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and bool(SHA256_RE.fullmatch(value))
 
 
-def _dirauth_users(config, store):
-    if isinstance(config, dict) and "dirauth_gitlab_users" in (config.get("collection") or {}):
-        return config["collection"]["dirauth_gitlab_users"]
-    return getattr(store, "dirauth_users", None)
-
-
-def _dirauth_set(users) -> set[str]:
-    return {
-        u.strip().lower()
-        for u in (DIRAUTH_GITLAB_USERS if users is None else users)
-        if isinstance(u, str) and u.strip()
-    }
-
-
-def _prepare_candidate(store, row, draft, prepared_at, dirauth_users):
-    had_attr = hasattr(store, "dirauth_users")
-    prior_users = getattr(store, "dirauth_users", None)
-    if dirauth_users is not None:
-        store.dirauth_users = tuple(dirauth_users)
-    try:
-        return store.prepare_candidate(row, draft, prepared_at)
-    finally:
-        if had_attr:
-            store.dirauth_users = prior_users
-        elif hasattr(store, "dirauth_users"):
-            delattr(store, "dirauth_users")
-
-
-def _record_input_hash(record: object) -> str | None:
-    if not isinstance(record, dict):
-        return None
-    if isinstance(record.get("input_hash"), str):
-        return record["input_hash"]
-    legacy = record.get("input_row")
-    return legacy.get("content_hash") if isinstance(legacy, dict) else None
+def _prepare(store, config, row, draft, at):
+    users = (config.get("collection") or {}).get("dirauth_gitlab_users") if isinstance(config, dict) else None
+    return store.prepare_candidate(row, draft, at, **({"dirauth_users": users} if "prepare_candidate" not in vars(store) else {}))
 
 
 def initial_review_state():
     """Only newly created chains initialize these fields; saved chains require them."""
     return {"request_budget": {"reserved": 0, "inconsistent_requests": [], "validation_reask": None},
             "untrusted_proposals": []}
+
+
+def _new_record(input_row: dict, writer=None, **extra) -> dict:
+    return {"schema_version": REVIEW_STATE_VERSION, "writer": writer, "input_hash": input_row["content_hash"],
+            "input_proof": 1, "input_row": input_row, "reviews": [], **initial_review_state(), **extra}
+
+
+def _load_job(db, item_id: str):
+    job = db.execute(
+        """SELECT writer_key,policy_hash,stage,approval_key,prepared_at,
+           draft_json IS NOT NULL AS has_draft,envelope_json IS NOT NULL AS has_envelope,
+           CASE WHEN typeof(draft_json)='text' THEN CAST(draft_json AS BLOB) END AS draft,
+           CASE WHEN typeof(envelope_json)='text' THEN CAST(envelope_json AS BLOB) END AS envelope,
+           CASE WHEN typeof(record_json)='text' THEN CAST(record_json AS BLOB) END AS record
+           FROM review_jobs WHERE item_id=?""",
+        (item_id,),
+    ).fetchone()
+    if job is None:
+        return None, None, None, None
+    return job, *(saved_object(job[k]) for k in ("draft", "envelope", "record"))
 
 
 def _carried_requests(record):
@@ -128,21 +116,88 @@ def status(store):
             "approval_cache_entries": store.db.execute("SELECT COUNT(*) FROM review_approvals").fetchone()[0]}
 
 
+def _valid_timestamp(value: object) -> bool:
+    try:
+        parse_utc(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _valid_saved_draft(draft: object) -> bool:
+    if not isinstance(draft, dict) or draft.get("publish", True) is not True:
+        return False
+    evidence = draft.get("evidence")
+    if not isinstance(evidence, list) or any(not isinstance(q, str) or has_invalid_text_chars(q) for q in evidence):
+        return False
+    fields = set(draft) - {"publish"}
+    if "update" in draft:
+        return (
+            fields == {"update", "confidence", "state", "evidence"}
+            and isinstance(draft["update"], str)
+            and bool(draft["update"].strip())
+            and not has_invalid_text_chars(draft["update"])
+            and draft["confidence"] in CONFIDENCES
+            and draft["state"] in STATES
+        )
+    return (
+        fields == {*candidate_mod.SEMANTIC_FIELDS, "evidence"}
+        and all(
+            isinstance(draft[k], str) and (k == "why_it_matters" or bool(draft[k].strip())) and not has_invalid_text_chars(draft[k])
+            for k in ("title", "summary", "why_it_matters")
+        )
+        and draft["category"] in CATEGORIES
+        and draft["priority"] in PRIORITIES
+        and draft["confidence"] in CONFIDENCES
+        and draft["state"] in STATES
+        and isinstance(draft["products"], list)
+        and all(isinstance(p, str) and p in PRODUCTS for p in draft["products"])
+        and isinstance(draft["tags"], list)
+        and all(isinstance(t, str) and t in CATEGORIES for t in draft["tags"])
+    )
+
+
 def reset_review_work(store, item_id):
     """Explicit operator retry starts a new review, retaining its completed draft.
 
     The caller owns the transaction.
     """
-    row = store.db.execute("SELECT writer_key,CAST(draft_json AS BLOB) AS draft FROM review_jobs WHERE item_id=?",
-                           (item_id,)).fetchone()
-    if row is None:
+    job, draft, saved_env, saved_record = _load_job(store.db, item_id)
+    if job is None:
         return
-    item = dict(store.db.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone())
-    record = {"schema_version": REVIEW_STATE_VERSION, "writer": {"key": row["writer_key"]}, "input_hash": item["content_hash"], "input_proof": 1, "input_row": item, "reviews": [], **initial_review_state()}
-    # A damaged draft is dropped, so the writer drafts again.
-    keep = saved_object(row["draft"]) is not None
-    store.db.execute("""UPDATE review_jobs SET stage='drafted',draft_json=CASE WHEN ? THEN draft_json END,envelope_json=NULL,
-        record_json=?,approval_key=NULL,updated_at=? WHERE item_id=?""", (keep, _json(record), now_iso(), item_id))
+    raw_row = store.db.execute(f"SELECT {ITEM_SAFE_COLUMNS} FROM items WHERE id=?", (item_id,)).fetchone()
+    item, item_payload = decode_item_row(raw_row)
+    valid_hashes = _valid_item_hashes(item_payload) if item_payload is not None else set()
+    stale_source = (
+        (
+            isinstance(saved_record, dict)
+            and (
+                ((ih := saved_record.get("input_hash")) is not None and ih not in valid_hashes)
+                or ((ir := saved_record.get("input_row")) is not None and (not isinstance(ir, dict) or ir.get("content_hash") != item["content_hash"]))
+            )
+        )
+        or (
+            isinstance(saved_env, dict)
+            and (er := saved_env.get("row")) is not None
+            and (not isinstance(er, dict) or er.get("content_hash") != item["content_hash"])
+        )
+    ) if item is not None else True
+    if (
+        item_payload is None
+        or stale_source
+        or not _valid_saved_draft(draft)
+        or not _is_sha256(job["writer_key"])
+        or not _is_sha256(job["policy_hash"])
+        or not _valid_timestamp(job["prepared_at"])
+    ):
+        store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (item_id,))
+        return
+    record = _new_record(item, {"key": job["writer_key"]}, policy_hash=job["policy_hash"])
+    store.db.execute(
+        """UPDATE review_jobs SET stage='drafted',envelope_json=NULL,
+        record_json=?,approval_key=NULL,updated_at=? WHERE item_id=?""",
+        (strict_json(record), now_iso(), item_id),
+    )
 
 
 def _save(store, row, writer_key, policy_hash, stage, draft, prepared, record, observed,
@@ -164,17 +219,13 @@ def _save(store, row, writer_key, policy_hash, stage, draft, prepared, record, o
             policy_hash=excluded.policy_hash,stage=excluded.stage,draft_json=excluded.draft_json,
             envelope_json=excluded.envelope_json,record_json=excluded.record_json,
             approval_key=excluded.approval_key,prepared_at=excluded.prepared_at,updated_at=excluded.updated_at""",
-            (row["id"], writer_key, policy_hash, stage, _json(draft) if draft is not None else None,
-             _json(prepared) if prepared is not None else None, _json(record), approval_key, prepared_at, observed))
-
-
-def _identity(prepared):
-    return tuple(prepared[key] for key in ("candidate_hash", "source_hash", "binding_hash"))
+            (row["id"], writer_key, policy_hash, stage, strict_json(draft) if draft is not None else None,
+             strict_json(prepared) if prepared is not None else None, strict_json(record), approval_key, prepared_at, observed))
 
 
 def _policy_copies(record, policy):
     """Check retained policy metadata without interpreting older verdict schemas."""
-    if not isinstance(policy, str) or not re.fullmatch(r"[0-9a-f]{64}", policy):
+    if not _is_sha256(policy):
         raise ValueError()
     pending = [record]
     while pending:
@@ -200,20 +251,11 @@ def _policy_copies(record, policy):
 
 def _valid_item_hashes(payload: dict) -> set[str]:
     """Return current and exact historical item_hash digests accepted for saved payloads."""
-    from .store import item_hash
-
     hashes = {item_hash(payload)}
     if isinstance(payload.get("source_content"), str):
         hashes.add(item_hash({k: v for k, v in payload.items() if k != "source_content"}))
     if payload.get("dirauth_notes"):
-        fields = {k: payload.get(k) for k in ("title", "content", "kind", "product", "labels", "authority", "upstream_state")}
-        fields["content"] = payload.get("source_content", payload.get("content"))
-        if payload.get("author"):
-            fields["author"] = payload["author"]
-        if payload.get("public_comments"):
-            fields["public_comments"] = analysis_context(payload)[1]
-        fields["dirauth_notes"] = payload["dirauth_notes"]
-        hashes.add(digest(fields))
+        hashes.add(digest({**item_hash_fields(payload, include_sender_domain=False), "dirauth_notes": payload["dirauth_notes"]}))
     return hashes
 
 
@@ -229,40 +271,23 @@ def _valid_item_fingerprints(row: dict) -> set[str]:
 
 def _saved_job(store, row, config):
     """Validate saved identity before a mismatch can start a fresh automatic review."""
-    from .store import item_hash
-
-    job = store.db.execute(
-        """SELECT writer_key,policy_hash,stage,approval_key,prepared_at,
-           typeof(draft_json) AS draft_type,CAST(draft_json AS BLOB) AS draft,
-           typeof(envelope_json) AS envelope_type,CAST(envelope_json AS BLOB) AS envelope,
-           typeof(record_json) AS record_type,CAST(record_json AS BLOB) AS record
-           FROM review_jobs WHERE item_id=?""",
-        (row["id"],),
-    ).fetchone()
+    job, draft, prepared, record = _load_job(store.db, row["id"])
     if job is None:
         return None, None, None, None, False
-    draft, prepared, record = (
-        saved_object(job[key]) if job[key + "_type"] == "text" else None
-        for key in ("draft", "envelope", "record")
-    )
     try:
-        if (record is None or (draft is None) != (job["draft"] is None)
-                or (prepared is None) != (job["envelope"] is None)):
+        if (record is None or (draft is not None) != bool(job["has_draft"])
+                or (prepared is not None) != bool(job["has_envelope"])):
             raise ValueError()
 
-        def source_identity(value):
-            """Verify saved row identifiers, payload integrity, and content_hash binding."""
-            if not isinstance(value, dict):
+        def _source_identity(value):
+            if not isinstance(value, dict) or (payload := saved_object(value["payload"].encode("utf-8"))) is None:
                 raise ValueError()
-            payload = saved_object(value["payload"].encode("utf-8"))
-            if (not isinstance(payload, dict) or value["id"] != row["id"] or payload.get("id") != value["id"]
+            if (value["id"] != row["id"] or payload.get("id") != value["id"]
                     or payload.get("url") != value["url"] or payload.get("source_id") != value["source_id"]
-                    or not isinstance(value["content_hash"], str)
-                    or not re.fullmatch(r"[0-9a-f]{64}", value["content_hash"])):
+                    or not _is_sha256(value["content_hash"])
+                    or value["content_hash"] not in _valid_item_hashes(payload)):
                 raise ValueError()
-            if value["content_hash"] not in _valid_item_hashes(payload):
-                raise ValueError()
-            return value["content_hash"]
+            return value["content_hash"], payload
 
         version, marker = record.get("schema_version"), record.get("input_proof")
         if type(version) is not int or version not in {1, REVIEW_STATE_VERSION}:
@@ -274,8 +299,7 @@ def _saved_job(store, row, config):
         elif {"input_proof", "request_budget", "untrusted_proposals"} & set(record):
             # These fields were never emitted by a merged version-one producer.
             raise ValueError()
-        if "input_hash" in record and (not isinstance(record["input_hash"], str)
-                or not re.fullmatch(r"[0-9a-f]{64}", record["input_hash"])):
+        if "input_hash" in record and not _is_sha256(record["input_hash"]):
             raise ValueError()
         if version == REVIEW_STATE_VERSION:
             if "input_hash" not in record:
@@ -294,23 +318,23 @@ def _saved_job(store, row, config):
             proof_row = prepared["row"]
         else:
             raise ValueError()
-        source_hash = source_identity(proof_row)
-        if _record_input_hash(record) != source_hash:
+        source_hash, proof_payload = _source_identity(proof_row)
+        if "input_hash" in record and record["input_hash"] != source_hash:
             raise ValueError()
-        if "input_row" in record and (source_identity(record["input_row"]) != source_hash
-                or candidate_mod.item_fingerprint(record["input_row"]) != candidate_mod.item_fingerprint(proof_row)):
-            raise ValueError()
-        source_identity(row)
-        same_source = (item_hash(saved_object(proof_row["payload"].encode("utf-8")))
-                       == item_hash(saved_object(row["payload"].encode("utf-8"))))
-        if (not isinstance(job["writer_key"], str) or not re.fullmatch(r"[0-9a-f]{64}", job["writer_key"])
+        for extra_row in (*([record["input_row"]] if "input_row" in record else ()), *([prepared["row"]] if prepared is not None else ())):
+            if extra_row is not proof_row and (
+                _source_identity(extra_row)[0] != source_hash
+                or candidate_mod.item_fingerprint(extra_row) != candidate_mod.item_fingerprint(proof_row)
+            ):
+                raise ValueError()
+        _, row_payload = _source_identity(row)
+        same_source = item_hash(proof_payload) == item_hash(row_payload)
+        if (not _is_sha256(job["writer_key"])
+                or not _valid_timestamp(job["prepared_at"])
                 or not isinstance(record.get("writer"), dict) or record["writer"].get("key") != job["writer_key"]):
             raise ValueError()
         if prepared is not None:
-            if (source_identity(prepared["row"]) != source_hash
-                    or candidate_mod.item_fingerprint(proof_row) != candidate_mod.item_fingerprint(prepared["row"])
-                    or not isinstance(prepared["binding"].get("item"), str)
-                    or prepared["binding"]["item"] not in _valid_item_fingerprints(prepared["row"])):
+            if not isinstance(prepared["binding"].get("item"), str) or prepared["binding"]["item"] not in _valid_item_fingerprints(prepared["row"]):
                 raise ValueError()
         elif job["stage"] != "drafted":
             raise ValueError()
@@ -357,12 +381,7 @@ def _story_text(story: dict) -> str:
 
 
 def _story_urls(story: dict) -> set[str]:
-    urls = set()
-    for src in story.get("sources") or ():
-        if isinstance(src, dict) and isinstance(src.get("url"), str):
-            with contextlib.suppress(ValueError, TypeError, UnicodeError):
-                urls.add(canonical_url(src["url"]))
-    return urls
+    return {u for src in (story.get("sources") or ()) if isinstance(src, dict) and (u := safe_canonical_url(src.get("url")))}
 
 
 def _story_gitlab_refs(story: dict) -> set[str]:
@@ -376,19 +395,15 @@ def _story_gitlab_refs(story: dict) -> set[str]:
         )
         if isinstance(src, dict) and isinstance(src.get("url"), str)
     ]
-    refs = set()
-    for group in gitlab_refs({"url": "", "title": "", "content": "\n".join([*src_urls, text])}):
-        refs.update(group)
-    projects = {}
-    for raw_url in src_urls:
-        with contextlib.suppress(ValueError, TypeError, UnicodeError):
-            clean = canonical_url(raw_url)
-            if match := _GITLAB_OWN.match(clean):
-                projects[(match.group(1), match.group(2).lower())] = clean
+    refs = set().union(*gitlab_refs({"url": "", "title": "", "content": "\n".join([*src_urls, text])}))
+    projects = {
+        (match.group(1), match.group(2).lower()): clean
+        for raw_url in src_urls
+        if (match := _GITLAB_OWN.match(clean := safe_canonical_url(raw_url)))
+    }
     if len(projects) == 1:
         [context_url] = projects.values()
-        for group in gitlab_refs({"url": context_url, "title": "", "content": text}):
-            refs.update(group)
+        refs.update(*gitlab_refs({"url": context_url, "title": "", "content": text}))
     return refs
 
 
@@ -470,7 +485,7 @@ def _auto_merge_pair(store, a_id: str, b_id: str) -> tuple[str, str] | None:
     if len(rows) != 2:
         return None
     pa, pb = saved_object(rows[a_id]["payload"]), saved_object(rows[b_id]["payload"])
-    if not isinstance(pa, dict) or not isinstance(pb, dict):
+    if pa is None or pb is None:
         return None
     cka, ckb = rows[a_id]["cluster_key"], rows[b_id]["cluster_key"]
     if (pa.get("origin") == "network-health" or pb.get("origin") == "network-health"
@@ -478,10 +493,10 @@ def _auto_merge_pair(store, a_id: str, b_id: str) -> tuple[str, str] | None:
             or (cka.startswith("release:") and ckb.startswith("release:") and cka != ckb)
             or not _specific_story_overlap(pa, pb)):
         return None
-    key_a = (pa.get("added_at") or rows[a_id]["added_at"] or rows[a_id]["published_at"], rows[a_id]["published_at"], a_id)
-    key_b = (pb.get("added_at") or rows[b_id]["added_at"] or rows[b_id]["published_at"], rows[b_id]["published_at"], b_id)
-    dup_id, surv_id = (b_id, a_id) if key_a < key_b else (a_id, b_id)
-    dup_p, surv_p = (pb, pa) if dup_id == b_id else (pa, pb)
+    (surv_p, surv_id), (dup_p, dup_id) = sorted(
+        ((pa, a_id), (pb, b_id)),
+        key=lambda pair: (pair[0].get("added_at") or rows[pair[1]]["added_at"] or rows[pair[1]]["published_at"], rows[pair[1]]["published_at"], pair[1]),
+    )
     if (pa.get("network") or pb.get("network")
             or dup_p.get("updates")
             or (dup_p.get("confidence") == "confirmed" and surv_p.get("confidence") != "confirmed")
@@ -533,8 +548,7 @@ def _can_route(candidate: dict, prepared: dict, result: dict, target_id) -> bool
         cand_products.add(item["product"])
     if cand_products & set(target.get("products") or ()) or target.get("related"):
         return True
-    target_text = f"{target.get('title') or ''}\n{target.get('summary') or ''}\n{target.get('latest_update') or ''}"
-    if set(sum(gitlab_refs(item), [])) & set(sum(gitlab_refs({"url": "", "title": "", "content": target_text}), [])):
+    if set().union(*gitlab_refs(item)) & set().union(*gitlab_refs({"url": "", "title": "", "content": _story_text(target)})):
         return True
     item_subj, _ = thread_subject(item)
     target_subj, _ = thread_subject({"url": item.get("url"), "title": target.get("title")})
@@ -564,9 +578,9 @@ def next_step(reviews, candidate, prepared):
         or (prepared.get("coverage") or {}).get("prior_story") is not None
     )
     official = (
-        item.get("authority") in {"official", "project-sender", "hackerone"}
+        item.get("authority") in (OFFICIAL_AUTHORITIES - {"dirauth-operator"})
         or is_hackerone_item(item)
-        or ((item.get("authority") in OFFICIAL_AUTHORITIES or is_dirauth_item(item, prepared.get("dirauth_users"))) and recent_dev)
+        or ((item.get("authority") == "dirauth-operator" or is_dirauth_item(item, prepared.get("dirauth_users"))) and recent_dev)
     ) and item.get("kind") != "tag"
     # An official item that fails only news value is the operator's to judge, once a fresh
     # verification has passed its facts; a duplicate still skips.
@@ -576,15 +590,14 @@ def next_step(reviews, candidate, prepared):
             return "hold", (stage, "official_not_news")
         if verdict != "revise":
             return ("hold", (stage, "model_hold")) if later else ("verify", candidate)
-    elif verdict == "skip" and (
-        not official
-        or (result["criteria"]["new_information"]["outcome"] == "fail" and not result.get("same_story"))
-    ):
-        if stage == "review" and not later and _can_auto_merge_review(candidate, prepared, result):
+    elif verdict == "skip":
+        if not official or (
+            result["criteria"]["new_information"]["outcome"] == "fail"
+            and (prepared.get("mode") == "update" or not result.get("same_story"))
+        ):
+            return ("verify" if stage == "review" and not later and _can_auto_merge_review(candidate, prepared, result) else "skip"), candidate
+        if result.get("same_story") and stage == "review" and not later:
             return "verify", candidate
-        return "skip", candidate
-    elif verdict == "skip" and official and result.get("same_story") and stage == "review" and not later:
-        return "verify", candidate
     if verdict == "approve":
         if stage == "verification" and (held := review.final_holds(candidate, prepared)):
             return "hold", ("final_check", held[0])
@@ -596,13 +609,12 @@ def next_step(reviews, candidate, prepared):
         return ("verify" if stage == "review" else "approve"), candidate
     if verdict != "revise" or (later and failed & review.EDITORIAL_CRITERIA and not disputed):
         return "hold", (stage, "release_labels" if latest.get("issue") else "model_hold")
-    is_update = prepared.get("mode") == "update"
-    if (item.get("kind") == "tag") if is_update else (prepared["payload"]["editorial_kind"] == "tag"):
+    if _literal_tag(prepared):
         return "hold", (stage, "tag_repair")
     if len(reviews) > MAX_VERIFY_REPAIRS + 1:
         return "hold", (stage, "repairs_exhausted")
     try:
-        repaired = review.apply_repair(candidate, result["repair"], update=is_update)
+        repaired = review.apply_repair(candidate, result["repair"], update=prepared.get("mode") == "update")
     except review.ReviewError:
         # After a disputed official item's first review, the unchanged text goes to its fresh verification.
         return ("verify", candidate) if disputed and not later else ("hold", (stage, "unusable_repair"))
@@ -732,6 +744,23 @@ def proposal_needs_check(record):
     return bool(pending_proposal(record)) or bool(active and latest <= active[-1]["request"])
 
 
+def _entry_stage(entry: dict) -> str:
+    return "repair" if entry.get("issue") == "release_labels" else "verify" if entry["stage"] == "verification" else "review"
+
+
+def _active_events(record: dict) -> list[tuple]:
+    return ([(entry.get("request"), False, entry) for entry in record["reviews"]]
+            + [(p["request"], True, p) for p in record["untrusted_proposals"] if p["disposition"] != "discarded_context"])
+
+
+def _agreed_same_story(reviews: list[dict]) -> str | None:
+    if len(reviews) >= 2 and reviews[-1]["stage"] == "verification":
+        first, final = reviews[0]["result"].get("same_story"), reviews[-1]["result"].get("same_story")
+        if isinstance(first, str) and first and first == final:
+            return first
+    return None
+
+
 def _validate_reask(record, stage):
     """Bind the one correction slot to its rejected reply and observed response."""
     budget, proposals = record["request_budget"], record["untrusted_proposals"]
@@ -754,14 +783,13 @@ def _validate_reask(record, stage):
     observed = correction["response"]
     for entry, untrusted in responses:
         marked = entry.get("reask_response", False)
-        if type(marked) is not bool or marked != (entry.get("request") == observed):
+        if marked != (entry.get("request") == observed):
             raise ValueError()
         if entry.get("request") in correction["attempts"] and not marked:
             raise ValueError()  # A transport retry cannot follow a received semantic reply.
         if marked:
             actual_context = entry["context"] if untrusted else {key: entry.get(key) for key in trigger["context"]}
-            actual_stage = (entry["stage"] if untrusted else "repair" if entry.get("issue") == "release_labels"
-                            else "verify" if entry["stage"] == "verification" else "review")
+            actual_stage = entry["stage"] if untrusted else _entry_stage(entry)
             before_hash = entry["candidate_before_hash"] if untrusted else entry["candidate_hash"]
             if (actual_context != trigger["context"] or actual_stage != trigger["stage"]
                     or before_hash != trigger["candidate_before_hash"]
@@ -776,11 +804,8 @@ def _validate_reask(record, stage):
 
 def _pending_reask(record, stage, candidate, prepared):
     """Resume only confirmed transport failures; an unknown or invalid reply is terminal."""
-    events = [(entry["request"], None) for entry in record["reviews"]]
-    events += [(proposal["request"], proposal) for proposal in record["untrusted_proposals"]
-               if proposal["disposition"] != "discarded_context"]
-    latest = max(events, default=(0, None), key=lambda event: event[0])[1]
-    if latest is None or latest["accepted"]:
+    _, is_proposal, latest = max(_active_events(record), default=(0, False, None), key=lambda event: event[0])
+    if not is_proposal or latest["accepted"]:
         return False
     correction = record["request_budget"]["validation_reask"]
     if correction is None or correction["trigger"] != latest["request"]:
@@ -799,14 +824,11 @@ def _pending_reask(record, stage, candidate, prepared):
 def validate_review_state(record, stage, candidate, prepared, *, allow_cached=True):
     """Fail closed on damaged bookkeeping before it can reach a cached approval."""
     budget = ReviewRequests(record).state
-    proposals = record.get("untrusted_proposals", [])
+    proposals = record["untrusted_proposals"]
     dispositions = {"pending", "superseded_unverified", "discarded_context", "unusable", "literal_tag", "labels", "repeated",
                     "checked_approve", "checked_revise", "checked_hold", "checked_skip"}
     fields = {"error", "request", "stage", "mode", "candidate_before_hash", "candidate_after_hash", "context", "changed_fields", "repair",
               "accepted", "disposition", "reask_trigger", "reask_response"}
-    def hashed(value):
-        """Return whether value is a lowercase 64-character hexadecimal SHA-256 string."""
-        return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
     try:
         if stage == "drafted":
             if (prepared is not None or record["reviews"] or "candidate" in record
@@ -814,11 +836,11 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                 raise ValueError()
         elif not isinstance(prepared, dict):
             raise ValueError()
-        if not isinstance(proposals, list) or len(proposals) > MAX_REVIEW_REQUESTS:
+        if len(proposals) > MAX_REVIEW_REQUESTS:
             raise ValueError()
         for entry in record["reviews"]:
             if (not isinstance(entry, dict) or entry.get("stage") not in {"review", "verification"}
-                    or not hashed(entry.get("candidate_hash"))):
+                    or not _is_sha256(entry.get("candidate_hash"))):
                 raise ValueError()
             review.validate_review(entry["result"], prepared["packet"],
                                    update=prepared.get("mode") == "update", coverage=prepared.get("coverage"))
@@ -828,31 +850,27 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                     or type(proposal["request"]) is not int or not 1 <= proposal["request"] <= budget["reserved"]
                     or proposal["stage"] not in {"review", "verify", "repair"}
                     or proposal["mode"] not in {"story", "update"}
-                    or not hashed(proposal["candidate_before_hash"])
-                    or (proposal["candidate_after_hash"] is not None and not hashed(proposal["candidate_after_hash"]))
+                    or not _is_sha256(proposal["candidate_before_hash"])
+                    or (proposal["candidate_after_hash"] is not None and not _is_sha256(proposal["candidate_after_hash"]))
                     or type(proposal["accepted"]) is not bool or proposal["disposition"] not in dispositions
-                    or type(proposal["reask_trigger"]) is not bool or type(proposal["reask_response"]) is not bool
+                    or type(proposal["reask_trigger"]) is not bool
                     or not isinstance(proposal["context"], dict)
                     or set(proposal["context"]) != {"source_hash", "coverage_hash", "binding_hash", "policy_hash"}
-                    or not all(hashed(value) for value in proposal["context"].values())
+                    or not all(_is_sha256(value) for value in proposal["context"].values())
                     or not isinstance(proposal["changed_fields"], list)
                     or proposal["changed_fields"] != sorted(set(proposal["changed_fields"]))
                     or set(proposal["changed_fields"]) - set(candidate_mod.UPDATE_FIELDS if proposal["mode"] == "update" else review.EDITABLE)):
                 raise ValueError()
             accepted = proposal["accepted"]
-            if (proposal["repair"] is not None and not isinstance(proposal["repair"], dict)):
-                raise ValueError()
             if proposal["repair"] is not None:
                 review._repair_fields(proposal["repair"], update=proposal["mode"] == "update")
-            if accepted and (proposal["candidate_after_hash"] is None or not proposal["changed_fields"]):
-                raise ValueError()
-            if accepted and proposal["disposition"] in {"unusable", "literal_tag", "labels", "repeated"}:
-                raise ValueError()
-            if proposal["disposition"] in {"pending", "superseded_unverified"} and not accepted:
+            if ((accepted and (proposal["candidate_after_hash"] is None or not proposal["changed_fields"]))
+                    or (proposal["disposition"] != "discarded_context"
+                        and accepted == (proposal["disposition"] in {"unusable", "literal_tag", "labels", "repeated"}))):
                 raise ValueError()
             if proposal["disposition"].startswith("checked_"):
                 verdict = proposal["disposition"].removeprefix("checked_")
-                if not accepted or not any(entry["stage"] == "verification"
+                if not any(entry["stage"] == "verification"
                         and entry["candidate_hash"] == proposal["candidate_after_hash"]
                         and type(entry.get("request")) is int and proposal["request"] < entry["request"] <= budget["reserved"]
                         and entry["result"]["verdict"] == verdict
@@ -891,9 +909,7 @@ def _validate_candidate_path(record, stage, candidate, prepared, *, allow_cached
     current = prepared.get("candidate", record.get("candidate"))
     expected_stage, trusted, seen = "review", [], {digest(current)}
     last_action, last_value = None, None
-    events = [(entry.get("request"), False, entry) for entry in record["reviews"]]
-    events += [(proposal["request"], True, proposal) for proposal in record["untrusted_proposals"]
-               if proposal["disposition"] != "discarded_context"]
+    events = _active_events(record)
     if (any(type(number) is not int or not 1 <= number <= record["request_budget"]["reserved"] for number, _, _ in events)
             or len({number for number, _, _ in events}) != len(events)):
         raise ValueError()
@@ -914,8 +930,7 @@ def _validate_candidate_path(record, stage, candidate, prepared, *, allow_cached
                 current, expected_stage = after, "verify"
                 seen.add(digest(current))
         else:
-            actual_stage = "repair" if entry.get("issue") == "release_labels" else "verify" if entry["stage"] == "verification" else "review"
-            if (actual_stage != expected_stage or entry["candidate_hash"] != digest(current)
+            if (_entry_stage(entry) != expected_stage or entry["candidate_hash"] != digest(current)
                     or any(entry.get(key) != value for key, value in context.items())):
                 raise ValueError()
             trusted.append(entry)
@@ -928,7 +943,7 @@ def _validate_candidate_path(record, stage, candidate, prepared, *, allow_cached
                     current, expected_stage = value, action
                     seen.add(digest(current))
             else:
-                expected_stage = {"approve": "approved", "skip": "skipped", "hold": "held", "route": "routed"}[action]
+                expected_stage = OUTCOME_STAGES[action]
     if (digest(current) != digest(candidate)
             or (not allow_cached and digest(record.get("candidate")) != digest(candidate))):
         raise ValueError()
@@ -936,7 +951,7 @@ def _validate_candidate_path(record, stage, candidate, prepared, *, allow_cached
     # current chain. It does not manufacture current-chain reviewer requests.
     cached_terminal = False
     if stage in {"approved", "skipped"} or "approval" in record:
-        key = digest([digest(candidate), context["source_hash"], record["policy_hash"], context["binding_hash"]])
+        key = _approval_key(candidate, context, record["policy_hash"])
         if record.get("approval_key") != key:
             raise ValueError()
         if "approval" in record:
@@ -957,9 +972,8 @@ def _validate_candidate_path(record, stage, candidate, prepared, *, allow_cached
                         and last_value[0] == "final_check")
     merged_handoff = (stage == "routed" and expected_stage in {"approved", "skipped"}
                       and record.get("merged_duplicate") == prepared.get("story_id")
-                      and len(trusted) >= 2 and trusted[-1]["stage"] == "verification"
-                      and trusted[0]["result"].get("same_story") == record.get("routed_to")
-                      and trusted[-1]["result"].get("same_story") == record.get("routed_to")
+                      and (agreed := _agreed_same_story(trusted)) is not None
+                      and agreed == record.get("routed_to")
                       and _can_auto_merge_review(candidate, prepared, trusted[-1]["result"]))
     if stage == "routed" and last_action == "route" and record.get("routed_to") != last_value:
         raise ValueError()
@@ -976,22 +990,12 @@ def _literal_tag(prepared):
 def _allowed_proposal(before, after, prepared, repair):
     """Check proposed labels without reclassifying read-only update context."""
     update = prepared.get("mode") == "update"
-    limits = review.repair_limits(prepared["packet"], prepared.get("coverage"), update=update)
-    editable = candidate_mod.UPDATE_FIELDS if update else review.EDITABLE
-    if (set(after) != set(before)
-            or any(after[key] != before[key] for key in before if key not in editable)
-            or any(repair[field] not in allowed for field, allowed in limits.items() if field in repair)
-            or ("tags" in repair and any(tag not in limits["category"] for tag in repair["tags"]))):
+    try:
+        candidate_mod.validate_approved(before, after, "update" if update else "story")
+    except candidate_mod.ReviewRequired:
         return False
-    if not update and (any(after[field] not in allowed for field, allowed in limits.items())
-                       or any(tag not in limits["category"] for tag in after["tags"])):
-        return False
-    if update:
-        old, new = before.get("updates"), after.get("updates")
-        return bool(old and new and len(old) == len(new) and old[:-1] == new[:-1]
-                    and {k: v for k, v in old[-1].items() if k != "text"}
-                    == {k: v for k, v in new[-1].items() if k != "text"})
-    return True
+    limits = review.repair_limits(prepared["packet"], prepared.get("coverage"), update=update, candidate_sources=before.get("sources"))
+    return review.within_label_limits(repair, limits) and (update or review.within_label_limits(after, limits))
 
 
 def _seen_candidates(record, candidate, prepared):
@@ -1012,20 +1016,6 @@ def recovery_status(record):
             "unresolved_inconsistency": unresolved}
 
 
-def call_review(reviewer, stage, candidate, prepared, *, requests, correction=False) -> dict:
-    """Return only a genuinely validated reply; an invalid reply remains an exception."""
-    result = reviewer.review(candidate, prepared["packet"], coverage=prepared["coverage"], verification=stage == "verify",
-                             issue=review.RELEASE_ISSUE if stage == "repair" else None,
-                             on_request=requests.callback(correction=correction),
-                             **({"validation_error": review.INCONSISTENT_VERDICT} if correction else {}),
-                             **({"update": True} if prepared.get("mode") == "update" else {}))
-    if correction and requests.state["validation_reask"]["response"] != requests.state["reserved"]:
-        raise AnalysisError("Validation response was not observed", code="app.damaged_job")
-    return {"stage": "verification" if stage == "verify" else "review", **({"issue": "release_labels"} if stage == "repair" else {}),
-            **({"reask_response": True} if correction else {}),
-            "candidate_hash": digest(candidate), "request": requests.state["reserved"], "result": result}
-
-
 def advance_review(reviewer, stage, candidate, prepared, record, requests):
     """Runtime and evaluation share the same untrusted-proposal transition.
 
@@ -1037,14 +1027,20 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
     correction = _pending_reask(record, stage, candidate, prepared)
     seen = _seen_candidates(record, candidate, prepared)
     waiting = pending_proposal(record)
-    before = requests.actual
+    before, failed = requests.actual, None
     try:
-        entry = call_review(reviewer, stage, candidate, prepared, requests=requests, correction=correction)
-    except review.InconsistentReview as error:
+        result = reviewer.review(candidate, prepared["packet"], coverage=prepared["coverage"], verification=stage == "verify",
+                                 issue=review.RELEASE_ISSUE if stage == "repair" else None,
+                                 on_request=requests.callback(correction=correction),
+                                 **({"validation_error": review.INCONSISTENT_VERDICT} if correction else {}),
+                                 **({"update": True} if prepared.get("mode") == "update" else {}))
+    except review.InconsistentReview as exc:
         if requests.actual == before:
             raise
-        if correction and requests.state["validation_reask"]["response"] != requests.state["reserved"]:
-            raise AnalysisError("Validation response was not observed", code="app.damaged_job")
+        failed = exc
+    if correction and requests.state["validation_reask"]["response"] != requests.state["reserved"]:
+        raise AnalysisError("Validation response was not observed", code="app.damaged_job")
+    if failed is not None:
         event = {"error": review.INCONSISTENT_VERDICT, "request": requests.state["reserved"], "stage": stage,
                  "mode": prepared.get("mode", "story"),
                  "candidate_before_hash": digest(candidate), "candidate_after_hash": None,
@@ -1057,13 +1053,13 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
             if _literal_tag(prepared):
                 event["disposition"] = "literal_tag"
                 raise review.ReviewError("Literal tags cannot use untrusted edits")
-            repaired = review.apply_repair(candidate, error.proposal, update=prepared.get("mode") == "update")
+            repaired = review.apply_repair(candidate, failed.proposal, update=prepared.get("mode") == "update")
             event["candidate_after_hash"] = digest(repaired)
             event["changed_fields"] = sorted(key for key in candidate if repaired.get(key) != candidate[key])
             event["repair"] = {key: repaired[key] for key in event["changed_fields"] if key != "updates"}
             if "updates" in event["changed_fields"]:
                 event["repair"]["update"] = repaired["updates"][-1]["text"]
-            if not _allowed_proposal(candidate, repaired, prepared, error.proposal):
+            if not _allowed_proposal(candidate, repaired, prepared, failed.proposal):
                 event["disposition"] = "labels"
                 raise review.ReviewError("Untrusted edit exceeds packet label limits")
             if event["candidate_after_hash"] in seen:
@@ -1079,13 +1075,16 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
                 # criteria are still absent from the trusted review history.
                 return advance_review(reviewer, stage, candidate, prepared, record, requests)
             requests.persist()
-            raise error
+            raise failed
         if waiting is not None:
             waiting["disposition"] = "superseded_unverified"
         event.update(accepted=True, disposition="pending")
         # The caller persists this audit, exact candidate and verify stage before
         # requesting its next step. No invalid reply is appended to reviews.
         return "verify", repaired
+    entry = {"stage": "verification" if stage == "verify" else "review", **({"issue": "release_labels"} if stage == "repair" else {}),
+             **({"reask_response": True} if correction else {}),
+             "candidate_hash": digest(candidate), "request": requests.state["reserved"], "result": result}
     if waiting is not None:
         if entry["stage"] != "verification" or entry["candidate_hash"] != waiting["candidate_after_hash"]:
             raise AnalysisError("Proposal verification identity changed", code="app.damaged_job")
@@ -1105,30 +1104,36 @@ def _verified(reviews) -> bool:
 
 
 def _ignore_at_gate(store, row: dict, observed: str, error: str, code: str, *,
-                    clear_story: bool = False, before_log=None, **details) -> str:
-    story_clause = ",story_id=NULL" if clear_story else ""
+                    clear_story: bool = False, verified_pending: bool = False, before_log=None, **details) -> str:
+    def _apply() -> str:
+        if not verified_pending:
+            store.require_pending_item(row, "Source item changed before gate skip")
+        story_clause = ",story_id=NULL" if clear_story else ""
+        if not store.db.execute(
+            f"""UPDATE items SET status='ignored'{story_clause},next_attempt_at=NULL,last_error=?
+                WHERE id=? AND content_hash=? AND status='pending'""",
+            (error, row["id"], row["content_hash"]),
+        ).rowcount:
+            return "stale"
+        store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
+        if before_log is not None:
+            before_log()
+        decisions.record(store.db, row["id"], code, observed, **details)
+        return "ignored"
+
+    if verified_pending:
+        return _apply()
     try:
         with store.db:
-            store.require_pending_item(row, "Source item changed before gate skip")
-            if not store.db.execute(
-                f"""UPDATE items SET status='ignored'{story_clause},next_attempt_at=NULL,last_error=?
-                    WHERE id=? AND content_hash=? AND status='pending'""",
-                (error, row["id"], row["content_hash"]),
-            ).rowcount:
-                return "stale"
-            store.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
-            if before_log is not None:
-                before_log()
-            decisions.record(store.db, row["id"], code, observed, **details)
+            return _apply()
     except candidate_mod.StaleCandidate:
         return "stale"
-    return "ignored"
 
 
-def _attach_item(store, db, row: dict, draft: dict, writer_key: str, routed_record: dict, observed: str,
+def _attach_item(store, row: dict, draft: dict, writer_key: str, routed_record: dict, observed: str,
                  target_id: str, note: str, *, require_unmapped: bool = False) -> None:
     guard = " AND story_id IS NULL" if require_unmapped else ""
-    updated = db.execute(
+    updated = store.db.execute(
         f"""UPDATE items SET status='pending',story_id=?,attempts=0,rejections=0,
             next_attempt_at=NULL,last_error=?
             WHERE id=? AND content_hash=? AND status='pending'{guard}""",
@@ -1142,8 +1147,8 @@ def _attach_item(store, db, row: dict, draft: dict, writer_key: str, routed_reco
 
 def _hold(store, row, draft, writer_key, record, observed, stage, reason):
     """One semantic hold is terminal; only source change/operator retry requeues."""
-
-    record.update(outcome="held", hold_code=reason, hold_reason=HOLDS[reason], verified_facts=not proposal_needs_check(record) and _verified(record["reviews"]))
+    record.update(outcome="held", hold_code=reason, hold_reason=HOLDS[reason],
+                  verified_facts=not proposal_needs_check(record) and _verified(record["reviews"]))
     with store.db:
         store.require_pending_item(row, "Source item changed before hold completed")
         if not store.db.execute("""UPDATE items SET status='rejected',attempts=attempts+1,
@@ -1152,14 +1157,12 @@ def _hold(store, row, draft, writer_key, record, observed, stage, reason):
             ("Final review held: " + HOLDS[reason], row["id"], row["content_hash"])).rowcount:
             raise candidate_mod.StaleCandidate("Source item changed before hold completed")
         store.record_analysis(row, draft, writer_key, observed, review_record=record)
-        store.db.execute("""UPDATE review_jobs SET stage='held',record_json=?,approval_key=NULL,
-            updated_at=? WHERE item_id=?""", (_json(record), observed, row["id"]))
+        set_job_stage(store.db, row["id"], "held", record, observed)
         decisions.record(store.db, row["id"], f"held.{stage}.{reason}", observed, review=record)
 
 
-def _route(store, row, draft, writer_key, record, observed, target, stage) -> str:
+def _route(store, row, draft, writer_key, record, observed, target, _stage=None) -> str:
     """Attach an unmapped item to `target` once and clear its standalone draft for update review."""
-    routed = False
     with store.db:
         store.require_pending_item(row, "Source item changed before routing")
         found = store.db.execute(
@@ -1168,19 +1171,18 @@ def _route(store, row, draft, writer_key, record, observed, target, stage) -> st
                WHERE s.id=? AND COALESCE(e.retracted,0)=0""",
             (target,),
         ).fetchone()
-        target_payload = saved_object(found["payload"]) if found is not None else None
-        if (isinstance(target_payload, dict)
-                and target_payload.get("origin") != "network-health"
-                and editorial.retired(store.db, story_id=target) is None):
-            routed_record = {**record, "outcome": "routed", "routed_to": target}
-            _attach_item(store, store.db, row, draft, writer_key, routed_record, observed,
-                         target, candidate_mod.UNVERIFIED_ROUTE, require_unmapped=True)
-            record.update(outcome="routed", routed_to=target)
-            routed = True
-    if not routed:
-        _hold(store, row, draft, writer_key, record, observed, stage, "model_hold")
-        return "held"
-    return "routed"
+        target_payload = saved_object(found["payload"] if found else None)
+        if (
+            target_payload is None
+            or target_payload.get("origin") == "network-health"
+            or editorial.retired(store.db, story_id=target) is not None
+        ):
+            raise candidate_mod.StaleCandidate("Target story changed before routing")
+        routed_record = {**record, "outcome": "routed", "routed_to": target}
+        _attach_item(store, row, draft, writer_key, routed_record, observed,
+                     target, candidate_mod.UNVERIFIED_ROUTE, require_unmapped=True)
+        record.update(outcome="routed", routed_to=target)
+        return "routed"
 
 
 def _try_auto_merge(config, store, pair: tuple[str, str], *, propagate: bool,
@@ -1189,8 +1191,7 @@ def _try_auto_merge(config, store, pair: tuple[str, str], *, propagate: bool,
                     observed: str | None = None) -> bool:
     dup_id, survivor_id = pair
 
-    def guard(db) -> None:
-        """Re-verify prepared bindings and merge eligibility inside the merge transaction."""
+    def _guard(db) -> None:
         if propagate:
             candidate_mod.verify_prepared_binding(db, prepared)
         if _auto_merge_pair(store, dup_id, survivor_id) != pair:
@@ -1198,8 +1199,8 @@ def _try_auto_merge(config, store, pair: tuple[str, str], *, propagate: bool,
 
     if propagate:
         routed_record = {**record, "candidate": record.get("candidate", prepared["candidate"]), "outcome": "routed", "routed_to": survivor_id, "merged_duplicate": dup_id}
-        complete = lambda db: _attach_item(
-            store, db, prepared["row"], draft, writer_key, routed_record, observed,
+        complete = lambda _db: _attach_item(
+            store, prepared["row"], draft, writer_key, routed_record, observed,
             survivor_id, "Attached to survivor story after duplicate merge",
         )
     else:
@@ -1211,7 +1212,7 @@ def _try_auto_merge(config, store, pair: tuple[str, str], *, propagate: bool,
             base_url=config["site"]["base_url"],
             observed=now_iso(),
             automatic=True,
-            _guard=guard,
+            _guard=_guard,
             _complete=complete,
         )
     except (candidate_mod.StaleCandidate, editorial.RetiredStory):
@@ -1226,12 +1227,8 @@ def _try_auto_merge(config, store, pair: tuple[str, str], *, propagate: bool,
 
 
 def _save_handoff(store, row, record, observed):
-    """Keep the exact old proof and budget until the routed item is prepared again.
-
-    The caller owns the transaction that changes the item's association.
-    """
-    if not store.db.execute("""UPDATE review_jobs SET stage='routed',record_json=?,approval_key=NULL,updated_at=?
-                               WHERE item_id=?""", (_json(record), observed, row["id"])).rowcount:
+    """Keep the exact old proof and budget until the routed item is prepared again."""
+    if not set_job_stage(store.db, row["id"], "routed", record, observed):
         raise AnalysisError("Review handoff has no durable job", code="app.damaged_job")
 
 
@@ -1257,29 +1254,28 @@ def _security_disclosure(item: dict) -> bool:
         return True
     if item.get("kind") != "gitlab_issue":
         return False
-    labels = {label.strip().casefold() for label in (item.get("labels") or []) if isinstance(label, str)}
+    labels = folded_labels(item)
     return "security" in labels and bool(labels & HIGH_SECURITY_SEVERITIES)
 
 
 def _not_recent(config, store, row, item, observed, *, existing=candidate_mod._UNSET) -> str | None:
-    """Ignore, before any model call, an item that would start a story from an old development.
+    """Ignore, before any model call, an item that would start a story from an old development."""
+    def _skip_developed_at(r: dict, it: dict, story=candidate_mod._UNSET) -> str | None:
+        if story is candidate_mod._UNSET:
+            story = candidate_mod.existing_story(store.db, r)
+        developed = developed_at(it)
+        if (developed >= after(-NEW_STORY_DAYS * 86400, r["last_seen"])
+                or _security_disclosure(it)
+                or story is not None
+                or store.db.execute("SELECT 1 FROM rejection_actions WHERE item_id=? AND content_hash=? AND action='retry'",
+                                    (r["id"], r["content_hash"])).fetchone()):
+            return None
+        return developed
 
-    An update of an existing story, a locked one included, is left to review, and so is a revision
-    an operator retried, a HackerOne disclosure or a high- or critical-severity security issue. Like any skip, a new
-    revision of the item queues it again; an issue whose notes were never verified also gets a
-    comment check, so a fresh public note does that.
-    """
-    developed = developed_at(item)
-    if existing is candidate_mod._UNSET:
-        existing = candidate_mod.existing_story(store.db, row)
-    if (developed >= after(-NEW_STORY_DAYS * 86400, row["last_seen"])
-            or _security_disclosure(item)
-            or existing is not None
-            or store.db.execute("SELECT 1 FROM rejection_actions WHERE item_id=? AND content_hash=? AND action='retry'",
-                                (row["id"], row["content_hash"])).fetchone()):
+    if _skip_developed_at(row, item, existing) is None:
         return None
-    def maybe_check_comments() -> None:
-        """Queue an initial public-comment check before ignoring an unverified GitLab issue."""
+
+    def _maybe_check_comments() -> None:
         if item.get("kind") == "gitlab_issue" and "comments_source_key" not in item:
             from .comments import request_check
             request_check(store.db, config, row, observed)
@@ -1287,24 +1283,18 @@ def _not_recent(config, store, row, item, observed, *, existing=candidate_mod._U
     try:
         with store.db:
             current = store.require_pending_item(row, "Source item changed before recency skip")
-            # Collection and closing dates do not alter review evidence identity,
-            # but a fresh date or operator retry can change recency eligibility.
-            current_item = json.loads(current["payload"])
             try:
-                current_developed = developed_at(current_item)
-                threshold = after(-NEW_STORY_DAYS * 86400, current["last_seen"])
+                current_developed = _skip_developed_at(current, json.loads(current["payload"]))
+            except editorial.RetiredStory:
+                raise
             except (ValueError, TypeError, KeyError):
                 return "stale"
-            if (current_developed >= threshold
-                    or _security_disclosure(current_item)
-                    or candidate_mod.existing_story(store.db, current) is not None
-                    or store.db.execute("SELECT 1 FROM rejection_actions WHERE item_id=? AND content_hash=? AND action='retry'",
-                                        (row["id"], row["content_hash"])).fetchone()):
+            if current_developed is None:
                 return "stale"
             reason = f"Not recent: newest dated development {current_developed} is over {NEW_STORY_DAYS} days before collection"
             return _ignore_at_gate(store, row, observed, reason, "skipped.gate.not_recent",
-                                   before_log=maybe_check_comments, developed_at=current_developed,
-                                   collected_at=current["last_seen"])
+                                   verified_pending=True, before_log=_maybe_check_comments,
+                                   developed_at=current_developed, collected_at=current["last_seen"])
     except candidate_mod.StaleCandidate:
         return "stale"
 
@@ -1318,9 +1308,6 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
     a saved job that cannot be read does. next_step bounds the repairs; a hold
     marks the item rejected immediately.
     """
-    from .candidate import ReviewRequired, StaleCandidate
-    from .editorial import RetiredStory, is_locked, retired
-
     observed = observed or now_iso()
     report = {"status": "pending", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
 
@@ -1331,9 +1318,9 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
 
     try:
         existing = candidate_mod.existing_story(store.db, row)
-        if existing is None and retired(
+        if existing is None and editorial.retired(
                 store.db, story_id=digest(row["cluster_key"])[:24], cluster_key=row["cluster_key"]) is not None:
-            raise RetiredStory("Story is retired")
+            raise editorial.RetiredStory("Story is retired")
         job, saved_draft, saved_prepared, saved_record, same_source = _saved_job(store, row, config)
         item_payload = json.loads(row["payload"])
         skipped = _not_recent(config, store, row, item_payload, observed, existing=existing)
@@ -1349,13 +1336,13 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             return {**report, "status": status_out}
         policy = review.policy_hash(config)
         prior = candidate_mod.update_target(store.db, row, existing=existing)
-    except RetiredStory:
+    except editorial.RetiredStory:
         return _ignore_retired()
-    except StaleCandidate:
+    except candidate_mod.StaleCandidate:
         return {**report, "status": "stale"}
 
     writer_key = cache_key(row, config["llm"], prior)
-    locked_reuse = (job is not None and existing is not None and is_locked(store.db, existing["id"])
+    locked_reuse = (job is not None and existing is not None and editorial.is_locked(store.db, existing["id"])
                     and same_source and saved_draft is not None)
     carry = None
     if (job is not None and job["policy_hash"] == policy and same_source
@@ -1367,10 +1354,30 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         prepared_at = job["prepared_at"]
     else:
         job, draft, old = None, None, None
-        record = {"schema_version": REVIEW_STATE_VERSION, "writer": None, "input_hash": row["content_hash"], "input_proof": 1, "input_row": row, "reviews": [], **initial_review_state()}
-        if carry is not None:
-            record.update(carry)
+        record = _new_record(row, **(carry or {}))
         prepared_at = observed
+    prepared = None
+
+    def _save_job(stg: str, *, env: bool = True, **kw) -> None:
+        _save(store, row, writer_key, policy, stg, draft, prepared if env else None,
+              record, observed, prepared_at=prepared_at, **kw)
+
+    def _hold_item(stg: str, reason: str, **extra) -> dict:
+        _hold(store, row, draft, writer_key, record, observed, stg, reason)
+        return {**report, "status": "held", **extra}
+
+    def _commit_decision(decision: str, key: str, *, fresh: bool = False, **extra) -> dict:
+        record["outcome"] = OUTCOME_STAGES[decision]
+        receipt = None
+        if fresh:
+            record.update(candidate=candidate, approval_key=key)
+            receipt = (key, digest(candidate), prepared["source_hash"], policy, prepared["binding_hash"],
+                       strict_json(record["reviews"][-1]["result"]), strict_json(record), observed, observed)
+        _save_job(record["outcome"], approval_key=key, approval_receipt=receipt)
+        committed = store.commit_candidate(prepared, candidate, writer_key, now_iso(), approval_key=key,
+                                           policy_hash=policy, review_record=record, decision=decision)
+        return {**report, "status": committed["status"], **extra}
+
     try:
         if draft is None:
             if not allow_network and item_payload["kind"] != "tag":
@@ -1380,13 +1387,13 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             record["writer"] = {"key": writer_key}  # The draft itself is saved in the job, then in analyses.
             if getattr(writer, "clears", 0):  # writer validation cleared the draft's impact sentence
                 record["writer"]["clears"] = writer.clears  # kept until an operator retry resets the record
-            _save(store, row, writer_key, policy, "drafted", draft, None, record, observed, prepared_at=prepared_at)
-        prepared = _prepare_candidate(store, row, draft, prepared_at, _dirauth_users(config, store))
+            _save_job("drafted", env=False)
+        prepared = _prepare(store, config, row, draft, prepared_at)
         same = (
             old is not None
             and job["policy_hash"] == policy
-            and _identity(old) == _identity(prepared)
-            and _dirauth_set(old.get("dirauth_users")) == _dirauth_set(prepared.get("dirauth_users"))
+            and all(old[k] == prepared[k] for k in ("candidate_hash", "source_hash", "binding_hash"))
+            and dirauth_user_set(old.get("dirauth_users")) == dirauth_user_set(prepared.get("dirauth_users"))
         )
         stage = job["stage"] if same else "review"
         fresh_prepared = {
@@ -1395,8 +1402,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         }
         if "dirauth_users" in prepared:
             fresh_prepared["dirauth_users"] = prepared["dirauth_users"]
-        fresh = {"schema_version": REVIEW_STATE_VERSION, "writer": record["writer"], "input_hash": row["content_hash"], "input_proof": 1, "input_row": row, "reviews": [], "policy_hash": policy, **initial_review_state(),
-                 "prepared": fresh_prepared}
+        fresh = _new_record(row, record["writer"], policy_hash=policy, prepared=fresh_prepared)
         # A coverage change invalidates old reviews, not the request budget of
         # this source revision and policy. Explicit operator retry starts afresh.
         if (job is not None and job["policy_hash"] == policy) or carry is not None:
@@ -1404,52 +1410,47 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         record = record if same else fresh
         candidate = record.get("candidate", prepared["candidate"])
         validate_review_state(record, stage, candidate, prepared)
-        _save(store, row, writer_key, policy, stage, draft, prepared, record, observed, prepared_at=prepared_at,
-              approval_key=job["approval_key"] if same else None)
+        _save_job(stage, approval_key=job["approval_key"] if same else None)
         if prepared.get("locked"):
             record["outcome"] = "locked"
             store.commit_candidate(prepared, prepared["candidate"], writer_key, now_iso(), review_record=record)
             return {**report, "status": record["outcome"]}
         if prepared["packet"]["missing_sources"]:
-            _hold(store, row, draft, writer_key, record, observed, "gate", "missing_sources")
-            return {**report, "status": "held"}
+            return _hold_item("gate", "missing_sources")
         if stage == "held":
             # The same candidate held before: a source reverted to a held revision,
             # or an item was requeued without reset_review_work. Do not review it again.
-            _hold(store, row, draft, writer_key, record, observed, "gate", "repeat_hold")
-            return {**report, "status": "held"}
+            return _hold_item("gate", "repeat_hold")
         key = _approval_key(candidate, prepared, policy)
-        cached = None if proposal_needs_check(record) else store.db.execute("SELECT * FROM review_approvals WHERE key=?", (key,)).fetchone()
+        cached = None if proposal_needs_check(record) else store.db.execute(
+            """SELECT CASE WHEN typeof(result_json)='text' THEN CAST(result_json AS BLOB) END AS result_blob,
+               CASE WHEN typeof(review_record_json)='text' THEN CAST(review_record_json AS BLOB) END AS record_blob
+               FROM review_approvals WHERE key=?""",
+            (key,),
+        ).fetchone()
         if cached is not None:
             try:
-                verdict = review.validate_review(json.loads(cached["result_json"]), prepared["packet"],
+                raw_verdict, proof = saved_object(cached["result_blob"]), saved_object(cached["record_blob"])
+                if raw_verdict is None or proof is None:
+                    raise ValueError()
+                verdict = review.validate_review(raw_verdict, prepared["packet"],
                                                  update=prepared.get("mode") == "update", coverage=prepared["coverage"])
-                proof = json.loads(cached["review_record_json"])
-                if not isinstance(proof, dict) or proof.get("policy_hash") != policy:
-                    raise AnalysisError("Cached review policy is damaged", code="app.damaged_job")
-                validate_review_state(proof, "approved" if verdict["verdict"] == "approve" else "skipped", candidate, prepared, allow_cached=False)
-                valid = verdict["verdict"] in {"approve", "skip"} and verdict.get("same_story") is None
-            except (AnalysisError, ValueError, TypeError, KeyError):
-                valid = False
-            if valid:
+                if (proof.get("policy_hash") != policy
+                        or verdict["verdict"] not in {"approve", "skip"} or verdict.get("same_story") is not None):
+                    raise ValueError()
+                validate_review_state(proof, OUTCOME_STAGES[verdict["verdict"]], candidate, prepared, allow_cached=False)
+            except (AnalysisError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
+                with store.db:
+                    store.db.execute("DELETE FROM review_approvals WHERE key=?", (key,))
+            else:
                 record["approval"] = proof
                 record["approval_key"] = key
                 if verdict["verdict"] == "approve" and (held := review.final_holds(candidate, prepared)):
-                    _hold(store, row, draft, writer_key, record, observed, "final_check", held[0])
-                    return {**report, "status": "held", "cache_hit": True}
-                record["outcome"] = "skipped" if verdict["verdict"] == "skip" else "approved"
-                _save(store, row, writer_key, policy, record["outcome"], draft, prepared, record, observed,
-                      prepared_at=prepared_at, approval_key=key)
-                committed = store.commit_candidate(prepared, candidate, writer_key, now_iso(), approval_key=key,
-                                                   policy_hash=policy, review_record=record, decision=verdict["verdict"])
-                report.update(status=committed["status"], cache_hit=True)
-                return report
-            with store.db:
-                store.db.execute("DELETE FROM review_approvals WHERE key=?", (key,))
+                    return _hold_item("final_check", held[0], cache_hit=True)
+                return _commit_decision(verdict["verdict"], key, cache_hit=True)
         if stage in {"approved", "skipped"}:  # without a usable receipt, review the writer's draft again
             stage, candidate, record = "review", prepared["candidate"], fresh
-        requests = ReviewRequests(record, lambda: _save(store, row, writer_key, policy, stage, draft, prepared,
-                                                        record, observed, prepared_at=prepared_at))
+        requests = ReviewRequests(record, lambda: _save_job(stage))
         while True:
             if not allow_network:
                 return {**report, "status": "deferred"}
@@ -1467,85 +1468,83 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                 status_out = _route(store, row, draft, writer_key, record, observed, value, record["reviews"][-1]["stage"])
                 return {**report, "status": status_out}
             if action == "hold":
-                _hold(store, row, draft, writer_key, record, observed, *value)
-                return {**report, "status": "held"}
+                return _hold_item(*value)
             if action in {"approve", "skip"}:
-                agreed_dup = None
-                if (prepared["coverage"].get("prior_story") is not None
-                        and len(record["reviews"]) >= 2
-                        and record["reviews"][-1]["stage"] == "verification"):
-                    first_same = record["reviews"][0]["result"].get("same_story")
-                    final_same = record["reviews"][-1]["result"].get("same_story")
-                    if isinstance(first_same, str) and first_same and first_same == final_same:
-                        agreed_dup = _auto_merge_pair(store, prepared["story_id"], first_same)
-                if agreed_dup is not None and agreed_dup[0] == prepared["story_id"] and _try_auto_merge(
-                    config, store, agreed_dup, propagate=True, prepared=prepared,
-                    draft=draft, writer_key=writer_key, record=record, observed=observed,
+                agreed_same = _agreed_same_story(record["reviews"]) if prepared["coverage"].get("prior_story") is not None else None
+                agreed_dup = _auto_merge_pair(store, prepared["story_id"], agreed_same) if agreed_same else None
+                if (
+                    agreed_dup is not None
+                    and agreed_dup[0] == prepared["story_id"]
+                    and _can_auto_merge_review(candidate, prepared, record["reviews"][-1]["result"])
+                    and _try_auto_merge(
+                        config, store, agreed_dup, propagate=True, prepared=prepared,
+                        draft=draft, writer_key=writer_key, record=record, observed=observed,
+                    )
                 ):
                     return {**report, "status": "routed"}
-                key = _approval_key(candidate, prepared, policy)
-                record.update(candidate=candidate, approval_key=key, outcome="skipped" if action == "skip" else "approved")
-                receipt = (key, digest(candidate), prepared["source_hash"], policy, prepared["binding_hash"],
-                           _json(record["reviews"][-1]["result"]), _json(record), observed, observed)
-                _save(store, row, writer_key, policy, record["outcome"], draft, prepared, record, observed,
-                      prepared_at=prepared_at, approval_key=key, approval_receipt=receipt)
-                committed = store.commit_candidate(prepared, candidate, writer_key, now_iso(), approval_key=key,
-                                                   policy_hash=policy, review_record=record, decision=action)
-                if agreed_dup is not None and agreed_dup[1] == prepared["story_id"]:
+                out = _commit_decision(action, _approval_key(candidate, prepared, policy), fresh=True)
+                if agreed_dup is not None:
                     _try_auto_merge(config, store, agreed_dup, propagate=False)
-                return {**report, "status": committed["status"]}
+                return out
             stage, candidate = action, value  # the next review: a verification or a release-label repair
             record["candidate"] = candidate
-            _save(store, row, writer_key, policy, stage, draft, prepared, record, observed, prepared_at=prepared_at)
+            _save_job(stage)
     except CompletionDeferred:
         return {**report, "status": "deferred", "budget_reached": True}
-    except RetiredStory:
+    except editorial.RetiredStory:
         return _ignore_retired()
-    except (StaleCandidate, ReviewRequired):
+    except (candidate_mod.StaleCandidate, candidate_mod.ReviewRequired):
         return {**report, "status": "stale"}
     finally:
         _prune(store, MAX_APPROVALS)
 
 
+def _valid_coverage_entry(entry: object) -> bool:
+    return (
+        isinstance(entry, dict)
+        and isinstance(entry.get("id"), str)
+        and isinstance(entry.get("title"), str)
+        and (bool(entry.get("retracted")) or isinstance(entry.get("updated_at"), str))
+    )
+
+
 def _new_coverage(old_coverage, current_coverage) -> list[dict]:
     old_recent = old_coverage.get("recent") if isinstance(old_coverage, dict) else None
-    seen = {(e["id"], e["updated_at"]) for e in (old_recent if isinstance(old_recent, list) else ())
-            if isinstance(e, dict) and isinstance(e.get("id"), str) and isinstance(e.get("updated_at"), str)}
-    return [{"id": e["id"], "title": e["title"], "updated_at": e["updated_at"]}
-            for e in ((current_coverage or {}).get("recent") or ()) if (e["id"], e["updated_at"]) not in seen]
+    seen = {
+        (e["id"], e.get("updated_at") if isinstance(e.get("updated_at"), str) else None, bool(e.get("retracted")))
+        for e in (old_recent if isinstance(old_recent, list) else ())
+        if _valid_coverage_entry(e)
+    }
+    curr_recent = current_coverage.get("recent") if isinstance(current_coverage, dict) else None
+    out = []
+    for e in (curr_recent if isinstance(curr_recent, list) else ()):
+        if not _valid_coverage_entry(e):
+            continue
+        retracted = bool(e.get("retracted"))
+        updated_at = e.get("updated_at") if isinstance(e.get("updated_at"), str) else None
+        if (e["id"], updated_at, retracted) not in seen:
+            out.append({"id": e["id"], "title": e["title"], "updated_at": updated_at, **({"retracted": True} if retracted else {})})
+    return out
 
 
 def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
-    def refuse(reason: str, editorial_failures=(), new_coverage=()):
-        """Build an ineligible operator-approval check result with structured diagnostics."""
+    def _refuse(reason: str, editorial_failures=(), new_coverage=()):
         return {"eligible": False, "reason": reason, "hash": None,
                 "editorial_failures": list(editorial_failures), "new_coverage": list(new_coverage)}, None
 
-    item_row = store.db.execute(
-        """SELECT id,url,source_id,content_hash,cluster_key,status,attempts,rejections,
-           next_attempt_at,last_error,story_id,first_seen,last_seen,priority_score,
-           typeof(payload) AS payload_type,CAST(payload AS BLOB) AS payload_blob FROM items WHERE id=?""",
-        (item_id,),
-    ).fetchone()
-    job = store.db.execute(
-        """SELECT writer_key,policy_hash,stage,prepared_at,
-           CASE WHEN typeof(draft_json)='text' THEN CAST(draft_json AS BLOB) END AS draft,
-           CASE WHEN typeof(envelope_json)='text' THEN CAST(envelope_json AS BLOB) END AS envelope,
-           CASE WHEN typeof(record_json)='text' THEN CAST(record_json AS BLOB) END AS record
-           FROM review_jobs WHERE item_id=?""", (item_id,),
-    ).fetchone()
+    item_row = store.db.execute(f"SELECT {ITEM_SAFE_COLUMNS} FROM items WHERE id=?", (item_id,)).fetchone()
+    job, draft, saved_env, record = _load_job(store.db, item_id)
     if item_row is None or item_row["status"] != "rejected" or job is None or job["stage"] != "held":
-        return refuse("Only a held final review can be approved")
-    payload_obj = saved_object(item_row["payload_blob"]) if item_row["payload_type"] == "text" else None
-    draft, saved_env, record = (saved_object(job[key]) for key in ("draft", "envelope", "record"))
+        return _refuse("Only a held final review can be approved")
+    row, payload_obj = decode_item_row(item_row)
     if (payload_obj is None or draft is None or saved_env is None or record is None
             or not isinstance(job["writer_key"], str) or not job["writer_key"]
             or not isinstance(job["prepared_at"], str)
             or not isinstance(reviews := record.get("reviews"), list)):
-        return refuse("Saved review record cannot be read")
+        return _refuse("Saved review record cannot be read")
     try:
         if any(not isinstance(entry, dict) or entry["stage"] not in {"review", "verification"} for entry in reviews):
-            return refuse("Saved review record cannot be read")
+            return _refuse("Saved review record cannot be read")
         editorial_failures = [
             f"{entry['stage']}:{name}"
             for entry in reviews
@@ -1553,83 +1552,88 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
             if entry["result"]["criteria"][name]["outcome"] != "pass"
         ]
     except (TypeError, KeyError, AttributeError):
-        return refuse("Saved review record cannot be read")
+        return _refuse("Saved review record cannot be read")
     policy = review.policy_hash(config)
     if (job["policy_hash"] != policy or record.get("policy_hash") != policy
             or any(entry.get("policy_hash") != policy for entry in reviews)):
-        return refuse("An earlier review policy or packet reviewed it; retry it", editorial_failures)
-    row = {key: item_row[key] for key in (
-        "id", "url", "source_id", "content_hash", "cluster_key", "status", "attempts", "rejections",
-        "next_attempt_at", "last_error", "story_id", "first_seen", "last_seen", "priority_score")}
-    row["payload"] = item_row["payload_blob"].decode("utf-8")
+        return _refuse("An earlier review policy or packet reviewed it; retry it", editorial_failures)
     try:
-        prepared = _prepare_candidate(store, row, draft, job["prepared_at"], _dirauth_users(config, store))
+        prepared = _prepare(store, config, row, draft, job["prepared_at"])
     except Exception:
-        return refuse("Its story or sources changed since the review; retry it", editorial_failures)
+        return _refuse("Its story or sources changed since the review; retry it", editorial_failures)
     if prepared["locked"]:
-        return refuse("Its story is editorially locked", editorial_failures)
+        return _refuse("Its story is editorially locked", editorial_failures)
     held_prepared = record.get("prepared")
     if not isinstance(held_prepared, dict):
-        return refuse("Saved review record cannot be read", editorial_failures)
+        return _refuse("Saved review record cannot be read", editorial_failures)
     new_coverage = _new_coverage(held_prepared.get("coverage"), prepared["coverage"])
     if prepared["packet"]["missing_sources"]:
-        return refuse("Final review held: " + HOLDS["missing_sources"], editorial_failures, new_coverage)
+        return _refuse("Final review held: " + HOLDS["missing_sources"], editorial_failures, new_coverage)
     saved_binding = saved_env.get("binding") if isinstance(saved_env.get("binding"), dict) else {}
-    if (prepared["story_id"] != saved_env.get("story_id")
-            or _dirauth_set(prepared.get("dirauth_users")) != _dirauth_set(saved_env.get("dirauth_users"))
-            or prepared["candidate_hash"] != held_prepared.get("candidate_hash")
-            or prepared["candidate_hash"] != saved_env.get("candidate_hash")
-            or prepared["source_hash"] != held_prepared.get("source_hash")
-            or prepared["source_hash"] != saved_env.get("source_hash")
+    try:
+        stale_binding = (
+            prepared["story_id"] != saved_env.get("story_id")
+            or dirauth_user_set(prepared.get("dirauth_users")) != dirauth_user_set(saved_env.get("dirauth_users"))
+            or any(prepared[k] != d.get(k) for d in (held_prepared, saved_env) for k in ("candidate_hash", "source_hash"))
             or any(prepared["binding"][key] != saved_binding.get(key)
                    for key in ("prior_story", "lock", "sources", "payload_hash",
-                               *(["mode"] if "mode" in saved_binding else [])))):
-        return refuse("Its story or sources changed since the review; retry it", editorial_failures, new_coverage)
+                               *(["mode"] if "mode" in saved_binding else [])))
+        )
+    except (TypeError, KeyError, AttributeError):
+        return _refuse("Saved review record cannot be read", editorial_failures, new_coverage)
+    if stale_binding:
+        return _refuse("Its story or sources changed since the review; retry it", editorial_failures, new_coverage)
     if any(entry.get("source_hash") != prepared["source_hash"] for entry in reviews):
-        return refuse("An earlier review policy or packet reviewed it; retry it", editorial_failures, new_coverage)
+        return _refuse("An earlier review policy or packet reviewed it; retry it", editorial_failures, new_coverage)
     is_update = prepared.get("mode") == "update"
     try:
         validated = [review.validate_review(entry["result"], prepared["packet"],
                                             update=is_update, coverage=held_prepared.get("coverage"))
                      for entry in reviews]
-    except (AnalysisError, ValueError, TypeError, KeyError):
-        return refuse("Saved review record cannot be read", editorial_failures, new_coverage)
+    except (AnalysisError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        return _refuse("Saved review record cannot be read", editorial_failures, new_coverage)
     if any(result["criteria"]["new_information"]["outcome"] != "pass" for result in validated):
-        return refuse("A review failed new_information (already covered); dismiss it", editorial_failures, new_coverage)
+        return _refuse("A review failed new_information (already covered); dismiss it", editorial_failures, new_coverage)
     candidate = record.get("candidate")
     try:
         candidate_mod.validate_approved(prepared["candidate"], candidate, "update" if is_update else "story")
     except candidate_mod.ReviewRequired as exc:
         msg = ("No fresh verification reviewed this exact text"
                if "complete public candidate" in str(exc) else "Saved review record cannot be read")
-        return refuse(msg, editorial_failures, new_coverage)
+        return _refuse(msg, editorial_failures, new_coverage)
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        return _refuse("Saved review record cannot be read", editorial_failures, new_coverage)
     candidate_hash = digest(candidate)
     reviews_of_text = [(entry, result) for entry, result in zip(reviews, validated) if entry.get("candidate_hash") == candidate_hash]
     if not any(entry.get("stage") == "verification" for entry, _ in reviews_of_text):
-        return refuse("No fresh verification reviewed this exact text", editorial_failures, new_coverage)
+        return _refuse("No fresh verification reviewed this exact text", editorial_failures, new_coverage)
     failed_facts = [
         name for name in review.CRITERIA
         if name not in review.EDITORIAL_CRITERIA
         and any(result["criteria"][name]["outcome"] != "pass" for _, result in reviews_of_text)
     ]
     if failed_facts:
-        return refuse(f"A review failed {', '.join(failed_facts)}; dismiss or retry it", editorial_failures, new_coverage)
-    if (record.get("verified_facts") is not True or not _verified(reviews)
-            or any(not result["criteria"]["source_support"]["source_refs"] for _, result in reviews_of_text)):
-        return refuse("No fresh verification with cited sources approved the facts; retry or dismiss it",
-                      editorial_failures, new_coverage)
-    if held := review.final_holds(candidate, prepared):
-        return refuse("Final review held: " + HOLDS[held[0]], editorial_failures, new_coverage)
-    if not review.release_labels_match_state(candidate):
-        return refuse("Final review held: " + HOLDS["release_labels"], editorial_failures, new_coverage)
+        return _refuse(f"A review failed {', '.join(failed_facts)}; dismiss or retry it", editorial_failures, new_coverage)
+    try:
+        if (record.get("verified_facts") is not True or not _verified(reviews)
+                or any(not result["criteria"]["source_support"]["source_refs"] for _, result in reviews_of_text)):
+            return _refuse("No fresh verification with cited sources approved the facts; retry or dismiss it",
+                           editorial_failures, new_coverage)
+        if held := review.final_holds(candidate, prepared):
+            return _refuse("Final review held: " + HOLDS[held[0]], editorial_failures, new_coverage)
+        if not review.release_labels_match_state(candidate):
+            return _refuse("Final review held: " + HOLDS["release_labels"], editorial_failures, new_coverage)
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        return _refuse("Saved review record cannot be read", editorial_failures, new_coverage)
     if not editorial_failures:
-        return refuse("Only a held news-value dispute can be approved", editorial_failures, new_coverage)
+        return _refuse("Only a held news-value dispute can be approved", editorial_failures, new_coverage)
     try:
         validate_review_state(record, "held", record.get("candidate", saved_env.get("candidate")), saved_env)
-    except (AnalysisError, ValueError, TypeError, KeyError):
-        return refuse("Saved proposal or review state cannot be read")
-    if proposal_needs_check(record):
-        return refuse("An untrusted proposal still needs a fresh valid review")
+        needs_check = proposal_needs_check(record)
+    except (AnalysisError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        return _refuse("Saved proposal or review state cannot be read")
+    if needs_check:
+        return _refuse("An untrusted proposal still needs a fresh valid review")
     exact_entries = [entry for entry, _ in reviews_of_text]
     approval_hash = digest(["approve-as-reviewed", prepared["binding_hash"], candidate_hash, policy, digest(exact_entries)])
     return {"eligible": True, "reason": None, "hash": approval_hash,
@@ -1639,7 +1643,11 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
 
 def approval(config, store, item_id: str) -> dict:
     """Read-only eligibility and binding hash for `rejected approve`; never raises on damaged rows."""
-    return _check_approval(config, store, item_id)[0]
+    try:
+        return _check_approval(config, store, item_id)[0]
+    except (AnalysisError, ValueError, TypeError, KeyError, AttributeError, IndexError, UnicodeError, RecursionError):
+        return {"eligible": False, "reason": "Saved review record cannot be read", "hash": None,
+                "editorial_failures": [], "new_coverage": []}
 
 
 def approve(config, store, item_id: str, approval_hash: str, reason: str, stamp: str) -> dict:
@@ -1652,7 +1660,7 @@ def approve(config, store, item_id: str, approval_hash: str, reason: str, stamp:
     if info["hash"] != approval_hash:
         raise ValueError("Approval hash does not match the current candidate, coverage and policy; inspect the item before approving")
     prepared, candidate, writer_key, record = handle
-    audit = json.loads(_json(record))
+    audit = copy.deepcopy(record)
     audit["outcome"] = "operator_approved"
     audit["operator_approval"] = {"reason": reason, "approved_at": stamp,
                                   "approval_hash": approval_hash, "new_coverage": info["new_coverage"]}

@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import copy
-import json
 import re
 
 from .analyze import SCHEMA as DRAFT_SCHEMA
 from .llm import (AnalysisError, CompletionClient, apply_label_limits, has_malformed_tor_version,
-                  has_shouting_caps, is_complete_sentence, label_limits, repair_schema, validate_text)
+                  has_shouting_caps, is_complete_sentence, label_limits, repair_schema,
+                  strip_unreleased_tag, validate_schema_field, validate_text)
 from .render import prepare_story
-from .schema import LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STORY_ID_RE, UPDATE_CHARS
-from .util import canonical_url, digest, normalize_evidence
+from .schema import FIELD_LIMITS, LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STATES, STORY_ID_RE, UPDATE_CHARS
+from .util import LIST_ARCHIVE_HOST, canonical_url, digest, normalize_evidence, strict_json
 
 REVIEW_VERSION = "onionflash-review-17"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
@@ -19,8 +19,8 @@ CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribu
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
 VERDICTS = ("approve", "revise", "hold", "skip")
 FIELDS = {key: copy.deepcopy(DRAFT_SCHEMA["properties"][key]) for key in EDITABLE}
-for field, length in (("title", 180), ("summary", 1600), ("why_it_matters", 800)):
-    FIELDS[field]["maxLength"] = length
+for field in ("title", "summary", "why_it_matters"):
+    FIELDS[field]["maxLength"] = FIELD_LIMITS[field]
 FIELDS["why_it_matters"]["enum"] = [""]
 UPDATE_EDITABLE = ("update", *LABEL_FIELDS)
 UPDATE_FIELDS = {"update": {"type": "string", "maxLength": UPDATE_CHARS},
@@ -486,8 +486,8 @@ def policy_hash(config: dict) -> str:
                    SCHEMA, UPDATE_REPAIR, identity, CompletionClient.REQUEST_POLICY])
 
 
-def _text(value, maximum: int, *, empty: bool = False) -> None:
-    validate_text(value, maximum, empty=empty, error=ReviewError, message="Invalid review text")
+def _text(value, maximum: int) -> None:
+    validate_text(value, maximum, error=ReviewError, message="Invalid review text")
 
 
 def _packet_refs(packet: dict) -> set[str]:
@@ -510,68 +510,83 @@ def _coverage_ids(coverage: dict | None) -> tuple[str | None, list[str], set[str
     return prior_id, sorted(live), retracted
 
 
-def repair_limits(packet: dict, coverage: dict | None = None, *, update: bool = False) -> dict:
+def _widen_update_state(limits: dict, sources: list[dict], prior: dict, candidate_sources=()) -> None:
+    if limits["state"] == ["merged"] and (
+        (isinstance(prior.get("state"), str) and prior["state"] in STATES and prior["state"] != "merged")
+        or any(isinstance(s, dict) and "/-/merge_requests/" not in str(s.get("url") or "") for s in (candidate_sources or ()))
+    ):
+        has_tag = any(s.get("kind") == "tag" for s in sources) or prior.get("state") == "tagged"
+        limits["state"] = [s for s in STATES if has_tag or s != "tagged"]
+
+
+def repair_limits(
+    packet: dict,
+    coverage: dict | None = None,
+    *,
+    update: bool = False,
+    candidate_sources: list[dict] | tuple[dict, ...] | None = None,
+) -> dict:
     """Use the same source and prior-label bounds for every kind of proposed edit."""
     limits = label_limits(packet["sources"])
-    if update and ((coverage or {}).get("prior_story") or {}).get("confidence") == "confirmed":
-        limits["confidence"] = ["confirmed"]
+    if update:
+        prior = (coverage or {}).get("prior_story") or {}
+        if prior.get("confidence") == "confirmed":
+            limits["confidence"] = ["confirmed"]
+        _widen_update_state(limits, packet["sources"], prior, candidate_sources)
     return limits
 
 
-def _repair_fields(repair: dict, *, update: bool = False) -> None:
-    """Check editable field shapes and values without granting factual approval."""
+def within_label_limits(mapping: dict, limits: dict) -> bool:
+    """Return whether every present classification field and tag in `mapping` obeys `limits`."""
+    tags = mapping.get("tags")
+    return (
+        all(isinstance(mapping[key], str) and mapping[key] in allowed for key, allowed in limits.items() if key in mapping)
+        and (tags is None or (isinstance(tags, list) and all(isinstance(tag, str) and tag in limits["category"] for tag in tags)))
+    )
+
+
+def _repair_fields(repair: dict, *, update: bool = False) -> dict:
+    """Check and normalize editable field shapes and values without granting factual approval."""
     editable = UPDATE_EDITABLE if update else EDITABLE
     rules = UPDATE_FIELDS if update else FIELDS
     if not isinstance(repair, dict) or not repair or set(repair) - set(editable):
         raise ReviewError("Repair contains unsupported or immutable fields")
-    for key, value in repair.items():
-        rule = rules[key]
-        if rule["type"] == "string":
-            if "enum" in rule:
-                if not isinstance(value, str) or value not in rule["enum"]:
-                    raise ReviewError("Invalid repair classification")
-            else:
-                _text(value, rule["maxLength"], empty=key == "why_it_matters")
-        elif (not isinstance(value, list) or len(value) > rule["maxItems"]
-              or any(not isinstance(entry, str) or entry not in rule["items"]["enum"] for entry in value)):
-            raise ReviewError("Invalid repair labels")
+    normalized = {
+        key: validate_schema_field(value, rules[key], empty=key == "why_it_matters",
+                                   error=ReviewError, message="Invalid repair field")
+        for key, value in repair.items()
+    }
     try:
-        json.dumps(repair, ensure_ascii=False, allow_nan=False).encode("utf-8")
-    except (ValueError, TypeError, UnicodeError):
+        strict_json(normalized)
+    except (ValueError, TypeError, RecursionError):
         raise ReviewError("Repair is not valid UTF-8 JSON") from None
-
-
-def untrusted_repair(verdict, repair, *, update: bool = False):
-    """Extract only a complete valid edit; the inconsistent reply still fails validation."""
-    editable = UPDATE_EDITABLE if update else EDITABLE
-    if verdict != "revise" or not isinstance(repair, dict) or set(repair) != set(editable):
-        return None
-    edits = {key: value for key, value in repair.items() if value is not None}
-    try:
-        _repair_fields(edits, update=update)
-    except ReviewError:
-        return None
-    return edits
+    return normalized
 
 
 def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict:
     """Normalize a minimal semantic repair BEFORE its independent verification."""
-    _repair_fields(repair, update=update)
+    edits = _repair_fields(repair, update=update)
+    explicit_tags = "tags" in edits
     updated = copy.deepcopy(candidate)
     if update:
         if not updated.get("updates"):
             raise ReviewError("Update repair requires a candidate update entry")
-        if updated.get("origin") == "network-health" and set(repair) - {"update"}:
+        if updated.get("origin") == "network-health" and set(edits) - {"update"}:
             raise ReviewError("Repair cannot change fixed-text alert labels")
-        for key, value in copy.deepcopy(repair).items():
-            if key == "update":
-                if not is_complete_sentence(value):
-                    raise ReviewError("Update repair must be a complete sentence")
-                updated["updates"][-1]["text"] = value
-            else:
-                updated[key] = value
-    else:
-        updated.update(copy.deepcopy(repair))
+        if (text := edits.pop("update", None)) is not None:
+            if not is_complete_sentence(text):
+                raise ReviewError("Update repair must be a complete sentence")
+            updated["updates"][-1]["text"] = text
+    if (
+        not explicit_tags
+        and "category" in edits
+        and edits["category"] != candidate.get("category")
+        and isinstance(updated.get("tags"), list)
+    ):
+        updated["tags"] = [t for t in updated["tags"] if t != candidate.get("category")]
+    updated.update(edits)
+    if not explicit_tags:
+        strip_unreleased_tag(updated)
     try:
         normalized = prepare_story(updated, editorial=updated.get("editorial"))
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
@@ -599,20 +614,17 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool 
     elif same_story is not None and coverage is not None and same_story not in recent_ids:
         raise ReviewError("Review same_story is not listed in coverage")
 
-    def references(values):
-        """Reject unknown, duplicate, or oversized packet source reference lists."""
-        if (not isinstance(values, list) or len(values) > 12
-                or any(not isinstance(value, str) or value not in refs for value in values)
-                or len(set(values)) != len(values)):
-            raise ReviewError("Review cites an unknown or invalid source reference")
-
     failed = set()
     for criterion, check in result["criteria"].items():
         if (not isinstance(check, dict) or set(check) != set(CHECK["properties"])
                 or check["outcome"] not in ("pass", "fail", "insufficient")):
             raise ReviewError("Invalid review criterion")
         _text(check["reason"], CHECK["properties"]["reason"]["maxLength"])
-        references(check["source_refs"])
+        values = check["source_refs"]
+        if (not isinstance(values, list) or len(values) > 12
+                or any(not isinstance(v, str) or v not in refs for v in values)
+                or len(set(values)) != len(values)):
+            raise ReviewError("Review cites an unknown or invalid source reference")
         if check["outcome"] != "pass":
             failed.add(criterion)
     verdict, repair = result["verdict"], result["repair"]
@@ -621,7 +633,14 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool 
         if failed or repair is not None or not result["criteria"]["source_support"]["source_refs"]:
             raise ReviewError("Review approval requires all criteria to pass without edits")
     elif not failed:
-        raise InconsistentReview(untrusted_repair(verdict, repair, update=update))
+        proposal = None
+        if verdict == "revise" and isinstance(repair, dict) and set(repair) == set(editable):
+            edits = {key: value for key, value in repair.items() if value is not None}
+            try:
+                proposal = _repair_fields(edits, update=update)
+            except ReviewError:
+                pass
+        raise InconsistentReview(proposal)
     if not wire and verdict == "skip" and not any(result["criteria"][name]["outcome"] == "fail" for name in EDITORIAL_CRITERIA):
         # Reviewer.review holds a reply's skip like this, so a saved one is damaged.
         raise ReviewError("Review skip requires a failed editorial criterion")
@@ -713,7 +732,7 @@ def _has_live_incident_claim(text: str) -> bool:
 
 def _is_tor_dev_spec(sources: list[dict], candidate_text: str) -> bool:
     norm_cand = _plain(candidate_text)
-    if _untrusted_incident_mention(candidate_text) or not _SPEC_CANDIDATE_RE.search(norm_cand):
+    if not _SPEC_CANDIDATE_RE.search(norm_cand):
         return False
     for source in sources:
         url = str(source.get("url") or "").lower()
@@ -767,9 +786,10 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
                               if source.get("kind") == "gitlab_mr" and source.get("upstream_state") == "merged"))
     all_proof = _plain("\n".join(passage["text"] for source in sources for passage in source["passages"]))
     if prepared.get("mode") == "update":
-        if (((prepared.get("coverage") or {}).get("prior_story") or {}).get("confidence") == "confirmed"
-                and "confirmed" not in limits["confidence"]):
+        prior = (prepared.get("coverage") or {}).get("prior_story") or {}
+        if prior.get("confidence") == "confirmed" and "confirmed" not in limits["confidence"]:
             limits = {**limits, "confidence": [*limits["confidence"], "confirmed"]}
+        _widen_update_state(limits, sources, prior, candidate.get("sources"))
         entry = candidate["updates"][-1]
         exact_urls = {canonical_url(source["url"]) for source in entry["sources"]}
         cited_urls = {url.split("#", 1)[0] for url in exact_urls}
@@ -785,20 +805,19 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
         untrusted_claim = False
     else:
         proof = all_proof
-        claimed = (_claimed_done(candidate["title"], candidate["summary"], candidate["why_it_matters"])
-                   if prepared["payload"]["editorial_kind"] == "gitlab_issue" else [])
-        lead = _plain(candidate["title"])
         texts = (candidate["title"], candidate["summary"], candidate["why_it_matters"])
+        claimed = _claimed_done(*texts) if prepared["payload"]["editorial_kind"] == "gitlab_issue" else []
+        lead = _plain(candidate["title"])
         community_list = bool(sources) and all(
-            source.get("authority") == "community" and "lists.torproject.org" in str(source.get("url") or "")
+            source.get("authority") == "community" and LIST_ARCHIVE_HOST in str(source.get("url") or "")
             for source in sources
         )
-        cand_full = "\n".join((candidate["title"], candidate["summary"], candidate.get("why_it_matters", "")))
-        tor_dev_spec = community_list and _is_tor_dev_spec(sources, cand_full)
-        untrusted_claim = community_list and not tor_dev_spec and (
-            candidate["category"] in {"security", "dos"}
-            or bool({"security", "dos"} & set(candidate.get("tags") or ()))
-            or _untrusted_incident_mention(cand_full)
+        cand_full = "\n".join(texts)
+        has_incident = community_list and _untrusted_incident_mention(cand_full)
+        untrusted_claim = has_incident or (
+            community_list
+            and bool({"security", "dos"} & {candidate["category"], *(candidate.get("tags") or ())})
+            and not _is_tor_dev_spec(sources, cand_full)
         )
     compromise_headline = bool(_HEDGED.search(all_proof) and _COMPROMISE.search(lead) and not _QUALIFIED.search(lead))
     is_alert = candidate.get("origin") == "network-health"
@@ -857,7 +876,7 @@ class Reviewer(CompletionClient):
                 check["properties"]["source_refs"]["items"]["enum"] = sorted(refs)
         # A repair offers only the labels this packet allows.
         repair = schema["properties"]["repair"]["anyOf"][1]["properties"]
-        limits = repair_limits(packet, coverage, update=update)
+        limits = repair_limits(packet, coverage, update=update, candidate_sources=candidate_public.get("sources"))
         apply_label_limits(repair, limits, nullable=True)
         # Each call starts with the rubric, exact candidate and bounded context.
         # A prior model response, critique or approval is never part of its history.
@@ -884,15 +903,10 @@ class Reviewer(CompletionClient):
             prompt = prompt + ROUTING_PROMPT
         if validation_error is not None:
             prompt += VALIDATION_REASK_PROMPT
-        result = self.complete(prompt, payload, schema, "onionflash_review",
-                               **({"on_request": on_request} if on_request is not None else {}))
+        result = self.complete(prompt, payload, schema, "onionflash_review", on_request=on_request)
         result = _validate(result, refs, wire=True, update=update, coverage=coverage)
-        if result["repair"] is not None:
-            for key, allowed in limits.items():
-                if key in result["repair"] and result["repair"][key] not in allowed:
-                    raise ReviewError("Review repair labels exceed this packet's limits")
-            if "tags" in result["repair"] and any(tag not in limits["category"] for tag in result["repair"]["tags"]):
-                raise ReviewError("Review repair labels exceed this packet's limits")
+        if result["repair"] is not None and not within_label_limits(result["repair"], limits):
+            raise ReviewError("Review repair labels exceed this packet's limits")
         if (not update and prior_id is None and result["verdict"] == "skip" and result["same_story"] is None
                 and result["criteria"]["news_value"]["outcome"] == "pass"
                 and result["criteria"]["new_information"]["outcome"] == "fail"):

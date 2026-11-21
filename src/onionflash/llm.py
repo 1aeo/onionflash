@@ -6,10 +6,12 @@ import json
 import os
 import re
 import time
+import unicodedata
 
 from .config import completion_budget_seconds
 from .schema import CATEGORIES, CONFIDENCES, STATES
 from .transport import DeadlineReached, FetchError, HttpClient
+from .util import LIST_ARCHIVE_HOST, has_invalid_text_chars, strict_json
 
 _ACRONYM_ALLOWLIST = frozenset({
     "TOR", "ARTI", "TCP", "UDP", "TLS", "SSL", "DNS", "HTTP", "HTTPS", "SOCKS", "SOCKS4",
@@ -74,16 +76,9 @@ class RequestObserver:
 
     def response_received(self) -> None:
         """Record that an HTTP response arrived before parsing completion output."""
-        pass
 
     def transport_failed(self) -> None:
         """Record that transport failed before an HTTP completion response arrived."""
-        pass
-
-
-def has_invalid_text_chars(value: str) -> bool:
-    """Reject ASCII control characters (other than tab/newline) and XML noncharacters."""
-    return any((ord(c) < 32 and c not in "\n\t") or c in "\ufffe\uffff" for c in value)
 
 
 def has_shouting_caps(text: str) -> bool:
@@ -95,17 +90,15 @@ def has_shouting_caps(text: str) -> bool:
     return False
 
 
-def _is_sic_annotated(text: str, match: re.Match[str]) -> bool:
-    prefix = text[max(0, match.start() - 48) : match.start()]
-    suffix = text[match.end() : match.end() + 80]
-    return bool(_SIC_PREFIX_RE.search(prefix) or _SIC_SUFFIX_RE.search(suffix))
-
-
 def has_malformed_tor_version(text: str, products: list[str] | tuple[str, ...] = ()) -> bool:
     """Return whether text cites a nonexistent three-part C-Tor version such as 0.4.17."""
     if products and "tor" not in products and "network" not in products:
         return False
-    return any(not _is_sic_annotated(text, match) for match in _MALFORMED_TOR_VERSION_RE.finditer(text))
+    return any(
+        not (_SIC_PREFIX_RE.search(text[max(0, m.start() - 48) : m.start()])
+             or _SIC_SUFFIX_RE.search(text[m.end() : m.end() + 80]))
+        for m in _MALFORMED_TOR_VERSION_RE.finditer(text)
+    )
 
 
 def validate_text(value: object, maximum: int, *, empty: bool = False,
@@ -117,6 +110,36 @@ def validate_text(value: object, maximum: int, *, empty: bool = False,
     if not stripped and not empty:
         raise error(message)
     return stripped
+
+
+def validate_schema_field(value: object, rule: dict, *, empty: bool = False,
+                          error: type[Exception] = AnalysisError, message: str = "Invalid model field"):
+    """Validate and normalize one string, boolean, enum, or string-array schema property."""
+    kind = rule.get("type")
+    if kind == "string":
+        if "enum" in rule:
+            if not isinstance(value, str) or value not in rule["enum"]:
+                raise error(message)
+            return value
+        return validate_text(value, rule["maxLength"], empty=empty, error=error, message=message)
+    if kind == "array":
+        member = rule["items"]
+        if (
+            not isinstance(value, list)
+            or len(value) > rule["maxItems"]
+            or any(
+                not isinstance(v, str)
+                or (v not in member["enum"] if "enum" in member else len(v) > member["maxLength"] or has_invalid_text_chars(v))
+                for v in value
+            )
+        ):
+            raise error(message)
+        return list(dict.fromkeys(value)) if "enum" in member else value
+    if kind == "boolean":
+        if type(value) is not bool or ("enum" in rule and value not in rule["enum"]):
+            raise error(message)
+        return value
+    raise ValueError(f"Unsupported schema rule type: {kind!r}")
 
 
 def is_complete_sentence(text: str) -> bool:
@@ -146,34 +169,107 @@ def unquoted_text(text: str) -> str:
 
 
 _MAIL_QUOTE_INTRO_RE = re.compile(
-    r"^(?:on\s+.+\bwrote:|am\s+.+\bschrieb\b.*:|le\s+.+\ba\s+écrit\s*:|[- ]*original message[- ]*|from:\s+.+)$",
+    r"^(?:on\s+.+\bwrote\s*:|am\s+.+\bschrieb\b.*:|le\s+.+\ba\s+écrit\s*:|[- ]*original message[- ]*)$",
     re.IGNORECASE,
 )
+_DATED_QUOTE_INTRO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\b.+:$")
+_FROM_HEADER_RE = re.compile(r"^from:\s+.+$", re.IGNORECASE)
+_QUOTE_ATTRIBUTION_END_RE = re.compile(r"\b(?:wrote\s*:|schrieb\b.*:|a\s+écrit\s*:)$", re.IGNORECASE)
+_QUOTE_WEEKDAY_PREFIX_RE = re.compile(
+    r"^(?:on|am|le)\s+(?:mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|"
+    r"sat(?:urday)?|sun(?:day)?|montag|dienstag|mittwoch|donnerstag|freitag|samstag|sonntag|"
+    r"lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche),?$",
+    re.IGNORECASE,
+)
+_NON_BOUNDARY_SUFFIX_RE = re.compile(
+    r"(?:"
+    r"\b\d{1,2}:\d{2}(?::\d{2})?:$"
+    r"|(?:^|[\s.(])[A-Za-z]\.$"
+    r"|\b(?:janv?|feb|févr|fevr|mar|märz?|apr|avr|may|mai|jun|juin|jul|juil|aug|août|aout|"
+    r"sept?|oct|okt|nov|dec|déc|dez|mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|"
+    r"lun|mar|mer|jeu|ven|sam|dim|mr|mrs|ms|dr|prof|st|jr|sr)\.$"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_standalone_quote_header(line: str) -> bool:
+    norm = unicodedata.normalize("NFC", line)
+    return bool(
+        _MAIL_QUOTE_INTRO_RE.match(norm)
+        or _FROM_HEADER_RE.match(norm)
+        or (_DATED_QUOTE_INTRO_RE.match(norm) and not _QUOTE_ATTRIBUTION_END_RE.search(norm))
+    )
+
+
+def _is_span_boundary(line: str) -> bool:
+    return bool(line) and line[-1] in ".!?:" and not _NON_BOUNDARY_SUFFIX_RE.search(line)
+
+
+def _dropped_dated_attribution(norm_lines: list[str], drop: list[bool], quoted: list[bool], start: int) -> bool:
+    if not re.match(r"^\d{4}-\d{2}-\d{2}\b", norm_lines[start]):
+        return False
+    end = start
+    while end < len(norm_lines) and drop[end] and not quoted[end] and norm_lines[end]:
+        end += 1
+    return end > start and bool(_QUOTE_ATTRIBUTION_END_RE.search(norm_lines[end - 1]))
 
 
 def unquoted_mail_text(text: str) -> str:
     """Strip >-quoted reply lines and quote-attribution headers preceding them."""
     lines = text.splitlines()
-    drop = [line.lstrip().startswith(">") for line in lines]
+    norm_lines = [unicodedata.normalize("NFC", line).strip() for line in lines]
+    quoted = [line.lstrip().startswith(">") for line in lines]
+    drop = list(quoted)
+    nonblank = lambda start: next((i for i in range(start, len(lines)) if norm_lines[i]), len(lines))
     for index in range(len(lines) - 1, -1, -1):
-        if drop[index] or not (stripped := lines[index].strip()):
+        if drop[index] or not (stripped := norm_lines[index]):
             continue
-        probe = index + 1
-        while probe < len(lines) and not lines[probe].strip():
-            probe += 1
-        if (probe == len(lines) or drop[probe]) and _MAIL_QUOTE_INTRO_RE.match(stripped):
+        probe = nonblank(index + 1)
+        if (
+            ((probe == len(lines) or drop[probe]) and _MAIL_QUOTE_INTRO_RE.match(stripped))
+            or (probe < len(lines) and drop[probe] and _FROM_HEADER_RE.match(stripped))
+            or (probe < len(lines) and quoted[probe] and _DATED_QUOTE_INTRO_RE.match(stripped))
+            or (
+                probe < len(lines)
+                and drop[probe]
+                and not quoted[probe]
+                and _QUOTE_WEEKDAY_PREFIX_RE.match(stripped)
+                and _dropped_dated_attribution(norm_lines, drop, quoted, probe)
+            )
+        ):
             drop[index] = True
             continue
-        if index + 1 < len(lines) and not drop[index + 1] and (next_line := lines[index + 1].strip()):
-            probe2 = index + 2
-            while probe2 < len(lines) and not lines[probe2].strip():
-                probe2 += 1
-            if (probe2 == len(lines) or drop[probe2]) and re.match(
-                r"^on\s+.+\bwrote:$", f"{stripped} {next_line}", re.IGNORECASE
+        if _is_span_boundary(stripped):
+            continue
+        for span_len in (2, 3):
+            end = index + span_len
+            if end > len(lines):
+                continue
+            cont = norm_lines[index + 1 : end]
+            if any(
+                not cont[offset]
+                or drop[index + 1 + offset]
+                or _is_standalone_quote_header(cont[offset])
+                or (offset < span_len - 2 and _is_span_boundary(cont[offset]))
+                for offset in range(span_len - 1)
             ):
-                drop[index] = drop[index + 1] = True
+                continue
+            after_span = nonblank(end)
+            joined = " ".join([stripped, *cont])
+            if (
+                (after_span == len(lines) or drop[after_span]) and _MAIL_QUOTE_INTRO_RE.match(joined)
+            ) or (after_span < len(lines) and quoted[after_span] and _DATED_QUOTE_INTRO_RE.match(joined)):
+                for k in range(index, end):
+                    drop[k] = True
+                break
     kept = "\n".join(line for line, remove in zip(lines, drop) if not remove)
     return re.sub(r"\n{3,}", "\n\n", kept).strip()
+
+
+def is_quoted_list_post(url: object, text: str) -> bool:
+    """Return whether `text` is a `lists.torproject.org` post containing `>`-quoted lines."""
+    return LIST_ARCHIVE_HOST in str(url or "") and any(ln.lstrip().startswith(">") for ln in text.splitlines())
 
 
 def label_limits(sources: list[dict]) -> dict:
@@ -212,8 +308,7 @@ def repair_schema(fields: dict, required: tuple[str, ...]) -> dict:
 
 def json_object(text: str, code: str = "writer.invalid_json") -> dict:
     """Parse a strict UTF-8 JSON object without duplicate keys, surrogates or NaNs."""
-    def unique(pairs):
-        """Reject duplicate object keys while constructing a JSON dictionary."""
+    def _unique(pairs):
         result = {}
         for key, value in pairs:
             if key in result:
@@ -222,11 +317,8 @@ def json_object(text: str, code: str = "writer.invalid_json") -> dict:
         return result
 
     try:
-        result = json.loads(text, object_pairs_hook=unique)
-        # Stored analyses must be standard UTF-8 JSON: reject unpaired surrogate
-        # escapes and non-finite numbers (NaN, Infinity, 1e999) before a malformed
-        # model response reaches the queue.
-        json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        result = json.loads(text, object_pairs_hook=_unique)
+        strict_json(result)
     except (ValueError, TypeError, RecursionError) as exc:
         raise AnalysisError("Model returned invalid JSON", code=code) from exc
     if not isinstance(result, dict):
@@ -281,9 +373,6 @@ class CompletionClient:
         if self.client is not None:
             self.client.close()
 
-    def _fail_retryable(self, message: str) -> AnalysisError:
-        return AnalysisError(message, retryable=True)
-
     def _admit(self, failure: AnalysisError | None = None) -> None:
         if self.deadline is not None and self.clock() >= self.deadline:
             if failure is not None:
@@ -294,10 +383,10 @@ class CompletionClient:
         """One fresh request; drafting, review and link checks share transport policy."""
         self._admit()
         if not self.llm["base_url"]:
-            raise self._fail_retryable("LLM endpoint is not configured")
+            raise AnalysisError("LLM endpoint is not configured", retryable=True)
         key = os.environ.get(self.llm["api_key_env"], "")
         if not key:
-            raise self._fail_retryable("LLM credential environment variable is missing")
+            raise AnalysisError("LLM credential environment variable is missing", retryable=True)
         if self.client is None:
             self.client = HttpClient(
                 self.http_settings,
@@ -306,23 +395,18 @@ class CompletionClient:
                 clock=self.clock,
             )
         try:
-            content = json.dumps(payload, ensure_ascii=False, allow_nan=False)
-            content.encode("utf-8")
+            content = strict_json(payload, sort_keys=False)
         except (ValueError, TypeError, RecursionError) as exc:
             raise AnalysisError("Model input is not valid UTF-8 JSON", code=self.stage + ".invalid_input") from exc
         options = generation_options(self.llm)
         request = {
             "model": self.llm["model"],
             "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": content}],
-            "temperature": options.pop("temperature"),
-            "max_tokens": options.pop("max_tokens"),
+            "temperature": options["temperature"],
+            "max_tokens": options["max_tokens"],
             "response_format": {"type": "json_schema", "json_schema": {"name": name, "strict": True, "schema": schema}},
+            **options,
         }
-        request.update(options)
-        return self._complete(request, key, **({"on_request": on_request} if on_request is not None else {}))
-
-    def _complete(self, request: dict, key: str, *, on_request=None) -> dict:
-        """POST one chat completion; only transport failures move on to a fallback."""
         failure = None
         for base_url in [self.llm["base_url"], *self.llm["fallback_base_urls"]]:
             self._admit(failure)
@@ -349,18 +433,15 @@ class CompletionClient:
                     "LLM request failed" + (f" (HTTP {exc.status})" if exc.status else ""),
                     retryable=True,
                 )
-                if isinstance(exc, DeadlineReached):
+                if isinstance(exc, DeadlineReached) and not exc.request_started:
                     # Only refusal before dispatch proves the reservation unused.
-                    # A timed-out request may already have reached the endpoint.
-                    if not exc.request_started:
-                        self.calls -= 1
-                        if on_request is not None:
-                            on_request(-1)
-                    if isinstance(on_request, RequestObserver):
-                        on_request.transport_failed()
-                    raise failure or current_failure from None
+                    self.calls -= 1
+                    if on_request is not None:
+                        on_request(-1)
                 if isinstance(on_request, RequestObserver):
                     on_request.transport_failed()
+                if isinstance(exc, DeadlineReached):
+                    raise failure or current_failure from None
                 failure = current_failure
         else:
             raise failure
@@ -370,9 +451,9 @@ class CompletionClient:
             choice = response.json()["choices"][0]
             finished, content = choice["finish_reason"], choice["message"]["content"]
         except (FetchError, KeyError, IndexError, TypeError):
-            raise self._fail_retryable("LLM returned an unexpected response") from None
+            raise AnalysisError("LLM returned an unexpected response", retryable=True) from None
         if finished != "stop":
             raise AnalysisError("Model completion was truncated or refused", code=self.stage + ".truncated")
         if not isinstance(content, str):
-            raise self._fail_retryable("Model returned no textual completion")
+            raise AnalysisError("Model returned no textual completion", retryable=True)
         return json_object(content, self.stage + ".invalid_json")

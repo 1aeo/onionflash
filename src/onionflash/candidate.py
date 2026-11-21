@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import copy
 import json
 import re
 
 from . import editorial, render, source_packet
 from .analyze import MIN_EVIDENCE_CHARS
-from .comments import analysis_context, is_budget_clipped_prefix, note_key, prior_notes
-from .llm import strip_unreleased_tag, unquoted_text
+from .comments import analysis_context, budget_unchanged_note_ids, note_key, prior_notes
+from .llm import strip_unreleased_tag, unquoted_mail_text, unquoted_text
 from .schema import SEMANTIC_FIELDS, UPDATE_FIELDS
 from .util import (after, digest, gitlab_refs, gitlab_url_variants, item_identity, normalize_evidence,
                    release_mentions, safe_canonical_url, saved_object, story_cluster, thread_subject)
@@ -42,24 +43,30 @@ def _url_matches(url: object, bases: set[str]) -> bool:
     return bool(clean and any(clean == base or clean.startswith(base + "#") for base in bases))
 
 
-def story_cites_item(story: dict, item: dict | str | None = None, *urls: str | None,
-                     item_id: str | None = None, url: str | None = None) -> bool:
-    """Return whether `story` cites `item` in its top-level sources or dated update sources."""
-    if isinstance(item, dict):
-        item_id = item_id or item.get("id")
-        urls = (item.get("url"), *urls)
-    elif isinstance(item, str):
-        item_id = item_id or item
-    bases = {u for u in (_norm_url(raw) for raw in (*urls, url)) if u}
-    return any(
-        isinstance(s, dict)
-        and ((item_id and (s.get("id") == item_id or s.get("source_item_id") == item_id)) or _url_matches(s.get("url"), bases))
-        for s in (story.get("sources") or ())
-    ) or any(
-        isinstance(cs, dict) and _url_matches(cs.get("url"), bases)
-        for u in (story.get("updates") or ())
-        if isinstance(u, dict)
-        for cs in (u.get("sources") or ())
+def item_source(item: dict) -> dict:
+    """Return the canonical four-field citation entry for `item`."""
+    return {key: item[key] for key in ("id", "url", "title", "published_at")}
+
+
+def _source_matches(entry: object, item_id: str | None, bases: set[str]) -> bool:
+    return isinstance(entry, dict) and bool(
+        (item_id and (entry.get("id") == item_id or entry.get("source_item_id") == item_id))
+        or _url_matches(entry.get("url"), bases)
+    )
+
+
+def _update_cites(update_entry: object, bases: set[str]) -> bool:
+    return isinstance(update_entry, dict) and any(
+        isinstance(cs, dict) and _url_matches(cs.get("url"), bases) for cs in (update_entry.get("sources") or ())
+    )
+
+
+def story_cites_item(story: dict, item_id: str | None, *urls: str | None) -> bool:
+    """Return whether `story` cites `item_id` or `urls` in its top-level or dated update sources."""
+    bases = {u for raw in urls if (u := _norm_url(raw))}
+    return (
+        any(_source_matches(s, item_id, bases) for s in (story.get("sources") or ()))
+        or any(_update_cites(u, bases) for u in (story.get("updates") or ()))
     )
 
 
@@ -72,7 +79,7 @@ def _retracted_title(db, row) -> str:
     payload = row["payload"]
     raw_blob = payload.encode("utf-8") if isinstance(payload, str) else payload
     for blob in (*(rev or ()), raw_blob):
-        if blob is not None and isinstance(obj := saved_object(blob), dict) and isinstance(obj.get("title"), str) and obj["title"].strip():
+        if (obj := saved_object(blob)) and isinstance(obj.get("title"), str) and obj["title"].strip():
             return obj["title"].strip()[:180]
     return "Retracted story"
 
@@ -82,7 +89,11 @@ def coverage_background(db, prior: dict | None, *, related_rows: list[tuple[str,
     """Bounded committed coverage for editorial comparison, never source evidence."""
     def public_text(row):
         """Normalize public coverage fields and reject mismatched stored identities."""
-        public = render.prepare_story(json.loads(row["payload"]))
+        raw_payload = row["payload"]
+        decoded = saved_object(raw_payload.encode("utf-8") if isinstance(raw_payload, str) else raw_payload)
+        if decoded is None:
+            raise ValueError("Damaged story payload")
+        public = render.prepare_story(decoded)
         if public["id"] != row["id"]:
             raise ValueError("Coverage identity differs from its stored story")
         out = {key: public[key] for key in ("id", *SEMANTIC_FIELDS, "published_at", "updated_at", "added_at")}
@@ -91,7 +102,7 @@ def coverage_background(db, prior: dict | None, *, related_rows: list[tuple[str,
                 out[optional] = public[optional]
         return out
 
-    def compact_entry(row, *, summary_limit: int = COVERAGE_SUMMARY_CHARS, reason: str | None = None) -> dict:
+    def _compact_entry(row, *, summary_limit: int = COVERAGE_SUMMARY_CHARS, reason: str | None = None) -> dict:
         if row["retracted"]:
             return {"id": row["id"], "title": _retracted_title(db, row), "retracted": True}
         current = public_text(row)
@@ -113,10 +124,10 @@ def coverage_background(db, prior: dict | None, *, related_rows: list[tuple[str,
     result = {"prior_story": previous, "recent": [], "truncated": False}
     seen_ids = {prior["id"]} if prior else set()
 
-    def try_add(row, *, summary_limit: int = COVERAGE_SUMMARY_CHARS, reason: str | None = None) -> bool:
+    def _try_add(row, *, summary_limit: int = COVERAGE_SUMMARY_CHARS, reason: str | None = None) -> bool:
         try:
-            entry = compact_entry(row, summary_limit=summary_limit, reason=reason)
-        except (ValueError, TypeError, KeyError, AttributeError, UnicodeError):
+            entry = _compact_entry(row, summary_limit=summary_limit, reason=reason)
+        except (ValueError, TypeError, KeyError, AttributeError, UnicodeError, RecursionError):
             result["truncated"] = True
             return True
         if (len(result["recent"]) + bool(previous) >= COVERAGE_ROWS
@@ -131,25 +142,26 @@ def coverage_background(db, prior: dict | None, *, related_rows: list[tuple[str,
         *((sid, RELATED_SUMMARY_CHARS, reason) for sid, reason in list(related_rows)[:RELATED_LIMIT]),
         *((sid, COVERAGE_SUMMARY_CHARS, "earlier decision") for sid in earlier_ids),
     ]
+    story_sql = (
+        "SELECT s.id,CASE WHEN typeof(s.payload)='text' THEN CAST(s.payload AS BLOB) END AS payload,"
+        "COALESCE(e.retracted,0) AS retracted FROM stories s LEFT JOIN editorial_controls e ON e.story_id=s.id"
+    )
     for story_id, limit, reason in pinned:
         if story_id in seen_ids:
             continue
-        pinned_row = db.execute(
-            """SELECT s.id,s.payload,COALESCE(e.retracted,0) AS retracted
-               FROM stories s LEFT JOIN editorial_controls e ON e.story_id=s.id WHERE s.id=?""",
-            (story_id,),
-        ).fetchone()
-        if pinned_row is not None and not pinned_row["retracted"] and not try_add(pinned_row, summary_limit=limit, reason=reason):
+        pinned_row = db.execute(f"{story_sql} WHERE s.id=?", (story_id,)).fetchone()
+        if pinned_row is not None and not pinned_row["retracted"] and not _try_add(pinned_row, summary_limit=limit, reason=reason):
             return result
 
+    added_expr = (
+        "CASE WHEN typeof(s.payload)='text' AND json_valid(s.payload) AND json_type(s.payload, '$.added_at')='text' "
+        "THEN json_extract(s.payload, '$.added_at') END"
+    )
     for row in db.execute(
-        """SELECT s.id,s.payload,COALESCE(e.retracted,0) AS retracted
-           FROM stories s LEFT JOIN editorial_controls e ON e.story_id=s.id
-           ORDER BY MAX(s.updated_at, COALESCE(json_extract(s.payload, '$.added_at'), s.published_at)) DESC, s.rowid DESC
-           LIMIT ?""",
+        f"{story_sql} ORDER BY MAX(s.updated_at, COALESCE({added_expr}, s.published_at)) DESC, s.rowid DESC LIMIT ?",
         (COVERAGE_ROWS + 1,),
     ).fetchall():
-        if row["id"] not in seen_ids and not try_add(row):
+        if row["id"] not in seen_ids and not _try_add(row):
             break
     return result
 
@@ -167,10 +179,8 @@ def writer_info(previous: dict | None, db=None) -> tuple[str | None, str, str]:
     authority = previous.get("editorial_authority")
     if authority is None and db is not None and writer:
         writer_row = db.execute("SELECT CAST(payload AS BLOB) FROM items WHERE id=?", (writer,)).fetchone()
-        if writer_row is not None:
-            saved = saved_object(writer_row[0])
-            if isinstance(saved, dict) and isinstance(saved.get("authority"), str):
-                authority = saved["authority"]
+        if (saved := saved_object(writer_row[0] if writer_row else None)) and isinstance(saved.get("authority"), str):
+            authority = saved["authority"]
     if authority is None:
         authority = "official" if kind in {"feed", ""} and previous.get("confidence") == "confirmed" else ""
     return writer, kind, authority
@@ -214,37 +224,21 @@ def _latest_published_source(db, item_id: str, analysis_key: str | None) -> dict
             continue
         if record_blob is None:
             return snap
-        rec = saved_object(record_blob)
-        if isinstance(rec, dict) and rec.get("outcome") in {"approved", "operator_approved"}:
+        if (rec := saved_object(record_blob)) and rec.get("outcome") in {"approved", "operator_approved"}:
             return snap
-    if analysis_key:
-        row = db.execute("SELECT CAST(source_payload AS BLOB) FROM analyses WHERE cache_key=?", (analysis_key,)).fetchone()
-        if row is not None:
-            return saved_object(row[0])
+    if analysis_key and (row := db.execute("SELECT CAST(source_payload AS BLOB) FROM analyses WHERE cache_key=?", (analysis_key,)).fetchone()):
+        return saved_object(row[0])
     return None
 
 
 def _source_cutoff(db, previous: dict, old_item: dict | None, item: dict | None = None) -> str:
     item_id = (item or old_item or {}).get("id") or previous.get("editorial_item")
     own_urls = {u for u in (_norm_url((item or {}).get("url")), _norm_url((old_item or {}).get("url"))) if u}
-
-    def is_own_source(entry: dict) -> bool:
-        return bool(
-            (item_id and (entry.get("id") == item_id or entry.get("source_item_id") == item_id))
-            or _url_matches(entry.get("url"), own_urls)
-        )
-
     initial_at = (old_item or {}).get("published_at") or (item or {}).get("published_at") or previous["published_at"]
     dates = [
         initial_at,
-        *(s["published_at"] for s in previous.get("sources", []) if isinstance(s, dict) and s.get("published_at") and is_own_source(s)),
-        *(
-            u["at"]
-            for u in previous.get("updates") or []
-            if isinstance(u, dict)
-            and u.get("at")
-            and any(isinstance(cs, dict) and _url_matches(cs.get("url"), own_urls) for cs in (u.get("sources") or []))
-        ),
+        *(s["published_at"] for s in previous.get("sources", []) if _source_matches(s, item_id, own_urls) and s.get("published_at")),
+        *(u["at"] for u in previous.get("updates") or () if _update_cites(u, own_urls) and u.get("at")),
     ]
     if old_item is not None:
         if old_item.get("kind") != "gitlab_issue":
@@ -252,27 +246,24 @@ def _source_cutoff(db, previous: dict, old_item: dict | None, item: dict | None 
         dates += [n["created_at"] for n in old_item.get("public_comments") or []]
     elif (
         db.execute("SELECT 1 FROM editorial_controls WHERE story_id=?", (previous["id"],)).fetchone() is None
-        and all(is_own_source(s) for s in previous.get("sources", []) if isinstance(s, dict) and not s.get("network_key"))
-        and all(
-            any(isinstance(cs, dict) and _url_matches(cs.get("url"), own_urls) for cs in (u.get("sources") or []))
-            for u in (previous.get("updates") or [])
-            if isinstance(u, dict)
-        )
+        and all(_source_matches(s, item_id, own_urls) for s in previous.get("sources", []) if isinstance(s, dict) and not s.get("network_key"))
+        and all(_update_cites(u, own_urls) for u in (previous.get("updates") or ()) if isinstance(u, dict))
     ):
         dates.append(previous["updated_at"])
     return max(dates)
 
 
 def _changed_note_ids(old_item: dict | None, item: dict) -> set[str]:
-    seen_notes = prior_notes((old_item or {}).get("public_comments"))
+    prev_comments = (old_item or {}).get("public_comments")
+    seen_notes = prior_notes(prev_comments)
     notes = item.get("public_comments") or []
-    clipped_tail = is_budget_clipped_prefix(seen_notes, notes)
+    budget_unchanged = budget_unchanged_note_ids(prev_comments, notes)
     return {
         nkey
-        for index, note in enumerate(notes)
+        for note in notes
         if "id" in note
         and (old_note := seen_notes.get(nkey := note_key(note["id"]))) is not None
-        and not (clipped_tail and index == len(notes) - 1)
+        and nkey not in budget_unchanged
         and unquoted_text(str(old_note.get("body") or "")).strip() != unquoted_text(note["body"]).strip()
     }
 
@@ -289,36 +280,13 @@ def _own_diff(db, previous: dict, item: dict, writer: str | None, *, item_id: st
         note_max = max((n.get("edited_at") or n["created_at"] for n in item.get("public_comments") or []), default="")
         body_changed = item["updated_at"] > max(cutoff, note_max)
     else:
-        body_changed = any(
-            unquoted_text(str(item.get(k) or "")).strip() != unquoted_text(str(prior_snap.get(k) or "")).strip()
-            for k in ("title", "upstream_state")
-        ) or (
-            unquoted_text(str(item.get("source_content", item.get("content")) or "")).strip()
-            != unquoted_text(str(prior_snap.get("source_content", prior_snap.get("content")) or "")).strip()
-        )
+        _unq = lambda v: unquoted_text(str(v or "")).strip()
+        _fields = lambda d: (_unq(d.get("title")), _unq(d.get("upstream_state")), _unq(d.get("source_content", d.get("content"))))
+        body_changed = _fields(item) != _fields(prior_snap)
     return True, prior_snap, cutoff, changed_ids, body_changed
 
 
-_QUOTE_HEADER = re.compile(
-    r"^(?:on\s+.+\bwrote:|am\s+.+\bschrieb\b.*:|le\s+.+\ba\s+écrit\s*:|\d{4}-\d{2}-\d{2}\b.+:)$",
-    re.I,
-)
 _REPLY_SUBJECT = re.compile(r"(?:^|\])\s*re:", re.I)
-
-
-def _unquoted_reply(text: str) -> str:
-    """Drop >-quoted lines and quote-attribution headers immediately preceding them."""
-    lines = text.splitlines()
-    keep = [not line.lstrip().startswith(">") for line in lines]
-    for index, line in enumerate(lines):
-        if not keep[index] or not _QUOTE_HEADER.match(line.strip()):
-            continue
-        probe = index + 1
-        while probe < len(lines) and not lines[probe].strip():
-            probe += 1
-        if probe < len(lines) and not keep[probe]:
-            keep[index] = False
-    return "\n".join(line for line, ok in zip(lines, keep) if ok)
 
 
 def own_update_input(db, row: dict, item: dict, *, existing=_UNSET) -> tuple[str, dict]:
@@ -339,18 +307,16 @@ def own_update_input(db, row: dict, item: dict, *, existing=_UNSET) -> tuple[str
         raw = item.get("source_content", item.get("content")) or ""
         is_reply = bool(_REPLY_SUBJECT.search(item.get("title") or ""))
         if (
-            "/hyperkitty/list/" in (item.get("url") or "")
-            or item.get("kind") == "pipermail"
-            or (item.get("kind") in {"feed", "rss"} and is_reply and "\n>" in ("\n" + raw))
+            any(ln.lstrip().startswith(">") for ln in raw.splitlines())
+            and ("/hyperkitty/list/" in (item.get("url") or "") or item.get("kind") == "pipermail" or (item.get("kind") in {"feed", "rss"} and is_reply))
+            and (stripped := unquoted_mail_text(raw)) != raw
         ):
-            stripped = _unquoted_reply(raw)
-            if stripped != raw:
-                filtered = json.loads(json.dumps(item))
-                filtered.pop("source_content", None)
-                filtered["content"] = stripped
-                if (is_reply or not normalize_evidence(item.get("title") or "")) and len(normalize_evidence(stripped)) < MIN_EVIDENCE_CHARS:
-                    return "skip", filtered
-                return mode, filtered
+            filtered = copy.deepcopy(item)
+            filtered.pop("source_content", None)
+            filtered["content"] = stripped
+            if (is_reply or not normalize_evidence(item.get("title") or "")) and len(normalize_evidence(stripped)) < MIN_EVIDENCE_CHARS:
+                return "skip", filtered
+            return mode, filtered
         return mode, item
     seen_bodies = {note_key(n["id"]): n.get("body") for n in (old_item or {}).get("public_comments") or [] if "id" in n}
     new_notes = [
@@ -360,7 +326,7 @@ def own_update_input(db, row: dict, item: dict, *, existing=_UNSET) -> tuple[str
             or note_key(note.get("id")) in changed_ids)
         and (stripped := unquoted_text(note["body"]).strip())
     ]
-    filtered = json.loads(json.dumps(item))
+    filtered = copy.deepcopy(item)
     filtered["public_comments"] = new_notes
     filtered["title"] = (unquoted_text(item["title"]).strip() or item["title"]) if body_changed else ""
     description = filtered.pop("source_content", filtered.get("content", ""))
@@ -421,34 +387,50 @@ def item_fingerprint(row: dict) -> str:
                    source_packet.source_fingerprint(json.loads(row["payload"]))])
 
 
+_STORY_SAFE_COLUMNS = (
+    "id,cluster_key,typeof(payload) AS _payload_type,"
+    "CAST(payload AS BLOB) AS _payload_blob,published_at,updated_at"
+)
+
+
+def _decode_story_row(row, *, raise_retired: bool) -> dict | None:
+    if row is None:
+        return None
+    if row["_payload_type"] != "text" or saved_object(row["_payload_blob"]) is None:
+        if raise_retired:
+            raise ValueError("Damaged story payload")
+        return None
+    return {
+        "id": row["id"],
+        "cluster_key": row["cluster_key"],
+        "payload": str(row["_payload_blob"], "utf-8"),
+        "published_at": row["published_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
 def _lookup_story(db, *, story_id: str | None = None, cluster_key: str | None = None,
                   raise_retired: bool = True) -> tuple[dict | None, str | None]:
     """Resolve `story_id` and/or `cluster_key` to `(live_story_dict, match_kind)`."""
-    def follow(alias: tuple[str, str | None]) -> dict | None:
-        target = db.execute("SELECT * FROM stories WHERE id=?", (alias[1],)).fetchone() if alias[1] else None
-        if target is not None:
-            calias = editorial.retired(db, story_id=target["id"], cluster_key=target["cluster_key"])
-            if calias is None:
-                return dict(target)
-            target = db.execute("SELECT * FROM stories WHERE id=?", (calias[1],)).fetchone() if calias[1] else None
-        if target is None and raise_retired:
-            raise editorial.RetiredStory("Story is retired")
-        return dict(target) if target is not None else None
+    def _follow_id(sid: str | None):
+        return db.execute(f"SELECT {_STORY_SAFE_COLUMNS} FROM stories WHERE id=?", (sid,)).fetchone() if sid else None
 
-    for col, val, kw, label in (
-        ("id", story_id, {"story_id": story_id}, "story_id"),
-        ("cluster_key", cluster_key, {"cluster_key": cluster_key}, "cluster"),
-    ):
+    def _resolve(row, *, allow_second: bool = True) -> dict | None:
+        if row is not None and (alias := editorial.retired(db, story_id=row["id"], cluster_key=row["cluster_key"])) is not None:
+            row = _follow_id(alias[1])
+            if allow_second and row is not None and (calias := editorial.retired(db, story_id=row["id"], cluster_key=row["cluster_key"])) is not None:
+                row = _follow_id(calias[1])
+        if row is None and raise_retired:
+            raise editorial.RetiredStory("Story is retired")
+        return _decode_story_row(row, raise_retired=raise_retired)
+
+    for col, val, label in (("id", story_id, "story_id"), ("cluster_key", cluster_key, "cluster")):
         if not val:
             continue
-        if (alias := editorial.retired(db, **kw)) is not None:
-            target = follow(alias)
-            return (target, "alias") if target else (None, None)
-        if (row := db.execute(f"SELECT * FROM stories WHERE {col}=?", (val,)).fetchone()) is not None:
-            if (second := editorial.retired(db, story_id=row["id"], cluster_key=row["cluster_key"])) is not None:
-                target = follow(second)
-                return (target, label) if target else (None, None)
-            return dict(row), label
+        if (alias := editorial.retired(db, **{label if label == "story_id" else "cluster_key": val})) is not None:
+            return (target, "alias") if (target := _resolve(_follow_id(alias[1]), allow_second=False)) else (None, None)
+        if (row := db.execute(f"SELECT {_STORY_SAFE_COLUMNS} FROM stories WHERE {col}=?", (val,)).fetchone()) is not None:
+            return (target, label) if (target := _resolve(row)) else (None, None)
     return None, None
 
 
@@ -459,48 +441,45 @@ def _live_story(db, story_id: str | None) -> dict | None:
 _MAPPED_PREDICATE = "story_id IS NOT NULL AND NOT (status IS 'pending' AND last_error IS ?)"
 
 
-def _mapped_stories(db, where: str, *params) -> list[dict]:
+def _unique_live_stories(db, story_ids: Iterable[str | None]) -> list[dict]:
     seen, found = set(), []
-    for (sid,) in db.execute(
-        f"SELECT DISTINCT story_id FROM items WHERE ({where}) AND {_MAPPED_PREDICATE}",
-        (*params, UNVERIFIED_ROUTE),
-    ).fetchall():
-        live = _live_story(db, sid)
-        if live and live["id"] not in seen:
+    for sid in story_ids:
+        if (live := _live_story(db, sid)) and live["id"] not in seen:
             seen.add(live["id"])
             found.append(live)
     return found
+
+
+def _mapped_stories(db, where: str, *params) -> list[dict]:
+    rows = db.execute(f"SELECT DISTINCT story_id FROM items WHERE ({where}) AND {_MAPPED_PREDICATE}",
+                      (*params, UNVERIFIED_ROUTE)).fetchall()
+    return _unique_live_stories(db, (sid for (sid,) in rows))
 
 
 def _stories_for_urls(db, urls: list[str]) -> list[dict]:
-    seen, found = set(), []
-    for url in urls:
-        variants = tuple(v.lower() for v in (gitlab_url_variants(url) or {url}))
-        placeholders = ",".join("?" for _ in variants)
-        for live in _mapped_stories(db, f"LOWER(url) IN ({placeholders})", *variants):
-            if live["id"] not in seen:
-                seen.add(live["id"])
-                found.append(live)
-    return found
+    variants = tuple(dict.fromkeys(v.lower() for url in urls for v in (gitlab_url_variants(url) or {url})))
+    return _mapped_stories(db, f"LOWER(url) IN ({','.join('?' * len(variants))})", *variants) if variants else []
 
 
-def _thread_matches(db, row: dict, item: dict, subject: str) -> list[dict]:
+def _thread_matches(db, row: dict, item: dict) -> list[dict]:
+    subject, is_reply = thread_subject(item) if row.get("source_id") else ("", False)
+    if not (subject and is_reply):
+        return []
     earliest = after(-THREAD_WINDOW_DAYS * 86400, item["published_at"])
-    seen, found = set(), []
-    for sid, payload_blob in db.execute(
+    rows = db.execute(
         f"SELECT story_id,CAST(payload AS BLOB) FROM items WHERE source_id=? AND id!=? AND {_MAPPED_PREDICATE}",
         (row["source_id"], row.get("id") or "", UNVERIFIED_ROUTE),
-    ).fetchall():
-        other = saved_object(payload_blob)
-        if (not isinstance(other, dict) or not isinstance(other.get("published_at"), str)
-                or not (earliest <= other["published_at"] <= item["published_at"])
-                or thread_subject(other)[0] != subject):
-            continue
-        live = _live_story(db, sid)
-        if live and live["id"] not in seen:
-            seen.add(live["id"])
-            found.append(live)
-    return found
+    ).fetchall()
+    return _unique_live_stories(
+        db,
+        (
+            sid for sid, payload_blob in rows
+            if (other := saved_object(payload_blob))
+            and isinstance(other.get("published_at"), str)
+            and earliest <= other["published_at"] <= item["published_at"]
+            and thread_subject(other)[0] == subject
+        ),
+    )
 
 
 def associate(db, row: dict) -> tuple[dict | None, str | None]:
@@ -524,7 +503,7 @@ def associate(db, row: dict) -> tuple[dict | None, str | None]:
         legacy, _ = _lookup_story(db, cluster_key=cluster)
         if legacy is not None:
             public = saved_object(legacy["payload"].encode("utf-8") if isinstance(legacy["payload"], str) else legacy["payload"])
-            if isinstance(public, dict) and story_cites_item(public, item):
+            if isinstance(public, dict) and story_cites_item(public, item.get("id"), item.get("url")):
                 return legacy, "source"
         cluster = story_cluster(item)
     matched, how = _lookup_story(db, cluster_key=cluster)
@@ -541,18 +520,10 @@ def associate(db, row: dict) -> tuple[dict | None, str | None]:
         return None, None
     if item.get("kind") == "gitlab_mr" and item.get("upstream_state") == "merged":
         closing, _ = gitlab_refs(item)
-        if closing:
-            closing_matches = _stories_for_urls(db, closing)
-            if len(closing_matches) == 1:
-                return closing_matches[0], "closing_ref"
-            if len(closing_matches) > 1:
-                return None, None
-    if row.get("source_id"):
-        subject, is_reply = thread_subject(item)
-        if subject and is_reply:
-            thread_matches = _thread_matches(db, row, item, subject)
-            if len(thread_matches) == 1:
-                return thread_matches[0], "thread"
+        if closing and (matches := _stories_for_urls(db, closing)):
+            return (matches[0], "closing_ref") if len(matches) == 1 else (None, None)
+    if matches := _thread_matches(db, row, item):
+        return (matches[0], "thread") if len(matches) == 1 else (None, None)
     return None, None
 
 
@@ -566,7 +537,7 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
     seen = set(exclude)
     pairs: list[tuple[str, str]] = []
 
-    def add(story_id: str | None, reason: str) -> None:
+    def _add(story_id: str | None, reason: str) -> None:
         if len(pairs) >= RELATED_LIMIT or not story_id or story_id in seen:
             return
         live = _live_story(db, story_id)
@@ -582,7 +553,7 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
         number = ref.rsplit("/", 1)[-1]
         marker = f"!{number}" if "/-/merge_requests/" in ref else f"#{number}"
         for match in _stories_for_urls(db, [ref]):
-            add(match["id"], f"references {marker}")
+            _add(match["id"], f"references {marker}")
     release_keys = release_mentions(item)
     if (row.get("cluster_key") or "").startswith("release:") and row["cluster_key"] not in release_keys:
         release_keys.insert(0, row["cluster_key"])
@@ -590,14 +561,11 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
         _, prod, ver = key.split(":", 2)
         reason = f"mentions {prod.replace('-', ' ')} {ver}"
         if (rel_story := _lookup_story(db, cluster_key=key, raise_retired=False)[0]) is not None:
-            add(rel_story["id"], reason)
+            _add(rel_story["id"], reason)
         for match in _mapped_stories(db, "cluster_key=?", key):
-            add(match["id"], reason)
-    if row.get("source_id"):
-        subject, is_reply = thread_subject(item)
-        if subject and is_reply:
-            for match in _thread_matches(db, row, item, subject):
-                add(match["id"], "same thread")
+            _add(match["id"], reason)
+    for match in _thread_matches(db, row, item):
+        _add(match["id"], "same thread")
     return pairs
 
 
@@ -610,7 +578,7 @@ def _earlier_decision_ids(db, row: dict, exclude: set[str] | frozenset[str] = fr
         return []
     seen, found = set(exclude), []
 
-    def push(story_id: str | None) -> None:
+    def _push(story_id: str | None) -> None:
         if story_id and story_id not in seen and (live := _live_story(db, story_id)) and live["id"] not in seen:
             seen.add(live["id"])
             found.append(live["id"])
@@ -626,38 +594,72 @@ def _earlier_decision_ids(db, row: dict, exclude: set[str] | frozenset[str] = fr
             if not (isinstance(rev, dict) and isinstance(rev.get("result"), dict)):
                 continue
             res = rev["result"]
-            push(res.get("same_story"))
+            _push(res.get("same_story"))
             reason = ((res.get("criteria") or {}).get("new_information") or {}).get("reason")
             if isinstance(reason, str):
                 for cited_id in re.findall(r"\b[0-9a-f]{24}\b", reason):
-                    push(cited_id)
+                    _push(cited_id)
         cov = (rec.get("prepared") or {}).get("coverage") or rec.get("coverage")
         if isinstance(cov, dict):
             if isinstance(cov.get("prior_story"), dict):
-                push(cov["prior_story"].get("id"))
+                _push(cov["prior_story"].get("id"))
             if not found:
                 for entry in (cov.get("recent") or ())[:8]:
                     if isinstance(entry, dict):
-                        push(entry.get("id"))
+                        _push(entry.get("id"))
         break
     return found
 
 
 def control_fingerprint(db, story_id: str) -> str:
     """Return a deterministic digest of the current editorial controls row for `story_id`."""
-    row = db.execute("SELECT revision,locked,retracted,notice_action,notice_reason,notice_at FROM editorial_controls WHERE story_id=?", (story_id,)).fetchone()
-    return digest(dict(row) if row else None)
+    row = db.execute(
+        """SELECT revision,locked,retracted,
+                  typeof(notice_action) AS _na_t,CAST(notice_action AS BLOB) AS _na_b,
+                  typeof(notice_reason) AS _nr_t,CAST(notice_reason AS BLOB) AS _nr_b,
+                  typeof(notice_at) AS _nat_t,CAST(notice_at AS BLOB) AS _nat_b
+           FROM editorial_controls WHERE story_id=?""",
+        (story_id,),
+    ).fetchone()
+    if row is None:
+        return digest(None)
+
+    def _val(kind: str, blob):
+        if kind == "null" or blob is None:
+            return None
+        if kind == "text":
+            try:
+                return str(blob, "utf-8")
+            except UnicodeError:
+                return {"invalid_utf8_hex": blob.hex()}
+        return blob.hex() if isinstance(blob, (bytes, bytearray)) else blob
+
+    return digest({
+        "revision": row["revision"],
+        "locked": row["locked"],
+        "retracted": row["retracted"],
+        "notice_action": _val(row["_na_t"], row["_na_b"]),
+        "notice_reason": _val(row["_nr_t"], row["_nr_b"]),
+        "notice_at": _val(row["_nat_t"], row["_nat_b"]),
+    })
 
 
 def verify_prepared_binding(db, prepared: dict) -> None:
     """Verify item, lock, editorial controls, and target story still match `prepared`."""
+    from .store import ITEM_SAFE_COLUMNS, decode_item_row
+
     row, story_id = prepared["row"], prepared["story_id"]
     if editorial.retired(db, story_id=story_id, cluster_key=prepared["cluster_key"]) is not None:
         raise editorial.RetiredStory("Story is retired")
     binding = prepared.get("binding") or {}
-    current = db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()
-    expected_fp = binding.get("item") or item_fingerprint(row)
-    if current is None or current["status"] != "pending" or item_fingerprint(dict(current)) != expected_fp:
+    raw_current = db.execute(f"SELECT {ITEM_SAFE_COLUMNS} FROM items WHERE id=?", (row["id"],)).fetchone()
+    current, _ = decode_item_row(raw_current)
+    try:
+        expected_fp = binding.get("item") or item_fingerprint(row)
+        current_fp = item_fingerprint(current) if current is not None else None
+    except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+        raise StaleCandidate("Source item changed before candidate committed") from None
+    if current is None or current["status"] != "pending" or current_fp != expected_fp:
         raise StaleCandidate("Source item changed before candidate committed")
     if editorial.is_locked(db, story_id) != bool(prepared.get("locked")):
         raise StaleCandidate("Editorial lock state changed before candidate committed")
@@ -665,7 +667,7 @@ def verify_prepared_binding(db, prepared: dict) -> None:
     if expected_lock is not None and control_fingerprint(db, story_id) != expected_lock:
         raise StaleCandidate("Editorial controls changed before candidate committed")
     expected_prior = binding.get("prior_story")
-    if expected_prior is not None and digest(existing_story(db, dict(current))) != expected_prior:
+    if expected_prior is not None and digest(existing_story(db, current)) != expected_prior:
         raise StaleCandidate("Target story changed before candidate committed")
 
 
@@ -683,8 +685,8 @@ def validate_approved(original: dict, approved: object, mode: str = "story") -> 
                 or app_updates[:-1] != orig_updates[:-1]
                 or not isinstance(app_updates[-1], dict) or not isinstance(orig_updates[-1], dict)
                 or "at" not in app_updates[-1] or "sources" not in app_updates[-1]
-                or app_updates[-1]["at"] != orig_updates[-1].get("at")
-                or app_updates[-1]["sources"] != orig_updates[-1].get("sources")):
+                or {k: v for k, v in app_updates[-1].items() if k != "text"}
+                != {k: v for k, v in orig_updates[-1].items() if k != "text"}):
             raise ReviewRequired("Update review cannot change earlier updates or the new update's date or citations")
     try:
         normalized = render.prepare_story(approved, editorial=original.get("editorial"))
@@ -699,10 +701,17 @@ def prepare(
     db, row: dict, result: dict, observed: str, *, dirauth_users: Iterable[str] | None = None
 ) -> dict:
     """Assemble the exact candidate and bind all state needed for its guarded commit."""
+    from .store import ITEM_SAFE_COLUMNS, decode_item_row
+
     # Copy caller-owned values so later repairs cannot mutate the original draft.
-    row, result = json.loads(json.dumps(row)), json.loads(json.dumps(result))
-    current = db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()
-    if current is None or item_fingerprint(dict(current)) != item_fingerprint(row):
+    row, result = copy.deepcopy(row), copy.deepcopy(result)
+    raw_current = db.execute(f"SELECT {ITEM_SAFE_COLUMNS} FROM items WHERE id=?", (row["id"],)).fetchone()
+    current, _ = decode_item_row(raw_current)
+    try:
+        same_item = current is not None and item_fingerprint(current) == item_fingerprint(row)
+    except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+        same_item = False
+    if not same_item:
         raise StaleCandidate("Source item changed before candidate preparation")
     item = json.loads(row["payload"])
     existing, how = associate(db, row)
@@ -731,7 +740,7 @@ def prepare(
     if not locked:
         if ("update" in result) != (mode == "update"):
             raise StaleCandidate("Draft scope does not match current story state")
-        source = {key: item[key] for key in ("id", "url", "title", "published_at")}
+        source = item_source(item)
         writer, kind, authority = writer_info(previous, db)
         if mode == "update":
             _, old_item, cutoff, changed_ids, body_changed = _own_diff(db, previous, item, writer)

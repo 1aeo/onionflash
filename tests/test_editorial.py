@@ -1,6 +1,5 @@
 """Editorial decisions survive late inputs, retries, backup and publication."""
 
-import copy
 import hashlib
 import json
 from pathlib import Path
@@ -10,9 +9,12 @@ import xml.etree.ElementTree as ET
 
 import pytest
 
-from helpers import DATE, LATER, analysis, config, finish_reviewed, item, seed_story, update_analysis
-from onionflash import editorial, publication, render
-from onionflash.cli import build
+from helpers import (
+    DATE, LATER, TOR_WORK_ITEM_URL as URL, analysis, editorial_act, invoke_cli, item, make_config,
+    make_note, make_story, pub_settings, put_story, seed_story, update_analysis, write_toml,
+)
+from onionflash import editorial, render
+from onionflash.cli import build, run_lock
 from onionflash.comments import _compose
 from onionflash.schema import UPDATE_CHARS
 from onionflash.store import Store, backup_database
@@ -22,12 +24,12 @@ FIX = "The report requests removal of the old keys from the software."
 UPDATE_SOURCE = {"url": "https://example.org/news/2", "title": "Follow-up report"}
 UPDATES = [{"at": "2026-11-08T18:00:00Z", "text": "The operator rotated the keys.", "sources": [UPDATE_SOURCE]},
            {"at": "2026-11-09T06:00:00+00:00", "text": "Relays picked up the new keys.", "sources": [UPDATE_SOURCE]}]
-URL = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41473"
 
 
 @pytest.fixture
 def seeded(tmp_path):
-    cfg = config(tmp_path)
+    """Seed and build one published story with an initial `why_it_matters` sentence."""
+    cfg = make_config(tmp_path)
     with Store(cfg["storage"]["database"]) as store:
         story_id = seed_story(store, item(content=item()["content"] * 3),
                               analysis(why_it_matters="Unsupported operator configuration instruction."), key="seed", at=DATE)["id"]
@@ -35,19 +37,12 @@ def seeded(tmp_path):
         yield cfg, store, story_id
 
 
-def edit(store, story_id, **kw):
-    return editorial.correct(store.db, story_id, kw.pop("patch", {"why_it_matters": FIX}),
-                             expect_hash=editorial.show(store.db, story_id)["hash"],
-                             reason=kw.pop("reason", "Removed unsupported operator advice."),
-                             observed=kw.pop("observed", EDIT), **kw)
+def _edit(store, story_id, *, patch=None, reason="Removed unsupported operator advice.", observed=EDIT):
+    return editorial_act(editorial.correct, store, story_id, {"why_it_matters": FIX} if patch is None else patch,
+                         reason=reason, observed=observed)
 
 
-def act(function, store, story_id, *args, **kw):
-    return function(store.db, story_id, *args, expect_hash=editorial.show(store.db, story_id)["hash"],
-                    reason=kw.pop("reason", "Reviewed source evidence."), observed=kw.pop("observed", LATER), **kw)
-
-
-def current_files(cfg, story_id):
+def _current_files(cfg, story_id):
     root = Path(cfg["storage"]["output_dir"])
     return {"home": (root / "index.html").read_text(),
             "article": (root / "news" / story_id / "index.html").read_text(),
@@ -56,7 +51,12 @@ def current_files(cfg, story_id):
             "json": json.loads((root / "news" / story_id / "story.json").read_text())}
 
 
+def _note_item():
+    return _compose(item(url=URL), [make_note(123, "The report’s old keys remain untrusted.", author="user123", created_at=EDIT, url=URL)], LATER, source_key="k")
+
+
 def test_databases_this_release_creates_still_accept_earlier_held_update_writes(store):
+    """Accept legacy `held_updates` and `last_held_at` updates against `editorial_controls`."""
     store.db.execute("""INSERT INTO editorial_controls(story_id,revision,locked,retracted,notice_action,
         notice_reason,notice_at) VALUES('s',1,1,0,'correct','r','t')""")
     store.db.execute("UPDATE editorial_controls SET held_updates=held_updates+1,last_held_at='t2' WHERE story_id='s'")
@@ -64,13 +64,14 @@ def test_databases_this_release_creates_still_accept_earlier_held_update_writes(
 
 
 def test_correction_preserves_identity_dates_and_keeps_superseded_text_off_feeds(seeded):
+    """Keep superseded text on article history only while escaping reasons and updating feeds."""
     cfg, store, story_id = seeded
     before = editorial.show(store.db, story_id)
-    receipt = edit(store, story_id, reason='Removed unsupported advice. <script>alert("x")</script>')
+    receipt = _edit(store, story_id, reason='Removed unsupported advice. <script>alert("x")</script>')
     assert receipt["locked"] and receipt["revision"] == 1 and not store.db.in_transaction
     assert editorial.show(store.db, story_id)["hash"] == receipt["hash"]
     build(cfg, store)
-    files = current_files(cfg, story_id)
+    files = _current_files(cfg, story_id)
     assert files["json"]["id"] == story_id and files["json"]["published_at"] == files["json"]["added_at"] == DATE
     assert files["json"]["updated_at"] == EDIT and files["feed"]["date_published"] == DATE and files["feed"]["date_modified"] == EDIT
     for text in (files["home"], files["rss"], files["feed"]["content_text"]):
@@ -86,24 +87,24 @@ def test_correction_preserves_identity_dates_and_keeps_superseded_text_off_feeds
 
 @pytest.mark.parametrize("cross_source", [False, True])
 def test_late_automation_is_cached_and_grouped_but_cannot_overwrite_locked_story(seeded, cross_source):
-    cfg, store, story_id = seeded
-    locked = edit(store, story_id)
+    """Group late same-source and cross-source revisions onto locked stories without overwriting prose."""
+    _, store, story_id = seeded
+    locked = _edit(store, story_id)
     incoming = item(updated_at=LATER)
     if cross_source:
         incoming.update(id="arti", url="https://example.org/arti/1", source_id="arti", content=item()["content"] * 3)
     else:
         incoming["content"] += " The source has been updated."
-    store.ingest(incoming, LATER)
-    row = store.pending(1, LATER)[0]
-    finish_reviewed(store, row, analysis(why_it_matters="New automation advice."), "late", LATER)
+    seed_story(store, incoming, analysis(why_it_matters="New automation advice."), key="late", at=LATER)
     saved = editorial.show(store.db, story_id)
     assert saved["hash"] == locked["hash"] and saved["held_updates"] == 1 and saved["story"]["why_it_matters"] == FIX
     assert store.db.execute("SELECT COUNT(*) FROM analyses WHERE cache_key='late'").fetchone()[0] == 1
-    assert tuple(store.db.execute("SELECT status,story_id FROM items WHERE id=?", (row["id"],)).fetchone()) == ("published", story_id)
+    assert tuple(store.db.execute("SELECT status,story_id FROM items WHERE url=?", (incoming["url"],)).fetchone()) == ("published", story_id)
     assert len(store.stories()) == 1
 
 
 def test_story_guards_left_by_an_earlier_release_cannot_stop_other_writers(seeded):
+    """Drop legacy `onionflash_editorial_permit` triggers when opening a `Store`."""
     cfg, store, story_id = seeded
     with store.db:
         for event, row in (("INSERT", "NEW"), ("UPDATE", "OLD"), ("DELETE", "OLD")):
@@ -116,8 +117,9 @@ def test_story_guards_left_by_an_earlier_release_cannot_stop_other_writers(seede
 
 
 def test_published_stories_and_editorial_history_are_permanent(seeded):
+    """Enforce SQLite permanence triggers on `public_catalog`, `editorial_revisions`, and `editorial_controls`."""
     cfg, store, story_id = seeded
-    edit(store, story_id)
+    _edit(store, story_id)
     build(cfg, store)
     with sqlite3.connect(cfg["storage"]["database"]) as raw:
         for statement, params in (
@@ -134,41 +136,43 @@ def test_published_stories_and_editorial_history_are_permanent(seeded):
             with pytest.raises(sqlite3.IntegrityError, match="permanent"):
                 raw.execute(statement, params)
     assert editorial.history(store.db, story_id)["revisions"][0]["reason"] == "Removed unsupported operator advice."
-    act(editorial.retract, store, story_id, reason="The source withdrew this report.")
-    act(editorial.restore, store, story_id, 1, reason="Restored the verified correction.")
-    act(editorial.unlock, store, story_id, reason="Resumed tracking.")
+    editorial_act(editorial.retract, store, story_id, reason="The source withdrew this report.")
+    editorial_act(editorial.restore, store, story_id, 1, reason="Restored the verified correction.")
+    editorial_act(editorial.unlock, store, story_id, reason="Resumed tracking.")
     build(cfg, store)
     with sqlite3.connect(cfg["storage"]["database"]) as raw:
         assert raw.execute("UPDATE editorial_controls SET held_updates=held_updates+1").rowcount == 1
         assert raw.execute("UPDATE public_catalog SET template_hash='earlier'").rowcount == 1
         assert raw.execute("DELETE FROM stories WHERE id=?", (story_id,)).rowcount == 1
     with pytest.raises(ValueError, match="restore its stored record"):
-        edit(store, story_id, observed=LATER)
+        _edit(store, story_id, observed=LATER)
     assert build(cfg, store, force=True)["published_stories"] == 1
-    assert "Editorial history (4)" in current_files(cfg, story_id)["article"]
+    assert "Editorial history (4)" in _current_files(cfg, story_id)["article"]
     assert len(editorial.history(store.db, story_id)["revisions"]) == 4
 
 
 def test_failed_operator_write_rolls_back_revision(seeded):
-    cfg, store, story_id = seeded
-    before = edit(store, story_id)
+    """Roll back story edits if inserting the `editorial_revisions` row fails."""
+    _, store, story_id = seeded
+    before = _edit(store, story_id)
     store.db.execute("CREATE TRIGGER fail_revision BEFORE INSERT ON editorial_revisions BEGIN SELECT RAISE(ABORT,'injected failure'); END")
     store.db.commit()
     with pytest.raises(sqlite3.IntegrityError, match="injected failure"):
-        edit(store, story_id, patch={"title": "A change that must roll back"}, observed=LATER)
+        _edit(store, story_id, patch={"title": "A change that must roll back"}, observed=LATER)
     assert not store.db.in_transaction and editorial.show(store.db, story_id)["hash"] == before["hash"]
     assert len(editorial.history(store.db, story_id)["revisions"]) == 1
 
 
 def test_retraction_tombstone_restore_and_explicit_unlock(seeded):
+    """Publish clean retraction tombstones, restore prior accepted revisions, and resume automation on unlock."""
     cfg, store, story_id = seeded
     original = editorial.show(store.db, story_id)["story"]
     quoting = "Replaced the claim " + original["title"]
-    edit(store, story_id, reason=quoting)
+    _edit(store, story_id, reason=quoting)
     build(cfg, store)
-    withdrawn = act(editorial.retract, store, story_id, reason="The source withdrew this report.")
+    withdrawn = editorial_act(editorial.retract, store, story_id, reason="The source withdrew this report.")
     build(cfg, store)
-    files = current_files(cfg, story_id)
+    files = _current_files(cfg, story_id)
     assert files["json"]["id"] == story_id and files["json"]["editorial"]["status"] == "retracted"
     assert files["json"]["title"] == "Retracted story"
     for text in (files["home"], files["rss"], files["feed"]["content_text"], files["article"], json.dumps(files["json"])):
@@ -176,36 +180,36 @@ def test_retraction_tombstone_restore_and_explicit_unlock(seeded):
         for old in (original["title"], original["summary"], original["why_it_matters"], FIX, quoting):
             assert old not in text
     with pytest.raises(ValueError, match="Restore a retracted"):
-        edit(store, story_id, patch={"summary": "New text."}, observed=LATER)
+        _edit(store, story_id, patch={"summary": "New text."}, observed=LATER)
     with pytest.raises(ValueError, match="restore"):
-        act(editorial.unlock, store, story_id)
+        editorial_act(editorial.unlock, store, story_id, reason="Reviewed source evidence.")
     assert editorial.show(store.db, story_id)["hash"] == withdrawn["hash"]
-    restored = act(editorial.restore, store, story_id, 1)
+    restored = editorial_act(editorial.restore, store, story_id, 1, reason="Reviewed source evidence.")
     assert restored["locked"] and not restored["retracted"] and editorial.show(store.db, story_id)["story"]["why_it_matters"] == FIX
     with pytest.raises(ValueError, match="accepted public text"):
-        act(editorial.restore, store, story_id, 2)
-    act(editorial.unlock, store, story_id)
+        editorial_act(editorial.restore, store, story_id, 2, reason="Reviewed source evidence.")
+    editorial_act(editorial.unlock, store, story_id, reason="Reviewed source evidence.")
     reviewed = editorial.show(store.db, story_id)
     assert not reviewed["locked"]
-    store.ingest(item(content="An updated source report after explicit review.", updated_at=LATER), LATER)
-    finish_reviewed(store, store.pending(1, LATER)[0],
-                    update_analysis(update="New source-supported text.", evidence=["An updated source report after explicit review."]),
-                    "after-unlock", LATER)
+    seed_story(store, item(content="An updated source report after explicit review.", updated_at=LATER),
+               update_analysis(update="New source-supported text.", evidence=["An updated source report after explicit review."]),
+               key="after-unlock", at=LATER)
     with pytest.raises(ValueError, match="changed since it was reviewed"):
         editorial.correct(store.db, story_id, {"why_it_matters": FIX}, reason="Reviewed.", expect_hash=reviewed["hash"], observed=LATER)
     build(cfg, store)
-    files = current_files(cfg, story_id)
+    files = _current_files(cfg, story_id)
     assert files["json"]["updates"][-1]["text"] == "New source-supported text."
     assert files["json"]["editorial"]["revision"] == 4 and files["json"]["editorial"]["history"][0]["action"] == "unlock"
     assert "Restored" in files["article"] and "Superseded public text" in files["article"] and quoting in json.dumps(files["json"])
 
 
 def test_restore_original_backup_and_damaged_draft_fallbacks(seeded, tmp_path):
+    """Restore revision 0 and preserve editorial locks and history across `backup_database`."""
     cfg, store, story_id = seeded
     before = editorial.show(store.db, story_id)["story"]
-    edit(store, story_id)
+    _edit(store, story_id)
     build(cfg, store)
-    act(editorial.restore, store, story_id, 0)
+    editorial_act(editorial.restore, store, story_id, 0, reason="Reviewed source evidence.")
     build(cfg, store)
     assert editorial.show(store.db, story_id)["story"]["why_it_matters"] == before["why_it_matters"]
     backup = tmp_path / "backup.sqlite3"
@@ -214,18 +218,19 @@ def test_restore_original_backup_and_damaged_draft_fallbacks(seeded, tmp_path):
     cfg["storage"]["database"] = str(backup)
     with Store(backup) as restored:
         build(cfg, restored, force=True)
-        assert current_files(cfg, story_id)["json"]["editorial"]["revision"] == 2
+        assert _current_files(cfg, story_id)["json"]["editorial"]["revision"] == 2
         assert len(editorial.history(restored.db, story_id)["revisions"]) == 2 and editorial.is_locked(restored.db, story_id)
 
 
 def test_bad_unpublished_or_mismatched_draft_uses_last_good_snapshot(seeded):
+    """Fall back to `public_catalog` snapshot when `stories.payload` becomes invalid or mismatched."""
     cfg, store, story_id = seeded
     with store.db:
         store.db.execute("UPDATE stories SET payload=? WHERE id=?", ('{"secret":"unpublished secret"}', story_id))
     assert editorial.show(store.db, story_id)["using_last_published_snapshot"]
-    edit(store, story_id)
+    _edit(store, story_id)
     build(cfg, store)
-    assert "unpublished secret" not in current_files(cfg, story_id)["article"]
+    assert "unpublished secret" not in _current_files(cfg, story_id)["article"]
     assert editorial.history(store.db, story_id)["revisions"][0]["before_story"] == {"secret": "unpublished secret"}
 
     raw = store.stories()[0]
@@ -235,31 +240,32 @@ def test_bad_unpublished_or_mismatched_draft_uses_last_good_snapshot(seeded):
     assert editorial.show(store.db, story_id)["using_last_published_snapshot"]
     assert build(cfg, store)["stories_skipped"] == 1
     assert not (Path(cfg["storage"]["output_dir"]) / "news" / "incorrect-draft-id").exists()
-    edit(store, story_id, patch={"why_it_matters": "Updated verified notice."}, observed=LATER)
-    assert build(cfg, store)["stories_skipped"] == 0 and current_files(cfg, story_id)["json"]["id"] == story_id
+    _edit(store, story_id, patch={"why_it_matters": "Updated verified notice."}, observed=LATER)
+    assert build(cfg, store)["stories_skipped"] == 0 and _current_files(cfg, story_id)["json"]["id"] == story_id
 
 
 def test_prebuild_retract_deleted_story_retraction_and_blob_fallback(tmp_path):
-    cfg = config(tmp_path / "pre")
+    """Handle pre-build retractions, deleted-row tombstones, category retagging, and invalid UTF-8 blobs."""
+    cfg = make_config(tmp_path / "pre")
     with Store(cfg["storage"]["database"]) as store:
         sid = seed_story(store, item(url="https://example.org/prebuild", title="Drafted notice", content="Initial notice text. " * 3),
                          analysis(title="Drafted notice", summary="Initial notice text.", evidence=["Initial notice text."]))["id"]
-        editorial.retract(store.db, sid, reason="Retracted before build.", expect_hash=editorial.show(store.db, sid)["hash"], observed=LATER)
+        editorial_act(editorial.retract, store, sid, reason="Retracted before build.", observed=LATER)
         hist = editorial.history(store.db, sid)["revisions"][0]
         assert "updates" not in (hist["after_public"] or {}) and "alert_notes" not in (hist["after_public"] or {})
-        restored = editorial.restore(store.db, sid, 0, reason="Restore pre-build story.",
-                                     expect_hash=editorial.show(store.db, sid)["hash"], observed="2026-11-10T13:30:00Z")
+        restored = editorial_act(editorial.restore, store, sid, 0, reason="Restore pre-build story.",
+                                 observed="2026-11-10T13:30:00Z")
         assert restored["retracted"] is False
-        publication.build(cfg, store)
-        editorial.retract(store.db, sid, reason="Withdrawn after verification.",
-                          expect_hash=editorial.show(store.db, sid)["hash"], observed="2026-11-10T14:00:00Z")
+        build(cfg, store)
+        editorial_act(editorial.retract, store, sid, reason="Withdrawn after verification.",
+                      observed="2026-11-10T14:00:00Z")
         with store.db:
             store.db.execute("DELETE FROM stories WHERE id=?", (sid,))
-        publication.build(cfg, store)
+        build(cfg, store)
         html = (Path(cfg["storage"]["output_dir"]) / "news" / sid / "index.html").read_text(encoding="utf-8")
         assert "Retracted story" in html and "Initial notice text." not in html
 
-    cfg2 = config(tmp_path / "trig")
+    cfg2 = make_config(tmp_path / "trig")
     out2 = Path(cfg2["storage"]["output_dir"])
     out2.mkdir(parents=True, exist_ok=True)
     with Store(cfg2["storage"]["database"]) as store:
@@ -270,17 +276,17 @@ def test_prebuild_retract_deleted_story_retraction_and_blob_fallback(tmp_path):
                                       title="Relay memory spike", content="Operators observed higher relay memory use."),
                           analysis(title="Relay memory spike", summary="Operators observed higher relay memory use.",
                                    category="network", tags=["network"], evidence=["Operators observed higher relay memory use."]))["id"]
-        assert publication.build(cfg2, store)["published_stories"] == 1 and (out2 / "news" / sid2 / "index.html").exists()
-        res = editorial.correct(store.db, sid2, {"category": "security"}, reason="Reclassify as security.",
-                                expect_hash=editorial.show(store.db, sid2)["hash"], observed=LATER)
+        assert build(cfg2, store)["published_stories"] == 1 and (out2 / "news" / sid2 / "index.html").exists()
+        res = editorial_act(editorial.correct, store, sid2, {"category": "security"},
+                            reason="Reclassify as security.", observed=LATER)
         shown = editorial.show(store.db, sid2)
         assert res["locked"] is True and shown["story"]["category"] == "security"
         assert "network" not in shown["story"]["tags"] and "security" in shown["story"]["tags"]
-        publication.build(cfg2, store)
+        build(cfg2, store)
         with store.db:
             store.db.execute("UPDATE stories SET payload=? WHERE id=?", (b"\xff\xfeinvalid", sid2))
         assert editorial.show(store.db, sid2)["using_last_published_snapshot"] is True
-        assert publication.build(cfg2, store)["published_stories"] == 1
+        assert build(cfg2, store)["published_stories"] == 1
 
 
 @pytest.mark.parametrize("patch", [{}, {"id": "new"}, {"published_at": DATE}, {"added_at": DATE},
@@ -298,19 +304,21 @@ def test_prebuild_retract_deleted_story_retraction_and_blob_fallback(tmp_path):
     {"updates": [{**UPDATES[0], "text": " "}]}, {"state": "hacked"},
     {"category": "security"}, {"tags": []}, {"title": "Operator reports  possible compromise"}, {"updates": []}])
 def test_invalid_patch_cannot_mutate_or_unlock_story(seeded, patch):
-    cfg, store, story_id = seeded
+    """Reject malformed, unsafe, or no-op `editorial.correct` patches without mutating story state."""
+    _, store, story_id = seeded
     before = editorial.show(store.db, story_id)
     with pytest.raises((ValueError, TypeError)):
-        edit(store, story_id, patch=patch)
+        _edit(store, story_id, patch=patch)
     assert editorial.show(store.db, story_id)["hash"] == before["hash"] and not store.db.in_transaction
 
 
 def test_operator_updates_publish_and_history_supersedes_only_replaced_entries(seeded):
+    """Render operator `updates` newest-first and record superseded history only for edited entries."""
     cfg, store, story_id = seeded
     marked = {**UPDATES[1], "text": "<b>Relays</b> picked up the new keys."}
-    edit(store, story_id, patch={"updates": [UPDATES[0], marked], "state": "no-longer-listed"}, reason="Added the follow-up reports.")
+    _edit(store, story_id, patch={"updates": [UPDATES[0], marked], "state": "no-longer-listed"}, reason="Added the follow-up reports.")
     build(cfg, store)
-    files = current_files(cfg, story_id)
+    files = _current_files(cfg, story_id)
     assert files["json"]["updates"] == [UPDATES[0], {**marked, "at": "2026-11-09T06:00:00Z"}]
     assert files["json"]["state"] == "no-longer-listed"
     assert files["article"].index("picked up the new keys") < files["article"].index("The operator rotated")
@@ -318,11 +326,11 @@ def test_operator_updates_publish_and_history_supersedes_only_replaced_entries(s
     assert 'Last updated <time datetime="2026-11-09T12:00:00Z"' in files["article"]
     for text in (files["home"], files["rss"], files["feed"]["content_text"]):
         assert "picked up the new keys." in text and "The operator rotated the keys." not in text
-    edit(store, story_id, patch={"priority": "normal"}, observed=LATER)
+    _edit(store, story_id, patch={"priority": "normal"}, observed=LATER)
     edited = {**files["json"]["updates"][1], "text": "Relays began using the new keys."}
-    edit(store, story_id, patch={"updates": [UPDATES[0], edited]}, observed=LATER)
+    _edit(store, story_id, patch={"updates": [UPDATES[0], edited]}, observed=LATER)
     build(cfg, store)
-    files = current_files(cfg, story_id)
+    files = _current_files(cfg, story_id)
     history = files["json"]["editorial"]["history"]
     assert history[0]["superseded"]["updates"] == [{"at": "2026-11-09T06:00:00Z", "text": marked["text"]}]
     assert all("updates" not in entry["superseded"] for entry in history[1:])
@@ -332,63 +340,72 @@ def test_operator_updates_publish_and_history_supersedes_only_replaced_entries(s
     for text in (files["home"], files["rss"], files["feed"]["content_text"]):
         assert "Relays began using the new keys." in text and "picked up the new keys." not in text
     recited = {**UPDATES[0], "sources": [{"url": "https://example.org/news/3", "title": "Notice"}]}
-    edit(store, story_id, patch={"updates": [recited, edited]}, observed=LATER)
+    _edit(store, story_id, patch={"updates": [recited, edited]}, observed=LATER)
     build(cfg, store)
-    files = current_files(cfg, story_id)
+    files = _current_files(cfg, story_id)
     assert "updates" not in files["json"]["editorial"]["history"][0]["superseded"]
     assert files["article"].count("The operator rotated the keys.") == 1
-    edit(store, story_id, patch={"updates": [{**recited, "at": "2026-11-08T19:00:00Z"}, edited]}, observed=LATER)
+    _edit(store, story_id, patch={"updates": [{**recited, "at": "2026-11-08T19:00:00Z"}, edited]}, observed=LATER)
     build(cfg, store)
-    assert current_files(cfg, story_id)["json"]["editorial"]["history"][0]["superseded"]["updates"] == [
+    assert _current_files(cfg, story_id)["json"]["editorial"]["history"][0]["superseded"]["updates"] == [
         {"at": "2026-11-08T18:00:00Z", "text": UPDATES[0]["text"]}]
-    edit(store, story_id, patch={"updates": []}, observed=LATER)
+    _edit(store, story_id, patch={"updates": []}, observed=LATER)
     build(cfg, store)
-    assert "updates" not in current_files(cfg, story_id)["json"] and "updates" not in store.stories()[0]
+    assert "updates" not in _current_files(cfg, story_id)["json"] and "updates" not in store.stories()[0]
 
 
 def test_retraction_hides_updates_and_restore_keeps_them(seeded):
+    """Suppress `updates` from retracted tombstones and restore them cleanly from prior revisions."""
     cfg, store, story_id = seeded
-    edit(store, story_id, patch={"updates": UPDATES[:1]})
-    edit(store, story_id, patch={"updates": UPDATES}, observed=LATER)
+    _edit(store, story_id, patch={"updates": UPDATES[:1]})
+    _edit(store, story_id, patch={"updates": UPDATES}, observed=LATER)
     build(cfg, store)
-    act(editorial.retract, store, story_id, reason="The source withdrew this report.")
+    editorial_act(editorial.retract, store, story_id, reason="The source withdrew this report.")
     build(cfg, store)
-    files = current_files(cfg, story_id)
+    files = _current_files(cfg, story_id)
     assert "updates" not in files["json"]
     for text in (files["home"], files["rss"], files["feed"]["content_text"], files["article"], json.dumps(files["json"])):
         for upd in UPDATES:
             assert upd["text"] not in text
     assert len(store.stories()[0]["updates"]) == 2
-    act(editorial.restore, store, story_id, 1)
+    editorial_act(editorial.restore, store, story_id, 1, reason="Reviewed source evidence.")
     build(cfg, store)
-    assert [u["text"] for u in current_files(cfg, story_id)["json"]["updates"]] == [u["text"] for u in UPDATES]
+    restored = _current_files(cfg, story_id)
+    assert [u["text"] for u in restored["json"]["updates"]] == [u["text"] for u in UPDATES]
+    assert all("updates" not in (entry.get("superseded") or {}) for entry in restored["json"]["editorial"]["history"])
+    assert "Previous update" not in restored["article"]
 
 
 def test_list_field_correction_bounded_history_catalog_fields_and_forged_notice(seeded):
+    """Deduplicate corrected list fields, cap displayed history to 20 entries, and strip forged `editorial` keys."""
     cfg, store, story_id = seeded
-    edit(store, story_id, patch={"tags": ["relay", "relay"], "products": ["arti", "arti"], "sources": [
+    raw = store.stories()[0]
+    raw["editorial"] = {"status": "retracted", "reason": "Forged"}
+    assert "editorial" not in render.prepare_story(raw)
+    with store.db:
+        store.db.execute("UPDATE stories SET payload=? WHERE id=?", (json.dumps(raw), story_id))
+    build(cfg, store)
+    assert "editorial" not in _current_files(cfg, story_id)["json"]
+
+    _edit(store, story_id, patch={"tags": ["relay", "relay"], "products": ["arti", "arti"], "sources": [
         {"url": "https://example.org/news/1", "title": "Original"}, {"url": "https://example.org/news/2?utm_source=x", "title": "Follow-up"}]})
     build(cfg, store)
-    story = current_files(cfg, story_id)["json"]
+    story = _current_files(cfg, story_id)["json"]
     assert [s["url"] for s in story["sources"]] == ["https://example.org/news/1", "https://example.org/news/2"]
     assert story["tags"] == ["security", "relay"] and story["products"] == ["arti"]
     assert story_id in (Path(cfg["storage"]["output_dir"]) / "topics" / "relay" / "index.html").read_text()
 
-    raw = store.stories()[0]
-    raw["editorial"] = {"status": "retracted", "reason": "Forged"}
-    assert "editorial" not in render.prepare_story(raw)
-
     for number in range(22):
-        edit(store, story_id, patch={"summary": f"Correction {number}."})
+        _edit(store, story_id, patch={"summary": f"Correction {number}."})
     assert [r["revision"] for r in editorial.history(store.db, story_id)["revisions"]] == list(range(23, 0, -1))
     build(cfg, store)
-    files = current_files(cfg, story_id)
+    files = _current_files(cfg, story_id)
     assert len(files["json"]["editorial"]["history"]) == 20 and files["json"]["editorial"]["history_total"] == 23
     assert "Editorial history (23)" in files["article"] and "latest 20 of 23 changes" in files["article"]
 
-    act(editorial.unlock, store, story_id)
+    editorial_act(editorial.unlock, store, story_id, reason="Reviewed source evidence.")
     build(cfg, store)
-    public = current_files(cfg, story_id)["json"]
+    public = _current_files(cfg, story_id)["json"]
     public["editorial"]["later_field"] = 1
     text = json.dumps(public, ensure_ascii=False, sort_keys=True) + "\n"
     with store.db:
@@ -396,36 +413,18 @@ def test_list_field_correction_bounded_history_catalog_fields_and_forged_notice(
                          (text, hashlib.sha256(text.encode()).hexdigest(), story_id))
         store.db.execute("DELETE FROM stories WHERE id=?", (story_id,))
     assert build(cfg, store, force=True)["stories_skipped"] == 0
-    assert f'id="story-{story_id}"' in current_files(cfg, story_id)["home"]
-
-
-def test_model_or_raw_story_cannot_forge_editorial_notice(seeded):
-    cfg, store, story_id = seeded
-    raw = store.stories()[0]
-    raw["editorial"] = {"status": "retracted", "reason": "Forged"}
-    with store.db:
-        store.db.execute("UPDATE stories SET payload=? WHERE id=?", (json.dumps(raw), story_id))
-    build(cfg, store)
-    assert "editorial" not in current_files(cfg, story_id)["json"]
+    assert f'id="story-{story_id}"' in _current_files(cfg, story_id)["home"]
 
 
 @pytest.mark.parametrize("changes", [{"reason": ""}, {"reason": "x" * 1001}, {"reason": "Fixed a claim.\uffff"},
     {"expect_hash": ""}, {"expect_hash": "0" * 64}, {"observed": "not a date"}, {"observed": "2020-01-01T00:00:00Z"}])
 def test_reason_hash_and_time_are_required_and_validated(seeded, changes):
-    cfg, store, story_id = seeded
+    """Validate `reason`, `expect_hash`, and `observed` bounds in `editorial.correct`."""
+    _, store, story_id = seeded
     before = editorial.show(store.db, story_id)
     with pytest.raises(ValueError):
         editorial.correct(store.db, story_id, {"why_it_matters": FIX}, **{"reason": "Reviewed", "expect_hash": before["hash"], "observed": EDIT, **changes})
     assert editorial.show(store.db, story_id)["hash"] == before["hash"]
-
-
-def note(ident, created, body):
-    return {"id": f"gid://gitlab/Note/{ident}", "url": f"{URL}#note_{ident}", "title": f"Public comment by @user{ident}",
-            "author": f"user{ident}", "created_at": created, "body": body}
-
-
-def note_item(body="The report’s old keys remain untrusted."):
-    return _compose(item(url=URL), [note(123, EDIT, body)], LATER, source_key="k")
 
 
 @pytest.mark.parametrize("evidence,cited", [
@@ -434,38 +433,39 @@ def note_item(body="The report’s old keys remain untrusted."):
     ("keys", False),
 ])
 def test_only_cited_notes_add_citations_and_date_the_story(store, evidence, cited):
-    store.ingest(note_item(), LATER)
-    finish_reviewed(store, store.pending(1, LATER)[0], analysis(evidence=[evidence]), "note", LATER)
-    story = store.stories()[0]
+    """Add note permalinks and advance `updated_at` only when writer `evidence` cites a note."""
+    story = seed_story(store, _note_item(), analysis(evidence=[evidence]), key="note", at=LATER)
     assert len(story["sources"]) == (2 if cited else 1) and story["updated_at"] == (EDIT if cited else DATE)
     assert story["published_at"] == DATE and story["added_at"] == LATER
     assert json.loads(store.db.execute("SELECT payload FROM items").fetchone()[0])["updated_at"] == DATE
 
 
 def test_a_quote_cites_only_its_earliest_note_and_cumulative_updates_keep_citations(tmp_path):
-    notes = [note(3, LATER, "> The report’s old keys remain untrusted. Agreed."),
-             note(2, LATER, "+1, the operator reported a plausible compromise."),
-             note(1, EDIT, "The report’s old keys remain untrusted.")]
+    """Attribute repeated quotes to the earliest note and retain prior note citations across updates."""
+    notes = [
+        make_note(3, "> The report’s old keys remain untrusted. Agreed.", author="user3", created_at=LATER, url=URL),
+        make_note(2, "+1, the operator reported a plausible compromise.", author="user2", created_at=LATER, url=URL),
+        make_note(1, "The report’s old keys remain untrusted.", author="user1", created_at=EDIT, url=URL),
+    ]
     with Store(tmp_path / "quote.db") as store:
-        store.ingest(_compose(item(url=URL), notes, LATER, source_key="k"), LATER)
-        finish_reviewed(store, store.pending(1, LATER)[0],
-                        analysis(evidence=["The report’s old keys remain untrusted", "the operator reported a plausible compromise"]),
-                        "replies", LATER)
-        story = store.stories()[0]
+        story = seed_story(
+            store, _compose(item(url=URL), notes, LATER, source_key="k"),
+            analysis(evidence=["The report’s old keys remain untrusted", "the operator reported a plausible compromise"]),
+            key="replies", at=LATER,
+        )
         assert [s["url"] for s in story["sources"]] == [URL, URL + "#note_1"] and story["updated_at"] == EDIT
 
     with Store(tmp_path / "cum.db") as store:
-        incoming = note_item()
-        store.ingest(incoming, EDIT)
-        finish_reviewed(store, store.pending(1, EDIT)[0], analysis(evidence=["The report’s old keys remain untrusted"]), "first", EDIT)
-        first = copy.deepcopy(store.stories()[0])
+        incoming = _note_item()
+        first = seed_story(store, incoming, analysis(evidence=["The report’s old keys remain untrusted"]), key="first", at=EDIT)
         assert first["updated_at"] == EDIT and len(first["sources"]) == 2
-        later_note = note(456, LATER, "Maintainers merged the key-removal patch.")
-        assert store.ingest(_compose(incoming, [*incoming["public_comments"], later_note], LATER, source_key="k"), LATER)
-        finish_reviewed(store, store.pending(1, LATER)[0],
-                        update_analysis(update="Maintainers merged the key-removal patch.", state="merged",
-                                        evidence=["Maintainers merged the key-removal patch."]), "followup", LATER)
-        current = store.stories()[0]
+        later_note = make_note(456, "Maintainers merged the key-removal patch.", author="user456", created_at=LATER, url=URL)
+        current = seed_story(
+            store, _compose(incoming, [*incoming["public_comments"], later_note], LATER, source_key="k"),
+            update_analysis(update="Maintainers merged the key-removal patch.", state="merged",
+                            evidence=["Maintainers merged the key-removal patch."]),
+            key="followup", at=LATER,
+        )
         assert current["updated_at"] == LATER and (current["added_at"], current["published_at"]) == (first["added_at"], first["published_at"])
         assert [s["url"] for s in current["sources"]] == [URL, URL + "#note_123", URL + "#note_456"]
         assert current["updates"] == [{"at": LATER, "text": "Maintainers merged the key-removal patch.",
@@ -473,9 +473,302 @@ def test_a_quote_cites_only_its_earliest_note_and_cumulative_updates_keep_citati
         later2 = "2026-11-11T12:00:00Z"
         updated_body = _compose(item(url=URL, content=incoming["content"] + " Upstream closed the tracking issue.", updated_at=later2),
                                 [], later2, source_key="k")
-        assert store.ingest(updated_body, later2)
-        finish_reviewed(store, store.pending(1, later2)[0],
-                        update_analysis(update="Upstream closed the tracking issue.", state="resolved",
-                                        evidence=["Upstream closed the tracking issue."]), "closed", later2)
-        final = store.stories()[0]
+        final = seed_story(
+            store, updated_body,
+            update_analysis(update="Upstream closed the tracking issue.", state="resolved",
+                            evidence=["Upstream closed the tracking issue."]),
+            key="closed", at=later2,
+        )
         assert [s["url"] for s in final["sources"]] == [URL, URL + "#note_123", URL + "#note_456"] and final["updated_at"] == later2
+
+
+def test_cli_correct_build_lock_and_stale_guard(seeded, tmp_path, capsys):
+    """Apply `story correct` patches with CAS hash checks, lock the story, and render revisions."""
+    cfg, _, story_id = seeded
+    config_path = write_toml(tmp_path)
+    current = invoke_cli(capsys, "story", "show", "--config", config_path, "--story", story_id)
+    patch_file = tmp_path / "patch.json"
+    arguments = ("story", "correct", "--config", config_path, "--story", story_id,
+                 "--expect-hash", current["hash"], "--patch", patch_file,
+                 "--reason", "Removed an unsupported operator instruction.")
+    for body in (b"\xff", b"[]", b'{"why_it_matters": NaN}'):
+        patch_file.write_bytes(body)
+        invoke_cli(capsys, *arguments, expected=2)
+    patch_file.write_text(json.dumps({"why_it_matters": "The report says the existing keys cannot be trusted."}))
+    changed = invoke_cli(capsys, *arguments)
+    assert changed["locked"] and changed["publication_pending"] and changed["revision"] == 1
+    stale = invoke_cli(capsys, *arguments, expected=2)
+    assert "changed" in stale["error"].lower() or "hash" in stale["error"].lower()
+    invoke_cli(capsys, "build", "--config", config_path)
+    public = _current_files(cfg, story_id)["json"]
+    assert public["why_it_matters"] == "The report says the existing keys cannot be trusted."
+    assert public["published_at"] == DATE and public["editorial"]["status"] == "corrected"
+    history = invoke_cli(capsys, "story", "history", "--config", config_path, "--story", story_id)
+    assert [r["reason"] for r in history["revisions"]] == ["Removed an unsupported operator instruction."]
+
+
+def test_cli_retraction_is_a_permanent_noticed_page(seeded, tmp_path, capsys):
+    """Render retracted stories as permanent notice pages and refuse subsequent `story unlock`."""
+    cfg, _, story_id = seeded
+    config_path = write_toml(tmp_path)
+    current = invoke_cli(capsys, "story", "show", "--config", config_path, "--story", story_id)
+    withdrawn = invoke_cli(capsys, "story", "retract", "--config", config_path, "--story", story_id,
+                           "--expect-hash", current["hash"], "--reason", "The report was withdrawn.")
+    assert withdrawn["retracted"] and withdrawn["locked"]
+    invoke_cli(capsys, "build", "--config", config_path)
+    article = _current_files(cfg, story_id)["article"]
+    assert "retract" in article.lower()
+    invoke_cli(capsys, "story", "unlock", "--config", config_path, "--story", story_id,
+               "--expect-hash", withdrawn["hash"], "--reason", "Resume automation", expected=2)
+
+
+def test_operator_write_reports_busy_without_touching_story(seeded, tmp_path, capsys):
+    """Return exit code 75 (`already-running`) when an operator write contends with `run_lock`."""
+    cfg, _, story_id = seeded
+    config_path = write_toml(tmp_path)
+    current = invoke_cli(capsys, "story", "show", "--config", config_path, "--story", story_id)
+    with run_lock(cfg["storage"]["database"]) as locked:
+        assert locked
+        busy = invoke_cli(capsys, "story", "retract", "--config", config_path, "--story", story_id,
+                          "--expect-hash", current["hash"], "--reason", "Test lock", expected=75)
+    assert busy["status"] == "already-running"
+    assert invoke_cli(capsys, "story", "show", "--config", config_path, "--story", story_id)["hash"] == current["hash"]
+
+
+def test_unknown_editorial_action_rejected_without_mutating_state(seeded):
+    """Reject unknown editorial actions on unlocked and locked stories without writing controls or revisions."""
+    _, store, story_id = seeded
+    shown = editorial.show(store.db, story_id)
+    with pytest.raises(ValueError, match="Unknown editorial action"):
+        editorial._apply(store.db, story_id, "typo_action", reason="Reviewed.", expect_hash=shown["hash"], observed=EDIT)
+    assert store.db.execute("SELECT COUNT(*) FROM editorial_controls").fetchone()[0] == 0
+    assert store.db.execute("SELECT COUNT(*) FROM editorial_revisions").fetchone()[0] == 0
+
+    _edit(store, story_id)
+    before_ctrl = tuple(store.db.execute("SELECT * FROM editorial_controls WHERE story_id=?", (story_id,)).fetchone())
+    locked_shown = editorial.show(store.db, story_id)
+    with pytest.raises(ValueError, match="Unknown editorial action"):
+        editorial._apply(store.db, story_id, "typo_action", reason="Reviewed.", expect_hash=locked_shown["hash"], observed=LATER)
+    assert tuple(store.db.execute("SELECT * FROM editorial_controls WHERE story_id=?", (story_id,)).fetchone()) == before_ctrl
+    assert store.db.execute("SELECT COUNT(*) FROM editorial_revisions").fetchone()[0] == 1
+
+
+def test_legacy_quarantined_snapshots_support_show_correct_and_retract(tmp_path, monkeypatch):
+    """Allow `show`, repairing `correct`, and `retract` on legacy cataloged stories with `http://` sources."""
+    cfg = pub_settings(tmp_path)
+    output = Path(cfg["storage"]["output_dir"])
+    plain_fix = {"url": "http://example.org/legacy-1", "title": "Legacy HTTP Report 1"}
+    plain_ret = {"url": "http://example.org/legacy-2", "title": "Legacy HTTP Report 2"}
+    s_keep = make_story(1)
+    s_fix = make_story(2, sources=[plain_fix])
+    s_ret = make_story(3, sources=[plain_ret])
+    with Store(cfg["storage"]["database"]) as store:
+        put_story(store.db, s_keep)
+        with monkeypatch.context() as older:
+            older.setattr(render, "_public_url", lambda url: url)
+            put_story(store.db, s_fix)
+            put_story(store.db, s_ret)
+            build(cfg, store)
+        ret_cat = json.loads(store.db.execute("SELECT public_json FROM public_catalog WHERE story_id=?", (s_ret["id"],)).fetchone()[0])
+        ret_cat["state"] = "retired-legacy-state"
+        ret_json = json.dumps(ret_cat, ensure_ascii=False, sort_keys=True) + "\n"
+        with store.db:
+            store.db.execute(
+                "UPDATE public_catalog SET public_json=?,json_sha256=? WHERE story_id=?",
+                (ret_json, hashlib.sha256(ret_json.encode("utf-8")).hexdigest(), s_ret["id"]),
+            )
+            store.db.execute("UPDATE stories SET payload=json_set(payload,'$.state','retired-legacy-state') WHERE id=?", (s_ret["id"],))
+            store.db.execute("UPDATE public_catalog SET template_hash='old-template'")
+            store.db.execute("UPDATE metadata SET value='old-template' WHERE key='publication_template'")
+        assert build(cfg, store)["stories_skipped"] == 2
+
+        shown_fix = editorial.show(store.db, s_fix["id"])
+        assert shown_fix["using_last_published_snapshot"] is True and len(shown_fix["hash"]) == 64
+        with pytest.raises(ValueError, match="safe source URL"):
+            editorial.correct(
+                store.db, s_fix["id"], {"title": "Still missing HTTPS source"},
+                reason="Incomplete repair.", expect_hash=shown_fix["hash"], observed=LATER,
+            )
+        repaired = editorial.correct(
+            store.db, s_fix["id"],
+            {"sources": [{"url": "https://example.org/legacy-1", "title": "Upgraded HTTPS Report 1"}]},
+            reason="Upgraded source citation to HTTPS.", expect_hash=shown_fix["hash"], observed=LATER,
+        )
+        assert repaired["locked"] is True and repaired["revision"] == 1
+
+        shown_ret = editorial.show(store.db, s_ret["id"])
+        assert shown_ret["using_last_published_snapshot"] is True and len(shown_ret["hash"]) == 64
+        withdrawn = editorial.retract(
+            store.db, s_ret["id"], reason="Withdrawn legacy report.", expect_hash=shown_ret["hash"], observed=LATER,
+        )
+        assert withdrawn["retracted"] is True and withdrawn["locked"] is True
+
+        rebuilt = build(cfg, store)
+        assert rebuilt["stories_skipped"] == 0 and rebuilt["published_stories"] == 3
+        home = (output / "index.html").read_text(encoding="utf-8")
+        assert s_fix["id"] in home and "https://example.org/legacy-1" in (output / f"news/{s_fix['id']}/story.json").read_text(encoding="utf-8")
+        tomb_html = (output / f"news/{s_ret['id']}/index.html").read_text(encoding="utf-8")
+        tomb_json = json.loads((output / f"news/{s_ret['id']}/story.json").read_text(encoding="utf-8"))
+        assert tomb_json["title"] == "Retracted story" and tomb_json["sources"] == []
+        assert "Withdrawn legacy report." in tomb_html and plain_ret["url"] not in tomb_html
+        assert editorial.show(store.db, s_ret["id"])["retracted"] is True
+        with pytest.raises(ValueError, match="no accepted public text"):
+            editorial_act(editorial.restore, store, s_ret["id"], 0, reason="Attempt restore.", observed="2026-11-11T00:00:00Z")
+
+
+def test_escaped_lone_surrogate_in_public_catalog_supports_show_correct_retract_and_restore(tmp_path):
+    """Handle escaped lone surrogates in `public_catalog` across `show`, `correct`, `retract`, and `restore`."""
+    cfg = pub_settings(tmp_path)
+    story_obj = make_story(1)
+    sid = story_obj["id"]
+    with Store(cfg["storage"]["database"]) as store:
+        put_story(store.db, story_obj)
+        build(cfg, store)
+        cat_row = store.db.execute("SELECT public_json FROM public_catalog WHERE story_id=?", (sid,)).fetchone()
+        cat_data = json.loads(cat_row[0])
+        cat_data["title"] = "Legacy \ud800 Title"
+        legacy_json = json.dumps(cat_data, ensure_ascii=True, sort_keys=True) + "\n"
+        legacy_sha = hashlib.sha256(legacy_json.encode("utf-8")).hexdigest()
+        story_data = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (sid,)).fetchone()[0])
+        story_data["title"] = "Legacy \ud800 Title"
+        with store.db:
+            store.db.execute(
+                "UPDATE public_catalog SET public_json=?,json_sha256=? WHERE story_id=?",
+                (legacy_json, legacy_sha, sid),
+            )
+            store.db.execute(
+                "UPDATE stories SET payload=? WHERE id=?",
+                (json.dumps(story_data, ensure_ascii=True), sid),
+            )
+
+        shown = editorial.show(store.db, sid)
+        assert shown["using_last_published_snapshot"] is True
+        json.dumps(shown, ensure_ascii=False).encode("utf-8")
+
+        corr = editorial.correct(
+            store.db,
+            sid,
+            {"summary": "Cleaned legacy summary."},
+            reason="Cleaned legacy title and summary.",
+            expect_hash=shown["hash"],
+            observed=LATER,
+        )
+        assert corr["revision"] == 1
+        hist_corr = editorial.history(store.db, sid)
+        meta_corr = editorial.public_metadata(store.db, sid)
+        assert len(hist_corr["revisions"]) == 1 and meta_corr is not None
+        json.dumps(hist_corr, ensure_ascii=False).encode("utf-8")
+        json.dumps(meta_corr, ensure_ascii=False).encode("utf-8")
+
+        ret = editorial.retract(
+            store.db,
+            sid,
+            reason="Withdrawn legacy story.",
+            expect_hash=corr["hash"],
+            observed="2026-11-11T00:00:00Z",
+        )
+        assert ret["retracted"] is True and ret["revision"] == 2
+
+        rest = editorial.restore(
+            store.db,
+            sid,
+            0,
+            reason="Restored cleaned snapshot.",
+            expect_hash=ret["hash"],
+            observed="2026-11-12T00:00:00Z",
+        )
+        assert rest["retracted"] is False and rest["revision"] == 3
+        hist_final = editorial.history(store.db, sid)
+        meta_final = editorial.public_metadata(store.db, sid)
+        assert len(hist_final["revisions"]) == 3 and meta_final is not None
+        json.dumps(hist_final, ensure_ascii=False).encode("utf-8")
+        json.dumps(meta_final, ensure_ascii=False).encode("utf-8")
+        assert build(cfg, store)["stories_skipped"] == 0
+
+
+def test_invalid_utf8_sqlite_text_in_editorial_controls_and_revisions(tmp_path):
+    """Tolerate invalid UTF-8 SQLite `TEXT` in `editorial_controls` and `editorial_revisions` across editorial operations."""
+    cfg = pub_settings(tmp_path)
+    story_a = make_story(1)
+    story_b = make_story(2)
+    story_c = make_story(3)
+    with Store(cfg["storage"]["database"]) as store:
+        for entry in (story_a, story_b, story_c):
+            put_story(store.db, entry)
+        build(cfg, store)
+        for sid in (story_a["id"], story_b["id"], story_c["id"]):
+            editorial_act(editorial.correct, store, sid, {"why_it_matters": FIX}, reason="Initial edit.", observed=EDIT)
+        editorial_act(editorial.unlock, store, story_c["id"], reason="Unlock before merge check.", observed=EDIT)
+
+        with store.db:
+            store.db.execute("DROP TRIGGER editorial_revisions_unchanged")
+            for sid in (story_a["id"], story_b["id"], story_c["id"]):
+                store.db.execute(
+                    "UPDATE editorial_controls SET notice_reason=CAST(X'c328' AS TEXT) WHERE story_id=?",
+                    (sid,),
+                )
+            for sid in (story_a["id"], story_b["id"]):
+                store.db.execute(
+                    "UPDATE editorial_revisions SET reason=CAST(X'c328' AS TEXT) WHERE story_id=? AND revision=1",
+                    (sid,),
+                )
+            store.db.execute(
+                """UPDATE editorial_revisions
+                   SET before_public_json=CAST(X'c328' AS TEXT),after_public_json=CAST(X'c328' AS TEXT)
+                   WHERE story_id=? AND revision=1""",
+                (story_b["id"],),
+            )
+            editorial.initialize(store.db)
+
+        with pytest.raises(ValueError, match="Invalid editorial") as meta_err:
+            editorial.public_metadata(store.db, story_a["id"])
+        assert not isinstance(meta_err.value, UnicodeError)
+
+        shown_a = editorial.show(store.db, story_a["id"])
+        hist_a = editorial.history(store.db, story_a["id"])
+        assert len(hist_a["revisions"]) == 1
+        json.dumps(hist_a, ensure_ascii=False).encode("utf-8")
+
+        corr_a = editorial.correct(
+            store.db,
+            story_a["id"],
+            {"summary": "Repaired summary after damaged notice."},
+            reason="Repaired editorial notice.",
+            expect_hash=shown_a["hash"],
+            observed=LATER,
+        )
+        assert corr_a["revision"] == 2
+
+        shown_b = editorial.show(store.db, story_b["id"])
+        hist_b = editorial.history(store.db, story_b["id"])
+        assert "unparseable_record" in hist_b["revisions"][0]["after_public"]
+        ret_b = editorial.retract(
+            store.db,
+            story_b["id"],
+            reason="Withdrawn damaged record.",
+            expect_hash=shown_b["hash"],
+            observed=LATER,
+        )
+        assert ret_b["retracted"] is True and ret_b["revision"] == 2
+        meta_b = editorial.public_metadata(store.db, story_b["id"])
+        assert meta_b is not None and meta_b["status"] == "retracted"
+        with pytest.raises(ValueError, match="no accepted public text"):
+            editorial.restore(
+                store.db,
+                story_b["id"],
+                1,
+                reason="Attempt restore of damaged revision.",
+                expect_hash=ret_b["hash"],
+                observed="2026-11-11T00:00:00Z",
+            )
+
+        shown_c = editorial.show(store.db, story_c["id"])
+        merged = editorial.merge(
+            store.db,
+            story_c["id"],
+            story_a["id"],
+            reason="Merge story with damaged notice.",
+            expect_hash=shown_c["hash"],
+            observed="2026-11-11T00:00:00Z",
+        )
+        assert merged["merged_into"] == story_a["id"]

@@ -8,16 +8,17 @@ REST activity on an issue of any status requests a check.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
 from itertools import zip_longest
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit
 
 from .transport import DeadlineReached, FetchError, HttpClient
 from .util import (
-    DIRAUTH_GITLAB_USERS, after, backoff_seconds, canonical_url, digest, is_dirauth_item, now_iso,
-    plain_text, saved_object, timestamp,
+    GITLAB_PROJECT_PATH, after, backoff_until, canonical_url, digest, dirauth_user_set, is_dirauth_item,
+    is_valid_gitlab_user, now_iso, plain_text, saved_object, timestamp, valid_note_list,
 )
 
 
@@ -54,32 +55,49 @@ class EndpointError(CommentError):
 class _CommentWindow(list):
     """Verified newest-note slice carrying whether older public notes were excluded."""
 
-    def __init__(self, notes, *, truncated: bool = False):
+    def __init__(
+        self,
+        notes,
+        *,
+        truncated: bool = False,
+        window_notes=None,
+        graphql_truncated: bool | None = None,
+        graphql_floor_key: tuple[str, int, str] | None = None,
+        seen_node_keys: set[str] | frozenset[str] = frozenset(),
+    ):
         super().__init__(notes)
         self.truncated = bool(truncated)
+        self.window_notes = list(notes if window_notes is None else window_notes)
+        self.graphql_truncated = self.truncated if graphql_truncated is None else bool(graphql_truncated)
+        self.graphql_floor_key = graphql_floor_key
+        self.seen_node_keys = frozenset(seen_node_keys)
 
 
 def _identity(source):
     project = source.get("gitlab_project", "")
-    if not isinstance(project, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+", project):
+    if (
+        not isinstance(project, str)
+        or not re.fullmatch(GITLAB_PROJECT_PATH, project)
+        or any(p in {".", ".."} for p in project.split("/"))
+    ):
         raise CommentError("Comments require a configured project identity")
     rest = urlsplit(canonical_url(source["url"]))
     match = re.fullmatch(r"/api/v4/projects/([^/]+)/issues", rest.path)
     if not match or (not match[1].isdigit() and unquote(match[1]) != project):
         raise CommentError("Configured REST project identity does not match")
-    origin = urlunsplit((rest.scheme, rest.netloc, "", "", ""))
+    origin = f"https://{rest.netloc}"
     # GitLab serves the REST path above, and so GraphQL, at the origin's root.
     return project, origin, origin + "/api/graphql", match[1]
 
 
 def _issue_identity(source, item):
     project, origin, endpoint, project_id = _identity(source)
-    parsed = urlsplit(canonical_url(item["url"]))
-    expected = urlsplit(origin)
+    issue_url = canonical_url(item["url"])
+    parsed = urlsplit(issue_url)
     match = re.fullmatch(re.escape("/" + project) + r"/-/(?:issues|work_items)/(\d+)", parsed.path)
-    if not match or parsed.query or parsed.fragment or parsed.netloc != expected.netloc:
+    if not match or parsed.query or parsed.fragment or f"https://{parsed.netloc}" != origin:
         raise CommentError("Issue URL is outside its configured project")
-    return project, origin, endpoint, project_id, match[1]
+    return project, origin, endpoint, project_id, match[1], issue_url
 
 
 def note_key(ident: object) -> str:
@@ -96,17 +114,64 @@ def prior_notes(raw_comments: object) -> dict[str, dict]:
     return {note_key(n["id"]): n for n in items if isinstance(n, dict) and isinstance(n.get("id"), str)}
 
 
-def is_budget_clipped_prefix(prev_notes: dict[str, dict] | list | None, curr_notes: list[dict]) -> bool:
+def _note_sort_key(note: dict) -> tuple[str, int, str]:
+    k = note_key(note["id"])
+    return note["created_at"], int(k) if k.isascii() and k.isdigit() else -1, note["id"]
+
+
+def _preserve_edited_at(note: dict, old_note: dict) -> None:
+    note.pop("edited_at", None)
+    if isinstance(old_note.get("edited_at"), str) and old_note["edited_at"] > note["created_at"]:
+        note["edited_at"] = old_note["edited_at"]
+
+
+def _body_sha256(body: str) -> str:
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def is_budget_clipped_prefix(prev_notes: dict[str, dict], curr_notes: list[dict]) -> bool:
     """Return True when the oldest retained note is an unedited prefix clipped by TOTAL_CHARS."""
-    if not curr_notes or sum(len(n.get("body") or "") for n in curr_notes if isinstance(n, dict)) < TOTAL_CHARS:
+    if (not curr_notes or not isinstance(tail := curr_notes[-1], dict)
+            or sum(len(n.get("body") or "") for n in curr_notes if isinstance(n, dict)) < TOTAL_CHARS):
         return False
-    prior = prev_notes if isinstance(prev_notes, dict) else prior_notes(prev_notes)
-    tail = curr_notes[-1]
-    old = prior.get(note_key(tail.get("id"))) if isinstance(tail, dict) else None
-    old_body, new_body = (old.get("body") if old else None), (tail.get("body") if isinstance(tail, dict) else None)
-    return (old is not None and tail.get("edited_at") == old.get("edited_at")
-            and isinstance(old_body, str) and isinstance(new_body, str)
-            and len(new_body) < len(old_body) and old_body.startswith(new_body))
+    old = prev_notes.get(note_key(tail.get("id")))
+    return (
+        old is not None
+        and isinstance(old_body := old.get("body"), str)
+        and isinstance(new_body := tail.get("body"), str)
+        and len(new_body) < len(old_body)
+        and old_body.startswith(new_body)
+    )
+
+
+def budget_unchanged_note_ids(prev_comments: object, curr_notes: list[dict]) -> set[str]:
+    """Return normalized note keys whose body length changed only from TOTAL_CHARS clipping."""
+    prev_list = prev_comments if isinstance(prev_comments, list) else []
+    prev_map = prior_notes(prev_list)
+    unchanged: set[str] = set()
+    if is_budget_clipped_prefix(prev_map, curr_notes):
+        unchanged.add(note_key(curr_notes[-1].get("id")))
+    if (
+        prev_list
+        and isinstance(prev_tail := prev_list[-1], dict)
+        and sum(len(n.get("body") or "") for n in prev_list if isinstance(n, dict)) >= TOTAL_CHARS
+        and (tail_key := note_key(prev_tail.get("id")))
+        and isinstance(old_body := prev_tail.get("body"), str)
+    ):
+        old_sha = prev_tail.get("body_sha256") if isinstance(prev_tail.get("body_sha256"), str) else None
+        for note in curr_notes:
+            if (
+                isinstance(note, dict)
+                and note_key(note.get("id")) == tail_key
+                and note.get("edited_at") == prev_tail.get("edited_at")
+                and isinstance(new_body := note.get("body"), str)
+                and len(new_body) > len(old_body)
+                and new_body.startswith(old_body)
+            ):
+                curr_sha = note.get("body_sha256") if isinstance(note.get("body_sha256"), str) else _body_sha256(new_body)
+                if old_sha is None or curr_sha == old_sha:
+                    unchanged.add(tail_key)
+    return unchanged
 
 
 def _source_key(source):
@@ -115,7 +180,7 @@ def _source_key(source):
 
 def fetch_comments(client, source, item):
     """Read the newest-note window in one request; any unusable part rejects the answer."""
-    project, origin, endpoint, project_id, iid = _issue_identity(source, item)
+    project, origin, endpoint, project_id, iid, issue_url = _issue_identity(source, item)
     response = client.request("POST", endpoint, headers={"Accept": "application/json"},
                               json_body={"query": QUERY, "variables": {"project": project, "iid": iid, "size": NOTE_WINDOW}})
     received = now_iso()
@@ -130,17 +195,29 @@ def fetch_comments(client, source, item):
     issue = obj.get("issue")
     if (not isinstance(issue, dict) or issue.get("confidential") is not False
             or issue.get("iid") != iid or not isinstance(issue.get("webUrl"), str)
-            or canonical_url(issue["webUrl"]) != canonical_url(item["url"])):
+            or canonical_url(issue["webUrl"]) != issue_url):
         raise CommentError("Public issue identity not verified")
     connection = issue.get("notes")
     if not isinstance(connection, dict) or not isinstance(connection.get("nodes"), list):
         raise CommentError("Public notes unavailable")
     notes = {}
+    node_floor_keys: list[tuple[str, int, str]] = []
+    seen_node_keys: set[str] = set()
     for note in connection["nodes"]:
         # Do not inspect, sanitize, log or persist a body before these flags.
         if not isinstance(note, dict):
             raise CommentError("Public note visibility is unknown")
         if note.get("internal") is True or note.get("system") is True:
+            if isinstance(raw_id := note.get("id"), str) and (nkey := note_key(raw_id)):
+                seen_node_keys.add(nkey)
+            if isinstance(raw_created := note.get("createdAt"), str):
+                try:
+                    created_ts = timestamp(raw_created)
+                except ValueError:
+                    created_ts = ""
+                if created_ts and created_ts <= received:
+                    raw_id = note.get("id") if isinstance(note.get("id"), str) else ""
+                    node_floor_keys.append(_note_sort_key({"id": raw_id, "created_at": created_ts}))
             continue
         if note.get("internal") is not False or note.get("system") is not False:
             raise CommentError("Public note visibility is unknown")
@@ -148,8 +225,9 @@ def fetch_comments(client, source, item):
         match = NOTE_GID_RE.fullmatch(ident) if isinstance(ident, str) else None
         if match is None:
             raise CommentError("Invalid public note identity")
+        seen_node_keys.add(match[1])
         url = canonical_url(note.get("url", ""))
-        if url != canonical_url(item["url"]) + "#note_" + match[1]:
+        if url != issue_url + "#note_" + match[1]:
             raise CommentError("Public note URL does not match issue")
         author = note.get("author")
         if not isinstance(author, dict) or not isinstance(author.get("username"), str):
@@ -157,13 +235,12 @@ def fetch_comments(client, source, item):
         if not isinstance(note.get("body"), str):
             raise CommentError("Invalid public note body")
         author, created = plain_text(author["username"], 100, html=False), timestamp(note.get("createdAt"))
-        raw_edited = note.get("lastEditedAt")
-        if raw_edited is not None and not isinstance(raw_edited, str):
-            raise CommentError("Invalid public note timestamp")
-        edited = min(max(timestamp(raw_edited), created), received) if raw_edited is not None else created
-        if not author:
+        edited = min(max(timestamp(raw_edited), created), received) if (raw_edited := note.get("lastEditedAt")) is not None else created
+        if not is_valid_gitlab_user(author):
             raise CommentError("Invalid public note attribution")
         body = plain_text(note["body"], COMMENT_CHARS, html=False)
+        if created <= received:
+            node_floor_keys.append(_note_sort_key({"id": ident, "created_at": created}))
         # Skip an empty note, and one dated after this response: it must not date or promote a story.
         if body and created <= received:
             entry = {"id": ident, "url": url, "title": "Public comment by @" + author,
@@ -171,23 +248,82 @@ def fetch_comments(client, source, item):
             if edited > created:
                 entry["edited_at"] = edited
             notes[match[1]] = entry
-    prior = prior_notes(item.get("public_comments"))
+    prev_list = item.get("public_comments") if isinstance(item.get("public_comments"), list) else []
+    prior = prior_notes(prev_list)
+    prev_tail_key = (
+        note_key(prev_list[-1].get("id"))
+        if prev_list
+        and isinstance(prev_list[-1], dict)
+        and sum(len(n.get("body") or "") for n in prev_list if isinstance(n, dict)) >= TOTAL_CHARS
+        else ""
+    )
+    window_notes = sorted(notes.values(), key=_note_sort_key, reverse=True)
     selected, remaining = [], TOTAL_CHARS
-    for note in sorted(notes.values(), key=lambda n: (n["created_at"], n["id"]), reverse=True):
+    clipped_baselines: dict[str, str | None] = {}
+    for raw_note in window_notes:
+        nkey = note_key(raw_note["id"])
+        old_note = prior.get(nkey)
+        raw_body = raw_note["body"]
+        raw_sha = _body_sha256(raw_body)
+        old_body = old_note.get("body") if old_note is not None and isinstance(old_note.get("body"), str) else None
+        old_full_sha = (
+            old_note["body_sha256"]
+            if old_note is not None and isinstance(old_note.get("body_sha256"), str)
+            else (_body_sha256(old_body) if old_note is not None and nkey != prev_tail_key and old_body is not None else None)
+        )
+        if old_note is not None and (
+            old_body == raw_body
+            or (old_full_sha is not None and old_full_sha == raw_sha)
+            or (
+                old_body is not None
+                and (
+                    (
+                        nkey == prev_tail_key
+                        and raw_body.startswith(old_body)
+                        and raw_note.get("edited_at") == old_note.get("edited_at")
+                    )
+                    or (
+                        0 < remaining < len(old_body)
+                        and len(raw_body) > remaining
+                        and len(selected) < MAX_COMMENTS
+                        and old_body.startswith(raw_body[:remaining])
+                    )
+                )
+            )
+        ):
+            _preserve_edited_at(raw_note, old_note)
         if remaining <= 0 or len(selected) >= MAX_COMMENTS:
-            break
-        note["body"] = note["body"][:remaining]
-        remaining -= len(note["body"])
-        selected.append(note)
-    clipped_tail = is_budget_clipped_prefix(prior, selected)
-    for index, note in enumerate(selected):
-        old_note = prior.get(note_key(note["id"]))
-        if old_note is not None and (old_note.get("body") == note["body"] or (clipped_tail and index == len(selected) - 1)):
-            note.pop("edited_at", None)
-            if isinstance(old_note.get("edited_at"), str) and old_note["edited_at"] > note["created_at"]:
-                note["edited_at"] = old_note["edited_at"]
-    window_truncated = len(connection["nodes"]) >= NOTE_WINDOW or len(selected) < len(notes)
-    return _CommentWindow(selected, truncated=window_truncated)
+            continue
+        was_clipped = len(raw_body) > remaining
+        clipped = {**raw_note, "body": raw_body[:remaining]}
+        if was_clipped:
+            clipped["body_sha256"] = raw_sha
+            clipped_baselines[nkey] = old_full_sha
+        remaining -= len(clipped["body"])
+        selected.append(clipped)
+    unchanged_ids = budget_unchanged_note_ids(prev_list, selected)
+    for note in selected:
+        old_note = prior.get(nkey := note_key(note["id"]))
+        if old_note is not None and (old_note.get("body") == note["body"] or nkey in unchanged_ids):
+            _preserve_edited_at(note, old_note)
+            if nkey in clipped_baselines:
+                # Keep the digest of the last unclipped or visibly exposed full body so
+                # hidden-tail edits made while clipped are detected upon later unclipping.
+                old_full_sha = clipped_baselines[nkey]
+                if old_full_sha is not None:
+                    note["body_sha256"] = old_full_sha
+                else:
+                    note.pop("body_sha256", None)
+    graphql_truncated = len(connection["nodes"]) >= NOTE_WINDOW
+    window_truncated = graphql_truncated or len(selected) < len(window_notes)
+    return _CommentWindow(
+        selected,
+        truncated=window_truncated,
+        window_notes=window_notes,
+        graphql_truncated=graphql_truncated,
+        graphql_floor_key=min(node_floor_keys, default=None),
+        seen_node_keys=seen_node_keys,
+    )
 
 
 def analysis_context(item):
@@ -201,57 +337,51 @@ def analysis_context(item):
     return item.get("source_content", item.get("content", ""))[:room], notes
 
 
-def _note_newer(a: dict, b: dict) -> bool:
-    if a["created_at"] != b["created_at"]:
-        return a["created_at"] > b["created_at"]
-    akey, bkey = note_key(a["id"]), note_key(b["id"])
-    if akey.isdigit() and bkey.isdigit():
-        if int(akey) != int(bkey):
-            return int(akey) > int(bkey)
-    return a["id"] > b["id"]
+def _dirauth_marker(note: dict) -> dict:
+    return {"id": note["id"], "author": note["author"], "created_at": note["created_at"]}
 
 
-def _reconcile_dirauth_notes(item: dict, composed_notes: list[dict], dirauth_users, *, truncated: bool) -> list[dict]:
-    users = {
-        u.strip().lower()
-        for u in (DIRAUTH_GITLAB_USERS if dirauth_users is None else dirauth_users)
-        if isinstance(u, str) and u.strip()
-    }
+def _reconcile_dirauth_notes(
+    item: dict,
+    composed_notes: list[dict],
+    dirauth_users,
+    *,
+    truncated: bool,
+    floor_key: tuple[str, int, str] | None = None,
+    seen_node_keys: set[str] | frozenset[str] = frozenset(),
+) -> list[dict]:
+    users = dirauth_user_set(dirauth_users)
     if not users:
         return []
-    seeded: dict[str, dict] = {}
-    for source_list in (item.get("public_comments"), item.get("dirauth_notes")):
-        if not isinstance(source_list, list):
-            continue
-        for raw in source_list:
-            if (
-                isinstance(raw, dict)
-                and all(isinstance(raw.get(f), str) and raw[f] for f in ("id", "author", "created_at"))
-                and raw["author"].strip().lower() in users
-                and (nkey := note_key(raw["id"]))
-            ):
-                seeded[nkey] = {"id": raw["id"], "author": raw["author"], "created_at": raw["created_at"]}
-    present_keys = {note_key(n["id"]) for n in composed_notes if isinstance(n.get("id"), str)}
-    floor = None
-    for note in composed_notes:
-        if floor is None or _note_newer(floor, note):
-            floor = note
-    retained: dict[str, dict] = {}
-    for nkey, prev in seeded.items():
-        if nkey in present_keys or not truncated:
-            continue
-        if floor is not None and _note_newer(prev, floor):
-            continue
-        retained[nkey] = prev
+    if truncated:
+        present_keys = {note_key(n["id"]) for n in composed_notes if isinstance(n.get("id"), str)}
+        effective_floor = (
+            floor_key
+            if floor_key is not None
+            else min((_note_sort_key(n) for n in composed_notes), default=None)
+        )
+        retained = {
+            nkey: _dirauth_marker(raw)
+            for notes in (item.get("public_comments"), item.get("dirauth_notes")) if isinstance(notes, list)
+            for raw in notes
+            if isinstance(raw, dict) and all(isinstance(raw.get(f), str) and raw[f] for f in ("id", "author", "created_at"))
+            and raw["author"].strip().lower() in users and (nkey := note_key(raw["id"]))
+            and nkey not in present_keys and nkey not in seen_node_keys
+            and (
+                effective_floor is None
+                or (
+                    _note_sort_key(raw)[:2] < effective_floor[:2]
+                    if floor_key is not None
+                    else _note_sort_key(raw) <= effective_floor
+                )
+            )
+        }
+    else:
+        retained = {}
     for note in composed_notes:
         if note["author"].strip().lower() in users and (nkey := note_key(note["id"])):
-            retained[nkey] = {"id": note["id"], "author": note["author"], "created_at": note["created_at"]}
-    ordered = sorted(
-        retained.values(),
-        key=lambda n: (n["created_at"], int(k) if (k := note_key(n["id"])).isdigit() else -1, n["id"]),
-        reverse=True,
-    )
-    return ordered[:MAX_DIRAUTH_NOTES]
+            retained[nkey] = _dirauth_marker(note)
+    return sorted(retained.values(), key=_note_sort_key, reverse=True)[:MAX_DIRAUTH_NOTES]
 
 
 def _compose(item, notes, checked, *, source_key, dirauth_users=None, window_truncated: bool | None = None):
@@ -261,17 +391,28 @@ def _compose(item, notes, checked, *, source_key, dirauth_users=None, window_tru
     if not isinstance(content, str):
         raise CommentError("Saved issue description is unavailable")
     prior = prior_notes(item.get("public_comments"))
-    clipped_tail = is_budget_clipped_prefix(prior, notes)
+    budget_unchanged = budget_unchanged_note_ids(item.get("public_comments"), notes)
     composed_notes = []
-    for index, note in enumerate(notes):
+    for note in notes:
         entry = dict(note)
-        old_note = prior.get(note_key(entry.get("id")))
-        if old_note is not None and old_note.get("body") != entry.get("body") and not (clipped_tail and index == len(notes) - 1):
-            prev_time = old_note.get("edited_at") or entry["created_at"]
+        nkey = note_key(entry.get("id"))
+        old_note = prior.get(nkey)
+        if old_note is not None and old_note.get("body") != entry.get("body") and nkey not in budget_unchanged:
+            prev_edit = old_note.get("edited_at")
+            prev_time = prev_edit if isinstance(prev_edit, str) and prev_edit else entry["created_at"]
             if not isinstance(entry.get("edited_at"), str) or entry["edited_at"] <= prev_time:
                 entry["edited_at"] = max(checked, prev_time)
         composed_notes.append(entry)
-    dirauth_list = _reconcile_dirauth_notes(item, composed_notes, dirauth_users, truncated=truncated)
+    if isinstance(notes, _CommentWindow) and window_truncated is None:
+        dirauth_source, dirauth_truncated, dirauth_floor, seen_node_keys = (
+            notes.window_notes, notes.graphql_truncated, notes.graphql_floor_key, notes.seen_node_keys
+        )
+    else:
+        dirauth_source, dirauth_truncated, dirauth_floor, seen_node_keys = composed_notes, truncated, None, frozenset()
+    dirauth_list = _reconcile_dirauth_notes(
+        item, dirauth_source, dirauth_users,
+        truncated=dirauth_truncated, floor_key=dirauth_floor, seen_node_keys=seen_node_keys,
+    )
     # Callers pass a key only for a verified fetch or an already verified stored snapshot.
     result.update(
         content=content,
@@ -302,22 +443,20 @@ def merge_cached_comments(store, item, source, observed=None, *, dirauth_users=N
     """
     if item.get("kind") != "gitlab_issue" or not source.get("gitlab_project"):
         return item
-    row = store.db.execute("SELECT id,typeof(payload) AS payload_type,CAST(payload AS BLOB) AS payload FROM items WHERE url=?",
-                           (item["url"],)).fetchone()
+    row = store.db.execute(
+        "SELECT id,CASE WHEN typeof(payload)='text' THEN CAST(payload AS BLOB) END AS payload FROM items WHERE url=?",
+        (item["url"],),
+    ).fetchone()
     if row is None:
         return item
-    old = (saved_object(row["payload"]) if row["payload_type"] == "text" else None) or {}
+    old = saved_object(row["payload"]) or {}
     key = _source_key(source)
-    req_fields = ("id", "url", "title", "author", "created_at", "body")
-    dirauth_fields = ("id", "author", "created_at")
-    valid_dirauth = "dirauth_notes" not in old or (
-        isinstance(old["dirauth_notes"], list)
-        and all(isinstance(n, dict) and all(isinstance(n.get(f), str) for f in dirauth_fields) for n in old["dirauth_notes"])
+    valid_notes = (
+        isinstance(old.get("comments_checked_at"), str)
+        and ("comments_truncated" not in old or type(old["comments_truncated"]) is bool)
+        and valid_note_list(old.get("public_comments"), ("id", "url", "title", "author", "created_at", "body"), allow_none=False)
+        and ("dirauth_notes" not in old or valid_note_list(old["dirauth_notes"], ("id", "author", "created_at"), allow_none=False))
     )
-    valid_trunc = "comments_truncated" not in old or type(old["comments_truncated"]) is bool
-    valid_notes = (isinstance(old.get("comments_checked_at"), str) and isinstance(old.get("public_comments"), list)
-                   and valid_dirauth and valid_trunc
-                   and all(isinstance(n, dict) and all(isinstance(n.get(f), str) for f in req_fields) for n in old["public_comments"]))
     current = valid_notes and old.get("comments_source_key") == key
     if observed and (not current or item["updated_at"] > old["comments_checked_at"]):
         with store.db:
@@ -354,14 +493,13 @@ def request_check(db, config, row, observed):
 def _candidates(store, source, observed, key):
     """Requested checks, then half recent candidates, half rotating unlocked published history."""
     limit = MAX_ISSUES_PER_SOURCE
-    state = store.db.execute("SELECT * FROM comment_sources WHERE source_id=?", (source["id"],)).fetchone()
-    if state and state["source_key"] == key and state["next_fetch_at"] and state["next_fetch_at"] > observed:
+    state = store.db.execute("SELECT * FROM comment_sources WHERE source_id=? AND source_key=?", (source["id"], key)).fetchone()
+    if state and state["next_fetch_at"] and state["next_fetch_at"] > observed:
         return []
-    with store.db:
-        if not state or state["source_key"] != key:
+    if not state:
+        with store.db:
             store.db.execute("INSERT OR REPLACE INTO comment_sources(source_id,source_key) VALUES(?,?)", (source["id"], key))
-    cursor = state["rotation_cursor"] if state and state["source_key"] == key else ""
-    recent_first = bool(state["recent_first"]) if state and state["source_key"] == key else False
+    cursor, recent_first = (state["rotation_cursor"], bool(state["recent_first"])) if state else ("", False)
     due = "(c.item_id IS NULL OR c.source_key<>? OR c.next_fetch_at<=?)"
     unlocked = " AND NOT EXISTS(SELECT 1 FROM editorial_controls e WHERE e.story_id=i.story_id AND e.locked=1)"
     columns = "i.id,i.content_hash,CAST(i.payload AS BLOB) AS payload"
@@ -387,11 +525,14 @@ def _candidates(store, source, observed, key):
     return list(selected.values())[:limit]
 
 
-def _advance_rotation(db, source_id: str, row: dict) -> None:
+def _finish_check(
+    db, source_id: str, row: dict, key: str, checked_at: str, next_fetch_at: str, *, failures: int = 0, error: str | None = None
+) -> None:
     if row["_comments_history"]:
         db.execute("UPDATE comment_sources SET rotation_cursor=?,recent_first=1 WHERE source_id=?", (row["id"], source_id))
     elif row["_comments_history"] is not None:  # a requested check takes no rotation turn
         db.execute("UPDATE comment_sources SET recent_first=0 WHERE source_id=?", (source_id,))
+    db.execute("INSERT OR REPLACE INTO comment_cache VALUES(?,?,?,?,?,?)", (row["id"], key, checked_at, next_fetch_at, failures, error))
 
 
 def enrich_comments(config, store, observed, *, deadline=None):
@@ -433,9 +574,10 @@ def enrich_comments(config, store, observed, *, deadline=None):
                 except (CommentError, ValueError, TypeError, KeyError, RecursionError):
                     report["skipped"] += 1
                     with store.db:
-                        _advance_rotation(store.db, source["id"], row)
-                        store.db.execute("INSERT OR REPLACE INTO comment_cache VALUES(?,?,?,?,0,?)",
-                                         (row["id"], key, observed, after(INTERVAL_SECONDS, observed), "Saved issue description unavailable"))
+                        _finish_check(
+                            store.db, source["id"], row, key, observed, after(INTERVAL_SECONDS, observed),
+                            error="Saved issue description unavailable",
+                        )
                     continue
                 try:
                     enriched = _compose(
@@ -450,16 +592,17 @@ def enrich_comments(config, store, observed, *, deadline=None):
                     report["failed"] += 1
                     cached = store.db.execute("SELECT failures,checked_at FROM comment_cache WHERE item_id=? AND source_key=?",
                                               (row["id"], key)).fetchone() or (0, observed)
-                    item_due = after(backoff_seconds(cached[0] + 1, BACKOFF_BASE_SECONDS, BACKOFF_CAP_SECONDS), observed)
+                    item_due = backoff_until(cached[0] + 1, BACKOFF_BASE_SECONDS, BACKOFF_CAP_SECONDS, observed)
                     is_endpoint = isinstance(exc, (FetchError, EndpointError))
                     with store.db:
-                        _advance_rotation(store.db, source["id"], row)
-                        store.db.execute("INSERT OR REPLACE INTO comment_cache VALUES(?,?,?,?,?,?)",
-                                         (row["id"], key, cached[1], item_due, cached[0] + 1, "Public comments unavailable"))
+                        _finish_check(
+                            store.db, source["id"], row, key, cached[1], item_due,
+                            failures=cached[0] + 1, error="Public comments unavailable",
+                        )
                         if is_endpoint:
                             state = store.db.execute("SELECT failures FROM comment_sources WHERE source_id=?", (source["id"],)).fetchone()
                             failures = (state[0] if state else 0) + 1
-                            due = after(backoff_seconds(failures, BACKOFF_BASE_SECONDS, BACKOFF_CAP_SECONDS), observed)
+                            due = backoff_until(failures, BACKOFF_BASE_SECONDS, BACKOFF_CAP_SECONDS, observed)
                             store.db.execute("UPDATE comment_sources SET failures=?,next_fetch_at=?,error=? WHERE source_id=?",
                                              (failures, due, "Public comments unavailable", source["id"]))
                     if is_endpoint:
@@ -469,12 +612,10 @@ def enrich_comments(config, store, observed, *, deadline=None):
                 changed = bool(store.ingest(enriched, observed, dirauth_users=dirauth_users))
                 report["changed"] += changed
                 with store.db:
-                    _advance_rotation(store.db, source["id"], row)
                     if not changed:
                         store.db.execute("UPDATE items SET payload=? WHERE id=? AND CAST(payload AS BLOB)=? AND content_hash=?",
                                          (json.dumps(enriched, ensure_ascii=False), row["id"], row["payload"], row["content_hash"]))
-                    store.db.execute("INSERT OR REPLACE INTO comment_cache VALUES(?,?,?,?,0,NULL)",
-                                     (row["id"], key, observed, after(INTERVAL_SECONDS, observed)))
+                    _finish_check(store.db, source["id"], row, key, observed, after(INTERVAL_SECONDS, observed))
                     store.db.execute("UPDATE comment_sources SET failures=0,next_fetch_at=NULL,error=NULL WHERE source_id=?", (source["id"],))
     finally:
         client.close()

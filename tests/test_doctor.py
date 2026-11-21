@@ -1,30 +1,29 @@
 """Tests for fixed-text DocTor consensus-health incident summaries, host attachment, and retired alerts."""
 
-from __future__ import annotations
-
+from datetime import timedelta
 import json
+from pathlib import Path
 import random
 import xml.etree.ElementTree as ET
-from datetime import timedelta
-from pathlib import Path
 
 import pytest
 
 from helpers import (
-    ApprovingReviewer, FakeClient, Writer, analysis, finish_reviewed, item as make_item,
-    make_story, patch_cli_pipeline, pub_settings, put_story, update_analysis,
+    DATE, DOCTOR_FEED_URL as FEED_URL, DOCTOR_LIST_URL as LIST_URL, DOCTOR_OK_LINE as OK_LINE,
+    ApprovingReviewer, FakeClient, FakeLinker, Writer, analysis, bastet_incident_items, decision_rows,
+    doctor_report_item as report_item, editorial_act, invoke_cli, item, make_doctor_config as make_config,
+    make_story, patch_cli_pipeline, pub_settings, put_story, raise_once, seed_story, story_payload,
+    update_analysis,
 )
 from onionflash import candidate, cli, collect, decisions, doctor, editorial, publication, render, source_packet
 from onionflash.analyze import AnalysisError
 from onionflash.config import load_config
+from onionflash.llm import CompletionDeferred
 from onionflash.store import Store
 from onionflash.transport import Response
 from onionflash.util import digest, format_utc, parse_utc
 
 FIXTURES = Path(__file__).parent / "fixtures" / "doctor"
-LIST_URL = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/"
-FEED_URL = LIST_URL + "feed/"
-OK_LINE = "NOTICE: The following directory authorities are not reporting bandwidth scanner results: faravahar"
 SRV_ERR = "ERROR: Consensus is missing a current shared random value"
 BASE_CONSENSUS_TOML = (
     '[storage]\ndatabase="state.sqlite3"\noutput_dir="public"\n[[sources]]\n'
@@ -33,74 +32,21 @@ BASE_CONSENSUS_TOML = (
 )
 
 
-def load_jsonl(name: str) -> list[dict]:
+def _load_jsonl(name: str) -> list[dict]:
     return [json.loads(line) for line in (FIXTURES / name).read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def make_config(tmp_path: Path, *, publish: bool = True, enabled: bool = True) -> tuple[Path, dict]:
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    path = tmp_path / "config.toml"
-    path.write_text(
-        '[storage]\ndatabase = "state.sqlite3"\noutput_dir = "public"\n[llm]\nbase_url = "https://llm.example/v1"\nmodel = "test-model"\n'
-        f'[[sources]]\nid = "tor-consensus-health"\nname = "Tor Project Consensus Health Alerts"\nwebsite_url = "{LIST_URL}"\nurl = "{FEED_URL}"\n'
-        f'kind = "feed"\nproduct = "network"\nauthority = "telemetry"\nalert_format = "consensus"\n'
-        f'publish = {"true" if publish else "false"}\nenabled = {"true" if enabled else "false"}\n',
-        encoding="utf-8",
-    )
-    return path, load_config(path)
-
-
-def report_item(slug: str, stamp: str, lines: list[str], *, title: str = "[tor-consensus-health] Consensus issues", url: str | None = None) -> dict:
-    return {"source_id": "tor-consensus-health", "url": url or f"{LIST_URL}message/{slug}/", "title": title,
-            "content": "\n".join(lines), "published_at": stamp, "updated_at": stamp, "kind": "feed",
-            "product": "network", "authority": "telemetry", "labels": [], "upstream_state": ""}
-
-
-def decision_rows(store: Store) -> list[dict]:
-    return [{**dict(r), "detail": json.loads(r["detail_json"])} for r in store.db.execute("SELECT * FROM decision_log ORDER BY id")]
-
-
-class FakeLinker:
-    def __init__(self, *answers):
-        self.answers, self.calls, self.seen = list(answers), 0, []
-
-    def __enter__(self): return self
-    def __exit__(self, *args): pass
-
-    def confirm(self, incident: dict, host: dict) -> bool:
-        self.calls += 1
-        self.seen.append((incident["rule"], incident["subject"], host["title"]))
-        if not self.answers:
-            return False
-        nxt = self.answers.pop(0)
-        if isinstance(nxt, Exception):
-            raise nxt
-        return bool(nxt)
-
-
-def seed_host(store: Store, *, url: str, title: str, summary: str, published_at: str = "2024-01-14T12:00:00Z",
-              category: str = "directory-authority", confidence: str = "confirmed", state: str = "developing") -> str:
-    incoming = make_item(url=url, title=title, content=summary + " Exact supporting sentence from the upstream source.",
-                         published_at=published_at, updated_at=published_at, authority="official")
-    store.ingest(incoming, published_at)
-    row = next(r for r in store.pending(10, published_at) if r["id"] == incoming["id"])
+def _seed_host(store: Store, *, url: str, title: str, summary: str, published_at: str = "2024-01-14T12:00:00Z") -> str:
+    incoming = item(url=url, title=title, content=summary + " Exact supporting sentence from the upstream source.",
+                    published_at=published_at, updated_at=published_at, authority="official")
     draft = analysis(title=title, summary=summary, why_it_matters="Operators track directory authority voting keys.",
-                     category=category, priority="high", confidence=confidence, state=state,
-                     products=["tor", "network"], tags=[category], evidence=[summary])
-    finish_reviewed(store, row, draft, "seed-" + row["id"], published_at)
-    return store.db.execute("SELECT story_id FROM items WHERE id=?", (row["id"],)).fetchone()[0]
-
-
-def bastet_incident_items(start_iso: str = "2024-01-15T00:05:00Z", *, close: bool = False) -> list[dict]:
-    t0 = parse_utc(start_iso)
-    missing = ["WARNING: The following authorities are missing from the consensus: bastet", OK_LINE]
-    items = [report_item(f"JAN24_ATTACH_BAS_{i}", format_utc(t0 + timedelta(hours=i * 12)), missing) for i in range(5)]
-    if close:
-        items += [report_item(f"JAN24_ATTACH_BAS_CLOSE_{i}", format_utc(t0 + timedelta(hours=60 + i * 16)), [OK_LINE]) for i in range(2)]
-    return items
+                     category="directory-authority", priority="high", confidence="confirmed", state="developing",
+                     products=["tor", "network"], tags=["directory-authority"], evidence=[summary])
+    return seed_story(store, incoming, draft, at=published_at)["id"]
 
 
 def test_feed_collection_parses_reports_skips_undated_and_logs_non_reports_once(tmp_path):
+    """Collect DocTor RSS entries, skip undated items, and log non-reports once."""
     _, cfg = make_config(tmp_path)
     source = cfg["sources"][0]
     collected = collect.collect_source(FakeClient([Response(200, (FIXTURES / "feed.xml").read_bytes(), {}, FEED_URL)]),
@@ -126,6 +72,7 @@ def test_feed_collection_parses_reports_skips_undated_and_logs_non_reports_once(
 
 
 def test_truncated_report_keeps_listings_without_counting_omissions(tmp_path):
+    """Retain explicit authority listings on truncated reports without treating omissions as clearance."""
     _, cfg = make_config(tmp_path)
     source, start = cfg["sources"][0], parse_utc("2024-01-02T00:05:00Z")
     lines = ["WARNING: The following authorities are missing from the consensus: bastet", OK_LINE]
@@ -142,8 +89,9 @@ def test_truncated_report_keeps_listings_without_counting_omissions(tmp_path):
 
 
 def test_family_a_positives_negatives_milestones_closing_and_no_resolved_wording(tmp_path):
+    """Evaluate Rule A missing-authority thresholds, 7-day milestones, closure, and public wording."""
     _, cfg = make_config(tmp_path, publish=True)
-    source, items = cfg["sources"][0], load_jsonl("jan2024_authority_cases.jsonl")
+    source, items = cfg["sources"][0], _load_jsonl("jan2024_authority_cases.jsonl")
     with Store(cfg["storage"]["database"]) as store:
         doctor.evaluate(cfg, store, source, FakeLinker(), "2024-01-10T00:00:00Z")
         assert doctor.ingest(store.db, source, items, "2024-01-10T00:05:00Z") == (len(items), 0)
@@ -177,9 +125,10 @@ def test_family_a_positives_negatives_milestones_closing_and_no_resolved_wording
 
 
 def test_family_b_missed_consensuses_wording_updates_gaps_and_recurrence(tmp_path):
+    """Evaluate Rule B stale-consensus hour counting, gaps, updates, and recurrence."""
     _, cfg = make_config(tmp_path, publish=True)
     source = cfg["sources"][0]
-    [b] = [inc for inc in doctor.incidents([doctor.parse(it, source) for it in load_jsonl("jan2024_stale_and_srv.jsonl")])[0] if inc["rule"] == "B"]
+    [b] = [inc for inc in doctor.incidents([doctor.parse(it, source) for it in _load_jsonl("jan2024_stale_and_srv.jsonl")])[0] if inc["rule"] == "B"]
     assert b["first"]["stamp"] == "2024-01-17T12:05:17Z" and b["opened"]["stamp"] == "2024-01-18T00:05:36Z"
     assert "in 6 separate hours" in doctor._story_summary("B", b["open_vars"])
     assert [ev["kind"] for ev in b["events"]] == ["B:more", "B:close", "B:reopen", "B:close"]
@@ -202,8 +151,9 @@ def test_family_b_missed_consensuses_wording_updates_gaps_and_recurrence(tmp_pat
 
 
 def test_family_c_recurrence_resets_state_to_developing_and_checks_notes(tmp_path):
+    """Reset Rule C shared-random-value stories to `developing` on recurrence and verify note text."""
     _, cfg = make_config(tmp_path, publish=True)
-    source, all_items = cfg["sources"][0], load_jsonl("jan2024_srv_recurrence.jsonl")
+    source, all_items = cfg["sources"][0], _load_jsonl("jan2024_srv_recurrence.jsonl")
     first_wave = [it for it in all_items if it["published_at"] <= "2024-01-04T02:00:00Z"]
     reopen_wave = [it for it in all_items if "2024-01-04T02:00:00Z" < it["published_at"] <= "2024-01-07T06:00:00Z"]
     final_wave = [it for it in all_items if it["published_at"] > "2024-01-07T06:00:00Z"]
@@ -239,18 +189,17 @@ def test_family_c_recurrence_resets_state_to_developing_and_checks_notes(tmp_pat
 
 
 def test_no_120_day_prune_order_independence_and_late_older_report_pinning(tmp_path):
+    """Preserve ingestion-order independence, unpruned long history, and pinned opening timestamps."""
     _, cfg = make_config(tmp_path, publish=True)
-    source, items = cfg["sources"][0], load_jsonl("jan2024_authority_cases.jsonl")
+    source, items = cfg["sources"][0], _load_jsonl("jan2024_authority_cases.jsonl")
     shuffled = list(items)
     random.Random(42).shuffle(shuffled)
     _, cfg_b = make_config(tmp_path / "b", publish=True)
     with Store(cfg["storage"]["database"]) as store_a, Store(cfg_b["storage"]["database"]) as store_b:
-        doctor.evaluate(cfg, store_a, source, FakeLinker(), "2024-01-10T00:00:00Z")
-        doctor.evaluate(cfg_b, store_b, source, FakeLinker(), "2024-01-10T00:00:00Z")
-        doctor.ingest(store_a.db, source, items, "2024-01-10T00:05:00Z")
-        doctor.ingest(store_b.db, source, shuffled, "2024-01-10T00:05:00Z")
-        doctor.evaluate(cfg, store_a, source, FakeLinker(), "2024-01-25T00:00:00Z")
-        doctor.evaluate(cfg_b, store_b, source, FakeLinker(), "2024-01-25T00:00:00Z")
+        for cur_cfg, cur_store, batch in ((cfg, store_a, items), (cfg_b, store_b, shuffled)):
+            doctor.evaluate(cur_cfg, cur_store, source, FakeLinker(), "2024-01-10T00:00:00Z")
+            doctor.ingest(cur_store.db, source, batch, "2024-01-10T00:05:00Z")
+            doctor.evaluate(cur_cfg, cur_store, source, FakeLinker(), "2024-01-25T00:00:00Z")
         assert store_a.stories() == store_b.stories()
 
     _, cfg_pin = make_config(tmp_path / "pin", publish=True)
@@ -275,6 +224,7 @@ def test_no_120_day_prune_order_independence_and_late_older_report_pinning(tmp_p
 
 
 def test_authorities_change_while_incident_is_open(tmp_path, monkeypatch):
+    """Close open incidents cleanly even when `doctor.AUTHORITIES` changes mid-incident."""
     _, cfg = make_config(tmp_path, publish=True)
     source, t0 = cfg["sources"][0], parse_utc("2024-01-05T00:00:00Z")
     lines = ["WARNING: The following authorities are missing from the consensus: bastet, newauth", OK_LINE]
@@ -294,6 +244,7 @@ def test_authorities_change_while_incident_is_open(tmp_path, monkeypatch):
 
 
 def test_dry_run_status_preview_publish_since_and_on_off_on_transitions(tmp_path, monkeypatch, capsys):
+    """Preview dry-run incidents in status, gate archival alerts at `publish_since`, and render alert notes."""
     path, cfg = make_config(tmp_path, publish=False)
     inc1 = [report_item(f"JAN24_DRY_1_{h:02d}", format_utc(parse_utc("2024-01-03T00:05:00Z") + timedelta(hours=h)), [SRV_ERR])
             for h in range(6)] + [report_item("JAN24_DRY_1_CLOSE", "2024-01-03T06:05:00Z", [OK_LINE])]
@@ -310,8 +261,7 @@ def test_dry_run_status_preview_publish_since_and_on_off_on_transitions(tmp_path
         cli.run(cfg, store)
         assert sum(r["code"] == "held.network.dry_run" for r in decision_rows(store)) == 2
 
-    assert cli.main(["status", "--config", str(path)]) == 0
-    status_payload = json.loads(capsys.readouterr().out)["network_health"]
+    status_payload = invoke_cli(capsys, "status", "--config", path)["network_health"]
     assert status_payload["mode"] == "dry_run" and status_payload["reports"] == len(inc1) + len(inc2_open) and len(status_payload["incidents"]) == 2
     assert status_payload["incidents"][0]["title"] == "Tor consensus published without a shared random value"
 
@@ -345,8 +295,9 @@ def test_dry_run_status_preview_publish_since_and_on_off_on_transitions(tmp_path
 
 
 def test_preset_publish_since_populates_reports_without_publishing_closed_archive(tmp_path):
+    """Skip closed archival episodes occurring prior to a preset `publish_since` cutoff."""
     _, cfg = make_config(tmp_path, publish=True)
-    source, items = cfg["sources"][0], load_jsonl("jan2024_srv_recurrence.jsonl")
+    source, items = cfg["sources"][0], _load_jsonl("jan2024_srv_recurrence.jsonl")
     with Store(cfg["storage"]["database"]) as store:
         store.set_meta(publish_since="2024-01-20T00:00:00Z")
         doctor.ingest(store.db, source, items, "2024-01-20T01:00:00Z")
@@ -357,13 +308,14 @@ def test_preset_publish_since_populates_reports_without_publishing_closed_archiv
 
 
 def test_attach_yes_preserves_host_labels_caches_answer_and_survives_later_model_update(tmp_path):
+    """Attach confirmed DocTor updates onto an existing host story without altering host fields."""
     _, cfg_dry = make_config(tmp_path, publish=False)
     _, cfg_pub = make_config(tmp_path, publish=True)
     with Store(cfg_dry["storage"]["database"]) as store:
-        host_id = seed_host(store, url="https://example.org/bastet-key-removal",
-                            title="Directory authority bastet removed after reported key compromise",
-                            summary="Maintainers announced removing directory authority bastet after its operator reported a compromise.")
-        before_host = render.prepare_story(json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (host_id,)).fetchone()[0]))
+        host_id = _seed_host(store, url="https://example.org/bastet-key-removal",
+                             title="Directory authority bastet removed after reported key compromise",
+                             summary="Maintainers announced removing directory authority bastet after its operator reported a compromise.")
+        before_host = render.prepare_story(story_payload(store, host_id))
         open_items = bastet_incident_items(close=False)
         close_only = bastet_incident_items(close=True)[len(open_items):]
         doctor.ingest(store.db, cfg_dry["sources"][0], open_items, "2024-01-17T12:00:00Z")
@@ -379,16 +331,16 @@ def test_attach_yes_preserves_host_labels_caches_answer_and_survives_later_model
         doctor.evaluate(cfg_pub, store, cfg_pub["sources"][0], linker2, "2024-01-18T12:00:00Z")
         assert linker2.calls == 0 and len(store.stories()) == 1
 
-        after_raw = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (host_id,)).fetchone()[0])
+        after_raw = story_payload(store, host_id)
         after_host = render.prepare_story(after_raw)
         for field in ("title", "summary", "why_it_matters", "category", "priority", "confidence", "state", "products", "tags"):
             assert after_host[field] == before_host[field]
         assert len(after_host["updates"]) == 2 and after_host["alert_notes"] == [doctor.NOTES["A"]] and len(after_host["sources"]) >= 2
 
-        follow = make_item(url="https://example.org/bastet-key-removal",
-                           title="Directory authority bastet removed after reported key compromise",
-                           content="Maintainers announced removing directory authority bastet after its operator reported a compromise. Release merged.",
-                           published_at="2024-01-14T12:00:00Z", updated_at="2024-01-19T00:00:00Z", authority="official")
+        follow = item(url="https://example.org/bastet-key-removal",
+                      title="Directory authority bastet removed after reported key compromise",
+                      content="Maintainers announced removing directory authority bastet after its operator reported a compromise. Release merged.",
+                      published_at="2024-01-14T12:00:00Z", updated_at="2024-01-19T00:00:00Z", authority="official")
         store.ingest(follow, "2024-01-19T00:00:00Z")
         prepared = candidate.prepare(
             store.db, store.pending(1, "2024-01-19T00:00:00Z")[0],
@@ -401,11 +353,12 @@ def test_attach_yes_preserves_host_labels_caches_answer_and_survives_later_model
 
 
 def test_attach_no_locked_host_candidate_cap_and_transient_link_failure(tmp_path):
+    """Handle negative link checks, locked/retracted hosts, candidate caps, and transient link errors."""
     _, cfg = make_config(tmp_path / "no", publish=True)
     with Store(cfg["storage"]["database"]) as store:
-        host_id = seed_host(store, url="https://example.org/bastet-flags",
-                            title="Directory authority bastet reports fewer Guard flags in vote",
-                            summary="Analysts noted directory authority bastet assigned fewer Guard flags than the consensus.")
+        host_id = _seed_host(store, url="https://example.org/bastet-flags",
+                             title="Directory authority bastet reports fewer Guard flags in vote",
+                             summary="Analysts noted directory authority bastet assigned fewer Guard flags than the consensus.")
         doctor.ingest(store.db, cfg["sources"][0], bastet_incident_items(), "2024-01-18T00:00:00Z")
         linker = FakeLinker(False)
         doctor.evaluate(cfg, store, cfg["sources"][0], linker, "2024-01-18T00:00:00Z")
@@ -413,9 +366,9 @@ def test_attach_no_locked_host_candidate_cap_and_transient_link_failure(tmp_path
         standalone = next(s for s in store.stories() if s["id"] != host_id)
         assert standalone["origin"] == "network-health"
 
-        mapped = make_item(url="https://example.org/follow-note", title="Unrelated headline attempt",
-                           content="Operators discussed a relay flag observation in detail on the mailing list.",
-                           published_at="2024-01-18T01:00:00Z", updated_at="2024-01-18T01:00:00Z")
+        mapped = item(url="https://example.org/follow-note", title="Unrelated headline attempt",
+                      content="Operators discussed a relay flag observation in detail on the mailing list.",
+                      published_at="2024-01-18T01:00:00Z", updated_at="2024-01-18T01:00:00Z")
         store.ingest(mapped, "2024-01-18T01:00:00Z")
         store.db.execute("UPDATE items SET story_id=? WHERE url=?", (standalone["id"], mapped["url"]))
         store.db.commit()
@@ -433,14 +386,13 @@ def test_attach_no_locked_host_candidate_cap_and_transient_link_failure(tmp_path
 
     _, cfg_lock = make_config(tmp_path / "locked", publish=True)
     with Store(cfg_lock["storage"]["database"]) as store:
-        locked_id = seed_host(store, url="https://example.org/bastet-locked", title="Directory authority bastet maintenance notice",
-                              summary="Operators reported directory authority bastet maintenance.")
-        editorial.correct(store.db, locked_id, {"why_it_matters": "Operator-locked context."}, reason="Clarified context.",
-                          expect_hash=editorial.show(store.db, locked_id)["hash"], observed="2024-01-14T13:00:00Z")
-        retracted_id = seed_host(store, url="https://example.org/bastet-retracted", title="Withdrawn bastet report",
-                                 summary="Withdrawn report naming directory authority bastet.", published_at="2024-01-14T14:00:00Z")
-        editorial.retract(store.db, retracted_id, reason="Withdrawn.", expect_hash=editorial.show(store.db, retracted_id)["hash"],
-                          observed="2024-01-14T15:00:00Z")
+        locked_id = _seed_host(store, url="https://example.org/bastet-locked", title="Directory authority bastet maintenance notice",
+                               summary="Operators reported directory authority bastet maintenance.")
+        editorial_act(editorial.correct, store, locked_id, {"why_it_matters": "Operator-locked context."},
+                      reason="Clarified context.", observed="2024-01-14T13:00:00Z")
+        retracted_id = _seed_host(store, url="https://example.org/bastet-retracted", title="Withdrawn bastet report",
+                                  summary="Withdrawn report naming directory authority bastet.", published_at="2024-01-14T14:00:00Z")
+        editorial_act(editorial.retract, store, retracted_id, reason="Withdrawn.", observed="2024-01-14T15:00:00Z")
         doctor.ingest(store.db, cfg_lock["sources"][0], bastet_incident_items(), "2024-01-18T00:00:00Z")
         linker = FakeLinker(pytest.fail)
         doctor.evaluate(cfg_lock, store, cfg_lock["sources"][0], linker, "2024-01-18T00:00:00Z")
@@ -450,11 +402,11 @@ def test_attach_no_locked_host_candidate_cap_and_transient_link_failure(tmp_path
 
     _, cfg_fail = make_config(tmp_path / "fail", publish=True)
     with Store(cfg_fail["storage"]["database"]) as store:
-        host_id = seed_host(store, url="https://example.org/bastet-outage", title="Directory authority bastet offline during hardware replacement",
-                            summary="Operators reported directory authority bastet is offline for hardware replacement.")
+        host_id = _seed_host(store, url="https://example.org/bastet-outage", title="Directory authority bastet offline during hardware replacement",
+                             summary="Operators reported directory authority bastet is offline for hardware replacement.")
         for idx in range(5):
-            seed_host(store, url=f"https://example.org/consensus-{idx}", title=f"Directory authority consensus voting issue {idx}",
-                      summary=f"Directory authorities experienced consensus voting delays in report {idx}.", published_at=f"2024-01-14T0{idx}:00:00Z")
+            _seed_host(store, url=f"https://example.org/consensus-{idx}", title=f"Directory authority consensus voting issue {idx}",
+                       summary=f"Directory authorities experienced consensus voting delays in report {idx}.", published_at=f"2024-01-14T0{idx}:00:00Z")
         b_dummy = {"key": "bcap", "rule": "B", "subject": "network", "first": {"stamp": "2024-01-15T00:00:00Z", "url": FEED_URL},
                    "opened": {"stamp": "2024-01-15T12:00:00Z", "url": FEED_URL}, "last": {"stamp": "2024-01-15T12:00:00Z", "url": FEED_URL}, "closed": None}
         assert len(doctor.candidate_hosts(store.db, b_dummy, log_locked=False)) == 3
@@ -468,23 +420,37 @@ def test_attach_no_locked_host_candidate_cap_and_transient_link_failure(tmp_path
         recover = FakeLinker(True)
         res_ok = doctor.evaluate(cfg_fail, store, cfg_fail["sources"][0], recover, "2024-01-18T00:05:00Z")
         assert recover.calls == 1 and res_ok["updates_written"] == 1
-        assert len(render.prepare_story(json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (host_id,)).fetchone()[0]))["updates"]) == 1
+        assert len(render.prepare_story(story_payload(store, host_id))["updates"]) == 1
+
+
+def test_link_admission_deferral_keeps_host_pending_without_failure(store, monkeypatch):
+    """Return `pending_link` without recording a failure when run admission ends during linking."""
+    host = {"id": "existing-host", "hash": "stable-hash", "public": {}}
+    monkeypatch.setattr(doctor, "candidate_hosts", lambda *_args, **_kwargs: [host])
+    logged = []
+    monkeypatch.setattr(doctor, "_log_incident", lambda *_args, **kwargs: logged.append(kwargs))
+    assert doctor._resolve_host_link(store.db, {"key": "incident"}, evaluate_mode=True, observed=DATE,
+                                     linker=raise_once(CompletionDeferred("Admission ended")), allow_network=True) == ("pending_link", None, 0, True)
+    assert store.db.execute("SELECT COUNT(*) FROM network_links").fetchone()[0] == 0
+    assert len(logged) == 1 and "error" not in logged[0]
 
 
 def test_unexpected_exception_in_evaluate_does_not_stop_run(tmp_path, monkeypatch):
+    """Contain unexpected `doctor.evaluate` exceptions inside `report['network']['error']`."""
     _, cfg = make_config(tmp_path, publish=True)
     cfg["sources"].append({"id": "tor-tags", "name": "Tor Tags", "kind": "tag", "url": "https://example.org/tags.atom",
                            "fallback_urls": [], "product": "tor", "authority": "official", "enabled": False,
                            "interval_seconds": 300, "max_pages": 1, "max_items": 10})
     patch_cli_pipeline(monkeypatch, now=None, analyzer=Writer.factory(), reviewer=ApprovingReviewer,
                        collect=lambda *_a, **_kw: {"items": [], "skipped": 0, "url": FEED_URL}, no_build=False)
-    monkeypatch.setattr(doctor, "evaluate", lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("unexpected failure")))
+    monkeypatch.setattr(doctor, "evaluate", raise_once(RuntimeError("unexpected failure")))
     with Store(cfg["storage"]["database"]) as store:
         report = cli.run(cfg, store)
         assert "Unexpected RuntimeError at" in report["network"]["error"] and report["published_stories"] == 0
 
 
 def test_multiple_enabled_consensus_sources_rejected_and_rule_c_counts_distinct_hours(tmp_path, monkeypatch):
+    """Reject multiple enabled consensus sources and count Rule C reports by distinct UTC hours."""
     path, cfg = make_config(tmp_path, publish=True, enabled=True)
     second_disabled = {**cfg["sources"][0], "id": "consensus-mirror", "url": "https://example.org/consensus.xml", "enabled": False}
     extra_toml = (f'\n[[sources]]\nid = "consensus-mirror"\nname = "Mirror"\nwebsite_url = "{LIST_URL}"\n'
@@ -497,8 +463,7 @@ def test_multiple_enabled_consensus_sources_rejected_and_rule_c_counts_distinct_
     with pytest.raises(ValueError, match="At most one enabled consensus alert source is supported"):
         load_config(path)
 
-    monkeypatch.setattr(cli, "HttpClient", lambda *_a, **_kw: (_ for _ in ()).throw(
-        AssertionError("HttpClient must not be constructed before consensus-source validation")))
+    monkeypatch.setattr(cli, "HttpClient", raise_once(AssertionError("HttpClient must not be constructed before consensus-source validation")))
     cfg_two = {**cfg, "sources": [cfg["sources"][0], {**second_disabled, "enabled": True}]}
     with Store(cfg["storage"]["database"]) as store:
         with pytest.raises(ValueError, match="At most one enabled consensus alert source is supported"):
@@ -516,15 +481,16 @@ def test_multiple_enabled_consensus_sources_rejected_and_rule_c_counts_distinct_
 
 
 def test_host_updates_drive_matching_invalidate_negative_cache_and_guards_hold(tmp_path):
+    """Re-check host links when host updates mention the authority, and respect cutoffs and locks."""
     _, cfg = make_config(tmp_path / "host_upd", publish=True)
     with Store(cfg["storage"]["database"]) as store:
-        host_id = seed_host(store, url="https://gitlab.torproject.org/tpo/network-health/analysis/-/issues/990",
-                            title="Directory consensus voting instability under investigation",
-                            summary="Operators are investigating intermittent voting instability across the directory.",
-                            published_at="2024-01-15T06:00:00Z")
-        raw_before = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (host_id,)).fetchone()[0])
+        host_id = _seed_host(store, url="https://gitlab.torproject.org/tpo/network-health/analysis/-/issues/990",
+                             title="Directory consensus voting instability under investigation",
+                             summary="Operators are investigating intermittent voting instability across the directory.",
+                             published_at="2024-01-15T06:00:00Z")
+        raw_before = story_payload(store, host_id)
         doctor.ingest(store.db, cfg["sources"][0], bastet_incident_items(close=False), "2024-01-17T12:00:00Z")
-        replayed = doctor._replay(doctor.load_reports(store.db))[0][0]
+        replayed = doctor.incidents(doctor.load_reports(store.db))[0][0]
         assert doctor.candidate_hosts(store.db, replayed, log_locked=False) == []
         old_hash = doctor._host_hash(render.prepare_story(raw_before), replayed)
         with store.db:
@@ -537,13 +503,17 @@ def test_host_updates_drive_matching_invalidate_negative_cache_and_guards_hold(t
             store.db.execute("UPDATE stories SET updated_at=?,payload=? WHERE id=?", ("2024-01-16T18:00:00Z", json.dumps(raw_after), host_id))
         seen_payloads = []
 
-        class InspectingLinker(doctor.LinkChecker):
-            def __init__(self): self.calls = 0
+        class _InspectingLinker(doctor.LinkChecker):
+            def __init__(self):
+                self.calls = 0
+
             def complete(self, prompt, payload, schema, name):
-                self.calls += 1; seen_payloads.append(payload)
+                """Record the linker prompt payload and confirm the incident match."""
+                self.calls += 1
+                seen_payloads.append(payload)
                 return {"reason": "Same bastet outage.", "same_incident": True}
 
-        linker = InspectingLinker()
+        linker = _InspectingLinker()
         res_attach = doctor.evaluate(cfg, store, cfg["sources"][0], linker, "2024-01-17T12:00:00Z")
         assert (linker.calls, res_attach["updates_written"], res_attach["stories_written"]) == (1, 1, 0)
         assert seen_payloads[0]["existing_story"]["updates"] == [
@@ -563,8 +533,8 @@ def test_host_updates_drive_matching_invalidate_negative_cache_and_guards_hold(t
         doctor.ingest(store.db, cfg_lock["sources"][0], bastet_incident_items(start_iso="2024-01-19T00:05:00Z", close=False), "2024-01-22T00:00:00Z")
         assert doctor.evaluate(cfg_lock, store, cfg_lock["sources"][0], FakeLinker(), "2024-01-22T00:00:00Z")["stories_written"] == 1
         standalone_id = store.stories()[0]["id"]
-        editorial.correct(store.db, standalone_id, {"why_it_matters": "Operator-pinned alert context."},
-                          reason="Pin alert context", expect_hash=editorial.show(store.db, standalone_id)["hash"], observed="2024-01-22T00:05:00Z")
+        editorial_act(editorial.correct, store, standalone_id, {"why_it_matters": "Operator-pinned alert context."},
+                      reason="Pin alert context", observed="2024-01-22T00:05:00Z")
         with store.db:
             store.db.execute("DELETE FROM stories WHERE id=?", (standalone_id,))
         assert doctor.evaluate(cfg_lock, store, cfg_lock["sources"][0], FakeLinker(), "2024-01-22T00:10:00Z")["stories_written"] == 0
@@ -572,17 +542,18 @@ def test_host_updates_drive_matching_invalidate_negative_cache_and_guards_hold(t
 
 
 def test_merge_host_story_transfers_doctor_network_pins_updates_and_citations(tmp_path):
+    """Transfer DocTor network pins, updates, and citations when merging host stories."""
     _, cfg = make_config(tmp_path, publish=True)
     with Store(cfg["storage"]["database"]) as store:
-        host_surv = seed_host(store, url="https://example.org/bastet-main", title="Primary report on directory authority bastet outage",
-                              summary="Primary tracking story for the directory authority bastet outage.", published_at="2024-01-14T13:00:00Z")
-        host_dup = seed_host(store, url="https://example.org/bastet-dup", title="Directory authority bastet maintenance outage",
-                             summary="Operators reported directory authority bastet is offline for maintenance.", published_at="2024-01-14T14:00:00Z")
+        host_surv = _seed_host(store, url="https://example.org/bastet-main", title="Primary report on directory authority bastet outage",
+                               summary="Primary tracking story for the directory authority bastet outage.", published_at="2024-01-14T13:00:00Z")
+        host_dup = _seed_host(store, url="https://example.org/bastet-dup", title="Directory authority bastet maintenance outage",
+                              summary="Operators reported directory authority bastet is offline for maintenance.", published_at="2024-01-14T14:00:00Z")
         doctor.ingest(store.db, cfg["sources"][0], bastet_incident_items(close=False), "2024-01-17T12:00:00Z")
         doctor.evaluate(cfg, store, cfg["sources"][0], FakeLinker(True), "2024-01-17T12:00:00Z")
         publication.build(cfg, store)
 
-        dup_payload = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (host_dup,)).fetchone()[0])
+        dup_payload = story_payload(store, host_dup)
         assert len(dup_payload.get("network") or []) == 1 and len(dup_payload.get("updates") or []) == 1
 
         b_more_rep = report_item("BMORE_REP_12", "2024-01-17T12:15:00Z", ["ERROR: The consensus is not fresh!"])
@@ -601,8 +572,7 @@ def test_merge_host_story_transfers_doctor_network_pins_updates_and_citations(tm
         with store.db:
             store.db.execute("UPDATE stories SET payload=? WHERE id=?", (json.dumps(dup_payload), host_dup))
 
-        editorial.merge(store.db, host_dup, host_surv, reason="Merge duplicate host story.",
-                        expect_hash=editorial.show(store.db, host_dup)["hash"], observed="2024-01-17T13:00:00Z")
+        editorial_act(editorial.merge, store, host_dup, host_surv, reason="Merge duplicate host story.", observed="2024-01-17T13:00:00Z")
         guard_linker = FakeLinker(AssertionError("Unexpected linker call"))
         res_next = doctor.evaluate(cfg, store, cfg["sources"][0], guard_linker, "2024-01-17T13:05:00Z")
         assert (guard_linker.calls, res_next["stories_written"], res_next["updates_written"]) == (0, 0, 0)
@@ -636,14 +606,15 @@ def test_merge_host_story_transfers_doctor_network_pins_updates_and_citations(tm
 
 
 def test_legacy_host_story_with_doctor_citations_has_no_missing_sources(tmp_path):
+    """Build packets without missing-source flags when a legacy host story carries DocTor citations."""
     _, cfg = make_config(tmp_path, publish=True)
     with Store(cfg["storage"]["database"]) as store:
-        store.ingest(make_item(url="https://example.org/legacy-1", title="Authority bastet maintenance", content="Authority bastet maintenance window."), "2024-01-14T10:00:00Z")
-        store.ingest(make_item(url="https://example.org/legacy-2", title="Authority bastet update", content="Follow-up on authority bastet maintenance."), "2024-01-14T11:00:00Z")
+        store.ingest(item(url="https://example.org/legacy-1", title="Authority bastet maintenance", content="Authority bastet maintenance window."), "2024-01-14T10:00:00Z")
+        store.ingest(item(url="https://example.org/legacy-2", title="Authority bastet update", content="Follow-up on authority bastet maintenance."), "2024-01-14T11:00:00Z")
         r1, r2 = store.pending(2, "2024-01-14T11:00:00Z")
-        host_id = seed_host(store, url="https://example.org/bastet-legacy-host", title="Directory authority bastet planned maintenance",
-                            summary="Operators scheduled maintenance on directory authority bastet.")
-        raw = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (host_id,)).fetchone()[0])
+        host_id = _seed_host(store, url="https://example.org/bastet-legacy-host", title="Directory authority bastet planned maintenance",
+                             summary="Operators scheduled maintenance on directory authority bastet.")
+        raw = story_payload(store, host_id)
         raw.pop("editorial_item", None)
         raw["sources"] = [{"id": r1["id"], "url": r1["url"], "title": "Legacy 1", "published_at": "2024-01-14T10:00:00Z"},
                           {"id": r2["id"], "url": r2["url"], "title": "Legacy 2", "published_at": "2024-01-14T11:00:00Z"}]
@@ -651,12 +622,13 @@ def test_legacy_host_story_with_doctor_citations_has_no_missing_sources(tmp_path
             store.db.execute("UPDATE stories SET payload=? WHERE id=?", (json.dumps(raw), host_id))
         doctor.ingest(store.db, cfg["sources"][0], bastet_incident_items(close=False), "2024-01-17T12:00:00Z")
         doctor.evaluate(cfg, store, cfg["sources"][0], FakeLinker(True), "2024-01-17T12:00:00Z")
-        pinned_raw = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (host_id,)).fetchone()[0])
+        pinned_raw = story_payload(store, host_id)
         pkt, _ = source_packet.build_packet(store.db, {**json.loads(r1["payload"]), "id": r1["id"]}, pinned_raw, pinned_raw, None)
         assert pkt["missing_sources"] == []
 
 
 def test_doctor_review_model_non_retryable_strikes_regroup_publish_since_and_retracted_status(tmp_path):
+    """Cover review-model selection, 3-strike fallback to standalone, held updates, and merged incidents."""
     _, cfg = make_config(tmp_path, publish=True)
     cfg["review"]["model"] = "dedicated-reviewer-model"
     assert doctor.LinkChecker(cfg).llm["model"] == "dedicated-reviewer-model"
@@ -676,8 +648,8 @@ def test_doctor_review_model_non_retryable_strikes_regroup_publish_since_and_ret
         assert store.stories()[0]["published_at"] >= "2024-01-08T00:00:00Z"
 
     with Store(cfg["storage"]["database"]) as store:
-        seed_host(store, url="https://example.org/bastet-unrelated", title="Directory authority bastet flag count note",
-                  summary="Directory authority bastet flag note.")
+        _seed_host(store, url="https://example.org/bastet-unrelated", title="Directory authority bastet flag count note",
+                   summary="Directory authority bastet flag note.")
         doctor.ingest(store.db, cfg["sources"][0], bastet_incident_items(close=False), "2024-01-18T00:00:00Z")
         bad_err = AnalysisError("Model completion was truncated or refused", code="review.truncated")
         for minute in (0, 5):
@@ -688,8 +660,8 @@ def test_doctor_review_model_non_retryable_strikes_regroup_publish_since_and_ret
         standalone = next(s for s in store.stories() if s.get("origin") == "network-health")
 
         publication.build(cfg, store)
-        editorial.correct(store.db, standalone["id"], {"why_it_matters": "Operator context."}, reason="Lock alert.",
-                          expect_hash=editorial.show(store.db, standalone["id"])["hash"], observed="2024-01-18T00:15:00Z")
+        editorial_act(editorial.correct, store, standalone["id"], {"why_it_matters": "Operator context."},
+                      reason="Lock alert.", observed="2024-01-18T00:15:00Z")
         doctor.ingest(store.db, cfg["sources"][0], bastet_incident_items(close=True)[5:], "2024-01-18T18:00:00Z")
         doctor.evaluate(cfg, store, cfg["sources"][0], FakeLinker(), "2024-01-18T18:00:00Z")
         doctor.evaluate(cfg, store, cfg["sources"][0], FakeLinker(), "2024-01-18T18:05:00Z")
@@ -697,8 +669,7 @@ def test_doctor_review_model_non_retryable_strikes_regroup_publish_since_and_ret
         assert decisions.summary(store.db, "2024-01-01T00:00:00Z")["awaiting_operator"]["held_updates"] == [
             {"story_id": standalone["id"], "held_updates": 1, "locked": True}]
 
-        editorial.retract(store.db, standalone["id"], reason="Retract alert.",
-                          expect_hash=editorial.show(store.db, standalone["id"])["hash"], observed="2024-01-18T19:00:00Z")
+        editorial_act(editorial.retract, store, standalone["id"], reason="Retract alert.", observed="2024-01-18T19:00:00Z")
         assert decisions.summary(store.db, "2024-01-01T00:00:00Z")["awaiting_operator"]["held_updates"] == []
         assert doctor.status(store.db, cfg["sources"])["incidents"][0]["target"] == f"retracted:{standalone['id']}"
 
@@ -714,8 +685,7 @@ def test_doctor_review_model_non_retryable_strikes_regroup_publish_since_and_ret
         publication.build(cfg_multi, store)
         s_gab = next(s for s in store.stories() if "gabelmoo" in s["title"])["id"]
         s_mor = next(s for s in store.stories() if "moria1" in s["title"])["id"]
-        editorial.merge(store.db, s_mor, s_gab, reason="Combine dual authority outage.",
-                        expect_hash=editorial.show(store.db, s_mor)["hash"], observed="2024-01-12T01:30:00Z")
+        editorial_act(editorial.merge, store, s_mor, s_gab, reason="Combine dual authority outage.", observed="2024-01-12T01:30:00Z")
         mor_only = [report_item(f"M_MOR_ONLY_{i}", format_utc(t0 + timedelta(hours=60 + i * 16)),
                                 ["WARNING: The following authorities are missing from the consensus: moria1"]) for i in range(2)]
         doctor.ingest(store.db, cfg_multi["sources"][0], mor_only, "2024-01-13T18:00:00Z")
@@ -723,7 +693,7 @@ def test_doctor_review_model_non_retryable_strikes_regroup_publish_since_and_ret
         [combined_open] = store.stories()
         assert len(combined_open["network"]) == 2 and combined_open["state"] == "developing"
 
-        bad_net_payload = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (s_gab,)).fetchone()[0])
+        bad_net_payload = story_payload(store, s_gab)
         bad_net_payload["network"].append({"key": []})
         with store.db:
             store.db.execute("UPDATE stories SET payload=? WHERE id=?", (json.dumps(bad_net_payload), s_gab))
@@ -746,6 +716,7 @@ def test_doctor_review_model_non_retryable_strikes_regroup_publish_since_and_ret
     BASE_CONSENSUS_TOML.replace('kind="feed"', 'kind="tag"'),
 ])
 def test_consensus_alert_source_rejects_invalid_and_retired_keys(tmp_path, invalid_toml):
+    """Reject retired `[monitoring]` sections and invalid consensus-alert source keys."""
     path = tmp_path / "config.toml"
     path.write_text(invalid_toml, encoding="utf-8")
     with pytest.raises(ValueError):
@@ -753,6 +724,7 @@ def test_consensus_alert_source_rejects_invalid_and_retired_keys(tmp_path, inval
 
 
 def test_consensus_alert_source_loads_enabled_in_dry_run_and_validates_keys(tmp_path, caplog):
+    """Default an enabled consensus-alert source to `publish = false` without deprecation warnings."""
     path = tmp_path / "config.toml"
     path.write_text(BASE_CONSENSUS_TOML, encoding="utf-8")
     source = load_config(path)["sources"][0]
@@ -761,7 +733,7 @@ def test_consensus_alert_source_loads_enabled_in_dry_run_and_validates_keys(tmp_
 
 
 def test_old_databases_keep_the_unused_monitoring_tables(tmp_path):
-    """The tables that earlier releases wrote stay as they were, and those releases' stories still build."""
+    """Preserve legacy `monitoring_*` tables untouched while building observed-anomaly stories."""
     cfg = pub_settings(tmp_path)
     value = make_story(1, confidence="observed-anomaly", state="developing", category="directory-authority")
     with Store(cfg["storage"]["database"]) as store:
@@ -776,3 +748,161 @@ def test_old_databases_keep_the_unused_monitoring_tables(tmp_path):
         cli.build(cfg, store)
     published = json.loads((Path(cfg["storage"]["output_dir"]) / "news" / value["id"] / "story.json").read_text(encoding="utf-8"))
     assert published["id"] == value["id"] and published["confidence"] == "observed-anomaly"
+
+
+def test_cli_run_propagates_budget_reached_when_doctor_linker_defers(tmp_path, monkeypatch):
+    """Mark `report['budget_reached']` True when `LinkChecker` defers on an expired run deadline."""
+    _, cfg = make_config(tmp_path, publish=True)
+    cfg["collection"]["run_budget_seconds"] = 0
+    patch_cli_pipeline(monkeypatch, now="2024-01-18T00:00:00Z", analyzer=Writer.factory(), reviewer=ApprovingReviewer)
+    with Store(cfg["storage"]["database"]) as store:
+        _seed_host(store, url="https://example.org/bastet-host",
+                   title="Directory authority bastet maintenance notice",
+                   summary="Operators reported directory authority bastet maintenance.")
+        src = cfg["sources"][0]
+        store.source(src)
+        store.source_success(src, {"url": src["url"]}, "2024-01-18T00:00:00Z")
+        doctor.ingest(store.db, src, bastet_incident_items(close=False), "2024-01-18T00:00:00Z")
+        assert store.pending(10, "2024-01-18T00:00:00Z") == []
+        report = cli.run(cfg, store)
+        assert report["budget_reached"] is True and report["network"]["held"] == 1
+
+
+def test_apply_incident_omitted_host_state_and_slotless_pin_transfer(tmp_path):
+    """Handle pinned host stories omitting `state` and transfer updates from legacy slotless network pins."""
+    _, cfg = make_config(tmp_path / "nostate", publish=True)
+    src = cfg["sources"][0]
+    with Store(cfg["storage"]["database"]) as store:
+        host_id = _seed_host(store, url="https://example.org/bastet-nostate",
+                             title="Directory authority bastet hardware maintenance",
+                             summary="Operators scheduled hardware maintenance on directory authority bastet.")
+        open_items = bastet_incident_items(close=False)
+        close_only = bastet_incident_items(close=True)[len(open_items):]
+        doctor.ingest(store.db, src, open_items, "2024-01-17T12:00:00Z")
+        doctor.evaluate(cfg, store, src, FakeLinker(True), "2024-01-17T12:00:00Z")
+        raw = story_payload(store, host_id)
+        raw.pop("state", None)
+        with store.db:
+            store.db.execute("UPDATE stories SET payload=? WHERE id=?", (json.dumps(raw), host_id))
+        assert doctor.evaluate(cfg, store, src, FakeLinker(), "2024-01-17T12:05:00Z")["updates_written"] == 0
+        doctor.ingest(store.db, src, close_only, "2024-01-18T12:00:00Z")
+        assert doctor.evaluate(cfg, store, src, FakeLinker(), "2024-01-18T12:00:00Z")["updates_written"] == 1
+        assert len(story_payload(store, host_id)["updates"]) == 2
+
+    _, cfg_merge = make_config(tmp_path / "slotless", publish=True)
+    with Store(cfg_merge["storage"]["database"]) as store:
+        surv_id = _seed_host(store, url="https://example.org/bastet-surv",
+                             title="Primary report on directory authority bastet",
+                             summary="Primary report tracking directory authority bastet.", published_at="2024-01-14T13:00:00Z")
+        dup_id = _seed_host(store, url="https://example.org/bastet-dup",
+                            title="Duplicate report on directory authority bastet",
+                            summary="Duplicate report tracking directory authority bastet.", published_at="2024-01-14T14:00:00Z")
+        doctor.ingest(store.db, cfg_merge["sources"][0], bastet_incident_items(close=False), "2024-01-17T12:00:00Z")
+        doctor.evaluate(cfg_merge, store, cfg_merge["sources"][0], FakeLinker(True), "2024-01-17T12:00:00Z")
+        publication.build(cfg_merge, store)
+        dup_raw = story_payload(store, dup_id)
+        dup_raw["network"][0].pop("slots", None)
+        with store.db:
+            store.db.execute("UPDATE stories SET payload=? WHERE id=?", (json.dumps(dup_raw), dup_id))
+        editorial_act(editorial.merge, store, dup_id, surv_id, reason="Merge duplicate.", observed="2024-01-17T13:00:00Z")
+        surv_story = story_payload(store, surv_id)
+        assert len(surv_story.get("updates") or []) == 1
+        expected_uid = digest([surv_id, "A:open", dup_raw["network"][0]["opened_url"]])[:24]
+        assert expected_uid in surv_story["network"][0]["update_ids"]
+
+
+def test_cli_run_reports_consensus_not_report_decisions_from_collection(tmp_path, monkeypatch):
+    """Include `skipped.network.not_report` logged during collection in `cli.run` decision counts."""
+    _, cfg = make_config(tmp_path, publish=False)
+    non_report = report_item("JAN24_CHAT_01", "2024-01-10T02:05:00Z", ["NOTICE: Valid prefix", "Human reply line"])
+    patch_cli_pipeline(
+        monkeypatch, now="2024-01-10T03:00:00Z", analyzer=Writer.factory(), reviewer=ApprovingReviewer,
+        collect=lambda *_a, **_kw: {"items": [non_report], "skipped": 0, "url": FEED_URL}, no_build=False,
+    )
+    with Store(cfg["storage"]["database"]) as store:
+        report = cli.run(cfg, store)
+    assert report["decisions"].get("skipped.network.not_report") == 1
+
+
+def test_transfer_attached_partially_slotted_pins_seen_updates_rekey_and_standalone_guard(tmp_path):
+    """Transfer pre-upgrade updates on partially slotted pins, rekey `seen_updates`, and refuse standalone survivors."""
+    _, cfg = make_config(tmp_path / "partial", publish=True)
+    src = cfg["sources"][0]
+    with Store(cfg["storage"]["database"]) as store:
+        surv_id = _seed_host(store, url="https://example.org/bastet-surv-p",
+                             title="Primary report on directory authority bastet outage",
+                             summary="Primary tracking story for directory authority bastet.", published_at="2024-01-14T13:00:00Z")
+        dup_id = _seed_host(store, url="https://example.org/bastet-dup-p",
+                            title="Duplicate report on directory authority bastet outage",
+                            summary="Duplicate tracking story for directory authority bastet.", published_at="2024-01-14T14:00:00Z")
+        open_items = bastet_incident_items(close=False)
+        close_items = bastet_incident_items(close=True)[len(open_items):]
+        doctor.ingest(store.db, src, open_items, "2024-01-17T12:00:00Z")
+        doctor.evaluate(cfg, store, src, FakeLinker(True), "2024-01-17T12:00:00Z")
+
+        dup_pre = story_payload(store, dup_id)
+        dup_pre["network"][0]["slots"] = []
+        long_rep = report_item("WEEK_420_REP", "2025-03-10T12:00:00Z",
+                               ["WARNING: The following authorities are missing from the consensus: bastet", OK_LINE])
+        with store.db:
+            store.db.execute("INSERT INTO network_reports(url,stamp,report) VALUES(?,?,?)",
+                             (long_rep["url"], "2025-03-10T12:00:00Z", '{"ran":true,"missing":["bastet"],"raw_missing":["bastet"],"stale":false,"srv":false}'))
+        w420_uid = digest([dup_id, "A:week-420", long_rep["url"]])[:24]
+        dup_pre["network"][0]["update_ids"].append(w420_uid)
+        dup_pre["updates"].append({
+            "at": "2025-03-10T12:00:00Z",
+            "text": "Still listed as missing from the consensus after 420 days, in DocTor's 2025-03-10 12:00 UTC report.",
+            "sources": [{"url": long_rep["url"], "title": "DocTor consensus-health report, 2025-03-10 12:00 UTC"}],
+        })
+        with store.db:
+            store.db.execute("DELETE FROM network_reports WHERE url=?", (long_rep["url"],))
+            store.db.execute("UPDATE stories SET payload=? WHERE id=?", (json.dumps(dup_pre), dup_id))
+
+        doctor.ingest(store.db, src, close_items, "2024-01-18T12:00:00Z")
+        doctor.evaluate(cfg, store, src, FakeLinker(), "2024-01-18T12:00:00Z")
+        with store.db:
+            store.db.execute("INSERT INTO network_reports(url,stamp,report) VALUES(?,?,?)",
+                             (long_rep["url"], "2025-03-10T12:00:00Z", '{"ran":true,"missing":[],"raw_missing":[],"stale":false,"srv":false}'))
+        dup_partial = story_payload(store, dup_id)
+        assert dup_partial["network"][0]["slots"] == ["ep1:A:close"]
+        publication.build(cfg, store)
+
+        assert doctor.transfer_attached(
+            store.db, story_id=dup_id, dup_raw=dup_partial, survivor_id=surv_id,
+            surv_raw={**story_payload(store, surv_id), "origin": "network-health"},
+            surv_fallback=False, surv_locked=False,
+        ) is False
+
+        editorial_act(editorial.merge, store, dup_id, surv_id, reason="Merge partial-slot duplicate.", observed="2025-03-11T00:00:00Z")
+        surv_after = story_payload(store, surv_id)
+        assert len(surv_after["updates"]) == 3
+        with store.db:
+            store.db.execute("DELETE FROM network_reports WHERE url=?", (long_rep["url"],))
+        res_eval = doctor.evaluate(cfg, store, src, FakeLinker(AssertionError("No link check expected")), "2025-03-11T00:05:00Z")
+        assert res_eval["updates_written"] == 0 and len(story_payload(store, surv_id)["updates"]) == 3
+
+    _, cfg_seen = make_config(tmp_path / "seen", publish=True)
+    src_s = cfg_seen["sources"][0]
+    with Store(cfg_seen["storage"]["database"]) as store:
+        surv2 = _seed_host(store, url="https://example.org/bastet-surv-s",
+                           title="Primary report on directory authority bastet",
+                           summary="Primary tracking story for directory authority bastet.", published_at="2024-01-14T13:00:00Z")
+        dup2 = _seed_host(store, url="https://example.org/bastet-dup-s",
+                          title="Duplicate report on directory authority bastet",
+                          summary="Duplicate tracking story for directory authority bastet.", published_at="2024-01-14T14:00:00Z")
+        doctor.ingest(store.db, src_s, bastet_incident_items(close=False), "2024-01-17T12:00:00Z")
+        doctor.evaluate(cfg_seen, store, src_s, FakeLinker(True), "2024-01-17T12:00:00Z")
+        dup2_raw = story_payload(store, dup2)
+        dup2_raw["network"][0].pop("slots", None)
+        surv2_raw = story_payload(store, surv2)
+        surv2_raw["updates"] = list(dup2_raw["updates"])
+        with store.db:
+            store.db.execute("UPDATE stories SET payload=? WHERE id=?", (json.dumps(dup2_raw), dup2))
+            store.db.execute("UPDATE stories SET payload=? WHERE id=?", (json.dumps(surv2_raw), surv2))
+        publication.build(cfg_seen, store)
+        editorial_act(editorial.merge, store, dup2, surv2, reason="Merge duplicate with matching update.", observed="2024-01-17T13:00:00Z")
+        merged_surv = story_payload(store, surv2)
+        expected_open_uid = digest([surv2, "A:open", dup2_raw["network"][0]["opened_url"]])[:24]
+        assert expected_open_uid in merged_surv["network"][0]["update_ids"]
+        assert len(merged_surv["updates"]) == 1
+        assert doctor.evaluate(cfg_seen, store, src_s, FakeLinker(), "2024-01-17T13:05:00Z")["updates_written"] == 0
