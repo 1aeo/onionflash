@@ -13,6 +13,7 @@ from helpers import (
 from onionflash import candidate, cli, editorial, publication, review, review_gate
 from onionflash.analyze import cache_key
 from onionflash.llm import AnalysisError
+from onionflash.store import _RETENTION_SCHEMA
 from onionflash.transport import FetchError
 
 
@@ -540,6 +541,7 @@ def test_same_hash_confirming_closed_at_poll_advances_freshness_against_delayed_
     assert after_delayed["closed_at"] == nov9 and after_delayed["updated_at"] == nov12
 
     # Compacted closed issue follows the same freshness invariant when a newer poll confirms closed_at.
+    store.db.executescript(_RETENTION_SCHEMA)
     comp_src = item(
         url="https://gitlab.torproject.org/tpo/core/tor/-/issues/999",
         kind="gitlab_issue",
@@ -550,15 +552,22 @@ def test_same_hash_confirming_closed_at_poll_advances_freshness_against_delayed_
     )
     comp_row = pending(store, comp_src)
     comp_payload = {k: v for k, v in json.loads(comp_row["payload"]).items() if k != "content"}
-    comp_payload["archived_bundle"] = "private-evidence/2026-11/bundle.ndjson.gz"
     with store.db:
         store.db.execute(
             "UPDATE items SET status='ignored',payload=? WHERE id=?",
             (json.dumps(comp_payload, ensure_ascii=False), comp_row["id"]),
         )
+        store.db.execute(
+            "INSERT INTO private_archive_refs VALUES('item',?,?,?,?,?,?)",
+            (comp_row["id"], comp_row["content_hash"], "archive/batch-closed.jsonl.zst", "a" * 64, nov9, '{"bucket":"cold"}'),
+        )
     assert store.ingest({**comp_src, "updated_at": nov12, "closed_at": nov9}, nov12) is False
-    comp_confirmed = json.loads(item_row(store, comp_row)["payload"])
+    comp_confirmed_row = item_row(store, comp_row)
+    comp_confirmed = json.loads(comp_confirmed_row["payload"])
+    assert comp_confirmed_row["status"] == "ignored" and "content" not in comp_confirmed
     assert comp_confirmed["closed_at"] == nov9 and comp_confirmed["updated_at"] == nov12
     assert store.ingest({**comp_src, "updated_at": nov11, "closed_at": nov11}, nov12) is False
-    comp_after = json.loads(item_row(store, comp_row)["payload"])
+    comp_after_row = item_row(store, comp_row)
+    comp_after = json.loads(comp_after_row["payload"])
+    assert comp_after_row["status"] == "ignored" and "content" not in comp_after
     assert comp_after["closed_at"] == nov9 and comp_after["updated_at"] == nov12
