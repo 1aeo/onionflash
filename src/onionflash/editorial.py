@@ -9,6 +9,16 @@ import hashlib
 import json
 
 from .config import DEFAULTS
+from .render import (
+    _date,
+    _iso,
+    _sources as _render_sources,
+    _text,
+    _update,
+    pointer_json,
+    prepare_story,
+    public_json_text,
+)
 from .schema import (
     CATEGORIES,
     CONFIDENCES,
@@ -21,14 +31,16 @@ from .schema import (
     STORY_ID_RE,
     UPDATE_CHARS,
 )
-from .util import canonical_url, digest, format_utc, gitlab_url_variants, now_iso, parse_utc, saved_object
+from .util import (
+    _SURROGATE_RE, canonical_url, digest, gitlab_url_variants, has_invalid_text_chars,
+    now_iso, saved_object, strict_json, timestamp,
+)
 
 FIELDS = frozenset({*SEMANTIC_FIELDS, "sources", "updates"})
+_PUBLIC_HISTORY_ACTIONS = frozenset({"correct", "retract", "restore", "unlock"})
 PUBLIC_HISTORY_LIMIT = 20
 MAX_ALIAS_HOPS = 16
 RESET_PENDING_SQL = "status='pending',attempts=0,rejections=0,next_attempt_at=NULL,last_error=NULL"
-_ID = STORY_ID_RE
-_HASH = SHA256_RE
 
 
 class RetiredStory(ValueError):
@@ -126,41 +138,50 @@ def retired(db, *, story_id: str | None = None, cluster_key: str | None = None) 
 
 
 def _id(value: str) -> str:
-    if not isinstance(value, str) or not _ID.fullmatch(value):
+    if not isinstance(value, str) or not STORY_ID_RE.fullmatch(value):
         raise ValueError("Invalid story ID")
     return value
 
 
-def _json(value) -> str:
-    text = json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
-    text.encode("utf-8")
-    return text
+def _require_expect_hash(expect_hash: object) -> None:
+    if not isinstance(expect_hash, str) or not SHA256_RE.fullmatch(expect_hash):
+        raise ValueError("A current expected story hash is required")
 
 
-def _text(value, name: str, limit: int, *, empty: bool = False) -> str:
+def clean_text(value: object, name: str, limit: int, *, empty: bool = False) -> str:
+    """Validate and strip bounded operator or public text, rejecting XML-unsafe characters."""
     # Reasons reach XML feeds as written, and XML cannot carry U+FFFE or U+FFFF.
-    if not isinstance(value, str) or len(value) > limit or any((ord(c) < 32 and c not in "\n\t") or c in "\ufffe\uffff" for c in value):
+    if not isinstance(value, str) or len(value) > limit or has_invalid_text_chars(value):
         raise ValueError(f"Invalid {name}")
-    try:
-        value.encode("utf-8")
-    except UnicodeError:
-        raise ValueError(f"Invalid {name}") from None
     value = value.strip()
     if not value and not empty:
         raise ValueError(f"{name} must not be empty")
     return value
 
 
+def _strip_surrogates(value: object):
+    if isinstance(value, str):
+        return _SURROGATE_RE.sub("", value)
+    if isinstance(value, list):
+        return [_strip_surrogates(item) for item in value]
+    if isinstance(value, dict):
+        return {(_strip_surrogates(k) if isinstance(k, str) else k): _strip_surrogates(v) for k, v in value.items()}
+    return value
+
+
+def _decode_utf8(blob: bytes | None, *, replace: bool = False) -> str | None:
+    if blob is None:
+        return None
+    try:
+        return str(blob, "utf-8")
+    except UnicodeError:
+        return blob.decode("utf-8", "replace") if replace else None
+
+
 def _begin_tx(db):
     from .store import immediate_transaction
 
     return immediate_transaction(db, "Editorial action needs a fresh transaction")
-
-
-def _public(value: dict) -> dict:
-    from .render import prepare_story
-
-    return prepare_story(value)
 
 
 def _enqueue_render(db, story_id: str) -> None:
@@ -193,17 +214,90 @@ def requeue_items(db, item_ids: list[str]) -> None:
 
 
 def _published(db, story_id: str) -> dict | None:
-    row = db.execute("SELECT public_json,json_sha256 FROM public_catalog WHERE story_id=?", (story_id,)).fetchone()
+    row = db.execute(
+        "SELECT CASE WHEN typeof(public_json)='text' THEN CAST(public_json AS BLOB) END AS public_json,json_sha256 "
+        "FROM public_catalog WHERE story_id=?",
+        (story_id,),
+    ).fetchone()
     if row is None:
         return None
-    if hashlib.sha256(row[0].encode("utf-8")).hexdigest() != row[1]:
+    raw_blob = row["public_json"]
+    if raw_blob is None or hashlib.sha256(raw_blob).hexdigest() != row["json_sha256"]:
         raise ValueError("Published story snapshot failed its integrity check")
-    public = json.loads(row[0])
+    if (raw_text := _decode_utf8(raw_blob)) is None:
+        raise ValueError("Published story snapshot failed its integrity check")
+    try:
+        public = json.loads(raw_text)
+    except (ValueError, RecursionError) as exc:
+        raise ValueError("Published story snapshot failed its integrity check") from exc
+    if not isinstance(public, dict):
+        raise ValueError("Published story snapshot failed its integrity check")
+    public = _strip_surrogates(public)
     public.pop("editorial", None)  # Revision history is stored separately, never recursively.
     return public
 
 
-def _snapshot(db, story_id: str) -> dict:
+def _legacy_public(published: object, story_id: str) -> dict:
+    if not isinstance(published, dict) or published.get("id") != story_id:
+        raise ValueError("Story has no valid public snapshot to correct")
+    title = _text(published.get("title"), FIELD_LIMITS["title"])
+    summary = _text(published.get("summary"), FIELD_LIMITS["summary"])
+    raw_sources = published.get("sources")
+    if not title or not summary or not isinstance(raw_sources, list):
+        raise ValueError("Story has no valid public snapshot to correct")
+    published_dt = _date(published.get("published_at"))
+    updated_dt = max(published_dt, _date(published.get("updated_at")))
+    added_dt = _date(published.get("added_at") or published.get("published_at"))
+    category = published.get("category", "network")
+    safe_sources = _render_sources(raw_sources, FIELD_LIMITS["max_sources"])
+    kept_sources = safe_sources or [
+        {"url": s["url"], "title": _text(s.get("title"), FIELD_LIMITS["source_title"]) or s["url"]}
+        for s in raw_sources[:FIELD_LIMITS["max_sources"]]
+        if isinstance(s, dict) and isinstance(s.get("url"), str) and s["url"]
+    ]
+    raw_tags = published.get("tags")
+    tags = list(dict.fromkeys(
+        tag for tag in [category, *(raw_tags if isinstance(raw_tags, list) else [])]
+        if isinstance(tag, str) and tag in CATEGORIES
+    ))
+    raw_products = published.get("products")
+    products = list(dict.fromkeys(
+        p for p in (raw_products if isinstance(raw_products, list) else [])
+        if isinstance(p, str) and p in PRODUCTS
+    ))
+    public = {
+        "id": story_id,
+        "title": title,
+        "summary": summary,
+        "why_it_matters": _text(published.get("why_it_matters"), FIELD_LIMITS["why_it_matters"]),
+        "category": category,
+        "priority": published.get("priority", "normal"),
+        "confidence": published.get("confidence", "reported"),
+        "state": published.get("state", "developing"),
+        "tags": tags,
+        "sources": kept_sources,
+        "products": products,
+        "published_at": _iso(published_dt),
+        "updated_at": _iso(updated_dt),
+        "added_at": _iso(added_dt),
+    }
+    raw_updates = published.get("updates")
+    updates = [entry for entry in map(_update, raw_updates if isinstance(raw_updates, list) else []) if entry]
+    if updates:
+        public["updates"] = updates
+    raw_notes = published.get("alert_notes")
+    notes = [
+        note for note in (_text(item, 600) for item in (raw_notes if isinstance(raw_notes, list) else [])[:FIELD_LIMITS["max_alert_notes"]])
+        if note
+    ]
+    if notes:
+        public["alert_notes"] = list(dict.fromkeys(notes))
+    if published.get("origin") == "network-health":
+        public["origin"] = "network-health"
+    return public
+
+
+def _snapshot(db, story_id: str, expect_hash: str | None = None) -> dict:
     _id(story_id)
     alias = retired(db, story_id=story_id)
     if alias is not None:
@@ -218,32 +312,64 @@ def _snapshot(db, story_id: str) -> dict:
     if row["payload_type"] == "text":
         try:
             payload_text = str(row["payload_blob"], "utf-8")
-            payload_text.encode("utf-8")
         except UnicodeError:
             payload_text = None
     record = {
         "id": row["id"],
         "cluster_key": row["cluster_key"],
-        "payload": payload_text if payload_text is not None else _json({"damaged_payload_hex": row["payload_blob"].hex()}),
+        "payload": payload_text if payload_text is not None else strict_json({"damaged_payload_hex": row["payload_blob"].hex()}),
         "published_at": row["published_at"],
         "updated_at": row["updated_at"],
     }
-    control_row = db.execute("SELECT * FROM editorial_controls WHERE story_id=?", (story_id,)).fetchone()
-    control = dict(control_row) if control_row else None
+    control_row = db.execute(
+        """SELECT story_id,revision,locked,retracted,held_updates,
+                  CASE WHEN typeof(notice_action)='text' THEN CAST(notice_action AS BLOB) END AS _notice_action,
+                  CASE WHEN typeof(notice_reason)='text' THEN CAST(notice_reason AS BLOB) END AS _notice_reason,
+                  CASE WHEN typeof(notice_at)='text' THEN CAST(notice_at AS BLOB) END AS _notice_at
+           FROM editorial_controls WHERE story_id=?""",
+        (story_id,),
+    ).fetchone()
+    control = (
+        {
+            "story_id": control_row["story_id"],
+            "revision": control_row["revision"],
+            "locked": control_row["locked"],
+            "retracted": control_row["retracted"],
+            "held_updates": control_row["held_updates"],
+            "notice_action": _decode_utf8(control_row["_notice_action"]),
+            "notice_reason": _decode_utf8(control_row["_notice_reason"]),
+            "notice_at": _decode_utf8(control_row["_notice_at"]),
+        }
+        if control_row
+        else None
+    )
+    is_retracted = bool(control and control["retracted"])
     published = _published(db, story_id)
     fallback = False
     try:
         if row["payload_type"] != "text" or (original := saved_object(row["payload_blob"])) is None:
             raise ValueError("Damaged story payload")
-        public = _public(original)
+        public = prepare_story(original, allow_empty_sources=is_retracted)
         if public["id"] != story_id:
             raise ValueError("Story identity differs from its database row")
     except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
-        if published is None:
+        if published is None or published.get("id") != story_id:
             raise ValueError("Story has no valid public snapshot to correct") from None
-        original, public, fallback = {}, _public(published), True
+        original = {}
+        try:
+            public = prepare_story(published, allow_empty_sources=is_retracted)
+        except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+            public = _legacy_public(published, story_id)
+        if public["id"] != story_id:
+            raise ValueError("Story has no valid public snapshot to correct") from None
+        fallback = True
     revision = control["revision"] if control else 0
-    fingerprint = digest([record, revision, bool(control and control["locked"]), bool(control and control["retracted"])])
+    fingerprint_parts = [record, revision, bool(control and control["locked"]), bool(control and control["retracted"])]
+    if fallback:
+        fingerprint_parts.append(public)
+    fingerprint = digest(fingerprint_parts)
+    if expect_hash is not None and fingerprint != expect_hash:
+        raise ValueError("Story changed since it was reviewed; refresh its hash before editing")
     return {"record": record, "raw": original, "public": public, "published": published,
             "control": control, "revision": revision, "hash": fingerprint, "fallback": fallback}
 
@@ -261,15 +387,43 @@ def show(db, story_id: str) -> dict:
 def history(db, story_id: str) -> dict:
     """Return the append-only editorial revision history for `story_id`, newest first."""
     revisions = []
-    for row in db.execute("SELECT * FROM editorial_revisions WHERE story_id=? ORDER BY revision DESC", (_id(story_id),)):
-        record = dict(row)
-        for name in ("before_story_json", "before_public_json", "after_story_json", "after_public_json"):
-            raw = record.pop(name)
-            try:
-                value = json.loads(raw) if raw is not None else None
-            except ValueError:
-                value = {"unparseable_record": raw}
-            record[name.removesuffix("_json")] = value
+    for row in db.execute(
+        """SELECT story_id,revision,
+                  typeof(action) AS _action_t,CAST(action AS BLOB) AS _action_b,
+                  typeof(reason) AS _reason_t,CAST(reason AS BLOB) AS _reason_b,
+                  typeof(created_at) AS _created_at_t,CAST(created_at AS BLOB) AS _created_at_b,
+                  typeof(before_story_json) AS _before_story_t,CAST(before_story_json AS BLOB) AS _before_story_b,
+                  typeof(before_public_json) AS _before_public_t,CAST(before_public_json AS BLOB) AS _before_public_b,
+                  typeof(after_story_json) AS _after_story_t,CAST(after_story_json AS BLOB) AS _after_story_b,
+                  typeof(after_public_json) AS _after_public_t,CAST(after_public_json AS BLOB) AS _after_public_b,
+                  typeof(before_hash) AS _before_hash_t,CAST(before_hash AS BLOB) AS _before_hash_b,
+                  typeof(after_hash) AS _after_hash_t,CAST(after_hash AS BLOB) AS _after_hash_b
+           FROM editorial_revisions WHERE story_id=? ORDER BY revision DESC""",
+        (_id(story_id),),
+    ):
+        record = {"story_id": row["story_id"], "revision": row["revision"]}
+        for col in ("action", "reason", "created_at", "before_hash", "after_hash"):
+            kind, blob = row[f"_{col}_t"], row[f"_{col}_b"]
+            if kind == "null" or blob is None:
+                record[col] = None
+            elif kind == "text":
+                record[col] = _strip_surrogates(_decode_utf8(blob, replace=True))
+            else:
+                record[col] = blob.hex() if isinstance(blob, (bytes, bytearray)) else str(blob)
+        for col in ("before_story", "before_public", "after_story", "after_public"):
+            kind, blob = row[f"_{col}_t"], row[f"_{col}_b"]
+            if kind == "null" or blob is None:
+                value = None
+            elif kind != "text":
+                value = {"unparseable_record": blob.hex() if isinstance(blob, (bytes, bytearray)) else str(blob)}
+            elif (raw_text := _decode_utf8(blob)) is None:
+                value = {"unparseable_record": _decode_utf8(blob, replace=True)}
+            else:
+                try:
+                    value = _strip_surrogates(json.loads(raw_text))
+                except (ValueError, RecursionError):
+                    value = {"unparseable_record": _strip_surrogates(raw_text)}
+            record[col] = value
         revisions.append(record)
     return {"story_id": story_id, "revisions": revisions}
 
@@ -284,29 +438,87 @@ def record_held(db, story_id: str) -> None:
     db.execute("UPDATE editorial_controls SET held_updates=held_updates+1 WHERE story_id=?", (story_id,))
 
 
+def _clean_history_updates(raw_updates: object) -> list[dict]:
+    if not isinstance(raw_updates, list):
+        return []
+    cleaned = []
+    for upd in raw_updates:
+        if not isinstance(upd, dict):
+            continue
+        try:
+            at = timestamp(upd.get("at"))
+        except ValueError:
+            continue
+        if text := _text(upd.get("text"), UPDATE_CHARS):
+            cleaned.append({"at": at, "text": text})
+    return cleaned
+
+
 def public_metadata(db, story_id: str) -> dict | None:
     """Build bounded public editorial notice and revision metadata for rendering."""
-    control = db.execute("SELECT * FROM editorial_controls WHERE story_id=?", (story_id,)).fetchone()
+    control = db.execute(
+        """SELECT revision,locked,retracted,
+                  CASE WHEN typeof(notice_action)='text' THEN CAST(notice_action AS BLOB) END AS notice_action,
+                  CASE WHEN typeof(notice_at)='text' THEN CAST(notice_at AS BLOB) END AS notice_at,
+                  CASE WHEN typeof(notice_reason)='text' THEN CAST(notice_reason AS BLOB) END AS notice_reason
+           FROM editorial_controls WHERE story_id=?""",
+        (story_id,),
+    ).fetchone()
     if control is None:
         return None
+    if (
+        (notice_action := _decode_utf8(control["notice_action"])) is None
+        or (notice_at := _decode_utf8(control["notice_at"])) is None
+        or (raw_notice_reason := _decode_utf8(control["notice_reason"])) is None
+    ):
+        raise ValueError("Invalid editorial notice reason")
+    notice_reason = _text(raw_notice_reason, 1000)
     rows = db.execute(
-        "SELECT revision,action,reason,created_at,before_public_json,after_public_json FROM editorial_revisions WHERE story_id=? ORDER BY revision DESC LIMIT ?",
+        """SELECT revision,
+                  CASE WHEN typeof(action)='text' THEN CAST(action AS BLOB) END AS action,
+                  CASE WHEN typeof(created_at)='text' THEN CAST(created_at AS BLOB) END AS created_at,
+                  CASE WHEN typeof(reason)='text' THEN CAST(reason AS BLOB) END AS reason,
+                  CASE WHEN typeof(before_public_json)='text' THEN CAST(before_public_json AS BLOB) END AS before_public_json,
+                  CASE WHEN typeof(after_public_json)='text' THEN CAST(after_public_json AS BLOB) END AS after_public_json
+           FROM editorial_revisions WHERE story_id=? ORDER BY revision DESC LIMIT ?""",
         (story_id, PUBLIC_HISTORY_LIMIT),
     ).fetchall()
     entries = []
     for row in rows:
-        entry = {key: row[key] for key in ("revision", "action", "reason", "created_at")}
-        if control["retracted"] and row["revision"] != control["revision"]:
-            entry["reason"] = ""  # an earlier reason may quote the withdrawn text
-        if row["before_public_json"] is not None and row["action"] != "unlock" and not control["retracted"]:
-            before = json.loads(row["before_public_json"])
-            entry["superseded"] = {key: before.get(key, "") for key in ("title", "summary", "why_it_matters")}
-            kept = {(update["at"], update["text"]) for update in json.loads(row["after_public_json"]).get("updates", [])}
-            if replaced := [{"at": update["at"], "text": update["text"]} for update in before.get("updates", []) if (update["at"], update["text"]) not in kept]:
-                entry["superseded"]["updates"] = replaced
+        is_current = row["revision"] == control["revision"]
+        action = _decode_utf8(row["action"])
+        created_at = _decode_utf8(row["created_at"])
+        if action is None or created_at is None or action not in _PUBLIC_HISTORY_ACTIONS:
+            if not is_current:
+                continue
+            raise ValueError("Invalid editorial revision")
+        if control["retracted"] and not is_current:
+            reason_text = ""
+        elif (raw_reason := _decode_utf8(row["reason"])) is None:
+            if control["retracted"]:
+                raise ValueError("Invalid editorial revision reason")
+            reason_text = ""
+        else:
+            reason_text = _text(raw_reason, 1000)
+        entry = {"revision": row["revision"], "action": action, "reason": reason_text, "created_at": created_at}
+        if row["before_public_json"] is not None and action != "unlock" and not control["retracted"]:
+            before = saved_object(row["before_public_json"], allow_surrogates=True)
+            if before is not None and before.get("id") == story_id:
+                entry["superseded"] = {
+                    key: _text(before.get(key, ""), FIELD_LIMITS[key])
+                    for key in ("title", "summary", "why_it_matters")
+                }
+                if (
+                    action != "retract"
+                    and (after_obj := saved_object(row["after_public_json"], allow_surrogates=True)) is not None
+                    and after_obj.get("id") == story_id
+                ):
+                    kept = {(u["at"], u["text"]) for u in _clean_history_updates(after_obj.get("updates"))}
+                    if replaced := [u for u in _clean_history_updates(before.get("updates")) if (u["at"], u["text"]) not in kept]:
+                        entry["superseded"]["updates"] = replaced
         entries.append(entry)
     return {"status": "retracted" if control["retracted"] else "corrected", "revision": control["revision"],
-            "action": control["notice_action"], "reason": control["notice_reason"], "at": control["notice_at"],
+            "action": notice_action, "reason": notice_reason, "at": notice_at,
             "history": entries, "history_total": control["revision"]}
 
 
@@ -317,7 +529,7 @@ def _sources(value, limit: int) -> list[dict]:
     for source in value:
         if not isinstance(source, dict) or set(source) != {"url", "title"}:
             raise ValueError("Sources require only url and title")
-        sources.append({"url": canonical_url(source["url"]), "title": _text(source["title"], "source title", FIELD_LIMITS["source_title"])})
+        sources.append({"url": canonical_url(source["url"]), "title": clean_text(source["title"], "source title", FIELD_LIMITS["source_title"])})
     if len({s["url"] for s in sources}) != len(sources):
         raise ValueError("Duplicate source URL")
     return sources
@@ -329,7 +541,7 @@ def _validated_patch(patch: dict) -> dict:
     clean = dict(patch)
     for field in ("title", "summary", "why_it_matters"):
         if field in clean:
-            clean[field] = _text(clean[field], field, FIELD_LIMITS[field], empty=field == "why_it_matters")
+            clean[field] = clean_text(clean[field], field, FIELD_LIMITS[field], empty=field == "why_it_matters")
     for field, allowed in (("category", CATEGORIES), ("priority", PRIORITIES), ("confidence", CONFIDENCES), ("state", PUBLIC_STATES)):
         if field in clean and (not isinstance(clean[field], str) or clean[field] not in allowed):
             raise ValueError(f"Invalid {field}")
@@ -348,7 +560,7 @@ def _validated_patch(patch: dict) -> dict:
         for update in clean["updates"]:
             if not isinstance(update, dict) or set(update) != {"at", "text", "sources"}:
                 raise ValueError("Updates require only at, text and sources")
-            updates.append({"at": format_utc(parse_utc(update["at"])), "text": _text(update["text"], "update text", UPDATE_CHARS),
+            updates.append({"at": timestamp(update["at"]), "text": clean_text(update["text"], "update text", UPDATE_CHARS),
                             "sources": _sources(update["sources"], FIELD_LIMITS["max_update_sources"])})
         clean["updates"] = updates
     return clean
@@ -357,14 +569,11 @@ def _validated_patch(patch: dict) -> dict:
 def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
            patch: dict | None = None, revision: int | None = None, observed: str | None = None) -> dict:
     _id(story_id)
-    reason = _text(reason, "public reason", 1000)
-    if not isinstance(expect_hash, str) or not _HASH.fullmatch(expect_hash):
-        raise ValueError("A current expected story hash is required")
-    stamp = format_utc(parse_utc(observed or now_iso()))
+    reason = clean_text(reason, "public reason", 1000)
+    _require_expect_hash(expect_hash)
+    stamp = timestamp(observed or now_iso())
     with _begin_tx(db):
-        current = _snapshot(db, story_id)
-        if current["hash"] != expect_hash:
-            raise ValueError("Story changed since it was reviewed; refresh its hash before editing")
+        current = _snapshot(db, story_id, expect_hash)
         if stamp < current["public"]["updated_at"]:
             raise ValueError("Editorial timestamp must not precede the current story update")
         control = current["control"] or {}
@@ -378,28 +587,50 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
             if "category" in clean and "tags" not in clean and clean["category"] != current["public"]["category"]:
                 public["tags"] = [t for t in public.get("tags", []) if t != current["public"]["category"]]
             public.update(clean)
-            if _public(public) == current["public"]:
+            if prepare_story(public) == current["public"]:
                 raise ValueError("Correction does not change any public field")
         elif action == "retract":
             public.update(retracted_fields(reason))
+            if not isinstance(public.get("category"), str) or public["category"] not in CATEGORIES:
+                public["category"] = "network"
+            if not isinstance(public.get("confidence"), str) or public["confidence"] not in CONFIDENCES:
+                public["confidence"] = "reported"
+            if not isinstance(public.get("state"), str) or public["state"] not in PUBLIC_STATES:
+                public["state"] = "developing"
             retracted = True
         elif action == "restore":
             if type(revision) is not int or not 0 <= revision < current["revision"]:
                 raise ValueError("Restore requires an earlier revision number (zero is the original accepted text)")
             if revision == 0:
-                row = db.execute("SELECT before_public_json,before_story_json FROM editorial_revisions WHERE story_id=? AND revision=1", (story_id,)).fetchone()
-                raw_prev = row[0] if row else None
-                if raw_prev is None and row and row[1]:
-                    try:
-                        raw_prev = _json(_public(json.loads(row[1])))
-                    except (ValueError, TypeError, KeyError, AttributeError):
-                        raw_prev = None
+                row = db.execute(
+                    """SELECT CASE WHEN typeof(before_public_json)='text' THEN CAST(before_public_json AS BLOB) END,
+                              CASE WHEN typeof(before_story_json)='text' THEN CAST(before_story_json AS BLOB) END
+                       FROM editorial_revisions WHERE story_id=? AND revision=1""",
+                    (story_id,),
+                ).fetchone()
             else:
-                row = db.execute("SELECT after_public_json FROM editorial_revisions WHERE story_id=? AND revision=? AND action!='retract'", (story_id, revision)).fetchone()
-                raw_prev = row[0] if row else None
-            if raw_prev is None:
+                row = db.execute(
+                    """SELECT CASE WHEN typeof(after_public_json)='text' THEN CAST(after_public_json AS BLOB) END
+                       FROM editorial_revisions WHERE story_id=? AND revision=? AND action!='retract'""",
+                    (story_id, revision),
+                ).fetchone()
+            previous = None
+            candidates = (row[0], row[1]) if revision == 0 and row else ((row[0],) if row else ())
+            for raw_candidate in candidates:
+                if (cand_obj := saved_object(raw_candidate, allow_surrogates=True)) is None:
+                    continue
+                cleaned = _strip_surrogates(cand_obj)
+                if cleaned.get("id") != story_id:
+                    continue
+                try:
+                    prepared = prepare_story(cleaned)
+                except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+                    continue
+                if prepared["id"] == story_id:
+                    previous = prepared
+                    break
+            if previous is None:
                 raise ValueError("That revision has no accepted public text to restore")
-            previous = _public(json.loads(raw_prev))
             public.update({key: previous[key] for key in FIELDS - {"updates"}})
             retracted = False
         elif action == "unlock":
@@ -407,12 +638,14 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
                 raise ValueError("Story is not editorially locked")
             if retracted:
                 raise ValueError("Explicitly restore a retracted story before resuming automation")
+            if any(not isinstance(control.get(k), str) for k in ("notice_action", "notice_reason", "notice_at")):
+                raise ValueError("Invalid editorial notice reason")
             locked = False
             notice_action, notice_reason, notice_at = control["notice_action"], control["notice_reason"], control["notice_at"]
         else:
             raise ValueError("Unknown editorial action")
         public["updated_at"] = stamp
-        public = _public(public)
+        public = prepare_story(public, allow_empty_sources=retracted)
         after_public = {k: v for k, v in public.items() if k not in ("updates", "alert_notes")} if retracted else public
         candidate = dict(current["raw"])
         candidate.pop("editorial", None)
@@ -425,7 +658,7 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
                     previous_sources.setdefault(variant, src)
         candidate["sources"] = [{**previous_sources.get(s["url"], {}), **s} for s in public["sources"]]
         next_revision = current["revision"] + 1
-        after_story = _json(candidate)
+        after_story = strict_json(candidate)
         held_updates = 0 if action == "unlock" else control.get("held_updates", 0)
         db.execute("UPDATE stories SET payload=?,updated_at=? WHERE id=?", (after_story, stamp, story_id))
         db.execute("""INSERT INTO editorial_controls(story_id,revision,locked,retracted,notice_action,notice_reason,notice_at,held_updates)
@@ -434,12 +667,18 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
             notice_reason=excluded.notice_reason,notice_at=excluded.notice_at,held_updates=excluded.held_updates""",
             (story_id, next_revision, int(locked), int(retracted), notice_action, notice_reason, notice_at, held_updates))
         after_hash = _snapshot(db, story_id)["hash"]
+        before_public_json = None
+        if current["published"] is not None and current["published"].get("id") == story_id:
+            try:
+                before_public_json = strict_json(_strip_surrogates(current["published"]))
+            except (ValueError, TypeError, RecursionError):
+                before_public_json = None
         db.execute("""INSERT INTO editorial_revisions(story_id,revision,action,reason,created_at,
             before_story_json,before_public_json,after_story_json,after_public_json,before_hash,after_hash)
             VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (story_id, next_revision, action, reason, stamp, current["record"]["payload"],
-             _json(current["published"]) if current["published"] is not None else None,
-             after_story, _json(after_public), current["hash"], after_hash))
+             before_public_json,
+             after_story, strict_json(after_public), current["hash"], after_hash))
         if action == "unlock":
             requeue_items(db, _held_item_ids(db, story_id))
         _enqueue_render(db, story_id)
@@ -472,29 +711,26 @@ def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str 
           automatic: bool = False, _guard=None, _complete=None) -> dict:
     """Permanently merge published duplicate `story_id` into `survivor_id` as a pointer."""
     from . import decisions, doctor
-    from .render import pointer_json
 
     _id(story_id)
     _id(survivor_id)
     if story_id == survivor_id:
         raise ValueError("Cannot merge a story into itself")
-    reason = _text(reason, "merge reason", 1000)
-    if not automatic and (not isinstance(expect_hash, str) or not _HASH.fullmatch(expect_hash)):
-        raise ValueError("A current expected story hash is required")
+    reason = clean_text(reason, "merge reason", 1000)
+    if not automatic:
+        _require_expect_hash(expect_hash)
     base = canonical_url(base_url).rstrip("/") + "/"
-    stamp = format_utc(parse_utc(observed or now_iso()))
+    stamp = timestamp(observed or now_iso())
     with _begin_tx(db):
         if _guard is not None:
             _guard(db)
-        dup = _snapshot(db, story_id)
+        dup = _snapshot(db, story_id, expect_hash)
         surv = _snapshot(db, survivor_id)
-        if expect_hash is not None and dup["hash"] != expect_hash:
-            raise ValueError("Story changed since it was reviewed; refresh its hash before editing")
         if (dup["control"] and dup["control"]["retracted"]) or (surv["control"] and surv["control"]["retracted"]):
             raise ValueError("Cannot merge a retracted story")
         if dup["published"] is None or surv["published"] is None:
             raise ValueError("Both stories must already be published before merging")
-        _public(surv["published"])
+        prepare_story(surv["published"])
         if db.execute("SELECT 1 FROM public_render_queue WHERE story_id=? AND last_error IS NOT NULL", (survivor_id,)).fetchone():
             raise ValueError("Survivor story has a quarantined render error")
         db.execute(
@@ -503,7 +739,7 @@ def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str 
         )
         db.execute("DELETE FROM stories WHERE id=?", (story_id,))
         db.execute("UPDATE editorial_controls SET locked=0,held_updates=0 WHERE story_id=?", (story_id,))
-        surv_locked = bool(surv["control"] and (surv["control"]["locked"] or surv["control"]["retracted"]))
+        surv_locked = bool(surv["control"] and surv["control"]["locked"])
         transferred_network = bool(dup["raw"].get("network")) and doctor.transfer_attached(
             db,
             story_id=story_id,
@@ -519,7 +755,7 @@ def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str 
             (survivor_id, story_id, dup["record"]["cluster_key"]),
         ).rowcount
         if held_ids:
-            if surv["control"] and surv["control"]["locked"]:
+            if surv_locked:
                 for hid in held_ids:
                     record_held(db, survivor_id)
                     decisions.record(db, hid, "held.gate.story_locked", stamp, merged_from=story_id)
@@ -531,7 +767,7 @@ def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str 
             resolved = retired(db, story_id=aid)
             if resolved is None or resolved[1] != survivor_id:
                 continue
-            pjson = json.dumps(pointer_json(base, aid, survivor_id), ensure_ascii=False, sort_keys=True) + "\n"
+            pjson = public_json_text(pointer_json(base, aid, survivor_id))
             psha = hashlib.sha256(pjson.encode("utf-8")).hexdigest()
             db.execute(
                 "UPDATE public_catalog SET updated_at=?,template_hash='',json_sha256=?,public_json=? WHERE story_id=?",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from contextlib import closing, contextmanager
+import copy
 from itertools import islice
 import json
 import logging
@@ -12,11 +13,11 @@ from pathlib import Path
 import sqlite3
 
 from . import candidate, decisions, doctor, editorial, publication
-from .candidate import ReviewRequired
+from .candidate import ReviewRequired, item_source
 from .comments import analysis_context
 from .util import (
-    after, backoff_seconds, canonical_json, digest, is_dirauth_item, is_hackerone_item, item_cluster,
-    item_identity, saved_object,
+    after, backoff_until, canonical_json, digest, is_dirauth_item, is_hackerone_item, item_cluster,
+    item_identity, safe_canonical_url, saved_object, strict_json, valid_note_list,
 )
 
 TAG_PRIORITY = 5  # queue floor for deterministic tag notices
@@ -24,6 +25,7 @@ HACKERONE_PRIORITY = 35  # queue boost so HackerOne disclosures run ahead of ord
 DIRAUTH_PRIORITY = 35  # queue boost so directory-authority tickets and replies run first
 POLL_TOLERANCE_SECONDS = 5  # absorbs scheduler start jitter after a successful poll
 
+_RETENTION_TABLES = {"item": ("items", "id"), "analysis": ("analyses", "cache_key")}
 _RETENTION_SCHEMA = """
     CREATE TABLE IF NOT EXISTS private_archive_refs (
         kind TEXT NOT NULL, record_id TEXT NOT NULL, record_hash TEXT NOT NULL,
@@ -48,13 +50,6 @@ _RETENTION_QUERIES = (
             AND (i.status!='ignored' OR i.story_id IS NOT NULL))
         ORDER BY created_at,cache_key"""),
 )
-_LIVE_STORY_SQL = """
-    SELECT s.id, s.cluster_key, s.published_at, s.updated_at,
-           CAST(s.payload AS BLOB) AS payload_blob,
-           COALESCE(e.locked, 0) AS locked, COALESCE(e.retracted, 0) AS retracted
-    FROM stories s
-    LEFT JOIN editorial_controls e ON e.story_id = s.id
-"""
 
 
 def backup_database(source: str | Path, destination: str | Path) -> None:
@@ -107,36 +102,41 @@ def immediate_transaction(db, busy_message: str = "Database transaction already 
         yield
 
 
-def _story_dict(row) -> dict | None:
-    payload = saved_object(row["payload_blob"])
-    if payload is None:
-        return None
-    return {
-        "id": row["id"],
-        "cluster_key": row["cluster_key"],
-        "published_at": row["published_at"],
-        "updated_at": row["updated_at"],
-        "payload": payload,
-        "locked": bool(row["locked"]),
-        "retracted": bool(row["retracted"]),
-    }
+ITEM_SAFE_COLUMNS = (
+    "id,url,source_id,content_hash,cluster_key,first_seen,last_seen,status,attempts,"
+    "rejections,next_attempt_at,last_error,priority_score,story_id,"
+    "typeof(payload) AS _payload_type,CAST(payload AS BLOB) AS _payload_blob"
+)
 
 
-def load_story_row(db, story_id: str) -> dict | None:
-    """Load one live non-retired story row with parsed payload and editorial flags, or None."""
-    row = db.execute(_LIVE_STORY_SQL + " WHERE s.id=?", (story_id,)).fetchone()
-    if row is None or editorial.retired(db, story_id=row["id"], cluster_key=row["cluster_key"]) is not None:
-        return None
-    return _story_dict(row)
+def decode_item_row(row) -> tuple[dict | None, dict | None]:
+    """Decode a UTF-8-safe `ITEM_SAFE_COLUMNS` row into `(entry_dict, payload_dict)` or `(None, None)`."""
+    if row is None or row["_payload_type"] != "text" or (payload := saved_object(row["_payload_blob"])) is None:
+        return None, None
+    entry = {k: row[k] for k in row.keys() if not k.startswith("_")}
+    entry["payload"] = str(row["_payload_blob"], "utf-8")
+    return entry, payload
 
 
-def iter_live_stories(db, *, limit: int = -1):
-    """Yield live non-retired story rows with parsed payloads, newest activity first."""
-    for row in db.execute(_LIVE_STORY_SQL + " ORDER BY s.updated_at DESC, s.id LIMIT ?", (limit,)):
-        if editorial.retired(db, story_id=row["id"], cluster_key=row["cluster_key"]) is None:
-            parsed = _story_dict(row)
-            if parsed is not None:
-                yield parsed
+def set_job_stage(db, item_id: str, stage: str, record: object, observed: str) -> int:
+    """Update an existing review job's stage, serialized audit record, and timestamp."""
+    return db.execute(
+        "UPDATE review_jobs SET stage=?,record_json=?,approval_key=NULL,updated_at=? WHERE item_id=?",
+        (stage, strict_json(record), observed, item_id),
+    ).rowcount
+
+
+def upsert_story(db, story_id: str, cluster_key: str, payload_json: str, published_at: str, updated_at: str) -> int:
+    """Insert a story or update its payload and `updated_at` in place, returning `rowcount`."""
+    return db.execute(
+        "INSERT INTO stories(id,cluster_key,payload,published_at,updated_at) VALUES(?,?,?,?,?)"
+        " ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at",
+        (story_id, cluster_key, payload_json, published_at, updated_at),
+    ).rowcount
+
+
+def _table_columns(db, table: str) -> list[str]:
+    return [info[1] for info in db.execute(f"PRAGMA table_info({table})")]
 
 
 def retained_analysis_keys(db) -> set[str]:
@@ -145,8 +145,7 @@ def retained_analysis_keys(db) -> set[str]:
         return set()
     pinned: set[str] = set()
     for (raw,) in db.execute("SELECT CAST(payload AS BLOB) FROM stories WHERE typeof(payload)='text'"):
-        payload = saved_object(raw)
-        if isinstance(payload, dict) and isinstance(payload.get("editorial_analysis_key"), str):
+        if (payload := saved_object(raw)) and isinstance(payload.get("editorial_analysis_key"), str):
             pinned.add(payload["editorial_analysis_key"])
     return pinned
 
@@ -198,19 +197,19 @@ def select_retention_candidates(
 
     def scan(kind: str, query: str):
         """Stream decoded cold item or analysis rows eligible for archival."""
-        table, key_col = ("items", "id") if kind == "item" else ("analyses", "cache_key")
-        columns = [info[1] for info in db.execute(f"PRAGMA table_info({table})")]
+        table, key_col = _RETENTION_TABLES[kind]
+        columns = _table_columns(db, table)
         for rowid, raw_key in db.execute(query, (cutoff,)):
-            label = raw_key.decode("utf-8", errors="replace") if isinstance(raw_key, bytes) else raw_key
             try:
                 key = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else raw_key
                 if kind == "analysis" and key in pinned_keys:
                     continue
                 row = _decode_table_row(db, table, columns, "rowid=?", rowid, key_col=key_col)
             except (UnicodeError, ValueError, RecursionError) as error:
+                label = raw_key.decode("utf-8", errors="replace") if isinstance(raw_key, bytes) else raw_key
                 log.warning("Skipping damaged retention %s %r (%s)", kind, label, type(error).__name__)
                 continue
-            if row is not None and (kind != "analysis" or row["cache_key"] not in pinned_keys):
+            if row is not None:
                 yield row
 
     for kind, query in _RETENTION_QUERIES:
@@ -238,13 +237,12 @@ def compact_retained_rows(
     counts = {"records_archived": 0, "items_compacted": 0, "analyses_evicted": 0, "changed_records_preserved": 0}
     with immediate_transaction(db):
         pinned_keys = retained_analysis_keys(db)
-        item_cols = [info[1] for info in db.execute("PRAGMA table_info(items)")]
-        analysis_cols = [info[1] for info in db.execute("PRAGMA table_info(analyses)")]
+        cols_by_kind = {kind: _table_columns(db, table) for kind, (table, _) in _RETENTION_TABLES.items()}
         for record in records:
             kind, row = record["kind"], record["row"]
-            table, key_col, cols = ("items", "id", item_cols) if kind == "item" else ("analyses", "cache_key", analysis_cols)
+            table, key_col = _RETENTION_TABLES[kind]
             try:
-                current = _decode_table_row(db, table, cols, f"{key_col}=?", row[key_col], key_col=key_col)
+                current = _decode_table_row(db, table, cols_by_kind[kind], f"{key_col}=?", row[key_col], key_col=key_col)
             except (UnicodeError, ValueError, RecursionError):
                 current = None
             if current is None or current != row:
@@ -298,55 +296,72 @@ def item_priority(item: dict, dirauth_users: Iterable[str] | None = None) -> int
 
 
 def _valid_saved_item(old: object) -> bool:
-    if not isinstance(old, dict):
-        return False
-    if not all(isinstance(old.get(key), str) for key in ("title", "content", "updated_at")):
+    if not isinstance(old, dict) or not all(isinstance(old.get(k), str) for k in ("title", "content", "updated_at")):
         return False
     if "source_content" in old and not isinstance(old["source_content"], str):
         return False
-    if "author" in old and old["author"] is not None and not isinstance(old["author"], str):
-        return False
-    if "sender_domain" in old and old["sender_domain"] is not None and not isinstance(old["sender_domain"], str):
+    if any(old.get(k) is not None and not isinstance(old[k], str) for k in ("author", "sender_domain")):
         return False
     if "comments_truncated" in old and type(old["comments_truncated"]) is not bool:
         return False
     labels = old.get("labels")
     if labels is not None and (not isinstance(labels, list) or any(not isinstance(entry, str) for entry in labels)):
         return False
-    notes = old.get("public_comments")
-    if notes is not None and (
-        not isinstance(notes, list)
-        or any(
-            not isinstance(note, dict)
-            or not all(isinstance(note.get(key), str) for key in ("author", "created_at", "body"))
-            for note in notes
-        )
-    ):
-        return False
-    dirauth_notes = old.get("dirauth_notes")
-    if dirauth_notes is not None and (
-        not isinstance(dirauth_notes, list)
-        or any(
-            not isinstance(note, dict)
-            or not all(isinstance(note.get(key), str) for key in ("id", "author", "created_at"))
-            for note in dirauth_notes
-        )
-    ):
-        return False
-    return True
+    return (
+        valid_note_list(old.get("public_comments"), ("id", "url", "title", "author", "created_at", "body"))
+        and valid_note_list(old.get("dirauth_notes"), ("id", "author", "created_at"))
+    )
 
 
-def item_hash(item: dict) -> str:
-    """A digest of the fields that make a new revision of an item."""
+def _valid_pending_payload(entry: dict | None, payload: dict | None) -> bool:
+    return (
+        entry is not None
+        and _valid_saved_item(payload)
+        and all(isinstance(payload.get(k), str) and bool(payload[k]) for k in ("id", "url", "kind", "published_at"))
+        and payload["id"] == entry["id"]
+        and payload["url"] == entry["url"]
+    )
+
+
+def _is_compacted_saved_item(db, item_id: str, row, old: object) -> bool:
+    if isinstance(row, str):
+        record_hash = row
+    else:
+        if row["status"] != "ignored" or row["story_id"] is not None:
+            return False
+        record_hash = row["content_hash"]
+    if not isinstance(old, dict) or "content" in old or not isinstance(record_hash, str) or not _valid_saved_item({**old, "content": ""}):
+        return False
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='private_archive_refs'").fetchone():
+        return False
+    return bool(db.execute(
+        """SELECT 1 FROM private_archive_refs
+           WHERE kind='item' AND record_id=? AND record_hash=?
+           AND typeof(object_key)='text' AND object_key!=''
+           AND typeof(object_sha256)='text' AND length(object_sha256)=64
+           AND typeof(archived_at)='text' AND archived_at!=''
+           AND typeof(destination_json)='text' AND json_valid(destination_json)
+           AND json_type(destination_json)='object'""",
+        (item_id, record_hash),
+    ).fetchone())
+
+
+def item_hash_fields(item: dict, *, include_sender_domain: bool = True) -> dict:
+    """Build the canonical field mapping hashed by `item_hash` for `item`."""
     fields = {k: item.get(k) for k in ("title", "content", "kind", "product", "labels", "authority", "upstream_state")}
     fields["content"] = item.get("source_content", item.get("content"))
     if item.get("author"):
         fields["author"] = item["author"]
-    if item.get("sender_domain"):
+    if include_sender_domain and item.get("sender_domain"):
         fields["sender_domain"] = item["sender_domain"]
     if item.get("public_comments"):
         fields["public_comments"] = analysis_context(item)[1]
-    return digest(fields)
+    return fields
+
+
+def item_hash(item: dict) -> str:
+    """A digest of the fields that make a new revision of an item."""
+    return digest(item_hash_fields(item))
 
 
 def _uncommented_hash(old: dict, item: dict) -> str:
@@ -354,6 +369,29 @@ def _uncommented_hash(old: dict, item: dict) -> str:
     if base_old.get("authority") == "dirauth-operator" and item.get("authority") == "development":
         base_old["authority"] = "development"
     return item_hash(base_old)
+
+
+def _unchanged_non_pending(target: dict, item: dict, content_hash: str, *, check_requested: bool) -> bool:
+    return (check_requested and item_hash(target) == content_hash) or (
+        "comments_source_key" not in item
+        and (target.get("public_comments") or target.get("dirauth_notes"))
+        and _uncommented_hash(target, item) == content_hash
+    )
+
+
+def _updated_closed_at(old: dict, item: dict) -> str | None:
+    closed_at = item.get("closed_at")
+    if (
+        item.get("kind") == "gitlab_issue"
+        and item.get("upstream_state") == "closed"
+        and isinstance(closed_at, str)
+        and closed_at
+        and isinstance(item.get("updated_at"), str)
+        and item["updated_at"] >= old["updated_at"]
+        and (closed_at != old.get("closed_at") or item["updated_at"] > old["updated_at"])
+    ):
+        return closed_at
+    return None
 
 
 class Store:
@@ -444,11 +482,11 @@ class Store:
         publication.initialize(self.db)
         doctor.initialize(self.db)
         if self.db.execute("PRAGMA user_version").fetchone()[0] < 1:
-            analysis_columns = {row[1] for row in self.db.execute("PRAGMA table_info(analyses)")}
+            analysis_columns = set(_table_columns(self.db, "analyses"))
             for name in ("source_payload", "source_item_id", "review_record"):
                 if name not in analysis_columns:
                     self.db.execute(f"ALTER TABLE analyses ADD COLUMN {name} TEXT")
-            if "rejections" not in {row[1] for row in self.db.execute("PRAGMA table_info(items)")}:
+            if "rejections" not in _table_columns(self.db, "items"):
                 self.db.execute("ALTER TABLE items ADD COLUMN rejections INTEGER NOT NULL DEFAULT 0")
             self.db.execute("PRAGMA user_version = 1")
         self.db.execute("CREATE INDEX IF NOT EXISTS analyses_source_snapshot ON analyses(source_item_id,created_at DESC,cache_key DESC)")
@@ -469,8 +507,7 @@ class Store:
         if row and row["url"] == source["url"]:
             return dict(row)
         with self.db:
-            self.db.execute("DELETE FROM source_state WHERE id=?", (source["id"],))
-            self.db.execute("INSERT INTO source_state(id,url) VALUES(?,?)", (source["id"], source["url"]))
+            self.db.execute("INSERT OR REPLACE INTO source_state(id,url) VALUES(?,?)", (source["id"], source["url"]))
         return dict(self.db.execute("SELECT * FROM source_state WHERE id=?", (source["id"],)).fetchone())
 
     def source_success(self, source: dict, result: dict, observed: str, *, schedule_from: str | None = None) -> None:
@@ -506,12 +543,12 @@ class Store:
         """Record a failed or catching-up poll with bounded retry backoff."""
         state = self.source(source)
         failures = state["failures"] + 1
-        delay = (
-            source["interval_seconds"]
+        next_fetch = (
+            after(source["interval_seconds"], observed)
             if catching_up
-            else backoff_seconds(failures, collection["failure_backoff_base_seconds"], collection["failure_backoff_cap_seconds"])
+            else backoff_until(failures, collection["failure_backoff_base_seconds"], collection["failure_backoff_cap_seconds"], observed)
         )
-        fields = {"failures": 0 if catching_up else failures, "error": error[:160], "next_fetch_at": after(delay, observed)}
+        fields = {"failures": 0 if catching_up else failures, "error": error[:160], "next_fetch_at": next_fetch}
         if watermark:
             fields["watermark"] = watermark
         assignments = ",".join(f"{name}=?" for name in fields)
@@ -527,35 +564,62 @@ class Store:
         check_requested = (item.get("kind") == "gitlab_issue" and "comments_source_key" not in item
                            and self._comment_requests.pop(item_id, None) == observed)
         row = self.db.execute(
-            """SELECT content_hash,status,story_id,cluster_key,typeof(payload) AS payload_type,
-               CAST(payload AS BLOB) AS payload FROM items WHERE id=?""",
+            """SELECT content_hash,status,story_id,cluster_key,
+               CASE WHEN typeof(payload)='text' THEN CAST(payload AS BLOB) END AS payload FROM items WHERE id=?""",
             (item_id,),
         ).fetchone()
-        old = saved_object(row["payload"]) if row and row["payload_type"] == "text" else None
-        if row and not _valid_saved_item(old):
-            logging.getLogger(__name__).warning("Replacing damaged saved item %s", item_id)
-            requested = "SELECT 1 FROM comment_cache WHERE item_id=? AND (failures>0 OR next_fetch_at<=checked_at)"
-            if row["content_hash"] == content_hash or (row["status"] != "pending" and check_requested
-                                                       and self.db.execute(requested, (item_id,)).fetchone()):
-                with self.db:
-                    self.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps(item, ensure_ascii=False), item_id))
-                return False
-        elif row and row["content_hash"] == content_hash:
-            return False
-        elif row and item["updated_at"] < old["updated_at"]:
-            return False
-        elif row and row["status"] != "pending" and check_requested and item_hash(old) == content_hash:
-            return False
-        elif (
-            row
-            and row["status"] != "pending"
-            and "comments_source_key" not in item
-            and not check_requested
-            and (old.get("public_comments") or old.get("dirauth_notes"))
-            and _uncommented_hash(old, item) == content_hash
-        ):
-            return False
         if row is not None:
+            old = saved_object(row["payload"])
+            requested = "SELECT 1 FROM comment_cache WHERE item_id=? AND (failures>0 OR next_fetch_at<=checked_at)"
+            if _is_compacted_saved_item(self.db, item_id, row, old):
+                body = item.get("source_content", item.get("content"))
+                rehydrated = {**old, "content": body} if isinstance(body, str) else None
+                same_body = rehydrated is not None and item_hash(rehydrated) == row["content_hash"]
+                if (
+                    row["content_hash"] == content_hash
+                    or item["updated_at"] < old["updated_at"]
+                    or (same_body and _unchanged_non_pending(rehydrated, item, content_hash, check_requested=check_requested))
+                ):
+                    closed_at = _updated_closed_at(old, item) if row["content_hash"] == content_hash else None
+                    if (
+                        item.get("kind") == "gitlab_issue"
+                        and (same_body or (row["content_hash"] == content_hash and item["updated_at"] >= old["updated_at"]))
+                        and self.db.execute(requested, (item_id,)).fetchone()
+                    ):
+                        restored = rehydrated if same_body else item
+                        if closed_at is not None and restored is rehydrated:
+                            restored = {**restored, "closed_at": closed_at, "updated_at": item["updated_at"]}
+                        with self.db:
+                            self.db.execute(
+                                "UPDATE items SET payload=? WHERE id=?",
+                                (json.dumps(restored, ensure_ascii=False), item_id),
+                            )
+                    elif closed_at is not None:
+                        with self.db:
+                            self.db.execute(
+                                "UPDATE items SET payload=? WHERE id=?",
+                                (json.dumps({**old, "closed_at": closed_at, "updated_at": item["updated_at"]}, ensure_ascii=False), item_id),
+                            )
+                    return False
+            elif not _valid_saved_item(old):
+                logging.getLogger(__name__).warning("Replacing damaged saved item %s", item_id)
+                if row["content_hash"] == content_hash or (row["status"] != "pending" and check_requested
+                                                           and self.db.execute(requested, (item_id,)).fetchone()):
+                    with self.db:
+                        self.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps(item, ensure_ascii=False), item_id))
+                    return False
+            elif (
+                row["content_hash"] == content_hash
+                or item["updated_at"] < old["updated_at"]
+                or (row["status"] != "pending" and _unchanged_non_pending(old, item, content_hash, check_requested=check_requested))
+            ):
+                if row["content_hash"] == content_hash and (closed_at := _updated_closed_at(old, item)) is not None:
+                    with self.db:
+                        self.db.execute(
+                            "UPDATE items SET payload=? WHERE id=?",
+                            (json.dumps({**old, "closed_at": closed_at, "updated_at": item["updated_at"]}, ensure_ascii=False), item_id),
+                        )
+                return False
             alias = editorial.retired(self.db, story_id=row["story_id"], cluster_key=row["cluster_key"])
             if alias is not None and alias[1] is None:
                 cluster = self.db.execute("SELECT cluster_key FROM story_aliases WHERE story_id=?", (alias[0],)).fetchone()[0]
@@ -564,11 +628,11 @@ class Store:
         try:
             with self.db:
                 self.db.execute(
-                    """INSERT INTO items(id,url,source_id,payload,content_hash,cluster_key,first_seen,last_seen,priority_score)
-                    VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
-                    url=excluded.url,source_id=excluded.source_id,payload=excluded.payload,content_hash=excluded.content_hash,
-                    cluster_key=excluded.cluster_key,last_seen=excluded.last_seen,status='pending',attempts=0,rejections=0,
-                    next_attempt_at=NULL,last_error=NULL,priority_score=excluded.priority_score""",
+                    f"""INSERT INTO items(id,url,source_id,payload,content_hash,cluster_key,first_seen,last_seen,priority_score)
+                        VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                        url=excluded.url,source_id=excluded.source_id,payload=excluded.payload,content_hash=excluded.content_hash,
+                        cluster_key=excluded.cluster_key,last_seen=excluded.last_seen,{editorial.RESET_PENDING_SQL},
+                        priority_score=excluded.priority_score""",
                     (item_id, item["url"], item["source_id"], json.dumps(item, ensure_ascii=False), content_hash, cluster, observed, observed, score),
                 )
         except sqlite3.IntegrityError:
@@ -578,23 +642,18 @@ class Store:
 
     def pending(self, limit: int, observed: str) -> list[dict]:
         """Due items, best first, after those waiting for a verification or a release-label repair."""
-        rows = []
-        for row in self.db.execute(
-            """SELECT id,url,source_id,content_hash,cluster_key,first_seen,last_seen,status,attempts,
-               rejections,next_attempt_at,last_error,priority_score,story_id,
-               typeof(payload) AS _payload_type,CAST(payload AS BLOB) AS _payload_blob
-               FROM items WHERE status='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?)
-               ORDER BY id IN (SELECT item_id FROM review_jobs WHERE stage IN ('verify','repair')) DESC,
-               priority_score DESC,last_seen DESC,id LIMIT ?""",
+        rows = self.db.execute(
+            f"""SELECT {ITEM_SAFE_COLUMNS} FROM items
+                WHERE status='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+                ORDER BY id IN (SELECT item_id FROM review_jobs WHERE stage IN ('verify','repair')) DESC,
+                priority_score DESC,last_seen DESC,id LIMIT ?""",
             (observed, limit),
-        ).fetchall():
-            if row["_payload_type"] == "text" and saved_object(row["_payload_blob"]) is not None:
-                entry = {k: row[k] for k in row.keys() if not k.startswith("_")}
-                entry["payload"] = str(row["_payload_blob"], "utf-8")
-                rows.append(entry)
-            else:
-                rows.append({"id": row["id"], "damaged": True})
-        return rows
+        ).fetchall()
+        return [
+            entry if _valid_pending_payload(entry, payload) else {"id": row["id"], "damaged": True}
+            for row in rows
+            for entry, payload in (decode_item_row(row),)
+        ]
 
     def pending_count(self) -> int:
         """Return the total number of items currently in pending status."""
@@ -602,17 +661,25 @@ class Store:
 
     def require_pending_item(self, row: dict, message: str) -> dict:
         """Read the complete source/association identity under the caller's write transaction."""
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+            raise candidate.StaleCandidate(message)
         if not self.db.in_transaction:
             self.db.execute("BEGIN IMMEDIATE")
-        current = self.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()
+        raw = self.db.execute(f"SELECT {ITEM_SAFE_COLUMNS} FROM items WHERE id=?", (row["id"],)).fetchone()
+        current, payload = decode_item_row(raw)
         try:
-            same = (current is not None and current["status"] == "pending"
-                    and candidate.item_fingerprint(dict(current)) == candidate.item_fingerprint(row))
+            row_payload = saved_object(row["payload"].encode("utf-8")) if isinstance(row.get("payload"), str) else None
+            same = (
+                _valid_pending_payload(current, payload)
+                and _valid_pending_payload(row, row_payload)
+                and current["status"] == "pending"
+                and candidate.item_fingerprint(current) == candidate.item_fingerprint(row)
+            )
         except (ValueError, TypeError, KeyError, AttributeError, UnicodeError, RecursionError):
             same = False
         if not same:
             raise candidate.StaleCandidate(message)
-        return dict(current)
+        return current
 
     def defer(self, item_id: str, error: str, llm: dict, observed: str, *, terminal: bool = False,
               code: str = "app.unexpected", expected_row: dict | None = None) -> bool:
@@ -640,11 +707,11 @@ class Store:
             if rejections >= 3:
                 self.reject(item_id, error, "failed." + code, observed)
                 return True
-            delay = backoff_seconds(attempts, llm["retry_base_seconds"], llm["retry_cap_seconds"])
+            next_at = backoff_until(attempts, llm["retry_base_seconds"], llm["retry_cap_seconds"], observed)
             return bool(self.db.execute(
                 "UPDATE items SET attempts=?,rejections=?,last_error=?,next_attempt_at=? "
                 "WHERE id=? AND status='pending'",
-                (attempts, rejections, error[:160], after(delay, observed), item_id),
+                (attempts, rejections, error[:160], next_at, item_id),
             ).rowcount)
 
     def reject(self, item_id: str, error: str, code: str, observed: str) -> None:
@@ -664,8 +731,8 @@ class Store:
     def record_analysis(self, row: dict, result: dict, cache_key: str, observed: str, *,
                         review_record: dict | None = None) -> str:
         """Append immutable private evidence; the caller owns the transaction."""
-        result_json = json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False)
-        record_json = json.dumps(review_record, ensure_ascii=False, sort_keys=True, allow_nan=False) if review_record is not None else None
+        result_json = strict_json(result)
+        record_json = strict_json(review_record) if review_record is not None else None
         values = (result_json, row["payload"], row["id"], record_json)
         previous = self.db.execute(
             """SELECT result,source_payload,source_item_id,review_record,
@@ -713,38 +780,37 @@ class Store:
     def add_citation(self, row: dict, story_id: str, observed: str) -> dict:
         """Attach a corroborating tag source without model calls or moving updated_at."""
         with immediate_transaction(self.db, "Citation commit requires a fresh transaction"):
-            current = self.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()
-            if (current is None or current["status"] != "pending"
-                    or candidate.item_fingerprint(dict(current)) != candidate.item_fingerprint(row)):
-                raise candidate.StaleCandidate("Source item changed before citation committed")
-            story_row = self.db.execute("SELECT * FROM stories WHERE id=?", (story_id,)).fetchone()
-            if story_row is None:
-                if editorial.retired(self.db, story_id=story_id) is not None:
-                    raise editorial.RetiredStory("Story is retired")
-                raise candidate.StaleCandidate("Target story is no longer available")
-            if editorial.retired(self.db, story_id=story_id, cluster_key=story_row["cluster_key"]) is not None:
+            current = self.require_pending_item(row, "Source item changed before citation committed")
+            story_row = self.db.execute(
+                "SELECT id,cluster_key,CASE WHEN typeof(payload)='text' THEN CAST(payload AS BLOB) END AS payload FROM stories WHERE id=?",
+                (story_id,),
+            ).fetchone()
+            if editorial.retired(self.db, story_id=story_id, cluster_key=story_row["cluster_key"] if story_row else None) is not None:
                 raise editorial.RetiredStory("Story is retired")
+            if story_row is None or (story_payload := saved_object(story_row["payload"])) is None:
+                raise candidate.StaleCandidate("Target story is no longer available")
             locked = editorial.is_locked(self.db, story_id)
-            item = json.loads(row["payload"])
-            source = {key: item[key] for key in ("id", "url", "title", "published_at")}
-            cache_key = digest(["citation", row["id"], row["content_hash"], story_id])
-            review_record = {"schema_version": 1, "writer": None, "input_hash": row["content_hash"], "reviews": [],
+            source = item_source(json.loads(current["payload"]))
+            if not safe_canonical_url(source["url"]):
+                raise candidate.StaleCandidate("Source item URL is invalid")
+            cache_key = digest(["citation", current["id"], current["content_hash"], story_id])
+            review_record = {"schema_version": 1, "writer": None, "input_hash": current["content_hash"], "reviews": [],
                              "outcome": "locked" if locked else "cited", "story_id": story_id}
-            analysis_key = self.record_analysis(row, {"citation": source["url"], "story_id": story_id},
+            analysis_key = self.record_analysis(current, {"citation": source["url"], "story_id": story_id},
                                                 cache_key, observed, review_record=review_record)
             if locked:
                 editorial.record_held(self.db, story_id)
                 code = "held.gate.story_locked"
             else:
-                self._append_citation(story_id, json.loads(story_row["payload"]), source)
+                self._append_citation(story_id, story_payload, source)
                 code = "published.update"
             self.db.execute(
                 "UPDATE items SET status='published',story_id=?,next_attempt_at=NULL,last_error=NULL WHERE id=?",
-                (story_id, row["id"]),
+                (story_id, current["id"]),
             )
             if not locked:
-                self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
-            decisions.record(self.db, row["id"], code, observed, review=review_record)
+                self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (current["id"],))
+            decisions.record(self.db, current["id"], code, observed, review=review_record)
         return {"story_id": story_id, "status": "locked" if locked else "cited", "analysis_key": analysis_key}
 
     def commit_candidate(self, prepared: dict, approved_candidate: dict | None, cache_key: str, observed: str, *,
@@ -769,7 +835,7 @@ class Store:
                             or review_record.get("outcome") != "operator_approved"
                             or not isinstance(approval_meta.get("reason"), str) or not approval_meta["reason"]):
                         raise ReviewRequired("Operator approval requires an operator_approval audit record")
-                    effective_users = self.dirauth_users if self.dirauth_users is not None else prepared.get("dirauth_users")
+                    effective_users = prepared["dirauth_users"] if "dirauth_users" in prepared else self.dirauth_users
                     current = candidate.prepare(
                         self.db, row, result, prepared["observed"], dirauth_users=effective_users
                     )
@@ -800,39 +866,39 @@ class Store:
             cited_on_skip = False
             if not locked:
                 if decision == "approve":
-                    payload = json.loads(json.dumps(prepared["payload"]))
+                    payload = copy.deepcopy(prepared["payload"])
                     payload.update({key: approved_candidate[key] for key in editable_fields})
                     new = self.db.execute("SELECT 1 FROM stories WHERE id=?", (story_id,)).fetchone() is None
                     if new:
                         payload["added_at"] = observed
                     code = "operator.approved" if operator else ("published.new" if new else "published.update")
                 else:
-                    failed_criteria = {name for name, check in verdict["criteria"].items() if check["outcome"] != "pass"}
-                    skipped = ("Final review skipped: " + ", ".join(
-                        name for name, check in verdict["criteria"].items() if check["outcome"] != "pass"))[:160]
+                    failed_criteria = list(decisions.failed_criteria(verdict["criteria"]))
+                    skipped = ("Final review skipped: " + ", ".join(failed_criteria))[:160]
                     code = decisions.skip_code(review_record, verdict)
                     item_obj = json.loads(row["payload"])
                     if (
-                        failed_criteria == {"new_information"}
+                        failed_criteria == ["new_information"]
                         and ((row.get("cluster_key") or "").startswith("release:") or item_obj.get("kind") == "metrics_timeline")
                         and story_id in verdict["criteria"]["new_information"]["reason"]
                         and not editorial.is_locked(self.db, story_id)
                     ):
                         existing_row = self.db.execute("SELECT payload FROM stories WHERE id=?", (story_id,)).fetchone()
                         if existing_row is not None:
-                            cite_source = {key: item_obj[key] for key in ("id", "url", "title", "published_at")}
-                            self._append_citation(story_id, json.loads(existing_row[0]), cite_source)
+                            self._append_citation(story_id, json.loads(existing_row[0]), item_source(item_obj))
                             cited_on_skip = True
             analysis_key = self.record_analysis(row, result, cache_key, observed, review_record=review_record)
             if payload is not None:
                 if prepared.get("mode", "story") == "story" and payload.get("editorial_item") == row["id"]:
                     payload["editorial_analysis_key"] = analysis_key
-                cursor = self.db.execute(
-                    """INSERT INTO stories(id,cluster_key,payload,published_at,updated_at)
-                       VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at""",
-                    (story_id, prepared["cluster_key"], json.dumps(payload, ensure_ascii=False, allow_nan=False), payload["published_at"], payload["updated_at"]),
-                )
-                if not cursor.rowcount:
+                if not upsert_story(
+                    self.db,
+                    story_id,
+                    prepared["cluster_key"],
+                    json.dumps(payload, ensure_ascii=False, allow_nan=False),
+                    payload["published_at"],
+                    payload["updated_at"],
+                ):
                     raise editorial.RetiredStory("Story is retired")
             elif locked:
                 editorial.record_held(self.db, story_id)
@@ -850,8 +916,8 @@ class Store:
                 )
                 if not keep_mapping:
                     story_row = self.db.execute("SELECT CAST(payload AS BLOB) FROM stories WHERE id=?", (prior_story_id,)).fetchone()
-                    story_obj = saved_object(story_row[0]) if story_row is not None else None
-                    keep_mapping = isinstance(story_obj, dict) and candidate.story_cites_item(story_obj, row["id"], row.get("url"))
+                    story_obj = saved_object(story_row[0] if story_row else None)
+                    keep_mapping = story_obj is not None and candidate.story_cites_item(story_obj, row["id"], row.get("url"))
                 mapped_id = prior_story_id if keep_mapping else None
             else:
                 mapped_id = None
@@ -862,9 +928,7 @@ class Store:
                 validate_review_state(review_record, "locked", None, prepared)
                 # Unlocking or transferring a held update changes its context,
                 # but must not replenish attempts already spent before the lock.
-                self.db.execute("""UPDATE review_jobs SET stage='locked',record_json=?,approval_key=NULL,updated_at=?
-                                   WHERE item_id=?""", (json.dumps(review_record, ensure_ascii=False, sort_keys=True,
-                                                                  allow_nan=False), observed, row["id"]))
+                set_job_stage(self.db, row["id"], "locked", review_record, observed)
             else:
                 self.db.execute("DELETE FROM review_jobs WHERE item_id=?", (row["id"],))
             decisions.record(self.db, row["id"], code, observed, review=review_record, reason=operator_reason)

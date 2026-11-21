@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import base64
-import binascii
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
-from .collect import CollectionError, fetch_cached, make_item
-from .util import after, digest, format_utc, parse_utc, plain_text
+from .collect import CollectionError, cached_result, fetch_cached, make_item
+from .util import UTC, after, digest, format_utc, plain_text, timestamp
 
 
 _COLUMNS = ("start date", "end date", "places", "protocols", "description", "links", "?")
 _ROW = re.compile(r"\|(?:(?:\\.|[^\\|])*\|){7}")
 _CELL = re.compile(r"((?:\\.|[^\\|])*)\|")
+_AUTOLINK_RE = re.compile(r"<(https?://[^>\s]+)>", re.I)
+
+
+def _clean_cell(cell: str, limit: int) -> str:
+    return plain_text(_AUTOLINK_RE.sub(r"\1", cell), limit)
 
 
 def _cells(line: str) -> list[str]:
@@ -29,7 +33,7 @@ def _date(value: str) -> str:
     if not re.fullmatch(r"~?\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}(?::\d{2})?)?", value):
         raise ValueError("Invalid timeline event date")
     # Unspecified timezones are read as UTC; the raw value stays in the item context.
-    return format_utc(datetime.fromisoformat(value.removeprefix("~")).replace(tzinfo=timezone.utc))
+    return format_utc(datetime.fromisoformat(value.removeprefix("~")).replace(tzinfo=UTC))
 
 
 def _rows(text: str):
@@ -48,17 +52,19 @@ def _rows(text: str):
         yield line_number, _cells(line)
 
 
-def collect_timeline(client, source: dict, url: str, state: dict, settings: dict, started: str) -> dict:
+def collect_timeline(
+    client, source: dict, url: str, state: dict, settings: dict, started: str, *, request_url: str | None = None
+) -> dict:
     """Collect a validated repository snapshot; only recent event dates qualify.
 
     A recent start or explicit end qualifies a row and dates its item. Neither an
     ongoing marker nor a repository commit/fetch timestamp makes a historical row new.
     """
-    response = fetch_cached(client, url, state)
+    response = fetch_cached(client, url, state, request_url=request_url)
     if response.status == 304:
-        return {"items": [], "url": url, "etag": state.get("etag"), "last_modified": state.get("last_modified")}
+        return cached_result(url, response, state)
     try:
-        api = urlsplit(url)
+        api = urlsplit(request_url or url)
         match = re.fullmatch(r"(/api/v4/projects/[^/]+)/repository/files/([^/]+)", api.path)
         record = response.json()
         if not match or not isinstance(record, dict) or record.get("encoding") != "base64":
@@ -71,7 +77,7 @@ def collect_timeline(client, source: dict, url: str, state: dict, settings: dict
         if not isinstance(commit, dict) or commit.get("id") != revision:
             raise ValueError("Timeline commit metadata does not match its file revision")
         # Revision time orders corrections; a skewed committer clock cannot postdate items.
-        revision_time = min(format_utc(parse_utc(commit.get("committed_date"))), started)
+        revision_time = min(timestamp(commit.get("committed_date")), started)
         repository = source["website_url"].rstrip("/")
         cutoff = after(-settings["lookback_days"] * 86400, started)
         identities = {}
@@ -93,26 +99,33 @@ def collect_timeline(client, source: dict, url: str, state: dict, settings: dict
                 continue
             item = None
             if recent:
-                context = (
+                limit = settings["content_chars"]
+                clean_places = _clean_cell(places, limit)
+                clean_protocols = _clean_cell(protocols, limit)
+                clean_desc = _clean_cell(description, limit)
+                clean_refs = _clean_cell(references, limit)
+                context = plain_text(
                     "Metrics Timeline entry. Event dates are not publication timestamps; "
                     "date-only values and unspecified timezones are normalized only for ordering. "
                     "Repository revision time is not event time. "
                     "An old ongoing marker is not proof that conditions continue today.\n"
                     f"Start date as supplied: {start}\nEnd date as supplied: {end or 'point event'}\n"
-                    f"Places: {places or 'not specified'}\nProtocols: {protocols or 'not specified'}\n"
+                    f"Places: {clean_places or 'not specified'}\nProtocols: {clean_protocols or 'not specified'}\n"
                     f"Unknown cause: {'Yes; preserve this uncertainty' if unknown else 'not marked unknown'}\n"
-                    f"Description: {description}\nReferences: {references or 'none listed'}"
+                    f"Description: {clean_desc}\nReferences: {clean_refs or 'none listed'}",
+                    limit,
+                    html=False,
                 )
                 citation = repository + "/-/blob/" + revision + "/" + quote(path, safe="/") + "?plain=1#L" + str(line)
-                item = make_item(source, citation, description, plain_text(context, settings["content_chars"]),
+                item = make_item(source, citation, _AUTOLINK_RE.sub(r"\1", description), context,
                                  published if start_recent else updated, revision_time)
                 if not item["title"]:
                     raise ValueError("Timeline event has no readable description")
                 item["source_entry_id"] = entry_id
             identities[entry_id] = {"fingerprint": fingerprint, "recent": recent, "ambiguous": False, "item": item}
-    except (ValueError, TypeError, KeyError, UnicodeError, binascii.Error) as exc:
+    except (ValueError, TypeError, KeyError) as exc:
         raise CollectionError("Invalid Metrics Timeline snapshot: " + str(exc)) from None
     items = [entry["item"] for entry in identities.values() if entry["item"] and not entry["ambiguous"]]
     if any(entry["ambiguous"] and entry["recent"] for entry in identities.values()):
         raise CollectionError("Ambiguous recent timeline identities skipped", items, catching_up=True)
-    return {"items": items, "url": url, "etag": response.headers.get("etag"), "last_modified": response.headers.get("last-modified")}
+    return cached_result(url, response, state, items)

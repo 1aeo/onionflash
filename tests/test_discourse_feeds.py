@@ -19,6 +19,7 @@ BODY = ("<p>The project is evaluating additional defenses.</p>"
 
 
 def footer(posts=1, participants=1, url=TOPIC):
+    """Build a synthetic Discourse RSS topic footer trailer."""
     return (f'<p><small>{posts} post{"s" if posts != 1 else ""} - '
             f'{participants} participant{"s" if participants != 1 else ""}</small></p>\n'
             f'<p><a href="{escape(url, quote=True)}">Read full topic</a></p>')
@@ -26,6 +27,7 @@ def footer(posts=1, participants=1, url=TOPIC):
 
 def collected(body=BODY, trailer=None, *, discourse=True, prefix="discourse", encoded=False,
               topic=TOPIC, observed=DATE, limit=None):
+    """Collect one synthetic Discourse RSS feed entry with an optional trailer."""
     namespace = f'xmlns:{prefix}="http://www.discourse.org/"' if discourse else ""
     element = "content:encoded" if encoded else "description"
     content = body + "\n  " + (footer(url=topic) if trailer is None else trailer)
@@ -41,6 +43,7 @@ def collected(body=BODY, trailer=None, *, discourse=True, prefix="discourse", en
 
 
 def publish_initial(store, item):
+    """Ingest and publish `item` as the initial developing story in `store`."""
     assert store.ingest(item, DATE)
     finish_reviewed(store, store.pending(1, DATE)[0], analysis(
         title="Tor evaluates further defenses", summary=plain_text(BODY, 1000), why_it_matters="",
@@ -51,6 +54,7 @@ def publish_initial(store, item):
 
 @pytest.mark.parametrize("encoded,prefix", [(False, "discourse"), (True, "forum")])
 def test_generated_counts_do_not_requeue_a_published_announcement(store, encoded, prefix):
+    """Ignore Discourse post/participant count changes in the generated footer."""
     initial = collected(encoded=encoded, prefix=prefix)
     assert initial["content"] == plain_text(BODY, 1000)
     published = publish_initial(store, initial)
@@ -68,6 +72,7 @@ def test_generated_counts_do_not_requeue_a_published_announcement(store, encoded
     BODY.replace("<p>Further releases are expected.</p>", ""),
 ])
 def test_real_same_timestamp_body_changes_still_queue(store, edited):
+    """Re-queue an official announcement when body prose changes under the same timestamp."""
     initial = collected()
     published = publish_initial(store, initial)
     changed = collected(edited, footer(3, 2), observed=LATER)
@@ -80,6 +85,7 @@ def test_real_same_timestamp_body_changes_still_queue(store, edited):
 
 @pytest.mark.parametrize("before,after", [("12 relays", "13 relays"), ("8 posts", "9 posts")])
 def test_authored_counts_and_footer_like_text_are_preserved(store, before, after):
+    """Keep authored count text and non-terminal trailers intact when stripping only the footer."""
     authored = BODY + "<p>12 relays reported circuit pressure.</p>" + footer(8, 4)
     initial = collected(authored, footer())
     assert initial["content"] == plain_text(authored, 2000)
@@ -101,10 +107,12 @@ def test_authored_counts_and_footer_like_text_are_preserved(store, before, after
     ("1 post - 1 participant\nRead full topic", True),
 ])
 def test_unproven_or_nonterminal_trailers_are_not_removed(trailer, discourse):
+    """Preserve non-Discourse, mismatched-URL, quoted, or nonterminal trailers."""
     assert collected(trailer=trailer, discourse=discourse)["content"] == plain_text(BODY + "\n  " + trailer, 20000)
 
 
 def test_matching_footer_links_decode_html_entities_and_normalization_stays_bounded():
+    """Decode HTML-escaped footer URLs and bound content after stripping Discourse trailers."""
     topic = TOPIC + "?filter=one&scope=two"
     assert collected(topic=topic)["content"] == plain_text(BODY, 1000)
     body = "<p>" + "Long announcement text. " * 50 + "</p>"
@@ -112,6 +120,7 @@ def test_matching_footer_links_decode_html_entities_and_normalization_stays_boun
 
 
 def test_legacy_footer_body_is_revised_once_without_rewriting_history(store):
+    """Re-ingest stripped body once over a legacy footer-containing stored item without altering history."""
     initial = collected()
     legacy = {**initial, "content": plain_text(BODY + footer(), 20000)}
     published = publish_initial(store, legacy)

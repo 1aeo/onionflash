@@ -11,6 +11,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import random
+import re
 import socket
 import ssl
 import time
@@ -24,7 +25,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 import httpcore
 import httpx
 
-from .util import backoff_seconds
+from .util import backoff_seconds, is_valid_domain
 
 
 RETRY_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
@@ -53,12 +54,15 @@ class DeadlineReached(FetchError):
 
 @dataclass(frozen=True)
 class Response:
+    """Bounded HTTP response with status code, raw bytes, headers, and final URL."""
+
     status: int
     body: bytes
     headers: dict[str, str]
     url: str
 
     def json(self) -> Any:
+        """Decode the response body as JSON or raise a sanitized `FetchError`."""
         try:
             return json.loads(self.body)
         except (ValueError, UnicodeDecodeError, RecursionError):
@@ -66,22 +70,29 @@ class Response:
 
 
 class AddressPolicy:
+    """Connect-time IP policy restricting destinations to global or allowed networks."""
+
     def __init__(self, allowed_networks: Iterable[str] = (), *, resolver: Callable = socket.getaddrinfo):
         self.networks = tuple(ipaddress.ip_network(value, strict=True) for value in allowed_networks)
         if any(net.prefixlen == 0 for net in self.networks):
             raise ValueError("a private-network allowlist must not include a default route")
         self.resolver = resolver
 
-    def permits(self, address: str) -> bool:
+    def permits(self, address: str | ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+        """Return whether `address` is a permitted global or explicitly allowed IP."""
         try:
             ip = ipaddress.ip_address(address)
         except ValueError:
             return False
+        if ip.is_multicast or ip.is_unspecified:
+            return False
+        if isinstance(ip, ipaddress.IPv6Address) and ip.scope_id is not None:
+            return False
         if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-            return self.permits(str(ip.ipv4_mapped))
+            return self.permits(ip.ipv4_mapped)
         if any(ip.version == net.version and ip in net for net in self.networks):
-            return not (ip.is_multicast or ip.is_unspecified)
-        if not ip.is_global or ip.is_multicast or ip.is_unspecified:
+            return True
+        if not ip.is_global:
             return False
         if isinstance(ip, ipaddress.IPv4Address):
             return ip not in _RELAY_6TO4
@@ -89,11 +100,12 @@ class AddressPolicy:
         # address even though the outer IPv6 address is classified as global.
         if ip not in _GLOBAL_UNICAST_V6 or ip.sixtofour or ip.teredo:
             return False
-        if ((int(ip) >> 32) & 0xFDFFFFFF) == 0x00005EFE:
-            return self.permits(str(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)))
+        if ((int(ip) >> 32) & 0xFCFFFFFF) == 0x00005EFE:
+            return self.permits(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
         return True
 
     def addresses(self, host: str, port: int) -> list[str]:
+        """Resolve `host` and return up to eight vetted numeric target addresses."""
         try:
             records = self.resolver(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM, socket.IPPROTO_TCP)
         except (OSError, ValueError):
@@ -104,6 +116,9 @@ class AddressPolicy:
         return addresses[:8]
 
 
+PUBLIC_ADDRESS_POLICY = AddressPolicy()
+
+
 class _CheckedBackend(httpcore.NetworkBackend):
     """Validate DNS at the connect boundary, then connect to a literal IP."""
 
@@ -112,6 +127,7 @@ class _CheckedBackend(httpcore.NetworkBackend):
         self.deadline: float | None = None
 
     def budget(self, timeout: float | None) -> float | None:
+        """Clamp timeout to the remaining request deadline."""
         if self.deadline is None:
             return timeout
         remaining = self.deadline - self.clock()
@@ -121,6 +137,8 @@ class _CheckedBackend(httpcore.NetworkBackend):
 
     def connect_tcp(self, host: str, port: int, timeout: float | None = None,
                     local_address: str | None = None, socket_options: Any = None):
+        """Resolve and validate host addresses, then connect within deadline."""
+        timeout = self.budget(timeout)
         addresses = self.policy.addresses(host, port)
         timeout = self.budget(timeout)
         deadline = self.clock() + timeout if timeout is not None else None
@@ -137,9 +155,11 @@ class _CheckedBackend(httpcore.NetworkBackend):
         raise httpcore.ConnectError("connection failed")
 
     def connect_unix_socket(self, path: str, timeout: float | None = None, socket_options: Any = None):
+        """Reject Unix domain socket connections."""
         raise FetchError("Unix sockets are not permitted")
 
     def sleep(self, seconds: float) -> None:
+        """Sleep for the requested duration."""
         time.sleep(seconds)
 
 
@@ -148,20 +168,30 @@ class _DeadlineStream(httpcore.NetworkStream):
         self.stream, self.budget = stream, budget
 
     def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        """Read up to max_bytes within the remaining deadline."""
         return self.stream.read(max_bytes, timeout=self.budget(timeout))
 
     def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        """Write buffer within the remaining deadline."""
         self.stream.write(buffer, timeout=self.budget(timeout))
 
     def close(self) -> None:
+        """Close the underlying network stream."""
         self.stream.close()
 
     def start_tls(self, ssl_context: ssl.SSLContext, server_hostname: str | None = None,
                   timeout: float | None = None):
+        """Upgrade the stream to TLS within the remaining deadline."""
+        try:
+            bounded = self.budget(timeout)
+        except BaseException:
+            self.stream.close()
+            raise
         return _DeadlineStream(self.stream.start_tls(ssl_context=ssl_context, server_hostname=server_hostname,
-                                                    timeout=self.budget(timeout)), self.budget)
+                                                    timeout=bounded), self.budget)
 
     def get_extra_info(self, info: str) -> Any:
+        """Return extra transport metadata from the underlying stream."""
         return self.stream.get_extra_info(info)
 
 
@@ -173,6 +203,7 @@ class _ResponseStream(httpx.SyncByteStream):
         yield from self.stream
 
     def close(self):
+        """Close the underlying response stream."""
         self.stream.close()
 
 
@@ -186,15 +217,22 @@ class _CheckedTransport(httpx.BaseTransport):
                                             network_backend=self.backend, retries=0)
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
+        """Dispatch an httpx request through the checked connection pool."""
         self.backend.deadline = request.extensions.get("onionflash_deadline")
-        url = httpcore.URL(scheme=request.url.raw_scheme, host=request.url.raw_host,
+        lookup_host = request.extensions.get("onionflash_lookup_host")
+        raw_host = lookup_host.encode("ascii") if isinstance(lookup_host, str) and lookup_host else request.url.raw_host
+        extensions = dict(request.extensions)
+        if raw_host != request.url.raw_host and "sni_hostname" not in extensions:
+            extensions["sni_hostname"] = request.url.raw_host.decode("ascii")
+        url = httpcore.URL(scheme=request.url.raw_scheme, host=raw_host,
                            port=request.url.port, target=request.url.raw_path)
         result = self.pool.handle_request(httpcore.Request(request.method, url, headers=request.headers.raw,
-                                                           content=request.stream, extensions=request.extensions))
+                                                           content=request.stream, extensions=extensions))
         return httpx.Response(result.status, headers=result.headers,
                               stream=_ResponseStream(result.stream), extensions=result.extensions)
 
     def close(self) -> None:
+        """Close the underlying connection pool."""
         self.pool.close()
 
 
@@ -241,6 +279,7 @@ class HttpClient:
                                     timeout=timeout, follow_redirects=False, trust_env=False)
 
     def close(self) -> None:
+        """Close the underlying HTTP connection pool."""
         self._client.close()
 
     def __enter__(self):
@@ -249,10 +288,16 @@ class HttpClient:
     def __exit__(self, *args):
         self.close()
 
-    def _url(self, value: str) -> str:
-        if not isinstance(value, str) or len(value) > 8192 or any(ord(c) < 32 or ord(c) == 127 for c in value):
+    def _parse_url(self, value: str) -> tuple[str, str]:
+        if (
+            not isinstance(value, str)
+            or len(value) > 8192
+            or "\\" in value
+            or any(ord(c) < 33 or ord(c) == 127 or c in "\ufffe\uffff" for c in value)
+        ):
             raise FetchError("invalid destination URL")
         try:
+            value.encode("utf-8")
             parts = urlsplit(value)
             host, port = parts.hostname, parts.port
             allowed_schemes = {"http", "https"} if self.allow_http else {"https"}
@@ -260,18 +305,40 @@ class HttpClient:
                     or parts.scheme not in allowed_schemes or (port is not None and not 1 <= port <= 65535)):
                 raise ValueError
             # IDNA normalization is performed by HTTPX before the actual lookup.
-            normalized = str(httpx.URL(urlunsplit((parts.scheme, parts.netloc, parts.path or "/", parts.query, ""))))
-            actual = urlsplit(normalized)
+            parsed_url = httpx.URL(urlunsplit((parts.scheme, parts.netloc, parts.path or "/", parts.query, "")))
+            host_name = parsed_url.raw_host.decode("ascii").lower()
+            if "%" in host_name or host_name.endswith(".."):
+                raise ValueError
+            clean_host = host_name[:-1] if host_name.endswith(".") else host_name
+            if not clean_host:
+                raise ValueError
             try:
-                if not self.policy.permits(str(ipaddress.ip_address(actual.hostname))):
-                    raise FetchError("destination address is not permitted")
+                ip = ipaddress.ip_address(clean_host)
             except ValueError:
-                pass
-            if self._injected_transport:
-                self.policy.addresses(actual.hostname, actual.port or (443 if actual.scheme == "https" else 80))
-            return normalized
+                if all(re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", part) for part in clean_host.split(".")):
+                    raise ValueError
+                if not self.policy.networks:
+                    if "." not in clean_host or clean_host == "localhost" or clean_host.endswith((".localhost", ".local", ".internal")):
+                        raise FetchError("destination address is not permitted")
+                    if not is_valid_domain(clean_host):
+                        raise ValueError
+                elif not (
+                    is_valid_domain(clean_host)
+                    if "." in clean_host
+                    else re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", clean_host)
+                ):
+                    raise ValueError
+                if clean_host != host_name:
+                    parsed_url = parsed_url.copy_with(host=clean_host)
+            else:
+                if clean_host != host_name or not self.policy.permits(ip):
+                    raise FetchError("destination address is not permitted")
+            return str(parsed_url), host_name
         except (ValueError, httpx.InvalidURL, UnicodeError):
             raise FetchError("invalid destination URL") from None
+
+    def _url(self, value: str) -> str:
+        return self._parse_url(value)[0]
 
     @staticmethod
     def _origin(value: str) -> tuple[str, str, int]:
@@ -283,14 +350,11 @@ class HttpClient:
             self.deadline_reached = True
             raise DeadlineReached(request_started=self._request_started)
 
-    def _pause(self, seconds: float) -> None:
-        self._check_deadline(seconds)
-        self.sleep(seconds)
-
     def _body(self, response: httpx.Response) -> bytes:
         limit = int(self.settings.get("max_response_bytes", 4 * 1024 * 1024))
 
         def check_size(size: int) -> None:
+            """Raise FetchError when size exceeds the configured byte limit."""
             if size > limit:
                 raise FetchError("response exceeds configured byte limit")
 
@@ -349,19 +413,24 @@ class HttpClient:
 
     def request(self, method: str, url: str, headers: dict[str, str] | None = None,
                 json_body: Any = None) -> Response:
+        """Send one bounded GET or POST request with connect-time IP checks and retries."""
         method = method.upper()
         if method not in {"GET", "POST"}:
             raise FetchError("unsupported request method")
         self.deadline_reached = False  # describes this request only, e.g. the last fallback
         self._request_started = False
-        start_url = self._url(url)
+        if self.deadline is not None:
+            self._check_deadline()
+        start_url, start_lookup_host = self._parse_url(url)
         start_headers = {"user-agent": self.settings.get("user_agent", "OnionFlash"),
                          "accept-encoding": "gzip, deflate"}
         start_headers.update({str(k).lower(): str(v) for k, v in (headers or {}).items() if k.lower() != "host"})
         attempts = max(1, min(10, int(self.settings.get("retry_attempts", 3))))
         max_redirects = int(self.settings.get("max_redirects", 4))
         for attempt in range(attempts):
-            current, active_headers, active_method, payload = start_url, dict(start_headers), method, json_body
+            current, lookup_host, active_headers, active_method, payload = (
+                start_url, start_lookup_host, dict(start_headers), method, json_body
+            )
             deadline = self.clock() + float(self.settings.get("total_timeout_seconds", 90.0))
             if self.deadline is not None:
                 self._check_deadline()
@@ -369,26 +438,37 @@ class HttpClient:
             retry_after = None
             try:
                 for redirects in range(max_redirects + 1):
+                    self._check_deadline()
                     # Cookies are unnecessary for source collection and must not
                     # make independently configured source requests stateful.
                     self._client.cookies.clear()
                     self._request_started = True
+                    if self._injected_transport:
+                        self.policy.addresses(lookup_host, self._origin(current)[2])
+                        self._check_deadline()
+                    extensions: dict[str, Any] = {"onionflash_deadline": deadline}
+                    if lookup_host != self._origin(current)[1]:
+                        extensions["onionflash_lookup_host"] = lookup_host
                     with self._client.stream(active_method, current, headers=active_headers, json=payload,
-                                             extensions={"onionflash_deadline": deadline}) as response:
+                                             extensions=extensions) as response:
                         if response.status_code in REDIRECT_STATUSES:
                             if redirects >= max_redirects:
                                 raise FetchError("redirect limit exceeded")
+                            self._check_deadline()
                             location = response.headers.get("location")
                             if not location:
                                 raise FetchError("redirect missing destination")
-                            destination = self._url(urljoin(current, location))
+                            destination, next_lookup_host = self._parse_url(urljoin(current, location))
+                            parsed_location = urlsplit(location)
+                            if not parsed_location.scheme and not parsed_location.netloc and lookup_host.endswith("."):
+                                next_lookup_host = lookup_host
                             if self._origin(destination) != self._origin(current):
                                 if active_method != "GET":
                                     raise FetchError("cross-origin request-body redirect refused")
                                 active_headers = {k: v for k, v in active_headers.items() if k in _SAFE_CROSS_ORIGIN_HEADERS}
                             if response.status_code == 303:
                                 active_method, payload = "GET", None
-                            current = destination
+                            current, lookup_host = destination, next_lookup_host
                             continue
                         if response.status_code in RETRY_STATUSES:
                             raise FetchError(f"HTTP {response.status_code}", status=response.status_code,
@@ -397,11 +477,14 @@ class HttpClient:
                             raise FetchError(f"HTTP {response.status_code}", status=response.status_code)
                         body = b"" if response.status_code in {204, 205, 304} else self._body(response)
                         return Response(response.status_code, body, dict(response.headers), current)
+            except DeadlineReached as exc:
+                self.deadline_reached = True
+                exc.request_started = exc.request_started or self._request_started
+                raise
             except FetchError as exc:
-                if isinstance(exc, DeadlineReached):
-                    exc.request_started = exc.request_started or self._request_started
-                # A deadline stop must not fall back to a shorter wait than Retry-After.
-                if isinstance(exc, DeadlineReached) or not exc.retryable or attempt + 1 >= attempts:
+                if exc.retryable:
+                    self._check_deadline()
+                if not exc.retryable or attempt + 1 >= attempts:
                     raise
                 retry_after = exc.retry_after
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError,
@@ -411,5 +494,7 @@ class HttpClient:
                     raise FetchError("network request failed", retryable=True) from None
             except (httpx.HTTPError, httpcore.ProtocolError, ValueError):
                 raise FetchError("invalid HTTP response") from None
-            self._pause(retry_delay(attempt, self.settings, retry_after))
+            delay = retry_delay(attempt, self.settings, retry_after)
+            self._check_deadline(delay)
+            self.sleep(delay)
         raise FetchError("request retries exhausted", retryable=True)

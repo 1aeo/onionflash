@@ -1,7 +1,5 @@
 """Publication boundary tests: trusted layout, untrusted source content."""
 
-from __future__ import annotations
-
 import copy
 from html.parser import HTMLParser
 import json
@@ -13,12 +11,11 @@ import pytest
 
 from helpers import SITE_CONFIG, STORY, publish_stories
 from onionflash.analyze import SCHEMA
-from onionflash.render import CATEGORIES, _page_url
+from onionflash.render import CATEGORIES, _page_url, prepare_story
 from onionflash.schema import UPDATE_CHARS
 
 
-class Page(HTMLParser):
-    """Inspect actual HTML elements and link labels, ignoring escaped source text."""
+class _Page(HTMLParser):
     def __init__(self, text):
         super().__init__()
         self.tags, self.links, self.summaries = [], [], []
@@ -26,9 +23,11 @@ class Page(HTMLParser):
         self.feed(text)
 
     def handle_starttag(self, tag, attrs):
+        """Record start tags and track active `nav`, `a`, and `summary` elements."""
         attrs = dict(attrs)
         self.tags.append((tag, attrs))
-        if tag == "nav": self.nav = attrs.get("aria-label")
+        if tag == "nav":
+            self.nav = attrs.get("aria-label")
         elif tag == "a":
             self.link = {**attrs, "text": "", "nav": self.nav}
             self.links.append(self.link)
@@ -37,25 +36,33 @@ class Page(HTMLParser):
             self.summaries.append(self.summary)
 
     def handle_endtag(self, tag):
-        if tag == "nav": self.nav = None
-        elif tag == "a": self.link = None
-        elif tag == "summary": self.summary = None
+        """Clear active `nav`, `a`, or `summary` element state on close."""
+        if tag == "nav":
+            self.nav = None
+        elif tag == "a":
+            self.link = None
+        elif tag == "summary":
+            self.summary = None
 
     def handle_data(self, text):
-        if self.link is not None: self.link["text"] += text
-        if self.summary is not None: self.summary["text"] += text
+        """Append text nodes to the active anchor or summary label."""
+        if self.link is not None:
+            self.link["text"] += text
+        if self.summary is not None:
+            self.summary["text"] += text
 
     def story_ids(self):
+        """Return ordered story IDs from rendered `<article class='story'>` cards."""
         return [attrs["id"].removeprefix("story-") for tag, attrs in self.tags if tag == "article" and attrs.get("class") == "story"]
 
 
-def render_site(tmp_path, stories=None, *, health=(), name="site", **site):
+def _render_site(tmp_path, stories=None, *, health=(), name="site", **site):
     output = tmp_path / name
     publish_stories([copy.deepcopy(STORY)] if stories is None else stories, output, health=health, **site)
     return output
 
 
-def assert_skipped(tmp_path, bad, name="bad"):
+def _assert_skipped(tmp_path, bad, name="bad"):
     output = tmp_path / name
     bad = {**bad, "id": "rejected"} if bad["id"] == STORY["id"] else bad
     assert publish_stories([bad, copy.deepcopy(STORY)], output) == 1
@@ -65,14 +72,16 @@ def assert_skipped(tmp_path, bad, name="bad"):
 
 @pytest.fixture(scope="module")
 def shared_sites(tmp_path_factory):
+    """Render shared single-story and paginated multi-story static sites once per module."""
     root = tmp_path_factory.mktemp("rendered")
-    single = render_site(root, name="single")
+    single = _render_site(root, name="single")
     paged_stories = [dict(STORY, id=f"release{n}", added_at=f"2026-11-{n + 1:02}T12:00:00Z") for n in range(3)]
-    paged = render_site(root, paged_stories, page_size=1, name="paged")
+    paged = _render_site(root, paged_stories, page_size=1, name="paged")
     return single, paged
 
 
 def test_valid_feeds_permalink_dates_and_source_domain(shared_sites):
+    """Emit valid RSS/JSON feed permalinks, RFC-2822/ISO timestamps, and source domains."""
     output, _ = shared_sites
     root = ET.parse(output / "feed.xml")
     entry = root.find("./channel/item")
@@ -87,10 +96,11 @@ def test_valid_feeds_permalink_dates_and_source_domain(shared_sites):
 
 
 def test_source_html_and_attributes_are_escaped_in_every_format(tmp_path):
+    """Escape untrusted HTML tags and attributes across HTML pages, RSS, and JSON feeds."""
     story = {**copy.deepcopy(STORY), "title": '<img src=x onerror="alert(1)"> & news',
              "summary": '<script>alert("bad")</script> and </script>',
              "sources": [{"url": STORY["sources"][0]["url"], "title": '"><svg onload=alert(1)>'}]}
-    output = render_site(tmp_path, [story])
+    output = _render_site(tmp_path, [story])
     for file in (output / "index.html", output / "news" / story["id"] / "index.html"):
         text = file.read_text()
         assert "<img src=x" not in text and "<svg onload=" not in text and "<script>alert" not in text and "&lt;script&gt;" in text
@@ -101,12 +111,13 @@ def test_source_html_and_attributes_are_escaped_in_every_format(tmp_path):
 
 
 def test_homepage_orders_by_addition_before_edits_and_keeps_feed_dates(tmp_path):
+    """Order homepage cards by `added_at` while preserving upstream `published_at` in feeds."""
     older = {**STORY, "id": "older", "published_at": "2026-11-01T12:00:00Z", "updated_at": "2026-11-09T12:00:00Z"}
     newer = {**STORY, "id": "newer"}
-    output = render_site(tmp_path, [older, newer])
+    output = _render_site(tmp_path, [older, newer])
     page = (output / "index.html").read_text()
     assert page.index('id="story-newer"') < page.index('id="story-older"')
-    lim_page = (render_site(tmp_path, [older, newer], page_size=1, name="limited") / "index.html").read_text()
+    lim_page = (_render_site(tmp_path, [older, newer], page_size=1, name="limited") / "index.html").read_text()
     assert 'id="story-newer"' in lim_page and 'id="story-older"' not in lim_page
     assert 'Latest story update <time datetime="2026-11-09T12:00:00Z"' in lim_page
     assert json.loads((output / "feed.json").read_text())["items"][0]["id"] == "https://example.com/onionflash/news/older/"
@@ -115,14 +126,14 @@ def test_homepage_orders_by_addition_before_edits_and_keeps_feed_dates(tmp_path)
                   "updated_at": "2026-09-22T12:00:00Z", "added_at": "2026-11-09T12:00:00Z"}
     earlier = {**STORY, "id": "earlier", "published_at": "2026-11-05T12:00:00Z",
                "updated_at": "2026-11-10T12:00:00Z", "added_at": "2026-11-05T12:00:00Z"}
-    added_out = render_site(tmp_path, [earlier, resurfaced], name="added")
+    added_out = _render_site(tmp_path, [earlier, resurfaced], name="added")
     added_page = (added_out / "index.html").read_text()
     assert added_page.index('id="story-resurfaced"') < added_page.index('id="story-earlier"')
     card = added_page[added_page.index('id="story-resurfaced"'):added_page.index('id="story-earlier"')]
     assert '<span class="story-date"><time datetime="2026-11-09T12:00:00Z"' in card and "updated-note" not in card
     res_art = (added_out / "news/resurfaced/index.html").read_text()
     assert 'First published <time datetime="2026-11-09T12:00:00Z"' in res_art and "Last updated" not in res_art
-    same = render_site(tmp_path, [{**resurfaced, "updated_at": resurfaced["added_at"]}], name="same")
+    same = _render_site(tmp_path, [{**resurfaced, "updated_at": resurfaced["added_at"]}], name="same")
     assert "Last updated" not in (same / "news/resurfaced/index.html").read_text()
     ear_art = (added_out / "news/earlier/index.html").read_text()
     assert 'First published <time datetime="2026-11-05T12:00:00Z"' in ear_art and 'Last updated <time datetime="2026-11-10T12:00:00Z"' in ear_art
@@ -131,6 +142,7 @@ def test_homepage_orders_by_addition_before_edits_and_keeps_feed_dates(tmp_path)
 
 
 def test_dated_updates_list_newest_first_and_cards_and_feeds_show_the_latest(tmp_path):
+    """Sanitize `updates`, order article timelines newest-first, and display only the latest update on cards/feeds."""
     src = {"url": "https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/1", "title": "<b>Merge request</b>"}
     quoted, third = {"url": 'https://example.org/a"onmouseover=x', "title": "Quoted"}, {"url": "https://example.org/third", "title": "Third"}
     story = copy.deepcopy(STORY)
@@ -145,7 +157,7 @@ def test_dated_updates_list_newest_first_and_cards_and_feeds_show_the_latest(tmp
         {"at": "2026-11-11T09:00:00Z", "text": "Unsafe source.", "sources": [{"url": "http://example.org/", "title": "x"}]},
         {"at": "2026-11-11T09:00:00Z", "text": " ", "sources": [src]},
     ]
-    output = render_site(tmp_path, [story])
+    output = _render_site(tmp_path, [story])
     public = json.loads((output / "news" / story["id"] / "story.json").read_text())
     assert public["updates"] == [
         {"at": "2026-11-09T09:00:00Z", "text": "The fix was proposed.", "sources": [src]},
@@ -174,10 +186,11 @@ def test_dated_updates_list_newest_first_and_cards_and_feeds_show_the_latest(tmp
 
 @pytest.mark.parametrize("updates", [None, [], "text", [{"at": "2026-11-10T09:00:00Z", "text": "No source."}]])
 def test_a_story_without_updates_has_no_updates_key_or_markup(tmp_path, updates):
+    """Omit `updates` JSON keys and timeline markup when a story has no valid dated updates."""
     story = copy.deepcopy(STORY)
     if updates is not None:
         story["updates"] = updates
-    output = render_site(tmp_path, [story])
+    output = _render_site(tmp_path, [story])
     assert "updates" not in json.loads((output / "news" / story["id"] / "story.json").read_text())
     home = (output / "index.html").read_text()
     assert '<span class="updated-note">Updated <time datetime="2026-11-08T14:00:00Z"' in home
@@ -193,12 +206,14 @@ def test_a_story_without_updates_has_no_updates_key_or_markup(tmp_path, updates)
     "https://example.com/\nmalicious", "https://example.com:99999/",
 ])
 def test_unsafe_sources_cannot_be_published(tmp_path, url):
-    assert_skipped(tmp_path, {**copy.deepcopy(STORY), "sources": [{"url": url, "title": "bad"}]})
+    """Quarantine stories whose only `sources` entry uses a non-public or unsafe URL."""
+    _assert_skipped(tmp_path, {**copy.deepcopy(STORY), "sources": [{"url": url, "title": "bad"}]})
 
 
 @pytest.mark.parametrize("bad_id", ["../outside", "/tmp/escape", "a/b", "a\\b", 'a" onload=x', "", "a" * 65])
 def test_unsafe_ids_cannot_escape_output_directory(tmp_path, bad_id):
-    assert_skipped(tmp_path, {**copy.deepcopy(STORY), "id": bad_id})
+    """Quarantine stories with path-traversal or malformed `id` values."""
+    _assert_skipped(tmp_path, {**copy.deepcopy(STORY), "id": bad_id})
     assert not (tmp_path / "outside").exists()
 
 
@@ -208,28 +223,31 @@ def test_unsafe_ids_cannot_escape_output_directory(tmp_path, bad_id):
     {"category": ["security"]}, {"sources": None}, {"tags": None}, {"title": None},
 ])
 def test_invalid_or_malformed_stored_fields_are_skipped(tmp_path, change):
-    assert_skipped(tmp_path, {**copy.deepcopy(STORY), "id": "malformed0123456789abcdef", **change})
+    """Quarantine stored stories carrying invalid timestamps, enums, or required-field types."""
+    _assert_skipped(tmp_path, {**copy.deepcopy(STORY), "id": "malformed0123456789abcdef", **change})
 
 
 def test_mixed_valid_invalid_stories_malformed_lists_unicode_and_controls(tmp_path, caplog):
+    """Filter bad list items and control characters while logging quarantined peer stories."""
     with_bad_src = copy.deepcopy(STORY)
     with_bad_src["sources"].append({"url": "javascript:alert(1)", "title": "bad"})
-    out1 = render_site(tmp_path, [with_bad_src], name="s1")
+    out1 = _render_site(tmp_path, [with_bad_src], name="s1")
     assert "javascript:" not in (out1 / "index.html").read_text() and "javascript:" not in (out1 / "feed.json").read_text()
 
     noisy = {**copy.deepcopy(STORY), "title": "Straße\x00\x01\x08\ud800 relay notes",
-             "tags": ["release", 7, ["unhashable"], "not-a-topic"], "products": ["tor", None, ["x"], "elsewhere"],
+             "tags": ["release", 7, ["unhashable"], "not-a-topic"], "products": ["tor", "arti", "tor", None, ["x"], "elsewhere"],
              "sources": ["not a source", *STORY["sources"]], "state": "no-longer-listed"}
-    out2 = render_site(tmp_path, [noisy], name="s2")
+    out2 = _render_site(tmp_path, [noisy], name="s2")
     feed_item = json.loads((out2 / "feed.json").read_text())["items"][0]
     assert feed_item["tags"] == ["release"] and STORY["sources"][0]["url"] in feed_item["content_text"]
+    assert json.loads((out2 / "news" / noisy["id"] / "story.json").read_text())["products"] == ["tor", "arti"]
     assert "Straße relay notes</a>" in (out2 / "index.html").read_text() and "data-search" not in (out2 / "index.html").read_text()
     assert ET.parse(out2 / "feed.xml").findtext("./channel/item/title") == "Straße relay notes"
     assert "<span>Event status</span> No longer listed" in (out2 / "news" / noisy["id"] / "index.html").read_text()
     assert "no-longer-listed" not in SCHEMA["properties"]["state"]["enum"]
 
     with pytest.raises(ValueError, match="No stored story can be rendered"):
-        render_site(tmp_path, [{**copy.deepcopy(STORY), "sources": [{"url": "javascript:alert(1)", "title": "bad"}]}], name="allbad")
+        _render_site(tmp_path, [{**copy.deepcopy(STORY), "sources": [{"url": "javascript:alert(1)", "title": "bad"}]}], name="allbad")
 
     bad_peer = {**copy.deepcopy(STORY), "id": "badbadbadbadbadbadbadbad", "sources": [{"url": "javascript:alert(1)", "title": "x"}]}
     mixed = tmp_path / "mixed"
@@ -241,12 +259,14 @@ def test_mixed_valid_invalid_stories_malformed_lists_unicode_and_controls(tmp_pa
 
 @pytest.mark.parametrize("unsafe_url", ["javascript:alert(1)", "https://user:secret@example.org/", "http://127.0.0.1/"])
 def test_unsafe_health_website_url_unlinked(tmp_path, unsafe_url):
-    upage = (render_site(tmp_path, health=[{"name": "Source", "website_url": unsafe_url}]) / "index.html").read_text()
+    """Render unsafe source-health `website_url` values as plain spans rather than anchors."""
+    upage = (_render_site(tmp_path, health=[{"name": "Source", "website_url": unsafe_url}]) / "index.html").read_text()
     assert "<span>Source</span>" in upage and unsafe_url not in upage
 
 
 def test_empty_state_health_panel_headers_and_determinism(tmp_path, shared_sites):
-    empty = render_site(tmp_path, [], name="empty")
+    """Render empty-feed notices, scrubbed health panels, CSP `_headers`, and deterministic outputs."""
+    empty = _render_site(tmp_path, [], name="empty")
     empty_page = (empty / "index.html").read_text()
     assert "The feed is getting started." in empty_page and 'class="story"' not in empty_page
     assert ET.parse(empty / "feed.xml").findall("./channel/item") == [] and json.loads((empty / "feed.json").read_text())["items"] == []
@@ -257,7 +277,7 @@ def test_empty_state_health_panel_headers_and_determinism(tmp_path, shared_sites
         {"name": "Old", "website_url": "https://example.org/b", "stale": True},
         {"name": '<img src=x onerror="alert(1)">', "website_url": "https://example.org/list/?a=1&b=2"},
     ]
-    hpage = (render_site(tmp_path, health=health, name="health") / "index.html").read_text()
+    hpage = (_render_site(tmp_path, health=health, name="health") / "index.html").read_text()
     assert 'Fresh</a><span class="health-state">Collected</span>' in hpage and 'Old</a><span class="health-state delayed">Delayed</span>' in hpage
     assert 'href="https://example.org/list/?a=1&amp;b=2">&lt;img' in hpage and "<img src=x" not in hpage
     assert all(s not in hpage for s in ("Last success", "top-secret", "192.168.50.10"))
@@ -273,12 +293,12 @@ def test_empty_state_health_panel_headers_and_determinism(tmp_path, shared_sites
     assert feeds_hdr.startswith("/onionflash/*.xml\n") and "\n  ! Content-Security-Policy\n" in feeds_hdr
     assert "style-src 'unsafe-inline'" in feeds_hdr and "img-src data:" in feeds_hdr and "'self'" not in feeds_hdr and "Content-Type:" not in headers
 
-    local = render_site(tmp_path, base_url="http://127.0.0.1:8788/", name="local")
+    local = _render_site(tmp_path, base_url="http://127.0.0.1:8788/", name="local")
     assert 'href="http://127.0.0.1:8788/feed.xml"' in (local / "index.html").read_text()
     lheaders = (local / "_headers").read_text()
     assert lheaders.startswith("/*\n") and "\n/*.xml\n  ! Content-Security-Policy\n" in lheaders
 
-    second = render_site(tmp_path, name="sub2")
+    second = _render_site(tmp_path, name="sub2")
     for file in sub.rglob("*"):
         if file.is_file():
             assert file.read_bytes() == (second / file.relative_to(sub)).read_bytes()
@@ -288,10 +308,11 @@ def test_empty_state_health_panel_headers_and_determinism(tmp_path, shared_sites
 
 @pytest.mark.parametrize("rel_html", ["index.html", f"news/{STORY['id']}/index.html", *[f"topics/{t}/index.html" for t in CATEGORIES]])
 def test_zero_js_and_clean_attributes_on_every_html_page(shared_sites, rel_html):
+    """Emit zero JavaScript files, event handlers, or interactive form elements on rendered HTML pages."""
     single, _ = shared_sites
     assert not list(single.rglob("*.js"))
     text = (single / rel_html).read_text()
-    parsed = Page(text)
+    parsed = _Page(text)
     assert not ({tag for tag, _ in parsed.tags} & {"script", "button", "input", "iframe"})
     for _, attrs in parsed.tags:
         assert not any(name.startswith("on") for name in attrs)
@@ -302,8 +323,9 @@ def test_zero_js_and_clean_attributes_on_every_html_page(shared_sites, rel_html)
 
 @pytest.mark.parametrize("topic", [None, *CATEGORIES])
 def test_topic_navigation_marks_current_page(shared_sites, topic):
+    """Mark the active topic link with `aria-current='page'` and expose topic RSS links."""
     single, _ = shared_sites
-    parsed = Page((single / (_page_url("", 1, topic) + "index.html")).read_text())
+    parsed = _Page((single / (_page_url("", 1, topic) + "index.html")).read_text())
     links = [l for l in parsed.links if l["nav"] == "News topics"]
     assert len(links) == 1 + len(CATEGORIES)
     current = [l for l in links if l.get("aria-current") == "page"]
@@ -315,9 +337,10 @@ def test_topic_navigation_marks_current_page(shared_sites, topic):
 
 @pytest.mark.parametrize("num,exp", [(1, "release2"), (2, "release1"), (3, "release0")])
 def test_topic_pagination_canonical_and_prev_next(shared_sites, num, exp):
+    """Emit canonical URLs and accurate `prev`/`next` pagination links across topic pages."""
     _, paged = shared_sites
     purl = _page_url(SITE_CONFIG["site"]["base_url"], num, "release")
-    parsed = Page((paged / _page_url("", num, "release") / "index.html").read_text())
+    parsed = _Page((paged / _page_url("", num, "release") / "index.html").read_text())
     assert parsed.story_ids() == [exp]
     assert [a["href"] for t, a in parsed.tags if t == "link" and a.get("rel") == "canonical"] == [purl]
     nav = [l for l in parsed.links if l["nav"] == "News pages"]
@@ -329,18 +352,20 @@ def test_topic_pagination_canonical_and_prev_next(shared_sites, num, exp):
 
 @pytest.mark.parametrize("bad_topic", ["../outside", "<script>", "tor", ""])
 def test_invalid_topic_slug_rejected(bad_topic):
+    """Raise `ValueError` when `_page_url` receives an unknown or unsafe topic slug."""
     with pytest.raises(ValueError):
         _page_url("https://example.com/", 1, bad_topic)
 
 
 def test_topics_routing_and_global_nav(tmp_path, shared_sites):
+    """Route category/tag stories into topic pages and render closed mobile global navigation."""
     authority = {**copy.deepcopy(STORY), "id": "authority123", "category": "directory-authority",
                  "tags": ["security"], "title": "An authority security report"}
     release = {**copy.deepcopy(STORY), "id": "release456", "category": "release",
                "tags": ["security"], "title": "A security release"}
-    output = render_site(tmp_path, [authority, release])
+    output = _render_site(tmp_path, [authority, release])
     assert 'href="https://example.com/onionflash/topics/security/"' in (output / "index.html").read_text()
-    story_ids = lambda t: set(Page((output / f"topics/{t}/index.html").read_text()).story_ids())
+    story_ids = lambda t: set(_Page((output / f"topics/{t}/index.html").read_text()).story_ids())
     titles = lambda t: {i.findtext("title") for i in ET.parse(output / f"tags/{t}.xml").findall("./channel/item")}
     assert story_ids("security") == {authority["id"], release["id"]}
     assert story_ids("directory-authority") == {authority["id"]} and story_ids("release") == {release["id"]}
@@ -352,7 +377,7 @@ def test_topics_routing_and_global_nav(tmp_path, shared_sites):
     expected_nav = {"Home", "Onion Vanity", "Blog", "Onion Flash", "Metrics",
                     "Exit DNS Health", "AROI Validator", "RouteFluxMap", "Contact"}
     for file in (single / "index.html", single / "news" / STORY["id"] / "index.html"):
-        parsed = Page(file.read_text())
+        parsed = _Page(file.read_text())
         menu = [a for t, a in parsed.tags if t == "details" and a.get("class") == "site-nav-mobile"]
         assert len(menu) == 1 and "open" not in menu[0] and {"text": "Menu"} in parsed.summaries
         links = [l for l in parsed.links if l["nav"] == "1AEO websites"]
@@ -361,4 +386,10 @@ def test_topics_routing_and_global_nav(tmp_path, shared_sites):
         assert all(l.get("aria-current") == "true" for l in links if l["text"] == "Onion Flash")
 
     empty_topic = (single / "topics/network/index.html").read_text()
-    assert "No stories in this topic yet." in empty_topic and Page(empty_topic).story_ids() == []
+    assert "No stories in this topic yet." in empty_topic and _Page(empty_topic).story_ids() == []
+
+
+def test_prepare_story_deduplicates_products_preserving_order():
+    """Deduplicate valid `products` entries in `prepare_story` while preserving first-seen order."""
+    prepared = prepare_story({**copy.deepcopy(STORY), "products": ["arti", "tor", "arti", "network", "tor"]})
+    assert prepared["products"] == ["arti", "tor", "network"]

@@ -10,7 +10,6 @@ CATEGORY_LABELS = {
 CATEGORIES = list(CATEGORY_LABELS)
 PRIORITIES = ["critical", "high", "normal", "low"]
 CONFIDENCES = ["confirmed", "reported", "suspected", "observed-anomaly"]
-CONFIDENCE_LEVELS = CONFIDENCES
 STATES = ["developing", "mitigation-available", "fixed", "resolved", "released", "merged", "tagged"]
 # Pages and operators may also use states the writer never chooses.
 PUBLIC_STATES = STATES + ["no-longer-listed"]

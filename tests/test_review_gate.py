@@ -1,57 +1,26 @@
 """The final-candidate gate resumes completed stages and never publishes unchecked."""
 
-import contextlib
 import json
 import sqlite3
 
 import pytest
 
-from helpers import (DAMAGE, DATE, LATER, ApprovingReviewer, Reviewer, Writer, analysis, approve,
-                     damaged, finish_reviewed, insert_approval, item, job, pending, run_gate as run,
-                     seed_legacy, tag, update_analysis, verdict)
-from onionflash import candidate, cli, decisions, editorial, rejection, review, review_gate
+from helpers import (
+    DAMAGE, DATE, LATER, ApprovingReviewer, FakeLLM, Reviewer, Writer, add_coverage, analysis, damage_item,
+    damaged, decision_codes as codes, downgrade_job_v1, editorial_act, insert_approval, item, item_row, job,
+    job_record, make_config, make_note, mapped_item, patch_cli_pipeline, pending, queued_row, raise_once,
+    run_gate as run, saved_audit as audit, seed_legacy, seed_story, tag, update_analysis, verdict,
+)
+from onionflash import candidate, cli, editorial, rejection, review, review_gate
 from onionflash.analyze import AnalysisError, Analyzer, cache_key, tag_notice
 from onionflash.comments import _compose
-from onionflash.store import ReviewRequired
-from onionflash.transport import FetchError, Response
+from onionflash.store import ReviewRequired, Store
+from onionflash.transport import FetchError
 from onionflash.util import digest, item_cluster
 
 
-def failing(action, *criteria, repair=None):
-    reply = verdict(action, repair=repair, criterion=criteria[0])
-    for name in criteria[1:]:
-        reply["criteria"][name].update(reason="The source does not support this claim.", outcome="fail")
-    return reply
-
-
-def audit(store):
-    return json.loads(store.db.execute("SELECT review_record FROM analyses ORDER BY rowid DESC").fetchone()[0])
-
-
-def codes(store, row):
-    return [entry["code"] for entry in decisions.for_item(store.db, row["id"])]
-
-
-def mapped_item(store, row, story_id):
-    """Start a gate-only scenario after its source-to-story association."""
-    with store.db:
-        store.db.execute("UPDATE items SET story_id=? WHERE id=?", (story_id, row["id"]))
-    return {**row, "story_id": story_id}
-
-
-def add_coverage(store, identity="other-story", **changes):
-    public = {"id": identity, "title": "A previous report", "summary": "The source reported an event.",
-              "why_it_matters": "", "category": "network", "priority": "normal", "confidence": "reported",
-              "state": "developing", "products": ["tor"], "tags": ["network"],
-              "sources": [{"url": "https://example.org/" + identity, "title": "Original source"}],
-              "published_at": DATE, "updated_at": DATE, "added_at": DATE, **changes}
-    with store.db:
-        store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)",
-                         (identity, identity, json.dumps(public), public["published_at"], public["updated_at"]))
-    return public
-
-
 def test_approved_exact_candidate_commits_dates_story_and_keeps_audit(context, monkeypatch):
+    """Commit an approved story candidate with current `added_at` and full two-stage audit."""
     cfg, store = context
     row = pending(store)
     writer, checker = Writer(), Reviewer(verdict())
@@ -69,6 +38,7 @@ def test_approved_exact_candidate_commits_dates_story_and_keeps_audit(context, m
 
 @pytest.mark.parametrize("failure", [AnalysisError("timeout", retryable=True), {}])
 def test_review_timeout_or_malformed_verdict_resumes_without_regenerating_writer(context, failure):
+    """Resume a failed or malformed review from `review` stage without re-calling the writer."""
     cfg, store = context
     row = pending(store)
     with pytest.raises(AnalysisError) as caught:
@@ -85,6 +55,7 @@ def test_review_timeout_or_malformed_verdict_resumes_without_regenerating_writer
 
 
 def test_repair_requires_fresh_verification_and_resumes_that_exact_stage(context):
+    """Persist repaired candidates in `verify` stage and resume verification without re-drafting."""
     cfg, store = context
     row = pending(store)
     first = Reviewer(verdict("revise", repair={"why_it_matters": ""}), AnalysisError("timeout", retryable=True))
@@ -100,46 +71,47 @@ def test_repair_requires_fresh_verification_and_resumes_that_exact_stage(context
     assert [e["stage"] for e in audit(store)["reviews"]] == ["review", "verification"]
 
 
-def test_verification_repairs_are_verified_fresh_and_stop_after_five(tmp_path):
-    from onionflash.config import DEFAULTS
-    from onionflash.store import Store
+def test_verification_repairs_are_verified_fresh(context):
+    """Verify iterative repairs fresh and commit the final approved summary."""
+    cfg, store = context
+    row = pending(store)
+    checker = Reviewer(verdict(), verdict("revise", repair={"summary": "A first repair."}),
+                       verdict("revise", repair={"summary": "A second repair."}), verdict())
+    result = run(cfg, store, row, Writer(), checker)
+    assert result == {"status": "published", "writer_calls": 1, "review_calls": 4, "cache_hit": False}
+    assert [c[2] for c in checker.calls] == [False, True, True, True]
+    assert [c[0]["summary"] for c in checker.calls[1:]] == [checker.calls[0][0]["summary"], "A first repair.", "A second repair."]
+    assert all(c[1] == checker.calls[0][1] for c in checker.calls) and all(c == checker.coverages[0] for c in checker.coverages)
+    assert store.stories()[0]["summary"] == "A second repair."
+    assert [e["stage"] for e in audit(store)["reviews"]] == ["review", "verification", "verification", "verification"]
+    assert audit(store)["outcome"] == "approved"
 
-    cfg = {**DEFAULTS, "storage": {"database": str(tmp_path / "ok.db"), "output_dir": str(tmp_path / "pub")}, "sources": []}
-    with Store(cfg["storage"]["database"]) as store:
-        row = pending(store)
-        checker = Reviewer(verdict(), verdict("revise", repair={"summary": "A first repair."}),
-                           verdict("revise", repair={"summary": "A second repair."}), verdict())
-        result = run(cfg, store, row, Writer(), checker)
-        assert result == {"status": "published", "writer_calls": 1, "review_calls": 4, "cache_hit": False}
-        assert [c[2] for c in checker.calls] == [False, True, True, True]
-        assert [c[0]["summary"] for c in checker.calls[1:]] == [checker.calls[0][0]["summary"], "A first repair.", "A second repair."]
-        assert all(c[1] == checker.calls[0][1] for c in checker.calls) and all(c == checker.coverages[0] for c in checker.coverages)
-        assert store.stories()[0]["summary"] == "A second repair."
-        assert [e["stage"] for e in audit(store)["reviews"]] == ["review", "verification", "verification", "verification"]
-        assert audit(store)["outcome"] == "approved"
 
-    with Store(tmp_path / "cap.db") as store:
-        row = pending(store)
-        repairs = [verdict("revise", repair={"summary": f"Repair number {n}."}) for n in range(7)]
-        with pytest.raises(AnalysisError):
-            run(cfg, store, row, Writer(), Reviewer(*repairs[:4], AnalysisError("timeout", retryable=True)))
-        assert job(store)["stage"] == "verify"
-        writer, checker = Writer(), Reviewer(*repairs[4:])
-        with pytest.raises(review.ReviewLimitReached):
-            run(cfg, store, row, writer, checker)
-        assert writer.calls == [] and [c[2] for c in checker.calls] == [True, True]
-        assert codes(store, row) == ["failed.review.request_limit"] and store.stories() == []
-        assert json.loads(job(store)["record_json"])["request_budget"]["reserved"] == 7
-        shown = rejection.show_item(store, row["id"])["final_review"]
-        assert shown["candidate"]["summary"] == "Repair number 5."
-        assert shown["base_candidate"]["summary"] == analysis()["summary"]
-        assert [(e["phase"], e["verdict"]) for e in shown["reviews"]] == [("review", "revise")] + [("verification", "revise")] * 5
-        assert all(e["failed"] == {"operational_advice": "fail: The source does not support this claim."} for e in shown["reviews"])
-        assert [e["repair"]["summary"] for e in shown["reviews"]] == [f"Repair number {n}." for n in range(6)]
+def test_verification_repairs_stop_after_seven_requests(context):
+    """Raise `ReviewLimitReached` once iterative verification repairs exhaust 7 requests."""
+    cfg, store = context
+    row = pending(store)
+    repairs = [verdict("revise", repair={"summary": f"Repair number {n}."}) for n in range(7)]
+    with pytest.raises(AnalysisError):
+        run(cfg, store, row, Writer(), Reviewer(*repairs[:4], AnalysisError("timeout", retryable=True)))
+    assert job(store)["stage"] == "verify"
+    writer, checker = Writer(), Reviewer(*repairs[4:])
+    with pytest.raises(review.ReviewLimitReached):
+        run(cfg, store, row, writer, checker)
+    assert writer.calls == [] and [c[2] for c in checker.calls] == [True, True]
+    assert codes(store, row) == ["failed.review.request_limit"] and store.stories() == []
+    assert job_record(store)["request_budget"]["reserved"] == 7
+    shown = rejection.show_item(store, row["id"])["final_review"]
+    assert shown["candidate"]["summary"] == "Repair number 5."
+    assert shown["base_candidate"]["summary"] == analysis()["summary"]
+    assert [(e["phase"], e["verdict"]) for e in shown["reviews"]] == [("review", "revise")] + [("verification", "revise")] * 5
+    assert all(e["failed"] == {"operational_advice": "fail: The source does not support this claim."} for e in shown["reviews"])
+    assert [e["repair"]["summary"] for e in shown["reviews"]] == [f"Repair number {n}." for n in range(6)]
 
 
 @pytest.mark.parametrize("case", ["hold", "revise-without-repair", "repeated-text", "tag-notice"])
 def test_verification_refusal_that_cannot_be_repaired_holds(context, case):
+    """Hold items when verification returns hold, empty repair, repeated text, or tag edits."""
     cfg, store = context
     tag_item = item(url="https://example.org/tags/tor-0.4.9.16", title="tor-0.4.9.16", kind="tag", content="")
     incoming, draft = (tag_item, tag_notice(tag_item)) if case == "tag-notice" else (item(), analysis())
@@ -160,12 +132,13 @@ def test_verification_refusal_that_cannot_be_repaired_holds(context, case):
 @pytest.mark.parametrize("replies,status", [
     ([verdict(), verdict("skip", criterion="news_value")], "held"),
     ([verdict(), verdict("skip", criterion="new_information")], "held"),
-    ([failing("revise", "news_value", "operational_advice", repair={"summary": "A shorter summary."}), verdict()], "held"),
-    ([verdict(), failing("revise", "news_value", "operational_advice", repair={"summary": "A shorter summary."})], "held"),
-    ([failing("revise", "news_value", "operational_advice", repair={"summary": "A shorter summary."}),
+    ([verdict("revise", criteria=("news_value", "operational_advice"), repair={"summary": "A shorter summary."}), verdict()], "held"),
+    ([verdict(), verdict("revise", criteria=("news_value", "operational_advice"), repair={"summary": "A shorter summary."})], "held"),
+    ([verdict("revise", criteria=("news_value", "operational_advice"), repair={"summary": "A shorter summary."}),
       verdict("skip", criterion="news_value")], "ignored"),
 ])
 def test_reviews_that_disagree_on_news_value_hold(context, replies, status):
+    """Hold when critique and verification disagree on news value, or ignore when both skip."""
     cfg, store = context
     row = pending(store)
     checker = Reviewer(*replies)
@@ -182,34 +155,31 @@ COVERED = {"url": "https://example.org/covered-story", "content": "Earlier disti
 COVERED_ID = digest(item_cluster(item(**COVERED)))[:24]
 
 
-def duplicate_skip(*extra_criteria):
-    reply = failing("skip", "new_information", *extra_criteria)
-    reply["criteria"]["new_information"]["reason"] = f"Already covered in {COVERED_ID}."
-    return reply
-
-
 @pytest.mark.parametrize("src,replies,status,code", [
     (OFFICIAL, [verdict("skip", criterion="news_value")] * 2, "held", "held.verification.official_not_news"),
     (OFFICIAL, [verdict("skip", criterion="news_value"),
-                failing("revise", "news_value", "operational_advice", repair={"summary": "A shorter summary."}),
+                verdict("revise", criteria=("news_value", "operational_advice"), repair={"summary": "A shorter summary."}),
                 verdict("skip", criterion="news_value")], "held", "held.verification.official_not_news"),
     (OFFICIAL, [verdict("revise", criterion="news_value"), verdict("skip", criterion="news_value")],
      "held", "held.verification.official_not_news"),
-    (OFFICIAL, [verdict("revise", criterion="news_value"), failing("revise", "news_value", "operational_advice")],
+    (OFFICIAL, [verdict("revise", criterion="news_value"), verdict("revise", criteria=("news_value", "operational_advice"))],
      "held", "held.verification.unusable_repair"),
-    (OFFICIAL, [duplicate_skip()], "ignored", "skipped.review.new_information"),
-    (OFFICIAL, [duplicate_skip("news_value")], "ignored", "skipped.review.new_information_and_news_value"),
-    (OFFICIAL, [{**verdict("skip", criterion="news_value"),
-                 "criteria": {**verdict("skip", criterion="news_value")["criteria"],
-                              "new_information": {"reason": "Coverage is truncated.", "source_refs": [], "outcome": "insufficient"}}}],
+    (OFFICIAL, [verdict("skip", criterion="new_information", reason=f"Already covered in {COVERED_ID}.")],
+     "ignored", "skipped.review.new_information"),
+    (OFFICIAL, [verdict("skip", criteria=("new_information", "news_value"), reason=f"Already covered in {COVERED_ID}.")],
+     "ignored", "skipped.review.new_information_and_news_value"),
+    (OFFICIAL, [verdict("skip", criterion="news_value",
+                        criteria={"new_information": {"reason": "Coverage is truncated.", "source_refs": [], "outcome": "insufficient"}})],
      "held", "held.review.model_hold"),
-    (OFFICIAL, [verdict("skip", criterion="news_value"), duplicate_skip()],
+    (OFFICIAL, [verdict("skip", criterion="news_value"),
+                verdict("skip", criterion="new_information", reason=f"Already covered in {COVERED_ID}.")],
      "ignored", "skipped.verification.new_information"),
     ({}, [verdict("skip", criterion="news_value")], "ignored", "skipped.review.news_value"),
     ({**OFFICIAL, "kind": "tag", "title": "tor-0.4.9.16", "content": ""}, [verdict("skip", criterion="news_value")],
      "ignored", "skipped.review.news_value"),
 ])
 def test_official_item_failing_news_value_is_held_not_skipped(context, src, replies, status, code):
+    """Hold non-tag official items failing `news_value` while allowing verified duplicate skips."""
     cfg, store = context
     _, covered_id = seed_legacy(store, item(**COVERED))
     assert covered_id == COVERED_ID
@@ -228,9 +198,9 @@ def test_official_item_failing_news_value_is_held_not_skipped(context, src, repl
 
 
 def test_a_hold_whose_verification_cites_no_source_does_not_record_verified_facts(context):
+    """Require source citations on verification passes before marking `verified_facts` true."""
     cfg, store = context
-    uncited = verdict("skip", criterion="news_value")
-    uncited["criteria"]["source_support"]["source_refs"] = []
+    uncited = verdict("skip", criterion="news_value", criteria={"source_support": {"source_refs": []}})
     row = pending(store, item(**OFFICIAL))
     assert run(cfg, store, row, Writer(), Reviewer(verdict("skip", criterion="news_value"), uncited))["status"] == "held"
     assert (audit(store)["hold_code"], audit(store)["verified_facts"]) == ("official_not_news", False)
@@ -252,6 +222,7 @@ def test_a_hold_whose_verification_cites_no_source_does_not_record_verified_fact
      [False, False], "held", "held.review.disagreed_news"),
 ])
 def test_release_labels_on_an_unreleased_story_get_a_repair_request_then_a_fresh_verification(context, draft, replies, flags, status, code):
+    """Send a targeted `release_labels` repair pass and verify fresh when release labels mismatch state."""
     cfg, store = context
     row = pending(store)
     checker = Reviewer(*replies)
@@ -276,6 +247,7 @@ FIVE_REPAIRS = [verdict("revise", repair={"summary": f"Repair number {n}."}) for
      "held.verification.repairs_exhausted"),
 ])
 def test_an_item_gets_at_most_seven_review_requests(context, replies, code):
+    """Hold items cleanly once repair/release-label passes exhaust the 7-request cap."""
     cfg, store = context
     row = pending(store)
     result = run(cfg, store, row, Writer(analysis(category="release", tags=["release"])), Reviewer(*replies))
@@ -283,10 +255,11 @@ def test_an_item_gets_at_most_seven_review_requests(context, replies, code):
 
 
 def test_receipt_resume_context_invalidation_and_pruning(context, monkeypatch):
+    """Resume cached approvals across crashes, invalidate on context drift, and pin active keys."""
     cfg, store = context
     row = pending(store)
     commit = store.commit_candidate
-    monkeypatch.setattr(store, "commit_candidate", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash")))
+    monkeypatch.setattr(store, "commit_candidate", raise_once(RuntimeError("simulated crash")))
     with pytest.raises(RuntimeError):
         run(cfg, store, row, Writer(), Reviewer(verdict("revise", repair={"summary": "A first repair."}),
                                                 verdict("revise", repair={"summary": "A second repair."}), verdict()))
@@ -296,10 +269,9 @@ def test_receipt_resume_context_invalidation_and_pruning(context, monkeypatch):
     assert res["status"] == "published" and res["cache_hit"] and w0.calls == r0.calls == []
     assert store.stories()[0]["summary"] == "A second repair."
 
-    # Context changes (coverage or policy) invalidate recorded receipt before commit.
     for idx, change in enumerate(("coverage", "policy")):
         row_c = pending(store, item(url=f"https://example.org/ctx-{idx}", content=f"Context change {idx} Compromise report."))
-        monkeypatch.setattr(store, "commit_candidate", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash")))
+        monkeypatch.setattr(store, "commit_candidate", raise_once(RuntimeError("simulated crash")))
         with pytest.raises(RuntimeError):
             run(cfg, store, row_c, Writer(analysis(evidence=[f"Context change {idx}"])), Reviewer(verdict()))
         monkeypatch.setattr(store, "commit_candidate", commit)
@@ -310,10 +282,9 @@ def test_receipt_resume_context_invalidation_and_pruning(context, monkeypatch):
         chk = Reviewer(verdict())
         assert run(cfg, store, row_c, Writer(), chk)["status"] == "published" and [c[2] for c in chk.calls] == [False, True]
 
-    # Cache pruning retains active approval jobs and resuming never temporarily unpins receipt.
     monkeypatch.setattr(review_gate, "MAX_APPROVALS", 1)
     row_p = pending(store, item(url="https://example.org/pin", content="Pinned approval test report."))
-    monkeypatch.setattr(store, "commit_candidate", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("crash")))
+    monkeypatch.setattr(store, "commit_candidate", raise_once(RuntimeError("crash")))
     with pytest.raises(RuntimeError):
         run(cfg, store, row_p, Writer(analysis(evidence=["Pinned approval test report."])), Reviewer(verdict()))
     active = job(store, row_p["id"])["approval_key"]
@@ -326,7 +297,7 @@ def test_receipt_resume_context_invalidation_and_pruning(context, monkeypatch):
     assert store.db.execute("SELECT COUNT(*) FROM review_approvals").fetchone()[0] == 2
 
     save = review_gate._save
-    monkeypatch.setattr(review_gate, "_save", lambda *a, **kw: (save(*a, **kw), (_ for _ in ()).throw(RuntimeError("crash after save"))))
+    monkeypatch.setattr(review_gate, "_save", lambda *a, **kw: (save(*a, **kw), raise_once(RuntimeError("crash after save"))()))
     with pytest.raises(RuntimeError):
         run(cfg, store, row_p, Writer(), Reviewer(), allow_network=False)
     assert job(store, row_p["id"])["approval_key"] == active
@@ -341,6 +312,7 @@ def test_receipt_resume_context_invalidation_and_pruning(context, monkeypatch):
 @pytest.mark.parametrize("column", ["draft_json", "envelope_json", "record_json"])
 @pytest.mark.parametrize("kind", DAMAGE)
 def test_a_damaged_review_job_fails_the_item_and_is_never_reviewed_afresh(context, column, kind):
+    """Fail closed with `app.damaged_job` on corrupted `review_jobs` columns without new calls."""
     cfg, store = context
     row = pending(store)
     with pytest.raises(AnalysisError):
@@ -354,6 +326,7 @@ def test_a_damaged_review_job_fails_the_item_and_is_never_reviewed_afresh(contex
 
 
 def test_a_damaged_review_job_never_stops_the_run(context, monkeypatch):
+    """Strike-reject a damaged `review_jobs` row across `cli.run` cycles without aborting the run."""
     cfg, store = context
     cfg["sources"] = []
     row = pending(store)
@@ -372,6 +345,7 @@ def test_a_damaged_review_job_never_stops_the_run(context, monkeypatch):
 
 @pytest.mark.parametrize("draft,stage", [({}, "verify"), ({"category": "release", "tags": ["release"]}, "repair")])
 def test_pending_resumes_an_unfinished_verification_or_repair_before_new_work(context, draft, stage):
+    """Prioritize items with unfinished `verify` or `repair` jobs ahead of fresh pending items."""
     cfg, store = context
     store.ingest(item(), DATE)
     store.ingest(item(url="https://example.org/routine", title="A routine report", labels=[]), DATE)
@@ -385,6 +359,7 @@ def test_pending_resumes_an_unfinished_verification_or_repair_before_new_work(co
 @pytest.mark.parametrize("repair", [None, {"title": analysis()["title"]}, {"title": ""}],
                          ids=["missing", "unchanged", "invalid"])
 def test_unusable_repair_holds_after_one_call_for_operator_inspection(context, repair):
+    """Hold unusable critique repairs after one call and expose them via `rejection.show_item`."""
     cfg, store = context
     row = pending(store)
     result = run(cfg, store, row, Writer(), Reviewer(verdict("revise", repair=repair)))
@@ -395,18 +370,18 @@ def test_unusable_repair_holds_after_one_call_for_operator_inspection(context, r
 
 @pytest.mark.parametrize("decision", ["approve", "skip"])
 def test_completed_decision_resumes_after_crash_without_any_model_call(context, monkeypatch, decision):
+    """Resume a recorded `approve` or `skip` decision across commit crashes with zero LLM calls."""
     cfg, store = context
     row = pending(store)
     commit = store.commit_candidate
-    monkeypatch.setattr(store, "commit_candidate", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash")))
+    monkeypatch.setattr(store, "commit_candidate", raise_once(RuntimeError("simulated crash")))
     with pytest.raises(RuntimeError):
         run(cfg, store, row, Writer(), Reviewer(verdict(decision, criterion="news_value")))
     assert job(store)["stage"] == ("approved" if decision == "approve" else "skipped") and len(store.stories()) == 0
     store.defer(row["id"], "Unexpected RuntimeError", cfg["llm"], LATER, terminal=True)
-    row = dict(store.db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone())
+    row = item_row(store, row)
     monkeypatch.setattr(store, "commit_candidate", commit)
-    store.ingest(item(url="https://example.org/other-report", content="A routine reply."), DATE)
-    other = dict(store.db.execute("SELECT * FROM items WHERE url=?", ("https://example.org/other-report",)).fetchone())
+    other = pending(store, item(url="https://example.org/other-report", content="A routine reply."))
     assert run(cfg, store, other, Writer(), Reviewer(verdict("skip", criterion="news_value")))["status"] == "ignored"
     writer, checker = Writer(), Reviewer()
     result = run(cfg, store, row, writer, checker, allow_network=False)
@@ -418,10 +393,11 @@ def test_completed_decision_resumes_after_crash_without_any_model_call(context, 
 
 @pytest.mark.parametrize("receipt", ["damaged", "missing"])
 def test_a_recorded_decision_without_a_usable_receipt_reviews_the_draft_again(context, monkeypatch, receipt):
+    """Re-review the saved draft when a recorded decision lacks a readable approval receipt."""
     cfg, store = context
     row = pending(store)
     commit = store.commit_candidate
-    monkeypatch.setattr(store, "commit_candidate", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash")))
+    monkeypatch.setattr(store, "commit_candidate", raise_once(RuntimeError("simulated crash")))
     first = Reviewer(verdict("revise", repair={"why_it_matters": ""}), verdict())
     with pytest.raises(RuntimeError):
         run(cfg, store, row, Writer(analysis(why_it_matters="Operators must edit their relay configuration.")), first)
@@ -444,6 +420,7 @@ FINAL_CHECKS = {
 
 @pytest.mark.parametrize("reason", FINAL_CHECKS)
 def test_verified_approval_failing_a_final_check_is_held_with_its_code(context, reason):
+    """Hold verified candidates that trip deterministic `final_holds` guards without caching receipts."""
     cfg, store = context
     src, draft = FINAL_CHECKS[reason]
     row = pending(store, item(**src))
@@ -457,10 +434,11 @@ def test_verified_approval_failing_a_final_check_is_held_with_its_code(context, 
 
 
 def test_resumed_final_check_source_and_policy_invalidation(context, monkeypatch):
+    """Re-run `final_holds` on resumed approvals and invalidate drafts/reviews appropriately."""
     cfg, store = context
     row = pending(store)
     commit, check = store.commit_candidate, review.final_holds
-    monkeypatch.setattr(store, "commit_candidate", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated crash")))
+    monkeypatch.setattr(store, "commit_candidate", raise_once(RuntimeError("simulated crash")))
     monkeypatch.setattr(review, "final_holds", lambda candidate, prepared: [])
     with pytest.raises(RuntimeError):
         run(cfg, store, row, Writer(analysis(confidence="confirmed")), Reviewer(verdict()))
@@ -472,12 +450,11 @@ def test_resumed_final_check_source_and_policy_invalidation(context, monkeypatch
     assert codes(store, row) == ["held.final_check.confirmed_source"]
     assert rejection.show_item(store, row["id"])["final_review"]["latest_review"]["verdict"] == "approve"
 
-    # Changed source invalidates staged draft; policy change reuses draft but requires fresh review.
     row2 = pending(store, item(url="https://example.org/src-change"))
     with pytest.raises(AnalysisError):
         run(cfg, store, row2, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
     store.ingest(item(url="https://example.org/src-change", content=item()["content"] + " Correction.", updated_at=LATER), LATER)
-    changed = next(r for r in store.pending(5, LATER) if r["url"] == "https://example.org/src-change")
+    changed = queued_row(store, "https://example.org/src-change")
     assert changed["content_hash"] != row2["content_hash"]
     w2 = Writer()
     assert run(cfg, store, changed, w2, Reviewer(verdict()))["writer_calls"] == len(w2.calls) == 1
@@ -490,7 +467,28 @@ def test_resumed_final_check_source_and_policy_invalidation(context, monkeypatch
     assert res3["writer_calls"] == 0 and res3["review_calls"] == 2 and not res3["cache_hit"]
 
 
+def test_writer_mode_change_redrafts_without_resetting_review_spend(context):
+    """Redraft when `writer_reasoning` changes `writer_key` while carrying forward spent review budget."""
+    config, store = context
+    row = pending(store)
+    writer = Writer(analysis(why_it_matters=""))
+    with pytest.raises(AnalysisError):
+        run(config, store, row, writer, Reviewer(AnalysisError("Temporary endpoint failure", retryable=True)))
+    before = job(store)
+    assert job_record(store)["request_budget"]["reserved"] == 1
+    config["llm"]["writer_reasoning"] = True
+    next_writer = Writer(analysis(why_it_matters=""))
+    with pytest.raises(AnalysisError):
+        run(config, store, row, next_writer, Reviewer(AnalysisError("Temporary endpoint failure", retryable=True)))
+    after = job(store)
+    assert len(next_writer.calls) == 1 and before["writer_key"] != after["writer_key"]
+    assert before["policy_hash"] == after["policy_hash"]
+    assert job_record(store)["request_budget"]["reserved"] == 2
+    assert store.stories() == []
+
+
 def test_update_review_repairs_human_lock_and_missing_retained_source(context):
+    """Verify update-mode repairs, operator lock preservation, and missing-retained-source holds."""
     cfg, store = context
     prior_why = "The report requests removal of the old directory-authority keys."
     original = item(content=item()["content"] * 3, updated_at="2026-11-09T12:00:00Z")
@@ -510,40 +508,29 @@ def test_update_review_repairs_human_lock_and_missing_retained_source(context):
     assert story["updates"] == [{"at": incoming["updated_at"], "text": "A second mirror reported the key issue.",
                                  "sources": [{"url": incoming["url"], "title": incoming["title"]}]}]
 
-    # Human lock during review preserves operator text, honors legacy input_row, and rejects stale drafts on newer edits.
     row_lock = pending(store, {**original, "content": original["content"] + " A later report.", "updated_at": LATER})
     with pytest.raises(AnalysisError):
         run(cfg, store, row_lock, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
-    with store.db:
-        saved = job(store)
-        legacy = json.loads(saved["record_json"])
-        for field in ("request_budget", "untrusted_proposals", "input_proof", "input_row"):
-            legacy.pop(field, None)
-        legacy["schema_version"] = 1
-        legacy["policy_hash"] = "a" * 64
-        store.db.execute("UPDATE review_jobs SET policy_hash=?,record_json=? WHERE item_id=?",
-                         (legacy["policy_hash"], json.dumps(legacy), row_lock["id"]))
-    locked_rev = editorial.correct(store.db, story_id, {"why_it_matters": "Operator-reviewed wording."},
-                                   reason="Corrected unsupported advice.", expect_hash=editorial.show(store.db, story_id)["hash"], observed=LATER)
+    downgrade_job_v1(store, row_lock)
+    editorial_act(editorial.correct, store, story_id, {"why_it_matters": "Operator-reviewed wording."},
+                  reason="Corrected unsupported advice.")
     second = run(cfg, store, row_lock, Writer(), Reviewer(), allow_network=False)
     assert second["status"] == "locked" and second["writer_calls"] == second["review_calls"] == 0
     assert store.stories()[0]["why_it_matters"] == "Operator-reviewed wording."
-    editorial.unlock(store.db, story_id, reason="Reopen briefly.", expect_hash=locked_rev["hash"], observed="2026-11-10T12:05:00Z")
+    editorial_act(editorial.unlock, store, story_id, reason="Reopen briefly.", observed="2026-11-10T12:05:00Z")
     row_lock_v2 = pending(store, {**original, "content": original["content"] + " A second follow-up.", "updated_at": "2026-11-10T12:10:00Z"},
                           at="2026-11-10T12:10:00Z", ready="2026-11-10T12:10:00Z")
     with pytest.raises(AnalysisError):
         run(cfg, store, row_lock_v2, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
-    editorial.correct(store.db, story_id, {"why_it_matters": "Re-locked operator wording."},
-                      reason="Re-lock.", expect_hash=editorial.show(store.db, story_id)["hash"], observed="2026-11-10T12:15:00Z")
+    editorial_act(editorial.correct, store, story_id, {"why_it_matters": "Re-locked operator wording."},
+                  reason="Re-lock.", observed="2026-11-10T12:15:00Z")
     row_lock_v3 = pending(store, {**original, "content": original["content"] + " A third follow-up.", "updated_at": "2026-11-10T12:20:00Z"},
                           at="2026-11-10T12:20:00Z", ready="2026-11-10T12:20:00Z")
     assert run(cfg, store, row_lock_v3, Writer(), Reviewer(), allow_network=False)["status"] == "deferred"
 
-    # Missing retained source holds without a review call; network disabled defers cleanly.
     orig2 = item(url="https://example.org/miss-orig", content="Distinct missing source body text long enough to cluster. " * 5, updated_at="2026-11-09T12:00:00Z")
     seed_legacy(store, orig2, analysis(evidence=["Distinct missing source body text"]))
-    with store.db:
-        store.db.execute("UPDATE items SET payload=json_remove(payload,'$.content') WHERE url=?", (orig2["url"],))
+    damage_item(store.db, orig2["id"], "compacted")
     row_miss = pending(store, item(url="https://example.org/miss-mirror", source_id="mirror", content=orig2["content"]))
     res_miss = run(cfg, store, row_miss, Writer(), Reviewer())
     assert res_miss["status"] == "held" and res_miss["review_calls"] == 0
@@ -556,8 +543,8 @@ def test_update_review_repairs_human_lock_and_missing_retained_source(context):
 
 
 def test_tag_notices_citations_updates_and_repair_holds(context, monkeypatch):
+    """Gate literal tag notices, zero-call release citations, and pre-release tag updates."""
     cfg, store = context
-    # Defer an unreviewed tag when network is disabled; hold if review proposes editing literal tag notice.
     t0 = item(title="tor-0.4.9.15", kind="tag", url="https://example.org/tags/0.4.9.15", content="")
     r0 = pending(store, t0)
     assert run(cfg, store, r0, Writer(tag_notice(t0)), Reviewer(), allow_network=False)["status"] == "deferred"
@@ -570,7 +557,6 @@ def test_tag_notices_citations_updates_and_repair_holds(context, monkeypatch):
     assert res_hold["status"] == "held" and res_hold["review_calls"] == 1
     assert "editing a literal tag notice" in store.db.execute("SELECT last_error FROM items WHERE id=?", (r_hold["id"],)).fetchone()[0]
 
-    # Routine tag uses local draft (no HTTP client) and requires editorial review; unreviewed commit raises ReviewRequired.
     r_routine = pending(store, item(kind="tag", title="data-refresh", url="https://example.org/tags/refresh", content="Routine"))
     with Analyzer(cfg) as writer:
         res_skip = run(cfg, store, r_routine, writer, Reviewer(verdict("skip", criterion="news_value")))
@@ -580,31 +566,30 @@ def test_tag_notices_citations_updates_and_repair_holds(context, monkeypatch):
     with pytest.raises(ReviewRequired):
         store.commit_candidate(prep_unrev, prep_unrev["candidate"], "not-reviewed", LATER)
 
-    # Tag never replaces richer tagged or released story in same release cluster (cites with 0 calls).
     for idx, state in enumerate(("tagged", "released")):
         ver = f"0.4.9.{20 + idx}"
         ex_item = item(kind="feed", product="tor", title=f"Tor {ver} release update", url=f"https://example.org/rel-{ver}")
-        finish_reviewed(store, pending(store, ex_item), analysis(title=f"Detailed {ver} update", state=state), f"det-{ver}", DATE)
+        seed_story(store, ex_item, analysis(title=f"Detailed {ver} update", state=state), key=f"det-{ver}", at=DATE)
         before_upd = next(s for s in store.stories(20) if ver in s["title"])["updated_at"]
         later_tag = tag(title=f"tor-{ver}", url=f"https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-{ver}", updated_at="2026-11-09T16:00:00Z")
-        out = review_gate.process_item(cfg, store, pending(store, later_tag), Writer(), Reviewer(), DATE)
+        out = run(cfg, store, pending(store, later_tag), observed=DATE)
         st = next(s for s in store.stories(20) if ver in s["title"])
         assert out["status"] == "cited" and out["writer_calls"] == out["review_calls"] == 0
         assert st["state"] == state and st["updated_at"] == before_upd and len(st["sources"]) == 2
 
     # An associated tag on a pre-release story runs update review without writer LLM calls.
-    monkeypatch.setattr(Analyzer, "complete", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("writer LLM forbidden")))
+    monkeypatch.setattr(Analyzer, "complete", raise_once(AssertionError("writer LLM forbidden")))
     for idx, state in enumerate(("developing", "fixed", "resolved", "mitigation-available", "merged")):
         ver = f"0.4.9.{30 + idx}"
         ex = item(kind="feed", product="tor", title=f"Tor {ver} release preparation", url=f"https://example.org/prep-{ver}")
-        prepared_story = finish_reviewed(store, pending(store, ex), analysis(title=f"Prep {ver}", state=state), f"prep-{ver}", DATE)
+        prepared_story = seed_story(store, ex, analysis(title=f"Prep {ver}", state=state), key=f"prep-{ver}", at=DATE)
         if state == "merged":
             bad_tag = tag(title=f"tor-{ver}", url=f"https://example.org/bad-tag-{ver}", updated_at="2026-11-09T16:00:00Z")
-            bad_row = mapped_item(store, pending(store, bad_tag), prepared_story["story_id"])
+            bad_row = mapped_item(store, pending(store, bad_tag), prepared_story["id"])
             held = run(cfg, store, bad_row, Analyzer(cfg), Reviewer(verdict("revise", update=True, repair={"state": "released"})))
             assert held["status"] == "held" and held["review_calls"] == 1
         t_item = tag(title=f"tor-{ver}", url=f"https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-{ver}", updated_at="2026-11-09T16:00:00Z")
-        tag_row = mapped_item(store, pending(store, t_item), prepared_story["story_id"])
+        tag_row = mapped_item(store, pending(store, t_item), prepared_story["id"])
         with Analyzer(cfg) as real_writer:
             out = review_gate.process_item(cfg, store, tag_row, real_writer, ApprovingReviewer(cfg), "2026-11-09T16:05:00Z")
         st = next(s for s in store.stories(20) if f"Prep {ver}" == s["title"])
@@ -614,10 +599,9 @@ def test_tag_notices_citations_updates_and_repair_holds(context, monkeypatch):
 
 
 def test_editorial_coverage_skips_followups_and_bounds(context, monkeypatch):
+    """Expose same-cycle coverage, preserve stories on skipped follow-ups, and bound coverage size."""
     cfg, store = context
-    # Publication times must stay inside the scenario's fixed chronology.
     monkeypatch.setattr(review_gate, "now_iso", lambda: "2026-11-11T00:00:00Z")
-    # Same-cycle coverage before build is visible to second item without entering evidence packet.
     first_row = pending(store, item(url="https://example.org/cov-first"))
     assert run(cfg, store, first_row, Writer(), Reviewer(verdict()))["status"] == "published"
     first_story = store.stories()[0]
@@ -630,7 +614,6 @@ def test_editorial_coverage_skips_followups_and_bounds(context, monkeypatch):
     assert chk.coverages[0]["recent"][0]["id"] == first_story["id"]
     assert first_story["summary"] not in json.dumps(chk.calls[0][1])
 
-    # Editorial skip on follow-up preserves existing article; material follow-up updates same article.
     orig, sid = seed_legacy(store, item(url="https://example.org/known", content="Known issue Compromise report. " * 3),
                             analysis(summary="Prior text. " * 100, why_it_matters="Prior consequence. " * 25,
                                      evidence=["Known issue Compromise report."]))
@@ -649,7 +632,6 @@ def test_editorial_coverage_skips_followups_and_bounds(context, monkeypatch):
     assert updated["updates"][-1]["text"] == "The source reports a substantive later result."
     assert sid not in {e["id"] for e in chk_u.coverages[0]["recent"]} and chk_u.coverages[1] == chk_u.coverages[0]
 
-    # Interrupted verification restarts critique when coverage changes; approve receipt cannot authorize skip.
     r_int = pending(store, item(url="https://example.org/interrupted"))
     with pytest.raises(AnalysisError):
         run(cfg, store, r_int, Writer(), Reviewer(verdict(), AnalysisError("unavailable", retryable=True)))
@@ -660,11 +642,10 @@ def test_editorial_coverage_skips_followups_and_bounds(context, monkeypatch):
 
     r_wrong = pending(store, item(url="https://example.org/wrong-decision"))
     prep_w = store.prepare_candidate(r_wrong, analysis(), LATER)
-    rec_w = approve(store, prep_w)
+    rec_w = insert_approval(store, prep_w)
     with pytest.raises(ReviewRequired, match="authorize this decision"):
         store.commit_candidate(prep_w, prep_w["candidate"], "wrong", LATER, decision="skip", **rec_w)
 
-    # Bounded coverage keeps exact prior visible text and bounded retracted rows.
     for n in range(40):
         add_coverage(store, f"bg-{n:02d}", summary="Background detail. " * 80,
                      added_at="2026-11-15T00:00:00Z", updated_at="2026-11-15T00:00:00Z")
@@ -684,17 +665,19 @@ def test_editorial_coverage_skips_followups_and_bounds(context, monkeypatch):
 
 @pytest.mark.parametrize("cached", [{"verdict": "approve"}, verdict("hold")], ids=["incomplete-approval", "hold"])
 def test_cache_reviews_again_unless_the_receipt_is_a_complete_decision(context, cached):
+    """Ignore cached `review_approvals` rows whose verdict is incomplete or a hold."""
     cfg, store = context
     row = pending(store)
     with pytest.raises(AnalysisError):
         run(cfg, store, row, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
     saved = job(store)
-    approve(store, json.loads(saved["envelope_json"]), policy=saved["policy_hash"], result=cached)
+    insert_approval(store, json.loads(saved["envelope_json"]), policy=saved["policy_hash"], result=cached)
     result = run(cfg, store, row, Writer(), Reviewer(verdict()))
     assert result["review_calls"] == 2 and not result["cache_hit"]
 
 
 def test_status_retry_reverted_hold_and_rejected_show_views(context, monkeypatch):
+    """Report stage counts, preserve DB state on `show_item`, and handle reverted holds and retries."""
     cfg, store = context
     assert review_gate.status(store) == {"stages": {}, "approval_cache_entries": 0}
     row = pending(store)
@@ -713,14 +696,12 @@ def test_status_retry_reverted_hold_and_rejected_show_views(context, monkeypatch
     assert run(cfg, store, row, Writer(), Reviewer(verdict("hold")))["status"] == "held"
     assert review_gate.status(store) == {"stages": {"held": 1}, "approval_cache_entries": 0}
 
-    # Reverted held revision holds again without calling reviewer.
     store.ingest(item(content=item()["content"] + " Edited."), DATE)
     assert run(cfg, store, store.pending(1, LATER)[0], Writer(), Reviewer(), allow_network=False)["status"] == "deferred"
     store.ingest(item(), DATE)
     chk_rev = Reviewer(verdict())
     assert run(cfg, store, store.pending(1, LATER)[0], Writer(), chk_rev)["status"] == "held" and chk_rev.calls == []
 
-    # Structured hold stays readable after a later rubric change without mutating DB.
     snap = list(store.db.iterdump())
     monkeypatch.setattr(review, "CRITERIA", (*review.CRITERIA, "a_later_criterion"))
     shown_h = rejection.show_item(store, row["id"])["final_review"]
@@ -730,16 +711,14 @@ def test_status_retry_reverted_hold_and_rejected_show_views(context, monkeypatch
     assert list(store.db.iterdump()) == snap
     monkeypatch.undo()
 
-    # Operator retry preserves held audit and reuses completed draft.
     rejection.retry_item(store, row["id"], row["content_hash"], "The review prompt was revised", LATER)
     assert audit(store)["outcome"] == "held" and job(store)["stage"] == "drafted"
     w_ret = Writer()
     assert run(cfg, store, store.pending(1, LATER)[0], w_ret, Reviewer(verdict()))["status"] == "published"
     assert w_ret.calls == [] and audit(store)["outcome"] == "approved"
 
-    # Reused approval after interrupted commit is readable in show_item.
     row_int = pending(store, item(url="https://example.org/int-show"))
-    monkeypatch.setattr(store, "commit_candidate", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("crash")))
+    monkeypatch.setattr(store, "commit_candidate", raise_once(RuntimeError("crash")))
     with pytest.raises(RuntimeError):
         run(cfg, store, row_int, Writer(), Reviewer(verdict()))
     with store.db:
@@ -752,6 +731,7 @@ def test_status_retry_reverted_hold_and_rejected_show_views(context, monkeypatch
 
 @pytest.mark.parametrize("kind", [*DAMAGE, "review-not-an-object", "review-without-result"])
 def test_rejected_show_and_retry_survive_damaged_record_or_draft(context, kind):
+    """Surface damaged held review records cleanly in `show_item` and recover on `retry_item`."""
     cfg, store = context
     row = pending(store)
     assert run(cfg, store, row, Writer(), Reviewer(verdict("hold")))["status"] == "held"
@@ -772,6 +752,7 @@ def test_rejected_show_and_retry_survive_damaged_record_or_draft(context, kind):
 
 
 def test_atomic_rollbacks_db_errors_and_run_reports(context, monkeypatch):
+    """Roll back failed job/hold writes atomically and avoid striking items on `OperationalError`."""
     cfg, store = context
     cfg["sources"] = []
     row = pending(store)
@@ -789,9 +770,8 @@ def test_atomic_rollbacks_db_errors_and_run_reports(context, monkeypatch):
     store.db.commit()
     assert run(cfg, store, row, Writer(), Reviewer(verdict()))["status"] == "published"
 
-    # Database OperationalError is not an item strike.
     store.ingest(item(url="https://example.org/locked"), DATE)
-    monkeypatch.setattr(cli, "process_item", lambda *a, **kw: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")))
+    monkeypatch.setattr(cli, "process_item", raise_once(sqlite3.OperationalError("database is locked")))
     with pytest.raises(sqlite3.OperationalError):
         cli.run(cfg, store)
     assert tuple(store.db.execute("SELECT status,rejections FROM items WHERE url='https://example.org/locked'").fetchone()) == ("pending", 0)
@@ -799,14 +779,12 @@ def test_atomic_rollbacks_db_errors_and_run_reports(context, monkeypatch):
 
 
 def test_run_report_counts_outcomes_model_calls_and_isolates_invalid_outputs(tmp_path, monkeypatch):
-    from onionflash.config import DEFAULTS
-    from onionflash.store import Store
-
-    cfg = {**DEFAULTS, "storage": {"database": str(tmp_path / "r1.db"), "output_dir": str(tmp_path / "p1")}, "sources": []}
+    """Aggregate run outcome counters, meter failed review calls, and isolate per-item exceptions."""
+    cfg = make_config(tmp_path / "r1", sources=[])
     with Store(cfg["storage"]["database"]) as store:
         outcomes = iter([("held", False), ("stale", False), ("published", True), ("ignored", False), ("ignored", True)])
         monkeypatch.setattr(cli, "process_item", lambda *a, **kw: dict(zip(("status", "cache_hit"), next(outcomes))))
-        monkeypatch.setattr(cli, "build", lambda *a: {})
+        patch_cli_pipeline(monkeypatch, now=None, reviewer=None, build=lambda *a: {})
         for name in ("one", "two", "three", "four", "five"):
             store.ingest(item(url="https://example.org/" + name), DATE)
         rep = cli.run(cfg, store)
@@ -814,22 +792,15 @@ def test_run_report_counts_outcomes_model_calls_and_isolates_invalid_outputs(tmp
         assert rep["decisions"] == {} and "review_held" not in rep and "review_skipped" not in rep
     monkeypatch.undo()
 
-    cfg2 = {**DEFAULTS, "llm": {**DEFAULTS["llm"], "base_url": "https://llm.example/v1"},
-            "storage": {"database": str(tmp_path / "r2.db"), "output_dir": str(tmp_path / "p2")}, "sources": []}
+    cfg2 = make_config(tmp_path / "r2", llm={"base_url": "https://llm.example/v1"}, sources=[])
     monkeypatch.setenv(cfg2["llm"]["api_key_env"], "test-key")
-
-    class Transport:
-        def request(self, method, url, headers=None, json_body=None):
-            if json_body["response_format"]["json_schema"]["name"] != "onionflash_news":
-                raise FetchError("network request failed", retryable=True)
-            body = {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(analysis(why_it_matters=""))}}]}
-            return Response(200, json.dumps(body).encode(), {}, url)
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr("onionflash.llm.HttpClient", lambda *a, **kw: Transport())
-    monkeypatch.setattr(cli, "build", lambda *a: {})
+    reply_fn = lambda *_a, json_body=None, **_kw: (
+        analysis(why_it_matters="")
+        if json_body["response_format"]["json_schema"]["name"] == "onionflash_news"
+        else FetchError("network request failed", retryable=True)
+    )
+    monkeypatch.setattr("onionflash.llm.HttpClient", lambda *a, **kw: FakeLLM(*([reply_fn] * 4)))
+    patch_cli_pipeline(monkeypatch, now=None, reviewer=None, build=lambda *a: {})
     with Store(cfg2["storage"]["database"]) as store:
         for name in ("one", "two"):
             store.ingest(item(url="https://example.org/" + name), DATE)
@@ -837,18 +808,15 @@ def test_run_report_counts_outcomes_model_calls_and_isolates_invalid_outputs(tmp
         assert (rep2["analysis_failed"], rep2["model_calls"]) == (2, 4)
     monkeypatch.undo()
 
-    cfg3 = {**DEFAULTS, "storage": {"database": str(tmp_path / "r3.db"), "output_dir": str(tmp_path / "p3")}, "sources": []}
+    cfg3 = make_config(tmp_path / "r3", sources=[])
     built = []
-    monkeypatch.setattr(cli, "Analyzer", lambda *a, **kw: contextlib.nullcontext(
-        Writer(lambda inc: analysis(title="\uffff") if inc["url"].endswith("/draft") else analysis())))
-    class Replies:
-        calls = 0
-        def review(self, cand, pkt, *, on_request=None, **kwargs):
-            if on_request is not None:
-                on_request(1)
-            return review.validate_review({} if "/reply" in pkt["sources"][0]["url"] else verdict(), pkt)
-    monkeypatch.setattr(cli, "Reviewer", lambda *a, **kw: contextlib.nullcontext(Replies()))
-    monkeypatch.setattr(cli, "build", lambda *a: built.append(True) or {})
+    patch_cli_pipeline(
+        monkeypatch,
+        now=None,
+        analyzer=Writer.factory(lambda inc: analysis(title="\uffff") if inc["url"].endswith("/draft") else analysis()),
+        reviewer=Reviewer.factory(lambda _cand, pkt, **_kw: {} if "/reply" in pkt["sources"][0]["url"] else verdict()),
+        build=lambda *a: built.append(True) or {},
+    )
     with Store(cfg3["storage"]["database"]) as store:
         for name in ("reply-1", "reply-2", "draft"):
             store.ingest(item(url="https://example.org/" + name), DATE)
@@ -864,41 +832,38 @@ def test_run_report_counts_outcomes_model_calls_and_isolates_invalid_outputs(tmp
 
 
 def test_own_item_newness_skips_unchanged_or_quoted_and_unlock_requeues_locked_updates(context):
+    """Skip quoted/unchanged follow-ups, defer updates on locked stories, and requeue upon unlock."""
     cfg, store = context
     url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41499"
-    n1 = {"id": "gid://gitlab/Note/1", "url": url + "#note_1", "title": "Public comment by @alice",
-          "author": "alice", "created_at": DATE, "body": "Initial report details for the relay issue."}
+    n1 = make_note(1, "Initial report details for the relay issue.", author="alice", url=url)
     issue = _compose(item(url=url, updated_at=DATE), [n1], DATE, source_key="k")
     assert run(cfg, store, pending(store, issue), Writer(analysis(evidence=["Initial report details for the relay issue."])),
                Reviewer(verdict()))["status"] == "published"
     story_id = store.stories()[0]["id"]
 
-    n2 = {"id": "gid://gitlab/Note/2", "url": url + "#note_2", "title": "Public comment by @bob",
-          "author": "bob", "created_at": LATER, "body": "> Initial report details for the relay issue.\n> Agreed."}
+    n2 = make_note(2, "> Initial report details for the relay issue.\n> Agreed.", author="bob", created_at=LATER, url=url)
     assert store.ingest(_compose(issue, [n1, n2], LATER, source_key="k"), LATER)
     assert run(cfg, store, store.pending(1, LATER)[0], Writer(), Reviewer()) == {
         "status": "ignored", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
-    assert store.db.execute("SELECT code FROM decision_log ORDER BY id DESC LIMIT 1").fetchone()[0] == "skipped.gate.no_new_content"
+    assert codes(store)[-1] == "skipped.gate.no_new_content"
 
     t99 = item(kind="tag", title="tor-0.4.9.99", url="https://example.org/tags/tor-0.4.9.99", content="")
     store.ingest(t99, DATE)
-    assert run(cfg, store, next(r for r in store.pending(5, DATE) if r["id"] == t99["id"]), Writer(), Reviewer(verdict()))["status"] == "published"
+    assert run(cfg, store, queued_row(store, t99, DATE), Writer(), Reviewer(verdict()))["status"] == "published"
     assert store.ingest({**t99, "content": "new annotation", "updated_at": LATER}, LATER)
-    assert run(cfg, store, next(r for r in store.pending(5, LATER) if r["id"] == t99["id"]), Writer(), Reviewer()) == {
+    assert run(cfg, store, queued_row(store, t99, LATER), Writer(), Reviewer()) == {
         "status": "ignored", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
 
-    locked = editorial.correct(store.db, story_id, {"priority": "normal"}, reason="Lower priority.",
-                               expect_hash=editorial.show(store.db, story_id)["hash"], observed=LATER)
+    editorial_act(editorial.correct, store, story_id, {"priority": "normal"}, reason="Lower priority.")
     later2 = "2026-11-10T14:00:00Z"
-    n3 = {"id": "gid://gitlab/Note/3", "url": url + "#note_3", "title": "Public comment by @maint",
-          "author": "maint", "created_at": later2, "body": "Maintainers merged the fix into main."}
+    n3 = make_note(3, "Maintainers merged the fix into main.", author="maint", created_at=later2, url=url)
     assert store.ingest(_compose(issue, [n1, n2, n3], later2, source_key="k"), later2)
     w_locked = Writer(update_analysis(update="Maintainers merged the fix.", state="merged", evidence=["Maintainers merged the fix into main."]))
-    assert run(cfg, store, next(r for r in store.pending(5, later2) if r["id"] == issue["id"]), w_locked, Reviewer())["status"] == "locked"
+    assert run(cfg, store, queued_row(store, issue, later2), w_locked, Reviewer())["status"] == "locked"
     assert w_locked.calls[0]["content"] == "" and [n["url"] for n in w_locked.calls[0]["public_comments"]] == [url + "#note_3"]
     assert store.pending(5, later2) == []
 
-    editorial.unlock(store.db, story_id, reason="Allow queued updates.", expect_hash=locked["hash"], observed="2026-11-10T15:00:00Z")
+    editorial_act(editorial.unlock, store, story_id, reason="Allow queued updates.", observed="2026-11-10T15:00:00Z")
     requeued = [r for r in store.pending(5, "2026-11-10T15:00:00Z") if r["id"] == issue["id"]]
     assert len(requeued) == 1
     assert run(cfg, store, requeued[0], Writer(update_analysis(update="Maintainers merged the fix.", state="merged",
@@ -929,6 +894,7 @@ def test_own_item_newness_skips_unchanged_or_quoted_and_unlock_requeues_locked_u
 
 
 def test_pending_update_rewrites_and_own_comment_cutoff_admits_edited_notes(context):
+    """Regenerate stale update drafts after concurrent updates and admit substantive note edits."""
     cfg, store = context
     _, release_id = seed_legacy(store, item(title="Tor 0.4.9.16 released", kind="feed", authority="official", content="Tor 0.4.9.16 was released with fixes."),
                                analysis(title="Tor 0.4.9.16 released", state="released", confidence="confirmed"))
@@ -956,32 +922,31 @@ def test_pending_update_rewrites_and_own_comment_cutoff_admits_edited_notes(cont
     issue_a = item(id="gitlab:49500", kind="gitlab_issue", url=issue_url, title="Tor 0.4.9.30 relay descriptor stall",
                    content="Initial report of descriptor stall in Tor 0.4.9.30.", published_at="2026-11-08T10:00:00Z",
                    updated_at="2026-11-08T10:00:00Z", public_comments=[])
-    assert review_gate.process_item(
+    assert run(
         cfg, store, pending(store, issue_a),
         Writer(analysis(title="Descriptor stall reported in Tor 0.4.9.30", summary="Initial report of descriptor stall in Tor 0.4.9.30.",
                         state="developing", evidence=["Initial report of descriptor stall in Tor 0.4.9.30."])),
-        Reviewer(verdict(), verdict()), "2026-11-08T10:05:00Z",
+        Reviewer(verdict()), "2026-11-08T10:05:00Z",
     )["status"] == "published"
     story_id = next(s for s in store.stories(10) if "0.4.9.30" in s["title"])["id"]
 
     other_src = item(kind="gitlab_mr", url="https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/1950",
                      title="Investigate descriptor stall (closes #49500)", content="Closes #49500 with diagnostic logging.",
                      upstream_state="merged", published_at="2026-11-10T12:00:00Z", updated_at="2026-11-10T12:00:00Z")
-    assert review_gate.process_item(
+    assert run(
         cfg, store, pending(store, other_src),
         Writer(update_analysis(update="A merge request added diagnostic logging for the stall.", state="merged",
                                evidence=["Closes #49500 with diagnostic logging."])),
-        Reviewer(verdict(update=True), verdict(update=True)), "2026-11-10T12:05:00Z",
+        Reviewer(verdict(update=True)), "2026-11-10T12:05:00Z",
     )["status"] == "published"
 
-    note_v1 = {"id": "501", "author": "maintainer", "title": "Comment by maintainer",
-               "created_at": "2026-11-09T09:00:00Z", "url": issue_url + "#note_501",
-               "body": "Root cause narrowed to malformed extra-info lines."}
+    note_v1 = make_note("501", "Root cause narrowed to malformed extra-info lines.", author="maintainer",
+                        created_at="2026-11-09T09:00:00Z", url=issue_url, note_id="501", title="Comment by maintainer")
     assert store.ingest({**issue_a, "updated_at": "2026-11-09T09:00:00Z", "public_comments": [note_v1]}, "2026-11-11T08:00:00Z")
     w_nov9 = Writer(update_analysis(update="Maintainers narrowed the root cause to malformed extra-info lines.",
                                     state="merged", evidence=["Root cause narrowed to malformed extra-info lines."]))
-    assert review_gate.process_item(cfg, store, store.pending(1, "2026-11-11T08:00:00Z")[0], w_nov9,
-                                    Reviewer(verdict(update=True), verdict(update=True)), "2026-11-11T08:00:00Z")["status"] == "published"
+    assert run(cfg, store, store.pending(1, "2026-11-11T08:00:00Z")[0], w_nov9,
+               Reviewer(verdict(update=True)), "2026-11-11T08:00:00Z")["status"] == "published"
     assert len(w_nov9.calls) == 1
     assert next(s for s in store.stories(10) if s["id"] == story_id)["updates"][-1]["sources"] == [
         {"url": canonical_issue_url + "#note_501", "title": "Comment by maintainer"}]
@@ -991,21 +956,33 @@ def test_pending_update_rewrites_and_own_comment_cutoff_admits_edited_notes(cont
     assert store.ingest(issue_a_edited, "2026-11-12T14:05:00Z")
     w_edit = Writer(update_analysis(update="A corrected maintainer note places the bug in routerstatus retry.",
                                     state="merged", evidence=["Correction: extra-info parsing was unaffected; bug is in routerstatus retry."]))
-    assert review_gate.process_item(cfg, store, store.pending(1, "2026-11-12T14:05:00Z")[0], w_edit,
-                                    Reviewer(verdict(update=True), verdict(update=True)), "2026-11-12T14:05:00Z")["status"] == "published"
+    assert run(cfg, store, store.pending(1, "2026-11-12T14:05:00Z")[0], w_edit,
+               Reviewer(verdict(update=True)), "2026-11-12T14:05:00Z")["status"] == "published"
     st_edit = next(s for s in store.stories(10) if s["id"] == story_id)
     assert st_edit["updates"][-1]["at"] == "2026-11-12T14:00:00Z"
 
     note_v2_quoted = {**note_v2, "body": note_v2["body"] + "\n\n> Earlier quoted context."}
     assert store.ingest({**issue_a, "updated_at": "2026-11-12T15:00:00Z", "public_comments": [note_v2_quoted]}, "2026-11-12T15:05:00Z")
-    res_same = review_gate.process_item(cfg, store, store.pending(1, "2026-11-12T15:05:00Z")[0], Writer(), Reviewer(), "2026-11-12T15:05:00Z")
+    res_same = run(cfg, store, store.pending(1, "2026-11-12T15:05:00Z")[0], observed="2026-11-12T15:05:00Z")
     assert res_same["status"] == "ignored" and res_same["writer_calls"] == res_same["review_calls"] == 0
     assert review_gate.candidate_mod._source_cutoff(store.db, st_edit, None, issue_a_edited) == "2026-11-12T14:00:00Z"
 
 
 def test_trusted_operator_vs_community_list_incidents_in_gate(context):
+    """Distinguish trusted-operator reports, untrusted community claims, and numbered Tor proposals."""
     cfg, store = context
     list_base = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/"
+    tordev_base = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/"
+
+    def _proposal(num, subject, action_clause):
+        head = f"Proposal {num}: {subject}"
+        row = pending(store, item(url=f"{tordev_base}prop{num}/", kind="feed", authority="community",
+                                  title=f"[tor-dev] {head}",
+                                  content=f"Proposal {num} {action_clause} circuit flooding and DoS attacks."))
+        draft = analysis(title=head, summary=f"Proposal {num} on tor-dev {action_clause} circuit flooding and DoS attacks.",
+                         category="protocol", tags=["protocol", "dos"], confidence="reported", state="developing",
+                         evidence=[f"Proposal {num} {action_clause} circuit flooding"])
+        return row, draft
 
     chat = pending(store, item(url=list_base + "chat1/", kind="feed", authority="trusted-operator",
                                content="Routine relay operator question about bandwidth."))
@@ -1022,7 +999,7 @@ def test_trusted_operator_vs_community_list_incidents_in_gate(context):
                              summary="A large relay operator reports a sustained SYN flood across exit relays.",
                              category="dos", tags=["dos"], confidence="reported", state="developing",
                              evidence=["Large relay family observed sustained SYN flood"])
-    assert run(cfg, store, trusted_inc, Writer(trusted_draft), Reviewer(verdict(), verdict()))["status"] == "published"
+    assert run(cfg, store, trusted_inc, Writer(trusted_draft), Reviewer(verdict()))["status"] == "published"
 
     untrusted_inc = pending(store, item(url=list_base + "comm1/", kind="feed", authority="community",
                                         content="Single operator claims relays face deanonymization attack."))
@@ -1030,50 +1007,741 @@ def test_trusted_operator_vs_community_list_incidents_in_gate(context):
                                summary="A mailing-list post claims relays face a deanonymization attack.",
                                category="security", tags=["security"], confidence="reported", state="developing",
                                evidence=["Single operator claims relays face deanonymization attack."])
-    assert run(cfg, store, untrusted_inc, Writer(untrusted_draft), Reviewer(verdict(), verdict()))["status"] == "held"
+    assert run(cfg, store, untrusted_inc, Writer(untrusted_draft), Reviewer(verdict()))["status"] == "held"
     assert codes(store, untrusted_inc) == ["held.final_check.untrusted_operator_claim"]
 
-    tordev_base = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/"
-    prop_item = pending(store, item(
-        url=tordev_base + "prop375/",
-        kind="feed",
-        authority="community",
-        title="[tor-dev] Proposal 375: Rate-limiting circuit flooding",
-        content="Proposal 375 specifies rate limits to defend against circuit flooding and DoS attacks.",
-    ))
-    prop_draft = analysis(
-        title="Proposal 375: Rate-limiting circuit flooding",
-        summary="Proposal 375 on tor-dev specifies rate limits to defend against circuit flooding and DoS attacks.",
-        category="protocol",
-        tags=["protocol", "dos"],
-        confidence="reported",
-        state="developing",
-        evidence=["Proposal 375 specifies rate limits to defend against circuit flooding"],
-    )
-    assert run(cfg, store, prop_item, Writer(prop_draft), Reviewer(verdict(), verdict()))["status"] == "published"
+    prop_item, prop_draft = _proposal(375, "Rate-limiting circuit flooding", "specifies rate limits to defend against")
+    assert run(cfg, store, prop_item, Writer(prop_draft), Reviewer(verdict()))["status"] == "published"
 
-    prop_disputed = pending(store, item(
-        url=tordev_base + "prop376/",
-        kind="feed",
-        authority="community",
-        title="[tor-dev] Proposal 376: Circuit flood defense parameters",
-        content="Proposal 376 adjusts rate-limiting parameters to mitigate circuit flooding and DoS attacks.",
-    ))
-    prop_disputed_draft = analysis(
-        title="Proposal 376: Circuit flood defense parameters",
-        summary="Proposal 376 on tor-dev adjusts rate-limiting parameters to mitigate circuit flooding and DoS attacks.",
-        category="protocol",
-        tags=["protocol", "dos"],
-        confidence="reported",
-        state="developing",
-        evidence=["Proposal 376 adjusts rate-limiting parameters to mitigate circuit flooding"],
-    )
-    assert run(
-        cfg, store, prop_disputed, Writer(prop_disputed_draft),
-        Reviewer(verdict(), verdict("skip", criterion="news_value")),
-    )["status"] == "held"
+    prop_disputed, prop_disputed_draft = _proposal(376, "Circuit flood defense parameters", "adjusts rate-limiting parameters to mitigate")
+    assert run(cfg, store, prop_disputed, Writer(prop_disputed_draft),
+               Reviewer(verdict(), verdict("skip", criterion="news_value")))["status"] == "held"
     assert codes(store, prop_disputed) == ["held.verification.disagreed_news"]
     elig = review_gate.approval(cfg, store, prop_disputed["id"])
     assert elig["eligible"] is True
     approved = rejection.approve_item(cfg, store, prop_disputed["id"], elig["hash"], "Publish Tor proposal", observed=LATER)
     assert approved["status"] == "published"
+
+
+@pytest.mark.parametrize("corruption", ["invalid_utf8", "nan", "surrogate", "deep"])
+def test_process_item_evicts_damaged_review_approvals_and_completes_live_review(context, corruption):
+    """Evict damaged `review_approvals` rows across invalid UTF-8, NaN, surrogates, and deep nesting."""
+    cfg, store = context
+    row = pending(store)
+    prepared = store.prepare_candidate(row, analysis(), LATER)
+    key = insert_approval(store, prepared, policy=review.policy_hash(cfg))["approval_key"]
+    rec_text = store.db.execute("SELECT review_record_json FROM review_approvals WHERE key=?", (key,)).fetchone()[0]
+    with store.db:
+        if corruption == "invalid_utf8":
+            store.db.execute("UPDATE review_approvals SET result_json=CAST(X'fffe' AS TEXT) WHERE key=?", (key,))
+        elif corruption == "nan":
+            store.db.execute("UPDATE review_approvals SET review_record_json=? WHERE key=?",
+                             ('{"extra":NaN,' + rec_text[1:], key))
+        elif corruption == "surrogate":
+            store.db.execute("UPDATE review_approvals SET review_record_json=? WHERE key=?",
+                             ('{"extra":"\\ud800",' + rec_text[1:], key))
+        else:
+            store.db.execute("UPDATE review_approvals SET result_json=? WHERE key=?", ("[" * 100 + "]" * 100, key))
+
+    evicted_before_live = []
+
+    def _check_and_approve(*_args, **_kwargs):
+        evicted_before_live.append(
+            store.db.execute("SELECT COUNT(*) FROM review_approvals WHERE key=?", (key,)).fetchone()[0]
+        )
+        return verdict()
+
+    out = run(cfg, store, row, Writer(), Reviewer(_check_and_approve), LATER)
+    assert out == {"status": "published", "writer_calls": 1, "review_calls": 2, "cache_hit": False}
+    assert evicted_before_live == [0, 0]
+    assert len(store.stories()) == 1
+
+
+def test_coverage_background_skips_damaged_stories_and_source_packet_recovers_compacted_and_note_sources(context):
+    """Skip damaged `stories` rows in `coverage_background` and recover URL-only compacted or note-only writer sources."""
+    from onionflash import source_packet
+
+    cfg, store = context
+    valid_story = seed_story(store, item(url="https://example.org/valid-story"), analysis(), key="valid-1", at=DATE)
+    with store.db:
+        store.db.execute(
+            "INSERT INTO stories(id,cluster_key,payload,published_at,updated_at) VALUES(?,?,?,?,?)",
+            ("b" * 24, "damaged:json", "{malformed", DATE, LATER),
+        )
+        store.db.execute(
+            "INSERT INTO stories(id,cluster_key,payload,published_at,updated_at) VALUES(?,?,CAST(X'fffe' AS TEXT),?,?)",
+            ("c" * 24, "damaged:utf8", DATE, LATER),
+        )
+    cov = candidate.coverage_background(store.db, None)
+    assert cov["truncated"] is True and [e["id"] for e in cov["recent"]] == [valid_story["id"]]
+    next_row = pending(store, item(url="https://example.org/fresh-after-damaged", content="A fresh independent report."))
+    assert run(cfg, store, next_row, Writer(analysis(evidence=["A fresh independent report."])), Reviewer(verdict()))["status"] == "published"
+
+    comp_item = item(url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/49501",
+                     title="Compacted historical ticket", content="Historical ticket body retained in analyses.")
+    comp_story = seed_story(
+        store, comp_item, analysis(title="Compacted historical ticket", summary="Historical ticket summary.",
+                                   evidence=["Historical ticket body retained in analyses."]),
+        key="comp-key", at=DATE,
+    )
+    comp_id = comp_story["editorial_item"]
+    raw_stored = json.loads(store.db.execute("SELECT payload FROM items WHERE id=?", (comp_id,)).fetchone()[0])
+    raw_stored.pop("content", None)
+    with store.db:
+        store.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps(raw_stored), comp_id))
+    loaded = source_packet._load(store.db, None, comp_item["url"], analysis_key=None)
+    assert loaded is not None and loaded[2] == "historical-analysis"
+    url_only_payload = {
+        **json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (comp_story["id"],)).fetchone()[0]),
+        "sources": [{"url": comp_item["url"], "title": comp_item["title"]}],
+    }
+    url_only_payload.pop("editorial_item", None)
+    pkt_comp, _ = source_packet.build_packet(
+        store.db, {**comp_item, "id": "incoming-other", "url": "https://example.org/other"}, url_only_payload, url_only_payload, None
+    )
+    assert pkt_comp["missing_sources"] == [] and pkt_comp["truncated"] is False
+
+    note_issue_url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/49502"
+    note_entry = make_note(7, "Maintainer triage note with concrete reproduction details.", author="arma", url=note_issue_url)
+    note_item = item(url=note_issue_url, kind="gitlab_issue", title="Issue with note-only citation",
+                     content="Parent issue description text.", public_comments=[note_entry])
+    note_story = seed_story(
+        store, note_item, analysis(title="Issue with note-only citation", summary="Summary citing triage note.",
+                                   evidence=["Maintainer triage note with concrete reproduction details."]),
+        key="note-key", at=DATE,
+    )
+    writer_id = note_story["editorial_item"]
+    note_only_src = {
+        "id": f"{writer_id}:{note_entry['id']}",
+        "source_item_id": writer_id,
+        "url": note_entry["url"],
+        "title": note_entry["title"],
+        "published_at": note_entry["created_at"],
+    }
+    raw_note_story = {
+        **json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (note_story["id"],)).fetchone()[0]),
+        "sources": [note_only_src],
+    }
+    pub_note_story = {**note_story, "sources": [{"url": note_entry["url"], "title": note_entry["title"]}]}
+    incoming_follow = {**item(url="https://example.org/follow-49502", content="Follow-up report."), "id": "f" * 24}
+    pkt_note, _ = source_packet.build_packet(
+        store.db, incoming_follow, raw_note_story, pub_note_story, writer_id, update=True
+    )
+    assert pkt_note["missing_sources"] == [] and pkt_note["truncated"] is False
+    assert any(s["url"] == note_issue_url for s in pkt_note["sources"])
+
+
+def test_auto_merge_update_without_compact_overlap_and_mr_cap_update_states(context):
+    """Avoid invalid `routed` handoffs when compact coverage lacks source URLs, and preserve update states across MR caps."""
+    from onionflash import publication
+
+    cfg, store = context
+    padding = (
+        "Operators observed sustained circuit setup delays across multiple independent vantage points "
+        "during peak consensus intervals while investigating relay descriptor propagation behavior across "
+        "affected network segments and recording hourly telemetry samples for comparison."
+    )
+    surv_src = item(
+        url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/49200",
+        kind="gitlab_issue",
+        title="Sustained circuit setup delays across relays",
+        content=padding,
+        published_at="2026-11-08T10:00:00Z",
+        updated_at="2026-11-08T10:00:00Z",
+    )
+    surv_story = seed_story(
+        store,
+        surv_src,
+        analysis(
+            title="Sustained circuit setup delays across relays",
+            summary=padding,
+            why_it_matters="",
+            category="relay",
+            tags=["relay"],
+            confidence="reported",
+            state="developing",
+            evidence=["Operators observed sustained circuit setup delays"],
+        ),
+        key="surv-49200",
+        at="2026-11-08T10:05:00Z",
+    )
+    dup_src = item(
+        url="https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/DUP49200/",
+        kind="feed",
+        authority="trusted-operator",
+        title="Follow-up notes on ticket",
+        content="Independent log review for #49200 found matching symptoms on two BSD guards.",
+        published_at="2026-11-08T11:00:00Z",
+        updated_at="2026-11-08T11:00:00Z",
+    )
+    dup_story = seed_story(
+        store,
+        dup_src,
+        analysis(
+            title="Follow-up notes on guard symptoms",
+            summary="Independent log review for #49200 found matching symptoms on two BSD guards.",
+            why_it_matters="",
+            category="relay",
+            tags=["relay"],
+            confidence="reported",
+            state="developing",
+            evidence=["Independent log review for #49200 found matching symptoms"],
+        ),
+        key="dup-49200",
+        at="2026-11-08T11:05:00Z",
+    )
+    publication.build(cfg, store)
+
+    upd_src = item(
+        url="https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/UPD49200/",
+        kind="feed",
+        authority="trusted-operator",
+        title="Additional guard telemetry",
+        content="Additional guard telemetry confirms the BSD socket buffer threshold.",
+        published_at="2026-11-08T12:00:00Z",
+        updated_at="2026-11-08T12:00:00Z",
+    )
+    upd_row = pending(store, upd_src, at="2026-11-08T12:05:00Z", ready="2026-11-08T12:05:00Z")
+    with store.db:
+        store.db.execute("UPDATE items SET story_id=? WHERE id=?", (dup_story["id"], upd_row["id"]))
+    upd_row = item_row(store, upd_row)
+    upd_draft = update_analysis(
+        update="Additional guard telemetry reports a BSD socket buffer threshold.",
+        confidence="reported",
+        state="developing",
+        evidence=["Additional guard telemetry confirms the BSD socket buffer threshold."],
+    )
+    same_reply = {**verdict(update=True), "same_story": surv_story["id"]}
+    res = run(cfg, store, upd_row, Writer(upd_draft), Reviewer(same_reply, same_reply), "2026-11-08T12:10:00Z")
+    assert res["status"] == "published" and job(store, upd_row) is None
+
+    mr1 = item(
+        url="https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/801",
+        kind="gitlab_mr",
+        upstream_state="merged",
+        title="Initial merge for 0.4.9.6",
+        content="Merged initial patch for 0.4.9.6.",
+    )
+    mr_story = seed_story(
+        store,
+        mr1,
+        analysis(
+            title="Initial merge for 0.4.9.6",
+            summary="Maintainers merged the initial patch.",
+            why_it_matters="",
+            category="feature",
+            tags=["feature"],
+            confidence="confirmed",
+            state="merged",
+            evidence=["Merged initial patch for 0.4.9.6."],
+        ),
+        key="mr-801",
+        at="2026-11-08T08:00:00Z",
+    )
+    tag_item = tag(url="https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-0.4.9.6", title="tor-0.4.9.6",
+                   updated_at="2026-11-08T09:00:00Z")
+    tag_row = pending(store, tag_item, at="2026-11-08T09:00:00Z", ready="2026-11-08T09:00:00Z")
+    with store.db:
+        store.db.execute("UPDATE items SET story_id=? WHERE id=?", (mr_story["id"], tag_row["id"]))
+    assert run(cfg, store, item_row(store, tag_row), Writer(), Reviewer(verdict(update=True)), "2026-11-08T09:05:00Z")["status"] == "published"
+    tagged_story = next(s for s in store.stories() if s["id"] == mr_story["id"])
+    assert tagged_story["state"] == "tagged"
+    for idx in range(2, 9):
+        mr_i = item(
+            url=f"https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/{800 + idx}",
+            kind="gitlab_mr",
+            upstream_state="merged",
+            title=f"Follow-up merge {idx}",
+            content=f"Merged follow-up patch {idx} into main.",
+            updated_at=f"2026-11-08T09:{10 + idx:02d}:00Z",
+        )
+        r_i = pending(store, mr_i, at=mr_i["updated_at"], ready=mr_i["updated_at"])
+        with store.db:
+            store.db.execute("UPDATE items SET story_id=? WHERE id=?", (mr_story["id"], r_i["id"]))
+        assert run(
+            cfg, store, item_row(store, r_i),
+            Writer(update_analysis(update=f"Follow-up merge {idx} landed.", confidence="confirmed", state="tagged",
+                                   evidence=[f"Merged follow-up patch {idx} into main."])),
+            Reviewer(verdict(update=True)), mr_i["updated_at"],
+        )["status"] == "published"
+    mr_9 = item(
+        url="https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/809",
+        kind="gitlab_mr",
+        upstream_state="merged",
+        title="Follow-up merge 9",
+        content="Merged follow-up patch 9 into main.",
+        updated_at="2026-11-08T10:30:00Z",
+    )
+    r_9 = pending(store, mr_9, at=mr_9["updated_at"], ready=mr_9["updated_at"])
+    with store.db:
+        store.db.execute("UPDATE items SET story_id=? WHERE id=?", (mr_story["id"], r_9["id"]))
+    res_9 = run(
+        cfg, store, item_row(store, r_9),
+        Writer(update_analysis(update="Follow-up merge 9 landed.", confidence="confirmed", state="tagged",
+                               evidence=["Merged follow-up patch 9 into main."])),
+        Reviewer(verdict(update=True)), mr_9["updated_at"],
+    )
+    assert res_9["status"] == "published"
+    reloaded_story = next(s for s in store.stories() if s["id"] == mr_story["id"])
+    assert reloaded_story["state"] == "tagged"
+    assert reloaded_story["updates"][-1]["text"] == "Follow-up merge 9 landed."
+
+
+def test_related_lookup_skips_damaged_story_payloads_and_associate_raises_value_error(context):
+    """Skip damaged `stories` rows during related lookups while failing damaged direct associations cleanly."""
+    cfg, store = context
+    damaged_src = item(
+        url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/499",
+        kind="gitlab_issue",
+        title="Damaged referenced ticket #499",
+        content="Initial description for ticket #499.",
+    )
+    damaged_story = seed_story(
+        store,
+        damaged_src,
+        analysis(title="Damaged referenced ticket #499", summary="Initial summary for #499.",
+                 evidence=["Initial description for ticket #499."]),
+        key="damaged-499",
+        at=DATE,
+    )
+    with store.db:
+        store.db.execute(
+            "UPDATE stories SET payload=CAST(X'7b22626164223afffe7d' AS TEXT) WHERE id=?",
+            (damaged_story["id"],),
+        )
+    mapped_row = store.db.execute("SELECT * FROM items WHERE url=?", (damaged_src["url"],)).fetchone()
+    with pytest.raises(ValueError, match="Damaged story payload"):
+        candidate.associate(store.db, dict(mapped_row))
+
+    followup_src = item(
+        url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/500",
+        kind="gitlab_issue",
+        title="Follow-up investigation on relay memory",
+        content="Investigation referencing #499 reports independent heap findings.",
+        published_at=LATER,
+        updated_at=LATER,
+    )
+    row = pending(store, followup_src, at=LATER, ready=LATER)
+    draft = analysis(
+        title="Independent heap findings reported in #500",
+        summary="Ticket #500 reports independent heap findings referencing #499.",
+        evidence=["Investigation referencing #499 reports independent heap findings."],
+    )
+    res = run(cfg, store, row, Writer(draft), Reviewer(verdict()), LATER)
+    assert res["status"] == "published"
+
+
+def test_official_duplicate_update_skips_and_auto_merges_without_holding(context):
+    """Allow verified official duplicate `update` skips to auto-merge or ignore rather than holding."""
+    from onionflash import publication
+
+    cfg, store = context
+    early_at = "2026-11-08T10:00:00Z"
+    mid_at = "2026-11-08T14:00:00Z"
+    older = seed_story(
+        store,
+        item(
+            url="https://blog.torproject.org/tor-04988-release/",
+            kind="feed",
+            authority="official",
+            product="tor",
+            title="New Release: Tor 0.4.9.88",
+            content="Tor 0.4.9.88 fixes a relay descriptor stall.",
+            published_at=early_at,
+            updated_at=early_at,
+        ),
+        analysis(
+            title="Tor 0.4.9.88 released",
+            summary="Tor 0.4.9.88 fixes a relay descriptor stall.",
+            why_it_matters="",
+            category="release",
+            tags=["release"],
+            confidence="confirmed",
+            state="released",
+            products=["tor"],
+            evidence=["Tor 0.4.9.88 fixes a relay descriptor stall."],
+        ),
+        key="older-04988",
+        at=early_at,
+    )
+    newer_dup = seed_story(
+        store,
+        item(
+            url="https://lists.torproject.org/tor-announce/tor-04988-note/",
+            kind="feed",
+            authority="official",
+            product="tor",
+            title="Relay descriptor stall notice for 0.4.9.88",
+            content="Official announcement summarizing the 0.4.9.88 descriptor stall.",
+            published_at=mid_at,
+            updated_at=mid_at,
+        ),
+        analysis(
+            title="Official notice on Tor 0.4.9.88 descriptor stall",
+            summary="Official notice describes the Tor 0.4.9.88 descriptor stall.",
+            why_it_matters="",
+            category="release",
+            tags=["release"],
+            confidence="confirmed",
+            state="released",
+            products=["tor"],
+            evidence=["Official announcement summarizing the 0.4.9.88 descriptor stall."],
+        ),
+        key="newer-04988",
+        at=mid_at,
+    )
+    reported_older = seed_story(
+        store,
+        item(
+            url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/49880",
+            kind="gitlab_issue",
+            authority="development",
+            product="tor",
+            title="Descriptor parsing defect on 0.4.9.89",
+            content="Issue #49880 tracks a descriptor parsing defect on 0.4.9.89.",
+            published_at=early_at,
+            updated_at=early_at,
+        ),
+        analysis(
+            title="Descriptor parsing defect tracked for 0.4.9.89",
+            summary="Issue #49880 tracks a descriptor parsing defect on 0.4.9.89.",
+            why_it_matters="",
+            confidence="reported",
+            state="developing",
+            products=["tor"],
+            evidence=["Issue #49880 tracks a descriptor parsing defect on 0.4.9.89."],
+        ),
+        key="rep-49880",
+        at=early_at,
+    )
+    confirmed_dup = seed_story(
+        store,
+        item(
+            url="https://blog.torproject.org/tor-04989-notice/",
+            kind="feed",
+            authority="official",
+            product="tor",
+            title="Official note on 0.4.9.89 descriptor parsing defect",
+            content="Official notice covering #49880 descriptor parsing defect on 0.4.9.89.",
+            published_at=mid_at,
+            updated_at=mid_at,
+        ),
+        analysis(
+            title="Official note on 0.4.9.89 descriptor parsing defect",
+            summary="Official note covers #49880 descriptor parsing defect on 0.4.9.89.",
+            why_it_matters="",
+            confidence="confirmed",
+            state="developing",
+            products=["tor"],
+            evidence=["Official notice covering #49880 descriptor parsing defect on 0.4.9.89."],
+        ),
+        key="conf-49880",
+        at=mid_at,
+    )
+    publication.build(cfg, store)
+
+    upd_row = pending(
+        store,
+        item(
+            url="https://lists.torproject.org/tor-announce/tor-04988-mirror/",
+            kind="feed",
+            authority="official",
+            product="tor",
+            title="Mirror announcement for Tor 0.4.9.88",
+            content="Tor 0.4.9.88 fixes a relay descriptor stall (mirror copy).",
+            published_at=LATER,
+            updated_at=LATER,
+        ),
+        at=LATER,
+        ready=LATER,
+    )
+    with store.db:
+        store.db.execute("UPDATE items SET story_id=? WHERE id=?", (newer_dup["id"], upd_row["id"]))
+    upd_row = item_row(store, upd_row)
+    skip_same = verdict(
+        "skip",
+        criterion="new_information",
+        update=True,
+        same_story=older["id"],
+        reason=f"Already covered in {older['id']}.",
+    )
+    res_auto = run(
+        cfg, store, upd_row,
+        Writer(update_analysis(
+            update="Tor 0.4.9.88 fixes a relay descriptor stall.",
+            confidence="confirmed",
+            state="released",
+            evidence=["Tor 0.4.9.88 fixes a relay descriptor stall (mirror copy)."],
+        )),
+        Reviewer(skip_same, skip_same),
+        LATER,
+    )
+    assert res_auto["status"] == "routed" and res_auto["review_calls"] == 2
+    assert editorial.retired(store.db, story_id=newer_dup["id"]) == (newer_dup["id"], older["id"])
+
+    upd_lossy = pending(
+        store,
+        item(
+            url="https://lists.torproject.org/tor-announce/tor-04989-mirror/",
+            kind="feed",
+            authority="official",
+            product="tor",
+            title="Mirror announcement for 0.4.9.89",
+            content="Mirror note covering #49880 descriptor parsing defect on 0.4.9.89.",
+            published_at=LATER,
+            updated_at=LATER,
+        ),
+        at=LATER,
+        ready=LATER,
+    )
+    with store.db:
+        store.db.execute("UPDATE items SET story_id=? WHERE id=?", (confirmed_dup["id"], upd_lossy["id"]))
+    upd_lossy = item_row(store, upd_lossy)
+    skip_lossy = verdict(
+        "skip",
+        criterion="new_information",
+        update=True,
+        same_story=reported_older["id"],
+        reason=f"Already covered in {reported_older['id']}.",
+    )
+    res_lossy = run(
+        cfg, store, upd_lossy,
+        Writer(update_analysis(
+            update="Mirror note covers the 0.4.9.89 descriptor parsing defect.",
+            confidence="confirmed",
+            state="developing",
+            evidence=["Mirror note covering #49880 descriptor parsing defect on 0.4.9.89."],
+        )),
+        Reviewer(skip_lossy, skip_lossy),
+        LATER,
+    )
+    assert res_lossy["status"] == "ignored" and res_lossy["review_calls"] == 2
+    assert codes(store, upd_lossy) == ["skipped.verification.new_information"]
+
+
+def test_source_packet_deduplicates_note_source_and_bare_parent_without_id(context):
+    """Emit only one source unit when a `#note_` `source_item_id` entry coexists with an id-less parent link."""
+    from onionflash import publication, source_packet
+
+    cfg, store = context
+    issue_url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/49550"
+    note_entry = make_note(15, "Maintainer confirmed the root cause in cell handling.", author="arma", url=issue_url)
+    parent_item = item(
+        url=issue_url,
+        kind="gitlab_issue",
+        title="Cell handling issue #49550",
+        content="Initial parent issue body for #49550.",
+        public_comments=[note_entry],
+    )
+    seeded = seed_story(
+        store,
+        parent_item,
+        analysis(
+            title="Cell handling issue #49550",
+            summary="Maintainer confirmed the root cause in cell handling.",
+            evidence=["Maintainer confirmed the root cause in cell handling."],
+        ),
+        key="key-49550",
+        at=DATE,
+    )
+    writer_id = seeded["editorial_item"]
+    note_src = {
+        "id": f"{writer_id}:{note_entry['id']}",
+        "source_item_id": writer_id,
+        "url": note_entry["url"],
+        "title": note_entry["title"],
+        "published_at": note_entry["created_at"],
+    }
+    raw_payload = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (seeded["id"],)).fetchone()[0])
+    raw_payload["sources"] = [note_src]
+    with store.db:
+        store.db.execute("UPDATE stories SET payload=? WHERE id=?", (json.dumps(raw_payload), seeded["id"]))
+    publication.build(cfg, store)
+
+    shown = editorial.show(store.db, seeded["id"])
+    editorial.correct(
+        store.db,
+        seeded["id"],
+        {
+            "sources": [
+                {"url": note_entry["url"], "title": note_entry["title"]},
+                {"url": issue_url, "title": parent_item["title"]},
+            ]
+        },
+        reason="Add parent issue URL alongside cited note.",
+        expect_hash=shown["hash"],
+        observed=LATER,
+    )
+    corrected_payload = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (seeded["id"],)).fetchone()[0])
+    corrected_public = editorial.show(store.db, seeded["id"])["story"]
+    assert any(s.get("source_item_id") == writer_id and "#note_" in s["url"] for s in corrected_payload["sources"])
+    assert any(s["url"] == issue_url and "id" not in s and "source_item_id" not in s for s in corrected_payload["sources"])
+
+    followup = {
+        **item(url="https://example.org/follow-49550", content="Follow-up report on #49550."),
+        "id": "e" * 24,
+    }
+    pkt, _ = source_packet.build_packet(
+        store.db, followup, corrected_payload, corrected_public, writer_id, update=True
+    )
+    assert pkt["missing_sources"] == [] and pkt["truncated"] is False
+    assert [s["id"] for s in pkt["sources"]] == ["S1"]
+    assert [s["url"] for s in pkt["sources"]] == [issue_url]
+    assert any(
+        p.get("url") == note_entry["url"] and note_entry["body"] in p.get("text", "")
+        for p in pkt["sources"][0]["passages"]
+    )
+
+
+def test_control_fingerprint_distinguishes_blob_and_non_text_editorial_values(context):
+    """Distinguish SQLite BLOB and integer editorial controls from matching hex text in binding verification."""
+    _, store = context
+    src = item(url="https://example.org/control-fp", content="Initial relay operational notice.")
+    seeded = seed_story(store, src, analysis(summary=src["content"], evidence=[src["content"]]), key="ctrl-fp", at=DATE)
+    followup = item(url="https://example.org/control-fp-follow", content="Follow-up operational notice.", updated_at=LATER)
+    row = pending(store, followup, at=LATER, ready=LATER)
+    with store.db:
+        store.db.execute("UPDATE items SET story_id=? WHERE id=?", (seeded["id"], row["id"]))
+        store.db.execute(
+            "INSERT INTO editorial_controls(story_id,revision,locked,retracted,notice_action,notice_reason,notice_at) "
+            "VALUES(?,1,0,0,'correct','cafe',?)",
+            (seeded["id"], DATE),
+        )
+    text_fp = candidate.control_fingerprint(store.db, seeded["id"])
+    prepared = candidate.prepare(
+        store.db, item_row(store, row),
+        update_analysis(update=followup["content"], evidence=[followup["content"]]), LATER,
+    )
+    candidate.verify_prepared_binding(store.db, prepared)
+
+    with store.db:
+        store.db.execute("UPDATE editorial_controls SET notice_reason=X'cafe' WHERE story_id=?", (seeded["id"],))
+    blob_fp = candidate.control_fingerprint(store.db, seeded["id"])
+    assert blob_fp != text_fp
+    with pytest.raises(candidate.StaleCandidate, match="Editorial controls changed"):
+        candidate.verify_prepared_binding(store.db, prepared)
+
+    with store.db:
+        store.db.execute("UPDATE editorial_controls SET notice_reason='313233' WHERE story_id=?", (seeded["id"],))
+    text_digits_fp = candidate.control_fingerprint(store.db, seeded["id"])
+    with store.db:
+        store.db.execute("UPDATE editorial_controls SET notice_reason=123 WHERE story_id=?", (seeded["id"],))
+    int_fp = candidate.control_fingerprint(store.db, seeded["id"])
+    with store.db:
+        store.db.execute("UPDATE editorial_controls SET notice_reason=X'313233' WHERE story_id=?", (seeded["id"],))
+    blob_digits_fp = candidate.control_fingerprint(store.db, seeded["id"])
+    assert len({text_digits_fp, int_fp, blob_digits_fp}) == 3
+
+    with store.db:
+        store.db.execute("UPDATE editorial_controls SET notice_reason='cafe' WHERE story_id=?", (seeded["id"],))
+    assert candidate.control_fingerprint(store.db, seeded["id"]) == text_fp
+
+
+def test_route_rejects_blob_typed_target_story_payload(context):
+    """Refuse to attach a routed item to a target story whose `stories.payload` is stored as BLOB."""
+    cfg, store = context
+    target = seed_story(
+        store,
+        item(url="https://example.org/blob-route-target", title="Authority overload report",
+             content="Operators report directory authority overload."),
+        analysis(title="Authority overload report", summary="Operators report directory authority overload.",
+                 evidence=["Operators report directory authority overload."]),
+        key="blob-route-target",
+        at=DATE,
+    )
+    followup_row = pending(
+        store,
+        item(url="https://example.org/blob-route-followup", title="Follow-up authority report",
+             content="Follow-up report on directory authority overload.", published_at=LATER, updated_at=LATER),
+        at=LATER,
+        ready=LATER,
+    )
+    orig_route = review_gate._route
+
+    def _mutate_target_to_blob(st, *args, **kwargs):
+        with st.db:
+            st.db.execute("UPDATE stories SET payload=CAST(payload AS BLOB) WHERE id=?", (target["id"],))
+        return orig_route(st, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(review_gate, "_route", _mutate_target_to_blob)
+        res = run(
+            cfg, store, followup_row, Writer(),
+            Reviewer(verdict(same_story=target["id"])), LATER,
+        )
+    assert res["status"] == "stale"
+    assert store.db.execute("SELECT story_id FROM items WHERE id=?", (followup_row["id"],)).fetchone()[0] is None
+
+
+def test_source_packet_matches_gitlab_project_case_while_keeping_blob_paths_case_sensitive(context):
+    """Match GitLab project-path case on current and historical citations without equating distinct blob paths."""
+    from onionflash import source_packet
+
+    _, store = context
+    stored_issue_url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/49777"
+    mixed_issue_url = "https://gitlab.torproject.org/TPO/Core/Tor/-/issues/49777"
+    issue_item = item(
+        url=stored_issue_url,
+        kind="gitlab_issue",
+        title="Relay circuit scheduling regression #49777",
+        content="Relay circuit scheduling regression details for #49777.",
+    )
+    store.ingest(issue_item, DATE)
+
+    blob_lower_url = "https://gitlab.torproject.org/tpo/core/tor/-/blob/main/readme.md"
+    blob_upper_url = "https://gitlab.torproject.org/tpo/core/tor/-/blob/main/README.md"
+    mixed_blob_upper_url = "https://gitlab.torproject.org/TPO/Core/Tor/-/blob/main/README.md"
+    blob_lower = item(url=blob_lower_url, kind="feed", title="Lowercase readme", content="Lowercase blob text.")
+    blob_upper = item(url=blob_upper_url, kind="feed", title="Uppercase README", content="Uppercase blob text.")
+    store.ingest(blob_lower, DATE)
+    store.ingest(blob_upper, DATE)
+
+    incoming = {**item(url="https://example.org/incoming-49777", content="Incoming follow-up."), "id": "f" * 24}
+    payload = {
+        "sources": [
+            {"id": incoming["id"], "url": incoming["url"]},
+            {"url": mixed_issue_url, "title": issue_item["title"]},
+            {"url": mixed_blob_upper_url, "title": blob_upper["title"]},
+        ]
+    }
+    public = {"sources": [{"url": mixed_issue_url}, {"url": mixed_blob_upper_url}]}
+    pkt, _ = source_packet.build_packet(store.db, incoming, payload, public, None)
+    assert pkt["missing_sources"] == [] and pkt["truncated"] is False
+    urls = [s["url"] for s in pkt["sources"]]
+    assert stored_issue_url in urls and blob_upper_url in urls
+    assert any("Uppercase blob text." in p["text"] for s in pkt["sources"] if s["url"] == blob_upper_url for p in s["passages"])
+
+    # A citation to a missing uppercase blob path must not match a stored lowercase blob path.
+    only_lower_url = "https://gitlab.torproject.org/tpo/core/tor/-/blob/main/notes.md"
+    wrong_case_url = "https://gitlab.torproject.org/TPO/Core/Tor/-/blob/main/NOTES.md"
+    store.ingest(item(url=only_lower_url, kind="feed", title="notes.md", content="Lowercase notes text."), DATE)
+    pkt_mismatch, _ = source_packet.build_packet(
+        store.db, incoming,
+        {"sources": [{"id": incoming["id"], "url": incoming["url"]}, {"url": wrong_case_url, "title": "NOTES.md"}]},
+        {"sources": [{"url": wrong_case_url}]},
+        None,
+    )
+    assert wrong_case_url in pkt_mismatch["missing_sources"]
+
+    # Historical analysis snapshots also match across GitLab project-path case differences.
+    hist_item = {**issue_item, "content": "Historical issue snapshot text for #49777."}
+    with store.db:
+        store.db.execute(
+            "INSERT INTO analyses(cache_key,result,created_at,source_payload,source_item_id) "
+            "VALUES(?,?,?,?,?)",
+            ("hist-case-key", "{}", DATE, json.dumps(hist_item), issue_item["id"]),
+        )
+        store.db.execute(
+            "UPDATE items SET payload=? WHERE id=?",
+            (json.dumps({**issue_item, "content": "", "title": ""}), issue_item["id"]),
+        )
+    pkt_hist, _ = source_packet.build_packet(
+        store.db, incoming,
+        {"sources": [{"id": incoming["id"], "url": incoming["url"]}, {"url": mixed_issue_url, "title": issue_item["title"]}]},
+        {"sources": [{"url": mixed_issue_url}]},
+        None,
+    )
+    assert pkt_hist["missing_sources"] == []
+    hist_unit = next(s for s in pkt_hist["sources"] if s["url"] == stored_issue_url)
+    assert hist_unit["snapshot"] == "historical-analysis"
+    assert any("Historical issue snapshot text" in p["text"] for p in hist_unit["passages"])

@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from .schema import PRODUCTS
-from .util import DIRAUTH_GITLAB_USERS, canonical_url
+from .util import DIRAUTH_GITLAB_USERS, canonical_url, is_valid_domain, is_valid_gitlab_user
 
 DEFAULT_TRUSTED_OPERATOR_DOMAINS = [
     "1aeo.com",
@@ -25,9 +25,6 @@ DEFAULT_TRUSTED_OPERATOR_DOMAINS = [
     "quintex.com",
     "unredacted.org",
 ]
-DEFAULT_DIRAUTH_GITLAB_USERS = list(DIRAUTH_GITLAB_USERS)
-_DOMAIN_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
-_GITLAB_USER_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,99}")
 
 DEFAULTS = {
     "site": {
@@ -56,7 +53,7 @@ DEFAULTS = {
         "source_budget_seconds": 60,
         "analysis_reserve_fraction": 0.5,
         "trusted_operator_domains": DEFAULT_TRUSTED_OPERATOR_DOMAINS,
-        "dirauth_gitlab_users": DEFAULT_DIRAUTH_GITLAB_USERS,
+        "dirauth_gitlab_users": list(DIRAUTH_GITLAB_USERS),
     },
     "http": {
         "timeout_seconds": 30,
@@ -152,6 +149,26 @@ def run_command_budget_seconds(config: dict) -> float:
     return config["collection"]["run_budget_seconds"] + completion_budget_seconds(config["llm"])
 
 
+def enabled_consensus_sources(sources: list[dict], *, check_single: bool = False) -> list[dict]:
+    """Return enabled consensus-alert sources, optionally enforcing at most one."""
+    active = [s for s in sources if s.get("alert_format") == "consensus" and s.get("enabled")]
+    if check_single and len(active) > 1:
+        raise ValueError("At most one enabled consensus alert source is supported")
+    return active
+
+
+def _clean_ident_list(raw: list, limit: int, pred, error: str, *, limit_error: str | None = None, skip: str = "") -> list[str]:
+    if len(raw) > limit:
+        raise ValueError(limit_error or error)
+    cleaned: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str) or not pred(ident := entry.strip().lower()):
+            raise ValueError(error)
+        if ident != skip and ident not in cleaned:
+            cleaned.append(ident)
+    return cleaned
+
+
 def _check_range(value: object, low: int, high: int, *, allow_float: bool = False) -> bool:
     ok_type = type(value) in (int, float) if allow_float else type(value) is int
     return ok_type and low <= value <= high
@@ -171,25 +188,93 @@ def _expand(value: str) -> str:
     return re.sub(r"\$\{([A-Z_][A-Z0-9_]*)\}", sub, value)
 
 
-def _clean_endpoint_url(url: str, *, allow_http: bool, trailing_slash: bool, error: str) -> str:
-    parsed = urlsplit(url)
+def _dns_request_url(raw: str, canonical: str) -> str:
+    """Preserve a single configured trailing FQDN dot on the host for DNS lookup only."""
+    raw_host = urlsplit(raw).hostname or ""
+    if not raw_host.endswith("."):
+        return canonical
+    parsed = urlsplit(canonical)
+    host = parsed.hostname or ""
+    if not host or ":" in host:
+        return canonical
+    netloc = f"{host}.:{parsed.port}" if parsed.port is not None else f"{host}."
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _clean_endpoint_url(
+    url: str,
+    *,
+    allow_http: bool,
+    trailing_slash: bool,
+    error: str,
+    allow_local: bool = False,
+    address_policy=None,
+) -> str:
+    if not isinstance(url, str):
+        raise ValueError(error)
     try:
+        url.encode("utf-8")
+        parsed = urlsplit(url)
         port = parsed.port
-    except ValueError:
+    except (UnicodeError, ValueError):
         raise ValueError(error) from None
     if (
         parsed.scheme not in ({"https", "http"} if allow_http else {"https"})
         or not parsed.hostname
-        or port == 0
+        or "%" in parsed.hostname
+        or (port is not None and not 1 <= port <= 65535)
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
         or parsed.fragment
+        or (not trailing_slash and ("?" in url or "#" in url))
         or "\\" in url
-        or any(ord(c) < 33 or ord(c) == 127 for c in url)
-        or (trailing_slash and any(p in {".", ".."} for p in unquote(parsed.path).split("/")))
+        or any(ord(c) < 33 or ord(c) == 127 or c in "\ufffe\uffff" for c in url)
+        or any(p in {".", ".."} for p in unquote(parsed.path).split("/"))
     ):
         raise ValueError(error)
+    import httpx
+
+    try:
+        parsed_url = httpx.URL(urlunsplit((parsed.scheme, parsed.netloc, "/", "", "")))
+        raw_host = parsed_url.raw_host.decode("ascii").lower()
+    except (httpx.InvalidURL, UnicodeError, ValueError):
+        raise ValueError(error) from None
+    if not raw_host or "%" in raw_host or raw_host.endswith(".."):
+        raise ValueError(error)
+    clean_host = raw_host[:-1] if raw_host.endswith(".") else raw_host
+    if not clean_host:
+        raise ValueError(error)
+    if not allow_local and (
+        clean_host == "localhost" or clean_host.endswith((".localhost", ".local", ".internal"))
+    ):
+        raise ValueError(error)
+    try:
+        ip = ipaddress.ip_address(clean_host)
+    except ValueError:
+        if all(re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", part) for part in clean_host.split(".")):
+            raise ValueError(error) from None
+        if "." in clean_host:
+            if not is_valid_domain(clean_host):
+                raise ValueError(error) from None
+        elif not (allow_local and re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", clean_host)):
+            raise ValueError(error) from None
+    else:
+        if (
+            clean_host != raw_host
+            or ip.is_unspecified
+            or ip.is_multicast
+            or (isinstance(ip, ipaddress.IPv6Address) and ip.scope_id is not None)
+        ):
+            raise ValueError(error)
+        if address_policy is not None:
+            if not address_policy.permits(ip):
+                raise ValueError(error)
+        elif not allow_local:
+            from . import transport
+
+            if not transport.PUBLIC_ADDRESS_POLICY.permits(ip):
+                raise ValueError(error)
     if trailing_slash:
         return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/") + "/", "", ""))
     return url.rstrip("/")
@@ -235,51 +320,30 @@ def load_config(path: str | Path) -> dict:
             if not isinstance(table[key], list):
                 raise ValueError(f"{section}.{key} must be an array")
 
-    raw_domains = config["collection"]["trusted_operator_domains"]
-    if len(raw_domains) > 500:
-        raise ValueError("Each trusted_operator_domains entry must be a valid domain name (at most 500 entries)")
-    trusted_domains: list[str] = []
-    for entry in raw_domains:
-        if not isinstance(entry, str):
-            raise ValueError("Each trusted_operator_domains entry must be a valid domain name")
-        domain = entry.strip().lower()
-        if not domain or len(domain) > 253 or not domain.isascii() or not _DOMAIN_RE.fullmatch(domain):
-            raise ValueError("Each trusted_operator_domains entry must be a valid domain name")
-        if domain != "torproject.org" and domain not in trusted_domains:
-            trusted_domains.append(domain)
-    config["collection"]["trusted_operator_domains"] = trusted_domains
-
-    raw_users = config["collection"]["dirauth_gitlab_users"]
-    if len(raw_users) > 200:
-        raise ValueError("Each dirauth_gitlab_users entry must be a valid GitLab username")
-    dirauth_users: list[str] = []
-    for entry in raw_users:
-        if not isinstance(entry, str):
-            raise ValueError("Each dirauth_gitlab_users entry must be a valid GitLab username")
-        user = entry.strip().lower()
-        if (
-            not user
-            or len(user) > 100
-            or not user.isascii()
-            or ".." in user
-            or user.endswith(".")
-            or not _GITLAB_USER_RE.fullmatch(user)
-        ):
-            raise ValueError("Each dirauth_gitlab_users entry must be a valid GitLab username")
-        if user not in dirauth_users:
-            dirauth_users.append(user)
-    config["collection"]["dirauth_gitlab_users"] = dirauth_users
+    domain_err = "Each trusted_operator_domains entry must be a valid domain name"
+    config["collection"]["trusted_operator_domains"] = _clean_ident_list(
+        config["collection"]["trusted_operator_domains"], 500, is_valid_domain, domain_err,
+        limit_error=f"{domain_err} (at most 500 entries)", skip="torproject.org",
+    )
+    config["collection"]["dirauth_gitlab_users"] = _clean_ident_list(
+        config["collection"]["dirauth_gitlab_users"], 200, is_valid_gitlab_user,
+        "Each dirauth_gitlab_users entry must be a valid GitLab username",
+    )
 
     config["site"]["base_url"] = _clean_endpoint_url(
         _expand(config["site"]["base_url"]),
         allow_http=True,
         trailing_slash=True,
         error="site.base_url must be a clean absolute HTTP(S) URL",
+        allow_local=True,
     )
     config["site"]["repository_url"] = canonical_url(config["site"]["repository_url"])
 
     for key in ("database", "output_dir"):
-        value = Path(_expand(config["storage"][key])).expanduser()
+        expanded = _expand(config["storage"][key])
+        if not expanded.strip():
+            raise ValueError(f"storage.{key} must not be empty")
+        value = Path(expanded).expanduser()
         candidate = value if value.is_absolute() else path.parent / value
         if candidate.is_symlink():
             raise ValueError(f"storage.{key} must not be a symlink")
@@ -287,26 +351,52 @@ def load_config(path: str | Path) -> dict:
     output, database = Path(config["storage"]["output_dir"]), Path(config["storage"]["database"])
     if output == path.parent or output in path.parents or output == Path(output.anchor):
         raise ValueError("Output must be a dedicated generated directory")
-    if database == output or output in database.parents:
+    if database == path or database == path.parent or database in path.parents or database.is_dir():
+        raise ValueError("Database must be a file path outside config and directory roots")
+    if database == output or output in database.parents or database in output.parents:
         raise ValueError("Database must be outside public output")
 
     llm = config["llm"]
+    if any(ord(c) < 32 or ord(c) == 127 for c in llm["model"]) or not (llm_model := llm["model"].strip()):
+        raise ValueError("llm.model must be a valid model identifier")
+    llm["model"] = llm_model
     if llm["writer_reasoning"] and not llm["send_chat_template_kwargs"]:
         raise ValueError("llm.writer_reasoning requires llm.send_chat_template_kwargs")
-    llm["base_url"] = _expand(llm["base_url"]).rstrip("/")
-    llm["fallback_base_urls"] = [_expand(u).rstrip("/") if isinstance(u, str) else "" for u in llm["fallback_base_urls"]]
-    if any(not u.strip() for u in llm["fallback_base_urls"]):
+    llm["base_url"] = _expand(llm["base_url"])
+    llm["fallback_base_urls"] = [_expand(u) if isinstance(u, str) else "" for u in llm["fallback_base_urls"]]
+    if any(not u.strip().rstrip("/") for u in llm["fallback_base_urls"]):
         raise ValueError("Each LLM fallback base URL must be a nonempty URL")
     for network in llm["allowed_networks"]:
         if not isinstance(network, str) or ipaddress.ip_network(network, strict=True).prefixlen == 0:
             raise ValueError("Each allowed_networks entry must be a non-default CIDR string")
     llm_error = "Invalid LLM base URL; credentials belong in its environment variable"
-    for url in (llm["base_url"], *llm["fallback_base_urls"]):
-        if url:
-            _clean_endpoint_url(url, allow_http=llm["allow_http"], trailing_slash=False, error=llm_error)
+    from . import transport
+
+    llm_policy = transport.AddressPolicy(llm["allowed_networks"]) if llm["allowed_networks"] else transport.PUBLIC_ADDRESS_POLICY
+    allow_llm_local = bool(llm["allowed_networks"])
+    if llm["base_url"]:
+        llm["base_url"] = _clean_endpoint_url(
+            llm["base_url"],
+            allow_http=llm["allow_http"],
+            trailing_slash=False,
+            error=llm_error,
+            allow_local=allow_llm_local,
+            address_policy=llm_policy,
+        )
+    llm["fallback_base_urls"] = [
+        _clean_endpoint_url(
+            url,
+            allow_http=llm["allow_http"],
+            trailing_slash=False,
+            error=llm_error,
+            allow_local=allow_llm_local,
+            address_policy=llm_policy,
+        )
+        for url in llm["fallback_base_urls"]
+    ]
 
     review = config["review"]
-    if not isinstance(review["model"], str) or len(review["model"]) > 200 or any(ord(c) < 32 for c in review["model"]):
+    if not isinstance(review["model"], str) or len(review["model"]) > 200 or any(ord(c) < 32 or ord(c) == 127 for c in review["model"]):
         raise ValueError("review.model must be a short model identifier, or empty to inherit llm.model")
     review["model"] = review["model"].strip()
 
@@ -317,10 +407,17 @@ def load_config(path: str | Path) -> dict:
     for source in sources:
         if not isinstance(source, dict) or set(source) - _SOURCE_KEYS:
             raise ValueError("Invalid source keys")
-        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", source.get("id", "")) or source["id"] in ids:
+        source_id = source.get("id")
+        if not isinstance(source_id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", source_id) or source_id in ids:
             raise ValueError("Source IDs must be unique short lowercase identifiers")
-        ids.add(source["id"])
-        source.setdefault("name", source["id"])
+        ids.add(source_id)
+        source.setdefault("name", source_id)
+        if (
+            not isinstance(source["name"], str)
+            or not 1 <= len(source["name"].strip()) <= 200
+            or any(ord(c) < 32 or ord(c) == 127 for c in source["name"])
+        ):
+            raise ValueError("Invalid source name")
         for key, default in _SOURCE_DEFAULTS.items():
             source.setdefault(key, copy.deepcopy(default))
         alert_format = source.get("alert_format", "")
@@ -334,17 +431,20 @@ def load_config(path: str | Path) -> dict:
                 raise ValueError("source.publish must be a boolean")
             if source["kind"] != "feed":
                 raise ValueError("Consensus alert sources require kind = 'feed'")
-        if source["kind"] not in {"feed", "tag", "gitlab_issue", "gitlab_mr", "metrics_timeline"}:
+        if not isinstance(source["kind"], str) or source["kind"] not in {"feed", "tag", "gitlab_issue", "gitlab_mr", "metrics_timeline"}:
             raise ValueError("Unsupported source kind")
-        if source["authority"] not in {"official", "community", "development", "telemetry", "hackerone"}:
+        if not isinstance(source["authority"], str) or source["authority"] not in {"official", "community", "development", "telemetry", "hackerone"}:
             raise ValueError("Unsupported source authority")
-        if source["product"] not in PRODUCTS:
+        if not isinstance(source["product"], str) or source["product"] not in PRODUCTS:
             raise ValueError("Unsupported source product")
         if not isinstance(source["enabled"], bool) or not _check_range(source["interval_seconds"], 30, 604800):
             raise ValueError("Invalid source enabled/interval_seconds")
         if not isinstance(source["fallback_urls"], list) or len(source["fallback_urls"]) > 5:
             raise ValueError("At most five fallback URLs per source")
-        source["url"] = canonical_url(source["url"])
+        if not isinstance(source.get("url"), str):
+            raise ValueError("Invalid source URL")
+        raw_url = source["url"]
+        source["url"] = canonical_url(raw_url)
         if "website_url" in source:
             source["website_url"] = canonical_url(source["website_url"])
         if source["kind"] == "metrics_timeline" or alert_format == "consensus":
@@ -354,7 +454,15 @@ def load_config(path: str | Path) -> dict:
             website = urlsplit(source["website_url"])
             if website.query or website.fragment or not website.path.strip("/"):
                 raise ValueError(f"{label} website_url must be a clean URL")
-        source["fallback_urls"] = [canonical_url(u) for u in source["fallback_urls"]]
+        raw_fallbacks = list(source["fallback_urls"])
+        source["fallback_urls"] = [canonical_url(u) for u in raw_fallbacks]
+        request_urls = {
+            canon: req
+            for raw_u, canon in ((raw_url, source["url"]), *zip(raw_fallbacks, source["fallback_urls"]))
+            if (req := _dns_request_url(raw_u, canon)) != canon
+        }
+        if request_urls:
+            source["_request_urls"] = request_urls
         if "gitlab_project" in source:
             if source["kind"] != "gitlab_issue":
                 raise ValueError("Comment configuration requires a GitLab issue source")
@@ -368,7 +476,5 @@ def load_config(path: str | Path) -> dict:
             source.setdefault(key, config["collection"][global_key])
             if not _check_range(source[key], *BOUNDS[global_key]):
                 raise ValueError(f"Invalid source {key}")
-    if sum(1 for s in sources if s.get("alert_format") == "consensus" and s["enabled"]) > 1:
-        raise ValueError("At most one enabled consensus alert source is supported")
-    config["_config_path"] = str(path)
+    enabled_consensus_sources(sources, check_single=True)
     return config

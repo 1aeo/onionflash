@@ -50,15 +50,19 @@ def backoff_seconds(attempt: int, base: float, cap: float) -> float:
     return min(cap, base * 2 ** min(max(attempt - 1, 0), 20))
 
 
+def backoff_until(attempt: int, base: float, cap: float, start: str | None = None) -> str:
+    """Return the UTC cooldown timestamp for one-based `attempt` after `start`."""
+    return after(backoff_seconds(attempt, base, cap), start)
+
+
 def timestamp(value: str | None, fallback: str | None = None) -> str:
     """Normalize a supplied aware timestamp, without inventing changing dates."""
     try:
         return format_utc(parse_utc(value))
     except ValueError:
-        pass
-    if fallback is not None:
-        return fallback
-    raise ValueError("Missing or invalid timezone-aware timestamp")
+        if fallback is not None:
+            return fallback
+        raise
 
 
 MAX_SAVED_DEPTH = 64  # the app's own records nest a few levels; deeper is damage the CLI could not print
@@ -99,9 +103,69 @@ def canonical_json(value: object, *, sort_keys: bool = True) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=sort_keys, separators=(",", ":"), allow_nan=False)
 
 
+def strict_json(value: object, *, sort_keys: bool = True) -> str:
+    """Serialize `value` to UTF-8 JSON without NaN, Infinity, or lone surrogates."""
+    text = json.dumps(value, ensure_ascii=False, sort_keys=sort_keys, allow_nan=False)
+    text.encode("utf-8")
+    return text
+
+
 def digest(value: object) -> str:
     """Return the hex SHA-256 digest of `canonical_json(value)`."""
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def has_invalid_text_chars(value: str) -> bool:
+    """Reject ASCII control characters (other than tab/newline), DEL, surrogates, and XML noncharacters."""
+    return any(
+        (ord(c) < 32 and c not in "\n\t") or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF or c in "\ufffe\uffff"
+        for c in value
+    )
+
+
+DOMAIN_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
+_GITLAB_USER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
+LIST_ARCHIVE_HOST = "lists.torproject.org"
+
+
+def _valid_domain_label(label: str) -> bool:
+    if not label.startswith("xn--"):
+        return True
+    import idna
+
+    try:
+        return idna.encode(idna.decode(label)).decode("ascii") == label
+    except UnicodeError:
+        return False
+
+
+def is_valid_domain(value: object) -> bool:
+    """Return whether `value` is a valid lowercase ASCII DNS domain name."""
+    return (
+        isinstance(value, str)
+        and len(value) <= 253
+        and bool(DOMAIN_RE.fullmatch(value))
+        and not value.rsplit(".", 1)[-1].isdigit()
+        and all(_valid_domain_label(lbl) for lbl in value.split("."))
+    )
+
+
+def is_valid_gitlab_user(value: object) -> bool:
+    """Return whether `value` is a syntactically valid GitLab username."""
+    return isinstance(value, str) and ".." not in value and not value.endswith(".") and bool(_GITLAB_USER_RE.fullmatch(value))
+
+
+def valid_note_list(notes: object, fields: tuple[str, ...], *, allow_none: bool = True) -> bool:
+    """Return whether `notes` is a list of dicts carrying string values for `fields`."""
+    return (allow_none and notes is None) or (
+        isinstance(notes, list)
+        and all(
+            isinstance(n, dict)
+            and all(isinstance(n.get(f), str) for f in fields)
+            and ("edited_at" not in n or isinstance(n["edited_at"], str))
+            for n in notes
+        )
+    )
 
 
 _TYPOGRAPHY = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2013": "-", "\u2014": "-"})
@@ -145,20 +209,32 @@ def plain_text(value: object, limit: int, *, html: bool = True) -> str:
     """
     if not isinstance(value, str):
         return ""
+    truncated_raw = len(value) > limit * 4
     text = value[: limit * 4]
     if html:
         parser = _TextParser()
         parser.feed(text)
-        pending, parts, hidden = parser.rawdata, len(parser.parts), parser.hidden
+        pending, hidden = parser.rawdata, parser.hidden
+        literal_tail = ""
+        if pending.startswith("<"):
+            # Discard incomplete markup before close(), since some Python versions
+            # emit unfinished tags or comments as text; keep bare literal '<word'.
+            if not truncated_raw and (
+                pending in {"<", "</"}
+                or (
+                    re.fullmatch(r"</?[A-Za-z][A-Za-z0-9_-]*", pending)
+                    and not re.match(r"</?(?:script|style|noscript|template)\b", pending, re.I)
+                )
+            ):
+                literal_tail = pending
+            parser.rawdata = ""
         parser.close()
-        # Some Python versions silently discard a final incomplete tag such as
-        # '<word', even on close(). Keep that literal text, not comments or scripts.
-        if not hidden and len(parser.parts) == parts and re.fullmatch(r"</?[A-Za-z][^>]*", pending):
-            parser.parts.append(pending)
+        if not hidden and literal_tail:
+            parser.parts.append(literal_tail)
         text = "".join(parser.parts)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = _SURROGATE_RE.sub("\ufffd", text)
-    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufffe\uffff]", "", text)
     return re.sub(r"[ \t]+", " ", re.sub(r"\n{3,}", "\n\n", text)).strip()[:limit]
 
 
@@ -177,10 +253,31 @@ def canonical_url(value: str) -> str:
         raise ValueError("Invalid source URL")
     value.encode("utf-8")  # Reject invalid Unicode URLs before persistence.
     parsed = urlsplit(value)
-    host = (parsed.hostname or "").lower().rstrip(".")
-    if parsed.scheme != "https" or not host or parsed.username is not None or parsed.password is not None:
+    raw_host = parsed.hostname or ""
+    if (
+        parsed.scheme != "https"
+        or not raw_host
+        or "%" in raw_host
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
         raise ValueError("Source URLs must be public HTTPS URLs without credentials")
-    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Invalid URL port") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("Invalid URL port")
+    import httpx
+
+    try:
+        decoded_host = httpx.URL(urlunsplit(("https", parsed.netloc, "/", "", ""))).raw_host.decode("ascii").lower()
+    except (httpx.InvalidURL, UnicodeError, ValueError) as exc:
+        raise ValueError("Invalid source URL") from exc
+    if "%" in decoded_host or decoded_host.endswith(".."):
+        raise ValueError("Invalid source URL")
+    host = decoded_host[:-1] if decoded_host.endswith(".") else decoded_host
+    if not host or host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
         raise ValueError("Local source URL is not allowed")
     try:
         address = ipaddress.ip_address(host)
@@ -189,35 +286,30 @@ def canonical_url(value: str) -> str:
             raise ValueError("Local source URL is not allowed")
         if all(re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", part) for part in host.split(".")):
             raise ValueError("Ambiguous numeric source host is not allowed")
+        if not is_valid_domain(host):
+            raise ValueError("Invalid source URL")
     else:
+        if host != decoded_host:
+            raise ValueError("Invalid source URL")
         from . import transport
 
-        policy = getattr(transport, "PUBLIC_ADDRESS_POLICY", None) or transport.AddressPolicy()
-        if not policy.permits(str(address)):
+        if not transport.PUBLIC_ADDRESS_POLICY.permits(address):
             raise ValueError("Private source URL is not allowed")
-    try:
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError("Invalid URL port") from exc
-    if port is not None and not 1 <= port <= 65535:
-        raise ValueError("Invalid URL port")
     authority = f"[{host}]" if ":" in host else host
     if port is not None and port != 443:
         authority += f":{port}"
     path = parsed.path or "/"
     if host == "gitlab.torproject.org":
-        path = re.sub(r"/-/issues/(\d+)/?\Z", r"/-/work_items/\1", path)
+        path = re.sub(r"/-/issues/(\d+)/?\Z", r"/-/work_items/\1", path, flags=re.I)
     query = urlencode([(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if not k.lower().startswith("utm_")])
     return urlunsplit(("https", authority, path, query, parsed.fragment))
 
 
 def safe_canonical_url(url: object) -> str:
     """Return canonical_url(url) for a valid public HTTPS URL string, or empty string otherwise."""
-    if not isinstance(url, str) or not url:
-        return ""
     try:
-        return canonical_url(url)
-    except (TypeError, ValueError, UnicodeError):
+        return canonical_url(url) if url else ""
+    except ValueError:
         return ""
 
 
@@ -244,34 +336,42 @@ _HACKERONE_REPORT_RE = re.compile(
 )
 
 
+def _url_host(url: object) -> str:
+    try:
+        return (urlsplit(url).hostname or "").lower().rstrip(".") if isinstance(url, str) and url else ""
+    except ValueError:
+        return ""
+
+
+def folded_labels(item: dict) -> set[str]:
+    """Return stripped case-folded string labels from `item`, or an empty set."""
+    labels = item.get("labels") if isinstance(item, dict) else None
+    return {s.strip().casefold() for s in labels if isinstance(s, str)} if isinstance(labels, (list, tuple, set, frozenset)) else set()
+
+
+def dirauth_user_set(users: Iterable[str] | None = None) -> set[str]:
+    """Normalize configured or default directory-authority GitLab usernames to lowercase."""
+    return {u.strip().lower() for u in (DIRAUTH_GITLAB_USERS if users is None else users) if isinstance(u, str) and u.strip()}
+
+
 def is_hackerone_item(item: dict) -> bool:
     """Return whether `item` is an authoritative HackerOne disclosure or GitLab report."""
     if not isinstance(item, dict):
         return False
     if item.get("authority") == "hackerone":
         return True
-    raw_url = item.get("url", "")
-    if isinstance(raw_url, str) and raw_url:
-        host = (urlsplit(raw_url).hostname or "").lower().rstrip(".")
-        if host == "hackerone.com" or host.endswith(".hackerone.com"):
-            return True
-    if item.get("authority") != "community" and item.get("kind") in {"gitlab_issue", "gitlab_mr"}:
-        labels = item.get("labels") or ()
-        if isinstance(labels, (list, tuple, set, frozenset)):
-            for label in labels:
-                if isinstance(label, str):
-                    folded = label.strip().casefold()
-                    if folded == "hackerone" or folded.startswith("hackerone::"):
-                        return True
-        title = item.get("title", "") if isinstance(item.get("title"), str) else ""
-        body = (
-            item["source_content"]
-            if isinstance(item.get("source_content"), str)
-            else (item.get("content", "") if isinstance(item.get("content"), str) else "")
-        )
-        if _HACKERONE_REPORT_RE.search(f"{title}\n{body}"):
-            return True
-    return False
+    if item.get("authority") == "community":
+        return False
+    host = _url_host(item.get("url"))
+    if host == "hackerone.com" or host.endswith(".hackerone.com"):
+        return True
+    if item.get("kind") not in {"gitlab_issue", "gitlab_mr"}:
+        return False
+    if any(f == "hackerone" or f.startswith("hackerone::") for f in folded_labels(item)):
+        return True
+    title = item["title"] if isinstance(item.get("title"), str) else ""
+    body = next((item[k] for k in ("source_content", "content") if isinstance(item.get(k), str)), "")
+    return bool(_HACKERONE_REPORT_RE.search(f"{title}\n{body}"))
 
 
 DIRAUTH_GITLAB_USERS = (
@@ -295,38 +395,25 @@ def is_dirauth_item(item: dict, dirauth_users: Iterable[str] | None = None) -> b
         return False
     if item.get("authority") == "dirauth-operator":
         return True
-    if item.get("authority") == "community" or item.get("kind") not in {"gitlab_issue", "gitlab_mr"}:
+    if item.get("authority") == "community" or item.get("kind") not in {"gitlab_issue", "gitlab_mr"} or _url_host(item.get("url")) != "gitlab.torproject.org":
         return False
-    raw_url = item.get("url")
-    if not isinstance(raw_url, str) or not raw_url:
-        return False
-    try:
-        host = (urlsplit(raw_url).hostname or "").lower().rstrip(".")
-    except ValueError:
-        return False
-    if host != "gitlab.torproject.org":
-        return False
-    labels = item.get("labels") or ()
-    if isinstance(labels, (list, tuple, set, frozenset)):
-        for label in labels:
-            if isinstance(label, str) and label.strip().casefold() in _DIRAUTH_LABELS:
-                return True
-    users = {
-        u.strip().lower()
-        for u in (DIRAUTH_GITLAB_USERS if dirauth_users is None else dirauth_users)
-        if isinstance(u, str) and u.strip()
-    }
-    author = item.get("author")
-    if isinstance(author, str) and author.strip().lower() in users:
+    if folded_labels(item) & _DIRAUTH_LABELS:
         return True
-    for field in ("public_comments", "dirauth_notes"):
-        notes = item.get(field)
-        if isinstance(notes, list) and any(
-            isinstance(note, dict) and isinstance(note.get("author"), str) and note["author"].strip().lower() in users
-            for note in notes
-        ):
-            return True
-    return False
+    users = dirauth_user_set(dirauth_users)
+    if isinstance(author := item.get("author"), str) and author.strip().lower() in users:
+        return True
+    return any(
+        isinstance(notes := item.get(field), list)
+        and any(isinstance(n, dict) and isinstance(n.get("author"), str) and n["author"].strip().lower() in users for n in notes)
+        for field in ("public_comments", "dirauth_notes")
+    )
+
+
+def effective_authority(item: dict, dirauth_users: Iterable[str] | None = None) -> str | None:
+    """Return `item`'s authority after promoting HackerOne or directory-authority development items."""
+    if item.get("authority") != "development":
+        return item.get("authority")
+    return "hackerone" if is_hackerone_item(item) else "dirauth-operator" if is_dirauth_item(item, dirauth_users) else "development"
 
 
 _PRODUCT_NAMES = {"tor-browser": r"tor[- ]browser", "arti": "arti", "tor": "tor"}
@@ -334,19 +421,28 @@ _VERSION = re.compile(r"\d+\.\d+(?:\.\d+){0,2}(?:[-.]?(?:alpha|beta|rc|a)\.?\d*)
 _RELEASE_QUALIFIERS = r"(?:(?:new|stable|alpha|beta|security|bugfix|releases?|version)\s+)*"
 _RELEASE_AFTER = re.compile(r"\s+(?:is\s+)?(?:now\s+)?available\b")
 _RELEASE_EOL = re.compile(r"\b(?:end[- ]of[- ]life|eol|out of support|no longer supported)\b")
-_GITLAB_OWN = re.compile(r"^(https://[^/?#]+)/(.+?)/-/(?:issues|work_items|merge_requests|tags|blob)/\S+")
-_GITLAB_URL_REF = re.compile(r"^(https://[^/?#]+)/(.+?)/-/(issues|work_items|merge_requests)/(\d+)(?:/|$)")
-_GITLAB_SHORT_REF = re.compile(r"^(?:([a-z0-9_.-]+(?:/[a-z0-9_.-]+)+))?([#!])(\d+)$", re.I)
-_REF_TOKEN = r"(?:https://[^\s<>()\[\]\"']+|(?<![\w/#!])(?:[a-z0-9_.-]+(?:/[a-z0-9_.-]+)+)?[#!]\d+\b)"
+GITLAB_PROJECT_PATH = r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+"
+_GITLAB_OWN = re.compile(rf"^(https://[^/?#]+)/({GITLAB_PROJECT_PATH})/-/(?:issues|work_items|merge_requests|tags|blob)/\S+", re.I)
+_GITLAB_URL_REF = re.compile(rf"^(https://[^/?#]+)/({GITLAB_PROJECT_PATH})/-/(issues|work_items|merge_requests)/(\d+)(?:/|$)", re.I)
+_GITLAB_SHORT_REF = re.compile(rf"^(?:({GITLAB_PROJECT_PATH}))?([#!])(\d+)$")
+_REF_TOKEN = rf"(?:https://[^\s<>()\[\]\"']+|(?<![\w/#!.-]){GITLAB_PROJECT_PATH}[#!]\d+\b|(?<![\w/#!])[#!]\d+\b)"
 _CLOSING_SPAN = re.compile(
     rf"\b(?:clos(?:e|es|ed|ing)|fix(?:|es|ed|ing)|resolv(?:e|es|ed|ing))\s*:?\s+({_REF_TOKEN}(?:\s*(?:,|and)\s*{_REF_TOKEN})*)",
     re.I,
 )
 _ANY_REF = re.compile(_REF_TOKEN, re.I)
 _RELEASE_MENTION = re.compile(
-    rf"\b(tor[- ]browser|arti|tor)[- ]{_RELEASE_QUALIFIERS}v?(\d+\.\d+(?:[\w.-]*\w)?)(?!(?:\w|\.\w))",
+    rf"\b({'|'.join(_PRODUCT_NAMES.values())})[- ]{_RELEASE_QUALIFIERS}v?(\d+\.\d+(?:[\w.-]*\w)?)(?!(?:\w|\.\w))",
     re.I,
 )
+_SUBJECT_NOISE_RE = re.compile(r"^(?:\[[^\]]+\]|fwd?\s*:|\(fwd\))\s*", re.I)
+_SUBJECT_REPLY_RE = re.compile(r"^(?:re|aw|sv)(?:\[\d+\])?\s*[:.]\s*", re.I)
+
+
+def _item_texts(item: dict) -> tuple[str, str]:
+    header = f"{item.get('title') or ''}\n{item.get('content') or ''}"
+    comments = (str(note.get("body") or "") for note in item.get("public_comments") or ())
+    return header, "\n".join((header, *comments))
 
 
 def item_cluster(item: dict) -> str:
@@ -398,16 +494,21 @@ def gitlab_refs(item: dict) -> tuple[list[str], list[str]]:
     """Extract canonical closing and mentioned GitLab issue and merge-request URLs."""
     own_url = str(item.get("url") or "")
     own_match = _GITLAB_OWN.match(own_url)
-    origin = own_match.group(1) if own_match else "https://gitlab.torproject.org"
-    own_project = own_match.group(2) if own_match else None
+    origin = own_match.group(1).lower() if own_match else "https://gitlab.torproject.org"
+    own_project = (
+        own_match.group(2)
+        if own_match and not any(p in {".", ".."} for p in own_match.group(2).split("/"))
+        else None
+    )
 
     def normalize_ref(token: str) -> str | None:
         """Resolve one full or shorthand GitLab issue or merge-request token."""
-        if token.startswith("https://"):
+        if token.lower().startswith("https://"):
             match = _GITLAB_URL_REF.match(token.rstrip(".,;:!?)>]").split("#", 1)[0].split("?", 1)[0])
             if not match:
                 return None
             ref_origin, project, kind_seg, number = match.groups()
+            ref_origin, kind_seg = ref_origin.lower(), kind_seg.lower()
             if ref_origin not in {"https://gitlab.torproject.org", origin}:
                 return None
             seg = "work_items" if kind_seg in {"issues", "work_items"} else "merge_requests"
@@ -417,40 +518,36 @@ def gitlab_refs(item: dict) -> tuple[list[str], list[str]]:
             if not project:
                 return None
             ref_origin, seg, number = origin, ("work_items" if short.group(2) == "#" else "merge_requests"), short.group(3)
+        if any(p in {".", ".."} for p in project.split("/")):
+            return None
         raw = f"{ref_origin}/{project.lower()}/-/{seg}/{number}"
-        return (safe_canonical_url(raw) or None) if ref_origin == "https://gitlab.torproject.org" else raw
+        return safe_canonical_url(raw) or None
 
-    own_canonical = normalize_ref(own_url) if own_url.startswith("https://") else None
-    closing, mentioned = [], []
-    header_text = f"{item.get('title') or ''}\n{item.get('content') or ''}"
-    for span in _CLOSING_SPAN.finditer(header_text):
-        for ref_match in _ANY_REF.finditer(span.group(1)):
-            resolved = normalize_ref(ref_match.group(0))
-            if resolved and resolved != own_canonical and resolved not in closing:
-                closing.append(resolved)
-    full_text = "\n".join([header_text, *(str(note.get("body") or "") for note in item.get("public_comments") or [])])
-    for ref_match in _ANY_REF.finditer(full_text):
-        resolved = normalize_ref(ref_match.group(0))
-        if resolved and resolved != own_canonical and resolved not in closing and resolved not in mentioned:
-            mentioned.append(resolved)
+    own_canonical = normalize_ref(own_url) if own_url.lower().startswith("https://") else None
+    header_text, full_text = _item_texts(item)
+    closing = list(dict.fromkeys(
+        resolved
+        for span in _CLOSING_SPAN.finditer(header_text)
+        for ref_match in _ANY_REF.finditer(span.group(1))
+        if (resolved := normalize_ref(ref_match.group(0))) and resolved != own_canonical
+    ))
+    mentioned = list(dict.fromkeys(
+        resolved
+        for ref_match in _ANY_REF.finditer(full_text)
+        if (resolved := normalize_ref(ref_match.group(0))) and resolved != own_canonical and resolved not in closing
+    ))
     return closing, mentioned
 
 
 def release_mentions(item: dict) -> list[str]:
     """Extract release:<product>:<version> keys explicitly named with their product."""
-    texts = [str(item.get("title") or ""), str(item.get("content") or ""),
-             *(str(note.get("body") or "") for note in item.get("public_comments") or [])]
     found = []
-    for match in _RELEASE_MENTION.finditer("\n".join(texts)):
-        raw_prod, raw_ver = match.group(1).lower(), match.group(2).lower()
-        version = raw_ver.removeprefix("v")
-        if not _VERSION.fullmatch(version):
-            continue
-        product = "tor-browser" if raw_prod.startswith("tor") and len(raw_prod) > 3 else raw_prod
-        key = f"release:{product}:{version}"
-        if key not in found:
-            found.append(key)
-    return found
+    for match in _RELEASE_MENTION.finditer(_item_texts(item)[1]):
+        raw_prod, version = match.group(1).lower(), match.group(2).lower()
+        if _VERSION.fullmatch(version):
+            product = "tor-browser" if raw_prod.startswith("tor") and len(raw_prod) > 3 else raw_prod
+            found.append(f"release:{product}:{version}")
+    return list(dict.fromkeys(found))
 
 
 def thread_subject(item: dict) -> tuple[str | None, bool]:
@@ -460,13 +557,11 @@ def thread_subject(item: dict) -> tuple[str | None, bool]:
     text = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()
     is_reply = False
     while text:
-        if tag_match := re.match(r"^\[[^\]]+\]\s*", text):
-            text = text[tag_match.end() :]
-        elif reply_match := re.match(r"^(?:re|aw|sv)(?:\[\d+\])?\s*[:.]\s*", text, re.I):
+        if match := _SUBJECT_NOISE_RE.match(text):
+            text = text[match.end() :]
+        elif match := _SUBJECT_REPLY_RE.match(text):
             is_reply = True
-            text = text[reply_match.end() :]
-        elif fwd_match := re.match(r"^(?:fwd?\s*:\s*|\(fwd\)\s*)", text, re.I):
-            text = text[fwd_match.end() :]
+            text = text[match.end() :]
         else:
             break
     cleaned = text.strip().lower()

@@ -37,10 +37,12 @@ _PATH = re.compile(
 
 
 def public_path_allowed(relative: str) -> bool:
+    """Return whether `relative` matches a permitted generated output file path."""
     return isinstance(relative, str) and bool(_PATH.fullmatch(relative))
 
 
 def initialize(db) -> None:
+    """Create publication ledger, catalog, topic, and render-queue tables and triggers."""
     editorial.initialize(db)
     db.executescript("""
         CREATE TABLE IF NOT EXISTS public_artifacts (
@@ -60,6 +62,17 @@ def initialize(db) -> None:
         DROP INDEX IF EXISTS public_catalog_published;
         CREATE INDEX IF NOT EXISTS public_catalog_added ON public_catalog(added_at DESC,updated_at DESC,story_id DESC);
         CREATE INDEX IF NOT EXISTS public_catalog_updated ON public_catalog(updated_at DESC,published_at DESC,story_id DESC);
+        CREATE INDEX IF NOT EXISTS public_catalog_template ON public_catalog(template_hash);
+        CREATE TABLE IF NOT EXISTS public_catalog_checks (
+            story_id TEXT PRIMARY KEY, template_hash TEXT NOT NULL,
+            json_sha256 TEXT NOT NULL, omitted INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS public_catalog_checks_omitted
+            ON public_catalog_checks(template_hash,omitted,story_id);
+        CREATE TRIGGER IF NOT EXISTS public_catalog_checks_invalidate
+            AFTER UPDATE OF template_hash, json_sha256, public_json ON public_catalog BEGIN
+            DELETE FROM public_catalog_checks WHERE story_id=NEW.story_id;
+        END;
         CREATE TABLE IF NOT EXISTS public_story_topics (
             topic TEXT NOT NULL, story_id TEXT NOT NULL,
             added_at TEXT NOT NULL, updated_at TEXT NOT NULL,
@@ -91,8 +104,9 @@ def initialize(db) -> None:
 
 
 def template_identity(site: dict) -> str:
+    """Compute a digest of rendering modules and site metadata to detect template changes."""
     root = Path(__file__).parent
-    files = [(name, hashlib.sha256((root / name).read_bytes()).hexdigest()) for name in ("render.py", "publication.py", "editorial.py", "schema.py", "util.py")]
+    files = [(name, _file_hash(root / name)) for name in ("render.py", "publication.py", "editorial.py", "schema.py", "util.py")]
     return digest([files, {key: site.get(key) for key in ("title", "description", "base_url", "repository_url")}])
 
 
@@ -140,6 +154,8 @@ TEMPORARY_PREFIX = ".onionflash-"
 
 
 class Artifacts:
+    """Atomic staged writer tracking generated public files in `public_artifacts`."""
+
     def __init__(self, db, output: Path, observed: str):
         self.db, self.output, self.observed = db, output, observed
         self.staging = output.parent / ("." + output.name + ".onionflash-staging")
@@ -154,6 +170,7 @@ class Artifacts:
 
     @contextmanager
     def stream(self, relative: str, content_type: str):
+        """Stream bytes into a staged temporary file and replace `relative` only on change."""
         target = _target(self.output, relative)
         descriptor, temporary_name = tempfile.mkstemp(prefix=TEMPORARY_PREFIX, dir=self.staging)
         temporary = Path(temporary_name)
@@ -179,13 +196,21 @@ class Artifacts:
             temporary.unlink(missing_ok=True)
 
     def write(self, relative: str, chunks, content_type: str) -> str:
+        """Write byte `chunks` to `relative` and return its SHA-256 hex digest."""
         with self.stream(relative, content_type) as sink:
             for chunk in chunks:
                 sink.write(chunk)
         return sink.checksum.hexdigest()
 
     def text(self, relative: str, text: str, content_type: str) -> str:
+        """Write UTF-8 `text` to `relative` and return its SHA-256 hex digest."""
         return self.write(relative, [text.encode("utf-8")], content_type)
+
+    def write_article(self, story_id: str, html_body: str, payload: dict) -> tuple[str, str]:
+        """Write paired `index.html` and `story.json` files and return `(public_json, sha256)`."""
+        public_json = render.public_json_text(payload)
+        self.text(f"news/{story_id}/index.html", html_body, "text/html; charset=utf-8")
+        return public_json, self.text(f"news/{story_id}/story.json", public_json, "application/json; charset=utf-8")
 
 
 class _Sink:
@@ -198,7 +223,7 @@ class _Sink:
         self.size += len(chunk)
 
 
-def _public_story(row, current: str | None = None) -> dict | None:
+def _public_story(row, current: str | None = None, *, warn: bool = True) -> dict | None:
     """A verified catalog snapshot, checked again unless the `current` template rendered it."""
     payload = row["public_json"]
     if not isinstance(payload, str) or hashlib.sha256(payload.encode("utf-8")).hexdigest() != row["json_sha256"]:
@@ -210,26 +235,58 @@ def _public_story(row, current: str | None = None) -> dict | None:
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             if current is None:
                 raise
-            logging.getLogger(__name__).warning("Left story %s out of listings and feeds (%s)", row["story_id"], type(exc).__name__)
+            if warn:
+                logging.getLogger(__name__).warning("Left story %s out of listings and feeds (%s)", row["story_id"], type(exc).__name__)
             return None
     if story["id"] != row["story_id"]:
         raise ValueError("Accepted story identity differs from its catalog entry")
     return story
 
 
-def _accepted_with_editorial(db, accepted) -> dict:
-    story = _public_story(accepted)
+def _catalog_row(db, story_id: str):
+    return db.execute("SELECT * FROM public_catalog WHERE story_id=?", (story_id,)).fetchone()
+
+
+def _dequeue(db, story_id: str) -> None:
+    db.execute("DELETE FROM public_render_queue WHERE story_id=?", (story_id,))
+
+
+def _render_accepted(db, site: dict, base: str, accepted) -> tuple[dict, str]:
     meta = editorial.public_metadata(db, accepted["story_id"])
-    if meta is None or (story.get("editorial") or {}).get("revision") == meta["revision"]:
-        return story
-    if meta["status"] == "retracted":
-        return render.prepare_story({**story, **editorial.retracted_fields(meta["reason"]), "updated_at": meta["at"]}, editorial=meta)
-    rev_row = db.execute(
-        "SELECT after_public_json FROM editorial_revisions WHERE story_id=? AND revision=?",
-        (accepted["story_id"], meta["revision"]),
-    ).fetchone()
-    base_story = json.loads(rev_row[0]) if rev_row and rev_row[0] else story
-    return render.prepare_story(base_story, editorial=meta)
+    payload = accepted["public_json"]
+    if not isinstance(payload, str) or hashlib.sha256(payload.encode("utf-8")).hexdigest() != accepted["json_sha256"]:
+        raise ValueError("Accepted public story snapshot is missing or changed")
+    raw = json.loads(payload)
+    if not isinstance(raw, dict):
+        raise ValueError("Accepted public story snapshot is missing or changed")
+    if meta is not None and (raw.get("editorial") or {}).get("revision") != meta["revision"]:
+        if meta["status"] == "retracted":
+            retracted_raw = {
+                **raw,
+                **editorial.retracted_fields(meta["reason"]),
+                "category": raw["category"] if isinstance(raw.get("category"), str) and raw["category"] in render.CATEGORIES else "network",
+                "confidence": raw["confidence"] if isinstance(raw.get("confidence"), str) and raw["confidence"] in render.CONFIDENCES else "reported",
+                "state": raw["state"] if isinstance(raw.get("state"), str) and raw["state"] in render.PUBLIC_STATES else "developing",
+                "updated_at": meta["at"],
+            }
+            story = render.prepare_story(retracted_raw, editorial=meta)
+        else:
+            rev_row = db.execute(
+                "SELECT CAST(after_public_json AS BLOB) FROM editorial_revisions WHERE story_id=? AND revision=? AND typeof(after_public_json)='text'",
+                (accepted["story_id"], meta["revision"]),
+            ).fetchone()
+            after_obj = saved_object(rev_row[0], allow_surrogates=True) if rev_row else None
+            if after_obj is None:
+                raise ValueError("Editorial revision snapshot is missing or unreadable")
+            story = render.prepare_story(after_obj, editorial=meta)
+    else:
+        story = _public_story(accepted)
+    if story["id"] != accepted["story_id"]:
+        raise ValueError("Accepted story identity differs from its catalog entry")
+    article = render.article_html(site, base, story)
+    render.public_json_text(story).encode("utf-8")
+    article.encode("utf-8")
+    return story, article
 
 
 def _accepted(db, *, order: str = "added_at", batch_size: int = 100, topic: str | None = None):
@@ -257,14 +314,6 @@ def _accepted(db, *, order: str = "added_at", batch_size: int = 100, topic: str 
             if (story := _public_story(row, current)) is not None:
                 yield story
         cursor = (rows[-1][order], rows[-1][secondary], rows[-1]["story_id"])
-
-
-def _story_topics(db, story: dict) -> None:
-    db.execute("DELETE FROM public_story_topics WHERE story_id=?", (story["id"],))
-    db.executemany(
-        "INSERT INTO public_story_topics(topic,story_id,added_at,updated_at) VALUES(?,?,?,?)",
-        [(topic, story["id"], story["added_at"], story["updated_at"]) for topic in story["tags"]],
-    )
 
 
 def _feeds(artifacts: Artifacts, db, site: dict, base: str) -> None:
@@ -298,21 +347,14 @@ def _feeds(artifacts: Artifacts, db, site: dict, base: str) -> None:
         json_writer.write(b"]}\n")
 
 
-def _remove_owned_file(artifacts: Artifacts, row, target: Path) -> None:
-    if target.is_symlink() or (target.exists() and not target.is_file()):
-        raise ValueError("Retired public artifact must be a regular file")
-    target.unlink(missing_ok=True)
-    artifacts.db.execute("DELETE FROM public_artifacts WHERE path=?", (row["path"],))
-    store_mod.set_meta(artifacts.db, publication_dirty="1")
-
-
 def _remove_obsolete_pages(artifacts: Artifacts, pages: int, topic: str | None = None) -> None:
     for page in itertools.count(pages + 1):
         relative = render._page_url("", page, topic) + "index.html"
-        row = artifacts.db.execute("SELECT path FROM public_artifacts WHERE path=?", (relative,)).fetchone()
-        if row is None:
+        if artifacts.db.execute("SELECT 1 FROM public_artifacts WHERE path=?", (relative,)).fetchone() is None:
             return
-        _remove_owned_file(artifacts, row, _target(artifacts.output, relative))
+        _target(artifacts.output, relative).unlink(missing_ok=True)
+        artifacts.db.execute("DELETE FROM public_artifacts WHERE path=?", (relative,))
+        store_mod.set_meta(artifacts.db, publication_dirty="1")
 
 
 def _listing(artifacts: Artifacts, site: dict, base: str, health: list, *, count: int,
@@ -333,16 +375,15 @@ def _listing(artifacts: Artifacts, site: dict, base: str, health: list, *, count
 
 
 def _pointer(artifacts: Artifacts, db, site: dict, base: str, identity: str, story_id: str, survivor_id: str) -> None:
-    accepted = db.execute("SELECT * FROM public_catalog WHERE story_id=?", (story_id,)).fetchone()
+    accepted = _catalog_row(db, story_id)
     if accepted is None:
         with db:
-            db.execute("DELETE FROM public_render_queue WHERE story_id=?", (story_id,))
+            _dequeue(db, story_id)
         return
     article = render.pointer_html(site, base, survivor_id)
-    public_json = json.dumps(render.pointer_json(base, story_id, survivor_id), ensure_ascii=False, sort_keys=True) + "\n"
+    pointer = render.pointer_json(base, story_id, survivor_id)
     with db:
-        artifacts.text(f"news/{story_id}/index.html", article, "text/html; charset=utf-8")
-        checksum = artifacts.text(f"news/{story_id}/story.json", public_json, "application/json; charset=utf-8")
+        public_json, checksum = artifacts.write_article(story_id, article, pointer)
         removed = db.execute("DELETE FROM public_story_topics WHERE story_id=?", (story_id,)).rowcount
         if accepted["json_sha256"] != checksum or accepted["template_hash"] == "" or removed:
             store_mod.bump_meta(db, "publication_catalog_revision")
@@ -350,7 +391,72 @@ def _pointer(artifacts: Artifacts, db, site: dict, base: str, identity: str, sto
             "UPDATE public_catalog SET template_hash=?,json_sha256=?,public_json=? WHERE story_id=?",
             (identity, checksum, public_json, story_id),
         )
-        db.execute("DELETE FROM public_render_queue WHERE story_id=?", (story_id,))
+        _dequeue(db, story_id)
+
+
+def _sync_catalog_checks(db, identity: str, *, batch_size: int = 100) -> list[str]:
+    """Incrementally validate unchecked stale catalog snapshots for `identity` and return omitted IDs."""
+    has_stale = db.execute(
+        "SELECT 1 FROM public_catalog WHERE template_hash<? OR template_hash>? LIMIT 1",
+        (identity, identity),
+    ).fetchone()
+    if has_stale is None:
+        if db.execute("SELECT 1 FROM public_catalog_checks LIMIT 1").fetchone() is not None:
+            with db:
+                db.execute("DELETE FROM public_catalog_checks")
+        return []
+    with db:
+        db.execute(
+            "DELETE FROM public_catalog_checks WHERE template_hash!=? OR story_id IN (SELECT story_id FROM story_aliases)",
+            (identity,),
+        )
+    cursor: str | None = None
+    while True:
+        cursor_sql = " AND c.story_id>?" if cursor is not None else ""
+        params = (identity, identity, *((cursor,) if cursor is not None else ()), batch_size)
+        rows = db.execute(
+            f"""SELECT c.story_id, c.template_hash, c.json_sha256, c.public_json
+                FROM public_catalog c
+                WHERE c.template_hash!=?
+                  AND c.story_id NOT IN (SELECT story_id FROM story_aliases)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM public_catalog_checks chk
+                      WHERE chk.story_id=c.story_id
+                        AND chk.template_hash=?
+                        AND chk.json_sha256=c.json_sha256
+                  ){cursor_sql}
+                ORDER BY c.story_id LIMIT ?""",
+            params,
+        ).fetchall()
+        if not rows:
+            break
+        checks = [
+            (cat_row["story_id"], identity, cat_row["json_sha256"], int(_public_story(cat_row, identity, warn=False) is None))
+            for cat_row in rows
+        ]
+        with db:
+            db.executemany(
+                """INSERT INTO public_catalog_checks(story_id,template_hash,json_sha256,omitted)
+                   VALUES(?,?,?,?) ON CONFLICT(story_id) DO UPDATE SET
+                   template_hash=excluded.template_hash,json_sha256=excluded.json_sha256,omitted=excluded.omitted""",
+                checks,
+            )
+        cursor = rows[-1]["story_id"]
+    return [
+        row[0]
+        for row in db.execute(
+            """SELECT c.story_id
+               FROM public_catalog_checks chk
+               JOIN public_catalog c ON c.story_id=chk.story_id
+               WHERE chk.template_hash=?
+                 AND chk.omitted=1
+                 AND c.template_hash!=?
+                 AND c.json_sha256=chk.json_sha256
+                 AND c.story_id NOT IN (SELECT story_id FROM story_aliases)
+               ORDER BY c.story_id""",
+            (identity, identity),
+        ).fetchall()
+    ]
 
 
 def build(config: dict, store, *, force: bool = False) -> dict:
@@ -381,8 +487,7 @@ def build(config: dict, store, *, force: bool = False) -> dict:
     candidates = db.execute(
         """SELECT public_render_queue.story_id AS id,
                   stories.id IS NOT NULL AS has_story,
-                  typeof(stories.payload) AS payload_type,
-                  CAST(stories.payload AS BLOB) AS payload
+                  CASE WHEN typeof(stories.payload)='text' THEN CAST(stories.payload AS BLOB) END AS payload
            FROM public_render_queue
            LEFT JOIN stories ON stories.id=public_render_queue.story_id
            WHERE public_render_queue.last_error IS NULL ORDER BY public_render_queue.rowid LIMIT ?""",
@@ -396,53 +501,69 @@ def build(config: dict, store, *, force: bool = False) -> dict:
             else:
                 with db:
                     removed_topics = db.execute("DELETE FROM public_story_topics WHERE story_id=?", (row["id"],)).rowcount
-                    in_catalog = db.execute("SELECT 1 FROM public_catalog WHERE story_id=?", (row["id"],)).fetchone()
-                    db.execute("DELETE FROM public_render_queue WHERE story_id=?", (row["id"],))
-                    if removed_topics or in_catalog:
+                    _dequeue(db, row["id"])
+                    if removed_topics or _catalog_row(db, row["id"]) is not None:
                         store_mod.bump_meta(db, "publication_catalog_revision")
                         store_mod.set_meta(db, publication_dirty="1")
             continue
         quarantined = False
         accepted = None
         if not row["has_story"]:
-            accepted = db.execute("SELECT * FROM public_catalog WHERE story_id=?", (row["id"],)).fetchone()
+            accepted = _catalog_row(db, row["id"])
             if accepted is None:
                 with db:
-                    db.execute("DELETE FROM public_render_queue WHERE story_id=?", (row["id"],))
+                    _dequeue(db, row["id"])
                 continue
         try:
             if accepted is not None:
-                story = _accepted_with_editorial(db, accepted)
+                story, article = _render_accepted(db, site, base, accepted)
             else:
-                if row["payload_type"] != "text" or (parsed_payload := saved_object(row["payload"], allow_surrogates=True)) is None:
+                if (parsed_payload := saved_object(row["payload"], allow_surrogates=True)) is None:
                     raise ValueError("Damaged story payload")
                 story = render.prepare_story(parsed_payload, editorial=editorial.public_metadata(db, row["id"]))
-            if story["id"] != row["id"]:
-                raise ValueError("Story identity differs from its database row")
-            article = render.article_html(site, base, story)
+                if story["id"] != row["id"]:
+                    raise ValueError("Story identity differs from its database row")
+                article = render.article_html(site, base, story)
+                render.public_json_text(story).encode("utf-8")
+                article.encode("utf-8")
         except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
             with db:
                 db.execute("UPDATE public_render_queue SET last_error=? WHERE story_id=?", (type(exc).__name__, row["id"]))
             logging.getLogger(__name__).warning("Quarantined unrenderable story %s (%s)", row["id"], type(exc).__name__)
-            if accepted is not None:
-                continue
-            accepted = db.execute("SELECT * FROM public_catalog WHERE story_id=?", (row["id"],)).fetchone()
-            if accepted is None:
+            if accepted is not None or (accepted := _catalog_row(db, row["id"])) is None:
+                if accepted is not None:
+                    with db:
+                        if db.execute("DELETE FROM public_story_topics WHERE story_id=?", (row["id"],)).rowcount:
+                            store_mod.bump_meta(db, "publication_catalog_revision")
+                            store_mod.set_meta(db, publication_dirty="1")
                 continue
             try:
-                story = _accepted_with_editorial(db, accepted)
-                article = render.article_html(site, base, story)
+                story, article = _render_accepted(db, site, base, accepted)
             except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+                with db:
+                    if db.execute("DELETE FROM public_story_topics WHERE story_id=?", (row["id"],)).rowcount:
+                        store_mod.bump_meta(db, "publication_catalog_revision")
+                        store_mod.set_meta(db, publication_dirty="1")
                 continue
             quarantined = True
-        public_json = json.dumps(story, ensure_ascii=False, sort_keys=True) + "\n"
         with db:
-            artifacts.text(f"news/{story['id']}/index.html", article, "text/html; charset=utf-8")
-            checksum = artifacts.text(f"news/{story['id']}/story.json", public_json, "application/json; charset=utf-8")
-            previous = db.execute("SELECT json_sha256 FROM public_catalog WHERE story_id=?", (story["id"],)).fetchone()
-            if previous is None or previous[0] != checksum:
+            public_json, checksum = artifacts.write_article(story["id"], article, story)
+            previous = accepted or _catalog_row(db, story["id"])
+            expected_topics = [(topic, story["id"], story["added_at"], story["updated_at"]) for topic in story["tags"]]
+            topics_stale = previous is None or previous["json_sha256"] != checksum or {
+                tuple(topic_row)
+                for topic_row in db.execute(
+                    "SELECT topic,story_id,added_at,updated_at FROM public_story_topics WHERE story_id=?",
+                    (story["id"],),
+                )
+            } != set(expected_topics)
+            if topics_stale:
                 store_mod.bump_meta(db, "publication_catalog_revision")
-                _story_topics(db, story)
+                db.execute("DELETE FROM public_story_topics WHERE story_id=?", (story["id"],))
+                db.executemany(
+                    "INSERT INTO public_story_topics(topic,story_id,added_at,updated_at) VALUES(?,?,?,?)",
+                    expected_topics,
+                )
             db.execute(
                 """INSERT INTO public_catalog(story_id,published_at,updated_at,added_at,source_hash,template_hash,json_sha256,public_json)
                    VALUES(?,?,?,?,'',?,?,?) ON CONFLICT(story_id) DO UPDATE SET
@@ -451,18 +572,34 @@ def build(config: dict, store, *, force: bool = False) -> dict:
                 (story["id"], story["published_at"], story["updated_at"], story["added_at"], identity, checksum, public_json),
             )
             if not quarantined:
-                db.execute("DELETE FROM public_render_queue WHERE story_id=?", (story["id"],))
+                _dequeue(db, story["id"])
     with db:
         if db.execute("DELETE FROM public_story_topics WHERE story_id IN (SELECT story_id FROM story_aliases)").rowcount:
             store_mod.bump_meta(db, "publication_catalog_revision")
             store_mod.set_meta(db, publication_dirty="1")
-    total_catalog, count, latest = db.execute(
+    omitted_ids = _sync_catalog_checks(db, identity)
+    total_catalog, active_catalog, latest = db.execute(
         """SELECT COUNT(*),
                   COALESCE(SUM(story_id NOT IN (SELECT story_id FROM story_aliases)), 0),
                   MAX(CASE WHEN story_id NOT IN (SELECT story_id FROM story_aliases) THEN updated_at END)
            FROM public_catalog"""
     ).fetchone()
-    retired_catalog = total_catalog - count
+    retired_catalog = total_catalog - active_catalog
+    not_omitted_sql = (
+        "NOT EXISTS (SELECT 1 FROM public_catalog_checks chk JOIN public_catalog pc ON pc.story_id=chk.story_id "
+        "WHERE chk.story_id={col} AND chk.template_hash=? AND chk.omitted=1 "
+        "AND pc.template_hash!=? AND pc.json_sha256=chk.json_sha256)"
+    )
+    if omitted_ids:
+        count, latest = db.execute(
+            f"""SELECT COUNT(*), MAX(c.updated_at)
+                FROM public_catalog c
+                WHERE c.story_id NOT IN (SELECT story_id FROM story_aliases)
+                  AND {not_omitted_sql.format(col='c.story_id')}""",
+            (identity, identity),
+        ).fetchone()
+    else:
+        count = active_catalog
     pending, skipped = db.execute(
         "SELECT COALESCE(SUM(last_error IS NULL), 0), COALESCE(SUM(last_error IS NOT NULL), 0) FROM public_render_queue"
     ).fetchone()
@@ -472,23 +609,32 @@ def build(config: dict, store, *, force: bool = False) -> dict:
         news = output / "news"
         if news.is_symlink() or next(news.glob("*/index.html"), None) is not None:
             raise ValueError("Refusing an empty catalog over existing published articles; restore publication history")
-    views = digest([site, identity, store_mod.get_meta(db, "publication_catalog_revision"), retired_catalog])
+    views = digest([site, identity, store_mod.get_meta(db, "publication_catalog_revision"), retired_catalog, omitted_ids])
     refresh = restart_rebuild or store_mod.get_meta(db, "publication_views") != views
     health = store.health(config["sources"], config["collection"]["stale_after_seconds"], observed)
     with db:
-        for name in render.ASSET_FILES:
+        for name, content_type in render.ASSET_FILES.items():
             path = Path(render.__file__).parent / "assets" / name
-            content_type = {"style.css": "text/css; charset=utf-8", "mark.svg": "image/svg+xml"}[name]
             artifacts.write(name, [path.read_bytes()], content_type)
         artifacts.text("_headers", render.headers_text(base), "text/plain; charset=utf-8")
         _listing(artifacts, site, base, health, count=count, latest=latest, refresh=refresh)
         if refresh:
             for topic in render.CATEGORIES:
-                stats = db.execute(
-                    "SELECT COUNT(*),MAX(updated_at) FROM public_story_topics WHERE topic=? AND story_id NOT IN (SELECT story_id FROM story_aliases)",
-                    (topic,),
-                ).fetchone()
-                _listing(artifacts, site, base, [], count=stats[0], latest=stats[1], refresh=True, topic=topic)
+                if omitted_ids:
+                    t_count, t_latest = db.execute(
+                        f"""SELECT COUNT(*), MAX(t.updated_at)
+                            FROM public_story_topics t
+                            WHERE t.topic=?
+                              AND t.story_id NOT IN (SELECT story_id FROM story_aliases)
+                              AND {not_omitted_sql.format(col='t.story_id')}""",
+                        (topic, identity, identity),
+                    ).fetchone()
+                else:
+                    t_count, t_latest = db.execute(
+                        "SELECT COUNT(*),MAX(updated_at) FROM public_story_topics WHERE topic=? AND story_id NOT IN (SELECT story_id FROM story_aliases)",
+                        (topic,),
+                    ).fetchone()
+                _listing(artifacts, site, base, [], count=t_count, latest=t_latest, refresh=True, topic=topic)
             _feeds(artifacts, db, site, base)
         changed = store_mod.get_meta(db, "publication_dirty") == "1"
         if changed:

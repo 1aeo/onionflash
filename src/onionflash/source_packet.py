@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import re
 
 from .comments import analysis_context
-from .llm import unquoted_mail_text
-from .util import canonical_url, digest, is_dirauth_item, is_hackerone_item, plain_text, saved_object
+from .llm import is_quoted_list_post, unquoted_mail_text
+from .util import (
+    GITLAB_PROJECT_PATH, canonical_url, digest, effective_authority, gitlab_url_variants,
+    plain_text, safe_canonical_url, saved_object,
+)
 
 
 # The review packet's fixed bounds.
@@ -16,16 +20,12 @@ BASE_SOURCE_FIELDS = (
     "published_at", "updated_at", "labels", "upstream_state", "public_comments",
 )
 OPTIONAL_SOURCE_FIELDS = ("author", "sender_domain")
-SOURCE_FIELDS = (*BASE_SOURCE_FIELDS, *OPTIONAL_SOURCE_FIELDS)
 
 
 def source_fingerprint(item: dict) -> str:
     """Polling receipts and scheduling metadata do not change evidence identity."""
-    fields = {key: item.get(key) for key in BASE_SOURCE_FIELDS}
-    for opt in OPTIONAL_SOURCE_FIELDS:
-        if item.get(opt):
-            fields[opt] = item[opt]
-    return digest(fields)
+    return digest({**{key: item.get(key) for key in BASE_SOURCE_FIELDS},
+                   **{opt: item[opt] for opt in OPTIONAL_SOURCE_FIELDS if item.get(opt)}})
 
 
 def _source_body(item: dict | None) -> str | None:
@@ -37,32 +37,25 @@ def _source_body(item: dict | None) -> str | None:
     return body if isinstance(body, str) and (body.strip() or item["title"].strip()) else None
 
 
-def _decode(value):
-    item = saved_object(value)
-    return item if _source_body(item) is not None else None
-
-
-def _lookup_fingerprint(row):
-    if row is None:
-        return None
-    item = saved_object(row["payload"])
-    return source_fingerprint(item) if item is not None else digest(row["payload"].hex())
-
-
 def _safe_canonical(url: str) -> str:
-    try:
-        return canonical_url(url)
-    except (ValueError, TypeError, UnicodeError):
-        return url
+    return safe_canonical_url(url) or url
 
 
-def _matches_citation(item, source_id, url):
-    if item is None or (source_id and item.get("id") != source_id):
-        return False
-    try:
-        return canonical_url(item["url"]) == canonical_url(url)
-    except (KeyError, TypeError, ValueError):
-        return False
+_GITLAB_PROJECT_PREFIX_RE = re.compile(rf"^(https://gitlab\.torproject\.org/)({GITLAB_PROJECT_PATH})(/-/.*)$")
+
+
+def _citation_url_key(url: object) -> str:
+    canon = safe_canonical_url(url)
+    if not canon:
+        return ""
+    if match := _GITLAB_PROJECT_PREFIX_RE.match(canon):
+        return f"{match.group(1)}{match.group(2).lower()}{match.group(3)}"
+    return canon
+
+
+def _matches_citation(item, source_id, url) -> bool:
+    return (_source_body(item) is not None and (not source_id or item.get("id") == source_id)
+            and bool(cu := _citation_url_key(url)) and _citation_url_key(item.get("url")) == cu)
 
 
 def _load(db, source_id: str | None, url: str, analysis_key: str | None = None):
@@ -70,40 +63,51 @@ def _load(db, source_id: str | None, url: str, analysis_key: str | None = None):
     query = "SELECT id,CAST(payload AS BLOB) AS payload FROM items WHERE "
     row = db.execute(query + "id=?", (source_id,)).fetchone() if source_id else None
     if row is None:
-        alt = url.replace("/-/work_items/", "/-/issues/") if "/-/work_items/" in url else url.replace("/-/issues/", "/-/work_items/")
-        canon = _safe_canonical(url)
-        row = db.execute(query + "url IN (?,?,?)", (url, alt, canon)).fetchone()
-        if row is None and "gitlab.torproject.org" in canon:
-            row = db.execute(query + "LOWER(url) IN (?,?)", (canon.lower(), alt.lower())).fetchone()
-    lookup = {"table": "item_lookup", "key": row["id"] if row else source_id or url,
-              "by": "id" if row or source_id else "url", "hash": _lookup_fingerprint(row)}
-    if row is not None:
-        item = _decode(row["payload"])
-        if _matches_citation(item, source_id, url):
-            return item, [lookup], "current", None
+        variants = gitlab_url_variants(url)
+        exact = tuple({url, *variants})
+        row = db.execute(f"{query}url IN ({','.join('?' * len(exact))})", exact).fetchone()
+        if row is None and any(_GITLAB_PROJECT_PREFIX_RE.match(v) for v in variants):
+            lower = tuple({v.lower() for v in variants})
+            target_key = _citation_url_key(url)
+            candidates = db.execute(
+                f"SELECT id,CASE WHEN typeof(url)='text' THEN url END AS url,CAST(payload AS BLOB) AS payload "
+                f"FROM items WHERE LOWER(url) IN ({','.join('?' * len(lower))})",
+                lower,
+            ).fetchall()
+            row = next((c for c in candidates if _citation_url_key(c["url"]) == target_key), None)
+    raw_item = saved_object(row["payload"]) if row is not None else None
+    lookup = {"table": "item_lookup", "key": row["id"] if row else source_id or url, "by": "id" if row or source_id else "url",
+              "hash": None if row is None else (source_fingerprint(raw_item) if raw_item is not None else digest(row["payload"].hex()))}
+    if _matches_citation(raw_item, source_id, url):
+        return raw_item, [lookup], "current", None
+    resolved_id = source_id or (row["id"] if row is not None else None)
 
     # Stable repository-entry IDs can move to a different immutable commit URL.
     # Keep the retained citation tied to its actual bytes, never the newer entry.
-    def snapshot(row):
+    def snapshot(analysis_row):
         """Decode and verify a historical analysis snapshot matching the requested citation."""
-        if row is None:
-            return None
-        item = _decode(row["source_payload"])
-        if _matches_citation(item, source_id, url):
-            return item, [lookup, {"table": "analyses", "key": row["cache_key"], "hash": source_fingerprint(item)}], "historical-analysis", row["created_at"]
+        if analysis_row is not None and _matches_citation(
+            item := saved_object(analysis_row["source_payload"]), resolved_id, url
+        ):
+            return (
+                item,
+                [lookup, {"table": "analyses", "key": analysis_row["cache_key"], "hash": source_fingerprint(item)}],
+                "historical-analysis",
+                analysis_row["created_at"],
+            )
         return None
 
     if analysis_key and (saved := snapshot(db.execute(
             "SELECT cache_key,CAST(source_payload AS BLOB) AS source_payload,created_at FROM analyses WHERE cache_key=?",
             (analysis_key,)).fetchone())):
         return saved
-    if source_id:
+    if resolved_id:
         # Stream this one source's indexed history; a later snapshot at a
         # different URL must not hide an older exact citation match.
-        for row in db.execute("""SELECT cache_key,CAST(source_payload AS BLOB) AS source_payload,created_at FROM analyses
+        for analysis_row in db.execute("""SELECT cache_key,CAST(source_payload AS BLOB) AS source_payload,created_at FROM analyses
                 WHERE source_item_id=? AND source_payload IS NOT NULL
-                ORDER BY created_at DESC,cache_key DESC""", (source_id,)):
-            if saved := snapshot(row):
+                ORDER BY created_at DESC,cache_key DESC""", (resolved_id,)):
+            if saved := snapshot(analysis_row):
                 return saved
     return None
 
@@ -165,6 +169,15 @@ def build_packet(
         source.get("source_item_id", source.get("id")) != writer_id, source["url"]))
     public_urls = {_safe_canonical(source["url"]) for source in public["sources"]}
     update_urls = {_safe_canonical(source["url"]) for source in public["updates"][-1]["sources"]} if update and public.get("updates") else set()
+    bare_parent_ids = {
+        ref.get("id")
+        for ref in references
+        if not ref.get("network_key")
+        and not ref.get("source_item_id")
+        and ref.get("id")
+        and (require_all or ref.get("id") in required_ids or _safe_canonical(ref["url"]) in public_urls)
+    }
+    emitted_ids: set[str] = set()
     for source in references:
         if source.get("network_key"):
             continue
@@ -186,39 +199,41 @@ def build_packet(
                 missing.append(source["url"])
             continue
         item, source_bindings, snapshot, captured = loaded
+        if not source.get("source_item_id") and item.get("id") in emitted_ids:
+            continue
         if source.get("source_item_id"):
             # A cited note is supplied with the text of its parent issue.
             source_canon = _safe_canonical(source["url"])
-            if not any(_safe_canonical(note["url"]) == source_canon for note in item.get("public_comments", [])):
+            source_key = _citation_url_key(source["url"]) or source_canon
+            if not any((_citation_url_key(note["url"]) or _safe_canonical(note["url"])) == source_key
+                       for note in item.get("public_comments", [])):
                 truncated = True
                 if required and (not update or require_all or source_canon in update_urls):
                     missing.append(source["url"])
-            continue
+            if source_id in bare_parent_ids or source_id in emitted_ids or item.get("id") in emitted_ids:
+                continue
         body = _source_body(item)
         if body is None:
             truncated = True
             if required:
                 missing.append(source["url"])
             continue
-        unit = {key: item.get(key) for key in ("kind", "authority", "product", "published_at", "updated_at", "upstream_state")}
-        if unit["authority"] == "development":
-            if is_hackerone_item(item):
-                unit["authority"] = "hackerone"
-            elif is_dirauth_item(item, dirauth_users):
-                unit["authority"] = "dirauth-operator"
-        unit.update(labels=normalize_labels(item.get("labels")), url=canonical_url(item["url"]), title=item["title"], snapshot=snapshot)
-        if isinstance(item.get("author"), str) and item["author"]:
-            unit["author"] = item["author"]
-        if isinstance(item.get("sender_domain"), str) and item["sender_domain"]:
-            unit["sender_domain"] = item["sender_domain"]
+        if source_id:
+            emitted_ids.add(source_id)
+        if item.get("id"):
+            emitted_ids.add(item["id"])
+        unit = {
+            **{key: item.get(key) for key in ("kind", "product", "published_at", "updated_at", "upstream_state")},
+            "authority": effective_authority(item, dirauth_users), "labels": normalize_labels(item.get("labels")),
+            "url": canonical_url(item["url"]), "title": item["title"], "snapshot": snapshot,
+            **{opt: item[opt] for opt in OPTIONAL_SOURCE_FIELDS if isinstance(item.get(opt), str) and item[opt]},
+        }
         if item.get("closed_at"):
             unit["closed_at"] = item["closed_at"]
         if captured:
             unit["captured_at"] = captured
-        if "lists.torproject.org" in unit["url"] and any(ln.lstrip().startswith(">") for ln in body.splitlines()):
-            unquoted = unquoted_mail_text(body).strip()
-            if unquoted and unquoted != body.strip():
-                unit["unquoted_content"] = plain_text(unquoted, LIMITS["max_source_chars"], html=False)
+        if is_quoted_list_post(unit["url"], body) and (unquoted := unquoted_mail_text(body)):
+            unit["unquoted_content"] = plain_text(unquoted, LIMITS["max_source_chars"], html=False)
         # First the text a writer sees for this item: its title, every note and its
         # description window; then the rest of the description. A share too small
         # for the whole source cuts description text before any note.

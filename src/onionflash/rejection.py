@@ -10,10 +10,8 @@ from __future__ import annotations
 from . import decisions, editorial, review_gate
 from .schema import ITEM_ID_RE, PRODUCTS, SHA256_RE
 from .store import _valid_saved_item
-from .util import canonical_url, digest, format_utc, now_iso, parse_utc, saved_object
+from .util import canonical_url, digest, now_iso, parse_utc, saved_object, timestamp
 
-MAX_LIMIT = 200
-HISTORY_LIMIT = 20
 _COLUMNS = (
     "id,content_hash,source_id,status,attempts,rejections,next_attempt_at,story_id,url,last_error,"
     "typeof(payload) AS payload_type,CAST(payload AS BLOB) AS payload"
@@ -41,15 +39,9 @@ def list_items(store, *, status: str = "rejected", limit: int = 50, after: str |
     """Bounded, stable ID pagination; transient pending failures are excluded."""
     if not isinstance(status, str) or status not in {"rejected", "dismissed", "ignored"}:
         raise ValueError("List status must be rejected, dismissed or ignored")
-    if type(limit) is not int or not 1 <= limit <= MAX_LIMIT:
-        raise ValueError(f"List limit must be between 1 and {MAX_LIMIT}")
     cursor = "" if after is None else _identifier(after)
-    rows = store.db.execute(
-        f"SELECT {_COLUMNS} FROM items WHERE status=? AND id>? ORDER BY id LIMIT ?",
-        (status, cursor, limit + 1),
-    ).fetchall()
-    shown = rows[:limit]
-    return {"items": [_summary(row) for row in shown], "next_cursor": shown[-1]["id"] if len(rows) > limit else None}
+    query = f"SELECT {_COLUMNS} FROM items WHERE status=? AND id>? ORDER BY id LIMIT ?"
+    return decisions.paginate_rows(lambda cap: store.db.execute(query, (status, cursor, cap)).fetchall(), limit, "items", _summary)
 
 
 def show_item(store, item_id: str, config: dict | None = None) -> dict:
@@ -63,7 +55,7 @@ def show_item(store, item_id: str, config: dict | None = None) -> dict:
     result["actions"] = [dict(action) for action in store.db.execute(
         """SELECT action_id,action,content_hash,reason,created_at,before_status,before_attempts,before_rejections
            FROM rejection_actions WHERE item_id=? ORDER BY action_id DESC LIMIT ?""",
-        (item_id, HISTORY_LIMIT),
+        (item_id, decisions.HISTORY_LIMIT),
     )]
     result["decisions"] = decisions.for_item(store.db, item_id)
     return result
@@ -96,7 +88,7 @@ def _final_review(store, item_id: str, *, config: dict | None = None):
             or (approval is not None and not isinstance(approval, dict))
         ):
             raise TypeError
-        reviews = raw_reviews if raw_reviews else (approval.get("reviews", []) if isinstance(approval, dict) else [])
+        reviews = raw_reviews or (approval.get("reviews", []) if approval else [])
         if not isinstance(reviews, list):
             raise TypeError
         latest = reviews[-1] if reviews else None
@@ -109,7 +101,7 @@ def _final_review(store, item_id: str, *, config: dict | None = None):
             "reviews": [{
                 "phase": entry["stage"], **({"issue": entry["issue"]} if "issue" in entry else {}),
                 "verdict": entry["result"]["verdict"], "candidate_hash": entry["candidate_hash"],
-                "failed": {n: f"{c['outcome']}: {c['reason']}" for n, c in entry["result"]["criteria"].items() if c["outcome"] != "pass"},
+                "failed": decisions.failed_criteria(entry["result"]["criteria"]),
                 "repair": entry["result"]["repair"],
             } for entry in reviews],
             "latest_review": latest and {**latest["result"], "phase": latest["stage"], "candidate_hash": latest["candidate_hash"]},
@@ -125,7 +117,7 @@ def _request(item_id: str, expected_hash: str, reason: str, observed: str | None
     _identifier(item_id)
     if not isinstance(expected_hash, str) or not SHA256_RE.fullmatch(expected_hash):
         raise ValueError(f"{hash_label} must be its 64-character lowercase hexadecimal value")
-    return editorial._text(reason, "operator reason", 1000), format_utc(parse_utc(observed or now_iso()))
+    return editorial.clean_text(reason, "operator reason", 1000), timestamp(observed or now_iso())
 
 
 def _checked(db, item_id: str, expected_hash: str, *, statuses: set[str]) -> dict:
@@ -145,12 +137,8 @@ def _checked(db, item_id: str, expected_hash: str, *, statuses: set[str]) -> dic
 def _ready(row: dict) -> None:
     payload = _saved_payload(row) or {}
     try:
-        if payload.get("id") != row["id"] or not _valid_saved_item(payload):
-            raise ValueError
-        for key in ("title", "content", "kind"):
-            if not isinstance(payload.get(key), str) or (key != "content" and not payload[key]):
-                raise ValueError
-        if payload.get("product") not in PRODUCTS:
+        if (payload.get("id") != row["id"] or not _valid_saved_item(payload) or not payload["title"]
+                or not (isinstance(payload.get("kind"), str) and payload["kind"]) or payload.get("product") not in PRODUCTS):
             raise ValueError
         canonical_url(payload["url"])
         parse_utc(payload["published_at"])

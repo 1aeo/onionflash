@@ -10,20 +10,20 @@ import argparse
 import json
 import os
 from pathlib import Path
-import re
 import time
 
 from onionflash.analyze import AnalysisError, Analyzer
 from onionflash.config import load_config
+from onionflash.llm import is_quoted_list_post, unquoted_mail_text
 from onionflash.render import prepare_story
 from onionflash.review import EDITABLE, Reviewer, final_holds, policy_hash
-from onionflash.review_gate import ReviewRequests, advance_review, initial_review_state, recovery_status
-from onionflash.source_packet import normalize_labels, number_sources
-from onionflash.util import item_cluster, story_cluster
+from onionflash.review_gate import OUTCOME_STAGES, ReviewRequests, advance_review, initial_review_state, recovery_status
+from onionflash.schema import ITEM_ID_RE
+from onionflash.source_packet import LIMITS, OPTIONAL_SOURCE_FIELDS, normalize_labels, number_sources
+from onionflash.util import item_cluster, plain_text, safe_canonical_url, story_cluster
 
 CASE_FILES = ("review_cases.json", "review_cases_judged.json", "review_cases_roles.json")
 SCOPES = ("story", "latest_update")
-STORY_ID = re.compile(r"[0-9a-f]{24}\Z")
 # A judged case names the flaw of its labeled wording or labels; one without a flaw is clean.
 FLAWS = ("invented_impact", "dropped_hedge", "overclaim", "filler", "badge_misuse", "stale_fact")
 CATCH_TARGET, FLAW_FLOOR, FLOOR_CASES, FALSE_ALARM_LIMIT = 0.90, 0.80, 10, 0.10
@@ -46,6 +46,19 @@ class EvaluationReviewer(Reviewer):
         return result
 
 
+def _expand_source(src: dict) -> tuple[dict, list]:
+    unit = {**src, "labels": normalize_labels(src.get("labels"))}
+    if "unquoted_content" not in unit:
+        body = "\n\n".join(
+            p["text"] if isinstance(p, dict) else p
+            for p in src["passages"]
+            if not (isinstance(p, dict) and "author" in p)
+        )
+        if is_quoted_list_post(src.get("url"), body) and (unquoted := unquoted_mail_text(body)):
+            unit["unquoted_content"] = plain_text(unquoted, LIMITS["max_source_chars"], html=False)
+    return unit, [src["title"], *src["passages"]]
+
+
 def expand(corpus: dict) -> list[dict]:
     """Rebuild each compact case as the exact candidate and numbered packet under review.
 
@@ -61,10 +74,7 @@ def expand(corpus: dict) -> list[dict]:
         if scope not in SCOPES:
             raise ValueError("Invalid evaluation scope")
         packet = corpus["packets"][case["packet"]]
-        sources = number_sources([
-            ({**src, "labels": normalize_labels(src.get("labels"))}, [src["title"], *src["passages"]])
-            for src in packet["sources"]
-        ])
+        sources = number_sources([_expand_source(src) for src in packet["sources"]])
         story = {**corpus["defaults"], "sources": [{"url": s["url"], "title": s["title"]} for s in sources],
                  **case["candidate"]}
         candidate = prepare_story(story, editorial=story.get("editorial"))
@@ -109,12 +119,28 @@ def draft_cases(corpus: dict) -> list[dict]:
 def writer_item(source: dict) -> dict:
     """The stored item a writer drafts from: authored passages are its notes, the rest its content."""
     passages = source["passages"][1:]
-    return {key: source.get(key) for key in ("title", "kind", "authority", "product", "published_at", "updated_at",
-                                             "upstream_state")} | {
+    item = {key: source.get(key) for key in ("url", "title", "kind", "authority", "product", "published_at",
+                                             "updated_at", "upstream_state")} | {
         "labels": normalize_labels(source.get("labels")),
         "content": "\n\n".join(passage["text"] for passage in passages if "author" not in passage),
         "public_comments": [{"author": passage["author"], "created_at": passage["created_at"], "url": passage["url"],
                              "body": passage["text"]} for passage in passages if "author" in passage]}
+    for opt in OPTIONAL_SOURCE_FIELDS:
+        if isinstance(source.get(opt), str) and source[opt]:
+            item[opt] = source[opt]
+    if "dirauth_notes" in source:
+        item["dirauth_notes"] = source["dirauth_notes"]
+    return item
+
+
+def _exact_url(raw_url: object) -> str:
+    raw = str(raw_url or "")
+    return safe_canonical_url(raw) or raw
+
+
+def _base_url(raw_url: object) -> str:
+    raw = str(raw_url or "").split("#", 1)[0]
+    return safe_canonical_url(raw) or raw
 
 
 def _wording(story: dict, scope: str = "story") -> str:
@@ -141,22 +167,25 @@ def omitted(case: dict, story: dict) -> list[str]:
     return [phrase for phrase in case.get("required", []) if phrase.casefold() not in text]
 
 
-def target_missed(judged: dict) -> list[str]:
-    """Name each judged target a run missed: the paired catch rate overall and for every
-    flaw with enough distinct cases, and the false-alarm rate. An empty set passes."""
-    flagged = {flaw: row for flaw, row in judged.items() if flaw != "clean"}
-    caught, total = sum(row["paired"] for row in flagged.values()), sum(row["cases"] for row in flagged.values())
-    missed = ["catch"] if total and caught / total < CATCH_TARGET else []
-    missed += [flaw for flaw, row in flagged.items()
-               if row["unique"] >= FLOOR_CASES and row["paired"] / row["cases"] < FLAW_FLOOR]
-    clean = judged.get("clean")
-    if clean and (clean["cases"] - clean["ok"]) / clean["cases"] > FALSE_ALARM_LIMIT:
-        missed.append("false_alarms")
-    return missed
-
-
 def _rate(part: int, whole: int) -> float | None:
     return round(part / whole, 3) if whole else None
+
+
+def _judged_metrics(judged: dict) -> dict:
+    flagged = {flaw: row for flaw, row in judged.items() if flaw != "clean"}
+    caught, paired, total = (sum(r.get(k, 0) for r in flagged.values()) for k in ("ok", "paired", "cases"))
+    clean = judged.get("clean") or {"cases": 0, "ok": 0}
+    alarms = clean["cases"] - clean["ok"]
+    missed = [*((["catch"] if total and paired / total < CATCH_TARGET else ())),
+              *(f for f, r in flagged.items() if r["unique"] >= FLOOR_CASES and r["paired"] / r["cases"] < FLAW_FLOOR),
+              *((["false_alarms"] if clean["cases"] and alarms / clean["cases"] > FALSE_ALARM_LIMIT else ()))]
+    return {"target_missed": missed, "catch_rate": _rate(caught, total),
+            "paired_catch_rate": _rate(paired, total), "false_alarm_rate": _rate(alarms, clean["cases"])}
+
+
+def target_missed(judged: dict) -> list[str]:
+    """Name each judged target a run missed; an empty list passes."""
+    return _judged_metrics(judged)["target_missed"]
 
 
 def _validate_cases(cases: list[dict], *, draft: bool = False) -> None:
@@ -171,7 +200,7 @@ def _validate_cases(cases: list[dict], *, draft: bool = False) -> None:
         expected_route = case.get("expected_same_story")
         valid_route = ("expected_same_story" not in case or expected_route is None
                        or (scope == "story" and coverage.get("prior_story") is None and case["expected"] == "skip"
-                           and isinstance(expected_route, str) and bool(STORY_ID.fullmatch(expected_route))
+                           and isinstance(expected_route, str) and bool(ITEM_ID_RE.fullmatch(expected_route))
                            and expected_route in recent_ids))
         flagged = case.get("unsupported") or case.get("forbidden_classifications") or case.get("required")
         if (case["id"] in identities or scope not in SCOPES or not valid_route
@@ -202,7 +231,8 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                                "editorial_misses", "impact_cleared", "draft_unsupported", "repairs_verified",
                                "repairs_held", "repairs_skipped", "verification_repairs", "final_holds",
                                "published_after_checks", "route_cases", "matched_routes", "missed_routes",
-                               "false_routes", "wrong_routes", "controlled_mismatches"), 0),
+                               "false_routes", "wrong_routes", "controlled_mismatches",
+                               "raw_inconsistencies", "unresolved_inconsistencies"), 0),
               "holds": {}, "incomplete": False}
     judged, outcomes, seen = {}, {}, set()
     identity = policy_hash(config)
@@ -244,23 +274,35 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                         record["draft_kept_unsupported"] = kept_unsupported(case, candidate)
                         totals["draft_unsupported"] += bool(record["draft_kept_unsupported"])
                     prior = (case.get("existing_coverage") or {}).get("prior_story")
-                    identity_item = {**item, "url": source["url"],
-                                     "source_entry_id": source.get("source_entry_id", source["url"])}
+                    prior_id = prior["id"] if prior else None
+                    row_source = source
+                    if scope == "latest_update":
+                        by_exact = {u: s for s in reversed(case["packet"]["sources"]) if (u := _exact_url(s.get("url")))}
+                        by_base = {u: s for s in reversed(case["packet"]["sources"]) if (u := _base_url(s.get("url")))}
+                        cited_sources = [c for c in (candidate["updates"][-1].get("sources") or ()) if isinstance(c, dict)]
+                        row_source = (
+                            next((m for c in cited_sources if (m := by_exact.get(_exact_url(c.get("url")))) is not None), None)
+                            or next((m for c in cited_sources if (m := by_base.get(_base_url(c.get("url")))) is not None), None)
+                            or source
+                        )
+                    row_item = item if row_source is source else writer_item(row_source)
+                    if row_source.get("closed_at"):
+                        row_item = {**row_item, "closed_at": row_source["closed_at"]}
+                    identity_item = {**row_item, "url": row_source["url"],
+                                     "source_entry_id": row_source.get("source_entry_id", row_source["url"])}
                     prepared = {"packet": case["packet"], "coverage": case.get("existing_coverage"),
                                 "review_scope": scope, "mode": "update" if scope == "latest_update" else "story",
-                                "story_id": prior["id"] if prior else None,
+                                "story_id": prior_id,
                                 "cluster_key": story_cluster(identity_item),
                                 "payload": {"editorial_kind": source["kind"]},
                                 "dirauth_users": list(config["collection"]["dirauth_gitlab_users"]),
-                                "row": {"url": source["url"], "story_id": prior["id"] if prior else None,
+                                "row": {"url": row_source["url"], "story_id": prior_id,
                                         "cluster_key": item_cluster(identity_item),
-                                        "payload": json.dumps(item)}}
-                    stage, text, record["reviews"] = "review", candidate, []
-                    while True:
-                        action, value = advance_review(reviewer, stage, text, prepared, record, requests)
-                        if action not in {"verify", "repair"}:
-                            break
-                        stage, text = action, value
+                                        "payload": json.dumps(row_item)}}
+                    stage, text = "review", candidate
+                    while (step := advance_review(reviewer, stage, text, prepared, record, requests))[0] in {"verify", "repair"}:
+                        stage, text = step
+                    action, value = step
                     first = record["reviews"][0]["result"]
                     last = next((entry["result"] for entry in reversed(record["reviews"]) if entry["stage"] == "verification"), None)
                     actual_route = (value if action == "route" and isinstance(value, str) else
@@ -281,7 +323,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                         record["hold"] = code = ".".join(("held", *value))
                         record["hold_code"] = value[1]
                         totals["holds"][code] = totals["holds"].get(code, 0) + 1
-                    record["outcome"] = {"approve": "approved", "skip": "skipped", "hold": "held", "route": "routed"}[action]
+                    record["outcome"] = OUTCOME_STAGES[action]
                     if checked:
                         record["final_holds"] = final_holds(text, prepared)
                     totals["final_holds"] += checked
@@ -296,18 +338,11 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                     if "expected_same_story" in case:
                         totals["route_cases"] += 1
                         expected_route = case["expected_same_story"]
-                        if expected_route is None:
-                            if actual_route is not None:
-                                totals["false_routes"] += 1
-                                route_ok = False
-                        elif action == "route" and value == expected_route:
+                        route_ok = actual_route is None if expected_route is None else action == "route" and value == expected_route
+                        if not route_ok:
+                            totals["false_routes" if expected_route is None else "missed_routes" if actual_route is None else "wrong_routes"] += 1
+                        elif expected_route is not None:
                             totals["matched_routes"] += 1
-                        elif actual_route is None:
-                            totals["missed_routes"] += 1
-                            route_ok = False
-                        else:
-                            totals["wrong_routes"] += 1
-                            route_ok = False
                     unsafe = published and (case["expected"] in {"skip", "hold"} or bool(record["kept_unsupported"]))
                     published_candidate = text if published else None
                     missing = omitted(case, published_candidate) if published else []
@@ -347,8 +382,8 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                     record.setdefault("matched", False)
                 record["review_request_count"] = requests.actual
                 record.update(recovery_status(record))
-                totals["raw_inconsistencies"] = totals.get("raw_inconsistencies", 0) + record["raw_inconsistency_count"]
-                totals["unresolved_inconsistencies"] = totals.get("unresolved_inconsistencies", 0) + int(record["unresolved_inconsistency"])
+                totals["raw_inconsistencies"] += record["raw_inconsistency_count"]
+                totals["unresolved_inconsistencies"] += int(record["unresolved_inconsistency"])
                 record["seconds"] = round(time.monotonic() - started, 2)
                 encoded = json.dumps(record, ensure_ascii=False, allow_nan=False)
                 credential = os.environ.get(config["llm"]["api_key_env"], "")
@@ -372,12 +407,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                 flaw, publishes, twins = flagged[case_id]
                 judged[flaw]["paired"] += ok and (publishes or bool(twins)) and all(
                     outcomes.get((iteration, twin), False) for twin in twins)
-        rows = [row for flaw, row in judged.items() if flaw != "clean"]
-        clean = judged.get("clean", {"cases": 0, "ok": 0})
-        totals.update(judged=judged, target_missed=target_missed(judged),
-                      catch_rate=_rate(sum(row["ok"] for row in rows), sum(row["cases"] for row in rows)),
-                      paired_catch_rate=_rate(sum(row["paired"] for row in rows), sum(row["cases"] for row in rows)),
-                      false_alarm_rate=_rate(clean["cases"] - clean["ok"], clean["cases"]))
+        totals.update(judged=judged, **_judged_metrics(judged))
         report.write(json.dumps({"summary": totals, "policy_hash": identity}) + "\n")
     print(json.dumps({"summary": totals}), flush=True)
     return totals

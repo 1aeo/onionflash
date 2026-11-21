@@ -9,11 +9,12 @@ import re
 from .comments import analysis_context
 from .llm import (
     AnalysisError, CompletionClient, apply_label_limits, generation_options,
-    has_malformed_tor_version, has_shouting_caps, is_complete_sentence, label_limits,
-    strip_unreleased_tag, tag_name, unquoted_mail_text, validate_text,
+    has_malformed_tor_version, has_shouting_caps, is_complete_sentence, is_quoted_list_post,
+    label_limits, strip_unreleased_tag, tag_name, unquoted_mail_text, validate_schema_field,
 )
 from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, STATES, UPDATE_CHARS
-from .util import digest, is_dirauth_item, is_hackerone_item, normalize_evidence as _plain
+from .source_packet import OPTIONAL_SOURCE_FIELDS
+from .util import LIST_ARCHIVE_HOST, digest, effective_authority, normalize_evidence as _plain
 
 PROMPT_VERSION = "onionflash-21"
 # Change this when update input filtering changes, independently of prompt prose.
@@ -317,6 +318,11 @@ def prior_context(prior: dict) -> dict:
     return context
 
 
+def _all_merge_sources(prior: dict) -> bool:
+    sources = prior.get("sources")
+    return bool(sources) and all("/-/merge_requests/" in s.get("url", "") for s in sources)
+
+
 def cache_key(row: dict, llm: dict, prior: dict | None = None) -> str:
     """Bind cached drafts to the active writer contract and update context."""
     prompt = SYSTEM_PROMPT if prior is None else UPDATE_PROMPT
@@ -330,9 +336,7 @@ def cache_key(row: dict, llm: dict, prior: dict | None = None) -> str:
                 json.dumps(schema, ensure_ascii=False, allow_nan=False)]
     if prior is not None:
         # Category and this source predicate also shape the update grammar.
-        sources = prior.get("sources")
-        all_merges = bool(sources) and all("/-/merge_requests/" in source.get("url", "") for source in sources)
-        identity.extend([prior_context(prior), prior.get("category"), all_merges, UPDATE_INPUT_VERSION])
+        identity.extend([prior_context(prior), prior.get("category"), _all_merge_sources(prior), UPDATE_INPUT_VERSION])
     return digest(identity)
 
 
@@ -363,25 +367,7 @@ def validate_analysis(result: dict, item: dict, schema: dict = SCHEMA) -> dict:
     if result["publish"] is not True:
         raise AnalysisError("Writer must return a draft for publication review")
     for key, rule in fields.items():
-        value = result[key]
-        if rule["type"] == "string":
-            allowed = rule.get("enum")
-            if allowed is not None:
-                if not isinstance(value, str) or value not in allowed:
-                    raise AnalysisError(f"Invalid model {key}")
-            else:
-                result[key] = validate_text(value, rule["maxLength"], empty=True, message=f"Invalid model {key}")
-        elif rule["type"] == "array":
-            if not isinstance(value, list) or len(value) > rule["maxItems"]:
-                raise AnalysisError(f"Invalid model {key}")
-            member = rule["items"]
-            if "enum" in member:
-                if any(not isinstance(v, str) or v not in member["enum"] for v in value):
-                    raise AnalysisError(f"Invalid model {key}")
-                # Check caps before normalizing harmless repeated labels.
-                result[key] = list(dict.fromkeys(value))
-            elif any(not isinstance(v, str) or len(v) > member["maxLength"] for v in value):
-                raise AnalysisError(f"Invalid model {key}")
+        result[key] = validate_schema_field(result[key], rule, empty=True, message=f"Invalid model {key}")
     evidence = result["evidence"]
     context = _plain(item["title"] + "\n" + item["content"])
     for index, quote in enumerate(evidence, 1):
@@ -397,9 +383,8 @@ def validate_analysis(result: dict, item: dict, schema: dict = SCHEMA) -> dict:
         raise AnalysisError("Published story needs text and source evidence")
     if "update" in fields and not is_complete_sentence(result["update"]):
         raise AnalysisError("Invalid model update: must be a complete punctuated sentence")
-    is_list_item = "lists.torproject.org" in str(item.get("url") or "")
     impact_context = context
-    if is_list_item and any(ln.lstrip().startswith(">") for ln in item.get("content", "").splitlines()):
+    if is_quoted_list_post(item.get("url"), item.get("content", "")):
         unquoted_ctx = _plain(unquoted_mail_text(item["content"]))
         if not any(_plain(quote) in unquoted_ctx for quote in evidence):
             raise AnalysisError(
@@ -414,7 +399,7 @@ def validate_analysis(result: dict, item: dict, schema: dict = SCHEMA) -> dict:
     impact = result.get("why_it_matters")
     if impact and (
         _numbers(impact) - _numbers(impact_context)
-        or (item.get("authority") == "community" and is_list_item)
+        or (item.get("authority") == "community" and LIST_ARCHIVE_HOST in str(item.get("url") or ""))
         or has_shouting_caps(impact)
         or has_malformed_tor_version(impact, result.get("products") or [item.get("product", "")])
     ):
@@ -475,25 +460,15 @@ class Analyzer(CompletionClient):
         is_update = prior is not None
         if item["kind"] == "tag":
             return tag_update(item, prior) if is_update else tag_notice(item)
-        bounded = {key: item.get(key) for key in (
-            "title", "kind", "product", "authority", "published_at", "updated_at", "labels", "upstream_state")}
-        if isinstance(item.get("author"), str) and item["author"]:
-            bounded["author"] = item["author"]
-        if isinstance(item.get("sender_domain"), str) and item["sender_domain"]:
-            bounded["sender_domain"] = item["sender_domain"]
-        if bounded["authority"] == "development":
-            if is_hackerone_item(item):
-                bounded["authority"] = "hackerone"
-            elif is_dirauth_item(item, getattr(self, "dirauth_users", None)):
-                bounded["authority"] = "dirauth-operator"
+        bounded = {
+            **{key: item.get(key) for key in ("title", "kind", "product", "published_at", "updated_at", "labels", "upstream_state")},
+            "authority": effective_authority(item, getattr(self, "dirauth_users", None)),
+            **{opt: item[opt] for opt in OPTIONAL_SOURCE_FIELDS if isinstance(item.get(opt), str) and item[opt]},
+        }
         bounded["content"], notes = analysis_context(item)
-        if (
-            "lists.torproject.org" in str(item.get("url") or "")
-            and any(ln.lstrip().startswith(">") for ln in bounded["content"].splitlines())
-        ):
-            unquoted = unquoted_mail_text(bounded["content"]).strip()
-            if unquoted:
-                bounded["unquoted_content"] = unquoted
+        quoted_list = is_quoted_list_post(item.get("url"), bounded["content"])
+        if quoted_list and (unquoted := unquoted_mail_text(bounded["content"])):
+            bounded["unquoted_content"] = unquoted
         if notes:
             bounded["public_comments"] = notes
         # Evidence may quote the description window or any note body the writer saw.
@@ -501,7 +476,7 @@ class Analyzer(CompletionClient):
         base_schema = UPDATE_SCHEMA if is_update else SCHEMA
         payload = {**bounded, "prior_story": prior_context(prior)} if is_update else bounded
         prompt, schema_name = (UPDATE_PROMPT, "onionflash_update") if is_update else (SYSTEM_PROMPT, "onionflash_news")
-        schema = _writer_schema(bounded, base_schema, prior=prior)
+        schema = _writer_schema(bounded, base_schema, prior=prior, quoted_list=quoted_list)
         reply = self.complete(prompt, payload, schema, schema_name)
         stated = reply.get("why_it_matters")
         result = validate_analysis(reply, source, base_schema)
@@ -516,25 +491,41 @@ class Analyzer(CompletionClient):
         return result
 
 
-def _writer_schema(bounded: dict, base_schema: dict = SCHEMA, *, prior: dict | None = None) -> dict:
+def _writer_schema(
+    bounded: dict, base_schema: dict = SCHEMA, *, prior: dict | None = None, quoted_list: bool | None = None
+) -> dict:
     """Constrain quote copying to literal spans of the exact supplied context, and labels to its limits."""
+    if quoted_list is None:
+        quoted_list = "unquoted_content" in bounded or is_quoted_list_post(bounded.get("url"), bounded.get("content", ""))
     maximum = base_schema["properties"]["evidence"]["items"]["maxLength"]
     excerpts = []
     notes = [note["body"] for note in bounded.get("public_comments", [])]
-    for text in (bounded["title"], bounded["content"], *notes):
-        groups, pending, normalized_size = [], [], 0
+    for index_text, text in enumerate((bounded["title"], bounded["content"], *notes)):
+        is_body = quoted_list and index_text == 1
+        groups, pending, normalized_size, prev_quoted = [], [], 0, None
         for line in text.splitlines(keepends=True):
+            line_quoted = line.lstrip().startswith(">") if is_body else False
+            if is_body and pending and line_quoted != prev_quoted:
+                if normalized_size >= MIN_EVIDENCE_CHARS:
+                    groups.append("".join(pending))
+                pending, normalized_size, prev_quoted = [], 0, None
             size = len(_plain(line))
             if not size and not pending:
                 continue
+            if not pending:
+                prev_quoted = line_quoted
             pending.append(line)
             if size:
                 normalized_size += size + bool(normalized_size)
             if normalized_size >= MIN_EVIDENCE_CHARS:
                 groups.append("".join(pending))
-                pending, normalized_size = [], 0
-        if pending and len(_plain(text)) >= MIN_EVIDENCE_CHARS:
-            groups.append(text[-maximum:])
+                pending, normalized_size, prev_quoted = [], 0, None
+        if pending:
+            tail = "".join(pending) if is_body else text[-maximum:]
+            if len(_plain(tail)) >= MIN_EVIDENCE_CHARS:
+                groups.append(tail)
+            elif not is_body and len(_plain(text)) >= MIN_EVIDENCE_CHARS:
+                groups.append(text[-maximum:])
         for line in groups:
             line = line.strip()
             for offset in range(0, len(line), maximum):
@@ -547,25 +538,24 @@ def _writer_schema(bounded: dict, base_schema: dict = SCHEMA, *, prior: dict | N
     excerpts = list(dict.fromkeys(excerpts))
     if not excerpts:
         raise AnalysisError("Source has no qualifying literal evidence excerpt", code="writer.no_literal_evidence")
+    unquoted_plain = _plain(unquoted_mail_text(bounded["content"])) if quoted_list else ""
+    if quoted_list and not any(_plain(exc) in unquoted_plain for exc in excerpts):
+        raise AnalysisError(
+            "Mailing-list reply has no qualifying unquoted author excerpt",
+            code="writer.quoted_only_evidence",
+        )
     if len(excerpts) > MAX_EVIDENCE_CHOICES:
         # Bound grammar size while retaining options throughout the input,
         # including the first title, unquoted reply text, and the last supplied comment.
-        unquoted_raw = bounded.get("unquoted_content")
-        if isinstance(unquoted_raw, str) and unquoted_raw:
-            unquoted_plain = _plain(unquoted_raw)
-            priority = [exc for exc in excerpts if _plain(exc) in unquoted_plain][: MAX_EVIDENCE_CHOICES // 2]
-            kept_set = set(priority)
-            rest = [exc for exc in excerpts if exc not in kept_set]
-            slots = MAX_EVIDENCE_CHOICES - len(priority)
-            sampled = (
-                [rest[index * (len(rest) - 1) // (slots - 1)] for index in range(slots)]
-                if slots > 1 and len(rest) > slots
-                else rest[:slots]
-            )
-            excerpts = priority + sampled
-        else:
-            excerpts = [excerpts[index * (len(excerpts) - 1) // (MAX_EVIDENCE_CHOICES - 1)]
-                        for index in range(MAX_EVIDENCE_CHOICES)]
+        if not unquoted_plain:
+            unquoted_raw = bounded.get("unquoted_content")
+            unquoted_plain = _plain(unquoted_raw) if isinstance(unquoted_raw, str) and unquoted_raw else ""
+        priority = [exc for exc in excerpts if _plain(exc) in unquoted_plain][: MAX_EVIDENCE_CHOICES // 2] if unquoted_plain else []
+        rest = [exc for exc in excerpts if exc not in set(priority)]
+        slots = MAX_EVIDENCE_CHOICES - len(priority)
+        sampled = ([rest[i * (len(rest) - 1) // (slots - 1)] for i in range(slots)]
+                   if slots > 1 and len(rest) > slots else rest[:slots])
+        excerpts = priority + sampled
     schema = copy.deepcopy(base_schema)
     schema["properties"]["publish"]["enum"] = [True]
     schema["properties"]["evidence"]["items"]["enum"] = excerpts
@@ -578,8 +568,7 @@ def _writer_schema(bounded: dict, base_schema: dict = SCHEMA, *, prior: dict | N
     if prior is not None:
         if prior.get("confidence") == "confirmed":
             limits["confidence"] = ["confirmed"]
-        if not (prior.get("state") == "merged" and prior.get("sources")
-                and all("/-/merge_requests/" in s.get("url", "") for s in prior["sources"])):
+        if not (prior.get("state") == "merged" and _all_merge_sources(prior)):
             has_tag = bounded.get("kind") == "tag" or prior.get("state") == "tagged"
             limits["state"] = [s for s in STATES if has_tag or s != "tagged"]
         if prior.get("category") == "release":
