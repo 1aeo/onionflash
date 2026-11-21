@@ -188,6 +188,19 @@ def _expand(value: str) -> str:
     return re.sub(r"\$\{([A-Z_][A-Z0-9_]*)\}", sub, value)
 
 
+def _dns_request_url(raw: str, canonical: str) -> str:
+    """Preserve a single configured trailing FQDN dot on the host for DNS lookup only."""
+    raw_host = urlsplit(raw).hostname or ""
+    if not raw_host.endswith("."):
+        return canonical
+    parsed = urlsplit(canonical)
+    host = parsed.hostname or ""
+    if not host or ":" in host:
+        return canonical
+    netloc = f"{host}.:{parsed.port}" if parsed.port is not None else f"{host}."
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
 def _clean_endpoint_url(
     url: str,
     *,
@@ -430,7 +443,8 @@ def load_config(path: str | Path) -> dict:
             raise ValueError("At most five fallback URLs per source")
         if not isinstance(source.get("url"), str):
             raise ValueError("Invalid source URL")
-        source["url"] = canonical_url(source["url"])
+        raw_url = source["url"]
+        source["url"] = canonical_url(raw_url)
         if "website_url" in source:
             source["website_url"] = canonical_url(source["website_url"])
         if source["kind"] == "metrics_timeline" or alert_format == "consensus":
@@ -440,7 +454,15 @@ def load_config(path: str | Path) -> dict:
             website = urlsplit(source["website_url"])
             if website.query or website.fragment or not website.path.strip("/"):
                 raise ValueError(f"{label} website_url must be a clean URL")
-        source["fallback_urls"] = [canonical_url(u) for u in source["fallback_urls"]]
+        raw_fallbacks = list(source["fallback_urls"])
+        source["fallback_urls"] = [canonical_url(u) for u in raw_fallbacks]
+        request_urls = {
+            canon: req
+            for raw_u, canon in ((raw_url, source["url"]), *zip(raw_fallbacks, source["fallback_urls"]))
+            if (req := _dns_request_url(raw_u, canon)) != canon
+        }
+        if request_urls:
+            source["_request_urls"] = request_urls
         if "gitlab_project" in source:
             if source["kind"] != "gitlab_issue":
                 raise ValueError("Comment configuration requires a GitLab issue source")

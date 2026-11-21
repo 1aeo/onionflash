@@ -52,17 +52,19 @@ def _rows(text: str):
         yield line_number, _cells(line)
 
 
-def collect_timeline(client, source: dict, url: str, state: dict, settings: dict, started: str) -> dict:
+def collect_timeline(
+    client, source: dict, url: str, state: dict, settings: dict, started: str, *, request_url: str | None = None
+) -> dict:
     """Collect a validated repository snapshot; only recent event dates qualify.
 
     A recent start or explicit end qualifies a row and dates its item. Neither an
     ongoing marker nor a repository commit/fetch timestamp makes a historical row new.
     """
-    response = fetch_cached(client, url, state)
+    response = fetch_cached(client, url, state, request_url=request_url)
     if response.status == 304:
         return cached_result(url, response, state)
     try:
-        api = urlsplit(url)
+        api = urlsplit(request_url or url)
         match = re.fullmatch(r"(/api/v4/projects/[^/]+)/repository/files/([^/]+)", api.path)
         record = response.json()
         if not match or not isinstance(record, dict) or record.get("encoding") != "base64":

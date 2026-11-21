@@ -134,15 +134,15 @@ def make_item(
     return item
 
 
-def fetch_cached(client: HttpClient, url: str, state: dict):
-    """GET with the cache validators saved for this exact URL."""
+def fetch_cached(client: HttpClient, url: str, state: dict, *, request_url: str | None = None):
+    """GET with the cache validators saved for this exact canonical URL."""
     headers = {}
     if state.get("active_url") == url:
         if state.get("etag"):
             headers["If-None-Match"] = state["etag"]
         if state.get("last_modified"):
             headers["If-Modified-Since"] = state["last_modified"]
-    return client.request("GET", url, headers=headers)
+    return client.request("GET", request_url or url, headers=headers)
 
 
 def cached_result(url: str, response, state: dict, items: Iterable[dict] = (), **extra) -> dict:
@@ -219,8 +219,10 @@ def _feed(
     state: dict,
     settings: dict,
     started: str,
+    *,
+    request_url: str | None = None,
 ) -> dict:
-    response = fetch_cached(client, url, state)
+    response = fetch_cached(client, url, state, request_url=request_url)
     if response.status == 304:
         return cached_result(url, response, state)
     rss_authors = _scan_feed_xml(response.body)
@@ -320,6 +322,8 @@ def _gitlab(
     state: dict,
     settings: dict,
     started: str,
+    *,
+    request_url: str | None = None,
 ) -> dict:
     """Seek through updated_at in ascending order from one inclusive watermark.
 
@@ -331,7 +335,7 @@ def _gitlab(
     updated_before excludes rows dated after the poll started.
     """
     page_size = min(settings["page_size"], source["max_items"])
-    parsed = urlsplit(url)
+    parsed = urlsplit(request_url or url)
     params = dict(parse_qsl(parsed.query, keep_blank_values=True))
     params.update({
         "scope": "all",
@@ -437,14 +441,16 @@ def collect_source(
     partial: list[dict] = []
     watermark = None
     catching_up = False
+    request_urls = source.get("_request_urls") or {}
     for url in [source["url"], *source["fallback_urls"]]:
+        request_url = request_urls.get(url, url)
         try:
             if source["kind"] in {"feed", "tag"}:
-                return _feed(client, source, url, state, settings, started)
+                return _feed(client, source, url, state, settings, started, request_url=request_url)
             if source["kind"] == "metrics_timeline":
                 from .timeline import collect_timeline
-                return collect_timeline(client, source, url, state, settings, started)
-            return _gitlab(client, source, url, state, settings, started)
+                return collect_timeline(client, source, url, state, settings, started, request_url=request_url)
+            return _gitlab(client, source, url, state, settings, started, request_url=request_url)
         except CollectionError as exc:
             last_error = str(exc)
             partial.extend(exc.items)

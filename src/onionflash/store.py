@@ -386,6 +386,7 @@ def _updated_closed_at(old: dict, item: dict) -> str | None:
         and item.get("upstream_state") == "closed"
         and isinstance(closed_at, str)
         and closed_at
+        and isinstance(item.get("updated_at"), str)
         and item["updated_at"] >= old["updated_at"]
         and closed_at != old.get("closed_at")
     ):
@@ -587,7 +588,7 @@ class Store:
                     ):
                         restored = rehydrated if same_body else item
                         if closed_at is not None and restored is rehydrated:
-                            restored = {**restored, "closed_at": closed_at}
+                            restored = {**restored, "closed_at": closed_at, "updated_at": item["updated_at"]}
                         with self.db:
                             self.db.execute(
                                 "UPDATE items SET payload=? WHERE id=?",
@@ -597,7 +598,7 @@ class Store:
                         with self.db:
                             self.db.execute(
                                 "UPDATE items SET payload=? WHERE id=?",
-                                (json.dumps({**old, "closed_at": closed_at}, ensure_ascii=False), item_id),
+                                (json.dumps({**old, "closed_at": closed_at, "updated_at": item["updated_at"]}, ensure_ascii=False), item_id),
                             )
                     return False
             elif not _valid_saved_item(old):
@@ -616,7 +617,7 @@ class Store:
                     with self.db:
                         self.db.execute(
                             "UPDATE items SET payload=? WHERE id=?",
-                            (json.dumps({**old, "closed_at": closed_at}, ensure_ascii=False), item_id),
+                            (json.dumps({**old, "closed_at": closed_at, "updated_at": item["updated_at"]}, ensure_ascii=False), item_id),
                         )
                 return False
             alias = editorial.retired(self.db, story_id=row["story_id"], cluster_key=row["cluster_key"])

@@ -479,7 +479,7 @@ def test_invalid_utf8_item_payload_raises_stale_candidate_without_sqlite_decode_
 
 
 def test_same_hash_closed_at_update_preserves_queue_state_and_rejects_older_regression(llm_context):
-    """Persist newer `closed_at` on same-hash ingest without resetting strikes or letting older polls regress it."""
+    """Persist newer `closed_at` and freshness timestamp on same-hash ingest without allowing intermediate regressions."""
     cfg, store = llm_context
     src = item(kind="gitlab_issue", upstream_state="closed", published_at="2026-09-01T12:00:00Z",
                updated_at="2026-11-09T12:00:00Z")
@@ -488,13 +488,21 @@ def test_same_hash_closed_at_update_preserves_queue_state_and_rejects_older_regr
     before = item_row(store, row)
     assert (before["attempts"], before["rejections"], before["status"]) == (1, 1, "pending")
 
-    assert store.ingest({**src, "closed_at": LATER}, LATER) is False
+    nov12 = "2026-11-12T00:00:00Z"
+    assert store.ingest({**src, "updated_at": nov12, "closed_at": nov12}, nov12) is False
     after_update = item_row(store, row)
     assert after_update["content_hash"] == before["content_hash"]
     assert (after_update["attempts"], after_update["rejections"], after_update["status"]) == (1, 1, "pending")
     assert after_update["last_error"] == before["last_error"]
-    assert json.loads(after_update["payload"])["closed_at"] == LATER
+    saved_after = json.loads(after_update["payload"])
+    assert saved_after["closed_at"] == nov12 and saved_after["updated_at"] == nov12
 
-    # An older REST poll must not regress the stored closed_at.
-    assert store.ingest({**src, "updated_at": "2026-11-08T00:00:00Z", "closed_at": "2026-10-01T00:00:00Z"}, LATER) is False
-    assert json.loads(item_row(store, row)["payload"])["closed_at"] == LATER
+    # A delayed intermediate poll (Nov 11, newer than original Nov 9 but older than Nov 12) must not overwrite closed_at.
+    nov11 = "2026-11-11T00:00:00Z"
+    assert store.ingest({**src, "updated_at": nov11, "closed_at": nov11}, nov12) is False
+    after_mid = json.loads(item_row(store, row)["payload"])
+    assert after_mid["closed_at"] == nov12 and after_mid["updated_at"] == nov12
+
+    # An older REST poll must not regress the stored closed_at either.
+    assert store.ingest({**src, "updated_at": "2026-11-08T00:00:00Z", "closed_at": "2026-10-01T00:00:00Z"}, nov12) is False
+    assert json.loads(item_row(store, row)["payload"])["closed_at"] == nov12

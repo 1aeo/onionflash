@@ -13,7 +13,7 @@ from helpers import (
     DATE, LATER, TOR_WORK_ITEM_URL as URL, analysis, editorial_act, invoke_cli, item, make_config,
     make_note, make_story, pub_settings, put_story, seed_story, update_analysis, write_toml,
 )
-from onionflash import editorial, render
+from onionflash import candidate, editorial, render
 from onionflash.cli import build, run_lock
 from onionflash.comments import _compose
 from onionflash.schema import UPDATE_CHARS
@@ -841,7 +841,7 @@ def test_retraction_hides_blob_historical_reason_and_tolerates_unreadable_after_
             put_story(store.db, entry)
         build(cfg, store)
 
-        # BLOB historical reason hidden by a retraction must not break public_metadata or either render path.
+        # BLOB historical reason must not break public_metadata, update_target, or retraction rendering.
         editorial_act(editorial.correct, store, s_blob["id"], {"summary": "First correction."}, reason="Old reason.", observed=EDIT)
         with store.db:
             store.db.execute("DROP TRIGGER editorial_revisions_unchanged")
@@ -850,8 +850,10 @@ def test_retraction_hides_blob_historical_reason_and_tolerates_unreadable_after_
                 (s_blob["id"],),
             )
             editorial.initialize(store.db)
-        with pytest.raises(ValueError, match="Invalid editorial revision reason"):
-            editorial.public_metadata(store.db, s_blob["id"])
+        meta_unretracted = editorial.public_metadata(store.db, s_blob["id"])
+        assert meta_unretracted is not None and meta_unretracted["status"] == "corrected"
+        assert meta_unretracted["reason"] == "Old reason."
+        assert meta_unretracted["history"][0]["reason"] == ""
         editorial_act(editorial.retract, store, s_blob["id"], reason="Withdrawn publicly.", observed=LATER)
         meta_blob = editorial.public_metadata(store.db, s_blob["id"])
         assert meta_blob is not None and meta_blob["status"] == "retracted"
@@ -896,3 +898,124 @@ def test_retraction_hides_blob_historical_reason_and_tolerates_unreadable_after_
         tomb = json.loads((output / f"news/{s_cat['id']}/story.json").read_text(encoding="utf-8"))
         assert (tomb["category"], tomb["confidence"], tomb["state"]) == ("network", "reported", "developing")
         assert tomb["editorial"]["status"] == "retracted"
+
+
+def test_retraction_skips_unreadable_older_history_and_blob_reason_does_not_break_update_target(tmp_path):
+    """Skip unreadable older revision rows on retraction and keep `candidate.update_target` working with BLOB reasons."""
+    cfg = pub_settings(tmp_path)
+    output = Path(cfg["storage"]["output_dir"])
+    with Store(cfg["storage"]["database"]) as store:
+        base_item = item(url=URL, content="Original report on relay key rotation details.")
+        seeded_story = seed_story(store, base_item, analysis(), key="seed-blob", at=DATE)
+        sid = seeded_story["id"]
+        build(cfg, store)
+
+        # Unretracted story with a BLOB historical revision reason must still allow candidate.update_target().
+        editorial_act(editorial.correct, store, sid, {"summary": "Clarified summary."}, reason="Initial fix.", observed=EDIT)
+        editorial_act(editorial.unlock, store, sid, reason="Resume updates.", observed=EDIT)
+        with store.db:
+            store.db.execute("DROP TRIGGER editorial_revisions_unchanged")
+            store.db.execute(
+                "UPDATE editorial_revisions SET reason=CAST('raw blob reason' AS BLOB) WHERE story_id=? AND revision=1",
+                (sid,),
+            )
+            editorial.initialize(store.db)
+        follow_up = {**base_item, "content": "Follow-up update confirming all relays completed rotation.", "updated_at": LATER}
+        assert store.ingest(follow_up, LATER) is True
+        pending_row = store.pending(5, LATER)[0]
+        target = candidate.update_target(store.db, pending_row)
+        assert target is not None and target["id"] == sid
+        assert {entry["revision"]: entry["reason"] for entry in target["editorial"]["history"]} == {
+            2: "Resume updates.",
+            1: "",
+        }
+
+        # Retracted story with a BLOB action in an older revision row must skip that older row and still publish cleanly.
+        s_ret = make_story(2, id="story-blob-action", title="Blob action story")
+        put_story(store.db, s_ret)
+        build(cfg, store)
+        editorial_act(editorial.correct, store, s_ret["id"], {"summary": "First revision."}, reason="Fix 1.", observed=EDIT)
+        with store.db:
+            store.db.execute("DROP TRIGGER editorial_revisions_unchanged")
+            store.db.execute(
+                "UPDATE editorial_revisions SET action=CAST('correct' AS BLOB) WHERE story_id=? AND revision=1",
+                (s_ret["id"],),
+            )
+            editorial.initialize(store.db)
+        editorial_act(editorial.retract, store, s_ret["id"], reason="Withdrawn despite older BLOB.", observed=LATER)
+        meta = editorial.public_metadata(store.db, s_ret["id"])
+        assert meta is not None and meta["status"] == "retracted"
+        assert [entry["revision"] for entry in meta["history"]] == [2]
+        assert meta["history"][0]["reason"] == "Withdrawn despite older BLOB."
+        # Private revision row in editorial_revisions stays intact and untouched.
+        assert len(editorial.history(store.db, s_ret["id"])["revisions"]) == 2
+        assert build(cfg, store)["stories_skipped"] == 0
+        with store.db:
+            store.db.execute("DELETE FROM stories WHERE id=?", (s_ret["id"],))
+        assert build(cfg, store, force=True)["stories_skipped"] == 0
+        assert "Withdrawn despite older BLOB." in (output / f"news/{s_ret['id']}/index.html").read_text(encoding="utf-8")
+
+
+def test_retraction_tolerates_non_strict_legacy_catalog_snapshot_and_restore_rejects_foreign_story_id(tmp_path):
+    """Record non-strict legacy `before_public_json` as unavailable on retraction and validate restore snapshot IDs."""
+    cfg = pub_settings(tmp_path)
+    output = Path(cfg["storage"]["output_dir"])
+    s_nan = make_story(1, id="story-legacy-nan", title="Legacy NaN story", summary="Initial summary.")
+    s_a = make_story(2, id="story-restore-a", title="Story A original", summary="Original summary A.")
+    s_b = make_story(3, id="story-restore-b", title="Story B original", summary="Original summary B.")
+    with Store(cfg["storage"]["database"]) as store:
+        for entry in (s_nan, s_a, s_b):
+            put_story(store.db, entry)
+        build(cfg, store)
+
+        # Checksum-valid catalog snapshot carrying legacy NaN must not abort retraction.
+        nan_cat = json.loads(store.db.execute("SELECT public_json FROM public_catalog WHERE story_id=?", (s_nan["id"],)).fetchone()[0])
+        nan_cat["legacy_score"] = float("nan")
+        nan_text = json.dumps(nan_cat, ensure_ascii=False, sort_keys=True, allow_nan=True) + "\n"
+        nan_sha = hashlib.sha256(nan_text.encode("utf-8")).hexdigest()
+        with store.db:
+            store.db.execute(
+                "UPDATE public_catalog SET public_json=?,json_sha256=? WHERE story_id=?",
+                (nan_text, nan_sha, s_nan["id"]),
+            )
+        shown_nan = editorial.show(store.db, s_nan["id"])
+        ret_nan = editorial.retract(
+            store.db, s_nan["id"], reason="Withdrawn legacy NaN snapshot.", expect_hash=shown_nan["hash"], observed=LATER,
+        )
+        assert ret_nan["retracted"] is True and ret_nan["revision"] == 1
+        hist_nan = editorial.history(store.db, s_nan["id"])
+        assert hist_nan["revisions"][0]["before_public"] is None
+        assert hist_nan["revisions"][0]["after_public"]["title"] == "Retracted story"
+        assert build(cfg, store)["stories_skipped"] == 0
+        assert "Withdrawn legacy NaN snapshot." in (output / f"news/{s_nan['id']}/index.html").read_text(encoding="utf-8")
+
+        # Restore must validate snapshot IDs on both revision > 0 and revision == 0 fallbacks.
+        editorial_act(editorial.correct, store, s_a["id"], {"summary": "Corrected summary A."}, reason="Rev 1.", observed=EDIT)
+        editorial_act(editorial.correct, store, s_a["id"], {"summary": "Second summary A."}, reason="Rev 2.", observed=LATER)
+        b_pub = store.db.execute("SELECT public_json FROM public_catalog WHERE story_id=?", (s_b["id"],)).fetchone()[0]
+        with store.db:
+            store.db.execute("DROP TRIGGER editorial_revisions_unchanged")
+            store.db.execute(
+                "UPDATE editorial_revisions SET after_public_json=?,before_public_json=? WHERE story_id=? AND revision=1",
+                (b_pub, b_pub, s_a["id"]),
+            )
+            editorial.initialize(store.db)
+        # Revision 1 after_public_json belongs to story B -> must reject.
+        with pytest.raises(ValueError, match="no accepted public text"):
+            editorial_act(editorial.restore, store, s_a["id"], 1, reason="Attempt foreign rev 1.", observed="2026-11-11T00:00:00Z")
+        # Revision 0 before_public_json belongs to story B, but before_story_json belongs to story A -> restores story A.
+        restored = editorial_act(editorial.restore, store, s_a["id"], 0, reason="Restore original A.", observed="2026-11-11T00:00:00Z")
+        assert restored["revision"] == 3
+        assert editorial.show(store.db, s_a["id"])["story"]["title"] == "Story A original"
+        assert editorial.show(store.db, s_a["id"])["story"]["summary"] == "Original summary A."
+
+        # If both revision-0 candidates belong to story B, restore must reject.
+        with store.db:
+            store.db.execute("DROP TRIGGER editorial_revisions_unchanged")
+            store.db.execute(
+                "UPDATE editorial_revisions SET before_story_json=? WHERE story_id=? AND revision=1",
+                (b_pub, s_a["id"]),
+            )
+            editorial.initialize(store.db)
+        with pytest.raises(ValueError, match="no accepted public text"):
+            editorial_act(editorial.restore, store, s_a["id"], 0, reason="Attempt foreign rev 0.", observed="2026-11-12T00:00:00Z")

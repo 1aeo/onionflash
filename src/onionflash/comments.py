@@ -205,7 +205,13 @@ def _source_key(source):
 def fetch_comments(client, source, item):
     """Read the newest-note window in one request; any unusable part rejects the answer."""
     project, origin, endpoint, project_id, iid, issue_url = _issue_identity(source, item)
-    response = client.request("POST", endpoint, headers={"Accept": "application/json"},
+    req_base = (source.get("_request_urls") or {}).get(source["url"])
+    request_endpoint = (
+        f"https://{urlsplit(req_base).netloc}/api/graphql"
+        if isinstance(req_base, str) and req_base
+        else endpoint
+    )
+    response = client.request("POST", request_endpoint, headers={"Accept": "application/json"},
                               json_body={"query": QUERY, "variables": {"project": project, "iid": iid, "size": NOTE_WINDOW}})
     received = now_iso()
     data = response.json()

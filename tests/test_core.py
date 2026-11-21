@@ -1503,3 +1503,59 @@ def test_llm_endpoint_rejects_local_private_ips_and_nfkc_and_preserves_host_port
     )
     with pytest.raises(ValueError, match="Invalid LLM base URL"):
         load_config(disallowed_private)
+
+
+def test_configured_trailing_dot_gitlab_source_uses_absolute_dns_and_canonical_identity(tmp_path):
+    """Preserve a configured trailing-dot GitLab FQDN for DNS lookup while keeping source and item URLs canonical."""
+    from onionflash.util import item_identity
+
+    cfg_path = tmp_path / "fqdn_gitlab.toml"
+    cfg_path.write_text(
+        '[storage]\ndatabase = "state/app.sqlite3"\noutput_dir = "build/public"\n'
+        '[[sources]]\n'
+        'id = "gl-fqdn"\n'
+        'name = "GitLab FQDN"\n'
+        'kind = "gitlab_issue"\n'
+        'url = "https://gitlab.example.org./api/v4/projects/426/issues"\n'
+        'product = "tor"\n'
+        'authority = "development"\n',
+        encoding="utf-8",
+    )
+    loaded = load_config(cfg_path)
+    src = loaded["sources"][0]
+    assert src["url"] == "https://gitlab.example.org/api/v4/projects/426/issues"
+
+    dns_hosts: list[str] = []
+    request_hosts: list[str] = []
+
+    def _recording_dns(host, port, *args, **kwargs):
+        dns_hosts.append(host)
+        return public_dns(host, port, *args, **kwargs)
+
+    issue_payload = json.dumps([
+        {
+            "web_url": "https://gitlab.example.org./tpo/core/tor/-/issues/42",
+            "title": "Absolute FQDN issue",
+            "description": "Reported on a trailing-dot GitLab endpoint.",
+            "created_at": "2026-11-08T10:00:00Z",
+            "updated_at": "2026-11-08T11:00:00Z",
+            "state": "opened",
+        }
+    ]).encode()
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        request_hosts.append(request.url.host)
+        return httpx.Response(200, content=issue_payload)
+
+    with Store(loaded["storage"]["database"]) as st:
+        state = st.source(src)
+        assert state["url"] == "https://gitlab.example.org/api/v4/projects/426/issues"
+        with HttpClient(DEFAULTS["http"], transport=httpx.MockTransport(_handler), resolver=_recording_dns) as client:
+            collected = collect_source(client, src, state, loaded["collection"], DATE)
+
+    assert dns_hosts == ["gitlab.example.org."]
+    assert request_hosts == ["gitlab.example.org"]
+    assert collected["url"] == "https://gitlab.example.org/api/v4/projects/426/issues"
+    assert len(collected["items"]) == 1
+    assert collected["items"][0]["url"] == "https://gitlab.example.org/tpo/core/tor/-/issues/42"
+    assert item_identity(collected["items"][0]) == "https://gitlab.example.org/tpo/core/tor/-/issues/42"

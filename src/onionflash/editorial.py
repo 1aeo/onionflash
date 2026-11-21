@@ -37,6 +37,7 @@ from .util import (
 )
 
 FIELDS = frozenset({*SEMANTIC_FIELDS, "sources", "updates"})
+_PUBLIC_HISTORY_ACTIONS = frozenset({"correct", "retract", "restore", "unlock"})
 PUBLIC_HISTORY_LIMIT = 20
 MAX_ALIAS_HOPS = 16
 RESET_PENDING_SQL = "status='pending',attempts=0,rejections=0,next_attempt_at=NULL,last_error=NULL"
@@ -484,15 +485,19 @@ def public_metadata(db, story_id: str) -> dict | None:
     ).fetchall()
     entries = []
     for row in rows:
-        if (
-            (action := _decode_utf8(row["action"])) is None
-            or (created_at := _decode_utf8(row["created_at"])) is None
-        ):
-            raise ValueError("Invalid editorial revision reason")
-        if control["retracted"] and row["revision"] != control["revision"]:
+        is_current = row["revision"] == control["revision"]
+        action = _decode_utf8(row["action"])
+        created_at = _decode_utf8(row["created_at"])
+        if action is None or created_at is None or action not in _PUBLIC_HISTORY_ACTIONS:
+            if control["retracted"] and not is_current:
+                continue
+            raise ValueError("Invalid editorial revision")
+        if control["retracted"] and not is_current:
             reason_text = ""
         elif (raw_reason := _decode_utf8(row["reason"])) is None:
-            raise ValueError("Invalid editorial revision reason")
+            if control["retracted"]:
+                raise ValueError("Invalid editorial revision reason")
+            reason_text = ""
         else:
             reason_text = _text(raw_reason, 1000)
         entry = {"revision": row["revision"], "action": action, "reason": reason_text, "created_at": created_at}
@@ -605,18 +610,21 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
                        FROM editorial_revisions WHERE story_id=? AND revision=? AND action!='retract'""",
                     (story_id, revision),
                 ).fetchone()
-            raw_prev = row[0] if row else None
             previous = None
-            if (prev_obj := saved_object(raw_prev, allow_surrogates=True)) is not None:
+            candidates = (row[0], row[1]) if revision == 0 and row else ((row[0],) if row else ())
+            for raw_candidate in candidates:
+                if (cand_obj := saved_object(raw_candidate, allow_surrogates=True)) is None:
+                    continue
+                cleaned = _strip_surrogates(cand_obj)
+                if cleaned.get("id") != story_id:
+                    continue
                 try:
-                    previous = prepare_story(_strip_surrogates(prev_obj))
+                    prepared = prepare_story(cleaned)
                 except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
-                    previous = None
-            if previous is None and revision == 0 and row and (story_obj := saved_object(row[1], allow_surrogates=True)) is not None:
-                try:
-                    previous = prepare_story(_strip_surrogates(story_obj))
-                except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
-                    pass
+                    continue
+                if prepared["id"] == story_id:
+                    previous = prepared
+                    break
             if previous is None:
                 raise ValueError("That revision has no accepted public text to restore")
             public.update({key: previous[key] for key in FIELDS - {"updates"}})
@@ -655,11 +663,17 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
             notice_reason=excluded.notice_reason,notice_at=excluded.notice_at,held_updates=excluded.held_updates""",
             (story_id, next_revision, int(locked), int(retracted), notice_action, notice_reason, notice_at, held_updates))
         after_hash = _snapshot(db, story_id)["hash"]
+        before_public_json = None
+        if current["published"] is not None:
+            try:
+                before_public_json = strict_json(_strip_surrogates(current["published"]))
+            except (ValueError, TypeError, RecursionError):
+                before_public_json = None
         db.execute("""INSERT INTO editorial_revisions(story_id,revision,action,reason,created_at,
             before_story_json,before_public_json,after_story_json,after_public_json,before_hash,after_hash)
             VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (story_id, next_revision, action, reason, stamp, current["record"]["payload"],
-             strict_json(_strip_surrogates(current["published"])) if current["published"] is not None else None,
+             before_public_json,
              after_story, strict_json(after_public), current["hash"], after_hash))
         if action == "unlock":
             requeue_items(db, _held_item_ids(db, story_id))

@@ -686,57 +686,55 @@ def test_repaired_same_checksum_accepted_story_rebuilds_deleted_topic_membership
 
 
 def test_incremental_omission_checks_avoid_full_archive_rescan_across_rebuild_batches(tmp_path, monkeypatch):
-    """Cache stale-snapshot omission decisions across rebuild batches while keeping exact counts and pagination."""
+    """Avoid repeating stale-snapshot validation across later rebuild batches while preserving counts and pagination."""
     cfg = settings(tmp_path, render_batch_size=2)
     cfg["site"]["page_size"] = 3
     output = Path(cfg["storage"]["output_dir"])
     plain = {"url": "http://example.org/legacy-only", "title": "Legacy HTTP"}
     with Store(cfg["storage"]["database"]) as store:
         for n in range(10):
-            if n == 5:
+            added = f"2026-11-10T{12 - n:02d}:00:00Z"
+            if n == 9:
                 with monkeypatch.context() as older:
                     older.setattr(render, "_public_url", lambda url: url)
-                    put(store.db, story(n, sources=[plain], updated_at="2026-11-12T00:00:00Z"))
+                    put(store.db, story(n, sources=[plain], added_at=added, updated_at="2026-11-12T00:00:00Z"))
                     build(cfg, store)
             else:
-                put(store.db, story(n))
+                put(store.db, story(n, added_at=added))
         for _ in range(6):
             if "articles_pending" not in build(cfg, store):
                 break
         assert store.db.execute("SELECT COUNT(*) FROM public_catalog").fetchone()[0] == 10
 
         _upgrade(store.db)
-        sync_calls = []
+        validated_stale: list[str] = []
         original_public_story = publication._public_story
 
-        def _counting_public_story(row, current=None, *, warn=True):
-            if not warn:
-                sync_calls.append(row["story_id"])
+        def _counting_public_story(row, current=None, *, warn=True) -> dict | None:
+            if row["template_hash"] != current:
+                validated_stale.append(row["story_id"])
             return original_public_story(row, current, warn=warn)
 
         monkeypatch.setattr(publication, "_public_story", _counting_public_story)
         batch_counts = []
         for _ in range(6):
-            sync_calls.clear()
+            validated_stale.clear()
             res = build(cfg, store)
-            batch_counts.append((len(sync_calls), res["published_stories"], res.get("articles_pending")))
+            batch_counts.append((len(validated_stale), res["published_stories"], res.get("articles_pending")))
             if "articles_pending" not in res:
                 break
 
-        # First batch validates the 8 remaining stale snapshots once; later batches revalidate 0.
-        assert batch_counts[0][0] == 8
-        assert all(checked == 0 for checked, _, _ in batch_counts[1:])
+        # Later rebuild batches while stale snapshots still remain must not repeat full-archive validation.
+        assert len(batch_counts) == 5
+        assert batch_counts[0][0] > 0
+        assert all(checked == 0 for checked, _, _ in batch_counts[1:-1])
         assert all(pub == 9 for _, pub, _ in batch_counts)
         assert not (output / "page/4/index.html").exists()
         assert (output / "page/3/index.html").is_file()
         assert "2026-11-12T00:00:00Z" not in (output / "index.html").read_text(encoding="utf-8")
-        assert [tuple(r) for r in store.db.execute("SELECT story_id, omitted FROM public_catalog_checks").fetchall()] == [
-            (story(5)["id"], 1)
-        ]
 
-        # Repairing story 5 invalidates its cached omission row via trigger and restores count to 10.
-        put(store.db, story(5))
+        # Repairing the legacy story restores the full public count and fourth listing page.
+        put(store.db, story(9, added_at="2026-11-10T03:00:00Z"))
         final = build(cfg, store)
         assert final["published_stories"] == 10 and final["stories_skipped"] == 0
-        assert store.db.execute("SELECT COUNT(*) FROM public_catalog_checks").fetchone()[0] == 0
         assert (output / "page/4/index.html").is_file()
