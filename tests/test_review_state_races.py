@@ -506,3 +506,59 @@ def test_same_hash_closed_at_update_preserves_queue_state_and_rejects_older_regr
     # An older REST poll must not regress the stored closed_at either.
     assert store.ingest({**src, "updated_at": "2026-11-08T00:00:00Z", "closed_at": "2026-10-01T00:00:00Z"}, nov12) is False
     assert json.loads(item_row(store, row)["payload"])["closed_at"] == nov12
+
+
+def test_same_hash_confirming_closed_at_poll_advances_freshness_against_delayed_intermediate(llm_context):
+    """Advance freshness when a newer poll confirms the same `closed_at` so delayed intermediate polls cannot overwrite it."""
+    cfg, store = llm_context
+    nov9 = "2026-11-09T12:00:00Z"
+    nov11 = "2026-11-11T00:00:00Z"
+    nov12 = "2026-11-12T00:00:00Z"
+    src = item(
+        kind="gitlab_issue",
+        upstream_state="closed",
+        published_at="2026-09-01T12:00:00Z",
+        updated_at=nov9,
+        closed_at=nov9,
+    )
+    row = pending(store, src)
+    assert store.defer(row["id"], "Temporary error", cfg["llm"], LATER, terminal=True, expected_row=row) is True
+    before = item_row(store, row)
+
+    # Newer poll confirms the same closed_at -> advances stored updated_at while preserving hash and queue state.
+    assert store.ingest({**src, "updated_at": nov12, "closed_at": nov9}, nov12) is False
+    confirmed = item_row(store, row)
+    assert confirmed["content_hash"] == before["content_hash"]
+    assert (confirmed["attempts"], confirmed["rejections"], confirmed["status"]) == (1, 1, "pending")
+    assert confirmed["last_error"] == before["last_error"]
+    confirmed_payload = json.loads(confirmed["payload"])
+    assert confirmed_payload["closed_at"] == nov9 and confirmed_payload["updated_at"] == nov12
+
+    # Delayed intermediate poll (Nov 11) with a different closed_at must not overwrite the Nov 12 confirmed value.
+    assert store.ingest({**src, "updated_at": nov11, "closed_at": nov11}, nov12) is False
+    after_delayed = json.loads(item_row(store, row)["payload"])
+    assert after_delayed["closed_at"] == nov9 and after_delayed["updated_at"] == nov12
+
+    # Compacted closed issue follows the same freshness invariant when a newer poll confirms closed_at.
+    comp_src = item(
+        url="https://gitlab.torproject.org/tpo/core/tor/-/issues/999",
+        kind="gitlab_issue",
+        upstream_state="closed",
+        published_at="2026-09-01T12:00:00Z",
+        updated_at=nov9,
+        closed_at=nov9,
+    )
+    comp_row = pending(store, comp_src)
+    comp_payload = {k: v for k, v in json.loads(comp_row["payload"]).items() if k != "content"}
+    comp_payload["archived_bundle"] = "private-evidence/2026-11/bundle.ndjson.gz"
+    with store.db:
+        store.db.execute(
+            "UPDATE items SET status='ignored',payload=? WHERE id=?",
+            (json.dumps(comp_payload, ensure_ascii=False), comp_row["id"]),
+        )
+    assert store.ingest({**comp_src, "updated_at": nov12, "closed_at": nov9}, nov12) is False
+    comp_confirmed = json.loads(item_row(store, comp_row)["payload"])
+    assert comp_confirmed["closed_at"] == nov9 and comp_confirmed["updated_at"] == nov12
+    assert store.ingest({**comp_src, "updated_at": nov11, "closed_at": nov11}, nov12) is False
+    comp_after = json.loads(item_row(store, comp_row)["payload"])
+    assert comp_after["closed_at"] == nov9 and comp_after["updated_at"] == nov12

@@ -388,7 +388,7 @@ def _updated_closed_at(old: dict, item: dict) -> str | None:
         and closed_at
         and isinstance(item.get("updated_at"), str)
         and item["updated_at"] >= old["updated_at"]
-        and closed_at != old.get("closed_at")
+        and (closed_at != old.get("closed_at") or item["updated_at"] > old["updated_at"])
     ):
         return closed_at
     return None

@@ -574,7 +574,7 @@ def test_editorial_revision_surrogates_and_invalid_utf8_do_not_crash_build(tmp_p
         for sid in ("story-surrogate", "story-bad-utf8", "story-bad-notice"):
             editorial_act(editorial.correct, store, sid, {"summary": f"Corrected summary for {sid}."},
                           reason="Clarified wording.", observed="2026-11-10T00:00:00Z")
-        surrogate_before = '{"title":"Superseded\\ud800Headline","summary":"Superseded\\ud800Summary","why_it_matters":""}'
+        surrogate_before = '{"id":"story-surrogate","title":"Superseded\\ud800Headline","summary":"Superseded\\ud800Summary","why_it_matters":""}'
         with store.db:
             store.db.execute("DROP TRIGGER editorial_revisions_unchanged")
             store.db.execute(

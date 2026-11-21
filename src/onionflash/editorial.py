@@ -489,7 +489,7 @@ def public_metadata(db, story_id: str) -> dict | None:
         action = _decode_utf8(row["action"])
         created_at = _decode_utf8(row["created_at"])
         if action is None or created_at is None or action not in _PUBLIC_HISTORY_ACTIONS:
-            if control["retracted"] and not is_current:
+            if not is_current:
                 continue
             raise ValueError("Invalid editorial revision")
         if control["retracted"] and not is_current:
@@ -503,12 +503,16 @@ def public_metadata(db, story_id: str) -> dict | None:
         entry = {"revision": row["revision"], "action": action, "reason": reason_text, "created_at": created_at}
         if row["before_public_json"] is not None and action != "unlock" and not control["retracted"]:
             before = saved_object(row["before_public_json"], allow_surrogates=True)
-            if before is not None:
+            if before is not None and before.get("id") == story_id:
                 entry["superseded"] = {
                     key: _text(before.get(key, ""), FIELD_LIMITS[key])
                     for key in ("title", "summary", "why_it_matters")
                 }
-                if action != "retract" and (after_obj := saved_object(row["after_public_json"], allow_surrogates=True)) is not None:
+                if (
+                    action != "retract"
+                    and (after_obj := saved_object(row["after_public_json"], allow_surrogates=True)) is not None
+                    and after_obj.get("id") == story_id
+                ):
                     kept = {(u["at"], u["text"]) for u in _clean_history_updates(after_obj.get("updates"))}
                     if replaced := [u for u in _clean_history_updates(before.get("updates")) if (u["at"], u["text"]) not in kept]:
                         entry["superseded"]["updates"] = replaced
@@ -664,7 +668,7 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
             (story_id, next_revision, int(locked), int(retracted), notice_action, notice_reason, notice_at, held_updates))
         after_hash = _snapshot(db, story_id)["hash"]
         before_public_json = None
-        if current["published"] is not None:
+        if current["published"] is not None and current["published"].get("id") == story_id:
             try:
                 before_public_json = strict_json(_strip_surrogates(current["published"]))
             except (ValueError, TypeError, RecursionError):

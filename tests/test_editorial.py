@@ -1019,3 +1019,71 @@ def test_retraction_tolerates_non_strict_legacy_catalog_snapshot_and_restore_rej
             editorial.initialize(store.db)
         with pytest.raises(ValueError, match="no accepted public text"):
             editorial_act(editorial.restore, store, s_a["id"], 0, reason="Attempt foreign rev 0.", observed="2026-11-12T00:00:00Z")
+
+
+def test_restore_skips_unreadable_older_history_and_ignores_foreign_public_history_snapshots(tmp_path):
+    """Skip older unreadable revision rows after restore and never record or publish foreign-ID history snapshots."""
+    cfg = pub_settings(tmp_path)
+    output = Path(cfg["storage"]["output_dir"])
+    s_rest = make_story(1, id="story-rest-blob", title="Restorable story", summary="Original restorable summary.")
+    s_own = make_story(2, id="story-own-hist", title="Own story", summary="Own original summary.", updates=UPDATES[:1])
+    s_for = make_story(3, id="story-foreign-hist", title="Foreign headline", summary="Foreign summary.")
+    with Store(cfg["storage"]["database"]) as store:
+        for entry in (s_rest, s_own, s_for):
+            put_story(store.db, entry)
+        build(cfg, store)
+
+        # Older BLOB action row must be skipped not only while retracted, but also after restoring the story.
+        editorial_act(editorial.correct, store, s_rest["id"], {"summary": "First edit."}, reason="Fix 1.", observed=EDIT)
+        with store.db:
+            store.db.execute("DROP TRIGGER editorial_revisions_unchanged")
+            store.db.execute(
+                "UPDATE editorial_revisions SET action=CAST('correct' AS BLOB) WHERE story_id=? AND revision=1",
+                (s_rest["id"],),
+            )
+            editorial.initialize(store.db)
+        editorial_act(editorial.retract, store, s_rest["id"], reason="Withdrawn.", observed=LATER)
+        assert build(cfg, store)["stories_skipped"] == 0
+        editorial_act(editorial.restore, store, s_rest["id"], 0, reason="Restored cleanly.", observed="2026-11-11T00:00:00Z")
+        meta_rest = editorial.public_metadata(store.db, s_rest["id"])
+        assert meta_rest is not None and meta_rest["status"] == "corrected"
+        assert [entry["revision"] for entry in meta_rest["history"]] == [3, 2]
+        assert build(cfg, store)["stories_skipped"] == 0
+        assert "Original restorable summary." in (output / f"news/{s_rest['id']}/index.html").read_text(encoding="utf-8")
+
+        # Foreign catalog snapshot on a healthy story must not be recorded as before_public_json during correction.
+        foreign_json = store.db.execute("SELECT public_json FROM public_catalog WHERE story_id=?", (s_for["id"],)).fetchone()[0]
+        foreign_sha = hashlib.sha256(foreign_json.encode("utf-8")).hexdigest()
+        with store.db:
+            store.db.execute(
+                "UPDATE public_catalog SET public_json=?,json_sha256=? WHERE story_id=?",
+                (foreign_json, foreign_sha, s_own["id"]),
+            )
+        editorial_act(editorial.correct, store, s_own["id"], {"summary": "Own corrected summary."}, reason="Fix own.", observed=EDIT)
+        rev1 = store.db.execute(
+            "SELECT before_public_json FROM editorial_revisions WHERE story_id=? AND revision=1",
+            (s_own["id"],),
+        ).fetchone()
+        assert rev1[0] is None
+        meta_own = editorial.public_metadata(store.db, s_own["id"])
+        assert meta_own is not None and "superseded" not in meta_own["history"][0]
+
+        # Existing foreign-ID before_public_json or after_public_json rows must also be ignored in public_metadata.
+        assert build(cfg, store)["stories_skipped"] == 0
+        editorial_act(editorial.correct, store, s_own["id"], {"title": "Own retitled"}, reason="Retitle own.", observed=LATER)
+        with store.db:
+            store.db.execute("DROP TRIGGER editorial_revisions_unchanged")
+            store.db.execute(
+                "UPDATE editorial_revisions SET before_public_json=? WHERE story_id=? AND revision=1",
+                (foreign_json, s_own["id"]),
+            )
+            store.db.execute(
+                "UPDATE editorial_revisions SET after_public_json=? WHERE story_id=? AND revision=2",
+                (foreign_json, s_own["id"]),
+            )
+            editorial.initialize(store.db)
+        meta_checked = editorial.public_metadata(store.db, s_own["id"])
+        by_rev = {entry["revision"]: entry for entry in meta_checked["history"]}
+        assert "superseded" not in by_rev[1]
+        assert "superseded" in by_rev[2] and "updates" not in by_rev[2]["superseded"]
+        assert "Foreign headline" not in json.dumps(meta_checked)
