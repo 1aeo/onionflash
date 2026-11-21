@@ -133,6 +133,11 @@ def writer_item(source: dict) -> dict:
     return item
 
 
+def _exact_url(raw_url: object) -> str:
+    raw = str(raw_url or "")
+    return safe_canonical_url(raw) or raw
+
+
 def _base_url(raw_url: object) -> str:
     raw = str(raw_url or "").split("#", 1)[0]
     return safe_canonical_url(raw) or raw
@@ -272,11 +277,14 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                     prior_id = prior["id"] if prior else None
                     row_source = source
                     if scope == "latest_update":
-                        by_base = {_base_url(s.get("url")): s for s in reversed(case["packet"]["sources"])}
-                        for cited in candidate["updates"][-1].get("sources") or ():
-                            if isinstance(cited, dict) and (matched_src := by_base.get(_base_url(cited.get("url")))) is not None:
-                                row_source = matched_src
-                                break
+                        by_exact = {u: s for s in reversed(case["packet"]["sources"]) if (u := _exact_url(s.get("url")))}
+                        by_base = {u: s for s in reversed(case["packet"]["sources"]) if (u := _base_url(s.get("url")))}
+                        cited_sources = [c for c in (candidate["updates"][-1].get("sources") or ()) if isinstance(c, dict)]
+                        row_source = (
+                            next((m for c in cited_sources if (m := by_exact.get(_exact_url(c.get("url")))) is not None), None)
+                            or next((m for c in cited_sources if (m := by_base.get(_base_url(c.get("url")))) is not None), None)
+                            or source
+                        )
                     row_item = item if row_source is source else writer_item(row_source)
                     if row_source.get("closed_at"):
                         row_item = {**row_item, "closed_at": row_source["closed_at"]}

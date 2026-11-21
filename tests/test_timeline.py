@@ -332,6 +332,20 @@ def test_atom_and_rss_timeline_id_fallbacks_and_conflict_guards():
     ]
     assert charset_res["skipped"] == 0
 
+    mixed_scheme_atom = b"""<?xml version="1.0" encoding="utf-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom"><title>Multilingual Atom</title>
+      <entry><id>tag:example.org,2026:multi</id><title>Post FR/EN</title><updated>2026-11-10T12:00:00Z</updated>
+        <link rel="alternate" type="text/html" hreflang="fr" href="http://example.org/fr/post"/>
+        <link rel="alternate" type="text/html" hreflang="en" href="https://example.org/en/post"/>
+        <summary>Multilingual body.</summary></entry>
+      <entry><id>https://example.org/ambig</id><title>Fallback A</title><updated>2026-11-10T12:00:00Z</updated>
+        <link rel="alternate" type="text/html" href="http://example.org/http-only-a"/><summary>Body A.</summary></entry>
+      <entry><id>https://example.org/ambig</id><title>Fallback B</title><updated>2026-11-10T12:00:00Z</updated>
+        <link rel="alternate" type="text/html" href="http://example.org/http-only-b"/><summary>Body B.</summary></entry>
+    </feed>"""
+    multi_res = collect_source(FakeClient([response(mixed_scheme_atom)]), source(), {}, DEFAULTS["collection"], "2026-11-10T12:05:00Z")
+    assert [i["url"] for i in multi_res["items"]] == ["https://example.org/en/post"]
+
 
 def test_timeline_cell_isolation_and_markdown_autolink_preservation():
     """Isolate per-cell HTML sanitization and preserve `<https://...>` autolinks in `collect_timeline`."""
@@ -346,10 +360,17 @@ def test_timeline_cell_isolation_and_markdown_autolink_preservation():
     collected = _collect(rows)["items"]
     by_pub = {entry["published_at"]: entry for entry in collected}
     first = by_pub["2026-11-08T00:00:00Z"]
+    assert "Places: cn\n" in first["content"]
+    assert "Protocols: not specified\n" in first["content"]
+    assert "<script>" not in first["content"]
     assert "Unknown cause: Yes; preserve this uncertainty" in first["content"]
     assert f"References: {ref_url}" in first["content"]
 
     second = by_pub["2026-11-07T00:00:00Z"]
+    assert "Places: ir\n" in second["content"]
+    assert "Protocols: obfs4\n" in second["content"]
+    assert "<!--" not in second["content"]
+    assert "<style>" not in second["content"]
     assert "https://example.org/detail" in second["title"]
     assert "https://example.org/detail" in second["content"]
     assert "Unknown cause: Yes; preserve this uncertainty" in second["content"]

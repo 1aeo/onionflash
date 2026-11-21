@@ -62,6 +62,17 @@ def initialize(db) -> None:
         DROP INDEX IF EXISTS public_catalog_published;
         CREATE INDEX IF NOT EXISTS public_catalog_added ON public_catalog(added_at DESC,updated_at DESC,story_id DESC);
         CREATE INDEX IF NOT EXISTS public_catalog_updated ON public_catalog(updated_at DESC,published_at DESC,story_id DESC);
+        CREATE INDEX IF NOT EXISTS public_catalog_template ON public_catalog(template_hash);
+        CREATE TABLE IF NOT EXISTS public_catalog_checks (
+            story_id TEXT PRIMARY KEY, template_hash TEXT NOT NULL,
+            json_sha256 TEXT NOT NULL, omitted INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS public_catalog_checks_omitted
+            ON public_catalog_checks(template_hash,omitted,story_id);
+        CREATE TRIGGER IF NOT EXISTS public_catalog_checks_invalidate
+            AFTER UPDATE OF template_hash, json_sha256, public_json ON public_catalog BEGIN
+            DELETE FROM public_catalog_checks WHERE story_id=NEW.story_id;
+        END;
         CREATE TABLE IF NOT EXISTS public_story_topics (
             topic TEXT NOT NULL, story_id TEXT NOT NULL,
             added_at TEXT NOT NULL, updated_at TEXT NOT NULL,
@@ -253,9 +264,9 @@ def _render_accepted(db, site: dict, base: str, accepted) -> tuple[dict, str]:
             retracted_raw = {
                 **raw,
                 **editorial.retracted_fields(meta["reason"]),
-                "category": raw.get("category") if raw.get("category") in render.CATEGORIES else "network",
-                "confidence": raw.get("confidence") if raw.get("confidence") in render.CONFIDENCES else "reported",
-                "state": raw.get("state") if raw.get("state") in render.PUBLIC_STATES else "developing",
+                "category": raw["category"] if isinstance(raw.get("category"), str) and raw["category"] in render.CATEGORIES else "network",
+                "confidence": raw["confidence"] if isinstance(raw.get("confidence"), str) and raw["confidence"] in render.CONFIDENCES else "reported",
+                "state": raw["state"] if isinstance(raw.get("state"), str) and raw["state"] in render.PUBLIC_STATES else "developing",
                 "updated_at": meta["at"],
             }
             story = render.prepare_story(retracted_raw, editorial=meta)
@@ -265,7 +276,9 @@ def _render_accepted(db, site: dict, base: str, accepted) -> tuple[dict, str]:
                 (accepted["story_id"], meta["revision"]),
             ).fetchone()
             after_obj = saved_object(rev_row[0], allow_surrogates=True) if rev_row else None
-            story = render.prepare_story(after_obj if after_obj is not None else _public_story(accepted), editorial=meta)
+            if after_obj is None:
+                raise ValueError("Editorial revision snapshot is missing or unreadable")
+            story = render.prepare_story(after_obj, editorial=meta)
     else:
         story = _public_story(accepted)
     if story["id"] != accepted["story_id"]:
@@ -381,6 +394,71 @@ def _pointer(artifacts: Artifacts, db, site: dict, base: str, identity: str, sto
         _dequeue(db, story_id)
 
 
+def _sync_catalog_checks(db, identity: str, *, batch_size: int = 100) -> list[str]:
+    """Incrementally validate unchecked stale catalog snapshots for `identity` and return omitted IDs."""
+    has_stale = db.execute(
+        "SELECT 1 FROM public_catalog WHERE template_hash<? OR template_hash>? LIMIT 1",
+        (identity, identity),
+    ).fetchone()
+    if has_stale is None:
+        if db.execute("SELECT 1 FROM public_catalog_checks LIMIT 1").fetchone() is not None:
+            with db:
+                db.execute("DELETE FROM public_catalog_checks")
+        return []
+    with db:
+        db.execute(
+            "DELETE FROM public_catalog_checks WHERE template_hash!=? OR story_id IN (SELECT story_id FROM story_aliases)",
+            (identity,),
+        )
+    cursor: str | None = None
+    while True:
+        cursor_sql = " AND c.story_id>?" if cursor is not None else ""
+        params = (identity, identity, *((cursor,) if cursor is not None else ()), batch_size)
+        rows = db.execute(
+            f"""SELECT c.story_id, c.template_hash, c.json_sha256, c.public_json
+                FROM public_catalog c
+                WHERE c.template_hash!=?
+                  AND c.story_id NOT IN (SELECT story_id FROM story_aliases)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM public_catalog_checks chk
+                      WHERE chk.story_id=c.story_id
+                        AND chk.template_hash=?
+                        AND chk.json_sha256=c.json_sha256
+                  ){cursor_sql}
+                ORDER BY c.story_id LIMIT ?""",
+            params,
+        ).fetchall()
+        if not rows:
+            break
+        checks = [
+            (cat_row["story_id"], identity, cat_row["json_sha256"], int(_public_story(cat_row, identity, warn=False) is None))
+            for cat_row in rows
+        ]
+        with db:
+            db.executemany(
+                """INSERT INTO public_catalog_checks(story_id,template_hash,json_sha256,omitted)
+                   VALUES(?,?,?,?) ON CONFLICT(story_id) DO UPDATE SET
+                   template_hash=excluded.template_hash,json_sha256=excluded.json_sha256,omitted=excluded.omitted""",
+                checks,
+            )
+        cursor = rows[-1]["story_id"]
+    return [
+        row[0]
+        for row in db.execute(
+            """SELECT c.story_id
+               FROM public_catalog_checks chk
+               JOIN public_catalog c ON c.story_id=chk.story_id
+               WHERE chk.template_hash=?
+                 AND chk.omitted=1
+                 AND c.template_hash!=?
+                 AND c.json_sha256=chk.json_sha256
+                 AND c.story_id NOT IN (SELECT story_id FROM story_aliases)
+               ORDER BY c.story_id""",
+            (identity, identity),
+        ).fetchall()
+    ]
+
+
 def build(config: dict, store, *, force: bool = False) -> dict:
     """Update changed artifacts; the caller holds the existing database lock."""
     db, site = store.db, config["site"]
@@ -471,12 +549,20 @@ def build(config: dict, store, *, force: bool = False) -> dict:
         with db:
             public_json, checksum = artifacts.write_article(story["id"], article, story)
             previous = accepted or _catalog_row(db, story["id"])
-            if previous is None or previous["json_sha256"] != checksum:
+            expected_topics = [(topic, story["id"], story["added_at"], story["updated_at"]) for topic in story["tags"]]
+            topics_stale = previous is None or previous["json_sha256"] != checksum or {
+                tuple(topic_row)
+                for topic_row in db.execute(
+                    "SELECT topic,story_id,added_at,updated_at FROM public_story_topics WHERE story_id=?",
+                    (story["id"],),
+                )
+            } != set(expected_topics)
+            if topics_stale:
                 store_mod.bump_meta(db, "publication_catalog_revision")
                 db.execute("DELETE FROM public_story_topics WHERE story_id=?", (story["id"],))
                 db.executemany(
                     "INSERT INTO public_story_topics(topic,story_id,added_at,updated_at) VALUES(?,?,?,?)",
-                    [(topic, story["id"], story["added_at"], story["updated_at"]) for topic in story["tags"]],
+                    expected_topics,
                 )
             db.execute(
                 """INSERT INTO public_catalog(story_id,published_at,updated_at,added_at,source_hash,template_hash,json_sha256,public_json)
@@ -491,17 +577,7 @@ def build(config: dict, store, *, force: bool = False) -> dict:
         if db.execute("DELETE FROM public_story_topics WHERE story_id IN (SELECT story_id FROM story_aliases)").rowcount:
             store_mod.bump_meta(db, "publication_catalog_revision")
             store_mod.set_meta(db, publication_dirty="1")
-    omitted_ids = sorted(
-        cat_row["story_id"]
-        for cat_row in db.execute(
-            """SELECT story_id, template_hash, json_sha256, public_json
-               FROM public_catalog
-               WHERE template_hash != ? AND story_id NOT IN (SELECT story_id FROM story_aliases)""",
-            (identity,),
-        ).fetchall()
-        if _public_story(cat_row, identity, warn=False) is None
-    )
-    omitted_set = set(omitted_ids)
+    omitted_ids = _sync_catalog_checks(db, identity)
     total_catalog, active_catalog, latest = db.execute(
         """SELECT COUNT(*),
                   COALESCE(SUM(story_id NOT IN (SELECT story_id FROM story_aliases)), 0),
@@ -509,14 +585,19 @@ def build(config: dict, store, *, force: bool = False) -> dict:
            FROM public_catalog"""
     ).fetchone()
     retired_catalog = total_catalog - active_catalog
-    if omitted_set:
-        active_dates = [
-            u for sid, u in db.execute(
-                "SELECT story_id, updated_at FROM public_catalog WHERE story_id NOT IN (SELECT story_id FROM story_aliases)"
-            )
-            if sid not in omitted_set
-        ]
-        count, latest = len(active_dates), max(active_dates, default=None)
+    not_omitted_sql = (
+        "NOT EXISTS (SELECT 1 FROM public_catalog_checks chk JOIN public_catalog pc ON pc.story_id=chk.story_id "
+        "WHERE chk.story_id={col} AND chk.template_hash=? AND chk.omitted=1 "
+        "AND pc.template_hash!=? AND pc.json_sha256=chk.json_sha256)"
+    )
+    if omitted_ids:
+        count, latest = db.execute(
+            f"""SELECT COUNT(*), MAX(c.updated_at)
+                FROM public_catalog c
+                WHERE c.story_id NOT IN (SELECT story_id FROM story_aliases)
+                  AND {not_omitted_sql.format(col='c.story_id')}""",
+            (identity, identity),
+        ).fetchone()
     else:
         count = active_catalog
     pending, skipped = db.execute(
@@ -539,15 +620,15 @@ def build(config: dict, store, *, force: bool = False) -> dict:
         _listing(artifacts, site, base, health, count=count, latest=latest, refresh=refresh)
         if refresh:
             for topic in render.CATEGORIES:
-                if omitted_set:
-                    topic_dates = [
-                        u for sid, u in db.execute(
-                            "SELECT story_id, updated_at FROM public_story_topics WHERE topic=? AND story_id NOT IN (SELECT story_id FROM story_aliases)",
-                            (topic,),
-                        )
-                        if sid not in omitted_set
-                    ]
-                    t_count, t_latest = len(topic_dates), max(topic_dates, default=None)
+                if omitted_ids:
+                    t_count, t_latest = db.execute(
+                        f"""SELECT COUNT(*), MAX(t.updated_at)
+                            FROM public_story_topics t
+                            WHERE t.topic=?
+                              AND t.story_id NOT IN (SELECT story_id FROM story_aliases)
+                              AND {not_omitted_sql.format(col='t.story_id')}""",
+                        (topic, identity, identity),
+                    ).fetchone()
                 else:
                     t_count, t_latest = db.execute(
                         "SELECT COUNT(*),MAX(updated_at) FROM public_story_topics WHERE topic=? AND story_id NOT IN (SELECT story_id FROM story_aliases)",

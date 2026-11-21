@@ -759,9 +759,97 @@ def test_expired_deadline_skips_dns_and_aborts_mid_redirect_hop():
     assert hops == ["https://first.example/feed"]
 
     fqdn_target = "https://lists.torproject.org./mailman3/hyperkitty/list/tor-dev@lists.torproject.org/feed/"
+    looked_up: list[str] = []
+
+    def _recording_dns(host, port, *args):
+        looked_up.append(host)
+        return public_dns(host, port, *args)
+
     with HttpClient({"retry_attempts": 1}, transport=httpx.MockTransport(
         lambda req: httpx.Response(301, headers={"location": fqdn_target}) if req.url.host == "old.example"
         else httpx.Response(200, content=b"ok")
-    ), resolver=public_dns) as client:
+    ), resolver=_recording_dns) as client:
         resp = client.request("GET", "https://old.example/feed")
     assert resp.url == "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/feed/"
+    assert looked_up == ["old.example", "lists.torproject.org."]
+
+
+def test_trailing_dot_fqdn_dns_post_dns_deadline_and_direct_deadline_reached():
+    """Preserve trailing-dot DNS lookup, recheck deadline after DNS, and mark direct DeadlineReached."""
+    from onionflash.collect import CollectionError, collect_source
+    from helpers import source
+
+    resolved, sni_hosts = [], []
+
+    def _prod_dns(host, port, *args):
+        resolved.append(host)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    class _RecordingStream(httpcore.MockStream):
+        def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+            """Record TLS SNI server_hostname before delegating to MockStream."""
+            sni_hosts.append(server_hostname)
+            return super().start_tls(ssl_context, server_hostname=server_hostname, timeout=timeout)
+
+    class _RedirectBackend(httpcore.MockBackend):
+        def __init__(self, responses):
+            super().__init__(responses)
+            self._responses = list(responses)
+
+        def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+            """Serve sequential raw HTTP responses via _RecordingStream."""
+            return _RecordingStream([self._responses.pop(0)])
+
+    client = HttpClient({"retry_attempts": 1, "backoff_base_seconds": 0}, resolver=_prod_dns, sleep=lambda _: None)
+    client._client._transport.backend.backend = _RedirectBackend([
+        b"HTTP/1.1 302 Found\r\nLocation: https://feed.example.org./news\r\nContent-Length: 0\r\n\r\n",
+        b"HTTP/1.1 302 Found\r\nLocation: /final\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    ])
+    with client:
+        resp = client.request("GET", "https://start.example.org/feed")
+    assert resp.body == b"ok"
+    assert resp.url == "https://feed.example.org/final"
+    assert resolved == ["start.example.org", "feed.example.org.", "feed.example.org."]
+    assert sni_hosts == ["start.example.org", "feed.example.org", "feed.example.org"]
+
+    now = [100.0]
+    handler_calls = []
+
+    def _late_ok_dns(*args):
+        now[0] = 200.0
+        return public_dns(*args)
+
+    def _handler(req):
+        handler_calls.append(str(req.url))
+        return httpx.Response(200, content=b"ok")
+
+    with HttpClient({"retry_attempts": 1}, transport=httpx.MockTransport(_handler),
+                    resolver=_late_ok_dns, clock=lambda: now[0]) as late_client:
+        late_client.deadline = 150.0
+        with pytest.raises(DeadlineReached) as late_err:
+            late_client.request("GET", "https://example.org/late")
+        assert late_err.value.request_started is True
+        assert late_client.deadline_reached is True
+    assert handler_calls == []
+
+    now[0] = 100.0
+    with HttpClient({"retry_attempts": 1}, transport=httpx.MockTransport(_handler),
+                    resolver=public_dns, clock=lambda: now[0]) as ok_client:
+        ok_client.deadline = 150.0
+        assert ok_client.request("GET", "https://example.org/timely").body == b"ok"
+    assert handler_calls == ["https://example.org/timely"]
+
+    mirror_hits = []
+
+    def _direct_deadline(req):
+        mirror_hits.append(str(req.url))
+        raise DeadlineReached()
+
+    with HttpClient({"retry_attempts": 1}, transport=httpx.MockTransport(_direct_deadline),
+                    resolver=public_dns) as deadline_client:
+        src = source(url="https://primary.example/feed.xml", fallback_urls=["https://mirror.example/feed.xml"])
+        with pytest.raises(CollectionError, match="request deadline reached"):
+            collect_source(deadline_client, src, {}, DEFAULTS["collection"], DATE)
+        assert deadline_client.deadline_reached is True
+    assert mirror_hits == ["https://primary.example/feed.xml"]

@@ -676,6 +676,21 @@ def test_saved_job_validates_prepared_at_and_reset_review_work_guards_draft_and_
         review_gate.reset_review_work(store, row_corrupt_rec["id"])
     assert job(store, row_corrupt_rec) is not None and job_record(store, row_corrupt_rec)["input_hash"] == row_corrupt_rec["content_hash"]
 
+    for idx, bad_hash in enumerate(([], {}, "not-a-sha256")):
+        row_bad_hash = pending(store, item(url=f"https://example.org/bad-input-hash-{idx}"))
+        _pause_before_prepare(cfg, store, row_bad_hash, monkeypatch)
+        damaged_rec = {**job_record(store, row_bad_hash), "input_hash": bad_hash}
+        patch_job(store, row_bad_hash, record=damaged_rec)
+        with store.db:
+            review_gate.reset_review_work(store, row_bad_hash["id"])
+        assert job(store, row_bad_hash) is None
+
+    row_valid_hash = pending(store, item(url="https://example.org/valid-input-hash"))
+    _pause_before_prepare(cfg, store, row_valid_hash, monkeypatch)
+    with store.db:
+        review_gate.reset_review_work(store, row_valid_hash["id"])
+    assert job(store, row_valid_hash) is not None and job_record(store, row_valid_hash)["input_hash"] == row_valid_hash["content_hash"]
+
     target, incoming, routed_row, _ = seed_routed_followup(cfg, store)
     assert run(cfg, store, queued_row(store, routed_row), Writer(update_analysis()), wire_reviewer(cfg, verdict("hold", update=True)))["status"] == "held"
     revised_incoming = {**incoming, "content": "Completely revised follow-up report.", "updated_at": LATER}

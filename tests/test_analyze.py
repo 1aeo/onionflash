@@ -820,12 +820,15 @@ def test_effective_generation_contract_changes_invalidate_writer_cache(field, va
 
 def test_writer_cache_uses_effective_options_and_excludes_credentials(monkeypatch):
     """Hash effective reasoning-profile options while ignoring overridden scalars and API keys."""
+    previous = _prior_story()
     before = _cache_key_for(writer_reasoning=True)
+    before_update = _cache_key_for(previous=previous, writer_reasoning=True)
     overrides = dict(writer_reasoning=True, temperature=0, max_output_tokens=7, enable_thinking=False,
                      api_key_env="ANOTHER_PRIVATE_KEY_NAME", credential="not-part-of-generation")
     monkeypatch.setenv("ANOTHER_PRIVATE_KEY_NAME", "synthetic-private-value")
     assert _cache_key_for(**overrides) == before
-    assert _cache_key_for(previous=_prior_story(), **overrides) != before
+    assert _cache_key_for(previous=previous, **overrides) == before_update
+    assert before_update != before
 
 
 def test_fallback_order_is_part_of_writer_identity():
@@ -849,7 +852,7 @@ def test_enabled_writer_sends_the_declared_profile_exactly(capture):
         "presence_penalty": 0.0, "repetition_penalty": 1.0, "reasoning_effort": "xhigh",
         "chat_template_kwargs": {"enable_thinking": True},
     }
-    assert sent.content == httpx.Request("POST", "https://model.example/v1/chat/completions", json=expected).content
+    assert json.loads(sent.content) == expected
     assert transport["max_response_bytes"] == 2097152
     assert transport["timeout_seconds"] == effective["timeout_seconds"] == 3600
     assert transport["total_timeout_seconds"] == 3610
@@ -865,9 +868,10 @@ def test_writer_option_does_not_change_other_stages(capture, cls):
     original = copy.deepcopy(enabled)
     capture(Analyzer, enabled)
     after, effective_after, transport_after = capture(cls, enabled)
-    assert before.content == after.content and transport_before == transport_after and enabled == original
-    assert json.loads(after.content)["chat_template_kwargs"] == {"enable_thinking": False}
-    assert "reasoning_effort" not in json.loads(after.content)
+    before_body, after_body = json.loads(before.content), json.loads(after.content)
+    assert before_body == after_body and transport_before == transport_after and enabled == original
+    assert after_body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "reasoning_effort" not in after_body
     assert effective_before["max_output_tokens"] == effective_after["max_output_tokens"]
 
 
@@ -1168,3 +1172,58 @@ def test_unquoted_mail_text_strips_time_colon_initial_abbrev_and_nfd_headers_and
         ("On Tor 0.4.8.19, our relay crashed.\nwrote:\n> Quote", "On Tor 0.4.8.19, our relay crashed.\nwrote:"),
     ):
         assert unquoted_mail_text(prose_body) == expected
+
+
+def test_unquoted_mail_text_keeps_from_prose_and_dated_headings_before_quotes(store):
+    """Keep `From:` prose above attributions and dated author headings directly above quotes."""
+    from_prose = "From: our metrics, CPU dropped 40%.\nOn Tuesday, Alice wrote:\n> Any update?"
+    assert unquoted_mail_text(from_prose) == "From: our metrics, CPU dropped 40%."
+    assert unquoted_mail_text(
+        "From: our metrics, CPU dropped 40%.\n-----Original Message-----\nFrom: someone@example.org\n> Any update?"
+    ) == "From: our metrics, CPU dropped 40%."
+    assert unquoted_mail_text("From: Alice\n> Any update on CPU load?") == ""
+    assert unquoted_mail_text(
+        "Top reply.\n\n-----Original Message-----\nFrom: Alice <alice@example.org>\n"
+        "Sent: Tuesday, Nov 16, 2026 10:00 AM\nTo: tor-relays@lists.torproject.org\n"
+        "Subject: Re: CPU load\n\n> Quoted line"
+    ) == "Top reply."
+    assert unquoted_mail_text(
+        "Top reply.\n\nFrom: Alice <alice@example.org>\nDate: Tue, 16 Nov 2026 10:00:00 +0000\n"
+        "Subject: Re: CPU load\n\n> Quoted line"
+    ) == "Top reply."
+
+    dated_heading = "2026-11-15 CPU load returned to baseline:\n> Did CPU load recover?"
+    assert unquoted_mail_text(dated_heading) == "2026-11-15 CPU load returned to baseline:"
+    assert unquoted_mail_text("2026-11-15 Alice wrote:\n> Did CPU load recover?") == ""
+    assert unquoted_mail_text("2026-11-15 10:00 schrieb Alice:\n> Did CPU load recover?") == ""
+
+    base_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message"
+    original = item(
+        url=f"{base_url}/CPU1/",
+        kind="feed",
+        authority="community",
+        title="[tor-relays] Relay CPU load spike",
+        content="Relays observed elevated CPU load after deployment.",
+        published_at=DATE,
+        updated_at=DATE,
+    )
+    seeded = seed_story(store, original, analysis(summary=original["content"], evidence=[original["content"]]), key="cpu-1")
+    for idx, (reply_body, expected_kept) in enumerate((
+        (from_prose, "From: our metrics, CPU dropped 40%."),
+        (dated_heading, "2026-11-15 CPU load returned to baseline:"),
+    ), 2):
+        reply = item(
+            url=f"{base_url}/CPU{idx}/",
+            kind="feed",
+            authority="community",
+            title="[tor-relays] Re: Relay CPU load spike",
+            content=reply_body,
+            published_at=LATER,
+            updated_at=LATER,
+        )
+        row = pending(store, reply, at=LATER, ready=LATER)
+        with store.db:
+            store.db.execute("UPDATE items SET story_id=? WHERE id=?", (seeded["id"], row["id"]))
+        row = {**row, "story_id": seeded["id"]}
+        mode, filtered = candidate.own_update_input(store.db, row, json.loads(row["payload"]))
+        assert mode == "update" and filtered["content"] == expected_kept

@@ -1050,14 +1050,18 @@ def test_enrich_comments_treats_slow_resolver_and_final_503_past_deadline_as_bud
     cfg, store = comments_env
     store.ingest(_issue(), DATE)
     clock = [100.0]
+    calls = {"dns": 0, "http": 0}
+    monkeypatch.setattr(comments.time, "monotonic", lambda: clock[0])
 
     def _dns(*args):
+        calls["dns"] += 1
         if mode == "slow_dns":
             clock[0] = 200.0
             raise OSError("DNS timeout")
         return public_dns(*args)
 
     def _handle(_req):
+        calls["http"] += 1
         clock[0] = 200.0
         return httpx.Response(503)
 
@@ -1066,8 +1070,11 @@ def test_enrich_comments_treats_slow_resolver_and_final_503_past_deadline_as_bud
         lambda settings: HttpClient({**settings, "retry_attempts": 1}, transport=httpx.MockTransport(_handle),
                                     resolver=_dns, clock=lambda: clock[0]),
     )
-    report = enrich_comments(cfg, store, DATE, deadline=150.0)
-    assert report["budget_reached"] is True and report["failed"] == 0
+    report = enrich_comments(cfg, store, DATE, deadline=120.0)
+    assert report["budget_reached"] is True
+    assert report["failed"] == 0
+    assert calls["dns"] == 1
+    assert calls["http"] == (0 if mode == "slow_dns" else 1)
     assert store.db.execute("SELECT COUNT(*) FROM comment_sources WHERE failures > 0").fetchone()[0] == 0
 
 
@@ -1082,9 +1089,10 @@ def test_comments_do_not_split_identical_issue_grouping():
 
 
 @pytest.mark.parametrize("shrink_poll2", [False, True])
-def test_clipped_tail_suffix_edit_during_intermediate_poll_is_revealed_when_unclipped(store, shrink_poll2):
+def test_clipped_tail_suffix_edit_during_intermediate_poll_is_revealed_when_unclipped(store, monkeypatch, shrink_poll2):
     """Detect hidden-tail edits made while clipped once a later poll unclips the note."""
     src = issue_source()
+    monkeypatch.setattr(comments, "now_iso", lambda: "2026-11-12T16:00:00Z")
     base = _issue()
     raw_newer = [
         gql_note(
@@ -1142,9 +1150,10 @@ def test_clipped_tail_suffix_edit_during_intermediate_poll_is_revealed_when_uncl
     assert candidate._changed_note_ids(p2_react, p3_react) == set()
 
 
-def test_shortened_note_matching_old_prefix_below_remaining_budget_keeps_last_edited_at():
+def test_shortened_note_matching_old_prefix_below_remaining_budget_keeps_last_edited_at(monkeypatch):
     """Preserve upstream `lastEditedAt` when a shortened note fits within remaining character budget."""
     src = issue_source()
+    monkeypatch.setattr(comments, "now_iso", lambda: "2026-11-12T16:00:00Z")
     old_body = "Hello world " + ("x" * 88)
     raw_n1 = gql_note("1", author="bob", createdAt="2026-11-10T10:01:00Z", lastEditedAt=None, body=old_body, iid="41473")
     poll1 = _compose(_issue(), fetch_comments(FakeClient([gql_notes_response([raw_n1])]), src, _issue()),
@@ -1162,6 +1171,74 @@ def test_shortened_note_matching_old_prefix_below_remaining_budget_keeps_last_ed
     assert "body_sha256" not in selected[-1]
     poll2 = _compose(poll1, selected, "2026-11-10T10:15:00Z", source_key="k")
     assert poll2["public_comments"][-1]["edited_at"] == short_ts
+
+
+def test_exact_budget_shortened_note_keeps_edit_while_clipped_unchanged_suppresses(monkeypatch):
+    """Distinguish a note shortened to exactly the remaining budget from genuine TOTAL_CHARS clipping."""
+    src = issue_source()
+    monkeypatch.setattr(comments, "now_iso", lambda: "2026-11-12T16:00:00Z")
+    old_body = "0123456789" + ("x" * 90)
+    raw_n1 = gql_note("1", author="bob", createdAt="2026-11-10T10:01:00Z", lastEditedAt=None, body=old_body, iid="41473")
+    poll1 = _compose(_issue(), fetch_comments(FakeClient([gql_notes_response([raw_n1])]), src, _issue()),
+                     "2026-11-10T10:05:00Z", source_key="k")
+
+    # Four newer notes leave exactly 10 characters of TOTAL_CHARS (8000 - 7990 == 10).
+    newer_7990 = [
+        gql_note(str(i), author="bob", createdAt=f"2026-11-10T10:0{i}:00Z",
+                 body=("y" * 2000 if i < 5 else "y" * 1990), iid="41473")
+        for i in range(2, 6)
+    ]
+    edit_ts = "2026-11-10T10:07:00Z"
+    exact_short = {**raw_n1, "body": "0123456789", "lastEditedAt": edit_ts}
+    sel_exact = fetch_comments(FakeClient([gql_notes_response([exact_short, *newer_7990])]), src, poll1)
+    assert sel_exact[-1]["body"] == "0123456789"
+    assert sel_exact[-1]["body_clipped"] is False
+    assert sel_exact[-1]["edited_at"] == edit_ts
+    poll2 = _compose(poll1, sel_exact, "2026-11-10T10:08:00Z", source_key="k")
+    assert poll2["public_comments"][-1]["edited_at"] == edit_ts
+    assert comments.budget_unchanged_note_ids(poll1["public_comments"], poll2["public_comments"]) == set()
+    assert candidate._changed_note_ids(poll1, poll2) == {"1"}
+
+    # Later expanding an exact-fit (unclipped) note is a real edit, not an unclipping.
+    expanded = {**raw_n1, "body": "0123456789 expanded", "lastEditedAt": edit_ts}
+    sel_expand = fetch_comments(FakeClient([gql_notes_response([expanded, *newer_7990[:2]])]), src, poll2)
+    poll3 = _compose(poll2, sel_expand, "2026-11-10T10:10:00Z", source_key="k")
+    assert poll3["public_comments"][-1]["edited_at"] == "2026-11-10T10:10:00Z"
+    assert candidate._changed_note_ids(poll2, poll3) == {"1"}
+
+    # By contrast, an unchanged 100-char note clipped to 10 chars still suppresses false edits.
+    unchanged_touched = {**raw_n1, "lastEditedAt": edit_ts}
+    sel_clipped = fetch_comments(FakeClient([gql_notes_response([unchanged_touched, *newer_7990])]), src, poll1)
+    assert sel_clipped[-1]["body"] == "0123456789"
+    assert sel_clipped[-1]["body_clipped"] is True
+    assert "edited_at" not in sel_clipped[-1]
+    poll_clipped = _compose(poll1, sel_clipped, "2026-11-10T10:08:00Z", source_key="k")
+    assert "edited_at" not in poll_clipped["public_comments"][-1]
+    assert candidate._changed_note_ids(poll1, poll_clipped) == set()
+
+
+def test_verified_comment_poll_replaces_damaged_prior_note_snapshot(comments_env, monkeypatch):
+    """Replace a damaged saved note (e.g. non-string body) when GraphQL returns valid public notes."""
+    cfg, store = comments_env
+    src = cfg["sources"][0]
+    monkeypatch.setattr(comments, "now_iso", lambda: "2026-11-12T16:00:00Z")
+    base = _issue()
+    store.ingest(dict(base), DATE)
+    damaged_payload = {
+        **base,
+        "comments_source_key": _source_key(src),
+        "comments_checked_at": DATE,
+        "public_comments": [{**make_note(1, "ok", author="bob", url=URL), "body": 123}],
+    }
+    with store.db:
+        store.db.execute("UPDATE items SET payload=? WHERE url=?", (json.dumps(damaged_payload), URL))
+    fresh_note = gql_note("1", "Verified replacement body.", author="bob", createdAt="2026-11-08T12:05:00Z", iid="41473")
+    report = enrich_with_client(cfg, store, FakeClient([gql_notes_response([fresh_note])]), LATER)
+    assert report["checked"] == 1
+    assert report["failed"] == 0
+    saved = json.loads(store.db.execute("SELECT payload FROM items WHERE url=?", (URL,)).fetchone()[0])
+    assert [n["body"] for n in saved["public_comments"]] == ["Verified replacement body."]
+    assert store.db.execute("SELECT failures FROM comment_sources WHERE source_id=?", (src["id"],)).fetchone()[0] == 0
 
 
 @pytest.mark.parametrize("transition", ["internal", "empty_body", "discussion_to_internal_note"])

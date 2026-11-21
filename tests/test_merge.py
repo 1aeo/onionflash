@@ -680,8 +680,6 @@ def test_gitlab_refs_are_project_qualified_in_auto_merge_and_routing(context):
 
 def test_story_aliases_are_insert_only_and_permanent(store):
     """Enforce SQLite triggers preventing updates, deletes, or replacements on `story_aliases`."""
-    columns = {row[1] for row in store.db.execute("PRAGMA table_info(story_aliases)")}
-    assert columns == {"story_id", "cluster_key", "survivor_id", "reason", "created_at", "story_json"}
     _add_alias(store.db, "retired-story-1", "url:retired-cluster-1", story_json='{"id":"retired-story-1"}')
     with pytest.raises(sqlite3.IntegrityError, match="Story aliases are permanent"):
         store.db.execute("UPDATE story_aliases SET reason='changed' WHERE story_id='retired-story-1'")

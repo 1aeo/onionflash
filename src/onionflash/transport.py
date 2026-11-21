@@ -219,10 +219,15 @@ class _CheckedTransport(httpx.BaseTransport):
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         """Dispatch an httpx request through the checked connection pool."""
         self.backend.deadline = request.extensions.get("onionflash_deadline")
-        url = httpcore.URL(scheme=request.url.raw_scheme, host=request.url.raw_host,
+        lookup_host = request.extensions.get("onionflash_lookup_host")
+        raw_host = lookup_host.encode("ascii") if isinstance(lookup_host, str) and lookup_host else request.url.raw_host
+        extensions = dict(request.extensions)
+        if raw_host != request.url.raw_host and "sni_hostname" not in extensions:
+            extensions["sni_hostname"] = request.url.raw_host.decode("ascii")
+        url = httpcore.URL(scheme=request.url.raw_scheme, host=raw_host,
                            port=request.url.port, target=request.url.raw_path)
         result = self.pool.handle_request(httpcore.Request(request.method, url, headers=request.headers.raw,
-                                                           content=request.stream, extensions=request.extensions))
+                                                           content=request.stream, extensions=extensions))
         return httpx.Response(result.status, headers=result.headers,
                               stream=_ResponseStream(result.stream), extensions=result.extensions)
 
@@ -283,7 +288,7 @@ class HttpClient:
     def __exit__(self, *args):
         self.close()
 
-    def _url(self, value: str) -> str:
+    def _parse_url(self, value: str) -> tuple[str, str]:
         if (
             not isinstance(value, str)
             or len(value) > 8192
@@ -328,9 +333,12 @@ class HttpClient:
             else:
                 if clean_host != host_name or not self.policy.permits(ip):
                     raise FetchError("destination address is not permitted")
-            return str(parsed_url)
+            return str(parsed_url), host_name
         except (ValueError, httpx.InvalidURL, UnicodeError):
             raise FetchError("invalid destination URL") from None
+
+    def _url(self, value: str) -> str:
+        return self._parse_url(value)[0]
 
     @staticmethod
     def _origin(value: str) -> tuple[str, str, int]:
@@ -413,14 +421,16 @@ class HttpClient:
         self._request_started = False
         if self.deadline is not None:
             self._check_deadline()
-        start_url = self._url(url)
+        start_url, start_lookup_host = self._parse_url(url)
         start_headers = {"user-agent": self.settings.get("user_agent", "OnionFlash"),
                          "accept-encoding": "gzip, deflate"}
         start_headers.update({str(k).lower(): str(v) for k, v in (headers or {}).items() if k.lower() != "host"})
         attempts = max(1, min(10, int(self.settings.get("retry_attempts", 3))))
         max_redirects = int(self.settings.get("max_redirects", 4))
         for attempt in range(attempts):
-            current, active_headers, active_method, payload = start_url, dict(start_headers), method, json_body
+            current, lookup_host, active_headers, active_method, payload = (
+                start_url, start_lookup_host, dict(start_headers), method, json_body
+            )
             deadline = self.clock() + float(self.settings.get("total_timeout_seconds", 90.0))
             if self.deadline is not None:
                 self._check_deadline()
@@ -434,9 +444,13 @@ class HttpClient:
                     self._client.cookies.clear()
                     self._request_started = True
                     if self._injected_transport:
-                        self.policy.addresses(*self._origin(current)[1:])
+                        self.policy.addresses(lookup_host, self._origin(current)[2])
+                        self._check_deadline()
+                    extensions: dict[str, Any] = {"onionflash_deadline": deadline}
+                    if lookup_host != self._origin(current)[1]:
+                        extensions["onionflash_lookup_host"] = lookup_host
                     with self._client.stream(active_method, current, headers=active_headers, json=payload,
-                                             extensions={"onionflash_deadline": deadline}) as response:
+                                             extensions=extensions) as response:
                         if response.status_code in REDIRECT_STATUSES:
                             if redirects >= max_redirects:
                                 raise FetchError("redirect limit exceeded")
@@ -444,14 +458,17 @@ class HttpClient:
                             location = response.headers.get("location")
                             if not location:
                                 raise FetchError("redirect missing destination")
-                            destination = self._url(urljoin(current, location))
+                            destination, next_lookup_host = self._parse_url(urljoin(current, location))
+                            parsed_location = urlsplit(location)
+                            if not parsed_location.scheme and not parsed_location.netloc and lookup_host.endswith("."):
+                                next_lookup_host = lookup_host
                             if self._origin(destination) != self._origin(current):
                                 if active_method != "GET":
                                     raise FetchError("cross-origin request-body redirect refused")
                                 active_headers = {k: v for k, v in active_headers.items() if k in _SAFE_CROSS_ORIGIN_HEADERS}
                             if response.status_code == 303:
                                 active_method, payload = "GET", None
-                            current = destination
+                            current, lookup_host = destination, next_lookup_host
                             continue
                         if response.status_code in RETRY_STATUSES:
                             raise FetchError(f"HTTP {response.status_code}", status=response.status_code,
@@ -461,6 +478,7 @@ class HttpClient:
                         body = b"" if response.status_code in {204, 205, 304} else self._body(response)
                         return Response(response.status_code, body, dict(response.headers), current)
             except DeadlineReached as exc:
+                self.deadline_reached = True
                 exc.request_started = exc.request_started or self._request_started
                 raise
             except FetchError as exc:

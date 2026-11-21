@@ -214,14 +214,23 @@ def plain_text(value: object, limit: int, *, html: bool = True) -> str:
     if html:
         parser = _TextParser()
         parser.feed(text)
-        pending, parts, hidden = parser.rawdata, len(parser.parts), parser.hidden
-        if pending.startswith("<") and (truncated_raw or re.match(r"</?(?:script|style|noscript|template)\b", pending, re.I)):
-            parser.rawdata = pending = ""
+        pending, hidden = parser.rawdata, parser.hidden
+        literal_tail = ""
+        if pending.startswith("<"):
+            # Discard incomplete markup before close(), since some Python versions
+            # emit unfinished tags or comments as text; keep bare literal '<word'.
+            if not truncated_raw and (
+                pending in {"<", "</"}
+                or (
+                    re.fullmatch(r"</?[A-Za-z][A-Za-z0-9_-]*", pending)
+                    and not re.match(r"</?(?:script|style|noscript|template)\b", pending, re.I)
+                )
+            ):
+                literal_tail = pending
+            parser.rawdata = ""
         parser.close()
-        # Some Python versions silently discard a final incomplete tag such as
-        # '<word', even on close(). Keep that literal text, not comments or scripts.
-        if not hidden and len(parser.parts) == parts and re.fullmatch(r"</?[A-Za-z][A-Za-z0-9_-]*", pending):
-            parser.parts.append(pending)
+        if not hidden and literal_tail:
+            parser.parts.append(literal_tail)
         text = "".join(parser.parts)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = _SURROGATE_RE.sub("\ufffd", text)

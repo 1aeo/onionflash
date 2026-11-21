@@ -207,14 +207,18 @@ def test_new_closing_date_prevents_an_obsolete_recency_skip(llm_context, monkeyp
 
     def _closing_date_arrives(config, database, incoming, payload, observed, **kwargs):
         updated = {**src, "closed_at": LATER}
-        with database.db:
-            database.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps(updated), row["id"]))
+        assert database.ingest(updated, LATER) is False
         return original(config, database, incoming, payload, observed, **kwargs)
 
     monkeypatch.setattr(review_gate, "_not_recent", _closing_date_arrives)
     checker = wire_reviewer(cfg)
     assert run(cfg, store, row, Writer(), checker)["status"] == "stale"
-    assert checker.calls == 0 and item_row(store, row)["status"] == "pending"
+    refreshed = item_row(store, row)
+    assert checker.calls == 0
+    assert refreshed["status"] == "pending"
+    assert refreshed["content_hash"] == row["content_hash"]
+    assert refreshed["attempts"] == 0 and refreshed["rejections"] == 0
+    assert json.loads(refreshed["payload"])["closed_at"] == LATER
 
 
 def test_polling_metadata_without_new_evidence_does_not_invalidate_review(llm_context):
@@ -472,3 +476,25 @@ def test_invalid_utf8_item_payload_raises_stale_candidate_without_sqlite_decode_
         with pytest.raises(candidate.StaleCandidate) as caught:
             fn()
         assert secret_marker not in str(caught.value)
+
+
+def test_same_hash_closed_at_update_preserves_queue_state_and_rejects_older_regression(llm_context):
+    """Persist newer `closed_at` on same-hash ingest without resetting strikes or letting older polls regress it."""
+    cfg, store = llm_context
+    src = item(kind="gitlab_issue", upstream_state="closed", published_at="2026-09-01T12:00:00Z",
+               updated_at="2026-11-09T12:00:00Z")
+    row = pending(store, src)
+    assert store.defer(row["id"], "Temporary error", cfg["llm"], LATER, terminal=True, expected_row=row) is True
+    before = item_row(store, row)
+    assert (before["attempts"], before["rejections"], before["status"]) == (1, 1, "pending")
+
+    assert store.ingest({**src, "closed_at": LATER}, LATER) is False
+    after_update = item_row(store, row)
+    assert after_update["content_hash"] == before["content_hash"]
+    assert (after_update["attempts"], after_update["rejections"], after_update["status"]) == (1, 1, "pending")
+    assert after_update["last_error"] == before["last_error"]
+    assert json.loads(after_update["payload"])["closed_at"] == LATER
+
+    # An older REST poll must not regress the stored closed_at.
+    assert store.ingest({**src, "updated_at": "2026-11-08T00:00:00Z", "closed_at": "2026-10-01T00:00:00Z"}, LATER) is False
+    assert json.loads(item_row(store, row)["payload"])["closed_at"] == LATER

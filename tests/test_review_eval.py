@@ -56,10 +56,7 @@ def _scripted(reply, *, coverages=None, reason_target=None):
                 on_request(1)
             if coverages is not None:
                 coverages.append(coverage)
-            try:
-                out = reply(candidate, verification)
-            except TypeError:
-                out = reply(verification)
+            out = reply(candidate, verification)
             if isinstance(out, tuple):
                 v_name, same = out
                 raw = verdict(
@@ -99,25 +96,25 @@ def _check_packet_roundtrip(raw_doc, packet_name):
     return itm, built["sources"][0], expanded
 
 
-def _strings(value, *, skip_ids=False):
+def _string_entries(value, path="$", *, skip_ids=False):
     if isinstance(value, dict):
-        for key, item in value.items():
-            yield key
+        for idx, (key, item) in enumerate(value.items()):
+            yield f"{path}.<key[{idx}]>", key
+            child_path = f"{path}[{idx}]" if path in {"$.packets", "$.coverage_sets"} or not re.fullmatch(r"[a-z_]+", key) else f"{path}.{key}"
             if not (skip_ids and key == "id"):
-                yield from _strings(item, skip_ids=skip_ids)
+                yield from _string_entries(item, child_path, skip_ids=skip_ids)
     elif isinstance(value, list):
-        for item in value:
-            yield from _strings(item, skip_ids=skip_ids)
+        for idx, item in enumerate(value):
+            yield from _string_entries(item, f"{path}[{idx}]", skip_ids=skip_ids)
     elif isinstance(value, str):
-        yield value
+        yield path, value
 
 
-def _denied(texts, words):
-    found = set()
-    for text in texts:
-        folded = unicodedata.normalize("NFKC", text).casefold()
-        found |= {*re.findall(r"[a-z0-9]+", folded), *re.findall(r"[a-z]+", folded)} & words
-    return found
+def _has_denied(text, words):
+    if not words:
+        return False
+    folded = unicodedata.normalize("NFKC", text).casefold()
+    return bool(({*re.findall(r"[a-z0-9]+", folded), *re.findall(r"[a-z]+", folded)}) & words)
 
 
 def _torproject_https(url):
@@ -126,7 +123,50 @@ def _torproject_https(url):
     except (TypeError, ValueError):
         return False
     host = (parts.hostname or "").lower()
-    return parts.scheme == "https" and (host == "torproject.org" or host.endswith(".torproject.org"))
+    return (
+        parts.scheme == "https"
+        and parts.username is None
+        and parts.password is None
+        and "@" not in parts.netloc
+        and (host == "torproject.org" or host.endswith(".torproject.org"))
+    )
+
+
+def _judged_hygiene_problems(raw, denied_anywhere, denied_in_own_text):
+    problems = []
+    everything = list(_string_entries(raw))
+    for loc, text in everything:
+        if _has_denied(text, denied_anywhere):
+            problems.append(f"{loc}: denied private name present")
+        if any(m.group(1).lower() != "lists.torproject.org" for m in EMAIL.finditer(unicodedata.normalize("NFKC", text))):
+            problems.append(f"{loc}: e-mail address outside the Tor lists")
+    for p_idx, packet in enumerate(raw["packets"].values()):
+        for s_idx, source in enumerate(packet["sources"]):
+            if not _torproject_https(source["url"]):
+                problems.append(f"$.packets[{p_idx}].sources[{s_idx}].url: non-torproject or credentialed URL")
+            for n_idx, passage in enumerate(source["passages"]):
+                if isinstance(passage, dict) and not _torproject_https(passage["url"]):
+                    problems.append(f"$.packets[{p_idx}].sources[{s_idx}].passages[{n_idx}].url: non-torproject or credentialed URL")
+            if RUN_STATE & set(source):
+                problems.append(f"$.packets[{p_idx}].sources[{s_idx}]: run-state field kept")
+
+    own = [
+        *((f"$.packets.<key[{idx}]>", name) for idx, name in enumerate(raw["packets"])),
+        *_string_entries({k: v for k, v in raw.items() if k != "packets"}, skip_ids=True),
+    ]
+    own_denied = denied_in_own_text | denied_anywhere
+    for loc, text in own:
+        if _has_denied(text, own_denied):
+            problems.append(f"{loc}: denied tool, model, or private word in corpus own text")
+        if any(not _torproject_https(u) for u in URL.findall(text)):
+            problems.append(f"{loc}: non-torproject or credentialed link in corpus own text")
+        if ABSOLUTE_PATH.search(text):
+            problems.append(f"{loc}: filesystem path in corpus own text")
+        if HEX_ID.search(text):
+            problems.append(f"{loc}: id-like hex string in corpus own text")
+    if re.search(r"\d", raw["description"]):
+        problems.append("$.description: carries a count or date")
+    return problems
 
 
 def _numbers(text):
@@ -142,6 +182,20 @@ def _unexplained_numbers(text, packet):
         known.update(parts)
     return sorted(n for n in _numbers(text)
                   if n not in known and f"0.{n}" not in known and not (n.startswith("0.") and n[2:] in known))
+
+
+def _unexplained_case_numbers(case):
+    candidate, coverage = case["candidate"], case["existing_coverage"]
+    candidate_text = "\n".join(candidate[k] for k in ("title", "summary", "why_it_matters")).casefold()
+    for phrase in case.get("unsupported") or []:
+        candidate_text = candidate_text.replace(phrase.casefold(), " ")
+    prior_story = coverage.get("prior_story")
+    prior_text = (
+        "\n".join(prior_story[k] for k in ("title", "summary", "why_it_matters"))
+        if prior_story else ""
+    )
+    own_text = f"{candidate_text}\n{prior_text}" if prior_text else candidate_text
+    return _unexplained_numbers(own_text, case["packet"])
 
 
 def _corpus_case_errors(module, case, corpus):
@@ -202,34 +256,7 @@ def test_judged_corpus_is_public_and_labeled(evaluation, tmp_path, monkeypatch, 
     ids = [case["id"] for case in cases]
     assert len(set(ids)) == len(ids) and not (set(ids) & {case["id"] for case in controlled["cases"]})
 
-    everything = list(_strings(raw))
-    if found := _denied(everything, denied_anywhere):
-        problems.append(f"deployment, owner or private names present: {sorted(found)}")
-    for text in everything:
-        for match in EMAIL.finditer(unicodedata.normalize("NFKC", text)):
-            if match.group(1).lower() != "lists.torproject.org":
-                problems.append(f"e-mail address outside the Tor lists: {match.group(0)!r}")
-    for name, packet in raw["packets"].items():
-        for source in packet["sources"]:
-            if not _torproject_https(source["url"]):
-                problems.append(f"packet {name}: source is not https torproject.org: {source['url']}")
-            notes = [p for p in source["passages"] if isinstance(p, dict)]
-            problems.extend(f"packet {name}: note is not https torproject.org: {n['url']}"
-                            for n in notes if not _torproject_https(n["url"]))
-            if RUN_STATE & set(source):
-                problems.append(f"packet {name}: run-state field kept")
-
-    own = [*raw["packets"], *_strings({k: v for k, v in raw.items() if k != "packets"}, skip_ids=True)]
-    if found := _denied(own, denied_in_own_text | denied_anywhere):
-        problems.append(f"tool, model or labeling words in the corpus's own text: {sorted(found)}")
-    for text in own:
-        problems.extend(f"link outside torproject.org in own text: {u}" for u in URL.findall(text) if not _torproject_https(u))
-        if ABSOLUTE_PATH.search(text):
-            problems.append(f"filesystem path in own text: {text[:80]!r}")
-        if HEX_ID.search(text):
-            problems.append(f"id-like hex string in own text: {text[:80]!r}")
-    if re.search(r"\d", raw["description"]):
-        problems.append("the description carries a count or date")
+    problems.extend(_judged_hygiene_problems(raw, denied_anywhere, denied_in_own_text))
 
     audits = {}
     for raw_case, case in zip(raw["cases"], cases):
@@ -271,10 +298,7 @@ def test_judged_corpus_is_public_and_labeled(evaluation, tmp_path, monkeypatch, 
         stories = [candidate, *([coverage["prior_story"]] if coverage["prior_story"] else [])]
         problems.extend(f"{cid}: {k} {st[k]} is neither a default nor an upstream date"
                         for st in stories for k in DATE_KEYS if st.get(k) not in known)
-        own_text = "\n".join(st[k] for st in stories for k in ("title", "summary", "why_it_matters"))
-        for phrase in unsupported or []:
-            own_text = re.sub(re.escape(phrase), " ", own_text, flags=re.I)
-        if extra := _unexplained_numbers(own_text, case["packet"]):
+        if extra := _unexplained_case_numbers(case):
             problems.append(f"{cid}: numbers that the packet does not hold: {extra}")
         if coverage["prior_story"] and coverage["prior_story"]["id"] != candidate["id"]:
             problems.append(f"{cid}: the prior story is not the same article as the update")
@@ -334,7 +358,7 @@ def test_evaluation_scoring_repairs_holds_and_private_output(evaluation, tmp_pat
     """Score false approvals, verified repairs, unusable repairs, and 0600 private output paths."""
     module, config = evaluation
     sel = [BY_ID["bastet-original"], BY_ID["legitimate-custom-config"], BY_ID["new-version-tag"]]
-    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _: {"verdict": "approve"}))
+    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _c, _v: {"verdict": "approve"}))
     out = tmp_path / "private/report.jsonl"
     res = module.evaluate(config, sel, out)
     assert res["false_approvals"] == 1 and res["matched"] == 2 and stat.S_IMODE(out.stat().st_mode) == 0o600
@@ -347,7 +371,7 @@ def test_evaluation_scoring_repairs_holds_and_private_output(evaluation, tmp_pat
 
     for repair, kept, fa in (({"priority": "high"}, ["update their configurations"], 1), ({"why_it_matters": ""}, [], 0)):
         monkeypatch.setattr(module, "EvaluationReviewer",
-                            _scripted(lambda v: {"verdict": "approve"} if v else {"verdict": "revise", "repair": repair}))
+                            _scripted(lambda _c, v: {"verdict": "approve"} if v else {"verdict": "revise", "repair": repair}))
         o2 = tmp_path / f"fa-{fa}.jsonl"
         r2 = module.evaluate(config, [BY_ID["bastet-original"]], o2)
         assert (r2["repairs_verified"], r2["false_approvals"], r2["matched"]) == (1, fa, 1 - fa)
@@ -358,7 +382,7 @@ def test_evaluation_scoring_repairs_holds_and_private_output(evaluation, tmp_pat
                                                  ("hold", {"priority": "high"}, ["hold", "hold", "hold"], 0),
                                                  ("approve", {"why_it_matters": ""}, ["approve", "hold", "hold"], 1)):
         monkeypatch.setattr(module, "EvaluationReviewer",
-                            _scripted(lambda v: {"verdict": verified} if v else {"verdict": "revise", "repair": repair}))
+                            _scripted(lambda _c, v: {"verdict": verified} if v else {"verdict": "revise", "repair": repair}))
         o3 = tmp_path / f"{verified}-{cleared}.jsonl"
         r3 = module.evaluate(config, pos_sel, o3)
         matched = verdicts.count("approve")
@@ -368,11 +392,11 @@ def test_evaluation_scoring_repairs_holds_and_private_output(evaluation, tmp_pat
 
     unusable_sel = [BY_ID["bastet-original"], BY_ID["empty-context-release"]]
     for repair in (None, {"why_it_matters": ""}):
-        monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _: {"verdict": "revise", "repair": repair}))
+        monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _c, _v: {"verdict": "revise", "repair": repair}))
         ru = module.evaluate(config, unusable_sel, tmp_path / f"unusable-{repair is None}.jsonl")
         assert (ru["errors"], ru["repairs_held"], ru["matched"], ru["positive_rejections"]) == (0, 2, 1, 1)
 
-    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _: {"verdict": "hold"}))
+    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _c, _v: {"verdict": "hold"}))
     assert module.evaluate(config, [BY_ID["bastet-confirmed-badge"]], tmp_path / "badge.jsonl")["matched"] == 1
 
 
@@ -381,17 +405,17 @@ def test_editorial_skips_misses_coverage_verification_and_final_checks(evaluatio
     module, config = evaluation
     skip_case = next(c for c in CORPUS if c["expected"] == "skip" and not c.get("unsupported"))
     for outcome, misses, false in (("skip", 0, 0), ("hold", 1, 0), ("approve", 1, 1)):
-        monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _: {"verdict": outcome}))
+        monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _c, _v: {"verdict": outcome}))
         r = module.evaluate(config, [skip_case], tmp_path / f"sk-{outcome}.jsonl")
         assert (r["editorial_misses"], r["false_approvals"]) == (misses, false)
     monkeypatch.setattr(module, "EvaluationReviewer",
-                        _scripted(lambda v: {"verdict": "approve"} if v else {"verdict": "revise", "repair": {"summary": "A supported but redundant statement."}}))
+                        _scripted(lambda _c, v: {"verdict": "approve"} if v else {"verdict": "revise", "repair": {"summary": "A supported but redundant statement."}}))
     r_rep = module.evaluate(config, [skip_case], tmp_path / "sk-rep.jsonl")
     assert r_rep["false_approvals"] == r_rep["editorial_misses"] == 1
 
     pair = [BY_ID["bastet-original"], BY_ID["bastet-corrected"]]
     for outcome, misses in (("skip", 1), ("hold", 0)):
-        monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _: {"verdict": outcome}))
+        monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _c, _v: {"verdict": outcome}))
         rp = module.evaluate(config, pair, tmp_path / f"nw-{outcome}.jsonl")
         assert (rp["editorial_misses"], rp["matched"], rp["positive_rejections"]) == (misses, 1 - misses, 1)
 
@@ -399,7 +423,7 @@ def test_editorial_skips_misses_coverage_verification_and_final_checks(evaluatio
     seen = []
     monkeypatch.setattr(
         module, "EvaluationReviewer",
-        _scripted(lambda v: {"verdict": "skip"} if v else {"verdict": "revise", "repair": {"summary": "A source-supported statement."}}, coverages=seen),
+        _scripted(lambda _c, v: {"verdict": "skip"} if v else {"verdict": "revise", "repair": {"summary": "A source-supported statement."}}, coverages=seen),
     )
     cov_out = tmp_path / "coverage.jsonl"
     rcov = module.evaluate(config, [cov_case], cov_out)
@@ -408,14 +432,14 @@ def test_editorial_skips_misses_coverage_verification_and_final_checks(evaluatio
     assert json.loads(cov_out.read_text().splitlines()[0])["existing_coverage"] == cov_case["existing_coverage"]
 
     app_case = next(c for c in CORPUS if c["expected"] == "approve")
-    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda v: {"verdict": "hold"} if v else {"verdict": "approve"}))
+    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _c, v: {"verdict": "hold"} if v else {"verdict": "approve"}))
     fh_out = tmp_path / "final-hold.jsonl"
     rfh = module.evaluate(config, [app_case], fh_out)
     assert rfh["positive_rejections"] == 1 and rfh["matched"] == 0
     rec_fh = json.loads(fh_out.read_text().splitlines()[0])
     assert rec_fh["published_candidate"] is None and rec_fh["final_verdict"] == "hold"
 
-    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _: {"verdict": "approve"}))
+    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _c, _v: {"verdict": "approve"}))
     chk_out = tmp_path / "checks.jsonl"
     rchk = module.evaluate(config, [BY_ID["bastet-removed-as-done"], BY_ID["bastet-corrected"]], chk_out)
     assert (rchk["false_approvals"], rchk["matched"], rchk["final_holds"], rchk["published_after_checks"]) == (1, 1, 1, 1)
@@ -478,7 +502,7 @@ def test_draft_mode_drafts_once_and_isolates_writer_diagnostics(evaluation, tmp_
 
     orig_eval_reviewer = module.EvaluationReviewer
     monkeypatch.setattr(module, "Analyzer", _DraftWriter)
-    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _: {"verdict": "approve"}))
+    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _c, _v: {"verdict": "approve"}))
     out = tmp_path / "drafts.jsonl"
     res = module.evaluate(config, cases, out, rounds=2, draft=True)
     assert sorted(p["title"] for p in requests) == sorted(
@@ -527,7 +551,7 @@ def test_omissions_holds_model_verdict_release_repairs_and_fix_loop(evaluation, 
     module, config = evaluation
     om_case = BY_ID["draft-omits-disclosure"]
     for out_v, om, miss, match in (("approve", 1, 0, 0), ("skip", 0, 1, 0), ("hold", 0, 0, 1)):
-        monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _: {"verdict": out_v}))
+        monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _c, _v: {"verdict": out_v}))
         r = module.evaluate(config, [om_case], tmp_path / f"om-{out_v}.jsonl")
         assert (r["omissions"], r["editorial_misses"], r["matched"], r["false_approvals"], r["controlled_mismatches"]) == (
             om, miss, match, 0, 1 - match)
@@ -541,12 +565,12 @@ def test_omissions_holds_model_verdict_release_repairs_and_fix_loop(evaluation, 
         ("official-skip", off_case, "skip", 1, 0, 0, {"held.verification.official_not_news": 1}),
         ("community-skip", comm_case, "skip", 0, 0, 1, {}),
     ):
-        monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _: {"verdict": out_v}))
+        monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _c, _v: {"verdict": out_v}))
         r = module.evaluate(config, [sel], tmp_path / f"{name}.jsonl")
         assert (r["matched"], r["false_approvals"], r["editorial_misses"], r["holds"]) == (match, fa, miss, holds)
 
     replies_iter = iter([{"verdict": "approve"}, {"verdict": "revise", "repair": {"why_it_matters": ""}}, {"verdict": "approve"}])
-    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _: next(replies_iter)))
+    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _c, _v: next(replies_iter)))
     loop_out = tmp_path / "loop.jsonl"
     rloop = module.evaluate(config, [BY_ID["bastet-original"]], loop_out)
     rec_loop = json.loads(loop_out.read_text().splitlines()[0])
@@ -626,11 +650,11 @@ def test_judged_scoring_thresholds_and_cli_main(evaluation, tmp_path, monkeypatc
         "stale_fact": dict(zip(("ok", "paired"), st), cases=rounds, unique=1),
         "clean": {"cases": 2 * rounds, "ok": cl, "unique": 2},
     }
-    clearing = _scripted(lambda v: {"verdict": "approve"} if v else {"verdict": "revise", "repair": {"why_it_matters": ""}})
+    clearing = _scripted(lambda _c, v: {"verdict": "approve"} if v else {"verdict": "revise", "repair": {"why_it_matters": ""}})
     for name, rev_cls, rounds, j_exp, missed in (
-        ("approve", _scripted(lambda _: {"verdict": "approve"}), 1, rows((0, 0), (0, 0), (1, 1), 2), ["catch"]),
+        ("approve", _scripted(lambda _c, _v: {"verdict": "approve"}), 1, rows((0, 0), (0, 0), (1, 1), 2), ["catch"]),
         ("clear", clearing, 1, rows((1, 0), (0, 0), (0, 0), 0), ["catch", "false_alarms"]),
-        ("skip", _scripted(lambda _: {"verdict": "skip"}), 1, rows((0, 0), (0, 0), (0, 0), 0), ["catch", "false_alarms"]),
+        ("skip", _scripted(lambda _c, _v: {"verdict": "skip"}), 1, rows((0, 0), (0, 0), (0, 0), 0), ["catch", "false_alarms"]),
         ("discerning", discerning, 2, rows((2, 2), (2, 2), (2, 2), 4, rounds=2), []),
     ):
         monkeypatch.setattr(module, "EvaluationReviewer", rev_cls)
@@ -721,7 +745,7 @@ def test_latest_update_scope_scans_only_new_entry_and_excludes_draft_mode(evalua
     seen_scopes, orig_call = [], module.advance_review
     monkeypatch.setattr(module, "advance_review", lambda rev, stage, text, prep, state, requests: (
         seen_scopes.append((prep["review_scope"], prep["mode"])) or orig_call(rev, stage, text, prep, state, requests)))
-    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _: {"verdict": "approve"}))
+    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _c, _v: {"verdict": "approve"}))
     assert module.evaluate(config, [by_id["update-fix-merged"], by_id["bastet-corrected"]], tmp_path / "scopes.jsonl")["matched"] == 2
     assert seen_scopes == [("latest_update", "update"), ("latest_update", "update"), ("story", "story"), ("story", "story")]
 
@@ -765,16 +789,16 @@ def test_expected_same_story_scores_matched_missed_wrong_unroutable_and_false_ro
     assert recs_ok[pos["id"]]["same_story"] == target_id and recs_ok[neg["id"]]["same_story"] is None
 
     repost = BY_ID["same-story-official-release-only-repeat"]
-    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda *_: ("skip", repost["expected_same_story"]), reason_target=repost["expected_same_story"]))
+    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _c, _v: ("skip", repost["expected_same_story"]), reason_target=repost["expected_same_story"]))
     routed = module.evaluate(config, [repost], tmp_path / "release-repost.jsonl")
     assert (routed["matched_routes"], routed["matched"], routed["controlled_mismatches"]) == (1, 1, 0)
 
-    for fn, exp_key in ((lambda *_: ("skip", None), "missed_routes"), (lambda *_: ("skip", other_id), "wrong_routes")):
+    for fn, exp_key in ((lambda _c, _v: ("skip", None), "missed_routes"), (lambda _c, _v: ("skip", other_id), "wrong_routes")):
         monkeypatch.setattr(module, "EvaluationReviewer", _scripted(fn, reason_target=target_id))
         res = module.evaluate(config, [pos], tmp_path / f"{exp_key}.jsonl")
         assert (res["route_cases"], res["matched_routes"], res[exp_key], res["matched"]) == (1, 0, 1, 0)
 
-    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda *_: ("skip", target_id), reason_target=target_id))
+    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _c, _v: ("skip", target_id), reason_target=target_id))
     res_false = module.evaluate(config, [neg], tmp_path / "routes-false.jsonl")
     assert (res_false["route_cases"], res_false["false_routes"], res_false["matched_routes"], res_false["matched"]) == (1, 1, 0, 0)
 
@@ -791,12 +815,12 @@ def test_expected_same_story_scores_matched_missed_wrong_unroutable_and_false_ro
             "title": "Directory authority bastet missing from consensus", "summary": "DocTor reported bastet missing.",
             "category": "network", "state": "developing", "published_at": DATE, "updated_at": DATE, "sources": []}]},
     }
-    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda *_: ("skip", nh_id), reason_target=target_id))
+    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _c, _v: ("skip", nh_id), reason_target=target_id))
     nh_res = module.evaluate(config, [nh_case], tmp_path / "eval_out.jsonl")
     assert (nh_res["matched_routes"], nh_res["wrong_routes"], nh_res["matched"]) == (0, 1, 0)
 
     with monkeypatch.context() as mp:
-        mp.setattr(module, "EvaluationReviewer", _scripted(lambda *_: ("approve", target_id), reason_target=target_id))
+        mp.setattr(module, "EvaluationReviewer", _scripted(lambda _c, _v: ("approve", target_id), reason_target=target_id))
         mp.setattr(review_gate, "next_step", lambda reviews, text, prepared: ("route", target_id))
         out_gate = tmp_path / "routes-gate.jsonl"
         res_gate = module.evaluate(config, [pos], out_gate)
@@ -858,14 +882,14 @@ def test_expand_and_writer_item_preserve_unquoted_content_url_sender_and_officia
     }
     [draft_case] = module.draft_cases(mini_corpus)
     monkeypatch.setattr(module, "Analyzer", _QuotedCommunityWriter)
-    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda *_: ("approve", None)))
+    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _c, _v: ("approve", None)))
     draft_out = tmp_path / "draft-quoted.jsonl"
     assert module.evaluate(config, [draft_case], draft_out, draft=True)["matched"] == 1
     assert seen_writer_payloads[0]["unquoted_content"] == "2026-11-08 measurement shows guard bandwidth recovered."
     draft_rec = json.loads(draft_out.read_text().splitlines()[0])
     assert draft_rec["published_candidate"]["why_it_matters"] == ""
 
-    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda *_: {"verdict": "skip"}))
+    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _c, _v: {"verdict": "skip"}))
     for cid, src_extra in (
         ("dirauth-dev-hold", {"url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/49901",
                               "kind": "gitlab_issue", "author": "linus"}),
@@ -997,9 +1021,133 @@ def test_expand_and_writer_item_preserve_unquoted_content_url_sender_and_officia
     }
     monkeypatch.setattr(
         module, "EvaluationReviewer",
-        _scripted(lambda *_: {"verdict": "revise", "repair": {"update": "Reworded literal tag update."}}),
+        _scripted(lambda _c, _v: {"verdict": "revise", "repair": {"update": "Reworded literal tag update."}}),
     )
     tag_upd_out = tmp_path / "tag-upd-hold.jsonl"
     assert module.evaluate(config, [tag_upd_case], tag_upd_out)["matched"] == 1
     tag_upd_rec = json.loads(tag_upd_out.read_text().splitlines()[0])
     assert tag_upd_rec["hold"] == "held.review.tag_repair"
+
+
+def test_latest_update_matches_note_citation_by_exact_url_before_base_fallback(evaluation, tmp_path, monkeypatch):
+    """Select an exact note source entry before falling back to its parent base URL in `evaluate`."""
+    module, config = evaluation
+    issue_url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/49910"
+    note_url = f"{issue_url}#note_42"
+    later_ts = "2026-11-09T12:00:00Z"
+    parent_src = {
+        "id": "S1", "url": issue_url, "title": "Parent issue #49910",
+        "kind": "gitlab_issue", "authority": "development", "product": "tor",
+        "published_at": DATE, "updated_at": DATE, "upstream_state": "opened", "labels": [],
+        "source_entry_id": "parent-entry",
+        "passages": [{"id": "S1:P1", "text": "Parent issue #49910"}, {"id": "S1:P2", "text": "Initial issue report."}],
+    }
+    note_src = {
+        "id": "S2", "url": note_url, "title": "Tag note on #49910",
+        "kind": "tag", "authority": "official", "product": "tor",
+        "published_at": later_ts, "updated_at": later_ts, "upstream_state": "", "labels": [],
+        "source_entry_id": "note-entry-42",
+        "passages": [{"id": "S2:P1", "text": "Tag note on #49910"}, {"id": "S2:P2", "text": "Note evidence text."}],
+    }
+    base_case = {
+        "id": "exact-note-url-match",
+        "scope": "latest_update",
+        "expected": "approve",
+        "candidate": {
+            "id": "e" * 24,
+            "title": "Parent issue #49910",
+            "summary": "Initial issue report.",
+            "why_it_matters": "",
+            "category": "network",
+            "priority": "normal",
+            "confidence": "reported",
+            "state": "developing",
+            "products": ["tor"],
+            "tags": ["network"],
+            "published_at": DATE,
+            "updated_at": later_ts,
+            "sources": [{"url": issue_url, "title": parent_src["title"]}, {"url": note_url, "title": note_src["title"]}],
+            "updates": [{"at": later_ts, "text": "A follow-up note updated the ticket.", "sources": [{"url": note_url, "title": note_src["title"]}]}],
+        },
+        "packet": {"sources": [parent_src, note_src], "missing_sources": [], "truncated": False},
+        "existing_coverage": {"prior_story": {"id": "e" * 24, "confidence": "reported", "state": "developing", "updated_at": DATE}, "recent": []},
+    }
+    seen_rows = []
+    orig_advance = module.advance_review
+
+    def _capture_advance(rev, stage, text, prep, state, requests):
+        seen_rows.append(prep["row"]["url"])
+        return orig_advance(rev, stage, text, prep, state, requests)
+
+    monkeypatch.setattr(module, "advance_review", _capture_advance)
+    monkeypatch.setattr(module, "EvaluationReviewer", _scripted(lambda _c, _v: {"verdict": "approve"}))
+    assert module.evaluate(config, [base_case], tmp_path / "exact-note.jsonl")["matched"] == 1
+    assert seen_rows == [note_url, note_url]
+
+    # When only an unlisted note fragment is cited, fall back to the parent base-URL entry.
+    seen_rows.clear()
+    fallback_case = copy.deepcopy(base_case)
+    fallback_case["id"] = "base-url-fallback-match"
+    fallback_case["candidate"]["updates"][-1]["sources"] = [{"url": f"{issue_url}#note_99", "title": "Other note"}]
+    assert module.evaluate(config, [fallback_case], tmp_path / "fallback-note.jsonl")["matched"] == 1
+    assert seen_rows == [issue_url, issue_url]
+
+
+def test_corpus_hygiene_helpers_reject_credentials_redact_private_text_and_scope_exemptions():
+    """Verify credential rejection, redacted hygiene diagnostics, prior-story number checks, and callback errors."""
+    assert _torproject_https("https://torproject.org/")
+    assert _torproject_https("https://lists.torproject.org/mailman3/lists/tor-relays.lists.torproject.org/")
+    for bad_url in (
+        "https://user:secret@lists.torproject.org/path",
+        "https://alice@torproject.org/path",
+        "https://@lists.torproject.org/path",
+        "http://torproject.org/",
+    ):
+        assert not _torproject_https(bad_url)
+
+    def _buggy(_cand, _ver):
+        raise TypeError("callback bug sentinel")
+
+    with pytest.raises(TypeError, match="callback bug sentinel"):
+        _scripted(_buggy)().review({}, {"sources": []})
+
+    private_doc = {
+        "description": "Public description",
+        "defaults": RAW_PUBLIC["defaults"],
+        "packets": {
+            "secretpacket": {
+                "sources": [{
+                    "url": "https://user:topsecret@lists.torproject.org/m/1",
+                    "title": "Contact private.person@example.org about secretword",
+                    "passages": [
+                        {"url": "https://evil.example/leak", "text": "See /Users/privateuser/notes.txt"},
+                    ],
+                }]
+            }
+        },
+        "cases": [{
+            "id": "case-1",
+            "candidate": {"summary": "Visit https://user:topsecret@lists.torproject.org/m/1 or /Users/privateuser/file."},
+        }],
+        "coverage_sets": {},
+    }
+    problems = _judged_hygiene_problems(private_doc, frozenset({"secretword", "secretpacket"}), frozenset())
+    assert len(problems) >= 6
+    joined = "\n".join(problems)
+    for sensitive in ("private.person@example.org", "secretword", "secretpacket", "topsecret", "evil.example", "/Users/privateuser"):
+        assert sensitive not in joined
+
+    shared_phrase = "upgrade to version 73"
+    case_with_prior = {
+        "unsupported": [shared_phrase],
+        "candidate": {"title": "Update", "summary": f"Operators must {shared_phrase}.", "why_it_matters": ""},
+        "existing_coverage": {
+            "prior_story": {"title": "Earlier story", "summary": f"Earlier text says {shared_phrase}.", "why_it_matters": ""},
+            "recent": [],
+        },
+        "packet": {"sources": [{"id": "S1", "title": "Update", "passages": [{"id": "S1:P1", "text": "No version here."}]}]},
+    }
+    assert _unexplained_case_numbers(case_with_prior) == ["73"]
+    case_candidate_only = copy.deepcopy(case_with_prior)
+    case_candidate_only["existing_coverage"]["prior_story"]["summary"] = "Earlier text with no number."
+    assert _unexplained_case_numbers(case_candidate_only) == []

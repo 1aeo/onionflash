@@ -678,3 +678,69 @@ def test_summary_ignores_non_int_writer_clears_and_preserves_reserved_fields(sto
     assert res["writer_clears"] == 2
     [example] = res["examples"]["published.new"]
     assert example["item_id"] == inc["id"] and example["decided_at"] == LATER
+
+
+@pytest.mark.parametrize("missing_field", ["title", "id", "url"])
+def test_saved_public_comment_missing_citation_field_is_rejected_as_damaged(context, missing_field):
+    """Quarantine pending items whose saved `public_comments` omit citation fields consumed by candidate assembly."""
+    cfg, store = context
+    src = gitlab_source()
+    issue = item(source_id=src["id"], url=TOR_WORK_ITEM_URL, kind="gitlab_issue")
+    row = pending(store, issue, at=DATE, ready=DATE)
+    broken_note = {
+        "id": "gid://gitlab/Note/99",
+        "url": TOR_WORK_ITEM_URL + "#note_99",
+        "title": "Public comment by @operator",
+        "author": "operator",
+        "created_at": DATE,
+        "body": "Maintainers confirmed the mitigation details.",
+    }
+    broken_note.pop(missing_field)
+    payload = {**json.loads(row["payload"]), "public_comments": [broken_note]}
+    with store.db:
+        store.db.execute("UPDATE items SET payload=? WHERE id=?", (json.dumps(payload), row["id"]))
+    assert store.pending(5, LATER) == [{"id": row["id"], "damaged": True}]
+    with store.db:
+        store.db.execute("UPDATE items SET status='rejected' WHERE id=?", (row["id"],))
+    with pytest.raises(ValueError, match="incomplete or unreadable"):
+        rejection.retry_item(store, row["id"], row["content_hash"], "Attempt retry", LATER)
+    with store.db:
+        store.db.execute("UPDATE items SET status='pending' WHERE id=?", (row["id"],))
+    assert store.ingest(item(source_id=src["id"], url=TOR_WORK_ITEM_URL, kind="gitlab_issue"), LATER) is False
+    [repaired] = store.pending(5, LATER)
+    assert "damaged" not in repaired and repaired["id"] == row["id"]
+
+
+def test_compacted_issue_rehydration_from_older_poll_preserves_newer_metadata(tmp_path):
+    """Preserve newer `updated_at` and verified-empty comment metadata when rehydrating from an older poll."""
+    src = gitlab_source()
+    cfg = make_config(tmp_path, sources=[src], comments={"enabled": True})
+    rest_issue = lambda **kw: item(source_id=src["id"], url=TOR_WORK_ITEM_URL, kind="gitlab_issue", **kw)
+    newer_ts = LATER
+    older_ts = "2026-11-07T12:00:00Z"
+    with Store(cfg["storage"]["database"]) as store:
+        store.db.executescript(_RETENTION_SCHEMA)
+        store.ingest(rest_issue(updated_at=newer_ts), newer_ts)
+        assert enrich_with_client(cfg, store, FakeClient([gql_notes_response([])]), newer_ts)["checked"] == 1
+        row = store.pending(1, newer_ts)[0]
+        saved_full = json.loads(row["payload"])
+        assert saved_full["public_comments"] == [] and saved_full["comments_checked_at"] == newer_ts
+        compacted = {k: v for k, v in saved_full.items() if k != "content"}
+        with store.db:
+            store.db.execute("UPDATE items SET status='ignored',payload=? WHERE id=?", (json.dumps(compacted), row["id"]))
+            store.db.execute(
+                "INSERT INTO private_archive_refs VALUES('item',?,?,?,?,?,?)",
+                (row["id"], row["content_hash"], "archive/batch-empty.jsonl.zst", "c" * 64, newer_ts, '{"bucket":"cold"}'),
+            )
+            store.db.execute("UPDATE comment_cache SET next_fetch_at=checked_at WHERE item_id=?", (row["id"],))
+
+        assert store.ingest(rest_issue(updated_at=older_ts), after(60, newer_ts)) is False
+        status_now, raw_now = store.db.execute("SELECT status,payload FROM items WHERE id=?", (row["id"],)).fetchone()
+        restored = json.loads(raw_now)
+        assert status_now == "ignored"
+        assert restored["content"] == saved_full["content"]
+        assert restored["updated_at"] == newer_ts
+        assert restored["public_comments"] == []
+        assert restored["comments_checked_at"] == newer_ts
+        assert restored["comments_source_key"] == saved_full["comments_source_key"]
+        assert restored["comments_truncated"] is False

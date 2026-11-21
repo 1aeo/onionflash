@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import re
 
 from .comments import analysis_context
 from .llm import is_quoted_list_post, unquoted_mail_text
-from .util import canonical_url, digest, effective_authority, gitlab_url_variants, plain_text, safe_canonical_url, saved_object
+from .util import (
+    GITLAB_PROJECT_PATH, canonical_url, digest, effective_authority, gitlab_url_variants,
+    plain_text, safe_canonical_url, saved_object,
+)
 
 
 # The review packet's fixed bounds.
@@ -37,9 +41,21 @@ def _safe_canonical(url: str) -> str:
     return safe_canonical_url(url) or url
 
 
+_GITLAB_PROJECT_PREFIX_RE = re.compile(rf"^(https://gitlab\.torproject\.org/)({GITLAB_PROJECT_PATH})(/-/.*)$")
+
+
+def _citation_url_key(url: object) -> str:
+    canon = safe_canonical_url(url)
+    if not canon:
+        return ""
+    if match := _GITLAB_PROJECT_PREFIX_RE.match(canon):
+        return f"{match.group(1)}{match.group(2).lower()}{match.group(3)}"
+    return canon
+
+
 def _matches_citation(item, source_id, url) -> bool:
     return (_source_body(item) is not None and (not source_id or item.get("id") == source_id)
-            and bool(cu := safe_canonical_url(url)) and safe_canonical_url(item.get("url")) == cu)
+            and bool(cu := _citation_url_key(url)) and _citation_url_key(item.get("url")) == cu)
 
 
 def _load(db, source_id: str | None, url: str, analysis_key: str | None = None):
@@ -50,9 +66,15 @@ def _load(db, source_id: str | None, url: str, analysis_key: str | None = None):
         variants = gitlab_url_variants(url)
         exact = tuple({url, *variants})
         row = db.execute(f"{query}url IN ({','.join('?' * len(exact))})", exact).fetchone()
-        if row is None and any("gitlab.torproject.org" in v for v in variants):
+        if row is None and any(_GITLAB_PROJECT_PREFIX_RE.match(v) for v in variants):
             lower = tuple({v.lower() for v in variants})
-            row = db.execute(f"{query}LOWER(url) IN ({','.join('?' * len(lower))})", lower).fetchone()
+            target_key = _citation_url_key(url)
+            candidates = db.execute(
+                f"SELECT id,CASE WHEN typeof(url)='text' THEN url END AS url,CAST(payload AS BLOB) AS payload "
+                f"FROM items WHERE LOWER(url) IN ({','.join('?' * len(lower))})",
+                lower,
+            ).fetchall()
+            row = next((c for c in candidates if _citation_url_key(c["url"]) == target_key), None)
     raw_item = saved_object(row["payload"]) if row is not None else None
     lookup = {"table": "item_lookup", "key": row["id"] if row else source_id or url, "by": "id" if row or source_id else "url",
               "hash": None if row is None else (source_fingerprint(raw_item) if raw_item is not None else digest(row["payload"].hex()))}
@@ -182,7 +204,9 @@ def build_packet(
         if source.get("source_item_id"):
             # A cited note is supplied with the text of its parent issue.
             source_canon = _safe_canonical(source["url"])
-            if not any(_safe_canonical(note["url"]) == source_canon for note in item.get("public_comments", [])):
+            source_key = _citation_url_key(source["url"]) or source_canon
+            if not any((_citation_url_key(note["url"]) or _safe_canonical(note["url"])) == source_key
+                       for note in item.get("public_comments", [])):
                 truncated = True
                 if required and (not update or require_all or source_canon in update_urls):
                     missing.append(source["url"])

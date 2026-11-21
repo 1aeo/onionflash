@@ -129,11 +129,37 @@ def _body_sha256(body: str) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
+def _valid_prior_comments(raw_comments: object) -> list[dict]:
+    if isinstance(raw_comments, list) and all(
+        isinstance(n, dict)
+        and isinstance(n.get("id"), str)
+        and isinstance(n.get("body"), str)
+        and ("body_sha256" not in n or isinstance(n["body_sha256"], str))
+        and ("body_clipped" not in n or type(n["body_clipped"]) is bool)
+        for n in raw_comments
+    ):
+        return raw_comments
+    return []
+
+
+def _body_chars(notes: list[dict]) -> int:
+    return sum(len(body) for n in notes if isinstance(n, dict) and isinstance(body := n.get("body"), str))
+
+
+def _tail_was_clipped(notes: list[dict]) -> bool:
+    if not notes or not isinstance(tail := notes[-1], dict):
+        return False
+    clipped = tail.get("body_clipped")
+    if type(clipped) is bool:
+        return clipped
+    return _body_chars(notes) >= TOTAL_CHARS
+
+
 def is_budget_clipped_prefix(prev_notes: dict[str, dict], curr_notes: list[dict]) -> bool:
     """Return True when the oldest retained note is an unedited prefix clipped by TOTAL_CHARS."""
-    if (not curr_notes or not isinstance(tail := curr_notes[-1], dict)
-            or sum(len(n.get("body") or "") for n in curr_notes if isinstance(n, dict)) < TOTAL_CHARS):
+    if not _tail_was_clipped(curr_notes):
         return False
+    tail = curr_notes[-1]
     old = prev_notes.get(note_key(tail.get("id")))
     return (
         old is not None
@@ -146,16 +172,14 @@ def is_budget_clipped_prefix(prev_notes: dict[str, dict], curr_notes: list[dict]
 
 def budget_unchanged_note_ids(prev_comments: object, curr_notes: list[dict]) -> set[str]:
     """Return normalized note keys whose body length changed only from TOTAL_CHARS clipping."""
-    prev_list = prev_comments if isinstance(prev_comments, list) else []
+    prev_list = _valid_prior_comments(prev_comments)
     prev_map = prior_notes(prev_list)
     unchanged: set[str] = set()
     if is_budget_clipped_prefix(prev_map, curr_notes):
         unchanged.add(note_key(curr_notes[-1].get("id")))
     if (
-        prev_list
-        and isinstance(prev_tail := prev_list[-1], dict)
-        and sum(len(n.get("body") or "") for n in prev_list if isinstance(n, dict)) >= TOTAL_CHARS
-        and (tail_key := note_key(prev_tail.get("id")))
+        _tail_was_clipped(prev_list)
+        and (tail_key := note_key((prev_tail := prev_list[-1]).get("id")))
         and isinstance(old_body := prev_tail.get("body"), str)
     ):
         old_sha = prev_tail.get("body_sha256") if isinstance(prev_tail.get("body_sha256"), str) else None
@@ -248,15 +272,9 @@ def fetch_comments(client, source, item):
             if edited > created:
                 entry["edited_at"] = edited
             notes[match[1]] = entry
-    prev_list = item.get("public_comments") if isinstance(item.get("public_comments"), list) else []
+    prev_list = _valid_prior_comments(item.get("public_comments"))
     prior = prior_notes(prev_list)
-    prev_tail_key = (
-        note_key(prev_list[-1].get("id"))
-        if prev_list
-        and isinstance(prev_list[-1], dict)
-        and sum(len(n.get("body") or "") for n in prev_list if isinstance(n, dict)) >= TOTAL_CHARS
-        else ""
-    )
+    prev_tail_key = note_key(prev_list[-1]["id"]) if _tail_was_clipped(prev_list) else ""
     window_notes = sorted(notes.values(), key=_note_sort_key, reverse=True)
     selected, remaining = [], TOTAL_CHARS
     clipped_baselines: dict[str, str | None] = {}
@@ -297,8 +315,11 @@ def fetch_comments(client, source, item):
         was_clipped = len(raw_body) > remaining
         clipped = {**raw_note, "body": raw_body[:remaining]}
         if was_clipped:
+            clipped["body_clipped"] = True
             clipped["body_sha256"] = raw_sha
             clipped_baselines[nkey] = old_full_sha
+        elif len(raw_body) == remaining:
+            clipped["body_clipped"] = False
         remaining -= len(clipped["body"])
         selected.append(clipped)
     unchanged_ids = budget_unchanged_note_ids(prev_list, selected)
@@ -390,8 +411,9 @@ def _compose(item, notes, checked, *, source_key, dirauth_users=None, window_tru
     content = result.pop("source_content", result.get("content"))
     if not isinstance(content, str):
         raise CommentError("Saved issue description is unavailable")
-    prior = prior_notes(item.get("public_comments"))
-    budget_unchanged = budget_unchanged_note_ids(item.get("public_comments"), notes)
+    prev_list = _valid_prior_comments(item.get("public_comments"))
+    prior = prior_notes(prev_list)
+    budget_unchanged = budget_unchanged_note_ids(prev_list, notes)
     composed_notes = []
     for note in notes:
         entry = dict(note)

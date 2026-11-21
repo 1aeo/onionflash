@@ -308,7 +308,7 @@ def _valid_saved_item(old: object) -> bool:
     if labels is not None and (not isinstance(labels, list) or any(not isinstance(entry, str) for entry in labels)):
         return False
     return (
-        valid_note_list(old.get("public_comments"), ("author", "created_at", "body"))
+        valid_note_list(old.get("public_comments"), ("id", "url", "title", "author", "created_at", "body"))
         and valid_note_list(old.get("dirauth_notes"), ("id", "author", "created_at"))
     )
 
@@ -377,6 +377,20 @@ def _unchanged_non_pending(target: dict, item: dict, content_hash: str, *, check
         and (target.get("public_comments") or target.get("dirauth_notes"))
         and _uncommented_hash(target, item) == content_hash
     )
+
+
+def _updated_closed_at(old: dict, item: dict) -> str | None:
+    closed_at = item.get("closed_at")
+    if (
+        item.get("kind") == "gitlab_issue"
+        and item.get("upstream_state") == "closed"
+        and isinstance(closed_at, str)
+        and closed_at
+        and item["updated_at"] >= old["updated_at"]
+        and closed_at != old.get("closed_at")
+    ):
+        return closed_at
+    return None
 
 
 class Store:
@@ -565,16 +579,25 @@ class Store:
                     or item["updated_at"] < old["updated_at"]
                     or (same_body and _unchanged_non_pending(rehydrated, item, content_hash, check_requested=check_requested))
                 ):
+                    closed_at = _updated_closed_at(old, item) if row["content_hash"] == content_hash else None
                     if (
                         item.get("kind") == "gitlab_issue"
-                        and (row["content_hash"] == content_hash or same_body)
+                        and (same_body or (row["content_hash"] == content_hash and item["updated_at"] >= old["updated_at"]))
                         and self.db.execute(requested, (item_id,)).fetchone()
                     ):
-                        restored = item if row["content_hash"] == content_hash else rehydrated
+                        restored = rehydrated if same_body else item
+                        if closed_at is not None and restored is rehydrated:
+                            restored = {**restored, "closed_at": closed_at}
                         with self.db:
                             self.db.execute(
                                 "UPDATE items SET payload=? WHERE id=?",
                                 (json.dumps(restored, ensure_ascii=False), item_id),
+                            )
+                    elif closed_at is not None:
+                        with self.db:
+                            self.db.execute(
+                                "UPDATE items SET payload=? WHERE id=?",
+                                (json.dumps({**old, "closed_at": closed_at}, ensure_ascii=False), item_id),
                             )
                     return False
             elif not _valid_saved_item(old):
@@ -589,6 +612,12 @@ class Store:
                 or item["updated_at"] < old["updated_at"]
                 or (row["status"] != "pending" and _unchanged_non_pending(old, item, content_hash, check_requested=check_requested))
             ):
+                if row["content_hash"] == content_hash and (closed_at := _updated_closed_at(old, item)) is not None:
+                    with self.db:
+                        self.db.execute(
+                            "UPDATE items SET payload=? WHERE id=?",
+                            (json.dumps({**old, "closed_at": closed_at}, ensure_ascii=False), item_id),
+                        )
                 return False
             alias = editorial.retired(self.db, story_id=row["story_id"], cluster_key=row["cluster_key"])
             if alias is not None and alias[1] is None:

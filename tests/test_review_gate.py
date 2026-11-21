@@ -1244,6 +1244,8 @@ def test_auto_merge_update_without_compact_overlap_and_mr_cap_update_states(cont
     with store.db:
         store.db.execute("UPDATE items SET story_id=? WHERE id=?", (mr_story["id"], tag_row["id"]))
     assert run(cfg, store, item_row(store, tag_row), Writer(), Reviewer(verdict(update=True)), "2026-11-08T09:05:00Z")["status"] == "published"
+    tagged_story = next(s for s in store.stories() if s["id"] == mr_story["id"])
+    assert tagged_story["state"] == "tagged"
     for idx in range(2, 9):
         mr_i = item(
             url=f"https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/{800 + idx}",
@@ -1280,6 +1282,9 @@ def test_auto_merge_update_without_compact_overlap_and_mr_cap_update_states(cont
         Reviewer(verdict(update=True)), mr_9["updated_at"],
     )
     assert res_9["status"] == "published"
+    reloaded_story = next(s for s in store.stories() if s["id"] == mr_story["id"])
+    assert reloaded_story["state"] == "tagged"
+    assert reloaded_story["updates"][-1]["text"] == "Follow-up merge 9 landed."
 
 
 def test_related_lookup_skips_damaged_story_payloads_and_associate_raises_value_error(context):
@@ -1582,3 +1587,161 @@ def test_source_packet_deduplicates_note_source_and_bare_parent_without_id(conte
     assert pkt["missing_sources"] == [] and pkt["truncated"] is False
     assert [s["id"] for s in pkt["sources"]] == ["S1"]
     assert [s["url"] for s in pkt["sources"]] == [issue_url]
+    assert any(
+        p.get("url") == note_entry["url"] and note_entry["body"] in p.get("text", "")
+        for p in pkt["sources"][0]["passages"]
+    )
+
+
+def test_control_fingerprint_distinguishes_blob_and_non_text_editorial_values(context):
+    """Distinguish SQLite BLOB and integer editorial controls from matching hex text in binding verification."""
+    _, store = context
+    src = item(url="https://example.org/control-fp", content="Initial relay operational notice.")
+    seeded = seed_story(store, src, analysis(summary=src["content"], evidence=[src["content"]]), key="ctrl-fp", at=DATE)
+    followup = item(url="https://example.org/control-fp-follow", content="Follow-up operational notice.", updated_at=LATER)
+    row = pending(store, followup, at=LATER, ready=LATER)
+    with store.db:
+        store.db.execute("UPDATE items SET story_id=? WHERE id=?", (seeded["id"], row["id"]))
+        store.db.execute(
+            "INSERT INTO editorial_controls(story_id,revision,locked,retracted,notice_action,notice_reason,notice_at) "
+            "VALUES(?,1,0,0,'correct','cafe',?)",
+            (seeded["id"], DATE),
+        )
+    text_fp = candidate.control_fingerprint(store.db, seeded["id"])
+    prepared = candidate.prepare(
+        store.db, item_row(store, row),
+        update_analysis(update=followup["content"], evidence=[followup["content"]]), LATER,
+    )
+    candidate.verify_prepared_binding(store.db, prepared)
+
+    with store.db:
+        store.db.execute("UPDATE editorial_controls SET notice_reason=X'cafe' WHERE story_id=?", (seeded["id"],))
+    blob_fp = candidate.control_fingerprint(store.db, seeded["id"])
+    assert blob_fp != text_fp
+    with pytest.raises(candidate.StaleCandidate, match="Editorial controls changed"):
+        candidate.verify_prepared_binding(store.db, prepared)
+
+    with store.db:
+        store.db.execute("UPDATE editorial_controls SET notice_reason='313233' WHERE story_id=?", (seeded["id"],))
+    text_digits_fp = candidate.control_fingerprint(store.db, seeded["id"])
+    with store.db:
+        store.db.execute("UPDATE editorial_controls SET notice_reason=123 WHERE story_id=?", (seeded["id"],))
+    int_fp = candidate.control_fingerprint(store.db, seeded["id"])
+    with store.db:
+        store.db.execute("UPDATE editorial_controls SET notice_reason=X'313233' WHERE story_id=?", (seeded["id"],))
+    blob_digits_fp = candidate.control_fingerprint(store.db, seeded["id"])
+    assert len({text_digits_fp, int_fp, blob_digits_fp}) == 3
+
+    with store.db:
+        store.db.execute("UPDATE editorial_controls SET notice_reason='cafe' WHERE story_id=?", (seeded["id"],))
+    assert candidate.control_fingerprint(store.db, seeded["id"]) == text_fp
+
+
+def test_route_rejects_blob_typed_target_story_payload(context):
+    """Refuse to attach a routed item to a target story whose `stories.payload` is stored as BLOB."""
+    cfg, store = context
+    target = seed_story(
+        store,
+        item(url="https://example.org/blob-route-target", title="Authority overload report",
+             content="Operators report directory authority overload."),
+        analysis(title="Authority overload report", summary="Operators report directory authority overload.",
+                 evidence=["Operators report directory authority overload."]),
+        key="blob-route-target",
+        at=DATE,
+    )
+    followup_row = pending(
+        store,
+        item(url="https://example.org/blob-route-followup", title="Follow-up authority report",
+             content="Follow-up report on directory authority overload.", published_at=LATER, updated_at=LATER),
+        at=LATER,
+        ready=LATER,
+    )
+    orig_route = review_gate._route
+
+    def _mutate_target_to_blob(st, *args, **kwargs):
+        with st.db:
+            st.db.execute("UPDATE stories SET payload=CAST(payload AS BLOB) WHERE id=?", (target["id"],))
+        return orig_route(st, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(review_gate, "_route", _mutate_target_to_blob)
+        res = run(
+            cfg, store, followup_row, Writer(),
+            Reviewer(verdict(same_story=target["id"])), LATER,
+        )
+    assert res["status"] == "stale"
+    assert store.db.execute("SELECT story_id FROM items WHERE id=?", (followup_row["id"],)).fetchone()[0] is None
+
+
+def test_source_packet_matches_gitlab_project_case_while_keeping_blob_paths_case_sensitive(context):
+    """Match GitLab project-path case on current and historical citations without equating distinct blob paths."""
+    from onionflash import source_packet
+
+    _, store = context
+    stored_issue_url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/49777"
+    mixed_issue_url = "https://gitlab.torproject.org/TPO/Core/Tor/-/issues/49777"
+    issue_item = item(
+        url=stored_issue_url,
+        kind="gitlab_issue",
+        title="Relay circuit scheduling regression #49777",
+        content="Relay circuit scheduling regression details for #49777.",
+    )
+    store.ingest(issue_item, DATE)
+
+    blob_lower_url = "https://gitlab.torproject.org/tpo/core/tor/-/blob/main/readme.md"
+    blob_upper_url = "https://gitlab.torproject.org/tpo/core/tor/-/blob/main/README.md"
+    mixed_blob_upper_url = "https://gitlab.torproject.org/TPO/Core/Tor/-/blob/main/README.md"
+    blob_lower = item(url=blob_lower_url, kind="feed", title="Lowercase readme", content="Lowercase blob text.")
+    blob_upper = item(url=blob_upper_url, kind="feed", title="Uppercase README", content="Uppercase blob text.")
+    store.ingest(blob_lower, DATE)
+    store.ingest(blob_upper, DATE)
+
+    incoming = {**item(url="https://example.org/incoming-49777", content="Incoming follow-up."), "id": "f" * 24}
+    payload = {
+        "sources": [
+            {"id": incoming["id"], "url": incoming["url"]},
+            {"url": mixed_issue_url, "title": issue_item["title"]},
+            {"url": mixed_blob_upper_url, "title": blob_upper["title"]},
+        ]
+    }
+    public = {"sources": [{"url": mixed_issue_url}, {"url": mixed_blob_upper_url}]}
+    pkt, _ = source_packet.build_packet(store.db, incoming, payload, public, None)
+    assert pkt["missing_sources"] == [] and pkt["truncated"] is False
+    urls = [s["url"] for s in pkt["sources"]]
+    assert stored_issue_url in urls and blob_upper_url in urls
+    assert any("Uppercase blob text." in p["text"] for s in pkt["sources"] if s["url"] == blob_upper_url for p in s["passages"])
+
+    # A citation to a missing uppercase blob path must not match a stored lowercase blob path.
+    only_lower_url = "https://gitlab.torproject.org/tpo/core/tor/-/blob/main/notes.md"
+    wrong_case_url = "https://gitlab.torproject.org/TPO/Core/Tor/-/blob/main/NOTES.md"
+    store.ingest(item(url=only_lower_url, kind="feed", title="notes.md", content="Lowercase notes text."), DATE)
+    pkt_mismatch, _ = source_packet.build_packet(
+        store.db, incoming,
+        {"sources": [{"id": incoming["id"], "url": incoming["url"]}, {"url": wrong_case_url, "title": "NOTES.md"}]},
+        {"sources": [{"url": wrong_case_url}]},
+        None,
+    )
+    assert wrong_case_url in pkt_mismatch["missing_sources"]
+
+    # Historical analysis snapshots also match across GitLab project-path case differences.
+    hist_item = {**issue_item, "content": "Historical issue snapshot text for #49777."}
+    with store.db:
+        store.db.execute(
+            "INSERT INTO analyses(cache_key,result,created_at,source_payload,source_item_id) "
+            "VALUES(?,?,?,?,?)",
+            ("hist-case-key", "{}", DATE, json.dumps(hist_item), issue_item["id"]),
+        )
+        store.db.execute(
+            "UPDATE items SET payload=? WHERE id=?",
+            (json.dumps({**issue_item, "content": "", "title": ""}), issue_item["id"]),
+        )
+    pkt_hist, _ = source_packet.build_packet(
+        store.db, incoming,
+        {"sources": [{"id": incoming["id"], "url": incoming["url"]}, {"url": mixed_issue_url, "title": issue_item["title"]}]},
+        {"sources": [{"url": mixed_issue_url}]},
+        None,
+    )
+    assert pkt_hist["missing_sources"] == []
+    hist_unit = next(s for s in pkt_hist["sources"] if s["url"] == stored_issue_url)
+    assert hist_unit["snapshot"] == "historical-analysis"
+    assert any("Historical issue snapshot text" in p["text"] for p in hist_unit["passages"])

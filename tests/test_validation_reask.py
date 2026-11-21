@@ -485,16 +485,18 @@ def test_untrusted_update_preserves_history_and_requires_exact_fresh_verificatio
     cfg, _ = llm_context
     case, prepared = _update_case()
     original = copy.deepcopy(case["candidate"])
+    snapshot = copy.deepcopy(original)
     record, requests = _new_review_state(cfg, original)
     text = "Operators can use the supplied workaround."
     checker = wire_reviewer(cfg, inconsistent({"update": text}, update=True), verdict(update=True))
     action, repaired = review_gate.advance_review(checker, "review", original, prepared, record, requests)
     assert action == "verify" and record["reviews"] == [] and requests.actual == 1
+    assert original == snapshot
     assert repaired["updates"][-1]["text"] == text
-    assert repaired["updates"][:-1] == original["updates"][:-1]
-    assert {k: v for k, v in repaired.items() if k != "updates"} == {k: v for k, v in original.items() if k != "updates"}
-    assert repaired["updates"][-1]["at"] == original["updates"][-1]["at"]
-    assert repaired["updates"][-1]["sources"] == original["updates"][-1]["sources"]
+    assert repaired["updates"][:-1] == snapshot["updates"][:-1]
+    assert {k: v for k, v in repaired.items() if k != "updates"} == {k: v for k, v in snapshot.items() if k != "updates"}
+    assert repaired["updates"][-1]["at"] == snapshot["updates"][-1]["at"]
+    assert repaired["updates"][-1]["sources"] == snapshot["updates"][-1]["sources"]
     assert record["untrusted_proposals"][0]["repair"] == {"update": text}
     action, approved = review_gate.advance_review(checker, action, repaired, prepared, record, requests)
     assert action == "approve" and approved == repaired and requests.actual == 2
@@ -712,3 +714,110 @@ def test_duplicate_only_products_repair_triggers_validation_reask_instead_of_ver
     assert audit["untrusted_proposals"][0]["disposition"] == "unusable"
     assert _correction(audit)["trigger"] == 1 and _correction(audit)["response"] == 2
     assert store.stories()[0]["products"] == ["tor"]
+
+
+def test_untrusted_mr_only_update_category_proposal_replays_inherited_release_tag(llm_context):
+    """Persist and replay proposed edits separately from normalization-inherited tags on MR-only updates."""
+    from onionflash import render
+
+    cfg, _ = llm_context
+    mr_url = "https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/951"
+    mr_src = {
+        "id": "S1",
+        "url": mr_url,
+        "title": "Fix relay security parsing",
+        "kind": "gitlab_mr",
+        "authority": "development",
+        "product": "tor",
+        "published_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-09T12:00:00Z",
+        "upstream_state": "merged",
+        "labels": [],
+        "passages": [
+            {"id": "S1:P1", "text": "Fix relay security parsing"},
+            {"id": "S1:P2", "text": "Merged a security fix for relay descriptor parsing."},
+        ],
+    }
+    cand = render.prepare_story({
+        "id": "a" * 24,
+        "title": "Tor 0.4.9.10 released",
+        "summary": "Tor 0.4.9.10 shipped with network updates.",
+        "why_it_matters": "",
+        "category": "network",
+        "priority": "normal",
+        "confidence": "confirmed",
+        "state": "released",
+        "products": ["tor"],
+        "tags": ["network", "release"],
+        "published_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-09T12:00:00Z",
+        "added_at": "2026-11-08T12:00:00Z",
+        "sources": [{"url": mr_url, "title": mr_src["title"]}],
+        "updates": [{
+            "at": "2026-11-09T12:00:00Z",
+            "text": "Maintainers merged !951 with a security fix.",
+            "sources": [{"url": mr_url, "title": mr_src["title"]}],
+        }],
+    })
+    prepared = {
+        "candidate": cand,
+        "packet": {"sources": [mr_src], "missing_sources": [], "truncated": False},
+        "coverage": {
+            "prior_story": {"id": cand["id"], "state": "released", "confidence": "confirmed", "updated_at": "2026-11-08T12:00:00Z"},
+            "recent": [],
+            "truncated": False,
+        },
+        "mode": "update",
+        "payload": {"editorial_kind": "gitlab_mr"},
+        "row": {
+            "payload": json.dumps({
+                "kind": "gitlab_mr",
+                "authority": "development",
+                "upstream_state": "merged",
+                "url": mr_url,
+                "title": mr_src["title"],
+                "content": "Merged a security fix for relay descriptor parsing.",
+                "published_at": "2026-11-08T12:00:00Z",
+                "updated_at": "2026-11-09T12:00:00Z",
+            })
+        },
+    }
+    limits = review.repair_limits(prepared["packet"], prepared["coverage"], update=True, candidate_sources=cand["sources"])
+    assert "release" not in limits["category"] and "security" in limits["category"]
+
+    record, requests = _new_review_state(cfg, copy.deepcopy(cand))
+    checker = wire_reviewer(cfg, inconsistent({"category": "security"}, update=True), verdict(update=True))
+    stage, repaired = review_gate.advance_review(checker, "review", copy.deepcopy(cand), prepared, record, requests)
+    assert stage == "verify"
+    assert repaired["category"] == "security" and repaired["tags"] == ["security", "release"]
+    event = record["untrusted_proposals"][0]
+    assert event["accepted"] is True
+    assert event["repair"] == {"category": "security"}
+    assert event["changed_fields"] == ["category", "tags"]
+    review_gate.validate_review_state(record, "verify", repaired, prepared)
+
+    action, approved = review_gate.advance_review(checker, stage, repaired, prepared, record, requests)
+    assert action == "approve" and approved == repaired and checker.calls == 2
+    record.update(
+        candidate=repaired,
+        outcome="approved",
+        approval_key=digest([
+            digest(repaired), digest(prepared["packet"]), record["policy_hash"],
+            review_gate._context(prepared, record["policy_hash"])["binding_hash"],
+        ]),
+    )
+    review_gate.validate_review_state(record, "approved", repaired, prepared)
+
+    explicit_record, explicit_requests = _new_review_state(cfg, copy.deepcopy(cand))
+    explicit_checker = wire_reviewer(
+        cfg,
+        inconsistent({"category": "security", "tags": ["security", "release"]}, update=True),
+        verdict("hold", criterion="source_support", update=True),
+    )
+    action2, _ = review_gate.advance_review(
+        explicit_checker, "review", copy.deepcopy(cand), prepared, explicit_record, explicit_requests
+    )
+    assert action2 == "hold"
+    assert explicit_record["untrusted_proposals"][0]["accepted"] is False
+    assert explicit_record["untrusted_proposals"][0]["disposition"] == "labels"
+    assert explicit_record["untrusted_proposals"][0]["repair"] == {"category": "security", "tags": ["security", "release"]}

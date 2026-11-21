@@ -172,7 +172,7 @@ def reset_review_work(store, item_id):
         (
             isinstance(saved_record, dict)
             and (
-                ((ih := saved_record.get("input_hash")) is not None and ih not in valid_hashes)
+                ((ih := saved_record.get("input_hash")) is not None and (not _is_sha256(ih) or ih not in valid_hashes))
                 or ((ir := saved_record.get("input_row")) is not None and (not isinstance(ir, dict) or ir.get("content_hash") != item["content_hash"]))
             )
         )
@@ -863,7 +863,8 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                 raise ValueError()
             accepted = proposal["accepted"]
             if proposal["repair"] is not None:
-                review._repair_fields(proposal["repair"], update=proposal["mode"] == "update")
+                if review._repair_fields(proposal["repair"], update=proposal["mode"] == "update") != proposal["repair"]:
+                    raise ValueError()
             if ((accepted and (proposal["candidate_after_hash"] is None or not proposal["changed_fields"]))
                     or (proposal["disposition"] != "discarded_context"
                         and accepted == (proposal["disposition"] in {"unusable", "literal_tag", "labels", "repeated"}))):
@@ -1053,13 +1054,13 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
             if _literal_tag(prepared):
                 event["disposition"] = "literal_tag"
                 raise review.ReviewError("Literal tags cannot use untrusted edits")
-            repaired = review.apply_repair(candidate, failed.proposal, update=prepared.get("mode") == "update")
+            is_update = prepared.get("mode") == "update"
+            proposed = review._repair_fields(failed.proposal, update=is_update)
+            repaired = review.apply_repair(candidate, proposed, update=is_update)
             event["candidate_after_hash"] = digest(repaired)
             event["changed_fields"] = sorted(key for key in candidate if repaired.get(key) != candidate[key])
-            event["repair"] = {key: repaired[key] for key in event["changed_fields"] if key != "updates"}
-            if "updates" in event["changed_fields"]:
-                event["repair"]["update"] = repaired["updates"][-1]["text"]
-            if not _allowed_proposal(candidate, repaired, prepared, failed.proposal):
+            event["repair"] = proposed
+            if not _allowed_proposal(candidate, repaired, prepared, event["repair"]):
                 event["disposition"] = "labels"
                 raise review.ReviewError("Untrusted edit exceeds packet label limits")
             if event["candidate_after_hash"] in seen:
@@ -1166,7 +1167,7 @@ def _route(store, row, draft, writer_key, record, observed, target, _stage=None)
     with store.db:
         store.require_pending_item(row, "Source item changed before routing")
         found = store.db.execute(
-            """SELECT CAST(s.payload AS BLOB) AS payload
+            """SELECT CASE WHEN typeof(s.payload)='text' THEN CAST(s.payload AS BLOB) END AS payload
                FROM stories s LEFT JOIN editorial_controls e ON e.story_id=s.id
                WHERE s.id=? AND COALESCE(e.retracted,0)=0""",
             (target,),

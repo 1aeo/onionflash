@@ -772,3 +772,127 @@ def test_invalid_utf8_sqlite_text_in_editorial_controls_and_revisions(tmp_path):
             observed="2026-11-11T00:00:00Z",
         )
         assert merged["merged_into"] == story_a["id"]
+
+
+def test_catalog_fallback_rejects_mismatched_story_id_and_binds_snapshot_in_hash(tmp_path):
+    """Reject cross-story catalog fallback snapshots and invalidate CAS hashes when fallback text changes."""
+    cfg_id = pub_settings(tmp_path / "id")
+    story_a = make_story(1, id="story-a", title="Story A", summary="Summary A.")
+    story_b = make_story(2, id="story-b", title="Story B", summary="Summary B.")
+    with Store(cfg_id["storage"]["database"]) as store:
+        put_story(store.db, story_a)
+        put_story(store.db, story_b)
+        build(cfg_id, store)
+
+        b_cat_json = store.db.execute("SELECT public_json FROM public_catalog WHERE story_id='story-b'").fetchone()[0]
+        b_cat_sha = hashlib.sha256(b_cat_json.encode("utf-8")).hexdigest()
+        with store.db:
+            store.db.execute("UPDATE stories SET payload='broken json' WHERE id='story-a'")
+            store.db.execute(
+                "UPDATE public_catalog SET public_json=?,json_sha256=? WHERE story_id='story-a'",
+                (b_cat_json, b_cat_sha),
+            )
+        with pytest.raises(ValueError, match="no valid public snapshot"):
+            editorial.show(store.db, "story-a")
+
+    cfg = pub_settings(tmp_path / "hash")
+    with Store(cfg["storage"]["database"]) as store:
+        put_story(store.db, story_b)
+        build(cfg, store)
+
+        shown_b = editorial.show(store.db, "story-b")
+        editorial.correct(
+            store.db, "story-b", {"summary": "Summary B revised."},
+            reason="Revise summary B.", expect_hash=shown_b["hash"], observed=LATER,
+        )
+        with store.db:
+            store.db.execute("UPDATE stories SET payload='broken json' WHERE id='story-b'")
+        fallback_before = editorial.show(store.db, "story-b")
+        assert fallback_before["using_last_published_snapshot"] is True
+        assert fallback_before["story"]["summary"] == "Summary B."
+
+        # Rebuilding without changing the effective public snapshot preserves the hash.
+        with store.db:
+            store.db.execute("UPDATE public_catalog SET template_hash='old-template' WHERE story_id='story-b'")
+        assert editorial.show(store.db, "story-b")["hash"] == fallback_before["hash"]
+
+        # Building publishes Summary B revised from editorial_revisions without altering stories or editorial_controls.
+        build(cfg, store)
+        fallback_after = editorial.show(store.db, "story-b")
+        assert fallback_after["using_last_published_snapshot"] is True
+        assert fallback_after["story"]["summary"] == "Summary B revised."
+        assert fallback_after["hash"] != fallback_before["hash"]
+        with pytest.raises(ValueError, match="changed since it was reviewed"):
+            editorial.correct(
+                store.db, "story-b", {"why_it_matters": FIX},
+                reason="Stale review.", expect_hash=fallback_before["hash"], observed="2026-11-11T00:00:00Z",
+            )
+
+
+def test_retraction_hides_blob_historical_reason_and_tolerates_unreadable_after_json_and_list_category(tmp_path):
+    """Hide BLOB historical reasons on retraction, skip unreadable `after_public_json` update diffs, and coerce list categories."""
+    cfg = pub_settings(tmp_path)
+    output = Path(cfg["storage"]["output_dir"])
+    s_blob = make_story(1, id="story-blob-reason", title="Blob reason story")
+    s_upd = make_story(2, id="story-upd-after", title="Update history story", updates=UPDATES[:1])
+    s_cat = make_story(3, id="story-list-cat", title="List category story")
+    with Store(cfg["storage"]["database"]) as store:
+        for entry in (s_blob, s_upd, s_cat):
+            put_story(store.db, entry)
+        build(cfg, store)
+
+        # BLOB historical reason hidden by a retraction must not break public_metadata or either render path.
+        editorial_act(editorial.correct, store, s_blob["id"], {"summary": "First correction."}, reason="Old reason.", observed=EDIT)
+        with store.db:
+            store.db.execute("DROP TRIGGER editorial_revisions_unchanged")
+            store.db.execute(
+                "UPDATE editorial_revisions SET reason=CAST('hidden blob' AS BLOB) WHERE story_id=? AND revision=1",
+                (s_blob["id"],),
+            )
+            editorial.initialize(store.db)
+        with pytest.raises(ValueError, match="Invalid editorial revision reason"):
+            editorial.public_metadata(store.db, s_blob["id"])
+        editorial_act(editorial.retract, store, s_blob["id"], reason="Withdrawn publicly.", observed=LATER)
+        meta_blob = editorial.public_metadata(store.db, s_blob["id"])
+        assert meta_blob is not None and meta_blob["status"] == "retracted"
+        assert {entry["revision"]: entry["reason"] for entry in meta_blob["history"]} == {2: "Withdrawn publicly.", 1: ""}
+        assert build(cfg, store)["stories_skipped"] == 0
+        with store.db:
+            store.db.execute("DELETE FROM stories WHERE id=?", (s_blob["id"],))
+        assert build(cfg, store, force=True)["stories_skipped"] == 0
+        assert "Withdrawn publicly." in (output / f"news/{s_blob['id']}/index.html").read_text(encoding="utf-8")
+
+        # Unreadable after_public_json must not mark retained updates as superseded, while valid empty updates still do.
+        editorial_act(editorial.correct, store, s_upd["id"], {"title": "Retitled update story"}, reason="Retitled.", observed=EDIT)
+        with store.db:
+            store.db.execute("DROP TRIGGER editorial_revisions_unchanged")
+            store.db.execute(
+                "UPDATE editorial_revisions SET after_public_json='not-valid-json' WHERE story_id=? AND revision=1",
+                (s_upd["id"],),
+            )
+            editorial.initialize(store.db)
+        meta_upd = editorial.public_metadata(store.db, s_upd["id"])
+        assert meta_upd is not None and "updates" not in meta_upd["history"][0]["superseded"]
+        build(cfg, store)
+        editorial_act(editorial.correct, store, s_upd["id"], {"updates": []}, reason="Removed update.", observed=LATER)
+        meta_removed = editorial.public_metadata(store.db, s_upd["id"])
+        assert meta_removed["history"][0]["superseded"]["updates"] == [{"at": UPDATES[0]["at"], "text": UPDATES[0]["text"]}]
+
+        # Non-string legacy category (list) coerces to "network" on retract and in _render_accepted.
+        cat_snap = json.loads(store.db.execute("SELECT public_json FROM public_catalog WHERE story_id=?", (s_cat["id"],)).fetchone()[0])
+        cat_snap["category"] = []
+        cat_snap["confidence"] = []
+        cat_snap["state"] = []
+        cat_text = json.dumps(cat_snap, ensure_ascii=False, sort_keys=True) + "\n"
+        cat_sha = hashlib.sha256(cat_text.encode("utf-8")).hexdigest()
+        with store.db:
+            store.db.execute("UPDATE public_catalog SET public_json=?,json_sha256=? WHERE story_id=?", (cat_text, cat_sha, s_cat["id"]))
+            store.db.execute("UPDATE stories SET payload='broken json' WHERE id=?", (s_cat["id"],))
+        retracted = editorial_act(editorial.retract, store, s_cat["id"], reason="Withdrawn legacy category.", observed=LATER)
+        assert retracted["retracted"] is True
+        with store.db:
+            store.db.execute("DELETE FROM stories WHERE id=?", (s_cat["id"],))
+        assert build(cfg, store)["stories_skipped"] == 0
+        tomb = json.loads((output / f"news/{s_cat['id']}/story.json").read_text(encoding="utf-8"))
+        assert (tomb["category"], tomb["confidence"], tomb["state"]) == ("network", "reported", "developing")
+        assert tomb["editorial"]["status"] == "retracted"

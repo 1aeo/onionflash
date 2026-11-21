@@ -467,7 +467,7 @@ def test_topics_include_category_or_tag_without_duplicates_and_follow_added_date
         assert store.db.execute("SELECT COUNT(*) FROM public_story_topics WHERE topic='security'").fetchone()[0] == 2
 
 
-def test_recategorization_updates_only_affected_topics_and_removes_stale_views(tmp_path, monkeypatch):
+def test_recategorization_updates_only_affected_topics_and_removes_stale_views(tmp_path):
     """Regenerate only affected topic views when a story's category/tags change."""
     cfg = settings(tmp_path)
     cfg["site"]["page_size"] = 1
@@ -478,8 +478,6 @@ def test_recategorization_updates_only_affected_topics_and_removes_stale_views(t
         output = Path(cfg["storage"]["output_dir"])
         unrelated = output / "topics/network/index.html"
         previous = unrelated.stat().st_mtime_ns
-        calls, original = [], render.index_html
-        monkeypatch.setattr(render, "index_html", lambda *a, **kw: (calls.append(kw.get("topic")), original(*a, **kw))[1])
         put(store.db, story(0, category="security", tags=[]))
         build(cfg, store)
         assert not (output / "topics/release/page/3/index.html").exists()
@@ -487,8 +485,12 @@ def test_recategorization_updates_only_affected_topics_and_removes_stale_views(t
         assert _ids(output / "topics/security/index.html") == [story(0)["id"]]
         assert (output / f"news/{story(0)['id']}/index.html").is_file()
         assert unrelated.stat().st_mtime_ns == previous
-        calls.clear()
-        assert not build(cfg, store)["public_changed"] and calls == [None]
+        home = output / "index.html"
+        home_before, home_mtime = home.read_bytes(), home.stat().st_mtime_ns
+        assert not build(cfg, store)["public_changed"]
+        assert home.read_bytes() == home_before
+        assert home.stat().st_mtime_ns == home_mtime
+        assert unrelated.stat().st_mtime_ns == previous
 
 
 def test_corrupt_catalog_after_first_batch_and_artifact_allowlist(tmp_path):
@@ -594,3 +596,147 @@ def test_editorial_revision_surrogates_and_invalid_utf8_do_not_crash_build(tmp_p
         assert "SupersededHeadline" in (output / "news/story-surrogate/index.html").read_text(encoding="utf-8")
         s2_json = json.loads((output / "news/story-bad-utf8/story.json").read_text(encoding="utf-8"))
         assert "superseded" not in s2_json["editorial"]["history"][0]
+
+
+def test_unreadable_correction_revision_preserves_old_catalog_until_repaired(tmp_path):
+    """Quarantine missing-row corrections with unreadable `after_public_json` so forced retries publish once repaired."""
+    cfg = settings(tmp_path)
+    output = Path(cfg["storage"]["output_dir"])
+    orig = story(1, summary="Original summary.")
+    sid = orig["id"]
+    with Store(cfg["storage"]["database"]) as store:
+        put(store.db, orig)
+        build(cfg, store)
+        before_json = (output / f"news/{sid}/story.json").read_bytes()
+        before_cat = tuple(store.db.execute("SELECT * FROM public_catalog WHERE story_id=?", (sid,)).fetchone())
+
+        editorial_act(editorial.correct, store, sid, {"summary": "Corrected summary."},
+                      reason="Fix wording.", observed="2026-11-10T00:00:00Z")
+        repaired_after = store.db.execute(
+            "SELECT after_public_json FROM editorial_revisions WHERE story_id=? AND revision=1", (sid,),
+        ).fetchone()[0]
+        with store.db:
+            store.db.execute("DROP TRIGGER editorial_revisions_unchanged")
+            store.db.execute(
+                "UPDATE editorial_revisions SET after_public_json='corrupt json' WHERE story_id=? AND revision=1", (sid,),
+            )
+            editorial.initialize(store.db)
+            store.db.execute("DELETE FROM stories WHERE id=?", (sid,))
+
+        failed = build(cfg, store)
+        assert failed["stories_skipped"] == 1
+        assert (output / f"news/{sid}/story.json").read_bytes() == before_json
+        assert tuple(store.db.execute("SELECT * FROM public_catalog WHERE story_id=?", (sid,)).fetchone()) == before_cat
+
+        with store.db:
+            store.db.execute("DROP TRIGGER editorial_revisions_unchanged")
+            store.db.execute(
+                "UPDATE editorial_revisions SET after_public_json=? WHERE story_id=? AND revision=1",
+                (repaired_after, sid),
+            )
+            editorial.initialize(store.db)
+
+        recovered = build(cfg, store, force=True)
+        assert recovered["stories_skipped"] == 0
+        published = json.loads((output / f"news/{sid}/story.json").read_text(encoding="utf-8"))
+        assert published["summary"] == "Corrected summary."
+        assert published["editorial"]["revision"] == 1
+        assert sid in _ids(output / "topics/release/index.html")
+
+
+def test_repaired_same_checksum_accepted_story_rebuilds_deleted_topic_memberships(tmp_path):
+    """Restore missing `public_story_topics` rows and refresh topic views when a repaired story matches its old checksum."""
+    cfg = settings(tmp_path, render_batch_size=1)
+    output = Path(cfg["storage"]["output_dir"])
+    s2 = story(1, tags=["release"])
+    s1 = story(2, tags=["release", "security"])
+    with Store(cfg["storage"]["database"]) as store:
+        put(store.db, s2)
+        put(store.db, s1)
+        for _ in range(2):
+            build(cfg, store)
+        editorial_act(editorial.correct, store, s1["id"], {"summary": "Clarified summary."},
+                      reason="Clarify.", observed="2026-11-10T00:00:00Z")
+        build(cfg, store)
+        assert s1["id"] in _ids(output / "topics/security/index.html")
+
+        with store.db:
+            store.db.execute("UPDATE editorial_controls SET notice_reason=CAST(x'fffe' AS TEXT) WHERE story_id=?", (s1["id"],))
+        for _ in range(2):
+            failed = build(cfg, store, force=True)
+        assert failed["stories_skipped"] == 1 and "articles_pending" not in failed
+        assert store.db.execute("SELECT COUNT(*) FROM public_story_topics WHERE story_id=?", (s1["id"],)).fetchone()[0] == 0
+        assert s1["id"] not in _ids(output / "topics/security/index.html")
+
+        with store.db:
+            store.db.execute("UPDATE editorial_controls SET notice_reason='Clarify.' WHERE story_id=?", (s1["id"],))
+        rev_before = int(store.get_meta("publication_catalog_revision") or 0)
+        batch1 = build(cfg, store, force=True)
+        assert batch1["articles_pending"] == 1
+        batch2 = build(cfg, store, force=True)
+        assert "articles_pending" not in batch2 and batch2["stories_skipped"] == 0
+        assert int(store.get_meta("publication_catalog_revision") or 0) == rev_before + 1
+        assert store.db.execute("SELECT COUNT(*) FROM public_story_topics WHERE story_id=?", (s1["id"],)).fetchone()[0] == 2
+        assert s1["id"] in _ids(output / "topics/release/index.html")
+        assert s1["id"] in _ids(output / "topics/security/index.html")
+
+        rev_stable = store.get_meta("publication_catalog_revision")
+        assert not build(cfg, store)["public_changed"]
+        assert store.get_meta("publication_catalog_revision") == rev_stable
+
+
+def test_incremental_omission_checks_avoid_full_archive_rescan_across_rebuild_batches(tmp_path, monkeypatch):
+    """Cache stale-snapshot omission decisions across rebuild batches while keeping exact counts and pagination."""
+    cfg = settings(tmp_path, render_batch_size=2)
+    cfg["site"]["page_size"] = 3
+    output = Path(cfg["storage"]["output_dir"])
+    plain = {"url": "http://example.org/legacy-only", "title": "Legacy HTTP"}
+    with Store(cfg["storage"]["database"]) as store:
+        for n in range(10):
+            if n == 5:
+                with monkeypatch.context() as older:
+                    older.setattr(render, "_public_url", lambda url: url)
+                    put(store.db, story(n, sources=[plain], updated_at="2026-11-12T00:00:00Z"))
+                    build(cfg, store)
+            else:
+                put(store.db, story(n))
+        for _ in range(6):
+            if "articles_pending" not in build(cfg, store):
+                break
+        assert store.db.execute("SELECT COUNT(*) FROM public_catalog").fetchone()[0] == 10
+
+        _upgrade(store.db)
+        sync_calls = []
+        original_public_story = publication._public_story
+
+        def _counting_public_story(row, current=None, *, warn=True):
+            if not warn:
+                sync_calls.append(row["story_id"])
+            return original_public_story(row, current, warn=warn)
+
+        monkeypatch.setattr(publication, "_public_story", _counting_public_story)
+        batch_counts = []
+        for _ in range(6):
+            sync_calls.clear()
+            res = build(cfg, store)
+            batch_counts.append((len(sync_calls), res["published_stories"], res.get("articles_pending")))
+            if "articles_pending" not in res:
+                break
+
+        # First batch validates the 8 remaining stale snapshots once; later batches revalidate 0.
+        assert batch_counts[0][0] == 8
+        assert all(checked == 0 for checked, _, _ in batch_counts[1:])
+        assert all(pub == 9 for _, pub, _ in batch_counts)
+        assert not (output / "page/4/index.html").exists()
+        assert (output / "page/3/index.html").is_file()
+        assert "2026-11-12T00:00:00Z" not in (output / "index.html").read_text(encoding="utf-8")
+        assert [tuple(r) for r in store.db.execute("SELECT story_id, omitted FROM public_catalog_checks").fetchall()] == [
+            (story(5)["id"], 1)
+        ]
+
+        # Repairing story 5 invalidates its cached omission row via trigger and restores count to 10.
+        put(store.db, story(5))
+        final = build(cfg, store)
+        assert final["published_stories"] == 10 and final["stories_skipped"] == 0
+        assert store.db.execute("SELECT COUNT(*) FROM public_catalog_checks").fetchone()[0] == 0
+        assert (output / "page/4/index.html").is_file()

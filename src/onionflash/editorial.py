@@ -352,16 +352,21 @@ def _snapshot(db, story_id: str, expect_hash: str | None = None) -> dict:
         if public["id"] != story_id:
             raise ValueError("Story identity differs from its database row")
     except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
-        if published is None:
+        if published is None or published.get("id") != story_id:
             raise ValueError("Story has no valid public snapshot to correct") from None
         original = {}
         try:
             public = prepare_story(published, allow_empty_sources=is_retracted)
         except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
             public = _legacy_public(published, story_id)
+        if public["id"] != story_id:
+            raise ValueError("Story has no valid public snapshot to correct") from None
         fallback = True
     revision = control["revision"] if control else 0
-    fingerprint = digest([record, revision, bool(control and control["locked"]), bool(control and control["retracted"])])
+    fingerprint_parts = [record, revision, bool(control and control["locked"]), bool(control and control["retracted"])]
+    if fallback:
+        fingerprint_parts.append(public)
+    fingerprint = digest(fingerprint_parts)
     if expect_hash is not None and fingerprint != expect_hash:
         raise ValueError("Story changed since it was reviewed; refresh its hash before editing")
     return {"record": record, "raw": original, "public": public, "published": published,
@@ -482,7 +487,6 @@ def public_metadata(db, story_id: str) -> dict | None:
         if (
             (action := _decode_utf8(row["action"])) is None
             or (created_at := _decode_utf8(row["created_at"])) is None
-            or row["reason"] is None
         ):
             raise ValueError("Invalid editorial revision reason")
         if control["retracted"] and row["revision"] != control["revision"]:
@@ -499,8 +503,7 @@ def public_metadata(db, story_id: str) -> dict | None:
                     key: _text(before.get(key, ""), FIELD_LIMITS[key])
                     for key in ("title", "summary", "why_it_matters")
                 }
-                if action != "retract":
-                    after_obj = saved_object(row["after_public_json"], allow_surrogates=True) or {}
+                if action != "retract" and (after_obj := saved_object(row["after_public_json"], allow_surrogates=True)) is not None:
                     kept = {(u["at"], u["text"]) for u in _clean_history_updates(after_obj.get("updates"))}
                     if replaced := [u for u in _clean_history_updates(before.get("updates")) if (u["at"], u["text"]) not in kept]:
                         entry["superseded"]["updates"] = replaced
@@ -579,11 +582,11 @@ def _apply(db, story_id: str, action: str, *, reason: str, expect_hash: str,
                 raise ValueError("Correction does not change any public field")
         elif action == "retract":
             public.update(retracted_fields(reason))
-            if public.get("category") not in CATEGORIES:
+            if not isinstance(public.get("category"), str) or public["category"] not in CATEGORIES:
                 public["category"] = "network"
-            if public.get("confidence") not in CONFIDENCES:
+            if not isinstance(public.get("confidence"), str) or public["confidence"] not in CONFIDENCES:
                 public["confidence"] = "reported"
-            if public.get("state") not in PUBLIC_STATES:
+            if not isinstance(public.get("state"), str) or public["state"] not in PUBLIC_STATES:
                 public["state"] = "developing"
             retracted = True
         elif action == "restore":

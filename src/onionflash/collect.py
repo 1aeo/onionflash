@@ -15,7 +15,7 @@ import feedparser
 from .transport import FetchError, HttpClient
 from .util import (
     LIST_ARCHIVE_HOST, UTC, after, canonical_url, effective_authority, format_utc,
-    is_valid_domain, is_valid_gitlab_user, parse_utc, plain_text, timestamp,
+    is_valid_domain, is_valid_gitlab_user, parse_utc, plain_text, safe_canonical_url, timestamp,
 )
 
 
@@ -256,14 +256,13 @@ def _feed(
             continue
         alternate_href = next(
             (
-                link_obj["href"]
+                canon
                 for link_obj in (entry.get("links") or ())
                 if isinstance(link_obj, dict)
                 and link_obj.get("rel", "alternate") == "alternate"
                 and str(link_obj.get("type") if "type" in link_obj else "text/html").partition(";")[0].strip().lower()
                 in {"text/html", "application/xhtml+xml", "html", "xhtml"}
-                and isinstance(link_obj.get("href"), str)
-                and bool(link_obj["href"])
+                and (canon := safe_canonical_url(link_obj.get("href")))
             ),
             None,
         )
@@ -356,18 +355,29 @@ def _gitlab(
             raise CollectionError(str(exc), items, resume) from exc
         if not isinstance(records, list) or any(not isinstance(r, dict) for r in records) or len(records) > page_size:
             raise CollectionError("GitLab returned an unexpected response", items, resume)
-        stamps = []
+        page_error = None
+        stamps: list[datetime] = []
+        valid_records: list[dict] = []
         if records:
             try:
-                stamps = [parse_utc(r.get("updated_at")) for r in records]
                 floor = parse_utc(params["updated_after"])
             except (TypeError, ValueError):
                 raise CollectionError("GitLab returned an invalid timestamp", items, resume) from None
-            if stamps[0] < floor or any(b < a for a, b in zip(stamps, stamps[1:])):
-                raise CollectionError("GitLab returned out-of-order timestamps", items, resume)
-            if stamps[-1] > upper:
-                raise CollectionError("GitLab returned an out-of-range timestamp", items, resume)
-        for record in records:
+            for record in records:
+                try:
+                    stamp = parse_utc(record.get("updated_at"))
+                except (TypeError, ValueError):
+                    page_error = "GitLab returned an invalid timestamp"
+                    continue
+                stamps.append(stamp)
+                if floor <= stamp <= upper:
+                    valid_records.append(record)
+            if page_error is None:
+                if stamps[0] < floor or any(b < a for a, b in zip(stamps, stamps[1:])):
+                    page_error = "GitLab returned out-of-order timestamps"
+                elif stamps[-1] > upper:
+                    page_error = "GitLab returned an out-of-range timestamp"
+        for record in valid_records:
             if source["kind"] == "gitlab_mr" and record.get("state") != "merged":
                 continue
             try:
@@ -403,6 +413,8 @@ def _gitlab(
                 item["closed_at"] = min(closed, started)
             if item["title"]:
                 items.append(item)
+        if page_error is not None:
+            raise CollectionError(page_error, items, resume)
         if len(records) < page_size:
             return {"items": items, "url": url, "watermark": after(-settings["overlap_seconds"], started)}
         moved = stamps[-1] > floor

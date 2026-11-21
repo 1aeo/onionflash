@@ -441,14 +441,17 @@ def test_prompt_versions_and_hackerone_and_tordev_trusted_operator_rules():
     assert review.REVIEW_VERSION == "onionflash-review-17"
     assert "hackerone" in review_gate.OFFICIAL_AUTHORITIES
     assert "dirauth-operator" in review_gate.OFFICIAL_AUTHORITIES
-    assert "including hackerone, dirauth-operator,\ntrusted-operator and project-sender" in analyze.SYSTEM_PROMPT
-    assert "cite HackerOne in prose when the source text itself references HackerOne" in analyze.SYSTEM_PROMPT
-    assert "hackerone\nmarks a disclosed HackerOne report" in review.SYSTEM_PROMPT
-    assert "unless source authority is hackerone, a gitlab_issue in the\npacket cites hackerone.com/reports/" in review.SYSTEM_PROMPT
-    assert "Disclosed\nHackerOne reports (authority=hackerone or a gitlab_issue citing hackerone.com/reports/)" in review.SYSTEM_PROMPT
-    assert "authority=project-sender or\nauthority=trusted-operator" in review.SYSTEM_PROMPT
-    assert "substantive technical critique, protocol review, or empirical\nmulti-relay measurement" in review.SYSTEM_PROMPT
-    assert "Community, issue, hackerone, dirauth-operator, project-sender and trusted-operator" in review.UPDATE_SYSTEM_PROMPT
+    analyze_prompt = " ".join(analyze.SYSTEM_PROMPT.split())
+    review_prompt = " ".join(review.SYSTEM_PROMPT.split())
+    update_prompt = " ".join(review.UPDATE_SYSTEM_PROMPT.split())
+    assert "including hackerone, dirauth-operator, trusted-operator and project-sender" in analyze_prompt
+    assert "cite HackerOne in prose when the source text itself references HackerOne" in analyze_prompt
+    assert "hackerone marks a disclosed HackerOne report" in review_prompt
+    assert "unless source authority is hackerone, a gitlab_issue in the packet cites hackerone.com/reports/" in review_prompt
+    assert "Disclosed HackerOne reports (authority=hackerone or a gitlab_issue citing hackerone.com/reports/)" in review_prompt
+    assert "authority=project-sender or authority=trusted-operator" in review_prompt
+    assert "substantive technical critique, protocol review, or empirical multi-relay measurement" in review_prompt
+    assert "Community, issue, hackerone, dirauth-operator, project-sender and trusted-operator" in update_prompt
 
 
 def test_evicted_dirauth_reply_retains_authority_while_deleted_reply_demotes(tmp_path):
@@ -830,7 +833,7 @@ def test_deleted_dirauth_note_evicts_when_older_system_notes_fill_graphql_window
     )
     system_count = 39 if with_newer_public else 40
     older_system = [
-        {**gql_note(i, f"changed label {i}", author="bot", createdAt="2026-11-12T10:01:00Z", iid="41995", url=issue_url),
+        {**gql_note(100 + i, f"changed label {i}", author="bot", createdAt="2026-11-12T10:01:00Z", iid="41995", url=issue_url),
          "system": True}
         for i in range(1, system_count + 1)
     ]

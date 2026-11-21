@@ -16,6 +16,7 @@ from helpers import (
 from onionflash import cli, decisions, editorial, rejection, review_gate
 from onionflash.analyze import AnalysisError, tag_notice
 from onionflash.candidate import ReviewRequired, StaleCandidate
+from onionflash.schema import SEMANTIC_FIELDS
 from onionflash.store import Store
 from onionflash.util import DIRAUTH_GITLAB_USERS
 
@@ -141,9 +142,11 @@ def test_verified_repair_mirror_official_and_repeat_holds_publish_exact_reviewed
     info = shown["approval"]
     assert info["eligible"] is True and info["editorial_failures"] == expected_failures
     rejection.approve_item(cfg, store, row["id"], info["hash"], f"{case} dispute resolved")
-    assert len(store.stories()) == 1
+    [story] = store.stories()
     for field, value in expected_patch.items():
-        assert store.stories()[0][field] == value
+        assert story[field] == value
+    for field in SEMANTIC_FIELDS:
+        assert story[field] == shown["candidate"][field]
 
 
 @pytest.mark.parametrize("incoming,draft,replies,expected_reason", [

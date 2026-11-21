@@ -172,8 +172,13 @@ _MAIL_QUOTE_INTRO_RE = re.compile(
     r"^(?:on\s+.+\bwrote\s*:|am\s+.+\bschrieb\b.*:|le\s+.+\ba\s+écrit\s*:|[- ]*original message[- ]*)$",
     re.IGNORECASE,
 )
-_DATED_QUOTE_INTRO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\b.+:$")
+_ORIGINAL_MSG_RE = re.compile(r"^[- ]*original message[- ]*$", re.IGNORECASE)
+_DATED_QUOTE_INTRO_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}\b.+\b(?:wrote\s*:|schrieb\b.*:|a\s+écrit\s*:)$",
+    re.IGNORECASE,
+)
 _FROM_HEADER_RE = re.compile(r"^from:\s+.+$", re.IGNORECASE)
+_FORWARDED_HEADER_RE = re.compile(r"^(?:sent|date|to|cc|bcc|reply-to|subject):\s+.+$", re.IGNORECASE)
 _QUOTE_ATTRIBUTION_END_RE = re.compile(r"\b(?:wrote\s*:|schrieb\b.*:|a\s+écrit\s*:)$", re.IGNORECASE)
 _QUOTE_WEEKDAY_PREFIX_RE = re.compile(
     r"^(?:on|am|le)\s+(?:mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|"
@@ -198,7 +203,7 @@ def _is_standalone_quote_header(line: str) -> bool:
     return bool(
         _MAIL_QUOTE_INTRO_RE.match(norm)
         or _FROM_HEADER_RE.match(norm)
-        or (_DATED_QUOTE_INTRO_RE.match(norm) and not _QUOTE_ATTRIBUTION_END_RE.search(norm))
+        or _DATED_QUOTE_INTRO_RE.match(norm)
     )
 
 
@@ -215,6 +220,26 @@ def _dropped_dated_attribution(norm_lines: list[str], drop: list[bool], quoted: 
     return end > start and bool(_QUOTE_ATTRIBUTION_END_RE.search(norm_lines[end - 1]))
 
 
+def _forwarded_header_block_end(
+    norm_lines: list[str],
+    drop: list[bool],
+    quoted: list[bool],
+    nonblank,
+    start: int,
+    *,
+    has_original_marker: bool,
+) -> int | None:
+    end = start + 1
+    while end < len(norm_lines) and norm_lines[end] and _FORWARDED_HEADER_RE.match(norm_lines[end]):
+        end += 1
+    if end <= start + 1:
+        return None
+    after = nonblank(end)
+    if after < len(norm_lines) and (quoted[after] or (has_original_marker and drop[after])):
+        return end
+    return None
+
+
 def unquoted_mail_text(text: str) -> str:
     """Strip >-quoted reply lines and quote-attribution headers preceding them."""
     lines = text.splitlines()
@@ -222,13 +247,25 @@ def unquoted_mail_text(text: str) -> str:
     quoted = [line.lstrip().startswith(">") for line in lines]
     drop = list(quoted)
     nonblank = lambda start: next((i for i in range(start, len(lines)) if norm_lines[i]), len(lines))
+    prev_nonblank = lambda before: next((i for i in range(before - 1, -1, -1) if norm_lines[i]), -1)
     for index in range(len(lines) - 1, -1, -1):
         if drop[index] or not (stripped := norm_lines[index]):
             continue
         probe = nonblank(index + 1)
+        if _FROM_HEADER_RE.match(stripped):
+            prev = prev_nonblank(index)
+            has_orig = prev >= 0 and bool(_ORIGINAL_MSG_RE.match(norm_lines[prev]))
+            if block_end := _forwarded_header_block_end(
+                norm_lines, drop, quoted, nonblank, index, has_original_marker=has_orig
+            ):
+                for k in range(index, block_end):
+                    drop[k] = True
+                continue
+            if probe < len(lines) and (quoted[probe] or (has_orig and drop[probe])):
+                drop[index] = True
+                continue
         if (
             ((probe == len(lines) or drop[probe]) and _MAIL_QUOTE_INTRO_RE.match(stripped))
-            or (probe < len(lines) and drop[probe] and _FROM_HEADER_RE.match(stripped))
             or (probe < len(lines) and quoted[probe] and _DATED_QUOTE_INTRO_RE.match(stripped))
             or (
                 probe < len(lines)

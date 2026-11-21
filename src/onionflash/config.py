@@ -195,7 +195,7 @@ def _clean_endpoint_url(
     trailing_slash: bool,
     error: str,
     allow_local: bool = False,
-    strip_default_port: bool = True,
+    address_policy=None,
 ) -> str:
     if not isinstance(url, str):
         raise ValueError(error)
@@ -254,17 +254,17 @@ def _clean_endpoint_url(
             or (isinstance(ip, ipaddress.IPv6Address) and ip.scope_id is not None)
         ):
             raise ValueError(error)
-        if not allow_local:
+        if address_policy is not None:
+            if not address_policy.permits(ip):
+                raise ValueError(error)
+        elif not allow_local:
             from . import transport
 
             if not transport.PUBLIC_ADDRESS_POLICY.permits(ip):
                 raise ValueError(error)
-    default_port = 443 if parsed.scheme == "https" else 80
-    authority = f"[{clean_host}]" if ":" in clean_host else clean_host
-    if port is not None and (not strip_default_port or port != default_port):
-        authority = f"{authority}:{port}"
-    path = parsed.path.rstrip("/") + ("/" if trailing_slash else "")
-    return urlunsplit((parsed.scheme, authority, path, "", ""))
+    if trailing_slash:
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/") + "/", "", ""))
+    return url.rstrip("/")
 
 
 def load_config(path: str | Path) -> dict:
@@ -323,7 +323,6 @@ def load_config(path: str | Path) -> dict:
         trailing_slash=True,
         error="site.base_url must be a clean absolute HTTP(S) URL",
         allow_local=True,
-        strip_default_port=False,
     )
     config["site"]["repository_url"] = canonical_url(config["site"]["repository_url"])
 
@@ -358,13 +357,28 @@ def load_config(path: str | Path) -> dict:
         if not isinstance(network, str) or ipaddress.ip_network(network, strict=True).prefixlen == 0:
             raise ValueError("Each allowed_networks entry must be a non-default CIDR string")
     llm_error = "Invalid LLM base URL; credentials belong in its environment variable"
-    allow_llm_local = bool(llm["allowed_networks"]) or llm["allow_http"]
+    from . import transport
+
+    llm_policy = transport.AddressPolicy(llm["allowed_networks"]) if llm["allowed_networks"] else transport.PUBLIC_ADDRESS_POLICY
+    allow_llm_local = bool(llm["allowed_networks"])
     if llm["base_url"]:
         llm["base_url"] = _clean_endpoint_url(
-            llm["base_url"], allow_http=llm["allow_http"], trailing_slash=False, error=llm_error, allow_local=allow_llm_local
+            llm["base_url"],
+            allow_http=llm["allow_http"],
+            trailing_slash=False,
+            error=llm_error,
+            allow_local=allow_llm_local,
+            address_policy=llm_policy,
         )
     llm["fallback_base_urls"] = [
-        _clean_endpoint_url(url, allow_http=llm["allow_http"], trailing_slash=False, error=llm_error, allow_local=allow_llm_local)
+        _clean_endpoint_url(
+            url,
+            allow_http=llm["allow_http"],
+            trailing_slash=False,
+            error=llm_error,
+            allow_local=allow_llm_local,
+            address_policy=llm_policy,
+        )
         for url in llm["fallback_base_urls"]
     ]
 

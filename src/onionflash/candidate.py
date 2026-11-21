@@ -632,7 +632,11 @@ def control_fingerprint(db, story_id: str) -> str:
                 return str(blob, "utf-8")
             except UnicodeError:
                 return {"invalid_utf8_hex": blob.hex()}
-        return blob.hex() if isinstance(blob, (bytes, bytearray)) else blob
+        return (
+            {"sqlite_type": kind, "hex": bytes(blob).hex()}
+            if isinstance(blob, (bytes, bytearray, memoryview))
+            else {"sqlite_type": kind, "value": blob}
+        )
 
     return digest({
         "revision": row["revision"],
