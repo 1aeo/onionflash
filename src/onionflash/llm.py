@@ -436,7 +436,10 @@ def parse_sse_completion(chunks: Iterable[bytes], *, max_content_bytes: int) -> 
                 if not isinstance(piece, str):
                     raise FetchError("invalid SSE response")
                 saw_content_str = True
-                content_bytes += len(piece.encode("utf-8"))
+                try:
+                    content_bytes += len(piece.encode("utf-8"))
+                except UnicodeEncodeError:
+                    raise FetchError("invalid SSE response") from None
                 if content_bytes > max_content_bytes:
                     raise FetchError("response exceeds configured byte limit")
                 parts.append(piece)
@@ -511,9 +514,9 @@ def parse_sse_completion(chunks: Iterable[bytes], *, max_content_bytes: int) -> 
 
     try:
         for raw_chunk in chunks:
+            feed_text(decoder.decode(raw_chunk, final=False))
             if done:
                 break
-            feed_text(decoder.decode(raw_chunk, final=False))
         if not done:
             feed_text(decoder.decode(b"", final=True))
     except UnicodeDecodeError:
@@ -527,7 +530,10 @@ def parse_sse_completion(chunks: Iterable[bytes], *, max_content_bytes: int) -> 
     if finish_reason is None:
         raise FetchError("incomplete SSE completion")
     body = {"choices": [{"finish_reason": finish_reason, "message": {"content": "".join(parts) if saw_content_str else None}}]}
-    return strict_json(body, sort_keys=False).encode("utf-8")
+    try:
+        return strict_json(body, sort_keys=False).encode("utf-8")
+    except (UnicodeEncodeError, ValueError, TypeError):
+        raise FetchError("invalid SSE response") from None
 
 
 class CompletionClient:

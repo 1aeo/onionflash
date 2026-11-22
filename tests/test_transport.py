@@ -910,8 +910,8 @@ def test_streaming_sse_completion_assembles_chunks_and_ignores_reasoning_size(co
     assert err.value.retryable is True
 
 
-def test_parse_sse_utf8_crlf_comments_multiline_and_fake_llm():
-    """Handle split UTF-8 bytes, split CRLF endings, multi-line data events, and FakeLLM SSE responses."""
+def test_parse_sse_utf8_crlf_comments_multiline_and_fake_llm(completion_client):
+    """Handle split UTF-8 bytes, split CRLF endings, multi-line data events, [DONE] stop, and FakeLLM SSE."""
     from helpers import FakeLLM
 
     euro = "€".encode("utf-8")
@@ -937,6 +937,58 @@ def test_parse_sse_utf8_crlf_comments_multiline_and_fake_llm():
 
     with pytest.raises(FetchError, match="invalid SSE response"):
         parse_sse_completion([b'data: {"choices":[{"delta":{"content":"\xff"}}]}\n\n'], max_content_bytes=4096)
+
+    for bad_escape in (
+        b'data: {"choices":[{"delta":{"content":"\\ud800"},"finish_reason":"stop"}]}\n\n',
+        b'data: {"choices":[{"delta":{"content":"{}"},"finish_reason":"\\ud800"}]}\n\n',
+    ):
+        with pytest.raises(FetchError, match="invalid SSE response"):
+            parse_sse_completion([bad_escape], max_content_bytes=4096)
+
+    class _DoneThenTrapStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield _sse_event({"choices": [{"delta": {"content": '{"stopped":"fast"}'}, "finish_reason": "stop"}]}) + b"data: [DONE]\n\n"
+            raise AssertionError("stream iterated past [DONE]")
+
+    done_client, _ = completion_client(
+        lambda _req: httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=_DoneThenTrapStream())
+    )
+    _, req_done, _ = _ledger()
+    assert _complete(done_client, req_done) == {"stopped": "fast"}
+
+    eof_done = [_sse_event({"choices": [{"delta": {"content": '{"eof":true}'}, "finish_reason": "stop"}]}).rstrip(b"\n"), b"\n\ndata: [DONE]"]
+    assert json.loads(parse_sse_completion(eof_done, max_content_bytes=4096))["choices"][0]["message"]["content"] == '{"eof":true}'
+
+    class _FallbackFakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, _method, url, **_kwargs):
+            """Return invalid-surrogate SSE on primary endpoint and valid SSE on fallback."""
+            self.calls += 1
+            if url.startswith("https://model.example"):
+                bad_body = b'data: {"choices":[{"delta":{"content":"\\ud800"},"finish_reason":"stop"}]}\n\n'
+                return Response(200, bad_body, {"Content-Type": "text/event-stream"}, url)
+            ok_body = _sse_event({"choices": [{"delta": {"content": '{"recovered":true}'}, "finish_reason": "stop"}]})
+            return Response(200, ok_body, {"Content-Type": "text/event-stream"}, url)
+
+        def close(self):
+            """No-op close hook for fake HTTP client protocol."""
+            return None
+
+    cfg_fb = copy.deepcopy(DEFAULTS)
+    cfg_fb["llm"].update(
+        base_url="https://model.example/v1",
+        fallback_base_urls=["https://fallback.example/v1"],
+        api_key_env="COMPLETION_TEST_KEY",
+    )
+    fb_cli = CompletionClient(cfg_fb)
+    fb_fake = _FallbackFakeClient()
+    fb_cli.client = fb_fake
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("COMPLETION_TEST_KEY", "synthetic-fixture-value")
+        assert fb_cli.complete("Sys", {"a": 1}, {"type": "object"}, "s") == {"recovered": True}
+    assert fb_fake.calls == 2
 
 
 @pytest.mark.parametrize("sse_failure", ["error_chunk", "premature_eof"])
@@ -1000,11 +1052,26 @@ def test_sse_truncated_length_is_non_retryable_and_limits_fail_closed(completion
     with pytest.raises(FetchError, match="byte limit"):
         parse_sse_completion([b"data: " + b"a" * 300000 + b"\n\n"], max_content_bytes=4096)
 
-    def _wire_overflow(_req: httpx.Request) -> httpx.Response:
-        chunks = [_sse_event({"choices": [{"delta": {"reasoning_content": "r" * 400000}, "finish_reason": None}]}) for _ in range(90)]
-        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=_ChunkStream(chunks))
+    reasoning_event = _sse_event({"choices": [{"delta": {"reasoning_content": "r" * 200000}, "finish_reason": None}]})
+    assert len(reasoning_event) < 262144
+    tail_events = [
+        _sse_event({"choices": [{"delta": {"content": '{"ok":true}'}, "finish_reason": "stop"}]}),
+        b"data: [DONE]\n\n",
+    ]
+    assert 160 * len(reasoning_event) + sum(len(item) for item in tail_events) < 32 * 1024 * 1024
+    assert 170 * len(reasoning_event) + sum(len(item) for item in tail_events) > 32 * 1024 * 1024
 
-    wire_client, _ = completion_client(_wire_overflow)
+    under_client, _ = completion_client(
+        lambda _req: httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                    stream=_ChunkStream([reasoning_event] * 160 + tail_events))
+    )
+    _, req_ok, _ = _ledger()
+    assert _complete(under_client, req_ok) == {"ok": True}
+
+    wire_client, _ = completion_client(
+        lambda _req: httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                    stream=_ChunkStream([reasoning_event] * 170 + tail_events))
+    )
     _, req2, _ = _ledger()
     with pytest.raises(AnalysisError, match="LLM request failed"):
         _complete(wire_client, req2)
