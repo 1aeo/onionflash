@@ -177,42 +177,79 @@ def normalize_evidence(text: str) -> str:
 
 
 class _TextParser(HTMLParser):
-    def __init__(self) -> None:
+    def __init__(self, limit: int, *, mark_blockquotes: bool = False) -> None:
+        """Initialize HTML text extractor with optional bounded blockquote markers."""
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self.hidden = 0
+        self.mark_blockquotes = mark_blockquotes
+        self.quote_depth = 0
+        self.line_start = True
+        self.quote_remaining = limit
+
+    def _append(self, text: str) -> None:
+        """Keep inline text together while marking each visible quoted line."""
+        if not self.mark_blockquotes:
+            self.parts.append(text)
+            return
+        if self.quote_remaining <= 0:
+            return
+        for part in text.replace("\r\n", "\n").replace("\r", "\n").splitlines(keepends=True):
+            if self.line_start and self.quote_depth and part.strip("\n"):
+                count = min(self.quote_depth, self.quote_remaining)
+                self.parts.append(">" * count)
+                self.quote_remaining -= count
+                # These markers survive all later whitespace/control cleanup.
+                # Once their count reaches the output limit, no suffix can
+                # enter the truncated text, even if earlier whitespace collapses.
+                if not self.quote_remaining:
+                    return
+                self.parts.append(" ")
+            self.parts.append(part)
+            self.line_start = part.endswith(("\n", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"))
 
     def handle_starttag(self, tag: str, attrs: list) -> None:
         """Track hidden markup blocks and emit line breaks around block elements."""
         if tag in {"script", "style", "noscript", "template"}:
             self.hidden += 1
+        elif self.mark_blockquotes and self.hidden:
+            return
+        elif tag == "blockquote" and self.mark_blockquotes:
+            self._append("\n")
+            self.quote_depth += 1
         elif tag in {"p", "br", "div", "li", "h1", "h2", "h3", "pre", "blockquote"}:
-            self.parts.append("\n")
+            self._append("\n")
 
     def handle_endtag(self, tag: str) -> None:
         """Exit hidden markup blocks and close block-level paragraphs."""
         if tag in {"script", "style", "noscript", "template"}:
             self.hidden = max(0, self.hidden - 1)
+        elif self.mark_blockquotes and self.hidden:
+            return
+        elif tag == "blockquote" and self.mark_blockquotes:
+            self._append("\n")
+            self.quote_depth = max(0, self.quote_depth - 1)
         elif tag in {"p", "div", "li", "pre", "blockquote"}:
-            self.parts.append("\n")
+            self._append("\n")
 
     def handle_data(self, data: str) -> None:
         """Collect visible character data outside hidden script or style tags."""
         if not self.hidden:
-            self.parts.append(data)
+            self._append(data)
 
 
-def plain_text(value: object, limit: int, *, html: bool = True) -> str:
+def plain_text(value: object, limit: int, *, html: bool = True, mark_blockquotes: bool = False) -> str:
     """Normalize untrusted text; with html=True, also strip markup.
 
     Plain-text fields (such as GitLab titles) keep literal text like "Vec<u8>".
+    Mailing-list body conversion may preserve HTML blockquotes as quote markers.
     """
     if not isinstance(value, str):
         return ""
     truncated_raw = len(value) > limit * 4
     text = value[: limit * 4]
     if html:
-        parser = _TextParser()
+        parser = _TextParser(limit, mark_blockquotes=mark_blockquotes)
         parser.feed(text)
         pending, hidden = parser.rawdata, parser.hidden
         literal_tail = ""
@@ -230,7 +267,7 @@ def plain_text(value: object, limit: int, *, html: bool = True) -> str:
             parser.rawdata = ""
         parser.close()
         if not hidden and literal_tail:
-            parser.parts.append(literal_tail)
+            parser.handle_data(literal_tail)
         text = "".join(parser.parts)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = _SURROGATE_RE.sub("\ufffd", text)
@@ -302,7 +339,12 @@ def canonical_url(value: str) -> str:
     if host == "gitlab.torproject.org":
         path = re.sub(r"/-/issues/(\d+)/?\Z", r"/-/work_items/\1", path, flags=re.I)
     query = urlencode([(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if not k.lower().startswith("utm_")])
-    return urlunsplit(("https", authority, path, query, parsed.fragment))
+    canonical = urlunsplit(("https", authority, path, query, parsed.fragment))
+    # Saved citations must remain valid when packet and publication readers
+    # validate them again; query escaping can expand a shorter supplied URL.
+    if len(canonical) > 4096:
+        raise ValueError("Invalid source URL")
+    return canonical
 
 
 def safe_canonical_url(url: object) -> str:
