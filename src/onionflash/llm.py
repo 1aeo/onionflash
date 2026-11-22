@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import re
 import time
 import unicodedata
+from collections.abc import Iterable
 
 from .config import completion_budget_seconds
 from .schema import CATEGORIES, CONFIDENCES, STATES
-from .transport import DeadlineReached, FetchError, HttpClient
+from .transport import DeadlineReached, FetchError, HttpClient, Response, is_event_stream
+
+_HTTP_CLIENT_CLASS = HttpClient
 from .util import LIST_ARCHIVE_HOST, _url_host, has_invalid_text_chars, is_trove_item, strict_json
 
 _ACRONYM_ALLOWLIST = frozenset({
@@ -381,6 +385,157 @@ def generation_options(settings: dict) -> dict:
     return options
 
 
+SSE_WIRE_MULTIPLIER = 16
+MIN_SSE_WIRE_BYTES = 32 * 1024 * 1024
+MIN_SSE_LINE_BYTES = 262144
+
+
+def parse_sse_completion(chunks: Iterable[bytes], *, max_content_bytes: int) -> bytes:
+    """Assemble an OpenAI-compatible SSE chat completion stream into strict JSON bytes."""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+    line_limit = max(max_content_bytes, MIN_SSE_LINE_BYTES)
+    line_parts: list[str] = []
+    line_bytes = 0
+    data_lines: list[str] = []
+    parts: list[str] = []
+    content_bytes = 0
+    saw_content_str = False
+    finish_reason: str | None = None
+    skip_lf = False
+    done = False
+
+    def flush_event() -> bool:
+        """Decode one accumulated SSE event payload; return False on [DONE]."""
+        nonlocal content_bytes, saw_content_str, finish_reason
+        if not data_lines:
+            return True
+        payload_str = "\n".join(data_lines)
+        data_lines.clear()
+        if payload_str.strip() == "[DONE]":
+            return False
+        try:
+            chunk = json.loads(payload_str)
+        except (ValueError, RecursionError):
+            raise FetchError("invalid SSE response") from None
+        if not isinstance(chunk, dict):
+            raise FetchError("invalid SSE response")
+        if chunk.get("error"):
+            raise FetchError("upstream stream error")
+        choices = chunk.get("choices")
+        if choices == []:
+            return True
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise FetchError("invalid SSE response")
+        choice = choices[0]
+        delta = choice.get("delta")
+        if delta is not None:
+            if not isinstance(delta, dict):
+                raise FetchError("invalid SSE response")
+            piece = delta.get("content")
+            if piece is not None:
+                if not isinstance(piece, str):
+                    raise FetchError("invalid SSE response")
+                saw_content_str = True
+                try:
+                    content_bytes += len(piece.encode("utf-8"))
+                except UnicodeEncodeError:
+                    raise FetchError("invalid SSE response") from None
+                if content_bytes > max_content_bytes:
+                    raise FetchError("response exceeds configured byte limit")
+                parts.append(piece)
+        reason = choice.get("finish_reason")
+        if reason is not None:
+            if not isinstance(reason, str):
+                raise FetchError("invalid SSE response")
+            if reason:
+                finish_reason = reason
+        return True
+
+    def finish_line() -> bool:
+        """Consume the current buffered SSE line and reset line state."""
+        nonlocal line_bytes
+        line = "".join(line_parts)
+        line_parts.clear()
+        line_bytes = 0
+        if not line:
+            return flush_event()
+        if line.startswith(":"):
+            return True
+        field, sep, value = line.partition(":")
+        if sep and value.startswith(" "):
+            value = value[1:]
+        if field == "data":
+            data_lines.append(value)
+        return True
+
+    def append_segment(segment: str) -> None:
+        """Append decoded text to the active SSE line within the per-line byte bound."""
+        nonlocal line_bytes
+        if not segment:
+            return
+        seg_bytes = len(segment.encode("utf-8"))
+        if line_bytes + seg_bytes > line_limit:
+            raise FetchError("response exceeds configured byte limit")
+        line_bytes += seg_bytes
+        line_parts.append(segment)
+
+    def feed_text(text: str) -> None:
+        """Split decoded UTF-8 text into CRLF/LF/CR SSE lines across chunk boundaries."""
+        nonlocal skip_lf, done
+        pos = 0
+        total = len(text)
+        while pos < total and not done:
+            if skip_lf:
+                skip_lf = False
+                if text[pos] == "\n":
+                    pos += 1
+                    continue
+            cr = text.find("\r", pos)
+            lf = text.find("\n", pos)
+            if cr == -1 and lf == -1:
+                append_segment(text[pos:])
+                break
+            if cr != -1 and (lf == -1 or cr < lf):
+                append_segment(text[pos:cr])
+                if not finish_line():
+                    done = True
+                    return
+                if cr + 1 < total and text[cr + 1] == "\n":
+                    pos = cr + 2
+                else:
+                    skip_lf = cr + 1 == total
+                    pos = cr + 1
+            else:
+                append_segment(text[pos:lf])
+                if not finish_line():
+                    done = True
+                    return
+                pos = lf + 1
+
+    try:
+        for raw_chunk in chunks:
+            feed_text(decoder.decode(raw_chunk, final=False))
+            if done:
+                break
+        if not done:
+            feed_text(decoder.decode(b"", final=True))
+    except UnicodeDecodeError:
+        raise FetchError("invalid SSE response") from None
+
+    if not done and line_parts and not finish_line():
+        done = True
+    if not done and data_lines:
+        flush_event()
+
+    if finish_reason is None:
+        raise FetchError("incomplete SSE completion")
+    body = {"choices": [{"finish_reason": finish_reason, "message": {"content": "".join(parts) if saw_content_str else None}}]}
+    try:
+        return strict_json(body, sort_keys=False).encode("utf-8")
+    except (UnicodeEncodeError, ValueError, TypeError):
+        raise FetchError("invalid SSE response") from None
+
+
 class CompletionClient:
     """Shared chat-completion HTTP client with endpoint failover and schema enforcement."""
 
@@ -451,7 +606,11 @@ class CompletionClient:
             "max_tokens": options["max_tokens"],
             "response_format": {"type": "json_schema", "json_schema": {"name": name, "strict": True, "schema": schema}},
             **options,
+            "stream": True,
         }
+        max_bytes = int(self.http_settings.get("max_response_bytes", 4 * 1024 * 1024))
+        stream_limit = max(max_bytes * SSE_WIRE_MULTIPLIER, MIN_SSE_WIRE_BYTES)
+        req_headers = {"Authorization": "Bearer " + key, "Accept-Encoding": "identity"}
         failure = None
         for base_url in [self.llm["base_url"], *self.llm["fallback_base_urls"]]:
             self._admit(failure)
@@ -465,12 +624,29 @@ class CompletionClient:
                 raise
             self.calls += 1
             try:
-                response = self.client.request(
-                    "POST",
-                    base_url + "/chat/completions",
-                    headers={"Authorization": "Bearer " + key},
-                    json_body=request,
-                )
+                if isinstance(self.client, _HTTP_CLIENT_CLASS):
+                    response = self.client.request(
+                        "POST",
+                        base_url + "/chat/completions",
+                        headers=req_headers,
+                        json_body=request,
+                        stream_reader=lambda chunks: parse_sse_completion(chunks, max_content_bytes=max_bytes),
+                        stream_limit=stream_limit,
+                    )
+                else:
+                    response = self.client.request(
+                        "POST",
+                        base_url + "/chat/completions",
+                        headers=req_headers,
+                        json_body=request,
+                    )
+                    if is_event_stream(response.headers):
+                        response = Response(
+                            response.status,
+                            parse_sse_completion((response.body,), max_content_bytes=max_bytes),
+                            response.headers,
+                            response.url,
+                        )
                 break
             except FetchError as exc:
                 # An endpoint or credential problem is not this item's fault.
