@@ -258,6 +258,14 @@ def retry_delay(attempt: int, settings: dict, retry_after: str | None = None,
     return delay
 
 
+def is_event_stream(headers: Any) -> bool:
+    """Return whether HTTP headers declare an SSE text/event-stream content type."""
+    for key, value in headers.items():
+        if key.lower() == "content-type":
+            return value.split(";", 1)[0].strip().lower() == "text/event-stream"
+    return False
+
+
 class HttpClient:
     """A reusable client for sequential requests; one request may be in flight."""
 
@@ -350,9 +358,8 @@ class HttpClient:
             self.deadline_reached = True
             raise DeadlineReached(request_started=self._request_started)
 
-    def _body(self, response: httpx.Response) -> bytes:
-        limit = int(self.settings.get("max_response_bytes", 4 * 1024 * 1024))
-
+    def _iter_body(self, response: httpx.Response, *, limit: int):
+        """Yield bounded, decompressed body chunks from an HTTP response stream."""
         def check_size(size: int) -> None:
             """Raise FetchError when size exceeds the configured byte limit."""
             if size > limit:
@@ -362,7 +369,9 @@ class HttpClient:
             # MockTransport commonly constructs already-read responses. The
             # production transport always supplies an unread bounded stream.
             check_size(len(response.content))
-            return response.content
+            if response.content:
+                yield response.content
+            return
         if length := response.headers.get("content-length"):
             try:
                 declared = int(length)
@@ -376,25 +385,28 @@ class HttpClient:
         if encoding not in {*wbits, "", "identity"}:
             raise FetchError("unsupported content encoding")
         decoder = zlib.decompressobj(wbits[encoding]) if encoding in wbits else None
-        body, raw_size, deflate_fallback = bytearray(), 0, encoding == "deflate"
+        raw_size, decoded_size, deflate_fallback = 0, 0, encoding == "deflate"
         try:
-            for chunk in response.iter_raw(chunk_size=65536):
+            for chunk in response.iter_raw(chunk_size=None):
                 check_size(raw_size := raw_size + len(chunk))
                 if not decoder:
-                    body.extend(chunk)
+                    if chunk:
+                        yield chunk
                     continue
                 pending = chunk
                 while pending:
                     try:
-                        decoded = decoder.decompress(pending, limit - len(body) + 1)
+                        decoded = decoder.decompress(pending, limit - decoded_size + 1)
                         deflate_fallback = False
                     except zlib.error:
-                        if not deflate_fallback or body:
+                        if not deflate_fallback or decoded_size:
                             raise
                         deflate_fallback, decoder = False, zlib.decompressobj(-zlib.MAX_WBITS)
-                        decoded = decoder.decompress(pending, limit - len(body) + 1)
-                    check_size(len(body) + len(decoded))
-                    body.extend(decoded)
+                        decoded = decoder.decompress(pending, limit - decoded_size + 1)
+                    check_size(decoded_size + len(decoded))
+                    if decoded:
+                        decoded_size += len(decoded)
+                        yield decoded
                     if decoder.unconsumed_tail:
                         pending = decoder.unconsumed_tail
                     elif decoder.eof and decoder.unused_data and encoding in {"gzip", "x-gzip"}:
@@ -402,17 +414,23 @@ class HttpClient:
                     else:
                         pending = b""
             if decoder:
-                flushed = decoder.flush(limit - len(body) + 1)
-                check_size(len(body) + len(flushed))
-                body.extend(flushed)
+                flushed = decoder.flush(limit - decoded_size + 1)
+                check_size(decoded_size + len(flushed))
+                if flushed:
+                    decoded_size += len(flushed)
+                    yield flushed
                 if not decoder.eof or decoder.unused_data:
                     raise FetchError("invalid compressed response")
         except zlib.error:
             raise FetchError("invalid compressed response") from None
-        return bytes(body)
+
+    def _body(self, response: httpx.Response) -> bytes:
+        limit = int(self.settings.get("max_response_bytes", 4 * 1024 * 1024))
+        return b"".join(self._iter_body(response, limit=limit))
 
     def request(self, method: str, url: str, headers: dict[str, str] | None = None,
-                json_body: Any = None) -> Response:
+                json_body: Any = None, *, stream_reader: Callable[[Iterable[bytes]], bytes] | None = None,
+                stream_limit: int | None = None) -> Response:
         """Send one bounded GET or POST request with connect-time IP checks and retries."""
         method = method.upper()
         if method not in {"GET", "POST"}:
@@ -475,7 +493,14 @@ class HttpClient:
                                              retryable=True, retry_after=response.headers.get("retry-after"))
                         if response.status_code >= 400:
                             raise FetchError(f"HTTP {response.status_code}", status=response.status_code)
-                        body = b"" if response.status_code in {204, 205, 304} else self._body(response)
+                        if response.status_code in {204, 205, 304}:
+                            body = b""
+                        elif stream_reader is not None and is_event_stream(response.headers):
+                            wire_limit = (int(stream_limit) if stream_limit is not None
+                                          else int(self.settings.get("max_response_bytes", 4 * 1024 * 1024)))
+                            body = stream_reader(self._iter_body(response, limit=wire_limit))
+                        else:
+                            body = self._body(response)
                         return Response(response.status_code, body, dict(response.headers), current)
             except DeadlineReached as exc:
                 self.deadline_reached = True

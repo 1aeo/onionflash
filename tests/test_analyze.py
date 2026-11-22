@@ -851,6 +851,7 @@ def test_enabled_writer_sends_the_declared_profile_exactly(capture):
         "top_p": 0.95, "top_k": 20, "min_p": 0.0,
         "presence_penalty": 0.0, "repetition_penalty": 1.0, "reasoning_effort": "xhigh",
         "chat_template_kwargs": {"enable_thinking": True},
+        "stream": True,
     }
     assert json.loads(sent.content) == expected
     assert transport["max_response_bytes"] == 2097152
