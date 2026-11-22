@@ -16,6 +16,16 @@ output_dir = "build/public"
 [comments]
 enabled = false
 
+# Optional daily sync of public Tor Project contributor and AROI operator registries.
+# Existing installations remain disabled until explicitly enabled.
+[registry]
+enabled = false
+
+# Optional deterministic identity list overrides:
+# [collection]
+# tor_core_gitlab_users = ["arma", "nickm"]
+# trusted_operator_domains = ["1aeo.com"]
+
 [llm]
 # Supply a base URL ending in /v1, or set a literal endpoint here. The API key is
 # read from the ONIONFLASH_LLM_API_KEY environment variable.

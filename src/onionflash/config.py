@@ -11,6 +11,7 @@ import tomllib
 from pathlib import Path
 from urllib.parse import unquote, urlsplit, urlunsplit
 
+from .registry import DEFAULT_TOR_CORE_USERS
 from .schema import PRODUCTS
 from .util import DIRAUTH_GITLAB_USERS, canonical_url, is_valid_domain, is_valid_gitlab_user
 
@@ -54,6 +55,7 @@ DEFAULTS = {
         "analysis_reserve_fraction": 0.5,
         "trusted_operator_domains": DEFAULT_TRUSTED_OPERATOR_DOMAINS,
         "dirauth_gitlab_users": list(DIRAUTH_GITLAB_USERS),
+        "tor_core_gitlab_users": list(DEFAULT_TOR_CORE_USERS),
     },
     "http": {
         "timeout_seconds": 30,
@@ -69,6 +71,7 @@ DEFAULTS = {
         "user_agent": "OnionFlash (+https://github.com/1aeo/onionflash)",
     },
     "comments": {"enabled": False},
+    "registry": {"enabled": False},
     "llm": {
         "base_url": "",
         "fallback_base_urls": [],
@@ -101,7 +104,7 @@ BOUNDS = {
 }
 
 OPERATOR_SETTINGS = {
-    "collection": {"trusted_operator_domains", "dirauth_gitlab_users"},
+    "collection": {"trusted_operator_domains", "dirauth_gitlab_users", "tor_core_gitlab_users"},
     "http": set(),
     "llm": {
         "base_url", "fallback_base_urls", "model", "allowed_networks",
@@ -111,8 +114,9 @@ OPERATOR_SETTINGS = {
 }
 
 SECTION_SPECS = {
-    "collection": {"lists": ("trusted_operator_domains", "dirauth_gitlab_users")},
+    "collection": {"lists": ("trusted_operator_domains", "dirauth_gitlab_users", "tor_core_gitlab_users")},
     "comments": {"bools": ("enabled",)},
+    "registry": {"bools": ("enabled",)},
     "site": {
         "ints": {"page_size": BOUNDS["page_size"]},
         "strings": {"title": (0, 300), "description": (0, 300)},
@@ -328,6 +332,10 @@ def load_config(path: str | Path) -> dict:
     config["collection"]["dirauth_gitlab_users"] = _clean_ident_list(
         config["collection"]["dirauth_gitlab_users"], 200, is_valid_gitlab_user,
         "Each dirauth_gitlab_users entry must be a valid GitLab username",
+    )
+    config["collection"]["tor_core_gitlab_users"] = _clean_ident_list(
+        config["collection"]["tor_core_gitlab_users"], 500, is_valid_gitlab_user,
+        "Each tor_core_gitlab_users entry must be a valid GitLab username",
     )
 
     config["site"]["base_url"] = _clean_endpoint_url(

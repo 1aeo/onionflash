@@ -20,7 +20,7 @@ from onionflash.review import EDITABLE, Reviewer, final_holds, policy_hash
 from onionflash.review_gate import OUTCOME_STAGES, ReviewRequests, advance_review, initial_review_state, recovery_status
 from onionflash.schema import ITEM_ID_RE
 from onionflash.source_packet import LIMITS, OPTIONAL_SOURCE_FIELDS, normalize_labels, number_sources
-from onionflash.util import item_cluster, plain_text, safe_canonical_url, story_cluster
+from onionflash.util import effective_authority, item_cluster, mandatory_news_rule, plain_text, safe_canonical_url, story_cluster
 
 CASE_FILES = ("review_cases.json", "review_cases_judged.json", "review_cases_roles.json")
 SCOPES = ("story", "latest_update")
@@ -48,14 +48,17 @@ class EvaluationReviewer(Reviewer):
 
 def _expand_source(src: dict) -> tuple[dict, list]:
     unit = {**src, "labels": normalize_labels(src.get("labels"))}
-    if "unquoted_content" not in unit:
-        body = "\n\n".join(
-            p["text"] if isinstance(p, dict) else p
-            for p in src["passages"]
-            if not (isinstance(p, dict) and "author" in p)
-        )
-        if is_quoted_list_post(src.get("url"), body) and (unquoted := unquoted_mail_text(body)):
-            unit["unquoted_content"] = plain_text(unquoted, LIMITS["max_source_chars"], html=False)
+    body = "\n\n".join(
+        p["text"] if isinstance(p, dict) else p
+        for p in src["passages"]
+        if not (isinstance(p, dict) and "author" in p)
+    )
+    if "unquoted_content" not in unit and is_quoted_list_post(src.get("url"), body) and (unquoted := unquoted_mail_text(body)):
+        unit["unquoted_content"] = plain_text(unquoted, LIMITS["max_source_chars"], html=False)
+    if "mandatory_news_rule" not in unit:
+        rule_item = {**unit, "content": body}
+        if (rule := mandatory_news_rule({**rule_item, "authority": effective_authority(rule_item)})) is not None:
+            unit["mandatory_news_rule"] = rule
     return unit, [src["title"], *src["passages"]]
 
 
@@ -296,6 +299,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                                 "cluster_key": story_cluster(identity_item),
                                 "payload": {"editorial_kind": source["kind"]},
                                 "dirauth_users": list(config["collection"]["dirauth_gitlab_users"]),
+                                "tor_core_users": list(config["collection"]["tor_core_gitlab_users"]),
                                 "row": {"url": row_source["url"], "story_id": prior_id,
                                         "cluster_key": item_cluster(identity_item),
                                         "payload": json.dumps(row_item)}}

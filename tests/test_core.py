@@ -1559,3 +1559,41 @@ def test_configured_trailing_dot_gitlab_source_uses_absolute_dns_and_canonical_i
     assert len(collected["items"]) == 1
     assert collected["items"][0]["url"] == "https://gitlab.example.org/tpo/core/tor/-/issues/42"
     assert item_identity(collected["items"][0]) == "https://gitlab.example.org/tpo/core/tor/-/issues/42"
+
+
+def test_registry_and_tor_core_gitlab_users_config_validation(tmp_path, monkeypatch):
+    """Validate `[registry]` boolean settings and `[collection].tor_core_gitlab_users` list rules."""
+    from onionflash.registry import DEFAULT_TOR_CORE_USERS
+
+    monkeypatch.setenv("ONIONFLASH_LLM_BASE_URL", "https://model.example/v1")
+    assert DEFAULTS["registry"] == {"enabled": False}
+    assert DEFAULTS["collection"]["tor_core_gitlab_users"] == list(DEFAULT_TOR_CORE_USERS)
+
+    example_path = tmp_path / "example.toml"
+    example_path.write_text(EXAMPLE_TOML, encoding="utf-8")
+    example_cfg = load_config(example_path)
+    assert example_cfg["registry"] == {"enabled": False}
+    assert example_cfg["collection"]["tor_core_gitlab_users"] == list(DEFAULT_TOR_CORE_USERS)
+
+    enabled_cfg = load_config(
+        write_toml(
+            tmp_path / "reg_on",
+            '[registry]\nenabled = true\n[collection]\ntor_core_gitlab_users = ["  NickM ", "arma", "nickm", "User_1.test"]\n',
+        )
+    )
+    assert enabled_cfg["registry"] == {"enabled": True}
+    assert enabled_cfg["collection"]["tor_core_gitlab_users"] == ["nickm", "arma", "user_1.test"]
+
+    for bad_reg in ('[registry]\nenabled = "yes"\n', '[registry]\nunknown = true\n', 'registry = "bad"\n'):
+        with pytest.raises(ValueError):
+            load_config(write_toml(tmp_path / "bad_reg", bad_reg))
+
+    with pytest.raises(ValueError, match="tor_core_gitlab_users must be an array"):
+        load_config(write_toml(tmp_path / "bad_type", '[collection]\ntor_core_gitlab_users = "nickm"\n'))
+
+    for bad_users in (
+        "[123]", '[""]', '["_hc"]', '[".."]', '["bad..user"]', '["trail."]',
+        '["@nickm"]', f'["{"a" * 101}"]', json.dumps([f"user{i}" for i in range(501)]),
+    ):
+        with pytest.raises(ValueError, match="tor_core_gitlab_users"):
+            load_config(write_toml(tmp_path / "bad_users", f"[collection]\ntor_core_gitlab_users = {bad_users}\n"))

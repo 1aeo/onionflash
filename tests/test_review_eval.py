@@ -423,7 +423,7 @@ def test_editorial_skips_misses_coverage_verification_and_final_checks(evaluatio
     seen = []
     monkeypatch.setattr(
         module, "EvaluationReviewer",
-        _scripted(lambda _c, v: {"verdict": "skip"} if v else {"verdict": "revise", "repair": {"summary": "A source-supported statement."}}, coverages=seen),
+        _scripted(lambda _c, v: ("skip", None) if v else {"verdict": "revise", "repair": {"summary": "A source-supported statement."}}, coverages=seen),
     )
     cov_out = tmp_path / "coverage.jsonl"
     rcov = module.evaluate(config, [cov_case], cov_out)

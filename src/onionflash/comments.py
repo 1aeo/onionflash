@@ -17,8 +17,9 @@ from urllib.parse import unquote, urlsplit
 
 from .transport import DeadlineReached, FetchError, HttpClient
 from .util import (
-    GITLAB_PROJECT_PATH, after, backoff_until, canonical_url, digest, dirauth_user_set, is_dirauth_item,
-    is_valid_gitlab_user, now_iso, plain_text, saved_object, timestamp, valid_note_list,
+    GITLAB_PROJECT_PATH, after, backoff_until, canonical_url, digest, dirauth_user_set,
+    effective_authority, is_valid_gitlab_user, now_iso, plain_text, saved_object, timestamp,
+    valid_note_list,
 )
 
 
@@ -411,7 +412,16 @@ def _reconcile_dirauth_notes(
     return sorted(retained.values(), key=_note_sort_key, reverse=True)[:MAX_DIRAUTH_NOTES]
 
 
-def _compose(item, notes, checked, *, source_key, dirauth_users=None, window_truncated: bool | None = None):
+def _compose(
+    item,
+    notes,
+    checked,
+    *,
+    source_key,
+    dirauth_users=None,
+    tor_core_users=None,
+    window_truncated: bool | None = None,
+):
     truncated = bool(getattr(notes, "truncated", False) if window_truncated is None else window_truncated)
     result = dict(item)
     content = result.pop("source_content", result.get("content"))
@@ -453,18 +463,19 @@ def _compose(item, notes, checked, *, source_key, dirauth_users=None, window_tru
         result["dirauth_notes"] = dirauth_list
     else:
         result.pop("dirauth_notes", None)
-    if result.get("authority") == "development" and is_dirauth_item(result, dirauth_users):
-        result["authority"] = "dirauth-operator"
+    if result.get("authority") == "development":
+        result["authority"] = effective_authority(result, dirauth_users, tor_core_users)
     elif (
-        result.get("authority") == "dirauth-operator"
+        result.get("authority") in {"dirauth-operator", "tor-core"}
         and (item.get("public_comments") or item.get("dirauth_notes"))
-        and not is_dirauth_item({**result, "authority": "development"}, dirauth_users)
     ):
-        result["authority"] = "development"
+        recomputed = effective_authority({**result, "authority": "development"}, dirauth_users, tor_core_users)
+        if recomputed in {"development", "tor-core", "dirauth-operator"}:
+            result["authority"] = recomputed
     return result
 
 
-def merge_cached_comments(store, item, source, observed=None, *, dirauth_users=None):
+def merge_cached_comments(store, item, source, observed=None, *, dirauth_users=None, tor_core_users=None):
     """Keep the verified snapshot on a REST refresh; Store.ingest rejects stale revisions.
 
     REST activity after the last check, or a missing snapshot, requests a check at any status.
@@ -500,6 +511,7 @@ def merge_cached_comments(store, item, source, observed=None, *, dirauth_users=N
         old["comments_checked_at"],
         source_key=key,
         dirauth_users=dirauth_users,
+        tor_core_users=tor_core_users,
         window_truncated=bool(old.get("comments_truncated")),
     )
 
@@ -577,6 +589,7 @@ def enrich_comments(config, store, observed, *, deadline=None):
         store.db.execute(f"DELETE FROM comment_sources WHERE source_id NOT IN ({','.join('?' * len(sources))})", [s["id"] for s in sources])
     # Fresh sessionless client refusing redirects so requests never leave the verified endpoint.
     dirauth_users = config.get("collection", {}).get("dirauth_gitlab_users")
+    tor_core_users = config.get("collection", {}).get("tor_core_gitlab_users")
     client = HttpClient({**config["http"], "max_redirects": 0})
     client.deadline = deadline
     try:
@@ -609,7 +622,8 @@ def enrich_comments(config, store, observed, *, deadline=None):
                     continue
                 try:
                     enriched = _compose(
-                        item, fetch_comments(client, source, item), observed, source_key=key, dirauth_users=dirauth_users
+                        item, fetch_comments(client, source, item), observed,
+                        source_key=key, dirauth_users=dirauth_users, tor_core_users=tor_core_users,
                     )
                 except DeadlineReached:
                     report["budget_reached"] = True
@@ -637,7 +651,7 @@ def enrich_comments(config, store, observed, *, deadline=None):
                         break
                     continue
                 report["checked"] += 1
-                changed = bool(store.ingest(enriched, observed, dirauth_users=dirauth_users))
+                changed = bool(store.ingest(enriched, observed, dirauth_users=dirauth_users, tor_core_users=tor_core_users))
                 report["changed"] += changed
                 with store.db:
                     if not changed:

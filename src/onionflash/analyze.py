@@ -14,9 +14,9 @@ from .llm import (
 )
 from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, STATES, UPDATE_CHARS
 from .source_packet import OPTIONAL_SOURCE_FIELDS
-from .util import LIST_ARCHIVE_HOST, digest, effective_authority, normalize_evidence as _plain
+from .util import LIST_ARCHIVE_HOST, digest, effective_authority, mandatory_news_rule, normalize_evidence as _plain
 
-PROMPT_VERSION = "onionflash-21"
+PROMPT_VERSION = "onionflash-22"
 # Change this when update input filtering changes, independently of prompt prose.
 UPDATE_INPUT_VERSION = 2
 WRITER_REASONING_OPTIONS = {
@@ -176,10 +176,11 @@ Convert ALL-CAPS shouted source phrases to normal sentence case while keeping st
 technical acronyms, and never copy nonexistent three-part C-Tor versions such as 0.4.17
 as valid release numbers (C Tor versions use four numbers, such as 0.4.9.17).
 Metadata fields such as authority (including hackerone, dirauth-operator,
-trusted-operator and project-sender) and author are internal provenance tags, not
-prose role labels: never invent unstated roles from authority alone (write 'a relay
-operator' rather than 'a trusted operator' unless the source text itself uses that
-phrase), cite HackerOne in prose when the source text itself references HackerOne,
+trusted-operator and project-sender, as well as tor-core) and author are internal
+provenance tags, not prose role labels: never invent unstated roles from authority alone
+(write 'a relay operator' rather than 'a trusted operator' unless the source text itself uses
+that phrase), cite HackerOne in prose when the source text itself references HackerOne,
+classify verified TROVE advisories (or mandatory_news_rule="trove") with category=security,
 preserve named hosts or directory authorities (such as Serge, sekhmet, bastet or
 maatuska) when stated in the issue or comments, and always include material
 follow-up corroboration or maintainer triage comments.
@@ -460,11 +461,14 @@ class Analyzer(CompletionClient):
         is_update = prior is not None
         if item["kind"] == "tag":
             return tag_update(item, prior) if is_update else tag_notice(item)
+        auth = effective_authority(item, getattr(self, "dirauth_users", None), getattr(self, "tor_core_users", None))
         bounded = {
             **{key: item.get(key) for key in ("title", "kind", "product", "published_at", "updated_at", "labels", "upstream_state")},
-            "authority": effective_authority(item, getattr(self, "dirauth_users", None)),
+            "authority": auth,
             **{opt: item[opt] for opt in OPTIONAL_SOURCE_FIELDS if isinstance(item.get(opt), str) and item[opt]},
         }
+        if (rule := mandatory_news_rule({**item, "authority": auth})) is not None:
+            bounded["mandatory_news_rule"] = rule
         bounded["content"], notes = analysis_context(item)
         quoted_list = is_quoted_list_post(item.get("url"), bounded["content"])
         if quoted_list and (unquoted := unquoted_mail_text(bounded["content"])):

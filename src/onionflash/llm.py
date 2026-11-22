@@ -11,7 +11,7 @@ import unicodedata
 from .config import completion_budget_seconds
 from .schema import CATEGORIES, CONFIDENCES, STATES
 from .transport import DeadlineReached, FetchError, HttpClient
-from .util import LIST_ARCHIVE_HOST, has_invalid_text_chars, strict_json
+from .util import LIST_ARCHIVE_HOST, has_invalid_text_chars, is_trove_item, strict_json
 
 _ACRONYM_ALLOWLIST = frozenset({
     "TOR", "ARTI", "TCP", "UDP", "TLS", "SSL", "DNS", "HTTP", "HTTPS", "SOCKS", "SOCKS4",
@@ -312,15 +312,21 @@ def is_quoted_list_post(url: object, text: str) -> bool:
 def label_limits(sources: list[dict]) -> dict:
     """The confidence, state and category labels a story told by these sources may carry: confirmed
     needs an official source that is not a tag, or a merged merge request; tagged needs a tag
-    source; and a story told only by merge requests is merged and not a release."""
+    source; a story told only by merge requests is merged and not a release; and verified TROVE
+    advisories must stay categorized as security."""
     confirmable = any((source.get("authority") == "official" and source.get("kind") != "tag")
                       or (source.get("kind") == "gitlab_mr" and source.get("upstream_state") == "merged")
                       for source in sources)
     tagged = any(source.get("kind") == "tag" for source in sources)
     merges = bool(sources) and all(source.get("kind") == "gitlab_mr" for source in sources)
-    return {"confidence": [value for value in CONFIDENCES if confirmable or value != "confirmed"],
-            "state": ["merged"] if merges else [value for value in STATES if tagged or value != "tagged"],
-            "category": [value for value in CATEGORIES if not merges or value != "release"]}
+    trove = any(is_trove_item(source) or source.get("mandatory_news_rule") == "trove" for source in sources)
+    allowed_tags = [value for value in CATEGORIES if not merges or value != "release"]
+    return {
+        "confidence": [value for value in CONFIDENCES if confirmable or value != "confirmed"],
+        "state": ["merged"] if merges else [value for value in STATES if tagged or value != "tagged"],
+        "category": ["security"] if trove else allowed_tags,
+        "tags": allowed_tags,
+    }
 
 
 def apply_label_limits(properties: dict, limits: dict, *, nullable: bool = False) -> None:
@@ -330,10 +336,11 @@ def apply_label_limits(properties: dict, limits: dict, *, nullable: bool = False
         return properties[field]["anyOf"][0] if nullable else properties[field]
 
     for key, allowed in limits.items():
-        if key in properties:
+        if key != "tags" and key in properties:
             rule(key)["enum"] = list(allowed)
-    if "tags" in properties and "category" in properties:
-        rule("tags")["items"]["enum"] = list(rule("category")["enum"])
+    if "tags" in properties and ("tags" in limits or "category" in limits):
+        tags_allowed = limits.get("tags") or limits["category"]
+        rule("tags")["items"]["enum"] = list(tags_allowed)
 
 
 def repair_schema(fields: dict, required: tuple[str, ...]) -> dict:
@@ -398,6 +405,7 @@ class CompletionClient:
         self.client: HttpClient | None = None
         self.calls = 0  # requests sent, for the run report
         self.dirauth_users = (config.get("collection") or {}).get("dirauth_gitlab_users")
+        self.tor_core_users = (config.get("collection") or {}).get("tor_core_gitlab_users")
 
     def __enter__(self) -> CompletionClient:
         return self

@@ -2024,6 +2024,87 @@
           ]
         }
       ]
+    },
+    "verified-trove-advisory": {
+      "sources": [
+        {
+          "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/99001",
+          "title": "TROVE-2026-901: Guard descriptor parser out-of-bounds read",
+          "kind": "gitlab_issue",
+          "authority": "development",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "opened",
+          "labels": [
+            "Security",
+            "Severity::high"
+          ],
+          "passages": [
+            "Advisory TROVE-2026-901 describes an out-of-bounds read in Tor's guard descriptor parser triggered by malformed directory responses on Tor 0.4.9.16 clients.",
+            "No merge request has been merged yet; maintainers are reviewing a proposed bounds check."
+          ]
+        }
+      ]
+    },
+    "community-trove-mention": {
+      "sources": [
+        {
+          "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/MSG99002/",
+          "title": "[tor-relays] Checking installed package version after seeing TROVE-2026-901",
+          "kind": "feed",
+          "authority": "community",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "Hi, I run a single relay on my home server and saw TROVE-2026-901 listed in a package changelog. How do I check which version apt installed on my machine?"
+          ]
+        }
+      ]
+    },
+    "project-sender-new-psa-thread": {
+      "sources": [
+        {
+          "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/MSG99003/",
+          "title": "[tor-relays] [PSA] Bridge operators using obfs4proxy should disable TLS session tickets",
+          "kind": "feed",
+          "authority": "project-sender",
+          "sender_domain": "torproject.org",
+          "product": "network",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "",
+          "passages": [
+            "Bridge operators running obfs4proxy behind a reverse TLS wrapper should disable TLS session tickets in the wrapper configuration because stale ticket keys can interfere with pluggable transport handshakes.",
+            "Please update your wrapper configuration and reload the service."
+          ]
+        }
+      ]
+    },
+    "tor-core-contributor-role": {
+      "sources": [
+        {
+          "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/99004",
+          "title": "Remotely triggerable assertion failure in circuit padding negotiation",
+          "kind": "gitlab_issue",
+          "authority": "tor-core",
+          "author": "alex-tor",
+          "product": "tor",
+          "published_at": "2026-11-10T12:00:00Z",
+          "updated_at": "2026-11-10T12:00:00Z",
+          "upstream_state": "opened",
+          "labels": [
+            "Security",
+            "Severity::high"
+          ],
+          "passages": [
+            "Alex (account @alex-tor) filed this security report describing a remotely triggerable assertion failure when Tor 0.4.9.16 relays process malformed circuit padding negotiation frames.",
+            "The report attaches a reproducer and proposes adding bounds validation in a future merge request; no fix has been merged or committed to C Tor."
+          ]
+        }
+      ]
     }
   },
   "cases": [
@@ -5821,6 +5902,190 @@
         "published_at": "2026-11-13T19:35:00Z",
         "updated_at": "2026-11-13T19:35:00Z",
         "added_at": "2026-11-13T19:35:00Z"
+      }
+    },
+    {
+      "id": "trove-verified-security-approve",
+      "packet": "verified-trove-advisory",
+      "expected": "approve",
+      "coverage": [
+        "news_value",
+        "source_support",
+        "status",
+        "uncertainty_attribution",
+        "technical_details"
+      ],
+      "candidate": {
+        "id": "2383e0da13d0d46dca94b6d7",
+        "title": "TROVE-2026-901 reports out-of-bounds read in Tor guard descriptor parser",
+        "summary": "Advisory TROVE-2026-901 reports an out-of-bounds read in Tor's guard descriptor parser triggered by malformed directory responses on Tor 0.4.9.16 clients. No merge request has been merged yet.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "high",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-10T12:00:00Z",
+        "updated_at": "2026-11-10T12:00:00Z",
+        "added_at": "2026-11-10T12:00:00Z"
+      }
+    },
+    {
+      "id": "trove-non-security-category-rejected",
+      "packet": "verified-trove-advisory",
+      "expected": "not_approve",
+      "coverage": [
+        "news_value",
+        "source_support",
+        "technical_details"
+      ],
+      "forbidden_classifications": {
+        "category": [
+          "network"
+        ]
+      },
+      "candidate": {
+        "id": "fd2a3b00e2015121ae91628b",
+        "title": "TROVE-2026-901 reports out-of-bounds read in Tor guard descriptor parser",
+        "summary": "Advisory TROVE-2026-901 reports an out-of-bounds read in Tor's guard descriptor parser triggered by malformed directory responses on Tor 0.4.9.16 clients. No merge request has been merged yet.",
+        "why_it_matters": "",
+        "category": "network",
+        "priority": "high",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "network"
+        ],
+        "published_at": "2026-11-10T12:00:00Z",
+        "updated_at": "2026-11-10T12:00:00Z",
+        "added_at": "2026-11-10T12:00:00Z"
+      }
+    },
+    {
+      "id": "community-trove-mention-skip",
+      "packet": "community-trove-mention",
+      "expected": "skip",
+      "coverage": [
+        "news_value"
+      ],
+      "candidate": {
+        "id": "5bdf7c75535d8bd8c9a8b750",
+        "title": "Relay operator asks how to check package version after seeing TROVE-2026-901",
+        "summary": "A community mailing-list post asks how to check which Tor package version apt installed on a home server after seeing TROVE-2026-901 in a changelog.",
+        "why_it_matters": "",
+        "category": "network",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "network"
+        ],
+        "published_at": "2026-11-10T12:00:00Z",
+        "updated_at": "2026-11-10T12:00:00Z",
+        "added_at": "2026-11-10T12:00:00Z"
+      }
+    },
+    {
+      "id": "project-sender-new-thread-psa-approve",
+      "packet": "project-sender-new-psa-thread",
+      "expected": "approve",
+      "coverage": [
+        "news_value",
+        "source_support",
+        "actor_and_action",
+        "operational_advice",
+        "uncertainty_attribution"
+      ],
+      "candidate": {
+        "id": "5ab09d0f2b669fc9444b2108",
+        "title": "PSA on tor-relays asks bridge operators to disable TLS session tickets",
+        "summary": "A tor-relays PSA from torproject.org says bridge operators running obfs4proxy behind a reverse TLS wrapper should disable TLS session tickets because stale ticket keys can interfere with pluggable transport handshakes. It asks operators to update their wrapper configuration and reload the service.",
+        "why_it_matters": "",
+        "category": "network",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "network"
+        ],
+        "tags": [
+          "network"
+        ],
+        "published_at": "2026-11-10T12:00:00Z",
+        "updated_at": "2026-11-10T12:00:00Z",
+        "added_at": "2026-11-10T12:00:00Z"
+      }
+    },
+    {
+      "id": "tor-core-role-neutral-approve",
+      "packet": "tor-core-contributor-role",
+      "expected": "approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support",
+        "uncertainty_attribution",
+        "news_value"
+      ],
+      "candidate": {
+        "id": "ff3a50fa38aae774d4273f37",
+        "title": "Alex reports remotely triggerable assertion failure in circuit padding parsing",
+        "summary": "A public GitLab issue filed by Alex reports a remotely triggerable assertion failure when Tor 0.4.9.16 relays process malformed circuit padding negotiation frames. No fix has been merged.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "high",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-10T12:00:00Z",
+        "updated_at": "2026-11-10T12:00:00Z",
+        "added_at": "2026-11-10T12:00:00Z"
+      }
+    },
+    {
+      "id": "tor-core-unverified-developer-title",
+      "packet": "tor-core-contributor-role",
+      "expected": "not_approve",
+      "coverage": [
+        "actor_and_action",
+        "source_support"
+      ],
+      "unsupported": [
+        "developer Alex"
+      ],
+      "candidate": {
+        "id": "ffd944ccc604897f6d0caa86",
+        "title": "C Tor developer Alex reports remotely triggerable assertion failure in circuit padding parsing",
+        "summary": "A public GitLab issue filed by C Tor developer Alex reports a remotely triggerable assertion failure when Tor 0.4.9.16 relays process malformed circuit padding negotiation frames. No fix has been merged.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "high",
+        "confidence": "reported",
+        "state": "developing",
+        "products": [
+          "tor"
+        ],
+        "tags": [
+          "security"
+        ],
+        "published_at": "2026-11-10T12:00:00Z",
+        "updated_at": "2026-11-10T12:00:00Z",
+        "added_at": "2026-11-10T12:00:00Z"
       }
     }
   ],

@@ -11,9 +11,9 @@ from .llm import (AnalysisError, CompletionClient, apply_label_limits, has_malfo
                   strip_unreleased_tag, validate_schema_field, validate_text)
 from .render import prepare_story
 from .schema import FIELD_LIMITS, LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STATES, STORY_ID_RE, UPDATE_CHARS
-from .util import LIST_ARCHIVE_HOST, canonical_url, digest, normalize_evidence, strict_json
+from .util import LIST_ARCHIVE_HOST, canonical_url, digest, is_trove_item, normalize_evidence, strict_json
 
-REVIEW_VERSION = "onionflash-review-17"
+REVIEW_VERSION = "onionflash-review-18"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details", "news_value", "new_information")
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
@@ -61,13 +61,16 @@ factual evidence and never fills missing packet facts."""
 
 _PERSONAL_ROLE_RULE = (
     "A person's reported activity or sender authority does not establish a role: require explicit "
-    "role evidence rather than inferring an occupation from what the person discusses. "
+    "role evidence in the packet text rather than inferring an occupation (such as relay operator) "
+    "from what the person discusses, posts or compiles; fail actor_and_action if a named person is "
+    "called a relay operator or given any occupation the packet text does not explicitly state for them. "
     "Fail actor_and_action if the text calls a named or identifiable person a developer "
     "without supplied evidence of code authored by that same person and committed into "
-    "C Tor's codebase. Mailing-list participation, sender domain or authority (including "
-    "project-sender and official), technical fluency, self-description, requesting a merge "
-    "request, and proposed/unmerged code do not establish this role. Quoting or attributing "
-    "a developer self-description does not waive this requirement. Another person's commit "
+    "C Tor's codebase. Self-description (including writing 'I am a developer'), quoting or "
+    "attributing a developer self-description, mailing-list participation, sender domain or "
+    "authority (including project-sender and official, tor-core, dirauth-operator, "
+    "trusted-operator and hackerone), technical fluency, requesting a merge request, and "
+    "proposed/unmerged code NEVER establish a developer role. Another person's commit "
     "or a contribution to another project is not evidence for it."
 )
 
@@ -101,7 +104,10 @@ Do not fail or rewrite supported text merely because it is brief or awkward. A s
 why_it_matters may repeat its own summary; an empty why_it_matters is valid. Category and
 priority are editorial labels: flag them only when they materially misrepresent evidence.
 Labels still make claims: a generic bugfix or dependency update is not a security fix
-without a described vulnerability or explicit security classification. Use release for a
+without a described vulnerability or explicit security classification. Conversely, every
+verified TROVE advisory (a packet source with mandatory_news_rule="trove") MUST be
+classified with category "security" (additional tags such as "dos" or "network" may appear
+alongside "security"). Use release for a
 version tag or announced release, not code merely merged into development (classify a
 merged capability as feature/protocol with state=merged). Reported and suspected are both
 acceptable for attributed unconfirmed claims when uncertainty is preserved; do not demand
@@ -123,8 +129,10 @@ why_it_matters in source_support's reason and fail (clearing why_it_matters) for
 claims, >-quoted reply text, unrequested advice, generic boilerplate or casual chat. Fail
 source_support when any field generalizes one sample, treats template checkboxes as proof
 confidential patches shipped, infers developer work, maintainer rulings or fix
-effectiveness beyond the text, omits a material packet disclosure, or labels a bugfix
-release security without a vulnerability.
+effectiveness beyond the text, omits a material packet disclosure, labels a bugfix
+release security without a vulnerability, or assigns any category other than "security" to
+a verified TROVE advisory (packet source with mandatory_news_rule="trove", where repair
+MUST set category to "security" and include "security" in tags).
 actor_and_action: preserve who does what. A developer changing compiled source is not a
 relay operator changing configuration. Preserve requested versus actual action;
 why_it_matters keeps the role terms and audience of the source sentence it restates.
@@ -132,8 +140,9 @@ Check each personal role or affiliation in every target field, including repeate
 {_PERSONAL_ROLE_RULE} Correct every occurrence of an unsupported role across all affected
 target fields, not just the headline: use the person's name alone (when the packet text
 states no role) or a source-stated role such as relay operator, never inventing titles from
-metadata (such as "Tor Project sender" or "trusted operator"), while preserving the
-underlying report or request. Also fail when a different role is
+metadata (such as "Tor Project sender", "trusted operator", "Tor Project developer" or
+"C Tor developer" from authority=tor-core), while preserving the underlying report or request.
+Also fail when a different role is
 substituted (such as relay for directory authority, or operators for software), or when a
 >-quoted mailing-list participant absent from unquoted_content is treated as the main actor.
 status: distinguish an issue/request, merged change, observed tag, announced release,
@@ -149,11 +158,12 @@ do not confirm an attack, compromise or defense bypass. Include material maintai
 disagreement or narrowing rather than presenting disputed or comment-narrowed claims as
 settled fact. Source authority provenance: project-sender marks a verified torproject.org
 list sender, trusted-operator marks a verified large AROI relay-family operator (such as
-1aeo.com), dirauth-operator marks a verified directory-authority operator on GitLab, and
-hackerone
-marks a disclosed HackerOne report — NONE of those authorities confirms a claim. Reserve
+1aeo.com), dirauth-operator marks a verified directory-authority operator on GitLab,
+tor-core marks a listed Tor Project GitLab account, and hackerone
+marks a disclosed HackerOne report — NONE of those authorities confirms a claim or proves a
+person is a developer or C Tor developer. Reserve
 confidence confirmed strictly for an official non-tag Tor Project announcement or a merged
-gitlab_mr; keep reported for issues, comments, hackerone, dirauth-operator,
+gitlab_mr; keep reported for issues, comments, hackerone, dirauth-operator, tor-core,
 project-sender, trusted-operator and community posts, and report mailing-list proposals as
 proposed (state developing, confidence reported, never adopted). Check candidate.confidence
 in reason and fail whenever confirmed lacks an official non-tag announcement or merged
@@ -184,8 +194,17 @@ compare source dates (never the current date): if the newest dated development
 (published_at, merge date, newest public comment, or closing) is more than 14 days before
 updated_at, fail news_value (verdict skip), unless source authority is hackerone, a gitlab_issue in the
 packet cites hackerone.com/reports/ or "Reported via HackerOne" (confidential HackerOne
-reports are routinely disclosed months after their filing date), or source labels include
+reports are routinely disclosed months after their filing date), mandatory_news_rule is
+present (such as a verified TROVE advisory), or source labels include
 Severity::high or Severity::critical (Severity::medium or unlabeled old issues skip).
+Verified TROVE advisories (mandatory_news_rule="trove", official/project/Tor GitLab),
+official Tor Project release announcements (mandatory_news_rule="release_announcement"),
+and new mailing-list threads opened by project-sender or official on lists.torproject.org
+(mandatory_news_rule="torproject_new_thread") are always news (skip only when
+new_information fails as already covered; category="security" for TROVE is enforced in
+source_support). Ordinary
+routine issues from authority=tor-core or replies from authority=project-sender still undergo
+normal news_value filtering.
 Otherwise require a material security report, authority change, significant availability
 incident, meaningful release/tag, major feature/capability users or operators can now use,
 changed default, shipped protocol/defense milestone, merged fix for a remotely triggerable
@@ -338,6 +357,8 @@ Evaluate all nine criteria in order before choosing verdict:
    (support only in an earlier source, prior_story or >-quoted reply history fails). Do not generalize one
    observer's relay or version, or invent "a new relay" from "with previous versions". Explicit title qualifiers
    such as "(Android Only)" or "alpha" govern over generic "for all platforms" template text.
+   When a packet source has mandatory_news_rule="trove", candidate.category MUST be "security"
+   (fail source_support and revise category to "security" otherwise).
 2. actor_and_action: Preserve who did or said what. Check every named or implied speaker against that specific
    passage's author field (and unquoted_content on mailing-list replies); fail if one commenter's or >-quoted
    participant's statement is attributed to an adjacent commenter, the reply sender, the issue opener or official
@@ -357,7 +378,7 @@ Evaluate all nine criteria in order before choosing verdict:
    maintainer disagreement or narrowing. Reserve confidence "confirmed" for an official non-tag Tor Project
    announcement or merged gitlab_mr (or when coverage_background.prior_story.confidence is already "confirmed",
    which must never be downgraded). Community, issue, hackerone, dirauth-operator, project-sender and trusted-operator
-   sources remain confidence "reported", never "confirmed" (use "reports", "says" or "notes", never "confirms"), and
+   and tor-core sources remain confidence "reported", never "confirmed" (use "reports", "says" or "notes", never "confirms"), and
    overload, flag loss or counters alone do not confirm an attack or compromise.
 5. scope_timing: Retain exact affected products, software versions, platforms, sample bounds, dates and inspection
    dates from the cited source; never merge adjacent version numbers when the observer measured only one version,
@@ -539,9 +560,14 @@ def repair_limits(
 def within_label_limits(mapping: dict, limits: dict) -> bool:
     """Return whether every present classification field and tag in `mapping` obeys `limits`."""
     tags = mapping.get("tags")
+    tags_allowed = limits.get("tags", limits["category"])
     return (
-        all(isinstance(mapping[key], str) and mapping[key] in allowed for key, allowed in limits.items() if key in mapping)
-        and (tags is None or (isinstance(tags, list) and all(isinstance(tag, str) and tag in limits["category"] for tag in tags)))
+        all(
+            isinstance(mapping[key], str) and mapping[key] in allowed
+            for key, allowed in limits.items()
+            if key != "tags" and key in mapping
+        )
+        and (tags is None or (isinstance(tags, list) and all(isinstance(tag, str) and tag in tags_allowed for tag in tags)))
     )
 
 
@@ -782,6 +808,7 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
     text, so every caller reaches the same answer, and none needs a model call."""
     sources = prepared["packet"]["sources"]
     limits = label_limits(sources)
+    trove_item = any(is_trove_item(source) or source.get("mandatory_news_rule") == "trove" for source in sources)
     merged = _plain("\n".join(source["title"] for source in sources
                               if source.get("kind") == "gitlab_mr" and source.get("upstream_state") == "merged"))
     all_proof = _plain("\n".join(passage["text"] for source in sources for passage in source["passages"]))
@@ -830,6 +857,7 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
         ("shouting_caps", not is_alert and any(has_shouting_caps(text) for text in texts)),
         ("malformed_version", not is_alert and any(has_malformed_tor_version(text, products) for text in texts)),
         ("untrusted_operator_claim", not is_alert and untrusted_claim),
+        ("trove_category", not is_alert and prepared.get("mode") != "update" and trove_item and candidate.get("category") != "security"),
     ) if held]
 
 

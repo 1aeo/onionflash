@@ -9,7 +9,7 @@ from .comments import analysis_context
 from .llm import is_quoted_list_post, unquoted_mail_text
 from .util import (
     GITLAB_PROJECT_PATH, canonical_url, digest, effective_authority, gitlab_url_variants,
-    plain_text, safe_canonical_url, saved_object,
+    mandatory_news_rule, plain_text, safe_canonical_url, saved_object,
 )
 
 
@@ -154,6 +154,7 @@ def build_packet(
     *,
     update: bool = False,
     dirauth_users: Iterable[str] | None = None,
+    tor_core_users: Iterable[str] | None = None,
 ):
     """Assemble the bounded numbered source packet and durable bindings for final review."""
     missing, bindings, units, truncated = [], {}, [], False
@@ -222,12 +223,16 @@ def build_packet(
             emitted_ids.add(source_id)
         if item.get("id"):
             emitted_ids.add(item["id"])
+        auth = effective_authority(item, dirauth_users, tor_core_users)
+        rule = mandatory_news_rule({**item, "authority": auth})
         unit = {
             **{key: item.get(key) for key in ("kind", "product", "published_at", "updated_at", "upstream_state")},
-            "authority": effective_authority(item, dirauth_users), "labels": normalize_labels(item.get("labels")),
+            "authority": auth, "labels": normalize_labels(item.get("labels")),
             "url": canonical_url(item["url"]), "title": item["title"], "snapshot": snapshot,
             **{opt: item[opt] for opt in OPTIONAL_SOURCE_FIELDS if isinstance(item.get(opt), str) and item[opt]},
         }
+        if rule is not None:
+            unit["mandatory_news_rule"] = rule
         if item.get("closed_at"):
             unit["closed_at"] = item["closed_at"]
         if captured:
