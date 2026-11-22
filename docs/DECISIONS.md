@@ -57,6 +57,9 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `skipped.gate.not_recent` | The item would start a new story, but its newest dated development is more than 14 days older than its collection. No model was asked. |
 | `skipped.gate.retired_story` | The item maps to a retired story identity or cluster key, which is never recreated. No model was asked. |
 | `skipped.gate.no_new_content` | A re-observed item for its own published story adds no new unquoted comment or body text (or re-observes its own tag notice). No model was asked. |
+| `skipped.gate.quoted_only` | A `lists.torproject.org` reply leaves less than the minimum qualifying unquoted author text after stripping `>`-quoted history and quote-attribution headers. No model was asked. |
+| `skipped.gate.housekeeping` | A non-security item is a pure acknowledgment reply or matches a routine checklist, version-bump, lockfile, or housekeeping chore pattern. No model was asked. |
+| `skipped.gate.duplicate_issue` | An unassociated non-security GitLab issue explicitly duplicates an issue or merge request (or is closed with a duplicate label) whose referenced target already maps to a live published story. No model was asked. |
 | `skipped.network.not_report` | A consensus-health feed entry was not a machine-formatted DocTor report (for example, a human reply or summary). |
 | `skipped.network.below_threshold` | A consensus-health episode ended before reaching its publication threshold. |
 | `skipped.network.before_enable` | A consensus-health incident had already closed before publication was enabled. |
@@ -79,7 +82,7 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `held.verification.disagreed_news` | A verification and the first review disagree on whether news value and new information both pass. |
 | `held.review.release_labels` | A release-label repair request held the candidate, or left a release label on a state that is not released or tagged. |
 | `held.verification.release_labels` | A verification approved a release label on a state that is not released or tagged, with no attempt left to repair it. |
-| `held.verification.official_not_news` | An official item, other than a tag, failed news value in a verification that passed its facts. |
+| `held.verification.official_not_news` | A non-mandatory official stream item (excluding tags), HackerOne disclosure, or recent dirauth-operational directory-authority item (excluding `project-sender` replies and `tor-core`) failed news value in a verification that passed its facts. |
 | `held.verification.repairs_exhausted` | A verification still refused the candidate after the repair limit. |
 | `held.final_check.completed_action` | A story written from an issue reports a completed action that its sources do not. |
 | `held.final_check.compromise_headline` | The headline drops the sources' doubt about a compromise. |
@@ -88,6 +91,7 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `held.final_check.shouting_caps` | The story or update contains unnormalized all-caps shouting. |
 | `held.final_check.malformed_version` | The story or update cites a nonexistent three-part C-Tor version number. |
 | `held.final_check.untrusted_operator_claim` | A new story reports an operational attack, compromise or vulnerability claim solely from an untrusted mailing-list post. |
+| `held.final_check.trove_category` | A verified `TROVE` advisory was approved for a new story without `category = "security"`. |
 | `failed.writer.invalid_output` | The writer's draft did not match its schema. |
 | `failed.writer.evidence_too_short` | A draft evidence quote was too short. |
 | `failed.writer.evidence_not_exact` | A draft evidence quote was not an exact excerpt of the source. |

@@ -108,6 +108,7 @@ def make_item(
     observed: str | None = None,
     author: str = "",
     dirauth_users: Iterable[str] | None = None,
+    tor_core_users: Iterable[str] | None = None,
 ) -> dict:
     """Normalize one collected record and clamp future timestamps to observation time."""
     if observed:
@@ -130,7 +131,7 @@ def make_item(
     clean_author = plain_text(author, 100, html=False)
     if is_valid_gitlab_user(clean_author):
         item["author"] = clean_author
-    item["authority"] = effective_authority(item, dirauth_users)
+    item["authority"] = effective_authority(item, dirauth_users, tor_core_users)
     return item
 
 
@@ -237,7 +238,9 @@ def _feed(
         and len(rss_authors) == len(feed.entries) > 0
         and all(
             raw is not None
-            and entry.get("authors") == [{"name": raw}]
+            and entry.get("author") == raw
+            and isinstance(entry.get("authors"), list)
+            and len(entry["authors"]) == 1
             and _hyperkitty_address(raw) is not None
             for raw, entry in zip(rss_authors, feed.entries)
         )
@@ -408,6 +411,7 @@ def _gitlab(
                     observed=started,
                     author=username,
                     dirauth_users=settings.get("dirauth_gitlab_users"),
+                    tor_core_users=settings.get("tor_core_gitlab_users"),
                 )
             except (KeyError, ValueError, TypeError):
                 continue

@@ -387,6 +387,99 @@ DIRAUTH_GITLAB_USERS = (
     "weasel",     # tor26
 )
 _DIRAUTH_LABELS = frozenset({"directory authority (dirauth)", "dirauth"})
+DEFAULT_TOR_CORE_USERS: tuple[str, ...] = (
+    "acute", "agix", "agrabeli", "ahf", "alsmith", "anadahz", "anarcat", "andreas", "anonym",
+    "antonela", "arlolra", "arma", "arthuredelstein", "arturo", "asn", "atagar", "bdavila",
+    "biella", "boklm", "bokonon", "boyska", "brizental", "christian", "clairehurst", "cohosh",
+    "cve", "dan_b", "dennis_jackson", "dgoulet", "diana", "dianamtor", "diziet", "djackson",
+    "donuts", "drwhax", "egypcio", "elshrek", "emmapeel", "esraa", "eta", "flexlibris", "gaba",
+    "gabi", "gazebook", "geko", "ggus", "gk", "gman999", "groente", "groentor", "gunner",
+    "haxxpop", "hc", "hellais", "hiro", "iang", "iangoldberg", "inf0", "intrigeri", "irl",
+    "isabela", "jacobo", "jnewsome", "juga", "julius", "jvoisin", "karsten", "kat", "kat5",
+    "kevun", "kushal", "lavamind", "lelutin", "linus", "ma1", "mattlav", "meejah", "meskio",
+    "micah", "micahflee", "morgan", "morganava", "mtigas", "n8fr8", "nadya", "nah", "narrira",
+    "nickm", "nicob", "nvjacobo", "ohmygodel", "opara", "pastly", "pavel", "phw", "pierov",
+    "pulls", "q", "qbi", "ramy", "rgdd", "rhatto", "robgjansen", "sajolida", "sanketh",
+    "sarah", "sarthikg", "sebastian", "sengler", "shelikhoo", "sjmurdoch", "stefani",
+    "syverson", "teor", "theenbyperor", "thorin", "tjr", "trinity-1686a", "weasel",
+    "wesleyac", "wseltzer", "wshackleton", "yawningangel", "zen-fu",
+)
+TROVE_RE = re.compile(r"\bTROVE-\d{4}-\d{3,5}\b", re.I)
+CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.I)
+_RELEASE_ANNOUNCE_TITLE_RE = re.compile(
+    r"\b(?:new release|security release|tor (?:stable|alpha|release)\b|\[release\])",
+    re.I,
+)
+_LIST_ARCHIVE_THREAD_PATH_RE = re.compile(
+    r"^/(?:mailman3/hyperkitty/list/[^/]+/(?:message|thread)/[^/]+"
+    r"|archives/list/[^/]+/(?:message|thread)/[^/]+"
+    r"|pipermail/[^/]+/[^/]+/[^/]+"
+    r"|m/[^/]+/?\Z)",
+    re.I,
+)
+
+
+def tor_core_user_set(users: Iterable[str] | None = None) -> set[str]:
+    """Normalize configured or default Tor Project GitLab usernames to lowercase."""
+    return {u.strip().lower() for u in (DEFAULT_TOR_CORE_USERS if users is None else users) if isinstance(u, str) and u.strip()}
+
+
+def _has_gitlab_user_activity(item: dict, users: set[str]) -> bool:
+    """Return whether a Tor GitLab issue/MR author or note author belongs to `users`."""
+    if not users:
+        return False
+    if isinstance(author := item.get("author"), str) and author.strip().lower() in users:
+        return True
+    return any(
+        isinstance(notes := item.get(field), list)
+        and any(isinstance(n, dict) and isinstance(n.get("author"), str) and n["author"].strip().lower() in users for n in notes)
+        for field in ("public_comments", "dirauth_notes")
+    )
+
+
+def trove_ids(item: dict) -> list[str]:
+    """Extract deduplicated uppercase `TROVE-YYYY-NNN` identifiers from title and body."""
+    if not isinstance(item, dict):
+        return []
+    title = item["title"] if isinstance(item.get("title"), str) else ""
+    body = next((item[k] for k in ("source_content", "content") if isinstance(item.get(k), str)), None)
+    if body is None and isinstance(item.get("passages"), list):
+        body = "\n".join(
+            p["text"]
+            for p in item["passages"]
+            if isinstance(p, dict) and "author" not in p and isinstance(p.get("text"), str)
+        )
+    return list(dict.fromkeys(m.upper() for m in TROVE_RE.findall(f"{title}\n{body or ''}")))
+
+
+def cve_ids(item: dict) -> list[str]:
+    """Extract deduplicated uppercase `CVE-YYYY-NNNN` identifiers from title, body, and comments."""
+    if not isinstance(item, dict):
+        return []
+    title = item["title"] if isinstance(item.get("title"), str) else ""
+    body = next((item[k] for k in ("source_content", "content") if isinstance(item.get(k), str)), "")
+    comments = (
+        str(note.get("body") or "")
+        for note in (item.get("public_comments") if isinstance(item.get("public_comments"), list) else ())
+        if isinstance(note, dict)
+    )
+    return list(dict.fromkeys(m.upper() for m in CVE_RE.findall("\n".join((title, body, *comments)))))
+
+
+def is_trove_item(item: dict) -> bool:
+    """Return whether `item` is a verified official, project, or Tor GitLab TROVE advisory."""
+    return (
+        isinstance(item, dict)
+        and bool(trove_ids(item))
+        and (
+            item.get("authority") in {"official", "project-sender", "hackerone", "dirauth-operator", "tor-core"}
+            or (
+                item.get("authority") != "community"
+                and item.get("kind") in {"gitlab_issue", "gitlab_mr"}
+                and _url_host(item.get("url")) == "gitlab.torproject.org"
+            )
+        )
+    )
 
 
 def is_dirauth_item(item: dict, dirauth_users: Iterable[str] | None = None) -> bool:
@@ -399,21 +492,35 @@ def is_dirauth_item(item: dict, dirauth_users: Iterable[str] | None = None) -> b
         return False
     if folded_labels(item) & _DIRAUTH_LABELS:
         return True
-    users = dirauth_user_set(dirauth_users)
-    if isinstance(author := item.get("author"), str) and author.strip().lower() in users:
+    return _has_gitlab_user_activity(item, dirauth_user_set(dirauth_users))
+
+
+def is_tor_core_item(item: dict, tor_core_users: Iterable[str] | None = None) -> bool:
+    """Return whether `item` is a Tor GitLab ticket or MR from or with a Tor core contributor."""
+    if not isinstance(item, dict):
+        return False
+    if item.get("authority") == "tor-core":
         return True
-    return any(
-        isinstance(notes := item.get(field), list)
-        and any(isinstance(n, dict) and isinstance(n.get("author"), str) and n["author"].strip().lower() in users for n in notes)
-        for field in ("public_comments", "dirauth_notes")
-    )
+    if item.get("authority") == "community" or item.get("kind") not in {"gitlab_issue", "gitlab_mr"} or _url_host(item.get("url")) != "gitlab.torproject.org":
+        return False
+    return _has_gitlab_user_activity(item, tor_core_user_set(tor_core_users))
 
 
-def effective_authority(item: dict, dirauth_users: Iterable[str] | None = None) -> str | None:
-    """Return `item`'s authority after promoting HackerOne or directory-authority development items."""
+def effective_authority(
+    item: dict,
+    dirauth_users: Iterable[str] | None = None,
+    tor_core_users: Iterable[str] | None = None,
+) -> str | None:
+    """Return `item`'s authority after promoting HackerOne, dirauth-operator, or tor-core development items."""
     if item.get("authority") != "development":
         return item.get("authority")
-    return "hackerone" if is_hackerone_item(item) else "dirauth-operator" if is_dirauth_item(item, dirauth_users) else "development"
+    if is_hackerone_item(item):
+        return "hackerone"
+    if is_dirauth_item(item, dirauth_users):
+        return "dirauth-operator"
+    if is_tor_core_item(item, tor_core_users):
+        return "tor-core"
+    return "development"
 
 
 _PRODUCT_NAMES = {"tor-browser": r"tor[- ]browser", "arti": "arti", "tor": "tor"}
@@ -440,7 +547,8 @@ _SUBJECT_REPLY_RE = re.compile(r"^(?:re|aw|sv)(?:\[\d+\])?\s*[:.]\s*", re.I)
 
 
 def _item_texts(item: dict) -> tuple[str, str]:
-    header = f"{item.get('title') or ''}\n{item.get('content') or ''}"
+    body = item.get("source_content") if isinstance(item.get("source_content"), str) else item.get("content")
+    header = f"{item.get('title') or ''}\n{body or ''}"
     comments = (str(note.get("body") or "") for note in item.get("public_comments") or ())
     return header, "\n".join((header, *comments))
 
@@ -550,11 +658,8 @@ def release_mentions(item: dict) -> list[str]:
     return list(dict.fromkeys(found))
 
 
-def thread_subject(item: dict) -> tuple[str | None, bool]:
-    """Normalized subject for HyperKitty list items (>= 3 words) and whether it is a reply."""
-    if "/hyperkitty/list/" not in str(item.get("url") or ""):
-        return None, False
-    text = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()
+def _strip_subject_prefixes(title: object) -> tuple[str, bool]:
+    text = re.sub(r"\s+", " ", str(title or "")).strip()
     is_reply = False
     while text:
         if match := _SUBJECT_NOISE_RE.match(text):
@@ -564,5 +669,59 @@ def thread_subject(item: dict) -> tuple[str | None, bool]:
             text = text[match.end() :]
         else:
             break
-    cleaned = text.strip().lower()
+    return text.strip().lower(), is_reply
+
+
+def thread_subject(item: dict) -> tuple[str | None, bool]:
+    """Normalized subject for HyperKitty list items (>= 3 words) and whether it is a reply."""
+    if "/hyperkitty/list/" not in str(item.get("url") or ""):
+        return None, False
+    cleaned, is_reply = _strip_subject_prefixes(item.get("title"))
     return (cleaned if len(cleaned.split()) >= 3 else None), is_reply
+
+
+def is_official_release_announcement(item: dict) -> bool:
+    """Return whether `item` is an official Tor Project release announcement feed entry."""
+    if not isinstance(item, dict) or item.get("authority") != "official" or item.get("kind") != "feed":
+        return False
+    title = str(item.get("title") or "")
+    _, is_reply = _strip_subject_prefixes(title)
+    if is_reply:
+        return False
+    if _RELEASE_ANNOUNCE_TITLE_RE.search(title):
+        return True
+    probe = {
+        "title": title,
+        "content": str(item.get("content") or item.get("source_content") or ""),
+        "kind": item["kind"],
+        "url": str(item.get("url") or ""),
+        **({"product": item["product"]} if item.get("product") else {}),
+    }
+    return item_cluster(probe).startswith("release:")
+
+
+def is_torproject_new_thread(item: dict) -> bool:
+    """Return whether `item` opens a new mailing-list thread from an official or @torproject.org sender."""
+    if not isinstance(item, dict) or _url_host(item.get("url")) != LIST_ARCHIVE_HOST:
+        return False
+    try:
+        path = urlsplit(str(item["url"])).path or ""
+    except ValueError:
+        return False
+    if not _LIST_ARCHIVE_THREAD_PATH_RE.match(path):
+        return False
+    if item.get("authority") not in {"project-sender", "official"}:
+        return False
+    cleaned, is_reply = _strip_subject_prefixes(item.get("title"))
+    return bool(cleaned) and not is_reply
+
+
+def mandatory_news_rule(item: dict) -> str | None:
+    """Return the mandatory news-value rule satisfied by `item`, or None."""
+    if is_trove_item(item):
+        return "trove"
+    if is_official_release_announcement(item):
+        return "release_announcement"
+    if is_torproject_new_thread(item):
+        return "torproject_new_thread"
+    return None

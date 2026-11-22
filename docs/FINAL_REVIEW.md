@@ -36,19 +36,40 @@ tag-only story; existing source mappings retain their history.
 The application enforces recency for new stories before any model request. An item
 that would start a story is ignored, as `skipped.gate.not_recent`, when its newest
 dated development is more than 14 days older than the collection of its current
-revision, unless it is a HackerOne disclosure or an issue labeled `Security` with
-high or critical severity (both exemptions also apply to the reviewer's 14-day
-packet-date check, since confidential HackerOne reports are routinely made public
-months after filing; on `tor-dev`, `trusted-operator` senders share `project-sender`
-eligibility for formal `[Proposal]` posts as well as substantive technical
-critiques, protocol reviews, and empirical multi-relay measurements while keeping
-`confidence` `reported`). That development is the post, creation, merge, tag or timeline event date, a
+revision, unless it is a HackerOne disclosure, a verified `TROVE` advisory
+(`TROVE-YYYY-NNN` in title or body of an official, `project-sender`, `hackerone`,
+`dirauth-operator`, `tor-core`, or non-community `gitlab.torproject.org` item), or an
+issue labeled `Security` with high or critical severity (these exemptions also apply to
+the reviewer's 14-day packet-date check, since confidential HackerOne and embargoed
+`TROVE` reports are routinely made public months after filing; on `tor-dev`,
+`trusted-operator` senders share `project-sender` eligibility for formal `[Proposal]`
+posts as well as substantive technical critiques, protocol reviews, and empirical
+multi-relay measurements while keeping `confidence` `reported`). That development is the post, creation, merge, tag or timeline event date, a
 verified public comment, or the date an issue was closed; an upstream
 `updated_at`, which an edit, a label or a visibility change also moves, never
 counts. Updates of existing stories, locked ones included, still go to review,
 and an operator retry of the revision lifts the limit. A new revision, such as a
 fresh public comment, queues the item again; an issue whose comments were not yet
 verified also gets a comment check, so a fresh comment is not missed.
+
+Before calling the writer or reviewer (when no operator retry exists for the current
+revision, and excluding tags and network-health alerts), the gate also applies three
+pre-LLM deterministic fast-skips:
+
+- `skipped.gate.quoted_only`: `lists.torproject.org` replies whose unquoted prose has
+  fewer than eight normalized characters after stripping `>`-quoted lines and
+  quote-attribution headers.
+- `skipped.gate.housekeeping`: pure acknowledgment replies (`<= 120` chars with no
+  `public_comments`, not closing an existing story) and unassociated checklist,
+  version-bump, lockfile, or housekeeping chore titles, guarded against
+  `mandatory_news_rule` items, HackerOne, `TROVE`, `CVE`, dirauth-operational items,
+  `public_comments`, and protected labels (`Security`, `regression`, `critical`,
+  `Severity::high`, `Severity::critical`).
+- `skipped.gate.duplicate_issue`: unassociated non-security GitLab issues explicitly
+  stating duplication of an issue/MR (or closed issues carrying `duplicate` or
+  `status::duplicate`) whose referenced target already maps to a live published story,
+  guarded against `"not a duplicate"`, `Security` labels, `CVE`/`TROVE` IDs, and
+  security/vulnerability/crash wording.
 
 The writer summarizes the source without selecting news. Its `publish=true` field
 submits a draft for review; only the reviewer decides news value and novelty.
@@ -68,7 +89,8 @@ A separate, bounded coverage background contains the existing article for a
 known update (`prior_story`, never repeated in `recent`) and compact entries
 ordered by recent story activity (`updated_at` or `added_at`). Up to six active
 `related` entries appear first—stories mapped from mentioned GitLab issues or
-merge requests, product-qualified release version mentions, or ambiguous
+merge requests, matching `TROVE-YYYY-NNN` identifiers (`references TROVE-YYYY-NNN`),
+product-qualified release version mentions, or ambiguous
 mailing-list reply threads—with up to 400 summary characters and their `related`
 reason; when a skipped item is retried, active stories from its earlier skipped
 decision follow with `related: "earlier decision"`. Retracted stories appear as
@@ -111,7 +133,9 @@ only `>`-quoted history are refused.
 Historical impact text remains readable. A review repair may clear it, but cannot
 create or rewrite an impact paragraph; operator corrections remain separate.
 Automatic approvals also require consistent metadata: a `release` category or
-tag needs state `released` or `tagged`. An approval of inconsistent labels gets a
+tag needs state `released` or `tagged`, and verified `TROVE` advisories
+(`mandatory_news_rule = "trove"`) constrain writer and repair schemas to
+`category = "security"` (while keeping multi-tag choices available). An approval of inconsistent labels gets a
 repair request that names the problem, then a fresh verification of the repaired
 text; labels that the request leaves in place hold the item. This check does not
 infer facts from source text.
@@ -181,11 +205,23 @@ story; see [merging duplicate stories](EDITORIAL.md#merge-a-duplicate-story).
   `updated_at`, a skip creates no article or revision and leaves existing
   coverage intact. A skip needs a failed news-value or new-information
   criterion, and a skip for new information alone must name an active covered
-  story (not a `retracted` marker); otherwise the item is held. An item from an
-  official, `project-sender`, `hackerone`, or `dirauth-operator` source, other than a
-  version tag, skips only when new information fails; when news value fails while new
-  information passes, it is held for the operator (`held.verification.official_not_news`)
-  once a fresh verification has passed its facts.
+  story (not a `retracted` marker); otherwise the item is held. Three
+  deterministic `mandatory_news_rule` classes—verified `TROVE` advisories
+  (`trove`), official Tor Project release announcements (`release_announcement`),
+  and new non-reply `lists.torproject.org` threads from `project-sender` or
+  `official` senders (`torproject_new_thread`)—override `news_value`-only
+  refusals once factual criteria pass (advancing an initial review to fresh
+  verification and approving at verification when `source_support.source_refs` is
+  non-empty, subject to final checks and release-label repairs, and never
+  caching a `skip` receipt), while still skipping normally when `new_information`
+  fails as already covered. Non-mandatory items from an `official` stream (other
+  than a version tag), `hackerone` disclosures, and recent dirauth-operational
+  `dirauth-operator` items (`Directory Authority (dirauth)`/`dirauth` labels or
+  directory-authority/consensus/voting topics) skip only when new information
+  fails; when news value fails while new information passes, they are held for
+  the operator (`held.verification.official_not_news`) once a fresh verification
+  has passed their facts (`project-sender` replies, `tor-core` items, and
+  non-operational or stale dirauth-author tickets skip normally).
 - `hold`: potentially useful material is unsupported, ambiguous or not ready to
   publish. It remains available through the existing operator controls; a hold
   whose facts passed fresh verification and whose reviews disputed only news
@@ -274,7 +310,7 @@ an older policy can justify a fresh budget; older verdict schemas remain readabl
 
 ## Final checks
 
-A verified approval publishes only if seven fixed checks also pass. They read the
+A verified approval publishes only if eight fixed checks also pass. They read the
 exact candidate, its source packet and the kind of source that wrote its text,
 make no model call, and run again when a saved approval is resumed. A failed
 check holds the item for the operator with its own [decision code](DECISIONS.md);
@@ -303,11 +339,14 @@ skips are not checked.
   vulnerability claim (`untrusted_operator_claim`); eligible `tor-dev` `[RFC]`,
   numbered Tor proposal, and IETF Internet-Draft or IETF RFC specifications that
   propose defenses without asserting a live operational incident are allowed.
+- A new story (outside update scope and network-health alerts) backed by a
+  verified `TROVE` advisory source must carry `category = "security"`
+  (`trove_category`).
 
 The writer's request and every review's repair offer only the confidence,
-state and category labels that these checks allow (and `tagged` only when a
-source is a version tag), and a draft outside them is refused like any other
-invalid draft.
+state and category labels that these checks allow (`tagged` only when a
+source is a version tag, and `category = "security"` for verified `TROVE`
+advisories), and a draft outside them is refused like any other invalid draft.
 
 ## Exact decisions and private state
 

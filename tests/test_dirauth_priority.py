@@ -14,7 +14,10 @@ from onionflash import (
     review_gate, source_packet,
 )
 from onionflash.comments import _compose, merge_cached_comments
-from onionflash.store import DIRAUTH_PRIORITY, HACKERONE_PRIORITY, Store, item_hash, item_hash_fields, item_priority
+from onionflash.store import (
+    DIRAUTH_PRIORITY, HACKERONE_PRIORITY, TOR_CORE_PRIORITY, Store, item_hash, item_hash_fields,
+    item_priority,
+)
 from onionflash.util import DIRAUTH_GITLAB_USERS, digest, is_dirauth_item, is_hackerone_item
 
 
@@ -436,22 +439,26 @@ def test_ninety_day_unembargoed_hackerone_issue_bypasses_not_recent_while_normal
 
 
 def test_prompt_versions_and_hackerone_and_tordev_trusted_operator_rules():
-    """Verify bumped prompt versions and presence of HackerOne and tor-dev trusted-operator instructions."""
-    assert analyze.PROMPT_VERSION == "onionflash-21"
-    assert review.REVIEW_VERSION == "onionflash-review-17"
+    """Verify bumped prompt versions and presence of HackerOne, tor-core, TROVE, and tor-dev rules."""
+    assert analyze.PROMPT_VERSION == "onionflash-22"
+    assert review.REVIEW_VERSION == "onionflash-review-18"
     assert "hackerone" in review_gate.OFFICIAL_AUTHORITIES
     assert "dirauth-operator" in review_gate.OFFICIAL_AUTHORITIES
     analyze_prompt = " ".join(analyze.SYSTEM_PROMPT.split())
     review_prompt = " ".join(review.SYSTEM_PROMPT.split())
     update_prompt = " ".join(review.UPDATE_SYSTEM_PROMPT.split())
     assert "including hackerone, dirauth-operator, trusted-operator and project-sender" in analyze_prompt
+    assert "tor-core" in analyze_prompt and "category=security" in analyze_prompt
     assert "cite HackerOne in prose when the source text itself references HackerOne" in analyze_prompt
     assert "hackerone marks a disclosed HackerOne report" in review_prompt
+    assert "tor-core marks a listed Tor Project GitLab account" in review_prompt
+    assert "mandatory_news_rule" in review_prompt
     assert "unless source authority is hackerone, a gitlab_issue in the packet cites hackerone.com/reports/" in review_prompt
     assert "Disclosed HackerOne reports (authority=hackerone or a gitlab_issue citing hackerone.com/reports/)" in review_prompt
     assert "authority=project-sender or authority=trusted-operator" in review_prompt
     assert "substantive technical critique, protocol review, or empirical multi-relay measurement" in review_prompt
     assert "Community, issue, hackerone, dirauth-operator, project-sender and trusted-operator" in update_prompt
+    assert "tor-core" in update_prompt
 
 
 def test_evicted_dirauth_reply_retains_authority_while_deleted_reply_demotes(tmp_path):
@@ -566,20 +573,22 @@ def test_evicted_dirauth_reply_retains_authority_while_deleted_reply_demotes(tmp
 
 
 @pytest.mark.parametrize(
-    ("users", "author", "expected_prio", "expected_authority", "expected_status", "expected_calls", "expected_code"),
+    ("users", "tor_core_users", "author", "expected_prio", "expected_authority", "expected_status", "expected_calls", "expected_code"),
     [
-        ([], "linus", 0, "development", "ignored", 1, "skipped.review.news_value"),
-        (["custom_auth"], "custom_auth", DIRAUTH_PRIORITY, "dirauth-operator", "held", 2, "held.verification.official_not_news"),
+        ([], [], "linus", 0, "development", "ignored", 1, "skipped.review.news_value"),
+        ([], None, "linus", TOR_CORE_PRIORITY, "tor-core", "ignored", 1, "skipped.review.news_value"),
+        (["custom_auth"], [], "custom_auth", DIRAUTH_PRIORITY, "dirauth-operator", "held", 2, "held.verification.official_not_news"),
     ],
 )
 def test_custom_dirauth_gitlab_users_threads_through_queue_packet_and_gate(
-    tmp_path, users, author, expected_prio, expected_authority, expected_status, expected_calls, expected_code
+    tmp_path, users, tor_core_users, author, expected_prio, expected_authority, expected_status, expected_calls, expected_code
 ):
-    """Honor custom dirauth_gitlab_users (including empty and custom handles) across queue, packet, and gate."""
+    """Honor custom dirauth_gitlab_users and tor_core_gitlab_users across queue, packet, and gate."""
     observed = "2026-11-12T12:00:00Z"
     body = "Minor formatting note opened on a configured authority ticket."
+    suffix = f"{len(users)}-{0 if tor_core_users is None else len(tor_core_users)}-{author}"
     issue = item(
-        url=f"https://gitlab.torproject.org/tpo/core/tor/-/issues/4196{len(users)}",
+        url=f"https://gitlab.torproject.org/tpo/core/tor/-/issues/4196{len(users)}{0 if tor_core_users is None else 1}",
         kind="gitlab_issue",
         authority="development",
         author=author,
@@ -597,11 +606,13 @@ def test_custom_dirauth_gitlab_users_threads_through_queue_packet_and_gate(
         evidence=[body],
     )
     skip_news = verdict("skip", criterion="news_value")
-    cfg = make_config(tmp_path / author)
+    cfg = make_config(tmp_path / suffix)
     cfg["collection"]["dirauth_gitlab_users"] = users
-    assert item_priority(issue, users) == expected_prio
+    if tor_core_users is not None:
+        cfg["collection"]["tor_core_gitlab_users"] = tor_core_users
+    assert item_priority(issue, users, tor_core_users) == expected_prio
 
-    with Store(tmp_path / f"{author}.sqlite3", dirauth_users=users) as store:
+    with Store(tmp_path / f"{suffix}.sqlite3", dirauth_users=users, tor_core_users=tor_core_users) as store:
         store.ingest(dict(issue), observed)
         [row] = store.pending(1, observed)
         assert row["priority_score"] == expected_prio

@@ -13,7 +13,7 @@ import sys
 import time
 import traceback
 
-from . import __version__, decisions, doctor, editorial, rejection
+from . import __version__, decisions, doctor, editorial, registry, rejection
 from .analyze import AnalysisError, Analyzer
 from .collect import CollectionError, collect_source
 from .comments import RUN_BUDGET_SECONDS as COMMENTS_BUDGET, enrich_comments, merge_cached_comments, status as comments_status
@@ -135,6 +135,16 @@ def _operator_command(args, store: Store, config: dict) -> dict:
     return getattr(rejection, args.action + "_item")(store, args.item, args.expect_hash, args.reason)
 
 
+def _effective_config(config: dict, store: Store) -> tuple[dict, list[str]]:
+    tor_core_users, trusted_domains = registry.effective_identities(config, store.db)
+    eff_collection = {
+        **config["collection"],
+        "tor_core_gitlab_users": tor_core_users,
+        "trusted_operator_domains": trusted_domains,
+    }
+    return {**config, "collection": eff_collection}, tor_core_users
+
+
 def run(config: dict, store: Store) -> dict:
     """Collect and review pending items within one deadline, then build the site."""
     consensus_sources = enabled_consensus_sources(config["sources"], check_single=True)
@@ -148,134 +158,159 @@ def run(config: dict, store: Store) -> dict:
     started = time.monotonic()
     budget = config["collection"]["run_budget_seconds"]
     collection_window = budget * (1 - config["collection"]["analysis_reserve_fraction"])
-    comments_enabled = bool(config.get("comments", {}).get("enabled"))
+    registry_budget = min(registry.RUN_BUDGET_SECONDS, collection_window / 2)
+    try:
+        report["registry"] = registry.refresh_if_due(config, store, observed, deadline=started + registry_budget)
+    except Exception as exc:
+        report["registry"] = {
+            "enabled": bool((config.get("registry") or {}).get("enabled", False)),
+            "due": True,
+            "refreshed": False,
+            "updated": {},
+            "errors": [_unexpected_error(exc)],
+        }
+    run_config, tor_core_users = _effective_config(config, store)
+    run_collection = run_config["collection"]
+    comments_enabled = bool(run_config.get("comments", {}).get("enabled"))
     comments_budget = min(COMMENTS_BUDGET, collection_window / 2) if comments_enabled else 0
     collection_deadline = started + collection_window - comments_budget
     network_ingested = {"reports_new": 0, "rejected": 0}
-
-    def record_items(source, items):
-        received = now_iso()
-        if source.get("alert_format") == "consensus":
-            added, rejected = doctor.ingest(store.db, source, list(items), received, config["collection"]["content_chars"])
-            network_ingested["reports_new"] += added
-            network_ingested["rejected"] += rejected
-            return received
-        dirauth_users = config["collection"].get("dirauth_gitlab_users")
-        if comments_enabled:
-            items = (merge_cached_comments(store, item, source, received, dirauth_users=dirauth_users) for item in items)
-        report["items_changed"] += sum(store.ingest(item, received, dirauth_users=dirauth_users) for item in items)
-        return received
-
-    with HttpClient(config["http"]) as client:
-        for source in config["sources"]:
-            if not source["enabled"]:
-                continue
-            state = store.source(source)
-            if not source_due(state, observed):
-                continue
-            remaining = collection_deadline - time.monotonic()
-            if remaining < 1:
-                report["budget_reached"] = True
-                break
-            shared = remaining <= config["collection"]["source_budget_seconds"]
-            client.deadline = time.monotonic() + min(remaining, config["collection"]["source_budget_seconds"])
-            client.deadline_reached = False
-            try:
-                try:
-                    result = collect_source(client, source, state, config["collection"], observed)
-                    received = record_items(source, result["items"])
-                    report["entries_skipped"] += result.get("skipped", 0)
-                    store.source_success(source, result, received, schedule_from=observed)
-                    report["sources_ok"] += 1
-                except CollectionError as exc:
-                    received = record_items(source, exc.items)
-                    out_of_time = shared and (client.deadline_reached or time.monotonic() >= collection_deadline)
-                    store.source_failure(
-                        source, str(exc), config["collection"], received,
-                        exc.watermark, exc.catching_up or out_of_time,
-                    )
-                    report["sources_failed"] += 1
-                    if out_of_time:
-                        report["budget_reached"] = True
-                        break
-            except Exception as exc:
-                store.source_failure(source, _unexpected_error(exc), config["collection"], now_iso())
-                report["sources_failed"] += 1
+    prev_tor_core = getattr(store, "tor_core_users", None)
+    store.tor_core_users = tuple(tor_core_users)
     try:
-        report["comments"] = enrich_comments(config, store, now_iso(), deadline=started + collection_window)
-    except Exception as exc:
-        report["comments"] = {
-            "enabled": comments_enabled, "checked": 0, "changed": 0,
-            "failed": 1, "skipped": 0, "budget_reached": False, "error": _unexpected_error(exc),
-        }
-    run_deadline = started + budget
-    endpoint_failures = 0
-    with (
-        Analyzer(config, deadline=run_deadline) as analyzer,
-        Reviewer(config, deadline=run_deadline) as reviewer,
-        doctor.LinkChecker(config, deadline=run_deadline) as linker,
-    ):
-        for consensus_source in consensus_sources:
-            try:
-                evaluated = doctor.evaluate(
-                    config, store, consensus_source, linker, now_iso(), allow_network=endpoint_failures < 2,
+        def record_items(source, items):
+            """Normalize, enrich, and store collected entries for one source."""
+            received = now_iso()
+            if source.get("alert_format") == "consensus":
+                added, rejected = doctor.ingest(store.db, source, list(items), received, run_collection["content_chars"])
+                network_ingested["reports_new"] += added
+                network_ingested["rejected"] += rejected
+                return received
+            dirauth_users = run_collection.get("dirauth_gitlab_users")
+            if comments_enabled:
+                items = (
+                    merge_cached_comments(
+                        store, item, source, received, dirauth_users=dirauth_users, tor_core_users=tor_core_users
+                    )
+                    for item in items
                 )
-                endpoint_failures += evaluated.pop("endpoint_failures", 0)
-                if evaluated.pop("budget_reached", False):
-                    report["budget_reached"] = True
-                report["network"] = {**network_ingested, **evaluated}
-            except sqlite3.Error:
-                raise
-            except Exception as exc:
-                report["network"] = {
-                    **network_ingested, "incidents_open": 0, "stories_written": 0,
-                    "updates_written": 0, "held": 0, "dry_run": not consensus_source.get("publish", False),
-                    "error": _unexpected_error(exc),
-                }
-        for row in store.pending(config["llm"]["max_items_per_run"], now_iso()):
-            if time.monotonic() >= run_deadline:
-                report["budget_reached"] = True
-                break
-            if row.get("damaged"):
-                store.reject(row["id"], "Stored source item is damaged", "failed.app.damaged_item", now_iso())
-                report["analysis_failed"] += 1
-                continue
-            try:
-                result = process_item(config, store, row, analyzer, reviewer, now_iso(), allow_network=endpoint_failures < 2)
-                if result["status"] not in {"stale", "deferred"}:
-                    report["analyzed"] += 1
-                report["review_cache_hits"] += bool(result["cache_hit"])
-                report["review_stale"] += result["status"] == "stale"
-                report["review_routed"] += result["status"] == "routed"
-                if result.get("budget_reached"):
+            report["items_changed"] += sum(
+                store.ingest(item, received, dirauth_users=dirauth_users, tor_core_users=tor_core_users) for item in items
+            )
+            return received
+
+        with HttpClient(run_config["http"]) as client:
+            for source in run_config["sources"]:
+                if not source["enabled"]:
+                    continue
+                state = store.source(source)
+                if not source_due(state, observed):
+                    continue
+                remaining = collection_deadline - time.monotonic()
+                if remaining < 1:
                     report["budget_reached"] = True
                     break
-            except ReviewLimitReached:
-                # The gate already checked the exact source and recorded this
-                # terminal rejection; it must not become a second queue strike.
-                report["analysis_failed"] += 1
-            except CompletionDeferred:
-                report["budget_reached"] = True
-                break
-            except sqlite3.Error:
-                raise
-            except Exception as exc:
-                is_analysis = isinstance(exc, AnalysisError)
-                retryable = is_analysis and exc.retryable
-                deferred = store.defer(
-                    row["id"], str(exc) if is_analysis else _unexpected_error(exc), config["llm"], now_iso(),
-                    terminal=not retryable, code=exc.code if is_analysis else "app.unexpected", expected_row=row,
-                )
-                report["analysis_failed"] += deferred
-                report["review_stale"] += not deferred
-                endpoint_failures += retryable
-        report["model_calls"] = analyzer.calls + reviewer.calls + linker.calls
-    report["decisions"] = decisions.codes_after(store.db, first)
-    report["pending_analysis"] = store.pending_count()
-    report["rejected_analysis"] = store.rejected_count()
-    report["final_review"] = review_status(store)
-    report.update(build(config, store))
-    return report
+                shared = remaining <= run_collection["source_budget_seconds"]
+                client.deadline = time.monotonic() + min(remaining, run_collection["source_budget_seconds"])
+                client.deadline_reached = False
+                try:
+                    try:
+                        result = collect_source(client, source, state, run_collection, observed)
+                        received = record_items(source, result["items"])
+                        report["entries_skipped"] += result.get("skipped", 0)
+                        store.source_success(source, result, received, schedule_from=observed)
+                        report["sources_ok"] += 1
+                    except CollectionError as exc:
+                        received = record_items(source, exc.items)
+                        out_of_time = shared and (client.deadline_reached or time.monotonic() >= collection_deadline)
+                        store.source_failure(
+                            source, str(exc), run_collection, received,
+                            exc.watermark, exc.catching_up or out_of_time,
+                        )
+                        report["sources_failed"] += 1
+                        if out_of_time:
+                            report["budget_reached"] = True
+                            break
+                except Exception as exc:
+                    store.source_failure(source, _unexpected_error(exc), run_collection, now_iso())
+                    report["sources_failed"] += 1
+        try:
+            report["comments"] = enrich_comments(run_config, store, now_iso(), deadline=started + collection_window)
+        except Exception as exc:
+            report["comments"] = {
+                "enabled": comments_enabled, "checked": 0, "changed": 0,
+                "failed": 1, "skipped": 0, "budget_reached": False, "error": _unexpected_error(exc),
+            }
+        run_deadline = started + budget
+        endpoint_failures = 0
+        with (
+            Analyzer(run_config, deadline=run_deadline) as analyzer,
+            Reviewer(run_config, deadline=run_deadline) as reviewer,
+            doctor.LinkChecker(run_config, deadline=run_deadline) as linker,
+        ):
+            for consensus_source in consensus_sources:
+                try:
+                    evaluated = doctor.evaluate(
+                        run_config, store, consensus_source, linker, now_iso(), allow_network=endpoint_failures < 2,
+                    )
+                    endpoint_failures += evaluated.pop("endpoint_failures", 0)
+                    if evaluated.pop("budget_reached", False):
+                        report["budget_reached"] = True
+                    report["network"] = {**network_ingested, **evaluated}
+                except sqlite3.Error:
+                    raise
+                except Exception as exc:
+                    report["network"] = {
+                        **network_ingested, "incidents_open": 0, "stories_written": 0,
+                        "updates_written": 0, "held": 0, "dry_run": not consensus_source.get("publish", False),
+                        "error": _unexpected_error(exc),
+                    }
+            for row in store.pending(run_config["llm"]["max_items_per_run"], now_iso()):
+                if time.monotonic() >= run_deadline:
+                    report["budget_reached"] = True
+                    break
+                if row.get("damaged"):
+                    store.reject(row["id"], "Stored source item is damaged", "failed.app.damaged_item", now_iso())
+                    report["analysis_failed"] += 1
+                    continue
+                try:
+                    result = process_item(run_config, store, row, analyzer, reviewer, now_iso(), allow_network=endpoint_failures < 2)
+                    if result["status"] not in {"stale", "deferred"}:
+                        report["analyzed"] += 1
+                    report["review_cache_hits"] += bool(result["cache_hit"])
+                    report["review_stale"] += result["status"] == "stale"
+                    report["review_routed"] += result["status"] == "routed"
+                    if result.get("budget_reached"):
+                        report["budget_reached"] = True
+                        break
+                except ReviewLimitReached:
+                    # The gate already checked the exact source and recorded this
+                    # terminal rejection; it must not become a second queue strike.
+                    report["analysis_failed"] += 1
+                except CompletionDeferred:
+                    report["budget_reached"] = True
+                    break
+                except sqlite3.Error:
+                    raise
+                except Exception as exc:
+                    is_analysis = isinstance(exc, AnalysisError)
+                    retryable = is_analysis and exc.retryable
+                    deferred = store.defer(
+                        row["id"], str(exc) if is_analysis else _unexpected_error(exc), run_config["llm"], now_iso(),
+                        terminal=not retryable, code=exc.code if is_analysis else "app.unexpected", expected_row=row,
+                    )
+                    report["analysis_failed"] += deferred
+                    report["review_stale"] += not deferred
+                    endpoint_failures += retryable
+            report["model_calls"] = analyzer.calls + reviewer.calls + linker.calls
+        report["decisions"] = decisions.codes_after(store.db, first)
+        report["pending_analysis"] = store.pending_count()
+        report["rejected_analysis"] = store.rejected_count()
+        report["final_review"] = review_status(store)
+        report.update(build(run_config, store))
+        return report
+    finally:
+        store.tor_core_users = prev_tor_core
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -311,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         database = config["storage"]["database"]
         dirauth_users = config["collection"]["dirauth_gitlab_users"]
+        tor_core_users = config["collection"]["tor_core_gitlab_users"]
         operator = args.command in OPERATOR_ACTIONS
         read_only = args.command == "status" or (operator and args.action in READ_ONLY_ACTIONS)
         guard = contextlib.nullcontext(True) if read_only else run_lock(database)
@@ -318,13 +354,14 @@ def main(argv: list[str] | None = None) -> int:
             if not acquired:
                 print(json.dumps({"status": "already-running"}))
                 return 0 if args.command == "run" else 75
-            with Store(database, dirauth_users=dirauth_users) as store:
+            with Store(database, dirauth_users=dirauth_users, tor_core_users=tor_core_users) as store:
                 if args.command == "status":
                     observed, published = now_iso(), store.get_meta("published_stories")
                     result = {
                         "pending_analysis": store.pending_count(),
                         "rejected_analysis": store.rejected_count(),
                         "published_stories": int(published) if published is not None else None,
+                        "registry": registry.status(store.db, config),
                         "comments": {"enabled": config["comments"]["enabled"], **comments_status(store)},
                         "final_review": review_status(store),
                         "network_health": doctor.status(store.db, config["sources"]),
@@ -332,11 +369,15 @@ def main(argv: list[str] | None = None) -> int:
                         "sources": store.health(config["sources"], config["collection"]["stale_after_seconds"], observed),
                     }
                 elif operator:
-                    result = _operator_command(args, store, config)
+                    eff_config, eff_tor_core = _effective_config(config, store)
+                    store.tor_core_users = tuple(eff_tor_core)
+                    result = _operator_command(args, store, eff_config)
                 elif args.command == "run":
                     result = run(config, store)
                 else:
-                    result = build(config, store, force=args.force)
+                    eff_config, eff_tor_core = _effective_config(config, store)
+                    store.tor_core_users = tuple(eff_tor_core)
+                    result = build(eff_config, store, force=args.force)
             print(json.dumps(result, ensure_ascii=operator))
         return 0
     except (ValueError, OSError) as exc:

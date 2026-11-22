@@ -13,7 +13,8 @@ from .comments import analysis_context, budget_unchanged_note_ids, note_key, pri
 from .llm import strip_unreleased_tag, unquoted_mail_text, unquoted_text
 from .schema import SEMANTIC_FIELDS, UPDATE_FIELDS
 from .util import (after, digest, gitlab_refs, gitlab_url_variants, item_identity, normalize_evidence,
-                   release_mentions, safe_canonical_url, saved_object, story_cluster, thread_subject)
+                   release_mentions, safe_canonical_url, saved_object, story_cluster, thread_subject,
+                   trove_ids)
 
 
 UNVERIFIED_ROUTE = "Attached to an existing story for update review"
@@ -493,6 +494,7 @@ def associate(db, row: dict) -> tuple[dict | None, str | None]:
     release_tag = isinstance(item, dict) and item.get("kind") == "tag" and cluster.startswith("release:")
 
     def tagged_or_released(story):
+        """Return whether `story` is currently in a `tagged` or `released` state."""
         public = saved_object(story["payload"].encode("utf-8") if isinstance(story["payload"], str) else story["payload"])
         return isinstance(public, dict) and public.get("state") in {"tagged", "released"}
 
@@ -532,6 +534,33 @@ def existing_story(db, row: dict):
     return associate(db, row)[0]
 
 
+def _stories_for_trove(db, trove_id: str) -> list[dict]:
+    """Return live stories whose content or mapped source items explicitly cite `trove_id`."""
+    pattern = f"%{trove_id}%"
+    ids: list[str] = []
+    for story_row in db.execute(
+        "SELECT id,CASE WHEN typeof(payload)='text' THEN CAST(payload AS BLOB) END AS payload "
+        "FROM stories WHERE payload LIKE ? ORDER BY updated_at DESC,id",
+        (pattern,),
+    ).fetchall():
+        story = saved_object(story_row["payload"])
+        if not story:
+            continue
+        text = "\n".join(str(story.get(k) or "") for k in ("title", "summary", "why_it_matters", "latest_update"))
+        updates = "\n".join(str(u.get("text") or "") for u in (story.get("updates") or ()) if isinstance(u, dict))
+        if trove_id in trove_ids({"title": text, "content": updates}):
+            ids.append(story_row["id"])
+    for item_row in db.execute(
+        f"SELECT story_id,CASE WHEN typeof(payload)='text' THEN CAST(payload AS BLOB) END AS payload "
+        f"FROM items WHERE payload LIKE ? AND {_MAPPED_PREDICATE}",
+        (pattern, UNVERIFIED_ROUTE),
+    ).fetchall():
+        item = saved_object(item_row["payload"])
+        if item and trove_id in trove_ids(item):
+            ids.append(item_row["story_id"])
+    return _unique_live_stories(db, ids)
+
+
 def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = frozenset()) -> list[tuple[str, str]]:
     """Up to 6 active related (story_id, reason) pairs for coverage comparison."""
     seen = set(exclude)
@@ -554,6 +583,9 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
         marker = f"!{number}" if "/-/merge_requests/" in ref else f"#{number}"
         for match in _stories_for_urls(db, [ref]):
             _add(match["id"], f"references {marker}")
+    for tid in trove_ids(item):
+        for match in _stories_for_trove(db, tid):
+            _add(match["id"], f"references {tid}")
     release_keys = release_mentions(item)
     if (row.get("cluster_key") or "").startswith("release:") and row["cluster_key"] not in release_keys:
         release_keys.insert(0, row["cluster_key"])
@@ -702,7 +734,13 @@ def validate_approved(original: dict, approved: object, mode: str = "story") -> 
 
 
 def prepare(
-    db, row: dict, result: dict, observed: str, *, dirauth_users: Iterable[str] | None = None
+    db,
+    row: dict,
+    result: dict,
+    observed: str,
+    *,
+    dirauth_users: Iterable[str] | None = None,
+    tor_core_users: Iterable[str] | None = None,
 ) -> dict:
     """Assemble the exact candidate and bind all state needed for its guarded commit."""
     from .store import ITEM_SAFE_COLUMNS, decode_item_row
@@ -741,6 +779,8 @@ def prepare(
                 "observed": observed}
     if dirauth_users is not None:
         envelope["dirauth_users"] = list(dirauth_users)
+    if tor_core_users is not None:
+        envelope["tor_core_users"] = list(tor_core_users)
     if not locked:
         if ("update" in result) != (mode == "update"):
             raise StaleCandidate("Draft scope does not match current story state")
@@ -814,7 +854,7 @@ def prepare(
         earlier_ids = _earlier_decision_ids(db, row, excluded | {sid for sid, _ in related_rows})
         writer = data["editorial_item"]
         packet, bindings = source_packet.build_packet(
-            db, item, data, public, writer, update=mode == "update", dirauth_users=dirauth_users
+            db, item, data, public, writer, update=mode == "update", dirauth_users=dirauth_users, tor_core_users=tor_core_users
         )
         binding["sources"] = bindings
         envelope.update(candidate=public, payload=data, packet=packet,

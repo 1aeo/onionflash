@@ -20,12 +20,21 @@ protocol changes. The additional configured streams are:
 | [Tor Project Forum Release Announcements](https://forum.torproject.org/c/news/tor-release-announcement/28) | `tor-release-announcements`, enabled | Official announcement prose can add incident scope, response plans and relay-operator instructions beyond the release notes; novelty follows the [publication review](FINAL_REVIEW.md#selection-and-grounding). |
 
 On `lists.torproject.org` archives whose RSS items carry HyperKitty's `local＠domain`
-`<author>` element, an entry from an exact `torproject.org` address is classified
-`project-sender` and an entry matching `[collection].trusted_operator_domains` (verified
-large AROI relay-operator domains; subdomains included) is classified `trusted-operator`,
+`<author>` element (validated via Expat as one plain `<author>` matching
+`feedparser`'s single-entry `author`/`authors` list, including items where
+`feedparser` splits a trailing `(user@domain)` into `authors[0]["email"]`), an
+entry from an exact `torproject.org` address is classified `project-sender` and
+an entry matching `[collection].trusted_operator_domains` (verified large AROI
+relay-operator domains; subdomains included) is classified `trusted-operator`,
 unless the stream is already `official`; display names, subjects and message bodies never
-count, neither classification establishes `confirmed` confidence, and the address is not
-stored. Sources may also declare `authority = "hackerone"`, and `development`-authority
+count, multi-author feeds stay `community`, neither classification establishes
+`confirmed` confidence, and the address is not stored. New non-reply threads on
+`lists.torproject.org` from `project-sender` or `official` senders satisfy the
+`torproject_new_thread` mandatory-news rule, whereas `project-sender` replies
+skip normally when `news_value` fails instead of escalating to
+`held.verification.official_not_news`.
+
+Sources may also declare `authority = "hackerone"`, and `development`-authority
 GitLab issues and merge requests whose own URL, `HackerOne`/`HackerOne::*` label, title,
 or description (excluding `public_comments` and `community` mailing-list posts) references
 `hackerone.com/reports/<id>` or `Reported via HackerOne` are upgraded to `hackerone` during
@@ -42,10 +51,52 @@ directory-authority or bridge-authority operator in `[collection].dirauth_gitlab
 match, never body or comment prose, and `dirauth-operator` items likewise receive a `+35`
 queue priority boost, keep `confidence` bounded below `confirmed` without an official
 announcement or merged merge request, and are held (`held.verification.official_not_news`)
-rather than skipped when review fails only `news_value`. Browser release announcements were already present in Tor
+when review fails only `news_value` if the item is recent and operationally related to
+directory-authority or consensus matters (stale or unrelated non-operational tickets skip
+normally). Remaining `development`-authority issues and merge requests on
+`gitlab.torproject.org` opened by or carrying a verified `public_comments` note from a
+Tor Project core contributor in `[collection].tor_core_gitlab_users` (merged with any
+cached `[registry]` users) are promoted to `tor-core` (`+25` queue priority boost).
+Authority promotion follows strict precedence
+`hackerone > dirauth-operator > tor-core > development`. `tor-core` likewise keeps
+`confidence` bounded below `confirmed` without an official announcement or merged merge
+request, never grants unstated personal titles (such as calling an author a C Tor
+developer without committed C-Tor code evidence), and undergoes normal `news_value`
+filtering rather than holding as `official_not_news`. Across the queue, deterministic
+priority boosts order verified `TROVE` advisories (`+40`, additive with authority
+boosts), `hackerone` (`+35`), `dirauth-operator` (`+35`), `tor-core` (`+25` when not
+`dirauth-operator`), and `trusted-operator` (`+15` when not a higher GitLab authority
+tier), above the `TAG_PRIORITY = 5` tag floor. Browser release announcements were already present in Tor
 Blog and tor-announce.
 The Browser issue stream is deliberately filtered; it does not replace those
 announcements or promise comprehensive vulnerability coverage.
+
+### Deterministic identity registries
+
+Set `[registry].enabled = true` to opt into daily upstream identity synchronization
+(`enabled = false` by default so existing installations stay offline-deterministic).
+When enabled, `onionflash run` refreshes three public registries at most once every
+24 hours (`86400` seconds) within a 15-second step budget, caches validated lists in
+SQLite `metadata`, and reports counts and sync timestamps under `registry` in
+`onionflash status`:
+
+- **Tor Project core contributors (`tor_core_users`)**: reads `content/about/people/*/contents.lr`
+  (`role = core`) from `tpo/web/tpo` via GitLab's repository tree and anonymous GraphQL
+  blobs (requiring at least 20 valid GitLab usernames), and merges with
+  `[collection].tor_core_gitlab_users` (which defaults to the built-in
+  `DEFAULT_TOR_CORE_USERS` baseline and caps effective entries at 500).
+- **Verified AROI operator domains (`trusted_operator_domains`)**: reads the public
+  AROI validator dataset (`https://aroivalidator.1aeo.com/latest.json`), strips leading
+  `www.`, excludes `torproject.org` and subdomains, retains domains with `>= 100` valid
+  relays, and merges with `[collection].trusted_operator_domains` (capped at 500).
+- **Directory-authority nicknames (`auth_dirs_nicknames`)**: parses voting directory
+  authority nicknames from Tor's `src/app/config/auth_dirs.inc` (requiring at least 5
+  nicknames) for operator drift checks in `onionflash status`.
+
+Every registry parser and cache reader fails closed: malformed, truncated, or
+undersized payloads raise `RegistryError` without overwriting previously cached valid
+lists, and transient errors leave cached identities intact while recording a bounded
+`last_error` in `metadata`.
 
 All source URLs, fallback URLs, intervals and enable flags are editable in TOML.
 The REST issue-note API currently returns 401 anonymously. The optional public

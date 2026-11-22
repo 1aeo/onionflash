@@ -16,14 +16,16 @@ import json
 import re
 
 from . import candidate as candidate_mod, decisions, editorial, review, source_packet
-from .analyze import cache_key
-from .llm import AnalysisError, CompletionDeferred, RequestObserver
+from .analyze import MIN_EVIDENCE_CHARS, cache_key
+from .llm import AnalysisError, CompletionDeferred, RequestObserver, is_quoted_list_post, unquoted_mail_text
 from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, SHA256_RE, STATES
 from .store import ITEM_SAFE_COLUMNS, decode_item_row, item_hash, item_hash_fields, set_job_stage
 from .util import (
-    _GITLAB_OWN, after, digest, dirauth_user_set, folded_labels, gitlab_refs, has_invalid_text_chars,
-    is_dirauth_item, is_hackerone_item, item_cluster, now_iso, parse_utc, release_mentions,
-    safe_canonical_url, saved_object, strict_json, thread_subject,
+    _DIRAUTH_LABELS, _GITLAB_OWN, _strip_subject_prefixes, after, cve_ids, digest,
+    dirauth_user_set, effective_authority, folded_labels, gitlab_refs, has_invalid_text_chars,
+    is_dirauth_item, is_hackerone_item, is_trove_item, item_cluster, LIST_ARCHIVE_HOST,
+    mandatory_news_rule, normalize_evidence, now_iso, parse_utc, release_mentions,
+    safe_canonical_url, saved_object, strict_json, thread_subject, tor_core_user_set, trove_ids,
 )
 
 REVIEW_STATE_VERSION = 2
@@ -36,7 +38,7 @@ HIGH_SECURITY_SEVERITIES = frozenset({"severity::high", "severity::critical"})
 # checked by another fresh verification: an item gets at most MAX_VERIFY_REPAIRS + 2 review requests.
 MAX_VERIFY_REPAIRS = 5
 MAX_REVIEW_REQUESTS = MAX_VERIFY_REPAIRS + 2
-OFFICIAL_AUTHORITIES = frozenset({"official", "project-sender", "hackerone", "dirauth-operator"})
+OFFICIAL_AUTHORITIES = frozenset({"official", "hackerone", "dirauth-operator"})
 OUTCOME_STAGES = {"approve": "approved", "skip": "skipped", "hold": "held", "route": "routed"}
 # Each hold reason and its operator text, which follows "Final review held: " in last_error. A hold
 # is logged as held.<stage>.<reason>, the stage being gate, review, verification or final_check.
@@ -59,6 +61,7 @@ HOLDS = {
     "shouting_caps": "the candidate contains unnormalized all-caps shouting",
     "malformed_version": "the candidate cites a nonexistent three-part C-Tor version",
     "untrusted_operator_claim": "an uncorroborated mailing-list incident claim needs a trusted source",
+    "trove_category": "a verified TROVE advisory must be categorized as security",
 }
 
 
@@ -67,8 +70,12 @@ def _is_sha256(value: object) -> bool:
 
 
 def _prepare(store, config, row, draft, at):
-    users = (config.get("collection") or {}).get("dirauth_gitlab_users") if isinstance(config, dict) else None
-    return store.prepare_candidate(row, draft, at, **({"dirauth_users": users} if "prepare_candidate" not in vars(store) else {}))
+    coll = config.get("collection") or {} if isinstance(config, dict) else {}
+    kwargs = {}
+    if "prepare_candidate" not in vars(store):
+        kwargs["dirauth_users"] = coll.get("dirauth_gitlab_users")
+        kwargs["tor_core_users"] = coll.get("tor_core_gitlab_users")
+    return store.prepare_candidate(row, draft, at, **kwargs)
 
 
 def initial_review_state():
@@ -364,7 +371,7 @@ def _prune(store, maximum):
 
 
 _VERSION_TOKEN = re.compile(r"\b\d+\.\d+(?:\.\d+)*(?:-[a-z0-9.]+)?\b", re.I)
-_PROPOSAL_TOKEN = re.compile(r"\bproposal\s+\d{3,4}\b|\bcve-\d{4}-\d+\b", re.I)
+_PROPOSAL_TOKEN = re.compile(r"\bproposal\s+\d{3,4}\b|\b(?:cve-\d{4}-\d+|trove-\d{4}-\d{3,5})\b", re.I)
 _SPECIFIC_WORD = re.compile(r"[a-z0-9]{4,}")
 _GENERIC_WORDS = frozenset({
     "tor", "arti", "tails", "browser", "onion", "flash", "project", "release", "released",
@@ -505,8 +512,25 @@ def _auto_merge_pair(store, a_id: str, b_id: str) -> tuple[str, str] | None:
     return dup_id, surv_id
 
 
-def _news(result) -> bool:
-    return all(result["criteria"][name]["outcome"] == "pass" for name in review.EDITORIAL_CRITERIA)
+_DIRAUTH_TOPIC_RE = re.compile(
+    r"\b(?:dirauth|directory authorit\w*|authorit(?:y|ies)|dirvote|consensus|voting|vote|bwauth|"
+    r"bandwidth\s+authorit\w*|relay\s+descriptor|bridge\s+authorit\w*|dannenberg|moria1|serge|"
+    r"maatuska|longclaw|gabelmoo|faravahar|bastet|sekhmet|dizum|tor26)\b",
+    re.I,
+)
+
+
+def _dirauth_operational_relevant(item: dict) -> bool:
+    if folded_labels(item) & _DIRAUTH_LABELS:
+        return True
+    title = item["title"] if isinstance(item.get("title"), str) else ""
+    body = next((item[k] for k in ("source_content", "content") if isinstance(item.get(k), str)), "")
+    return bool(_DIRAUTH_TOPIC_RE.search(f"{title}\n{body}"))
+
+
+def _news(result, *, mandatory: bool = False) -> bool:
+    new_info = result["criteria"]["new_information"]["outcome"] == "pass"
+    return new_info and (mandatory or result["criteria"]["news_value"]["outcome"] == "pass")
 
 
 def _can_route(candidate: dict, prepared: dict, result: dict, target_id) -> bool:
@@ -565,22 +589,43 @@ def next_step(reviews, candidate, prepared):
     """
     latest = reviews[-1]
     result, stage, later = latest["result"], latest["stage"], len(reviews) > 1
-    if later and _news(result) != _news(reviews[0]["result"]):
+    item = json.loads(prepared["row"]["payload"])
+    eff_auth = effective_authority(item, prepared.get("dirauth_users"), prepared.get("tor_core_users"))
+    mandatory = mandatory_news_rule({**item, "authority": eff_auth}) is not None
+    verdict = result["verdict"]
+    failed = {name for name, check in result["criteria"].items() if check["outcome"] != "pass"}
+    if later and _news(result, mandatory=mandatory) != _news(reviews[0]["result"], mandatory=mandatory):
         return "hold", (stage, "disagreed_news")
     if _can_route(candidate, prepared, result, result.get("same_story")):
         return "route", result["same_story"]
-    verdict = result["verdict"]
-    failed = {name for name, check in result["criteria"].items() if check["outcome"] != "pass"}
-    item = json.loads(prepared["row"]["payload"])
+    if mandatory and failed == {"news_value"} and verdict in {"skip", "revise", "hold"}:
+        if stage == "review" and not later:
+            return "verify", candidate
+        if stage == "verification":
+            if not result["criteria"]["source_support"]["source_refs"]:
+                return "hold", (stage, "model_hold")
+            if held := review.final_holds(candidate, prepared):
+                return "hold", ("final_check", held[0])
+            if not review.release_labels_match_state(candidate):
+                if latest.get("issue") or len(reviews) > MAX_VERIFY_REPAIRS:
+                    return "hold", (stage, "release_labels")
+                return "repair", candidate
+            return "approve", candidate
+        return "hold", (stage, "model_hold")
     recent_dev = (
         developed_at(item) >= after(-NEW_STORY_DAYS * 86400, item["updated_at"])
         or _security_disclosure(item)
         or (prepared.get("coverage") or {}).get("prior_story") is not None
     )
+    is_dirauth_rel = (
+        (eff_auth == "dirauth-operator" or is_dirauth_item(item, prepared.get("dirauth_users")))
+        and recent_dev
+        and _dirauth_operational_relevant(item)
+    )
     official = (
-        item.get("authority") in (OFFICIAL_AUTHORITIES - {"dirauth-operator"})
+        eff_auth in (OFFICIAL_AUTHORITIES - {"dirauth-operator"})
         or is_hackerone_item(item)
-        or ((item.get("authority") == "dirauth-operator" or is_dirauth_item(item, prepared.get("dirauth_users"))) and recent_dev)
+        or is_dirauth_rel
     ) and item.get("kind") != "tag"
     # An official item that fails only news value is the operator's to judge, once a fresh
     # verification has passed its facts; a duplicate still skips.
@@ -1249,14 +1294,167 @@ def developed_at(item: dict) -> str:
     return max(dates)
 
 
+_DUP_ISSUE_RE = re.compile(
+    r"\b(?:closed\s+as\s+(?:a\s+)?duplicate(?:\s+of)?|duplicate\s+of|duplicates?)\s*:?\s*"
+    r"(?:#\d+|[\w.-]+/[\w./-]+#\d+|https://gitlab\.torproject\.org/\S+)"
+    r"|\bdup(?:licate)?\s+of\s+(?:#\d+|[\w.-]+/[\w./-]+#\d+|https://gitlab\.torproject\.org/\S+)",
+    re.I,
+)
+_NOT_DUP_RE = re.compile(
+    r"\b(?:(?:is|was|are|were)n['’]?t\s+(?:a\s+)?|not\s+(?:a\s+)?|no\s+|non[- ]?)duplicates?\b",
+    re.I,
+)
+_DUP_LABELS = frozenset({"duplicate", "status::duplicate"})
+_DUP_SECURITY_GUARD_RE = re.compile(
+    r"\b(?:vulnerabilit\w*|exploit\w*|null[- ]?(?:pointer[- ]|ptr[- ])?deref\w*|use[- ]after[- ]free|buffer\s+overflow|"
+    r"out[- ]of[- ]bounds|remote\s+code(?:\s+execution)?)\b",
+    re.I,
+)
+_HOUSEKEEPING_TITLE_RE = re.compile(
+    r"(?:\brelease\s+checklist\b|\bversion\s+bump\b|\bbump(?:ing)?\s+(?:version|deps|dependencies)\b"
+    r"|\bforward[- ]port\b.*\bchangelogs?\b|^update\s+changelogs?\b|^clean\s*up\s+comments?\b"
+    r"|^fix\s+(?:whitespace|formatting|lint(?:ing)?|clippy)\b|^bump\s+(?:cargo\.lock|lockfile)\b"
+    r"|\b(?:cargo|package|yarn|poetry|uv)\.lock\b|\blockfile\b"
+    r"|\b(?:dependabot|renovate)\b|^(?:chore|ci|typo|housekeeping|l10n|i18n|translations?)\s*:)"
+    r"|\bminor\s+typo\b|\bfix(?:es|ing)?\s+(?:a\s+)?typo\b",
+    re.I,
+)
+_PURE_ACK_RE = re.compile(
+    r"^(?:"
+    r"(?:many\s+|hi[,.]?\s*)?(?:thanks?(?:\s+(?:a\s+lot|very\s+much|everyone|all))?|"
+    r"thank\s+you(?:\s+(?:very\s+much|all))?|\+1|lgtm|ack|bumped?|ping|me\s+too|"
+    r"same\s+here|agreed|works\s+for\s+me|verified|done|ok(?:ay)?|looks\s+good(?:\s+to\s+me)?|"
+    r"no\s+(?:news|changes?|updates?|issues?)(?:\s+here)?|following|subscribed|bump|"
+    r"test(?:ing)?(?:\s+post)?(?:\s*,?\s*please\s+ignore)?)"
+    r"\s*[,!.:;)]*\s*"
+    r")+(?:for\s+(?:the\s+)?(?:update|report|info|feedback|reply|testing)[!.,]*)?$",
+    re.I,
+)
+_PROTECTED_LABELS = frozenset({"security", "regression", "critical", "severity::high", "severity::critical"})
+
+
+def _has_operator_retry(db, row: dict | None) -> bool:
+    return bool(
+        isinstance(row, dict)
+        and row.get("id")
+        and row.get("content_hash")
+        and db.execute(
+            "SELECT 1 FROM rejection_actions WHERE item_id=? AND content_hash=? AND action='retry'",
+            (row["id"], row["content_hash"]),
+        ).fetchone()
+    )
+
+
 def _security_disclosure(item: dict) -> bool:
-    """A HackerOne disclosure or high/critical security issue may become public long after filing."""
-    if is_hackerone_item(item):
+    """A HackerOne disclosure, verified TROVE advisory, or high/critical security issue may become public long after filing."""
+    if is_hackerone_item(item) or is_trove_item(item):
         return True
     if item.get("kind") != "gitlab_issue":
         return False
     labels = folded_labels(item)
     return "security" in labels and bool(labels & HIGH_SECURITY_SEVERITIES)
+
+
+def _eval_deterministic_skip(
+    db, item: dict, existing: dict | None, *, row: dict | None = None, dirauth_users=None, tor_core_users=None
+) -> tuple[str, str] | None:
+    if item.get("kind") == "tag" or item.get("origin") == "network-health" or _has_operator_retry(db, row):
+        return None
+    body = item.get("source_content") if isinstance(item.get("source_content"), str) else (item.get("content") or "")
+    url = str(item.get("url") or "")
+    quoted_list = is_quoted_list_post(url, body)
+    unquoted = unquoted_mail_text(body) if quoted_list else body
+    if quoted_list and len(normalize_evidence(unquoted)) < MIN_EVIDENCE_CHARS:
+        return "skipped.gate.quoted_only", "Mailing-list reply contains no qualifying unquoted author text"
+    labels = folded_labels(item)
+    if (
+        existing is None
+        and item.get("kind") == "gitlab_issue"
+        and "security" not in labels
+        and not is_hackerone_item(item)
+        and not is_trove_item(item)
+        and not cve_ids(item)
+        and not trove_ids(item)
+    ):
+        comments_text = "\n".join(str(n.get("body") or "") for n in (item.get("public_comments") or ()) if isinstance(n, dict))
+        full_text = f"{item.get('title') or ''}\n{body}\n{comments_text}"
+        if not _NOT_DUP_RE.search(full_text) and not _DUP_SECURITY_GUARD_RE.search(full_text):
+            matches = list(_DUP_ISSUE_RE.finditer(full_text))
+            target_refs: list[str] = []
+            if matches:
+                dup_snippet = "\n".join(m.group(0) for m in matches)
+                closing, mentioned = gitlab_refs(
+                    {**item, "title": "", "content": dup_snippet, "source_content": dup_snippet, "public_comments": []}
+                )
+                target_refs = [*closing, *mentioned]
+            elif (labels & _DUP_LABELS) and item.get("upstream_state") == "closed":
+                closing, mentioned = gitlab_refs(item)
+                target_refs = [*closing, *mentioned]
+            if target_refs and candidate_mod._stories_for_urls(db, target_refs):
+                return "skipped.gate.duplicate_issue", "Duplicate GitLab issue referencing an already-covered story"
+    auth = effective_authority(item, dirauth_users, tor_core_users)
+    if mandatory_news_rule({**item, "authority": auth}) is not None:
+        return None
+    if (
+        is_hackerone_item(item)
+        or is_trove_item(item)
+        or (is_dirauth_item(item, dirauth_users) and _dirauth_operational_relevant(item))
+        or _security_disclosure(item)
+        or cve_ids(item)
+        or trove_ids(item)
+        or (labels & _PROTECTED_LABELS)
+    ):
+        return None
+    norm_body = re.sub(r"\s+", " ", unquoted).strip()
+    if (
+        norm_body
+        and len(norm_body) <= 120
+        and _PURE_ACK_RE.fullmatch(norm_body)
+        and not item.get("public_comments")
+        and not (existing is not None and item.get("upstream_state") == "closed")
+    ):
+        return "skipped.gate.housekeeping", "Routine acknowledgment or no-content reply"
+    cleaned_title, _ = _strip_subject_prefixes(item.get("title"))
+    if (
+        existing is None
+        and not item.get("public_comments")
+        and _HOUSEKEEPING_TITLE_RE.search(cleaned_title)
+    ):
+        return "skipped.gate.housekeeping", "Routine checklist or housekeeping item"
+    return None
+
+
+def _deterministic_skip(config, store, row, item, observed, *, existing=candidate_mod._UNSET) -> str | None:
+    """Ignore quoted-only replies, housekeeping items, and covered duplicate GitLab issues before any model call."""
+    coll = config.get("collection") or {} if isinstance(config, dict) else {}
+    dirauth_users = coll.get("dirauth_gitlab_users")
+    tor_core_users = coll.get("tor_core_gitlab_users")
+    if existing is candidate_mod._UNSET:
+        existing = candidate_mod.existing_story(store.db, row)
+    if (
+        _eval_deterministic_skip(
+            store.db, item, existing, row=row, dirauth_users=dirauth_users, tor_core_users=tor_core_users
+        )
+        is None
+    ):
+        return None
+    try:
+        with store.db:
+            current = store.require_pending_item(row, "Source item changed before deterministic gate skip")
+            try:
+                curr_item = json.loads(current["payload"])
+            except (ValueError, TypeError):
+                return "stale"
+            curr_existing = candidate_mod.existing_story(store.db, current)
+            hit = _eval_deterministic_skip(
+                store.db, curr_item, curr_existing, row=current, dirauth_users=dirauth_users, tor_core_users=tor_core_users
+            )
+            if hit is None:
+                return "stale"
+            code, reason = hit
+            return _ignore_at_gate(store, row, observed, reason, code, verified_pending=True)
+    except candidate_mod.StaleCandidate:
+        return "stale"
 
 
 def _not_recent(config, store, row, item, observed, *, existing=candidate_mod._UNSET) -> str | None:
@@ -1327,6 +1525,9 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         skipped = _not_recent(config, store, row, item_payload, observed, existing=existing)
         if skipped:
             return {**report, "status": skipped}
+        skipped_det = _deterministic_skip(config, store, row, item_payload, observed, existing=existing)
+        if skipped_det:
+            return {**report, "status": skipped_det}
         if existing is not None and candidate_mod.relation(json.loads(existing["payload"]), item_payload, store.db) == "citation":
             cited = store.add_citation(row, existing["id"], observed)
             return {**report, "status": cited["status"]}
@@ -1372,8 +1573,9 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         receipt = None
         if fresh:
             record.update(candidate=candidate, approval_key=key)
-            receipt = (key, digest(candidate), prepared["source_hash"], policy, prepared["binding_hash"],
-                       strict_json(record["reviews"][-1]["result"]), strict_json(record), observed, observed)
+            if record["reviews"][-1]["result"]["verdict"] == decision:
+                receipt = (key, digest(candidate), prepared["source_hash"], policy, prepared["binding_hash"],
+                           strict_json(record["reviews"][-1]["result"]), strict_json(record), observed, observed)
         _save_job(record["outcome"], approval_key=key, approval_receipt=receipt)
         committed = store.commit_candidate(prepared, candidate, writer_key, now_iso(), approval_key=key,
                                            policy_hash=policy, review_record=record, decision=decision)
@@ -1395,6 +1597,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             and job["policy_hash"] == policy
             and all(old[k] == prepared[k] for k in ("candidate_hash", "source_hash", "binding_hash"))
             and dirauth_user_set(old.get("dirauth_users")) == dirauth_user_set(prepared.get("dirauth_users"))
+            and tor_core_user_set(old.get("tor_core_users")) == tor_core_user_set(prepared.get("tor_core_users"))
         )
         stage = job["stage"] if same else "review"
         fresh_prepared = {
@@ -1403,6 +1606,8 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         }
         if "dirauth_users" in prepared:
             fresh_prepared["dirauth_users"] = prepared["dirauth_users"]
+        if "tor_core_users" in prepared:
+            fresh_prepared["tor_core_users"] = prepared["tor_core_users"]
         fresh = _new_record(row, record["writer"], policy_hash=policy, prepared=fresh_prepared)
         # A coverage change invalidates old reviews, not the request budget of
         # this source revision and policy. Explicit operator retry starts afresh.
@@ -1436,8 +1641,15 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                     raise ValueError()
                 verdict = review.validate_review(raw_verdict, prepared["packet"],
                                                  update=prepared.get("mode") == "update", coverage=prepared["coverage"])
+                eff_auth = effective_authority(item_payload, prepared.get("dirauth_users"), prepared.get("tor_core_users"))
+                mandatory_skip = (
+                    verdict["verdict"] == "skip"
+                    and mandatory_news_rule({**item_payload, "authority": eff_auth}) is not None
+                    and verdict["criteria"]["new_information"]["outcome"] == "pass"
+                )
                 if (proof.get("policy_hash") != policy
-                        or verdict["verdict"] not in {"approve", "skip"} or verdict.get("same_story") is not None):
+                        or verdict["verdict"] not in {"approve", "skip"} or verdict.get("same_story") is not None
+                        or mandatory_skip):
                     raise ValueError()
                 validate_review_state(proof, OUTCOME_STAGES[verdict["verdict"]], candidate, prepared, allow_cached=False)
             except (AnalysisError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
@@ -1449,6 +1661,23 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                 if verdict["verdict"] == "approve" and (held := review.final_holds(candidate, prepared)):
                     return _hold_item("final_check", held[0], cache_hit=True)
                 return _commit_decision(verdict["verdict"], key, cache_hit=True)
+        if (
+            stage == "approved"
+            and not proposal_needs_check(record)
+            and record.get("outcome") == "approved"
+            and record.get("approval_key") == key
+            and job["approval_key"] == key
+            and record.get("reviews")
+            and record["reviews"][-1]["result"]["verdict"] != "approve"
+            and mandatory_news_rule({
+                **item_payload,
+                "authority": effective_authority(item_payload, prepared.get("dirauth_users"), prepared.get("tor_core_users")),
+            }) is not None
+            and next_step(record["reviews"], candidate, prepared) == ("approve", candidate)
+        ):
+            if held := review.final_holds(candidate, prepared):
+                return _hold_item("final_check", held[0])
+            return _commit_decision("approve", key)
         if stage in {"approved", "skipped"}:  # without a usable receipt, review the writer's draft again
             stage, candidate, record = "review", prepared["candidate"], fresh
         requests = ReviewRequests(record, lambda: _save_job(stage))
@@ -1575,6 +1804,7 @@ def _check_approval(config, store, item_id: str) -> tuple[dict, tuple | None]:
         stale_binding = (
             prepared["story_id"] != saved_env.get("story_id")
             or dirauth_user_set(prepared.get("dirauth_users")) != dirauth_user_set(saved_env.get("dirauth_users"))
+            or tor_core_user_set(prepared.get("tor_core_users")) != tor_core_user_set(saved_env.get("tor_core_users"))
             or any(prepared[k] != d.get(k) for d in (held_prepared, saved_env) for k in ("candidate_hash", "source_hash"))
             or any(prepared["binding"][key] != saved_binding.get(key)
                    for key in ("prior_story", "lock", "sources", "payload_hash",

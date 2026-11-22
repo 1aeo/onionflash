@@ -16,13 +16,17 @@ from . import candidate, decisions, doctor, editorial, publication
 from .candidate import ReviewRequired, item_source
 from .comments import analysis_context
 from .util import (
-    after, backoff_until, canonical_json, digest, is_dirauth_item, is_hackerone_item, item_cluster,
-    item_identity, safe_canonical_url, saved_object, strict_json, valid_note_list,
+    after, backoff_until, canonical_json, digest, is_dirauth_item, is_hackerone_item,
+    is_tor_core_item, is_trove_item, item_cluster, item_identity, safe_canonical_url,
+    saved_object, strict_json, valid_note_list,
 )
 
 TAG_PRIORITY = 5  # queue floor for deterministic tag notices
+TRUSTED_OPERATOR_PRIORITY = 15  # queue boost for verified large AROI relay-family operators
+TOR_CORE_PRIORITY = 25  # queue boost for core Tor Project GitLab contributors
 HACKERONE_PRIORITY = 35  # queue boost so HackerOne disclosures run ahead of ordinary items
 DIRAUTH_PRIORITY = 35  # queue boost so directory-authority tickets and replies run first
+TROVE_PRIORITY = 40  # queue boost so verified TROVE advisories run ahead of ordinary items
 POLL_TOLERANCE_SECONDS = 5  # absorbs scheduler start jitter after a successful poll
 
 _RETENTION_TABLES = {"item": ("items", "id"), "analysis": ("analyses", "cache_key")}
@@ -280,18 +284,28 @@ def source_due(state: dict, observed: str) -> bool:
     return not due or due <= observed
 
 
-def item_priority(item: dict, dirauth_users: Iterable[str] | None = None) -> int:
-    """Score a collected item so HackerOne, directory-authority and security reports run first."""
+def item_priority(
+    item: dict,
+    dirauth_users: Iterable[str] | None = None,
+    tor_core_users: Iterable[str] | None = None,
+) -> int:
+    """Score a collected item so TROVE, HackerOne, directory-authority, Tor-core and security reports run first."""
     words = (item["title"] + " " + item["content"][:1500] + " " + " ".join(item.get("labels", []))).lower()
     score = sum(
         weight
         for word, weight in [("compromis", 30), ("security", 15), ("attack", 10), ("denial", 10), ("dirauth", 8), ("released", 5)]
         if word in words
     )
+    if is_trove_item(item):
+        score += TROVE_PRIORITY
     if is_hackerone_item(item):
         score += HACKERONE_PRIORITY
     if is_dirauth_item(item, dirauth_users):
         score += DIRAUTH_PRIORITY
+    elif is_tor_core_item(item, tor_core_users):
+        score += TOR_CORE_PRIORITY
+    elif item.get("authority") == "trusted-operator":
+        score += TRUSTED_OPERATOR_PRIORITY
     return max(score, TAG_PRIORITY if item["kind"] == "tag" else 0)
 
 
@@ -366,7 +380,7 @@ def item_hash(item: dict) -> str:
 
 def _uncommented_hash(old: dict, item: dict) -> str:
     base_old = {k: v for k, v in old.items() if k not in {"public_comments", "dirauth_notes", "comments_truncated"}}
-    if base_old.get("authority") == "dirauth-operator" and item.get("authority") == "development":
+    if base_old.get("authority") in {"dirauth-operator", "tor-core"} and item.get("authority") == "development":
         base_old["authority"] = "development"
     return item_hash(base_old)
 
@@ -397,9 +411,16 @@ def _updated_closed_at(old: dict, item: dict) -> str | None:
 class Store:
     """SQLite state store for sources, queued items, analyses and published stories."""
 
-    def __init__(self, path: str | Path, *, dirauth_users: Iterable[str] | None = None):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        dirauth_users: Iterable[str] | None = None,
+        tor_core_users: Iterable[str] | None = None,
+    ):
         """Open persistent state and apply idempotent schema maintenance before use."""
         self.dirauth_users = tuple(dirauth_users) if dirauth_users is not None else None
+        self.tor_core_users = tuple(tor_core_users) if tor_core_users is not None else None
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if path.is_symlink():
@@ -555,7 +576,14 @@ class Store:
         with self.db:
             self.db.execute(f"UPDATE source_state SET {assignments} WHERE id=?", (*fields.values(), source["id"]))
 
-    def ingest(self, item: dict, observed: str, *, dirauth_users: Iterable[str] | None = None) -> bool:
+    def ingest(
+        self,
+        item: dict,
+        observed: str,
+        *,
+        dirauth_users: Iterable[str] | None = None,
+        tor_core_users: Iterable[str] | None = None,
+    ) -> bool:
         """Store a new or updated source item and return whether it was queued."""
         item_id = digest(item_identity(item))[:24]
         item["id"] = item_id
@@ -624,7 +652,8 @@ class Store:
             if alias is not None and alias[1] is None:
                 cluster = self.db.execute("SELECT cluster_key FROM story_aliases WHERE story_id=?", (alias[0],)).fetchone()[0]
         effective_users = self.dirauth_users if dirauth_users is None else dirauth_users
-        score = item_priority(item, effective_users)
+        effective_tor_core = self.tor_core_users if tor_core_users is None else tor_core_users
+        score = item_priority(item, effective_users, effective_tor_core)
         try:
             with self.db:
                 self.db.execute(
@@ -752,11 +781,25 @@ class Store:
         return cache_key
 
     def prepare_candidate(
-        self, row: dict, result: dict, observed: str, *, dirauth_users: Iterable[str] | None = None
+        self,
+        row: dict,
+        result: dict,
+        observed: str,
+        *,
+        dirauth_users: Iterable[str] | None = None,
+        tor_core_users: Iterable[str] | None = None,
     ) -> dict:
         """Assemble a read-only publication candidate and source bindings for `row`."""
         effective_users = self.dirauth_users if dirauth_users is None else dirauth_users
-        return candidate.prepare(self.db, row, result, observed, dirauth_users=effective_users)
+        effective_tor_core = self.tor_core_users if tor_core_users is None else tor_core_users
+        return candidate.prepare(
+            self.db,
+            row,
+            result,
+            observed,
+            dirauth_users=effective_users,
+            tor_core_users=effective_tor_core,
+        )
 
     def _append_citation(self, story_id: str, story_payload: dict, source: dict) -> None:
         if "editorial_item" not in story_payload:
@@ -836,8 +879,9 @@ class Store:
                             or not isinstance(approval_meta.get("reason"), str) or not approval_meta["reason"]):
                         raise ReviewRequired("Operator approval requires an operator_approval audit record")
                     effective_users = prepared["dirauth_users"] if "dirauth_users" in prepared else self.dirauth_users
+                    effective_tor_core = prepared["tor_core_users"] if "tor_core_users" in prepared else self.tor_core_users
                     current = candidate.prepare(
-                        self.db, row, result, prepared["observed"], dirauth_users=effective_users
+                        self.db, row, result, prepared["observed"], dirauth_users=effective_users, tor_core_users=effective_tor_core
                     )
                     held_job = self.db.execute("SELECT stage FROM review_jobs WHERE item_id=?", (row["id"],)).fetchone()
                     item_state = self.db.execute("SELECT status FROM items WHERE id=?", (row["id"],)).fetchone()
@@ -847,20 +891,55 @@ class Store:
                         raise candidate.StaleCandidate("Item or coverage changed before approval committed")
                     operator_reason = approval_meta["reason"]
                 else:
-                    receipt = self.db.execute("SELECT * FROM review_approvals WHERE key=?", (approval_key,)).fetchone()
-                    if receipt is None or any(receipt[key] != expected for key, expected in (
-                            ("candidate_hash", digest(approved_candidate)), ("source_hash", prepared["source_hash"]),
-                            ("policy_hash", policy_hash), ("binding_hash", prepared["binding_hash"]))):
-                        raise ReviewRequired("Review decision does not match this candidate and its context")
+                    from . import review_gate
                     from .review import validate_review
 
-                    verdict = validate_review(json.loads(receipt["result_json"]), prepared["packet"],
-                                              update=mode == "update", coverage=prepared["coverage"])
-                    if verdict["verdict"] != decision:
-                        raise ReviewRequired("Final review did not authorize this decision")
-                    if review_record is None:
-                        review_record = json.loads(receipt["review_record_json"])
-                    self.db.execute("DELETE FROM review_approvals WHERE key=?", (approval_key,))
+                    receipt = self.db.execute("SELECT * FROM review_approvals WHERE key=?", (approval_key,)).fetchone()
+                    if receipt is not None:
+                        if any(receipt[key] != expected for key, expected in (
+                                ("candidate_hash", digest(approved_candidate)), ("source_hash", prepared["source_hash"]),
+                                ("policy_hash", policy_hash), ("binding_hash", prepared["binding_hash"]))):
+                            raise ReviewRequired("Review decision does not match this candidate and its context")
+                        verdict = validate_review(json.loads(receipt["result_json"]), prepared["packet"],
+                                                  update=mode == "update", coverage=prepared["coverage"])
+                        if verdict["verdict"] != decision:
+                            raise ReviewRequired("Final review did not authorize this decision")
+                        if review_record is None:
+                            review_record = json.loads(receipt["review_record_json"])
+                        self.db.execute("DELETE FROM review_approvals WHERE key=?", (approval_key,))
+                    else:
+                        expected_key = digest([digest(approved_candidate), prepared["source_hash"], policy_hash, prepared["binding_hash"]])
+                        job_row = (
+                            self.db.execute(
+                                "SELECT stage,policy_hash,approval_key FROM review_jobs WHERE item_id=?",
+                                (row["id"],),
+                            ).fetchone()
+                            if decision == "approve"
+                            and isinstance(review_record, dict)
+                            and approval_key == expected_key
+                            and review_record.get("policy_hash") == policy_hash
+                            and review_record.get("reviews")
+                            else None
+                        )
+                        if (
+                            job_row is None
+                            or job_row["stage"] != "approved"
+                            or job_row["policy_hash"] != policy_hash
+                            or job_row["approval_key"] != approval_key
+                        ):
+                            raise ReviewRequired("Review decision does not match this candidate and its context")
+                        review_gate.validate_review_state(
+                            review_record, "approved", approved_candidate, prepared, allow_cached=False
+                        )
+                        step_action, step_value = review_gate.next_step(review_record["reviews"], approved_candidate, prepared)
+                        if step_action != "approve" or step_value != approved_candidate:
+                            raise ReviewRequired("Final review did not authorize this decision")
+                        verdict = validate_review(
+                            review_record["reviews"][-1]["result"],
+                            prepared["packet"],
+                            update=mode == "update",
+                            coverage=prepared["coverage"],
+                        )
             if not operator:
                 candidate.verify_prepared_binding(self.db, prepared)
             cited_on_skip = False

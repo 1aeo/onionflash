@@ -18,6 +18,7 @@ CODES = frozenset({
     *(f"skipped.{stage}.{reason}" for stage in ("review", "verification")
       for reason in ("news_value", "new_information", "new_information_and_news_value")),
     "skipped.gate.not_recent", "skipped.gate.retired_story", "skipped.gate.no_new_content",
+    "skipped.gate.quoted_only", "skipped.gate.housekeeping", "skipped.gate.duplicate_issue",
     *(f"skipped.network.{reason}" for reason in ("not_report", "below_threshold", "before_enable", "host_locked")),
     "held.gate.missing_sources", "held.gate.repeat_hold", "held.gate.story_locked",
     *(f"held.network.{reason}" for reason in ("dry_run", "link_pending", "story_locked")),
@@ -26,7 +27,7 @@ CODES = frozenset({
     "held.verification.official_not_news", "held.verification.repairs_exhausted",
     *(f"held.final_check.{reason}" for reason in (
         "completed_action", "compromise_headline", "confirmed_source", "merge_state",
-        "shouting_caps", "malformed_version", "untrusted_operator_claim",
+        "shouting_caps", "malformed_version", "untrusted_operator_claim", "trove_category",
     )),
     *(f"failed.writer.{reason}" for reason in ("invalid_output", "evidence_too_short", "evidence_not_exact",
                                                "no_literal_evidence", "quoted_only_evidence", "invalid_input",
