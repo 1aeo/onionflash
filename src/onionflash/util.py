@@ -410,6 +410,13 @@ _RELEASE_ANNOUNCE_TITLE_RE = re.compile(
     r"\b(?:new release|security release|tor (?:stable|alpha|release)\b|\[release\])",
     re.I,
 )
+_LIST_ARCHIVE_THREAD_PATH_RE = re.compile(
+    r"^/(?:mailman3/hyperkitty/list/[^/]+/(?:message|thread)/[^/]+"
+    r"|archives/list/[^/]+/(?:message|thread)/[^/]+"
+    r"|pipermail/[^/]+/[^/]+/[^/]+"
+    r"|m/[^/]+/?\Z)",
+    re.I,
+)
 
 
 def tor_core_user_set(users: Iterable[str] | None = None) -> set[str]:
@@ -677,9 +684,10 @@ def is_official_release_announcement(item: dict) -> bool:
     """Return whether `item` is an official Tor Project release announcement feed entry."""
     if not isinstance(item, dict) or item.get("authority") != "official" or item.get("kind") != "feed":
         return False
-    if item.get("source_id") in {"tor-announce", "tor-release-announcements"}:
-        return True
     title = str(item.get("title") or "")
+    _, is_reply = _strip_subject_prefixes(title)
+    if is_reply:
+        return False
     if _RELEASE_ANNOUNCE_TITLE_RE.search(title):
         return True
     probe = {
@@ -694,7 +702,13 @@ def is_official_release_announcement(item: dict) -> bool:
 
 def is_torproject_new_thread(item: dict) -> bool:
     """Return whether `item` opens a new mailing-list thread from an official or @torproject.org sender."""
-    if not isinstance(item, dict) or LIST_ARCHIVE_HOST not in str(item.get("url") or ""):
+    if not isinstance(item, dict) or _url_host(item.get("url")) != LIST_ARCHIVE_HOST:
+        return False
+    try:
+        path = urlsplit(str(item["url"])).path or ""
+    except ValueError:
+        return False
+    if not _LIST_ARCHIVE_THREAD_PATH_RE.match(path):
         return False
     if item.get("authority") not in {"project-sender", "official"}:
         return False

@@ -226,8 +226,24 @@ def test_trove_cve_extraction_tor_core_and_mandatory_news_predicates():
         "authority": "official",
         "source_id": "tor-announce",
         "url": "https://lists.torproject.org/pipermail/tor-announce/2026/001.html",
-        "title": "[tor-announce] Maintenance note",
-        "content": "Release package note.",
+        "title": "[tor-announce] New release: Tor 0.4.9.16",
+        "content": "Tor 0.4.9.16 release package note.",
+    }
+    announce_reply = {
+        "kind": "feed",
+        "authority": "official",
+        "source_id": "tor-announce",
+        "url": "https://lists.torproject.org/pipermail/tor-announce/2026/003.html",
+        "title": "[tor-announce] Re: Scheduled GitLab maintenance",
+        "content": "Follow-up reply regarding scheduled maintenance.",
+    }
+    announce_maint = {
+        "kind": "feed",
+        "authority": "official",
+        "source_id": "tor-announce",
+        "url": "https://lists.torproject.org/pipermail/tor-announce/2026/004.html",
+        "title": "[tor-announce] Scheduled GitLab maintenance",
+        "content": "GitLab will undergo maintenance tomorrow.",
     }
     blog_digest = {
         "kind": "feed",
@@ -239,6 +255,10 @@ def test_trove_cve_extraction_tor_core_and_mandatory_news_predicates():
     }
     assert is_official_release_announcement(rel_feed) is True
     assert mandatory_news_rule(rel_feed) == "release_announcement"
+    assert is_official_release_announcement(announce_reply) is False
+    assert mandatory_news_rule(announce_reply) is None
+    assert is_official_release_announcement(announce_maint) is False
+    assert mandatory_news_rule(announce_maint) == "torproject_new_thread"
     assert is_official_release_announcement(blog_digest) is False
     assert mandatory_news_rule(blog_digest) is None
 
@@ -250,10 +270,18 @@ def test_trove_cve_extraction_tor_core_and_mandatory_news_predicates():
         "content": "Opening a new discussion thread.",
     }
     reply_thread = {**new_thread, "title": "[tor-dev] Re: Relay schedule"}
+    ref_param_blog = {
+        **new_thread,
+        "authority": "official",
+        "url": "https://blog.torproject.org/documentation/?ref=lists.torproject.org",
+    }
+    list_index = {**new_thread, "url": "https://lists.torproject.org/"}
     assert is_torproject_new_thread(new_thread) is True
     assert mandatory_news_rule(new_thread) == "torproject_new_thread"
     assert is_torproject_new_thread(reply_thread) is False
     assert mandatory_news_rule(reply_thread) is None
+    assert is_torproject_new_thread(ref_param_blog) is False
+    assert is_torproject_new_thread(list_index) is False
 
 
 def test_trove_label_limits_analyzer_and_final_holds(tmp_path):
@@ -887,3 +915,87 @@ def test_mandatory_revise_verification_paths_and_legacy_review_job_compat(tmp_pa
         requeued = item_row(store, r4)
         res4 = run_gate(cfg, store, requeued, Writer(draft), Reviewer(verdict(), verdict()), LATER)
         assert res4["status"] == "published"
+
+
+def test_review_gate_duplicate_ack_guards_and_receiptless_approval_resume(tmp_path):
+    """Protect contraction denials, source_content refs, Security acks, and receiptless approval resume."""
+    cfg = make_config(tmp_path)
+    with Store(tmp_path / "duplicate-guards.sqlite3") as store:
+        orig_url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/59001"
+        seed_source_story(
+            store,
+            _story_item(url=orig_url, title="Covered relay bug", content="Tracks #59001 relay bug."),
+            draft=_story_draft(title="Covered relay bug", summary="Tracks #59001 relay bug.", evidence=["Tracks #59001 relay bug."]),
+        )
+        # 1. Contraction denial ("isn't a duplicate of #59001") must not fast-skip
+        not_dup_contr = _story_item(
+            url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/59002",
+            title="Distinct relay regression",
+            content="This isn't a duplicate of #59001 and reproduces independently.",
+            author="outsider",
+        )
+        assert review_gate._eval_deterministic_skip(store.db, not_dup_contr, None) is None
+
+        # 2. source_content mentioning covered #59001 outside "duplicate of #99999" must not fast-skip
+        dup_uncovered_sc = _story_item(
+            url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/59003",
+            title="Unrelated uncovered duplicate",
+            content="Duplicate of #99999.",
+            source_content="Duplicate of #99999.\nAlso briefly mentions unrelated #59001 in background.",
+            author="outsider",
+        )
+        assert review_gate._eval_deterministic_skip(store.db, dup_uncovered_sc, None) is None
+
+        # 3. Protected label ("Security") with pure-ack body ("Verified.") must not fast-skip
+        sec_ack = _story_item(
+            url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/59004",
+            title="Relay key pinning bypass",
+            content="Verified.",
+            labels=["Security"],
+            author="outsider",
+        )
+        assert review_gate._eval_deterministic_skip(store.db, sec_ack, None) is None
+
+        # 4. Interrupted receiptless `approved` job (at reserved == MAX_REVIEW_REQUESTS) commits with 0 calls
+        mand_item = {
+            "source_id": "tor-dev",
+            "kind": "feed",
+            "authority": "project-sender",
+            "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/RESUME1/",
+            "title": "[tor-dev] Guard rotation schedule proposal",
+            "content": "Project sender proposes updating guard rotation schedule timing.",
+            "published_at": DATE,
+            "updated_at": DATE,
+        }
+        mand_draft = _story_draft(
+            title="Project proposes updated guard rotation schedule",
+            summary="A project sender proposes updating guard rotation schedule timing.",
+            evidence=["Project sender proposes updating guard rotation schedule timing."],
+        )
+        r_m = pending(store, mand_item)
+        # First complete a revise -> verification skip(news_value) flow so we capture the exact valid record
+        prep_m = review_gate._prepare(store, cfg, r_m, mand_draft, DATE)
+        policy = review.policy_hash(cfg)
+        key = review_gate._approval_key(prep_m["candidate"], prep_m, policy)
+        run_gate(
+            cfg, store, r_m, Writer(mand_draft),
+            Reviewer(verdict(), verdict("skip", criterion="news_value")),
+            DATE,
+        )
+        saved_story_id = store.db.execute("SELECT id FROM stories WHERE cluster_key=?", (prep_m["cluster_key"],)).fetchone()[0]
+        # Retrieve the committed audit record, remove approval receipt, reset item to pending + stage='approved'
+        rec_raw = store.db.execute("SELECT review_record FROM analyses WHERE source_item_id=?", (r_m["id"],)).fetchone()[0]
+        rec_obj = json.loads(rec_raw)
+        rec_obj["request_budget"]["reserved"] = review_gate.MAX_REVIEW_REQUESTS
+        wkey = rec_obj["writer"]["key"]
+        with store.db:
+            store.db.execute("DELETE FROM stories WHERE id=?", (saved_story_id,))
+            store.db.execute("DELETE FROM review_approvals")
+            store.db.execute("UPDATE items SET status='pending', story_id=NULL WHERE id=?", (r_m["id"],))
+            review_gate._save(
+                store, r_m, wkey, policy, "approved", mand_draft, prep_m, rec_obj, DATE,
+                prepared_at=DATE, approval_key=key, approval_receipt=None,
+            )
+        r_resume = item_row(store, r_m)
+        res_resume = run_gate(cfg, store, r_resume, Writer(), Reviewer(), DATE)
+        assert res_resume["status"] == "published" and res_resume["review_calls"] == 0 and res_resume["writer_calls"] == 0

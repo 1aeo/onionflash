@@ -135,6 +135,16 @@ def _operator_command(args, store: Store, config: dict) -> dict:
     return getattr(rejection, args.action + "_item")(store, args.item, args.expect_hash, args.reason)
 
 
+def _effective_config(config: dict, store: Store) -> tuple[dict, list[str]]:
+    tor_core_users, trusted_domains = registry.effective_identities(config, store.db)
+    eff_collection = {
+        **config["collection"],
+        "tor_core_gitlab_users": tor_core_users,
+        "trusted_operator_domains": trusted_domains,
+    }
+    return {**config, "collection": eff_collection}, tor_core_users
+
+
 def run(config: dict, store: Store) -> dict:
     """Collect and review pending items within one deadline, then build the site."""
     consensus_sources = enabled_consensus_sources(config["sources"], check_single=True)
@@ -159,13 +169,8 @@ def run(config: dict, store: Store) -> dict:
             "updated": {},
             "errors": [_unexpected_error(exc)],
         }
-    tor_core_users, trusted_domains = registry.effective_identities(config, store.db)
-    run_collection = {
-        **config["collection"],
-        "tor_core_gitlab_users": tor_core_users,
-        "trusted_operator_domains": trusted_domains,
-    }
-    run_config = {**config, "collection": run_collection}
+    run_config, tor_core_users = _effective_config(config, store)
+    run_collection = run_config["collection"]
     comments_enabled = bool(run_config.get("comments", {}).get("enabled"))
     comments_budget = min(COMMENTS_BUDGET, collection_window / 2) if comments_enabled else 0
     collection_deadline = started + collection_window - comments_budget
@@ -364,11 +369,15 @@ def main(argv: list[str] | None = None) -> int:
                         "sources": store.health(config["sources"], config["collection"]["stale_after_seconds"], observed),
                     }
                 elif operator:
-                    result = _operator_command(args, store, config)
+                    eff_config, eff_tor_core = _effective_config(config, store)
+                    store.tor_core_users = tuple(eff_tor_core)
+                    result = _operator_command(args, store, eff_config)
                 elif args.command == "run":
                     result = run(config, store)
                 else:
-                    result = build(config, store, force=args.force)
+                    eff_config, eff_tor_core = _effective_config(config, store)
+                    store.tor_core_users = tuple(eff_tor_core)
+                    result = build(eff_config, store, force=args.force)
             print(json.dumps(result, ensure_ascii=operator))
         return 0
     except (ValueError, OSError) as exc:

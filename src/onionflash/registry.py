@@ -154,8 +154,10 @@ def fetch_tor_core_users(client: HttpClient) -> list[str]:
         next_page = _header_ci(response.headers, "x-next-page")
         if next_page is not None:
             next_str = next_page.strip()
-            if not next_str or not next_str.isdigit() or int(next_str) != page + 1:
+            if not next_str:
                 break
+            if not next_str.isdigit() or int(next_str) != page + 1:
+                raise RegistryError("Invalid GitLab tree pagination header")
         elif len(entries) < _TREE_PAGE_SIZE:
             break
 
@@ -182,12 +184,16 @@ def fetch_tor_core_users(client: HttpClient) -> list[str]:
         nodes = blobs.get("nodes") if isinstance(blobs, dict) else None
         if not isinstance(nodes, list):
             raise RegistryError("Missing GraphQL blob nodes")
+        seen_paths: set[str] = set()
         for node in nodes:
             if not isinstance(node, dict):
                 raise RegistryError("Invalid GraphQL blob node")
             path = node.get("path")
             if not isinstance(path, str) or path not in path_to_slug:
                 raise RegistryError("Unexpected GraphQL blob path")
+            if path in seen_paths:
+                raise RegistryError("Duplicate GraphQL blob path")
+            seen_paths.add(path)
             raw_blob = node.get("rawBlob")
             if raw_blob is None:
                 continue
@@ -203,6 +209,8 @@ def fetch_tor_core_users(client: HttpClient) -> list[str]:
             slug_lower = slug.strip().lower()
             if not slug_lower.endswith("-core") and is_valid_gitlab_user(slug_lower):
                 users.add(slug_lower)
+        if seen_paths != set(path_to_slug):
+            raise RegistryError("Incomplete GraphQL blob response")
 
     if len(users) < MIN_CORE_USERS:
         raise RegistryError(f"Insufficient Tor core users ({len(users)})")

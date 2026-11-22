@@ -184,6 +184,15 @@ def test_fetch_tor_core_users_pagination_chunking_and_filtering():
     ])
     assert len(registry.fetch_tor_core_users(client_no_hdr)) == 105
 
+    # Explicit rawBlob=None for one requested entry succeeds when remaining nodes are complete.
+    all_25 = [f"m{i:02d}" for i in range(25)]
+    blobs_with_none = {**{f"content/about/people/{s}/contents.lr": _lektor_blob(nickname=s) for s in all_25[:-1]},
+                       f"content/about/people/{all_25[-1]}/contents.lr": None}
+    assert len(registry.fetch_tor_core_users(FakeClient([
+        response(json.dumps([{"name": s, "type": "tree"} for s in all_25]).encode()),
+        response(_graphql_response([f"content/about/people/{s}/contents.lr" for s in all_25], blobs_with_none)),
+    ]))) == 24
+
 
 @pytest.mark.parametrize("responses", [
     [response(b"error", status=502)],
@@ -194,9 +203,36 @@ def test_fetch_tor_core_users_pagination_chunking_and_filtering():
     [response(json.dumps([{"name": "onlyone", "type": "tree"}]).encode()), response(json.dumps({"errors": [{"message": "bad"}]}).encode())],
     [response(json.dumps([{"name": "onlyone", "type": "tree"}]).encode()), response(json.dumps({"data": None}).encode())],
     [
+        response(json.dumps([{"name": f"u{i:02d}", "type": "tree"} for i in range(25)]).encode(), {"X-Next-Page": "3"}),
+        response(_graphql_response(
+            [f"content/about/people/u{i:02d}/contents.lr" for i in range(25)],
+            _people_blobs([f"u{i:02d}" for i in range(25)]),
+        )),
+    ],
+    [
+        response(json.dumps([{"name": f"u{i:02d}", "type": "tree"} for i in range(25)]).encode(), {"X-Next-Page": "bad"}),
+    ],
+    [
         response(json.dumps([{"name": f"u{i:02d}", "type": "tree"} for i in range(25)]).encode()),
         response(json.dumps({"data": {"project": {"repository": {"blobs": {"nodes": [
             {"path": "content/about/people/unexpected/contents.lr", "rawBlob": _lektor_blob(nickname="unexpected")},
+        ]}}}}}).encode()),
+    ],
+    [
+        response(json.dumps([{"name": f"u{i:02d}", "type": "tree"} for i in range(25)]).encode()),
+        response(json.dumps({"data": {"project": {"repository": {"blobs": {"nodes": [
+            {"path": f"content/about/people/u{i:02d}/contents.lr", "rawBlob": _lektor_blob(nickname=f"u{i:02d}")}
+            for i in range(20)
+        ]}}}}}).encode()),
+    ],
+    [
+        response(json.dumps([{"name": f"u{i:02d}", "type": "tree"} for i in range(25)]).encode()),
+        response(json.dumps({"data": {"project": {"repository": {"blobs": {"nodes": [
+            {"path": "content/about/people/u00/contents.lr", "rawBlob": _lektor_blob(nickname="u00")},
+            *[
+                {"path": f"content/about/people/u{i:02d}/contents.lr", "rawBlob": _lektor_blob(nickname=f"u{i:02d}")}
+                for i in range(25)
+            ],
         ]}}}}}).encode()),
     ],
     [
@@ -627,3 +663,80 @@ def test_cli_run_and_status_wire_registry_identities(tmp_path, monkeypatch, caps
             "longclaw", "maatuska", "moria1", "sekhmet", "tor26",
         ],
     }
+
+
+def test_cli_operator_commands_resolve_cached_registry_identities(tmp_path, monkeypatch, capsys):
+    """Resolve cached registry identities network-free for `rejected show` and `rejected approve`."""
+    from helpers import DATE, Reviewer, pending, run_gate, verdict
+
+    monkeypatch.setenv("ONIONFLASH_LLM_BASE_URL", "https://model.example/v1")
+    cfg_path = write_toml(
+        tmp_path,
+        '[registry]\nenabled = true\n'
+        '[collection]\ntor_core_gitlab_users = ["cfg_core"]\n'
+        '[[sources]]\n'
+        'id = "tor-blog"\n'
+        'name = "Tor Blog"\n'
+        'url = "https://blog.torproject.org/feed.xml"\n'
+        'kind = "feed"\n'
+        'authority = "official"\n'
+        'product = "tor"\n',
+        with_source=False,
+    )
+    cfg = load_config(cfg_path)
+    monkeypatch.setattr(
+        registry, "HttpClient",
+        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("Operator CLI commands must not open HttpClient")),
+    )
+    with Store(cfg["storage"]["database"], dirauth_users=cfg["collection"]["dirauth_gitlab_users"]) as store:
+        with store.db:
+            set_meta(store.db, **{"registry.tor_core_users": json.dumps(["synced_core_user"])})
+        eff_cfg, eff_users = cli._effective_config(cfg, store)
+        assert eff_users == ["cfg_core", "synced_core_user"]
+        row = pending(store, {
+            "source_id": "tor-blog",
+            "url": "https://blog.torproject.org/routine-report-1/",
+            "title": "Routine official community roundup",
+            "content": "Monthly roundup of community events and translations.",
+            "published_at": DATE,
+            "updated_at": DATE,
+            "kind": "feed",
+            "product": "tor",
+            "authority": "official",
+            "labels": [],
+        })
+        draft = {
+            "publish": True,
+            "title": "Tor Blog posts monthly roundup",
+            "summary": "Monthly roundup of community events and translations.",
+            "why_it_matters": "",
+            "category": "feature",
+            "priority": "normal",
+            "confidence": "confirmed",
+            "state": "released",
+            "products": ["tor"],
+            "tags": ["feature"],
+            "evidence": ["Monthly roundup of community events and translations."],
+        }
+        held = run_gate(
+            eff_cfg, store, row,
+            Writer(draft),
+            Reviewer(verdict("skip", criterion="news_value"), verdict("skip", criterion="news_value")),
+            DATE,
+        )
+        assert held["status"] == "held"
+        item_id = row["id"]
+
+    shown = invoke_cli(capsys, "rejected", "show", "--config", str(cfg_path), "--item", item_id)
+    approval = shown["final_review"]["approval"]
+    assert approval["eligible"] is True and isinstance(approval["hash"], str)
+
+    approved = invoke_cli(
+        capsys,
+        "rejected", "approve",
+        "--config", str(cfg_path),
+        "--item", item_id,
+        "--approval-hash", approval["hash"],
+        "--reason", "Operator approves held official item after registry sync.",
+    )
+    assert approved["action"] == "approve" and approved["status"] == "published"

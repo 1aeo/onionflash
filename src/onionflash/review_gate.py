@@ -1300,7 +1300,10 @@ _DUP_ISSUE_RE = re.compile(
     r"|\bdup(?:licate)?\s+of\s+(?:#\d+|[\w.-]+/[\w./-]+#\d+|https://gitlab\.torproject\.org/\S+)",
     re.I,
 )
-_NOT_DUP_RE = re.compile(r"\bnot\s+(?:a\s+)?duplicate\b", re.I)
+_NOT_DUP_RE = re.compile(
+    r"\b(?:(?:is|was|are|were)n['’]?t\s+(?:a\s+)?|not\s+(?:a\s+)?|no\s+|non[- ]?)duplicates?\b",
+    re.I,
+)
 _DUP_LABELS = frozenset({"duplicate", "status::duplicate"})
 _DUP_SECURITY_GUARD_RE = re.compile(
     r"\b(?:vulnerabilit\w*|exploit\w*|null[- ]?(?:pointer[- ]|ptr[- ])?deref\w*|use[- ]after[- ]free|buffer\s+overflow|"
@@ -1380,7 +1383,9 @@ def _eval_deterministic_skip(
             target_refs: list[str] = []
             if matches:
                 dup_snippet = "\n".join(m.group(0) for m in matches)
-                closing, mentioned = gitlab_refs({**item, "title": "", "content": dup_snippet, "public_comments": []})
+                closing, mentioned = gitlab_refs(
+                    {**item, "title": "", "content": dup_snippet, "source_content": dup_snippet, "public_comments": []}
+                )
                 target_refs = [*closing, *mentioned]
             elif (labels & _DUP_LABELS) and item.get("upstream_state") == "closed":
                 closing, mentioned = gitlab_refs(item)
@@ -1397,6 +1402,7 @@ def _eval_deterministic_skip(
         or _security_disclosure(item)
         or cve_ids(item)
         or trove_ids(item)
+        or (labels & _PROTECTED_LABELS)
     ):
         return None
     norm_body = re.sub(r"\s+", " ", unquoted).strip()
@@ -1413,7 +1419,6 @@ def _eval_deterministic_skip(
         existing is None
         and not item.get("public_comments")
         and _HOUSEKEEPING_TITLE_RE.search(cleaned_title)
-        and not (labels & _PROTECTED_LABELS)
     ):
         return "skipped.gate.housekeeping", "Routine checklist or housekeeping item"
     return None
@@ -1656,6 +1661,23 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                 if verdict["verdict"] == "approve" and (held := review.final_holds(candidate, prepared)):
                     return _hold_item("final_check", held[0], cache_hit=True)
                 return _commit_decision(verdict["verdict"], key, cache_hit=True)
+        if (
+            stage == "approved"
+            and not proposal_needs_check(record)
+            and record.get("outcome") == "approved"
+            and record.get("approval_key") == key
+            and job["approval_key"] == key
+            and record.get("reviews")
+            and record["reviews"][-1]["result"]["verdict"] != "approve"
+            and mandatory_news_rule({
+                **item_payload,
+                "authority": effective_authority(item_payload, prepared.get("dirauth_users"), prepared.get("tor_core_users")),
+            }) is not None
+            and next_step(record["reviews"], candidate, prepared) == ("approve", candidate)
+        ):
+            if held := review.final_holds(candidate, prepared):
+                return _hold_item("final_check", held[0])
+            return _commit_decision("approve", key)
         if stage in {"approved", "skipped"}:  # without a usable receipt, review the writer's draft again
             stage, candidate, record = "review", prepared["candidate"], fresh
         requests = ReviewRequests(record, lambda: _save_job(stage))
