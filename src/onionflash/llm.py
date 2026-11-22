@@ -11,7 +11,7 @@ import unicodedata
 from .config import completion_budget_seconds
 from .schema import CATEGORIES, CONFIDENCES, STATES
 from .transport import DeadlineReached, FetchError, HttpClient
-from .util import LIST_ARCHIVE_HOST, has_invalid_text_chars, is_trove_item, strict_json
+from .util import LIST_ARCHIVE_HOST, _url_host, has_invalid_text_chars, is_trove_item, strict_json
 
 _ACRONYM_ALLOWLIST = frozenset({
     "TOR", "ARTI", "TCP", "UDP", "TLS", "SSL", "DNS", "HTTP", "HTTPS", "SOCKS", "SOCKS4",
@@ -306,7 +306,7 @@ def unquoted_mail_text(text: str) -> str:
 
 def is_quoted_list_post(url: object, text: str) -> bool:
     """Return whether `text` is a `lists.torproject.org` post containing `>`-quoted lines."""
-    return LIST_ARCHIVE_HOST in str(url or "") and any(ln.lstrip().startswith(">") for ln in text.splitlines())
+    return _url_host(url) == LIST_ARCHIVE_HOST and any(ln.lstrip().startswith(">") for ln in text.splitlines())
 
 
 def label_limits(sources: list[dict]) -> dict:

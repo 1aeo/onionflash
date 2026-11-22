@@ -996,6 +996,17 @@ def test_review_gate_duplicate_ack_guards_and_receiptless_approval_resume(tmp_pa
                 store, r_m, wkey, policy, "approved", mand_draft, prep_m, rec_obj, DATE,
                 prepared_at=DATE, approval_key=key, approval_receipt=None,
             )
+        # 5. External URL containing lists.torproject.org in path is never treated as a quoted list reply
+        non_archive_quoted = _story_item(
+            kind="feed",
+            authority="community",
+            url="https://example.org/posts/lists.torproject.org",
+            title="External post citing quoted archive excerpt",
+            content="> Quoted line one.\n> Quoted line two.",
+        )
+        assert llm.is_quoted_list_post(non_archive_quoted["url"], non_archive_quoted["content"]) is False
+        assert review_gate._eval_deterministic_skip(store.db, non_archive_quoted, None) is None
+
         r_resume = item_row(store, r_m)
         res_resume = run_gate(cfg, store, r_resume, Writer(), Reviewer(), DATE)
         assert res_resume["status"] == "published" and res_resume["review_calls"] == 0 and res_resume["writer_calls"] == 0
