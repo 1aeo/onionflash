@@ -377,6 +377,16 @@ def test_evaluation_scoring_repairs_holds_and_private_output(evaluation, tmp_pat
         assert (r2["repairs_verified"], r2["false_approvals"], r2["matched"]) == (1, fa, 1 - fa)
         assert json.loads(o2.read_text().splitlines()[0])["kept_unsupported"] == kept
 
+    tightened = "The issue says bastet's keys can no longer be trusted."
+    monkeypatch.setattr(
+        module, "EvaluationReviewer",
+        _scripted(lambda _c, v: {"verdict": "approve"} if v else {"verdict": "revise", "repair": {"why_it_matters": tightened}}),
+    )
+    o_tight = tmp_path / "tightened-wim.jsonl"
+    r_tight = module.evaluate(config, [BY_ID["bastet-original"]], o_tight)
+    assert (r_tight["repairs_verified"], r_tight["false_approvals"], r_tight["impact_cleared"], r_tight["matched"]) == (1, 0, 0, 1)
+    assert json.loads(o_tight.read_text().splitlines()[0])["published_candidate"]["why_it_matters"] == tightened
+
     pos_sel = [c for c in CORPUS if c["id"] in {"bastet-corrected", "new-release-news", "new-version-tag"}]
     for verified, repair, verdicts, cleared in (("approve", {"priority": "high"}, ["approve", "approve", "hold"], 0),
                                                  ("hold", {"priority": "high"}, ["hold", "hold", "hold"], 0),
