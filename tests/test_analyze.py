@@ -7,10 +7,10 @@ import httpx
 import pytest
 
 from helpers import (
-    DATE, LATER, NON_RELEASE_CATEGORIES, NON_TAG_STATES, ApprovingReviewer, FakeClient, Reviewer,
-    Writer, analysis, completion, decision_rows, finish_reviewed, item, list_rss, make_note,
-    patch_cli_pipeline, pending, public_dns, response, run_gate, seed_story, source, update_analysis,
-    verdict, wire_analyzer, write_toml,
+    DATE, LATER, NON_RELEASE_CATEGORIES, NON_TAG_STATES, ApprovingReviewer, FakeClient, FakeLLM,
+    Reviewer, Writer, analysis, completion, decision_rows, finish_reviewed, item, list_rss,
+    make_note, patch_cli_pipeline, pending, public_dns, response, run_gate, seed_story, source,
+    update_analysis, verdict, wire_analyzer, write_toml,
 )
 from onionflash import analyze, candidate, cli, collect, decisions, rejection, source_packet
 from onionflash.analyze import (
@@ -1228,3 +1228,184 @@ def test_unquoted_mail_text_keeps_from_prose_and_dated_headings_before_quotes(st
         row = {**row, "story_id": seeded["id"]}
         mode, filtered = candidate.own_update_input(store.db, row, json.loads(row["payload"]))
         assert mode == "update" and filtered["content"] == expected_kept
+
+
+def test_editorial_polish_pass_thread_root_label_normalization_and_fallback(monkeypatch):
+    """Run two-stage polish when enabled, forward thread_root safely, normalize labels, and fall back on invalid polish."""
+    from onionflash.llm import CompletionDeferred
+
+    # 1. Story polish (2 calls), headline refinement, why_it_matters preservation, and label retention.
+    src_item = item(
+        title="tor#41500: Consensus votes exceeding 16 MB fail serialization",
+        content="Consensus votes larger than 16 MB are truncated before signing on Tor 0.4.9.16.",
+        labels=[],
+    )
+    initial_draft = analysis(
+        title="Tor issue reports consensus vote truncation over 16 MB",
+        summary="A GitLab issue says consensus votes larger than 16 MB are truncated before signing on Tor 0.4.9.16.",
+        why_it_matters="Large directory votes exceeding 16 MB can be truncated before signing.",
+        category="network",
+        priority="normal",
+        confidence="reported",
+        state="developing",
+        products=["tor"],
+        tags=["network"],
+        evidence=["Consensus votes larger than 16 MB are truncated before signing on Tor 0.4.9.16."],
+    )
+    polished_reply = {
+        "title": "Tor consensus votes over 16 MB truncated before signing",
+        "summary": "Votes larger than 16 MB are truncated before signing on Tor 0.4.9.16.",
+        "why_it_matters": "Directory authority votes exceeding 16 MB on Tor 0.4.9.16 can be truncated before signing.",
+    }
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["llm"].update(base_url="https://llm.example/v1")
+    monkeypatch.setenv(cfg["llm"]["api_key_env"], "test-key")
+    polished_writer = Analyzer(cfg, editorial_polish=True)
+    polished_writer.client = FakeLLM(initial_draft, polished_reply)
+    out = polished_writer.analyze(src_item)
+    assert len(polished_writer.client.requests) == 2 and polished_writer.calls == 2
+    assert out["title"] == polished_reply["title"]
+    assert out["summary"] == polished_reply["summary"]
+    assert out["why_it_matters"] == polished_reply["why_it_matters"]
+    assert out["evidence"] == initial_draft["evidence"]
+    assert out["category"] == "network" and out["state"] == "developing"
+    polish_req = polished_writer.client.requests[1][1]
+    assert polish_req["messages"][0]["content"] == analyze.POLISH_PROMPT
+    assert polish_req["response_format"]["json_schema"]["name"] == "onionflash_polish"
+    assert polish_req["response_format"]["json_schema"]["schema"] == analyze.POLISH_SCHEMA
+    polish_payload = json.loads(polish_req["messages"][1]["content"])
+    assert polish_payload["draft"]["why_it_matters"] == initial_draft["why_it_matters"]
+
+    # 2. Partial polish reply retains omitted why_it_matters and validated fields; ungrounded polish clears why_it_matters.
+    omitted_wim_writer = Analyzer(cfg, editorial_polish=True)
+    omitted_wim_writer.client = FakeLLM(initial_draft, {"title": "Polished headline", "summary": "Polished summary."})
+    out_omitted = omitted_wim_writer.analyze(src_item)
+    assert out_omitted["title"] == "Polished headline"
+    assert out_omitted["why_it_matters"] == initial_draft["why_it_matters"] and omitted_wim_writer.clears == 0
+
+    bad_num_writer = Analyzer(cfg, editorial_polish=True)
+    bad_num_writer.client = FakeLLM(initial_draft, {**polished_reply, "why_it_matters": "Votes over 64 MB fail."})
+    out_cleared = bad_num_writer.analyze(src_item)
+    assert out_cleared["why_it_matters"] == "" and bad_num_writer.clears == 1
+
+    # 3. Fallback on non-retryable AnalysisError (invalid schema keys, shouting caps, truncated), while propagating retryable / Deadline.
+    for bad_reply in (
+        {"unexpected": "field"},
+        {**polished_reply, "title": "RELAYS AT RISK FOR DEANONYMIZATION"},
+        completion(polished_reply, finish_reason="length"),
+        {**polished_reply, "title": ""},
+    ):
+        fb_writer = Analyzer(cfg, editorial_polish=True)
+        fb_writer.client = FakeLLM(initial_draft, bad_reply)
+        fallback_out = fb_writer.analyze(src_item)
+        assert fallback_out == initial_draft and len(fb_writer.client.requests) == 2
+
+    retry_writer = Analyzer(cfg, editorial_polish=True)
+    retry_writer.client = FakeLLM(initial_draft, FetchError("unavailable", status=503))
+    with pytest.raises(AnalysisError) as retry_err:
+        retry_writer.analyze(src_item)
+    assert retry_err.value.retryable is True
+
+    defer_writer = Analyzer(cfg, editorial_polish=True)
+    defer_writer.client = FakeLLM(initial_draft, CompletionDeferred("deadline"))
+    with pytest.raises(CompletionDeferred):
+        defer_writer.analyze(src_item)
+
+    # 4. Polish skipped on tag items and update mode (prior is not None), and default editorial_polish=False makes 1 call.
+    default_writer = wire_analyzer(monkeypatch, initial_draft)
+    assert default_writer.analyze(src_item) == initial_draft and len(default_writer.client.requests) == 1
+
+    tag_writer = Analyzer(cfg, editorial_polish=True)
+    tag_writer.client = FakeLLM()
+    assert tag_writer.analyze(item(kind="tag", title="tor-0.4.9.16", content=""))["state"] == "tagged"
+    assert tag_writer.client.requests == []
+
+    upd_draft = update_analysis(update="A follow-up patch landed.", evidence=[src_item["content"]])
+    upd_writer = Analyzer(cfg, editorial_polish=True)
+    upd_writer.client = FakeLLM(upd_draft)
+    assert upd_writer.analyze(src_item, prior=_prior_story())["update"] == upd_draft["update"]
+    assert len(upd_writer.client.requests) == 1
+
+    # 5. thread_root forwarded into bounded payload (never into evidence or impact_context).
+    list_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/R2/"
+    reply_item = item(
+        url=list_url, kind="feed", authority="trusted-operator",
+        title="[tor-relays] Re: Guard bandwidth drop",
+        content="Our 5 relays saw stable throughput today.\n> Earlier 99 relays dropped.",
+        labels=[],
+        thread_root={"title": "[tor-relays] Guard bandwidth drop", "published_at": DATE,
+                     "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/R1/",
+                     "excerpt": "We saw 77 relays drop bandwidth earlier."},
+    )
+    reply_draft = analysis(
+        title="Guard bandwidth steady on 5 observed relays",
+        summary="A relay operator reports stable throughput across 5 relays.",
+        why_it_matters="5 observed relays maintained stable throughput.",
+        category="relay", tags=["relay"], confidence="reported",
+        evidence=["Our 5 relays saw stable throughput today."],
+    )
+    tr_writer = Analyzer(cfg, editorial_polish=True)
+    tr_writer.client = FakeLLM(reply_draft, {
+        "title": "Guard bandwidth steady on 5 observed relays",
+        "summary": "A relay operator reports stable throughput across 5 relays.",
+        "why_it_matters": "77 relays dropped bandwidth earlier.",
+    })
+    tr_out = tr_writer.analyze(reply_item)
+    first_sent = json.loads(tr_writer.client.requests[0][1]["messages"][1]["content"])
+    first_evidence_enum = tr_writer.client.requests[0][1]["response_format"]["json_schema"]["schema"]["properties"]["evidence"]["items"]["enum"]
+    assert first_sent["thread_root"] == reply_item["thread_root"]
+    assert all("77 relays" not in exc for exc in first_evidence_enum)
+    assert tr_out["why_it_matters"] == "" and tr_writer.clears == 1
+
+    # 6. Merged MR confidence=confirmed & dirauth operational category=directory-authority normalization in polish mode only.
+    mr_item = item(kind="gitlab_mr", upstream_state="merged", title="Fix descriptor retry timer", content="Merged fix for descriptor retries.", labels=[])
+    mr_draft = analysis(title="Fix descriptor retry timer", summary="Merged fix for descriptor retries.", why_it_matters="",
+                        category="network", state="merged", confidence="reported", tags=["network"],
+                        evidence=["Merged fix for descriptor retries."])
+    mr_polish = {"title": "Tor merges descriptor retry timer fix", "summary": "A merged MR fixes descriptor retry timing.", "why_it_matters": ""}
+    mr_writer = Analyzer(cfg, editorial_polish=True)
+    mr_writer.client = FakeLLM(mr_draft, mr_polish)
+    assert mr_writer.analyze(mr_item)["confidence"] == "confirmed"
+
+    da_item = item(
+        url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/41920",
+        kind="gitlab_issue", authority="dirauth-operator", author="linus",
+        title="Planned IPv4/IPv6 migration for maatuska",
+        content="maatuska will migrate to a new dual-stack subnet.", labels=["Directory Authority (dirauth)"],
+    )
+    da_draft = analysis(
+        title="Maatuska directory authority plans dual-stack migration",
+        summary="A ticket plans a dual-stack IP migration for maatuska.",
+        why_it_matters="", category="network", tags=["network"],
+        evidence=["maatuska will migrate to a new dual-stack subnet."],
+    )
+    da_polish = {"title": "Maatuska directory authority plans dual-stack IP migration",
+                 "summary": "maatuska will migrate to a new dual-stack subnet.", "why_it_matters": ""}
+    da_writer = Analyzer(cfg, editorial_polish=True)
+    da_writer.client = FakeLLM(da_draft, da_polish)
+    da_out = da_writer.analyze(da_item)
+    assert da_out["category"] == "directory-authority" and da_out["tags"] == ["directory-authority"]
+
+    with monkeypatch.context() as mp:
+        mp.setattr(analyze._util, "should_confirm_merged_mr", lambda srcs: srcs[0].get("kind") == "gitlab_mr", raising=False)
+        mp.setattr(analyze._util, "is_dirauth_category_story", lambda srcs: "maatuska" in srcs[0].get("title", ""), raising=False)
+        mr_hook = Analyzer(cfg, editorial_polish=True)
+        mr_hook.client = FakeLLM(mr_draft, mr_polish)
+        assert mr_hook.analyze(mr_item)["confidence"] == "confirmed"
+        da_hook = Analyzer(cfg, editorial_polish=True)
+        da_hook.client = FakeLLM(da_draft, da_polish)
+        assert da_hook.analyze(da_item)["category"] == "directory-authority"
+
+    direct_writer = Analyzer(cfg)
+    direct_writer.client = FakeLLM(polished_reply)
+    assert direct_writer.polish_draft(initial_draft, src_item, src_item)["title"] == polished_reply["title"]
+
+    # 7. cache_key invalidates on POLISH_PROMPT / POLISH_SCHEMA for story mode, not update mode.
+    story_key = _cache_key_for()
+    upd_key = _cache_key_for(previous=_prior_story())
+    with monkeypatch.context() as mp:
+        mp.setattr(analyze, "POLISH_PROMPT", analyze.POLISH_PROMPT + "\nExtra polish note.")
+        assert _cache_key_for() != story_key and _cache_key_for(previous=_prior_story()) == upd_key
+    with monkeypatch.context() as mp:
+        mp.setitem(analyze.POLISH_SCHEMA["properties"]["title"], "maxLength", 139)
+        assert _cache_key_for() != story_key and _cache_key_for(previous=_prior_story()) == upd_key
