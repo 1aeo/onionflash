@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
+import copy
 import fcntl
+import inspect
 import json
 import os
 from pathlib import Path
 import sqlite3
 import sys
+import threading
 import time
 import traceback
 
-from . import __version__, decisions, doctor, editorial, registry, rejection
-from .analyze import AnalysisError, Analyzer
+from . import __version__, candidate as candidate_mod, decisions, doctor, editorial, registry, rejection, review, review_gate
+from .analyze import AnalysisError, Analyzer, cache_key
 from .collect import CollectionError, collect_source
 from .comments import RUN_BUDGET_SECONDS as COMMENTS_BUDGET, enrich_comments, merge_cached_comments, status as comments_status
 from .config import enabled_consensus_sources, load_config
@@ -24,7 +28,12 @@ from .review import Reviewer, ReviewLimitReached
 from .review_gate import process_item, status as review_status
 from .store import Store, source_due
 from .transport import HttpClient
-from .util import now_iso
+from .util import after, digest, now_iso
+
+MAX_CONCURRENT_LLM_ITEMS = 4
+_ORIG_ANALYZER = Analyzer
+_ORIG_REVIEWER = Reviewer
+_ORIG_PROCESS_ITEM = process_item
 
 _OPERATOR_ACTION_ORDER = {
     "story": ("show", "history", "correct", "retract", "restore", "unlock", "merge"),
@@ -145,6 +154,226 @@ def _effective_config(config: dict, store: Store) -> tuple[dict, list[str]]:
     return {**config, "collection": eff_collection}, tor_core_users
 
 
+def _new_analyzer(config: dict, *, deadline: float | None = None):
+    """Construct `Analyzer`, opting into `editorial_polish=True` when supported."""
+    kwargs: dict[str, object] = {"deadline": deadline}
+    try:
+        params = inspect.signature(Analyzer).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "editorial_polish" in params:
+        kwargs["editorial_polish"] = True
+    return Analyzer(config, **kwargs)
+
+
+def _parallel_verify_kwargs(use_parallel: bool, reviewer_factory) -> dict:
+    """Return opt-in parallel verification kwargs when `process_item` supports them."""
+    if not use_parallel:
+        return {}
+    try:
+        params = inspect.signature(process_item).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "parallel_verify" in params and "reviewer_factory" in params:
+        return {"parallel_verify": True, "reviewer_factory": reviewer_factory}
+    return {}
+
+
+def _prefetch_drafts(
+    run_config: dict,
+    store: Store,
+    pending_rows: list[dict],
+    report: dict,
+    observed: str | None = None,
+    *,
+    run_deadline: float,
+    allow_network: bool = True,
+    endpoint_failures: int = 0,
+) -> tuple[int, int, set[str], bool]:
+    """Draft eligible queued items concurrently without accessing SQLite from worker threads."""
+    if not allow_network or endpoint_failures >= 2 or len(pending_rows) <= 1 or time.monotonic() >= run_deadline:
+        return 0, endpoint_failures, set(), False
+
+    coll = run_config.get("collection") or {}
+    dirauth_users = coll.get("dirauth_gitlab_users")
+    tor_core_users = coll.get("tor_core_gitlab_users")
+    policy = review.policy_hash(run_config)
+    tasks: list[tuple[dict, dict, dict | None, str, dict | None]] = []
+
+    for row in pending_rows[: MAX_CONCURRENT_LLM_ITEMS * 2]:
+        if row.get("damaged"):
+            continue
+        try:
+            item_payload = json.loads(row["payload"])
+            if item_payload.get("kind") == "tag":
+                continue
+            existing = candidate_mod.existing_story(store.db, row)
+            if (
+                existing is None
+                and editorial.retired(
+                    store.db, story_id=digest(row["cluster_key"])[:24], cluster_key=row["cluster_key"]
+                )
+                is not None
+            ):
+                continue
+            job, saved_draft, _saved_prepared, saved_record, same_source = review_gate._saved_job(
+                store, row, run_config
+            )
+            developed = review_gate.developed_at(item_payload)
+            if not (
+                developed >= after(-review_gate.NEW_STORY_DAYS * 86400, row["last_seen"])
+                or review_gate._security_disclosure(item_payload)
+                or existing is not None
+                or review_gate._has_operator_retry(store.db, row)
+            ):
+                continue
+            if (
+                review_gate._eval_deterministic_skip(
+                    store.db,
+                    item_payload,
+                    existing,
+                    row=row,
+                    dirauth_users=dirauth_users,
+                    tor_core_users=tor_core_users,
+                )
+                is not None
+            ):
+                continue
+            if (
+                existing is not None
+                and candidate_mod.relation(json.loads(existing["payload"]), item_payload, store.db) == "citation"
+            ):
+                continue
+            own_state, writer_item = candidate_mod.own_update_input(
+                store.db, row, item_payload, existing=existing
+            )
+            if own_state == "skip":
+                continue
+            prior = candidate_mod.update_target(store.db, row, existing=existing)
+        except sqlite3.Error:
+            raise
+        except (
+            AnalysisError,
+            editorial.RetiredStory,
+            candidate_mod.StaleCandidate,
+            ValueError,
+            TypeError,
+            KeyError,
+        ):
+            continue
+
+        writer_key = cache_key(row, run_config["llm"], prior)
+        locked_reuse = (
+            job is not None
+            and existing is not None
+            and editorial.is_locked(store.db, existing["id"])
+            and same_source
+            and saved_draft is not None
+        )
+        carry = None
+        if (
+            job is not None
+            and job["policy_hash"] == policy
+            and same_source
+            and (job["writer_key"] != writer_key or job["stage"] == "routed")
+        ):
+            carry = review_gate._carried_requests(saved_record)
+        if (
+            job is not None
+            and same_source
+            and job["stage"] != "routed"
+            and (job["writer_key"] == writer_key or locked_reuse)
+            and saved_draft is not None
+        ):
+            continue
+        tasks.append((row, copy.deepcopy(writer_item), copy.deepcopy(prior), writer_key, carry))
+
+    if len(tasks) < 2:
+        return 0, endpoint_failures, set(), False
+
+    def _draft_one(writer_item_copy: dict, prior_copy: dict | None):
+        """Run one `Analyzer` draft in an isolated client without SQLite access."""
+        with _new_analyzer(run_config, deadline=run_deadline) as worker:
+            try:
+                draft = (
+                    worker.analyze(writer_item_copy)
+                    if prior_copy is None
+                    else worker.analyze(writer_item_copy, prior=prior_copy)
+                )
+                return draft, worker.calls, getattr(worker, "clears", 0), None
+            except BaseException as exc:
+                return None, worker.calls, 0, exc
+
+    prefetched_calls = 0
+    handled_ids: set[str] = set()
+    budget_reached = False
+
+    with ThreadPoolExecutor(max_workers=min(MAX_CONCURRENT_LLM_ITEMS, len(tasks))) as pool:
+        submitted = [
+            ((row, writer_key, carry), pool.submit(_draft_one, writer_item_copy, prior_copy))
+            for row, writer_item_copy, prior_copy, writer_key, carry in tasks
+        ]
+        for idx, ((row, writer_key, carry), future) in enumerate(submitted):
+            if future.cancelled():
+                continue
+            draft, calls, clears, exc = future.result()
+            prefetched_calls += calls
+            if exc is None:
+                record = review_gate._new_record(row, **(carry or {}))
+                record["writer"] = {"key": writer_key}
+                if clears:
+                    record["writer"]["clears"] = clears
+                saved_at = observed or now_iso()
+                try:
+                    review_gate._save(
+                        store,
+                        row,
+                        writer_key,
+                        policy,
+                        "drafted",
+                        draft,
+                        None,
+                        record,
+                        saved_at,
+                        prepared_at=saved_at,
+                    )
+                except candidate_mod.StaleCandidate:
+                    report["review_stale"] += 1
+                    handled_ids.add(row["id"])
+                continue
+            if isinstance(exc, sqlite3.Error):
+                raise exc
+            if isinstance(exc, CompletionDeferred):
+                budget_reached = True
+                for _, rem in submitted[idx + 1 :]:
+                    rem.cancel()
+                continue
+            if not isinstance(exc, Exception):
+                raise exc
+            is_analysis = isinstance(exc, AnalysisError)
+            retryable = is_analysis and exc.retryable
+            if retryable and endpoint_failures >= 2:
+                continue
+            deferred = store.defer(
+                row["id"],
+                str(exc) if is_analysis else _unexpected_error(exc),
+                run_config["llm"],
+                observed or now_iso(),
+                terminal=not retryable,
+                code=exc.code if is_analysis else "app.unexpected",
+                expected_row=row,
+            )
+            report["analysis_failed"] += deferred
+            report["review_stale"] += not deferred
+            endpoint_failures += retryable
+            handled_ids.add(row["id"])
+            if endpoint_failures >= 2:
+                for _, rem in submitted[idx + 1 :]:
+                    rem.cancel()
+
+    return prefetched_calls, endpoint_failures, handled_ids, budget_reached
+
+
 def run(config: dict, store: Store) -> dict:
     """Collect and review pending items within one deadline, then build the site."""
     consensus_sources = enabled_consensus_sources(config["sources"], check_single=True)
@@ -243,66 +472,124 @@ def run(config: dict, store: Store) -> dict:
             }
         run_deadline = started + budget
         endpoint_failures = 0
+        prefetched_calls = 0
+        review_workers: list[Reviewer] = []
+        review_workers_lock = threading.Lock()
+
+        def _reviewer_factory():
+            """Construct an isolated `Reviewer` for concurrent verification calls."""
+            worker = Reviewer(run_config, deadline=run_deadline)
+            with review_workers_lock:
+                review_workers.append(worker)
+            return worker
+
         with (
-            Analyzer(run_config, deadline=run_deadline) as analyzer,
+            _new_analyzer(run_config, deadline=run_deadline) as analyzer,
             Reviewer(run_config, deadline=run_deadline) as reviewer,
             doctor.LinkChecker(run_config, deadline=run_deadline) as linker,
         ):
-            for consensus_source in consensus_sources:
-                try:
-                    evaluated = doctor.evaluate(
-                        run_config, store, consensus_source, linker, now_iso(), allow_network=endpoint_failures < 2,
+            try:
+                for consensus_source in consensus_sources:
+                    try:
+                        evaluated = doctor.evaluate(
+                            run_config, store, consensus_source, linker, now_iso(), allow_network=endpoint_failures < 2,
+                        )
+                        endpoint_failures += evaluated.pop("endpoint_failures", 0)
+                        if evaluated.pop("budget_reached", False):
+                            report["budget_reached"] = True
+                        report["network"] = {**network_ingested, **evaluated}
+                    except sqlite3.Error:
+                        raise
+                    except Exception as exc:
+                        report["network"] = {
+                            **network_ingested, "incidents_open": 0, "stories_written": 0,
+                            "updates_written": 0, "held": 0, "dry_run": not consensus_source.get("publish", False),
+                            "error": _unexpected_error(exc),
+                        }
+                pending_rows = store.pending(run_config["llm"]["max_items_per_run"], now_iso())
+                use_parallel = (
+                    Analyzer is _ORIG_ANALYZER
+                    and Reviewer is _ORIG_REVIEWER
+                    and process_item is _ORIG_PROCESS_ITEM
+                    and len(pending_rows) > 1
+                    and endpoint_failures < 2
+                    and time.monotonic() < run_deadline
+                )
+                handled_ids: set[str] = set()
+                prefetch_budget_reached = False
+                if use_parallel:
+                    prefetched_calls, endpoint_failures, handled_ids, prefetch_budget_reached = _prefetch_drafts(
+                        run_config,
+                        store,
+                        pending_rows,
+                        report,
+                        run_deadline=run_deadline,
+                        allow_network=endpoint_failures < 2,
+                        endpoint_failures=endpoint_failures,
                     )
-                    endpoint_failures += evaluated.pop("endpoint_failures", 0)
-                    if evaluated.pop("budget_reached", False):
+                    if prefetch_budget_reached:
                         report["budget_reached"] = True
-                    report["network"] = {**network_ingested, **evaluated}
-                except sqlite3.Error:
-                    raise
-                except Exception as exc:
-                    report["network"] = {
-                        **network_ingested, "incidents_open": 0, "stories_written": 0,
-                        "updates_written": 0, "held": 0, "dry_run": not consensus_source.get("publish", False),
-                        "error": _unexpected_error(exc),
-                    }
-            for row in store.pending(run_config["llm"]["max_items_per_run"], now_iso()):
-                if time.monotonic() >= run_deadline:
-                    report["budget_reached"] = True
-                    break
-                if row.get("damaged"):
-                    store.reject(row["id"], "Stored source item is damaged", "failed.app.damaged_item", now_iso())
-                    report["analysis_failed"] += 1
-                    continue
-                try:
-                    result = process_item(run_config, store, row, analyzer, reviewer, now_iso(), allow_network=endpoint_failures < 2)
-                    if result["status"] not in {"stale", "deferred"}:
-                        report["analyzed"] += 1
-                    report["review_cache_hits"] += bool(result["cache_hit"])
-                    report["review_stale"] += result["status"] == "stale"
-                    report["review_routed"] += result["status"] == "routed"
-                    if result.get("budget_reached"):
+                process_kwargs = _parallel_verify_kwargs(use_parallel, _reviewer_factory)
+                for row in pending_rows:
+                    if prefetch_budget_reached:
+                        break
+                    if row["id"] in handled_ids:
+                        continue
+                    if time.monotonic() >= run_deadline:
                         report["budget_reached"] = True
                         break
-                except ReviewLimitReached:
-                    # The gate already checked the exact source and recorded this
-                    # terminal rejection; it must not become a second queue strike.
-                    report["analysis_failed"] += 1
-                except CompletionDeferred:
-                    report["budget_reached"] = True
-                    break
-                except sqlite3.Error:
-                    raise
-                except Exception as exc:
-                    is_analysis = isinstance(exc, AnalysisError)
-                    retryable = is_analysis and exc.retryable
-                    deferred = store.defer(
-                        row["id"], str(exc) if is_analysis else _unexpected_error(exc), run_config["llm"], now_iso(),
-                        terminal=not retryable, code=exc.code if is_analysis else "app.unexpected", expected_row=row,
-                    )
-                    report["analysis_failed"] += deferred
-                    report["review_stale"] += not deferred
-                    endpoint_failures += retryable
-            report["model_calls"] = analyzer.calls + reviewer.calls + linker.calls
+                    if row.get("damaged"):
+                        store.reject(row["id"], "Stored source item is damaged", "failed.app.damaged_item", now_iso())
+                        report["analysis_failed"] += 1
+                        continue
+                    try:
+                        result = process_item(
+                            run_config,
+                            store,
+                            row,
+                            analyzer,
+                            reviewer,
+                            now_iso(),
+                            allow_network=endpoint_failures < 2,
+                            **process_kwargs,
+                        )
+                        if result["status"] not in {"stale", "deferred"}:
+                            report["analyzed"] += 1
+                        report["review_cache_hits"] += bool(result["cache_hit"])
+                        report["review_stale"] += result["status"] == "stale"
+                        report["review_routed"] += result["status"] == "routed"
+                        if result.get("budget_reached"):
+                            report["budget_reached"] = True
+                            break
+                    except ReviewLimitReached:
+                        # The gate already checked the exact source and recorded this
+                        # terminal rejection; it must not become a second queue strike.
+                        report["analysis_failed"] += 1
+                    except CompletionDeferred:
+                        report["budget_reached"] = True
+                        break
+                    except sqlite3.Error:
+                        raise
+                    except Exception as exc:
+                        is_analysis = isinstance(exc, AnalysisError)
+                        retryable = is_analysis and exc.retryable
+                        deferred = store.defer(
+                            row["id"], str(exc) if is_analysis else _unexpected_error(exc), run_config["llm"], now_iso(),
+                            terminal=not retryable, code=exc.code if is_analysis else "app.unexpected", expected_row=row,
+                        )
+                        report["analysis_failed"] += deferred
+                        report["review_stale"] += not deferred
+                        endpoint_failures += retryable
+                report["model_calls"] = (
+                    analyzer.calls
+                    + prefetched_calls
+                    + reviewer.calls
+                    + sum(worker.calls for worker in review_workers)
+                    + linker.calls
+                )
+            finally:
+                for worker in review_workers:
+                    worker.close()
         report["decisions"] = decisions.codes_after(store.db, first)
         report["pending_analysis"] = store.pending_count()
         report["rejected_analysis"] = store.rejected_count()
