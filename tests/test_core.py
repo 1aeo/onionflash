@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sqlite3
+import threading
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
@@ -12,12 +13,12 @@ import httpx
 import pytest
 
 from helpers import (
-    DAMAGE, DATE, ApprovingReviewer, FakeClient, FakeLLM, Writer, analysis, completion, damage_item,
-    damaged, finish_reviewed, invoke_cli, item, list_rss, make_config, patch_cli_pipeline, pending,
-    public_dns, publish_stories, raise_once, response, seed_story, source, tag, update_analysis,
+    DAMAGE, DATE, LATER, ApprovingReviewer, FakeClient, FakeLLM, Writer, analysis, completion, damage_item,
+    damaged, finish_reviewed, invoke_cli, item, job, job_record, list_rss, make_config, patch_cli_pipeline, pending,
+    public_dns, publish_stories, queued_row, raise_once, response, seed_story, source, tag, update_analysis,
     verdict, write_toml,
 )
-from onionflash import cli, collect, review, review_gate
+from onionflash import cli, collect, comments, editorial, llm, review, review_gate
 from onionflash.analyze import SCHEMA, AnalysisError, Analyzer, tag_notice, validate_analysis
 from onionflash.cli import build, run_lock
 from onionflash.collect import CollectionError, collect_source
@@ -750,10 +751,36 @@ def test_example_config_and_validation_guards(tmp_path, monkeypatch):
         with pytest.raises(ValueError, match="Invalid LLM base URL"):
             load_config(p)
     monkeypatch.setenv("ONIONFLASH_LLM_BASE_URL", "https://model.example/v1")
-    assert cfg["storage"]["database"] == str(tmp_path / "state/onionflash.sqlite3") and len(cfg["sources"]) >= 10 and cfg["llm"]["fallback_base_urls"] == []
+    assert cfg["storage"]["database"] == str(tmp_path / "state/onionflash.sqlite3") and len(cfg["sources"]) == 29 and cfg["llm"]["fallback_base_urls"] == []
     sources = {s["id"]: s for s in cfg["sources"]}
     assert sources["tor-browser-security"]["enabled"] and sources["tor-browser-security"]["authority"] == "development"
     assert sources["anti-censorship-team"]["enabled"] and sources["tor-dev"]["enabled"]
+    expected_new = {
+        "snowflake-tags": ("tag", "network", "official", None, "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/tags?format=atom"),
+        "snowflake-issues": ("gitlab_issue", "network", "development", "tpo/anti-censorship/pluggable-transports/snowflake", "https://gitlab.torproject.org/api/v4/projects/43/issues"),
+        "snowflake-merges": ("gitlab_mr", "network", "development", None, "https://gitlab.torproject.org/api/v4/projects/43/merge_requests"),
+        "webtunnel-tags": ("tag", "network", "official", None, "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/tags?format=atom"),
+        "webtunnel-issues": ("gitlab_issue", "network", "development", "tpo/anti-censorship/pluggable-transports/webtunnel", "https://gitlab.torproject.org/api/v4/projects/1674/issues"),
+        "webtunnel-merges": ("gitlab_mr", "network", "development", None, "https://gitlab.torproject.org/api/v4/projects/1674/merge_requests"),
+        "lyrebird-tags": ("tag", "network", "official", None, "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/-/tags?format=atom"),
+        "lyrebird-merges": ("gitlab_mr", "network", "development", None, "https://gitlab.torproject.org/api/v4/projects/417/merge_requests"),
+        "tor-browser-high-impact-bugs": ("gitlab_issue", "tor-browser", "development", "tpo/applications/tor-browser", canonical_url("https://gitlab.torproject.org/api/v4/projects/472/issues?labels=Apps::Product::TorBrowser,Apps::Impact::High,Apps::Type::Bug")),
+    }
+    for sid, (kind, product, authority, project, url) in expected_new.items():
+        stream = sources[sid]
+        assert stream["enabled"] is True
+        assert (stream["kind"], stream["product"], stream["authority"]) == (kind, product, authority)
+        assert stream["url"] == url
+        assert stream.get("gitlab_project") == project
+        assert stream["website_url"]
+        if kind == "gitlab_issue":
+            assert comments._identity(stream)[0] == project
+        if kind == "tag":
+            notice = tag_notice(tag(source_id=sid, product=product, title=f"{sid}-v1.0", url=f"{stream['website_url']}/v1.0"))
+            assert notice["state"] == "tagged" and notice["products"] == [product]
+    tb_client = FakeClient([response(b"[]")])
+    collect_source(tb_client, sources["tor-browser-high-impact-bugs"], {}, cfg["collection"], DATE)
+    assert parse_qs(urlsplit(tb_client.calls[0][1]).query)["labels"] == ["Apps::Product::TorBrowser,Apps::Impact::High,Apps::Type::Bug"]
     for old, new in [("max_items_per_run = 12", "max_items_per_run = 0"), ('output_dir = "build/public"', 'output_dir = "."')]:
         p.write_text(EXAMPLE_TOML.replace(old, new))
         with pytest.raises(ValueError):
@@ -1788,3 +1815,365 @@ def test_registry_and_tor_core_gitlab_users_config_validation(tmp_path, monkeypa
     ):
         with pytest.raises(ValueError, match="tor_core_gitlab_users"):
             load_config(write_toml(tmp_path / "bad_users", f"[collection]\ntor_core_gitlab_users = {bad_users}\n"))
+
+
+def test_cli_run_prefetches_drafts_concurrently_and_preserves_report_contract(context, monkeypatch):
+    """Run concurrent draft prefetch in `cli.run` without monkeypatched pipeline hooks and publish all items."""
+    assert cli.MAX_CONCURRENT_LLM_ITEMS == 4
+    cfg, store = context
+    cfg["sources"] = []
+    cfg["llm"].update(base_url="https://llm.example/v1", api_key_env="CONCURRENCY_TEST_KEY")
+    monkeypatch.setenv("CONCURRENCY_TEST_KEY", "synthetic-fixture-value")
+    patch_cli_pipeline(monkeypatch, now=DATE, reviewer=None, build=lambda *_a: {})
+
+    items = [
+        item(
+            url=f"https://example.org/concurrent-{i}",
+            title=f"Concurrent security report {i}",
+            content=f"Operators observed a distinct reproducible network event {i}.",
+        )
+        for i in range(4)
+    ]
+    for entry in items:
+        store.ingest(entry, DATE)
+
+    barrier = threading.Barrier(4, timeout=5.0)
+    lock = threading.Lock()
+    in_flight = 0
+    max_in_flight = 0
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        """Serve thread-safe writer and review JSON responses while proving concurrent writer overlap."""
+        nonlocal in_flight, max_in_flight
+        body = json.loads(request.content)
+        schema_name = body["response_format"]["json_schema"]["name"]
+        if schema_name == "onionflash_news":
+            with lock:
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+            try:
+                barrier.wait()
+                user_payload = json.loads(body["messages"][1]["content"])
+                reply = analysis(
+                    title=user_payload["title"],
+                    summary=user_payload["content"],
+                    why_it_matters="",
+                    evidence=[user_payload["content"]],
+                )
+            finally:
+                with lock:
+                    in_flight -= 1
+        else:
+            reply = verdict()
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(reply)}}]})
+
+    monkeypatch.setattr(
+        llm,
+        "HttpClient",
+        lambda settings, **kwargs: HttpClient(
+            settings, **kwargs, transport=httpx.MockTransport(_handle), resolver=public_dns
+        ),
+    )
+
+    report = cli.run(cfg, store)
+    assert max_in_flight == 4
+    assert report["analyzed"] == 4
+    assert report["analysis_failed"] == 0
+    assert report["budget_reached"] is False
+    assert report["model_calls"] == 12
+    assert len(store.stories()) == 4
+    assert store.db.execute("SELECT COUNT(*) FROM review_jobs").fetchone()[0] == 0
+    assert set(report) == {
+        "sources_ok", "sources_failed", "items_changed", "analyzed", "analysis_failed",
+        "budget_reached", "entries_skipped", "review_cache_hits", "review_stale",
+        "review_routed", "model_calls", "registry", "comments", "decisions",
+        "pending_analysis", "rejected_analysis", "final_review",
+    }
+
+
+def test_prefetch_drafts_filters_non_draftable_rows_preserves_clears_and_carries_budget(context, monkeypatch):
+    """Skip ineligible rows in `_prefetch_drafts`, persist drafts, and carry routed request budgets."""
+    cfg, store = context
+    cfg["sources"] = []
+    cfg["llm"].update(base_url="https://llm.example/v1", api_key_env="PREFETCH_FILTER_KEY")
+    monkeypatch.setenv("PREFETCH_FILTER_KEY", "synthetic-fixture-value")
+
+    prior_story = seed_story(
+        store,
+        item(url="https://example.org/prior-story", title="Prior story", content="Initial prior story report body."),
+        analysis(title="Prior story", summary="Initial prior story report body.", why_it_matters="", evidence=["Initial prior story report body."]),
+    )
+    retired_item = item(url="https://example.org/retired-target", title="Retired story", content="Retired report body.")
+    retired_story = seed_story(
+        store,
+        retired_item,
+        analysis(title="Retired story", summary="Retired report body.", why_it_matters="", evidence=["Retired report body."]),
+    )
+    editorial.retract(
+        store.db,
+        retired_story["id"],
+        expect_hash=editorial.show(store.db, retired_story["id"])["hash"],
+        reason="Retracted.",
+        observed=LATER,
+    )
+
+    # 1) Eligible fresh story item (also exercises writer clears accounting).
+    fresh = item(url="https://example.org/eligible-1", title="Eligible story one", content="Fresh verifiable defect report one.")
+    # 2) Eligible routed item carrying an existing request_budget.
+    routed = item(url="https://example.org/routed-2", title="Eligible routed item", content="Second verifiable report routed to prior story.")
+    # 3) Tag item (must not invoke Analyzer).
+    tag_entry = tag(title="tor-0.4.9.99", url="https://example.org/tags/tor-0.4.9.99")
+    # 4) Old non-recent item (skipped before LLM).
+    old_entry = item(url="https://example.org/old-3", title="Old issue", content="Old issue content body.",
+                     published_at="2026-09-01T00:00:00Z", updated_at="2026-09-01T00:00:00Z", labels=[])
+    # 5) Housekeeping ack item (deterministic skip).
+    ack_entry = item(url="https://example.org/ack-4", title="Re: report", content="Thanks!", labels=[])
+    # 6) Already drafted item in review_jobs.
+    already_drafted = item(url="https://example.org/drafted-5", title="Already drafted", content="Already drafted verifiable report.")
+
+    for entry in (fresh, tag_entry, old_entry, ack_entry, already_drafted):
+        store.ingest(entry, DATE)
+    store.ingest(retired_item, LATER)
+
+    # Create a genuine routed review_jobs record using Reviewer(same_story=prior_story["id"]).
+    from helpers import Reviewer as ScriptedReviewer
+
+    routed_row = pending(store, routed, at=DATE, ready=DATE)
+    routed_res = review_gate.process_item(
+        cfg,
+        store,
+        routed_row,
+        Writer(analysis(title=routed["title"], summary=routed["content"], why_it_matters="", evidence=[routed["content"]])),
+        ScriptedReviewer(verdict(same_story=prior_story["id"])),
+        DATE,
+    )
+    assert routed_res["status"] == "routed"
+    routed_row = queued_row(store, routed, LATER)
+
+    drafted_row = queued_row(store, already_drafted, DATE)
+    drafted_key = review_gate.cache_key(drafted_row, cfg["llm"], None)
+    drafted_record = review_gate._new_record(drafted_row)
+    drafted_record["writer"] = {"key": drafted_key}
+    review_gate._save(store, drafted_row, drafted_key, review.policy_hash(cfg), "drafted", analysis(), None, drafted_record, DATE, prepared_at=DATE)
+
+    seen_urls: list[str] = []
+    seen_lock = threading.Lock()
+
+    class _CheckingAnalyzer:
+        """Thread-safe stub Analyzer asserting only eligible items are drafted."""
+
+        def __init__(self, config, deadline=None, editorial_polish=False):
+            """Track calls, clears, and the editorial_polish opt-in flag."""
+            self.calls = 0
+            self.clears = 0
+            assert editorial_polish is True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def analyze(self, incoming, prior=None):
+            """Record analyzed URL and return a story or update draft."""
+            self.calls += 1
+            with seen_lock:
+                seen_urls.append(incoming["url"])
+            if prior is not None:
+                return update_analysis(update="A second report adds detail.", evidence=[incoming["content"]])
+            self.clears = 1
+            return analysis(title=incoming["title"], summary=incoming["content"], why_it_matters="", evidence=[incoming["content"]])
+
+    monkeypatch.setattr(cli, "Analyzer", _CheckingAnalyzer)
+    pending_rows = store.pending(20, LATER)
+    pending_rows.append({"id": "damaged-row", "damaged": True})
+    report = {"analysis_failed": 0, "review_stale": 0}
+    calls, failures, handled_ids, budget_reached = cli._prefetch_drafts(
+        cfg, store, pending_rows, report, LATER, run_deadline=10**9, allow_network=True,
+    )
+
+    assert set(seen_urls) == {fresh["url"], routed["url"]}
+    assert calls == 2 and failures == 0 and handled_ids == set() and budget_reached is False
+    fresh_job = job(store, queued_row(store, fresh, LATER)["id"])
+    assert fresh_job["stage"] == "drafted"
+    assert job_record(store, fresh_job["item_id"])["writer"]["clears"] == 1
+    routed_job = job(store, routed_row["id"])
+    assert routed_job["stage"] == "drafted"
+    assert job_record(store, routed_row["id"])["request_budget"]["reserved"] == 1
+
+
+def test_prefetch_drafts_circuit_breaker_terminal_errors_and_deadline(context, monkeypatch):
+    """Respect circuit-breaker limits, terminal deferrals, and budget expiration in `_prefetch_drafts`."""
+    cfg, store = context
+    cfg["sources"] = []
+
+    urls = [f"https://example.org/err-{i}" for i in range(4)]
+    for u in urls:
+        store.ingest(item(url=u, content=f"Content for {u}"), DATE)
+    rows = store.pending(10, DATE)
+
+    class _CircuitAnalyzer:
+        """Stub Analyzer simulating two retryable failures, one terminal failure, and one success."""
+
+        def __init__(self, config, deadline=None):
+            """Initialize call and clear counters."""
+            self.calls = 0
+            self.clears = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def analyze(self, incoming, prior=None):
+            """Fail first two items retryably, third non-retryably, and succeed on fourth."""
+            self.calls += 1
+            if incoming["url"].endswith(("err-0", "err-1")):
+                raise AnalysisError("HTTP 503", retryable=True)
+            if incoming["url"].endswith("err-2"):
+                raise AnalysisError("Bad evidence", retryable=False, code="writer.evidence_not_exact")
+            return analysis(title=incoming["title"], summary=incoming["content"], why_it_matters="", evidence=[incoming["content"]])
+
+    monkeypatch.setattr(cli, "Analyzer", _CircuitAnalyzer)
+    report = {"analysis_failed": 0, "review_stale": 0}
+    calls, failures, handled_ids, budget_reached = cli._prefetch_drafts(
+        cfg, store, rows, report, DATE, run_deadline=10**9, allow_network=True,
+    )
+    assert calls == 4 and failures == 2 and budget_reached is False
+    assert report["analysis_failed"] == 3 and len(handled_ids) == 3
+    # Fourth item's draft was saved without strikes even after earlier failures.
+    by_url = {r["url"]: r for r in rows}
+    assert job(store, by_url["https://example.org/err-3"]["id"])["stage"] == "drafted"
+
+    # CompletionDeferred sets budget_reached without deferring or adding strikes.
+    class _DeadlineAnalyzer:
+        """Stub Analyzer raising CompletionDeferred."""
+
+        calls = 0
+        attempted = 0
+        _lock = threading.Lock()
+
+        def __init__(self, config, deadline=None):
+            """Initialize deadline stub without altering class counters."""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def analyze(self, incoming, prior=None):
+            """Raise CompletionDeferred immediately before dispatch."""
+            with self._lock:
+                type(self).attempted += 1
+            raise llm.CompletionDeferred("Run deadline reached")
+
+    monkeypatch.setattr(cli, "Analyzer", _DeadlineAnalyzer)
+    rows2 = [by_url["https://example.org/err-0"], by_url["https://example.org/err-1"]]
+    report2 = {"analysis_failed": 0, "review_stale": 0}
+    before_attempts = [store.db.execute("SELECT attempts FROM items WHERE id=?", (r["id"],)).fetchone()[0] for r in rows2]
+    calls2, _fail2, handled2, budget2 = cli._prefetch_drafts(
+        cfg, store, rows2, report2, DATE, run_deadline=10**9, allow_network=True,
+    )
+    after_attempts = [store.db.execute("SELECT attempts FROM items WHERE id=?", (r["id"],)).fetchone()[0] for r in rows2]
+    assert _DeadlineAnalyzer.attempted >= 1
+    assert calls2 == 0 and budget2 is True and handled2 == set() and after_attempts == before_attempts
+
+
+def test_cli_opt_in_adapters_match_target_signatures(monkeypatch):
+    """Pass `editorial_polish` and `parallel_verify` only when target signatures accept them."""
+    seen: list[dict] = []
+
+    class _NoOptAnalyzer:
+        """Analyzer double without `editorial_polish`."""
+
+        def __init__(self, config, deadline=None):
+            """Record constructor args without `editorial_polish`."""
+            seen.append({"kind": "no_opt", "deadline": deadline})
+
+    class _PolishAnalyzer:
+        """Analyzer double declaring `editorial_polish`."""
+
+        def __init__(self, config, deadline=None, editorial_polish=False):
+            """Record constructor args including `editorial_polish`."""
+            seen.append({"kind": "polish", "deadline": deadline, "editorial_polish": editorial_polish})
+
+    monkeypatch.setattr(cli, "Analyzer", _NoOptAnalyzer)
+    cli._new_analyzer(DEFAULTS, deadline=42.0)
+    monkeypatch.setattr(cli, "Analyzer", _PolishAnalyzer)
+    cli._new_analyzer(DEFAULTS, deadline=43.0)
+    assert seen == [
+        {"kind": "no_opt", "deadline": 42.0},
+        {"kind": "polish", "deadline": 43.0, "editorial_polish": True},
+    ]
+
+    def _seq_process(cfg, store, row, writer, reviewer, observed=None, *, allow_network=True):
+        """Sequential process_item double."""
+
+    def _par_process(cfg, store, row, writer, reviewer, observed=None, *, allow_network=True, parallel_verify=False, reviewer_factory=None):
+        """Parallel-capable process_item double."""
+
+    factory = lambda: None
+    monkeypatch.setattr(cli, "process_item", _seq_process)
+    assert cli._parallel_verify_kwargs(True, factory) == {}
+    monkeypatch.setattr(cli, "process_item", _par_process)
+    assert cli._parallel_verify_kwargs(False, factory) == {}
+    assert cli._parallel_verify_kwargs(True, factory) == {"parallel_verify": True, "reviewer_factory": factory}
+
+
+def test_cli_run_concurrent_partial_failures_do_not_double_defer(context, monkeypatch):
+    """Ensure items deferred in `_prefetch_drafts` are not re-deferred during the main `cli.run` loop."""
+    cfg, store = context
+    cfg["sources"] = []
+    cfg["llm"].update(base_url="https://llm.example/v1", api_key_env="CONCURRENCY_FAIL_KEY")
+    monkeypatch.setenv("CONCURRENCY_FAIL_KEY", "synthetic-fixture-value")
+    patch_cli_pipeline(monkeypatch, now=DATE, reviewer=None, build=lambda *_a: {})
+
+    ok_item = item(url="https://example.org/part-ok", title="Healthy report", content="Healthy verifiable report body.")
+    retry_item = item(url="https://example.org/part-retry", title="Retryable report", content="Retryable report body text.")
+    bad_item = item(url="https://example.org/part-bad", title="Bad JSON report", content="Bad JSON report body text.")
+    for entry in (ok_item, retry_item, bad_item):
+        store.ingest(entry, DATE)
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        """Return HTTP 503 for retry_item, invalid JSON for bad_item, and valid responses for ok_item."""
+        body = json.loads(request.content)
+        schema_name = body["response_format"]["json_schema"]["name"]
+        if schema_name == "onionflash_news":
+            user_payload = json.loads(body["messages"][1]["content"])
+            if user_payload["title"] == retry_item["title"]:
+                return httpx.Response(503, content=b"unavailable")
+            if user_payload["title"] == bad_item["title"]:
+                return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": "{"}}]})
+            reply = analysis(
+                title=user_payload["title"],
+                summary=user_payload["content"],
+                why_it_matters="",
+                evidence=[user_payload["content"]],
+            )
+            return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(reply)}}]})
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(verdict())}}]})
+
+    monkeypatch.setattr(
+        llm,
+        "HttpClient",
+        lambda settings, **kwargs: HttpClient(
+            settings, **kwargs, transport=httpx.MockTransport(_handle), resolver=public_dns
+        ),
+    )
+
+    report = cli.run(cfg, store)
+    assert report["analyzed"] == 1
+    assert report["analysis_failed"] == 2
+    assert report["model_calls"] == 5
+    assert len(store.stories()) == 1
+    rows = {
+        r["url"]: (r["status"], r["attempts"], r["rejections"])
+        for r in store.db.execute("SELECT url, status, attempts, rejections FROM items")
+    }
+    assert rows == {
+        ok_item["url"]: ("published", 0, 0),
+        retry_item["url"]: ("pending", 1, 0),
+        bad_item["url"]: ("pending", 1, 1),
+    }
