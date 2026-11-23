@@ -443,21 +443,22 @@ def test_redirect_never_forwards_completion_or_releases_spent_reservation(comple
 
 
 def test_redirects_cannot_exceed_budget_through_configured_fallbacks(completion_client):
-    """Stop fallback traversal once redirected attempts exhaust the 7-request review budget."""
+    """Stop fallback traversal once redirected attempts exhaust the `MAX_REVIEW_REQUESTS` budget."""
     record, requests, persisted, sent = *_ledger(), []
+    cap = review_gate.MAX_REVIEW_REQUESTS
 
     def _handle(request):
         assert persisted[-1]["request_budget"]["reserved"] == len(sent) + 1
         sent.append(request)
         return httpx.Response(307, headers={"location": "/same-origin-loop"})
 
-    fallbacks = [f"https://fallback-{number}.example/v1" for number in range(1, 10)]
+    fallbacks = [f"https://fallback-{number}.example/v1" for number in range(1, cap + 3)]
     client, _ = completion_client(_handle, fallbacks=fallbacks)
     with pytest.raises(review.ReviewLimitReached, match="budget exhausted"):
         _complete(client, requests)
-    _assert_charged(client, requests, record, sent, 7)
+    _assert_charged(client, requests, record, sent, cap)
     assert all(request.method == "POST" and request.url.path == "/v1/chat/completions" for request in sent)
-    assert [request.url.host for request in sent] == ["model.example", *[f"fallback-{n}.example" for n in range(1, 7)]]
+    assert [request.url.host for request in sent] == ["model.example", *[f"fallback-{n}.example" for n in range(1, cap)]]
 
 
 def test_explicit_fallback_after_redirect_has_its_own_reservation(completion_client):
@@ -539,8 +540,9 @@ def test_deadline_after_dispatch_keeps_request_charged(completion_client, failur
 
 
 def test_repeated_dispatched_timeouts_cannot_replenish_budget(completion_client):
-    """Enforce the 7-request ceiling across repeated dispatched ReadTimeouts."""
+    """Enforce the `MAX_REVIEW_REQUESTS` ceiling across repeated dispatched ReadTimeouts."""
     record, requests, _, clock, sent = *_ledger(), [0.0], []
+    cap = review_gate.MAX_REVIEW_REQUESTS
 
     def _handle(request):
         sent.append(request)
@@ -549,14 +551,14 @@ def test_repeated_dispatched_timeouts_cannot_replenish_budget(completion_client)
 
     client, _ = completion_client(_handle)
     _arm_deadline(client, clock)
-    for _ in range(7):
+    for _ in range(cap):
         clock[0] = 0.0
         with pytest.raises(AnalysisError):
             _complete(client, requests)
     clock[0] = 0.0
     with pytest.raises(review.ReviewLimitReached):
         _complete(client, requests)
-    _assert_charged(client, requests, record, sent, 7)
+    _assert_charged(client, requests, record, sent, cap)
 
 
 def test_response_body_timeout_remains_charged(completion_client):
