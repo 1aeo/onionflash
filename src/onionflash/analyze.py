@@ -105,8 +105,9 @@ remaining strictly faithful to source:
 - title: Lead directly with the concrete Tor event (component, defect, protocol change, incident
   or release) rather than ticket-log phrasing ('Tor issue reports...', 'Arti issue reports...',
   'An opened Tor Browser issue says...', '<domain> reply offers...'). Keep all required hedges
-  ('reported', 'suspected', 'plausibly', 'may', 'proposed', 'unmerged', 'requests') and any
-  compromise qualification directly in the headline. When source.thread_root is present on a
+  ('reported', 'suspected', 'plausibly', 'may', 'proposed', 'unmerged', 'requests'), explicit
+  advisory, vulnerability or proposal identifiers ('TROVE-...', 'CVE-...', numbered proposals)
+  and version qualifiers directly in the headline. When source.thread_root is present on a
   mailing-list reply, use it ONLY as background thread-topic context to frame the headline
   around the thread topic, while keeping all claims, attribution and why_it_matters strictly on
   source.unquoted_content.
@@ -114,17 +115,23 @@ remaining strictly faithful to source:
   calling someone a developer or relay operator without explicit source evidence), lifecycle
   status (issue/request vs merged vs released), preconditions, version/platform scope, dates and
   material maintainer disagreement. Never treat >-quoted reply lines or source.thread_root as
-  the sender's claim. Never introduce ALL-CAPS shouting or 3-part C-Tor version typos.
+  the sender's claim. Never introduce ALL-CAPS shouting or 3-part C-Tor version typos. On
+  gitlab_issue items, NEVER introduce completed-action verbs ('removed', 'removes', 'fixed',
+  'patched', 'resolved', 'deployed', 'deploys', 'disabled', 'disables', 'revoked', 'revokes',
+  'rotated', 'rotates', 'shipped', 'ships', 'merged') into title, summary or why_it_matters
+  unless that exact word already appears in source.
 - why_it_matters: Preserve or tighten into 1 concise grounded sentence explaining the concrete
-  operational, security or user consequence strictly supported or directly entailed by source
-  (using only source.unquoted_content on quoted mailing-list replies, and strictly "" when
-  source.authority is "community" on lists.torproject.org). Do NOT clear or blank a valid,
-  grounded why_it_matters from draft. If draft.why_it_matters is empty on a substantive
-  non-community story whose source clearly entails a concrete operational/security/user
-  consequence, write that 1 grounded sentence; if it overclaims or drops a precondition/hedge,
-  tighten it to match source. Never add generic filler ('improves reliability/security/privacy'),
-  unstated operator directives ('operators must upgrade'), or invented numbers, counts, severities
-  or versions. Keep "" when no concrete consequence is implied or on untrusted community list posts.
+  operational, security or user consequence (or explicit reader action) explicitly stated or
+  directly supported by source (using only source.unquoted_content on quoted mailing-list replies,
+  and strictly "" when source.authority is "community" on lists.torproject.org). Do NOT clear
+  or blank a valid, grounded why_it_matters from draft. If draft.why_it_matters is empty on a
+  substantive non-community story whose source explicitly states a concrete operational,
+  security or user consequence, write that 1 grounded sentence; if it overclaims or drops a
+  precondition/hedge, tighten it to match source. Never invent speculative consequences not
+  stated in source, generic release-feature recaps, generic filler ('improves
+  reliability/security/privacy'), unstated operator directives ('operators must upgrade'), or
+  invented numbers, counts, severities or versions. Keep "" when no concrete consequence is
+  stated or on untrusted community list posts.
 
 Return only the requested JSON object matching POLISH_SCHEMA, without Markdown or extra prose.
 """
@@ -287,13 +294,13 @@ and stated lifecycle. In update mode, this retention rule does not require repea
 old consequences: report only what the supplied source adds, as the update rules require.
 
 why_it_matters is required for every substantive story whenever a concrete operational,
-security or user consequence (or explicit reader action) is strictly supported or directly
-entailed by supplied facts (preserving prerequisites, opt-in flags, channel/platform scope,
-affected audience, material disagreement and uncertainty). Write one concise, distinct
-sentence stating what the event means operationally from the packet's own facts — for
-example, what a missing CA revocation means for trusting certificates, what a 16 MB vote
-truncation means for large directory votes, or what missing final-hop encryption means —
-rather than repeating generic feature or release bullets. Attribute single-reporter or
+security or user consequence (or explicit reader action) is explicitly stated or directly
+supported by the supplied source (preserving prerequisites, opt-in flags, channel/platform
+scope, affected audience, material disagreement and uncertainty). Write one concise, distinct
+sentence stating that supported operational consequence — for example, what a missing CA
+revocation means for trusting certificates, what a 16 MB vote truncation means for large
+directory votes, or what missing final-hop encryption means — rather than speculative
+consequences not stated in the source or generic feature/release recaps. Attribute single-reporter or
 disputed consequences to their speaker ("The announcement asks ...", "The report says ..."),
 and retain belief, possibility or conditional language in the claim itself. Read all
 supplied comments before writing why_it_matters and preserve material narrowing or
@@ -301,8 +308,8 @@ disagreement in the same sentence. Never invent generic filler ("improves reliab
 "addresses issues to maintain privacy"), unstated operator directives ("operators must upgrade"),
 invented severities, counts, numbers or versions, or claims from >-quoted reply text or
 thread_root. Leave why_it_matters empty ("") ONLY for tags, pure internal refactors or
-chores, checklists, open questions with no implied operational effect, untrusted community
-lists.torproject.org posts (which MUST ALWAYS be ""), or when no concrete impact is implied.""",
+chores, checklists, open questions with no stated operational effect, untrusted community
+lists.torproject.org posts (which MUST ALWAYS be ""), or when no concrete impact is supported.""",
 )
 UPDATE_RULES = """UPDATE MODE: prior_story is the published account this source updates. It is background,
 never evidence: do not quote it, rely on it or repeat its facts. Instead of a headline,
@@ -504,6 +511,43 @@ def tag_notice(item: dict) -> dict:
     }
 
 
+_ADVISORY_ID_RE = re.compile(r"\b(?:TROVE|CVE)-\d{4}-\d+\b", re.IGNORECASE)
+_POLISH_DONE_WORDS = (
+    "removed", "removes", "fixed", "patched", "resolved", "deployed", "deploys",
+    "disabled", "disables", "revoked", "revokes", "rotated", "rotates", "shipped", "ships",
+)
+_POLISH_DONE_RE = re.compile(r"\b(" + "|".join(_POLISH_DONE_WORDS) + r")\b(?!-)")
+_POLISH_EXCUSED_RE = re.compile(
+    r"\b(?:should|must|will|would|could|may|might|to|be|not|never|yet|no|without|asks?|"
+    r"requests?|proposes?|wants?|plans?|needs?)\s+(?:(?:yet|been|be|being|to)\s+)*$"
+)
+_POLISH_UNPROVEN_RE = re.compile(r"\b(?:not|never|cannot|should|must|will|would|could|may|might|to|no)\b(?:\s+\w+){0,3}\s*$")
+
+
+def _audit_plain(text: str) -> str:
+    """Normalize text for completed-action checks identically to final review checks."""
+    return _plain(text).replace("n't", " not")
+
+
+def _claimed_done_words(*texts: str) -> set[str]:
+    """Return unexcused completed-action verbs present across draft or polished text fields."""
+    claimed: set[str] = set()
+    for raw in texts:
+        text = _audit_plain(raw)
+        for match in _POLISH_DONE_RE.finditer(text):
+            if not _POLISH_EXCUSED_RE.search(text[max(0, match.start() - 90) : match.start()]):
+                claimed.add(match[1])
+    return claimed
+
+
+def _word_stated_in_source(source_plain: str, word: str) -> bool:
+    """Return whether `word` appears un-negated and non-future in `source_plain`."""
+    return any(
+        not _POLISH_UNPROVEN_RE.search(source_plain[max(0, match.start() - 45) : match.start()])
+        for match in re.finditer(rf"\b{word}\b(?!-)", source_plain)
+    )
+
+
 def _normalize_editorial_labels(result: dict, source: dict, schema: dict) -> None:
     """Enforce deterministic merged-MR confidence and dirauth-category defaults during polish mode."""
     sources = [source]
@@ -553,6 +597,25 @@ class Analyzer(CompletionClient):
                 )
                 if key == "why_it_matters" or cleaned:
                     merged[key] = cleaned
+        draft_ids = {m.upper() for m in _ADVISORY_ID_RE.findall(str(draft.get("title") or ""))}
+        merged_ids = {m.upper() for m in _ADVISORY_ID_RE.findall(str(merged.get("title") or ""))}
+        if draft_ids - merged_ids:
+            raise AnalysisError("Polish dropped advisory identifier")
+        if source.get("kind") == "gitlab_issue":
+            draft_done = _claimed_done_words(
+                str(draft.get("title") or ""),
+                str(draft.get("summary") or ""),
+                str(draft.get("why_it_matters") or ""),
+            )
+            merged_done = _claimed_done_words(
+                str(merged.get("title") or ""),
+                str(merged.get("summary") or ""),
+                str(merged.get("why_it_matters") or ""),
+            )
+            source_plain = _audit_plain(f"{source.get('title') or ''}\n{source.get('content') or ''}")
+            for word in merged_done - draft_done:
+                if not _word_stated_in_source(source_plain, word):
+                    raise AnalysisError("Polish introduced unstated completed-action verb")
         stated = str(merged.get("why_it_matters") or "")
         return validate_analysis(merged, source, base_schema), stated
 

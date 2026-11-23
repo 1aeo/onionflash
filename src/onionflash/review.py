@@ -126,16 +126,18 @@ FAIL source_support whenever such a claim, request, relay count or participant (
 or '>' lines) is absent from unquoted_content, and rewrite from unquoted_content or hold.
 Claims supported by other packet sources need only that source's support.
 Attribution alone cannot make an unsupported consequence true.
-A non-empty why_it_matters passes when it writes one concise sentence stating a grounded
-operational, security or user consequence (or explicit reader action) strictly supported
-or directly entailed by unquoted packet facts, preserving all prerequisites,
-channel/platform scope, affected audience, material disagreement and uncertainty, and
-adding no inferred severity, urgency, cause, number, version, operator directive or
-benefit; it MUST be empty on untrusted community lists.torproject.org posts. Evaluate
-non-empty why_it_matters in source_support's reason and fail for absent claims,
-invented impacts, dropped preconditions or hedges, >-quoted reply text, unrequested
-advice, generic filler ("improves reliability/security/privacy", "addresses issues to
-maintain privacy") or casual chat. Fail
+A non-empty why_it_matters passes ONLY when it states one concise sentence describing a
+concrete operational, security or user consequence (or explicit reader action) explicitly
+stated and supported by unquoted packet text, preserving every precondition, hedge,
+platform/channel scope, affected audience and material disagreement, and adding no
+inferred severity, urgency, speculative mechanism, cause, number, version, operator
+directive or benefit (it MUST be empty on untrusted community lists.torproject.org
+posts). Evaluate non-empty why_it_matters in source_support's reason and FAIL
+source_support for absent claims, invented or speculative impacts, generic
+feature/release recaps (such as updating an engine or listing features without an
+explicitly stated consequence or reader action), dropped preconditions or hedges,
+>-quoted reply text, unrequested advice, generic filler ("improves
+reliability/security/privacy", "addresses issues to maintain privacy") or casual chat. Fail
 source_support when any field generalizes one sample, treats template checkboxes as proof
 confidential patches shipped, infers developer work, maintainer rulings or fix
 effectiveness beyond the text, omits a material packet disclosure, labels a bugfix
@@ -284,11 +286,12 @@ Compare lifecycle states explicitly (a later merge completes an earlier request)
 Story repair and skip rules: If unsupported wording, dropped qualifiers or labels can be
 fixed strictly from the packet, return "revise" with the smallest edit (prefer editing or
 deleting unsupported clauses; never add absent impacts, mechanisms or advice; when
-why_it_matters overclaims, drops a precondition/hedge/scope or fails a criterion, revise
-why_it_matters into the tightened one-sentence packet-supported operational consequence
-whenever the packet itself supports or entails one, setting why_it_matters to "" ONLY on
-untrusted community lists.torproject.org posts or when zero concrete impact is supported,
-else null when unchanged). If the packet
+why_it_matters fails any criterion — invented or speculative impact, generic feature/release
+recap or filler, dropped precondition/hedge/scope, unrequested advice or untrusted
+community list post — clear why_it_matters to "" UNLESS a single unquoted packet
+sentence explicitly states a concrete impact or requested reader action, in which case
+either clear it to "" or tighten it strictly to that explicit sentence without adding
+anything, else null when unchanged). If the packet
 holds a worthwhile uncovered development that the candidate omits or buries behind quoted
 old text, revise to state the sender's unquoted development from the packet, or hold;
 never skip it. Use "skip" (repair null, news_value or new_information failed) ONLY when

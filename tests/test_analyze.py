@@ -1428,3 +1428,102 @@ def test_editorial_polish_pass_thread_root_label_normalization_and_fallback(monk
     with monkeypatch.context() as mp:
         mp.setitem(analyze.POLISH_SCHEMA["properties"]["title"], "maxLength", 139)
         assert _cache_key_for() != story_key and _cache_key_for(previous=_prior_story()) == upd_key
+
+
+def test_polish_preserves_advisory_ids_and_issue_completed_action_verbs(monkeypatch):
+    """Fall back to pre-polish draft if polish drops TROVE/CVE IDs or introduces unstated completed-action verbs."""
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["llm"].update(base_url="https://llm.example/v1")
+    monkeypatch.setenv(cfg["llm"]["api_key_env"], "test-key")
+    # 1. Dropping TROVE or CVE identifier from title triggers deterministic fallback.
+    trove_item = item(
+        kind="gitlab_issue",
+        title="TROVE-2026-025: conflux LINK crash",
+        content="Conflux bug causes crash before fix.",
+        labels=["Security"],
+    )
+    trove_draft = analysis(
+        title="TROVE-2026-025: Conflux LINK bug can crash relays",
+        summary="A Conflux bug can crash relays.",
+        why_it_matters="Malicious clients could crash relays.",
+        category="security", tags=["security"],
+        evidence=["Conflux bug causes crash before fix."],
+    )
+    w_drop = Analyzer(cfg, editorial_polish=True)
+    w_drop.client = FakeLLM(trove_draft, {
+        "title": "Conflux LINK bug can crash relays in 0.4.9.10",
+        "summary": trove_draft["summary"],
+        "why_it_matters": trove_draft["why_it_matters"],
+    })
+    assert w_drop.analyze(trove_item)["title"] == trove_draft["title"]
+
+    cve_item = item(kind="feed", authority="official", title="CVE-2026-1234 release", content="Patches CVE-2026-1234 in client.", labels=[])
+    cve_draft = analysis(
+        title="CVE-2026-1234 client vulnerability patched",
+        summary="The release patches CVE-2026-1234.",
+        why_it_matters="", category="security", tags=["security"], confidence="confirmed", state="released",
+        evidence=["Patches CVE-2026-1234 in client."],
+    )
+    w_cve = Analyzer(cfg, editorial_polish=True)
+    w_cve.client = FakeLLM(cve_draft, {
+        "title": "Client vulnerability patched in latest release",
+        "summary": cve_draft["summary"],
+        "why_it_matters": "",
+    })
+    assert w_cve.analyze(cve_item)["title"] == cve_draft["title"]
+
+    # 2. Unstated completed-action verb on gitlab_issue falls back; stated verb or non-issue source succeeds.
+    iss_item = item(
+        kind="gitlab_issue",
+        title="TROVE-2026-013: assert on missing cert",
+        content="Closing ticket now that the fix is in 0.4.9.9.",
+        labels=["Security"],
+    )
+    iss_draft = analysis(
+        title="TROVE-2026-013: client assert on missing cert; fix reported in 0.4.9.9",
+        summary="Ticket closed after reporter said the fix is in 0.4.9.9.",
+        why_it_matters="A crafted descriptor can make a client assert.",
+        category="security", tags=["security"],
+        evidence=["Closing ticket now that the fix is in 0.4.9.9."],
+    )
+    w_verb = Analyzer(cfg, editorial_polish=True)
+    w_verb.client = FakeLLM(iss_draft, {
+        "title": iss_draft["title"],
+        "summary": iss_draft["summary"],
+        "why_it_matters": "A failure path removed by the fix in Tor 0.4.9.9 could crash clients.",
+    })
+    assert w_verb.analyze(iss_item)["why_it_matters"] == iss_draft["why_it_matters"]
+
+    stated_item = item(
+        kind="gitlab_issue",
+        title="Legacy flag removed in cleanup",
+        content="Maintainer removed the legacy flag in upstream commit.",
+        labels=[],
+    )
+    stated_draft = analysis(
+        title="Legacy flag update",
+        summary="Upstream updated flag handling.",
+        why_it_matters="", category="protocol", tags=["protocol"],
+        evidence=["Maintainer removed the legacy flag in upstream commit."],
+    )
+    w_stated = Analyzer(cfg, editorial_polish=True)
+    w_stated.client = FakeLLM(stated_draft, {
+        "title": "Legacy flag removed in upstream commit",
+        "summary": "Maintainer removed the legacy flag in an upstream commit.",
+        "why_it_matters": "",
+    })
+    assert w_stated.analyze(stated_item)["title"] == "Legacy flag removed in upstream commit"
+
+    non_iss = item(kind="gitlab_mr", upstream_state="merged", title="Drop old cipher", content="MR cleanup complete.", labels=[])
+    non_iss_draft = analysis(
+        title="Drop old cipher", summary="Cleanup complete.", why_it_matters="",
+        category="feature", state="merged", confidence="confirmed", tags=["feature"],
+        evidence=["MR cleanup complete."],
+    )
+    w_mr = Analyzer(cfg, editorial_polish=True)
+    w_mr.client = FakeLLM(non_iss_draft, {
+        "title": "Old cipher removed cleanly",
+        "summary": "Merged change removed old cipher support.",
+        "why_it_matters": "",
+    })
+    assert w_mr.analyze(non_iss)["title"] == "Old cipher removed cleanly"
