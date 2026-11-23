@@ -15,15 +15,15 @@ from onionflash import (
     analyze, candidate as candidate_mod, collect, comments, editorial, llm, rejection, review,
     review_gate, source_packet,
 )
-from onionflash.schema import CATEGORIES
+from onionflash.schema import CATEGORIES, CONFIDENCES
 from onionflash.store import (
     DIRAUTH_PRIORITY, HACKERONE_PRIORITY, TOR_CORE_PRIORITY, TROVE_PRIORITY,
     TRUSTED_OPERATOR_PRIORITY, ReviewRequired, Store, item_priority,
 )
 from onionflash.util import (
-    DEFAULT_TOR_CORE_USERS, cve_ids, digest, effective_authority, is_official_release_announcement,
-    is_tor_core_item, is_torproject_new_thread, is_trove_item, mandatory_news_rule,
-    tor_core_user_set, trove_ids,
+    DEFAULT_TOR_CORE_USERS, cve_ids, digest, effective_authority, is_dirauth_category_story,
+    is_official_release_announcement, is_tor_core_item, is_torproject_new_thread, is_trove_item,
+    mandatory_news_rule, should_confirm_merged_mr, tor_core_user_set, trove_ids,
 )
 
 
@@ -1010,3 +1010,135 @@ def test_review_gate_duplicate_ack_guards_and_receiptless_approval_resume(tmp_pa
         r_resume = item_row(store, r_m)
         res_resume = run_gate(cfg, store, r_resume, Writer(), Reviewer(), DATE)
         assert res_resume["status"] == "published" and res_resume["review_calls"] == 0 and res_resume["writer_calls"] == 0
+
+
+def test_security_duplicate_attaches_to_canonical_story_without_duplicating_story(tmp_path):
+    """Attach closed `Security`-labeled duplicates via `duplicate_ref` while fast-skipping non-security ones."""
+    cfg = make_config(tmp_path)
+    orig_url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41240"
+    dup_sec_url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41244"
+    dup_plain_url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41245"
+    with Store(tmp_path / "sec-dup.sqlite3") as store:
+        canon = seed_source_story(
+            store,
+            _story_item(
+                url=orig_url,
+                labels=["Security"],
+                title="Descriptor parser assertion failure",
+                content="Tracks #41240 descriptor parser assertion failure.",
+            ),
+            draft=_story_draft(
+                title="Descriptor parser assertion failure",
+                summary="Tracks #41240 descriptor parser assertion failure.",
+                category="security",
+                tags=["security"],
+                evidence=["Tracks #41240 descriptor parser assertion failure."],
+            ),
+        )
+        sec_dup = _story_item(
+            url=dup_sec_url,
+            labels=["Security", "status::duplicate"],
+            upstream_state="closed",
+            title="Duplicate security report",
+            content="Closing as a duplicate of #41240 after triage.",
+            author="outsider",
+        )
+        r_sec = pending(store, sec_dup)
+        matched, how = candidate_mod.associate(store.db, r_sec)
+        assert matched["id"] == canon["id"] and how == "duplicate_ref"
+        out_sec = run_gate(
+            cfg, store, r_sec,
+            Writer(_story_draft(evidence=["Closing as a duplicate of #41240 after triage."])),
+            Reviewer(verdict(), verdict()), LATER,
+        )
+        assert out_sec["status"] == "published"
+        assert len(store.stories()) == 1 and len(store.stories()[0]["updates"]) == 1
+
+        plain_dup = _story_item(
+            url=dup_plain_url,
+            labels=["status::duplicate"],
+            upstream_state="closed",
+            title="Plain duplicate report",
+            content="Duplicate of #41240.",
+            author="outsider",
+        )
+        r_plain = pending(store, plain_dup)
+        assert candidate_mod.associate(store.db, r_plain) == (None, None)
+        out_plain = run_gate(cfg, store, r_plain, Writer(), Reviewer(), LATER)
+        assert out_plain == {"status": "ignored", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
+        assert decision_codes(store, r_plain) == ["skipped.gate.duplicate_issue"]
+
+
+def test_should_confirm_merged_mr_and_dirauth_category_helpers():
+    """Verify `should_confirm_merged_mr` and `is_dirauth_category_story` while keeping `label_limits` enums intact."""
+    merged_mr = _story_item(
+        kind="gitlab_mr", upstream_state="merged",
+        url="https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/1951",
+        title="Add circuit rate limiting", content="Merged rate limiting change.",
+    )
+    open_mr = {**merged_mr, "upstream_state": "opened"}
+    issue_src = _story_item(title="Related issue", content="Opened issue.")
+    feed_src = _story_item(kind="feed", authority="official", title="Tor 0.4.9.17 released", content="Released.")
+    tag_src = _story_item(kind="tag", authority="official", title="tor-0.4.9.17", content="")
+
+    assert should_confirm_merged_mr([merged_mr]) is True
+    assert llm.should_confirm_merged_mr([merged_mr, {**merged_mr, "url": merged_mr["url"] + "2"}]) is True
+    assert should_confirm_merged_mr([open_mr]) is False
+    assert should_confirm_merged_mr([merged_mr, issue_src]) is False
+    assert should_confirm_merged_mr([issue_src]) is False
+    assert should_confirm_merged_mr([feed_src]) is False
+    assert should_confirm_merged_mr([tag_src]) is False
+    assert should_confirm_merged_mr([]) is False
+
+    # Existing label_limits enums remain compatible with downstream validation contracts.
+    assert llm.label_limits([merged_mr])["confidence"] == CONFIDENCES
+    assert llm.label_limits([merged_mr])["state"] == ["merged"]
+
+    dirauth_labeled = _story_item(
+        labels=["Directory Authority (dirauth)"],
+        title="Authority key schedule update", content="Routine key rotation planning.",
+    )
+    dirauth_op = _story_item(
+        authority="dirauth-operator", author="linus",
+        title="Consensus bandwidth weight discrepancy",
+        content="Observed discrepancy in consensus vote weights.",
+    )
+    dirauth_title = _story_item(
+        title="Planned IPv4/IPv6 migration for maatuska",
+        content="maatuska will migrate to a new dual-stack subnet.",
+    )
+    dirauth_packet_unit = {
+        "kind": "feed", "authority": "project-sender", "labels": [],
+        "title": "[tor-relays] Directory authority serge offline for hardware replacement",
+        "passages": [{"id": "S1:P1", "text": "Bridge authority serge is offline for disk replacement."}],
+    }
+    assert is_dirauth_category_story([dirauth_labeled]) is True
+    assert llm.is_dirauth_category_story([dirauth_op]) is True
+    assert is_dirauth_category_story([dirauth_title]) is True
+    assert is_dirauth_category_story([dirauth_packet_unit]) is True
+
+    # Exclusions: TROVE, CVE, Security/compromise, DoS/DDoS, release/tag, and non-operational chores.
+    assert is_dirauth_category_story([{**dirauth_labeled, "mandatory_news_rule": "trove"}]) is False
+    assert is_dirauth_category_story([{**dirauth_labeled, "content": "Tracks TROVE-2026-009."}], ) is False
+    assert is_dirauth_category_story([{**dirauth_labeled, "content": "Tracks CVE-2026-12345."}], ) is False
+    assert is_dirauth_category_story([{**dirauth_labeled, "labels": ["Directory Authority (dirauth)", "Security"]}]) is False
+    assert is_dirauth_category_story([_story_item(
+        title="dirauth: Remove bastet from list",
+        content="Operator reports bastet machine is very plausibly compromised.",
+    )]) is False
+    assert is_dirauth_category_story([_story_item(
+        labels=["Directory Authority (dirauth)"],
+        title="Directory authority DDoS mitigation", content="Mitigates DDoS flood against directory authorities.",
+    )]) is False
+    assert is_dirauth_category_story([_story_item(
+        kind="feed", authority="official",
+        title="Tor 0.4.9.16 released with directory authority key update",
+        content="Tor 0.4.9.16 is now available.",
+    )]) is False
+    assert is_dirauth_category_story([tag_src]) is False
+    assert is_dirauth_category_story([_story_item(
+        authority="dirauth-operator", author="weasel",
+        title="Minor comment typo in dirvote header",
+        content="There is a spelling typo in a code comment inside dirvote.h.",
+    )]) is False
+    assert is_dirauth_category_story([]) is False

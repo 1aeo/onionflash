@@ -15,7 +15,10 @@ from .schema import CATEGORIES, CONFIDENCES, STATES
 from .transport import DeadlineReached, FetchError, HttpClient, Response, is_event_stream
 
 _HTTP_CLIENT_CLASS = HttpClient
-from .util import LIST_ARCHIVE_HOST, _url_host, has_invalid_text_chars, is_trove_item, strict_json
+from .util import (  # noqa: E402
+    LIST_ARCHIVE_HOST, _url_host, has_invalid_text_chars, is_dirauth_category_story, is_trove_item,
+    should_confirm_merged_mr, strict_json,
+)
 
 _ACRONYM_ALLOWLIST = frozenset({
     "TOR", "ARTI", "TCP", "UDP", "TLS", "SSL", "DNS", "HTTP", "HTTPS", "SOCKS", "SOCKS4",

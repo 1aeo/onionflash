@@ -7,11 +7,14 @@ from helpers import (
     pending, queued_row, run_gate, seed_source_story, story_payload, update_analysis, verdict,
     wire_reviewer,
 )
-from onionflash import candidate, editorial, rejection, review, review_gate
+from onionflash import candidate, editorial, rejection, review, review_gate, source_packet
 from onionflash.analyze import tag_notice
 from onionflash.config import DEFAULTS
 from onionflash.render import prepare_story
-from onionflash.util import digest, gitlab_refs, item_cluster, release_mentions, story_cluster, thread_subject
+from onionflash.util import (
+    cve_ids, digest, duplicate_issue_refs, gitlab_refs, item_cluster, release_mentions,
+    story_cluster, thread_subject,
+)
 
 LIST_BASE = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/"
 OTHER_LIST_BASE = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/"
@@ -584,12 +587,12 @@ def test_coverage_activity_order_retracted_markers_truncation_and_reconsideratio
                                           published_at="2026-10-01T00:00:00Z", updated_at="2026-10-01T00:00:00Z"),
                               at="2026-10-01T00:00:00Z")
     stories = []
-    for idx in range(31):
-        stamp = f"2026-10-{idx + 2:02d}T00:00:00Z" if idx < 29 else f"2026-11-0{idx - 28}T00:00:00Z"
+    for idx in range(39):
+        stamp = f"2026-10-{idx + 2:02d}T00:00:00Z" if idx < 30 else f"2026-11-{idx - 29:02d}T00:00:00Z"
         stories.append(seed_source_story(store, item(url=f"https://example.org/s-{idx}", title=f"Story {idx:02d}",
                                                      published_at=stamp, updated_at=stamp), at=stamp))
-    bg32 = candidate.coverage_background(store.db, None)
-    assert len(bg32["recent"]) == 32 and bg32["truncated"] is False
+    bg40 = candidate.coverage_background(store.db, None)
+    assert len(bg40["recent"]) == 40 and bg40["truncated"] is False
 
     with store.db:
         store.db.execute("UPDATE stories SET updated_at='2026-11-10T18:00:00Z' WHERE id=?", (first["id"],))
@@ -599,9 +602,9 @@ def test_coverage_activity_order_retracted_markers_truncation_and_reconsideratio
              published_at="2026-10-03T00:00:00Z", updated_at="2026-10-03T00:00:00Z"),
         at="2026-11-10T19:00:00Z",
     )
-    bg33 = candidate.coverage_background(store.db, None)
-    assert bg33["truncated"] is True and bg33["recent"][0]["id"] == old_dated_new_run["id"]
-    assert bg33["recent"][1]["id"] == first["id"]
+    bg41 = candidate.coverage_background(store.db, None)
+    assert bg41["truncated"] is True and bg41["recent"][0]["id"] == old_dated_new_run["id"]
+    assert bg41["recent"][1]["id"] == first["id"]
 
     prior_row = dict(store.db.execute("SELECT * FROM stories WHERE id=?", (first["id"],)).fetchone())
     bg_prior = candidate.coverage_background(store.db, prior_row)
@@ -838,3 +841,286 @@ def test_wire_reviewer_populates_same_story_from_single_duplicate_reason_and_hol
     res_ret = wired.review(story_cand, pkt, coverage=cov)
     assert res_dup["verdict"] == "skip" and res_dup["same_story"] == live_id
     assert res_ret["verdict"] == "hold" and res_ret["model_verdict"] == "skip" and res_ret["same_story"] is None
+
+
+def test_duplicate_issue_refs_and_symmetric_closed_by_mr_association(store):
+    """Extract canonical duplicate refs and symmetrically associate closed issues to merged MRs."""
+    tor_41240 = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41240"
+    tor_41244 = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41244"
+    tor_mr_1076 = "https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/1076"
+
+    for body in (
+        "Closed as duplicate of #41240.",
+        "Closed as a duplicate of #41240 after triage.",
+        "Duplicate of tpo/core/tor#41240.",
+        "Dup of https://gitlab.torproject.org/tpo/core/tor/-/issues/41240",
+    ):
+        assert duplicate_issue_refs(item(kind="gitlab_issue", upstream_state="closed", url=tor_41244, content=body)) == [tor_41240]
+
+    assert duplicate_issue_refs(item(
+        kind="gitlab_issue", upstream_state="closed", url=tor_41244, title="Duplicate of !1076", content="See notes.",
+    )) == [tor_mr_1076]
+    assert duplicate_issue_refs(item(
+        kind="gitlab_issue", upstream_state="closed", url=tor_41244, content="Checking.",
+        public_comments=[make_note(1, "Closing: duplicate of #41240.", url=tor_41244)],
+    )) == [tor_41240]
+    assert duplicate_issue_refs(item(
+        kind="gitlab_issue", upstream_state="closed", url=tor_41244,
+        labels=["status::duplicate"], content="Same bug as #41240.",
+    )) == [tor_41240]
+    assert duplicate_issue_refs(item(
+        kind="gitlab_issue", upstream_state="closed", url=tor_41244,
+        labels=["duplicate"], content="Compare #41240 and #41241.",
+    )) == []
+
+    for rejected_item in (
+        item(kind="gitlab_issue", upstream_state="closed", url=tor_41244, content="This is not a duplicate of #41240."),
+        item(kind="gitlab_issue", upstream_state="closed", url=tor_41244, content="This isn't a duplicate of #41240."),
+        item(kind="gitlab_issue", upstream_state="opened", url=tor_41244, content="Duplicate of #41240."),
+        item(kind="gitlab_mr", upstream_state="closed", url=tor_mr_1076, content="Duplicate of #41240."),
+    ):
+        assert duplicate_issue_refs(rejected_item) == []
+
+    canon_story = seed_source_story(store, item(
+        kind="gitlab_issue", url=tor_41240, labels=["Security"],
+        title="Original security descriptor bug", content="Detailed report of the descriptor bug.",
+    ))
+    sec_dup_row = pending(store, item(
+        kind="gitlab_issue", url=tor_41244, labels=["Security"], upstream_state="closed",
+        title="Second filing for descriptor bug", content="Closed as a duplicate of #41240.",
+    ), LATER)
+    matched, how = candidate.associate(store.db, sec_dup_row)
+    assert matched["id"] == canon_story["id"] and how == "duplicate_ref"
+
+    nonsec_dup_row = pending(store, item(
+        kind="gitlab_issue", url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/41245",
+        labels=[], upstream_state="closed", title="Repeated non-security bug", content="Duplicate of #41240.",
+    ), LATER)
+    assert candidate.associate(store.db, nonsec_dup_row) == (None, None)
+
+    second_story = seed_source_story(store, item(
+        kind="gitlab_issue", url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/41241",
+        labels=["Security"], title="Another security bug", content="Separate security defect.",
+    ))
+    ambig_dup = pending(store, item(
+        kind="gitlab_issue", url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/41246",
+        labels=["Security"], upstream_state="closed", title="Ambiguous duplicate",
+        content="Closed as duplicate of #41240 and #41241.",
+    ), LATER)
+    assert candidate.associate(store.db, ambig_dup) == (None, None)
+
+    mr_story = seed_source_story(store, item(
+        kind="gitlab_mr", upstream_state="merged", url=tor_mr_1076,
+        title="Fix circuit guard selection (closes TPO/Core/Tor#41471)",
+        content="Closes https://gitlab.torproject.org/TPO/Core/Tor/-/issues/41471 with guard check.",
+    ))
+    open_mr_story = seed_source_story(store, item(
+        kind="gitlab_mr", upstream_state="opened",
+        url="https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/1077",
+        title="WIP fix (closes #41472)", content="Closes #41472 when ready.",
+    ))
+    unverified_mr = pending(store, item(
+        kind="gitlab_mr", upstream_state="merged",
+        url="https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/1078",
+        title="Unverified routed MR (closes #41473)", content="Closes #41473.",
+    ), LATER)
+    with store.db:
+        store.db.execute(
+            "UPDATE items SET story_id=?,last_error=? WHERE id=?",
+            (second_story["id"], candidate.UNVERIFIED_ROUTE, unverified_mr["id"]),
+        )
+        store.db.execute(
+            "INSERT INTO items(id,url,source_id,payload,content_hash,cluster_key,first_seen,last_seen,status,story_id) "
+            "VALUES('badblob','https://example.org/badblob','test',X'80','h','k',?,?, 'published',?)",
+            (DATE, DATE, second_story["id"]),
+        )
+
+    issue_41471 = pending(store, item(
+        kind="gitlab_issue", url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/41471",
+        title="Circuit guard selection defect", content="Observed guard selection regression.",
+    ), LATER)
+    matched_mr, how_mr = candidate.associate(store.db, issue_41471)
+    assert matched_mr["id"] == mr_story["id"] and how_mr == "closed_by_mr"
+
+    issue_41472 = pending(store, item(
+        kind="gitlab_issue", url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/41472",
+        title="Issue linked to open MR only", content="Open MR should not trigger closed_by_mr.",
+    ), LATER)
+    assert candidate.associate(store.db, issue_41472) == (None, None)
+
+    issue_41473 = pending(store, item(
+        kind="gitlab_issue", url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/41473",
+        title="Issue linked to unverified route MR", content="Unverified route should not trigger closed_by_mr.",
+    ), LATER)
+    assert candidate.associate(store.db, issue_41473) == (None, None)
+
+    second_closing_mr = seed_source_story(store, item(
+        kind="gitlab_mr", upstream_state="merged",
+        url="https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/1079",
+        title="Duplicate MR closing #41471", content="Also closes #41471.",
+    ))
+    assert second_closing_mr["id"] != mr_story["id"]
+    assert candidate.associate(store.db, issue_41471) == (None, None)
+    assert open_mr_story["id"] != mr_story["id"]
+
+
+def test_mailing_list_thread_root_context_is_metadata_only(store):
+    """Attach bounded parent-thread context metadata on mailing-list replies without altering passages."""
+    stale_root = item(
+        source_id="tor-relays", url=LIST_BASE + "OLDROOT/",
+        title="[tor-relays] Guard scheduler latency spike",
+        content="Too old parent message outside the 45-day thread window.",
+        published_at="2026-08-01T10:00:00Z", updated_at="2026-08-01T10:00:00Z",
+    )
+    other_list_root = item(
+        source_id="tor-dev", url=OTHER_LIST_BASE + "DEVROOT/",
+        title="[tor-dev] Guard scheduler latency spike",
+        content="Different mailing list should not supply parent thread context.",
+        published_at="2026-10-20T09:00:00Z", updated_at="2026-10-20T09:00:00Z",
+    )
+    real_root = item(
+        source_id="tor-relays", url=LIST_BASE + "ROOT/",
+        title="[tor-relays] Guard scheduler latency spike",
+        content="Root report describing guard scheduler latency across relays.\n\n> Quoted prelude omitted.",
+        published_at="2026-10-20T10:00:00Z", updated_at="2026-10-20T10:00:00Z",
+    )
+    mid_reply = item(
+        source_id="tor-relays", url=LIST_BASE + "MID/",
+        title="[tor-relays] Re: Guard scheduler latency spike",
+        content="Intermediate reply.",
+        published_at="2026-10-25T10:00:00Z", updated_at="2026-10-25T10:00:00Z",
+    )
+    for msg in (stale_root, other_list_root, real_root, mid_reply):
+        store.ingest(msg, msg["updated_at"])
+        with store.db:
+            store.db.execute("UPDATE items SET status='ignored' WHERE id=?", (msg["id"],))
+
+    reply = item(
+        source_id="tor-relays", url=LIST_BASE + "LEAF/",
+        title="[tor-relays] Re: Guard scheduler latency spike",
+        content="Our measurement shows 18ms median delay.\n\nOn Tue Alice wrote:\n> Earlier quoted line from thread.",
+        published_at="2026-11-08T12:00:00Z", updated_at="2026-11-08T12:00:00Z",
+    )
+    row = pending(store, reply, LATER)
+    assert candidate.associate(store.db, row) == (None, None)
+
+    root_meta = candidate._thread_root_item(store.db, row, reply)
+    assert root_meta == {
+        "title": "[tor-relays] Guard scheduler latency spike",
+        "published_at": "2026-10-20T10:00:00Z",
+        "url": LIST_BASE + "ROOT/",
+        "excerpt": "Root report describing guard scheduler latency across relays.",
+    }
+
+    mode, writer_item = candidate.own_update_input(store.db, row, reply)
+    assert mode == "story" and writer_item["thread_root"] == root_meta
+    assert "thread_root" not in reply
+
+    unrelated_post = item(
+        source_id="tor-relays", url=LIST_BASE + "STANDALONE/",
+        title="[tor-relays] Unrelated standalone post", content="Standalone post body.",
+    )
+    unrelated_row = pending(store, unrelated_post, LATER)
+    assert candidate.own_update_input(store.db, unrelated_row, unrelated_post) == ("story", unrelated_post)
+
+    draft = analysis(
+        title="Guard scheduler latency measured at 18ms",
+        summary="A mailing-list reply measures 18ms median guard scheduler delay.",
+        why_it_matters="", evidence=["Our measurement shows 18ms median delay."],
+    )
+    prepared = store.prepare_candidate(row, draft, LATER)
+    [unit] = prepared["packet"]["sources"]
+    assert unit["thread_context"] == root_meta
+    assert unit["unquoted_content"] == "Our measurement shows 18ms median delay."
+    assert all("Root report" not in p["text"] for p in unit["passages"])
+
+    compat_pkt, _ = source_packet.build_packet(
+        store.db, reply, prepared["payload"], prepared["candidate"], prepared["payload"]["editorial_item"],
+    )
+    assert "thread_context" not in compat_pkt["sources"][0]
+
+
+def test_related_expands_cve_authority_and_rare_lexical_overlap(store):
+    """Pin live non-retracted stories by CVE, directory authority nickname, and 90-day rare lexical overlap."""
+    assert (candidate.COVERAGE_ROWS, candidate.COVERAGE_CHARS, candidate.COVERAGE_SUMMARY_CHARS, candidate.RELATED_LIMIT) == (
+        40, 18000, 300, 10,
+    )
+
+    s_cve = seed_source_story(store, item(
+        url="https://example.org/cve-story", title="Parser issue assigned CVE-2026-55555",
+        content="Advisory tracks CVE-2026-55555 in cell parsing. " + ("padding " * 60),
+    ), draft=analysis(
+        title="Parser issue assigned CVE-2026-55555",
+        summary="Tracks CVE-2026-55555 in descriptor cell parsing. " + ("Detailed background text. " * 15),
+        evidence=["Advisory tracks CVE-2026-55555 in cell parsing."],
+    ))
+    s_auth = seed_source_story(store, item(
+        url="https://example.org/auth-story", title="Vote latency on maatuska",
+        content="Operators observed elevated latency on Maatuska yesterday.",
+    ), draft=analysis(
+        title="Vote latency on maatuska", summary="Elevated vote latency reported on maatuska.",
+        evidence=["Operators observed elevated latency on Maatuska yesterday."],
+    ))
+    s_lex_recent = seed_source_story(store, item(
+        url="https://example.org/lex-recent", title="WebTunnel nginx websocket buffer stall",
+        content="Reverse proxies using WebTunnel with nginx experience websocket handshake stalls.",
+        published_at="2026-10-15T00:00:00Z", updated_at="2026-10-15T00:00:00Z",
+    ), draft=analysis(
+        title="WebTunnel nginx websocket buffer stall",
+        summary="WebTunnel deployments behind nginx observe websocket handshake stalls.",
+        evidence=["Reverse proxies using WebTunnel with nginx experience websocket handshake stalls."],
+    ), at="2026-10-15T00:00:00Z")
+    s_lex_old = seed_source_story(store, item(
+        url="https://example.org/lex-old", title="Old WebTunnel nginx websocket note",
+        content="Historical WebTunnel nginx websocket handshake report from June.",
+        published_at="2026-06-01T00:00:00Z", updated_at="2026-06-01T00:00:00Z",
+    ), draft=analysis(
+        title="Old WebTunnel nginx websocket note",
+        summary="Historical WebTunnel nginx websocket handshake report from June.",
+        evidence=["Historical WebTunnel nginx websocket handshake report from June."],
+    ), at="2026-06-01T00:00:00Z")
+    s_generic = seed_source_story(store, item(
+        url="https://example.org/generic", title="Tor relay directory authority tor260 counter issue",
+        content="Tor and Arti relay client server network browser fix counter checks.",
+        published_at="2026-10-20T00:00:00Z", updated_at="2026-10-20T00:00:00Z",
+    ), draft=analysis(
+        title="Tor relay directory authority tor260 counter issue",
+        summary="Tor and Arti relay client server network browser fix counters.",
+        evidence=["Tor and Arti relay client server network browser fix counter checks."],
+    ), at="2026-10-20T00:00:00Z")
+
+    probe = item(
+        url="https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/CROSS1/",
+        title="[tor-relays] WebTunnel nginx handshake issue, CVE-2026-55555, and tor26 follow-up",
+        content=(
+            "Our counter test and counters aside, operators using WebTunnel with nginx "
+            "hit websocket handshake stalls; maatuska and CVE-2026-55555 were also discussed.\n\n"
+            "> Quoted older serge remark must not match authority."
+        ),
+        published_at="2026-11-08T12:00:00Z", updated_at="2026-11-08T12:00:00Z",
+    )
+    assert cve_ids(probe) == ["CVE-2026-55555"]
+    rel = candidate.related(store.db, {"id": probe["id"], "cluster_key": "url:probe"}, probe)
+    rel_map = dict(rel)
+    assert rel_map.get(s_cve["id"]) == "references CVE-2026-55555"
+    assert rel_map.get(s_auth["id"]) == "shared authority"
+    assert rel_map.get(s_lex_recent["id"]) == "shared technical terms"
+    assert s_lex_old["id"] not in rel_map
+    assert s_generic["id"] not in rel_map
+
+    bg = candidate.coverage_background(store.db, None, related_rows=rel)
+    cve_entry = next(e for e in bg["recent"] if e["id"] == s_cve["id"])
+    assert len(cve_entry["summary"]) > candidate.COVERAGE_SUMMARY_CHARS
+    assert len(cve_entry["summary"]) <= candidate.RELATED_SUMMARY_CHARS
+
+    # Verify RELATED_LIMIT == 10 pins up to 10 distinct stories cleanly.
+    ten_target = item(
+        url="https://example.org/ten-probe", title="Multi-CVE tracking note",
+        content=" ".join(f"CVE-2026-{1000 + n}" for n in range(12)),
+    )
+    for n in range(12):
+        cve = f"CVE-2026-{1000 + n}"
+        seed_source_story(store, item(
+            url=f"https://example.org/cve-cap-{n}", title=f"Tracking {cve}", content=f"Details for {cve}.",
+        ), draft=analysis(title=f"Tracking {cve}", summary=f"Details for {cve}.", evidence=[f"Details for {cve}."]))
+    assert len(candidate.related(store.db, {"id": ten_target["id"], "cluster_key": "url:ten"}, ten_target)) == 10
