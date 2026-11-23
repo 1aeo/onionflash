@@ -11,9 +11,11 @@ also prove their source before a mismatch can reset automatic review work.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import json
 import re
+import threading
 
 from . import candidate as candidate_mod, decisions, editorial, review, source_packet
 from .analyze import MIN_EVIDENCE_CHARS, cache_key
@@ -35,9 +37,10 @@ MAX_APPROVALS = 2000  # cached approvals kept besides those unfinished jobs pin
 NEW_STORY_DAYS = 14
 HIGH_SECURITY_SEVERITIES = frozenset({"severity::high", "severity::critical"})
 # The repairs that may follow the first review, a release-label repair request counting as one, each
-# checked by another fresh verification: an item gets at most MAX_VERIFY_REPAIRS + 2 review requests.
+# checked by another fresh verification, plus at most one 3rd tiebreaker vote on news_value:
+# an item gets at most MAX_VERIFY_REPAIRS + 3 review requests.
 MAX_VERIFY_REPAIRS = 5
-MAX_REVIEW_REQUESTS = MAX_VERIFY_REPAIRS + 2
+MAX_REVIEW_REQUESTS = MAX_VERIFY_REPAIRS + 3
 OFFICIAL_AUTHORITIES = frozenset({"official", "hackerone", "dirauth-operator"})
 OUTCOME_STAGES = {"approve": "approved", "skip": "skipped", "hold": "held", "route": "routed"}
 # Each hold reason and its operator text, which follows "Final review held: " in last_error. A hold
@@ -579,13 +582,54 @@ def _can_route(candidate: dict, prepared: dict, result: dict, target_id) -> bool
     return bool(item_subj and item_subj == target_subj)
 
 
+def _is_official(item: dict, prepared: dict) -> bool:
+    """Return whether `item` holds official, HackerOne, or relevant dirauth standing."""
+    eff_auth = effective_authority(item, prepared.get("dirauth_users"), prepared.get("tor_core_users"))
+    recent_dev = (
+        developed_at(item) >= after(-NEW_STORY_DAYS * 86400, item["updated_at"])
+        or _security_disclosure(item)
+        or (prepared.get("coverage") or {}).get("prior_story") is not None
+    )
+    is_dirauth_rel = (
+        (eff_auth == "dirauth-operator" or is_dirauth_item(item, prepared.get("dirauth_users")))
+        and recent_dev
+        and _dirauth_operational_relevant(item)
+    )
+    return (
+        eff_auth in (OFFICIAL_AUTHORITIES - {"dirauth-operator"})
+        or is_hackerone_item(item)
+        or is_dirauth_rel
+    ) and item.get("kind") != "tag"
+
+
+def _is_editorial_news_tie(reviews: list[dict], *, mandatory: bool) -> bool:
+    """Return True only when review and verification split strictly between approve and skip(news_value)."""
+    if mandatory or len(reviews) != 2 or any(entry.get("tiebreaker") for entry in reviews):
+        return False
+    first, second = reviews
+    if first.get("stage") != "review" or second.get("stage") != "verification":
+        return False
+    res0, res1 = first["result"], second["result"]
+    if "hold" in (res0["verdict"], res1["verdict"]):
+        return False
+    failed0 = {name for name, check in res0["criteria"].items() if check["outcome"] != "pass"}
+    failed1 = {name for name, check in res1["criteria"].items() if check["outcome"] != "pass"}
+    if "new_information" in failed0 or "new_information" in failed1:
+        return False
+    pair = ((res0["verdict"], failed0), (res1["verdict"], failed1))
+    return pair in (
+        (("approve", set()), ("skip", {"news_value"})),
+        (("skip", {"news_value"}), ("approve", set())),
+    )
+
+
 def next_step(reviews, candidate, prepared):
     """What follows the latest review of `candidate`, decided from the chain of reviews alone.
 
     ("route", story_id) attaches an unmapped item to an existing story, ("verify", text) sends text
-    to a fresh verification, ("repair", text) asks a review to repair its release labels,
-    ("approve" | "skip", candidate) commits, and ("hold", (stage, reason)) holds.
-    The evaluation follows the same steps.
+    to a fresh verification, ("tiebreak", text) asks a third verification pass to break a news_value
+    tie, ("repair", text) asks a review to repair its release labels, ("approve" | "skip", candidate)
+    commits, and ("hold", (stage, reason)) holds. The evaluation follows the same steps.
     """
     latest = reviews[-1]
     result, stage, later = latest["result"], latest["stage"], len(reviews) > 1
@@ -594,8 +638,26 @@ def next_step(reviews, candidate, prepared):
     mandatory = mandatory_news_rule({**item, "authority": eff_auth}) is not None
     verdict = result["verdict"]
     failed = {name for name, check in result["criteria"].items() if check["outcome"] != "pass"}
-    if later and _news(result, mandatory=mandatory) != _news(reviews[0]["result"], mandatory=mandatory):
-        return "hold", (stage, "disagreed_news")
+    official = _is_official(item, prepared)
+    is_tiebreak_pair = _is_editorial_news_tie(reviews[:2], mandatory=mandatory)
+    if len(reviews) == 3 and (latest.get("tiebreaker") or is_tiebreak_pair):
+        new_info_ok = result["criteria"]["new_information"]["outcome"] == "pass"
+        if not new_info_ok:
+            if result.get("same_story") and _can_route(candidate, prepared, result, result.get("same_story")):
+                return "route", result["same_story"]
+            return "hold", ("verification", "disagreed_news")
+        votes = sum(_news(entry["result"], mandatory=mandatory) for entry in reviews[:3])
+        if votes <= 1:
+            if official:
+                return "hold", ("verification", "official_not_news")
+            return "skip", candidate
+    else:
+        if len(reviews) == 2 and _is_editorial_news_tie(reviews, mandatory=mandatory):
+            return "tiebreak", candidate
+        has_tiebreak = len(reviews) > 3 and (reviews[2].get("tiebreaker") or is_tiebreak_pair)
+        news_anchor = reviews[2] if has_tiebreak else reviews[0]
+        if later and _news(result, mandatory=mandatory) != _news(news_anchor["result"], mandatory=mandatory):
+            return "hold", (stage, "disagreed_news")
     if _can_route(candidate, prepared, result, result.get("same_story")):
         return "route", result["same_story"]
     if mandatory and failed == {"news_value"} and verdict in {"skip", "revise", "hold"}:
@@ -612,21 +674,6 @@ def next_step(reviews, candidate, prepared):
                 return "repair", candidate
             return "approve", candidate
         return "hold", (stage, "model_hold")
-    recent_dev = (
-        developed_at(item) >= after(-NEW_STORY_DAYS * 86400, item["updated_at"])
-        or _security_disclosure(item)
-        or (prepared.get("coverage") or {}).get("prior_story") is not None
-    )
-    is_dirauth_rel = (
-        (eff_auth == "dirauth-operator" or is_dirauth_item(item, prepared.get("dirauth_users")))
-        and recent_dev
-        and _dirauth_operational_relevant(item)
-    )
-    official = (
-        eff_auth in (OFFICIAL_AUTHORITIES - {"dirauth-operator"})
-        or is_hackerone_item(item)
-        or is_dirauth_rel
-    ) and item.get("kind") != "tag"
     # An official item that fails only news value is the operator's to judge, once a fresh
     # verification has passed its facts; a duplicate still skips.
     disputed = official and failed & review.EDITORIAL_CRITERIA == {"news_value"}
@@ -790,7 +837,11 @@ def proposal_needs_check(record):
 
 
 def _entry_stage(entry: dict) -> str:
-    return "repair" if entry.get("issue") == "release_labels" else "verify" if entry["stage"] == "verification" else "review"
+    if entry.get("issue") == "release_labels":
+        return "repair"
+    if entry.get("tiebreaker"):
+        return "tiebreak"
+    return "verify" if entry["stage"] == "verification" else "review"
 
 
 def _active_events(record: dict) -> list[tuple]:
@@ -885,7 +936,10 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
             raise ValueError()
         for entry in record["reviews"]:
             if (not isinstance(entry, dict) or entry.get("stage") not in {"review", "verification"}
-                    or not _is_sha256(entry.get("candidate_hash"))):
+                    or not _is_sha256(entry.get("candidate_hash"))
+                    or ("tiebreaker" in entry and (entry["tiebreaker"] is not True
+                                                  or entry.get("stage") != "verification"
+                                                  or "issue" in entry))):
                 raise ValueError()
             review.validate_review(entry["result"], prepared["packet"],
                                    update=prepared.get("mode") == "update", coverage=prepared.get("coverage"))
@@ -893,7 +947,7 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
             if (not isinstance(proposal, dict) or set(proposal) != fields
                     or proposal["error"] != review.INCONSISTENT_VERDICT
                     or type(proposal["request"]) is not int or not 1 <= proposal["request"] <= budget["reserved"]
-                    or proposal["stage"] not in {"review", "verify", "repair"}
+                    or proposal["stage"] not in {"review", "verify", "repair", "tiebreak"}
                     or proposal["mode"] not in {"story", "update"}
                     or not _is_sha256(proposal["candidate_before_hash"])
                     or (proposal["candidate_after_hash"] is not None and not _is_sha256(proposal["candidate_after_hash"]))
@@ -982,7 +1036,7 @@ def _validate_candidate_path(record, stage, candidate, prepared, *, allow_cached
             trusted.append(entry)
             action, value = next_step(trusted, current, prepared)
             last_action, last_value = action, value
-            if action in {"verify", "repair"}:
+            if action in {"verify", "repair", "tiebreak"}:
                 if digest(value) != digest(current) and digest(value) in seen:
                     expected_stage = "held"
                 else:
@@ -1062,6 +1116,47 @@ def recovery_status(record):
             "unresolved_inconsistency": unresolved}
 
 
+def _handle_inconsistent_review(stage, candidate, prepared, record, requests, failed, seen, waiting, correction):
+    """Record an inconsistent review reply and return ('verify', repaired) or ('reask', candidate)."""
+    event = {"error": review.INCONSISTENT_VERDICT, "request": requests.state["reserved"], "stage": stage,
+             "mode": prepared.get("mode", "story"),
+             "candidate_before_hash": digest(candidate), "candidate_after_hash": None,
+             "context": _context(prepared, record["policy_hash"]), "changed_fields": [],
+             "repair": None, "accepted": False, "disposition": "unusable",
+             "reask_trigger": False, "reask_response": correction}
+    requests.state["inconsistent_requests"].append(event["request"])
+    record.setdefault("untrusted_proposals", []).append(event)
+    try:
+        if _literal_tag(prepared):
+            event["disposition"] = "literal_tag"
+            raise review.ReviewError("Literal tags cannot use untrusted edits")
+        is_update = prepared.get("mode") == "update"
+        proposed = review._repair_fields(failed.proposal, update=is_update)
+        repaired = review.apply_repair(candidate, proposed, update=is_update)
+        event["candidate_after_hash"] = digest(repaired)
+        event["changed_fields"] = sorted(key for key in candidate if repaired.get(key) != candidate[key])
+        event["repair"] = proposed
+        if not _allowed_proposal(candidate, repaired, prepared, event["repair"]):
+            event["disposition"] = "labels"
+            raise review.ReviewError("Untrusted edit exceeds packet label limits")
+        if event["candidate_after_hash"] in seen:
+            event["disposition"] = "repeated"
+            raise review.ReviewError("Untrusted edit repeats a reviewed candidate")
+    except review.ReviewError:
+        if requests.state["validation_reask"] is None and requests.state["reserved"] < MAX_REVIEW_REQUESTS:
+            event["reask_trigger"] = True
+            requests.state["validation_reask"] = {"trigger": event["request"], "attempts": [],
+                                                   "response": None, "transport_failed": False}
+            requests.persist()
+            return "reask", candidate
+        requests.persist()
+        raise failed
+    if waiting is not None:
+        waiting["disposition"] = "superseded_unverified"
+    event.update(accepted=True, disposition="pending")
+    return "verify", repaired
+
+
 def advance_review(reviewer, stage, candidate, prepared, record, requests):
     """Runtime and evaluation share the same untrusted-proposal transition.
 
@@ -1075,7 +1170,8 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
     waiting = pending_proposal(record)
     before, failed = requests.actual, None
     try:
-        result = reviewer.review(candidate, prepared["packet"], coverage=prepared["coverage"], verification=stage == "verify",
+        result = reviewer.review(candidate, prepared["packet"], coverage=prepared["coverage"],
+                                 verification=stage in {"verify", "tiebreak"},
                                  issue=review.RELEASE_ISSUE if stage == "repair" else None,
                                  on_request=requests.callback(correction=correction),
                                  **({"validation_error": review.INCONSISTENT_VERDICT} if correction else {}),
@@ -1087,48 +1183,17 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
     if correction and requests.state["validation_reask"]["response"] != requests.state["reserved"]:
         raise AnalysisError("Validation response was not observed", code="app.damaged_job")
     if failed is not None:
-        event = {"error": review.INCONSISTENT_VERDICT, "request": requests.state["reserved"], "stage": stage,
-                 "mode": prepared.get("mode", "story"),
-                 "candidate_before_hash": digest(candidate), "candidate_after_hash": None,
-                 "context": _context(prepared, record["policy_hash"]), "changed_fields": [],
-                 "repair": None, "accepted": False, "disposition": "unusable",
-                 "reask_trigger": False, "reask_response": correction}
-        requests.state["inconsistent_requests"].append(event["request"])
-        record.setdefault("untrusted_proposals", []).append(event)
-        try:
-            if _literal_tag(prepared):
-                event["disposition"] = "literal_tag"
-                raise review.ReviewError("Literal tags cannot use untrusted edits")
-            is_update = prepared.get("mode") == "update"
-            proposed = review._repair_fields(failed.proposal, update=is_update)
-            repaired = review.apply_repair(candidate, proposed, update=is_update)
-            event["candidate_after_hash"] = digest(repaired)
-            event["changed_fields"] = sorted(key for key in candidate if repaired.get(key) != candidate[key])
-            event["repair"] = proposed
-            if not _allowed_proposal(candidate, repaired, prepared, event["repair"]):
-                event["disposition"] = "labels"
-                raise review.ReviewError("Untrusted edit exceeds packet label limits")
-            if event["candidate_after_hash"] in seen:
-                event["disposition"] = "repeated"
-                raise review.ReviewError("Untrusted edit repeats a reviewed candidate")
-        except review.ReviewError:
-            if requests.state["validation_reask"] is None and requests.state["reserved"] < MAX_REVIEW_REQUESTS:
-                event["reask_trigger"] = True
-                requests.state["validation_reask"] = {"trigger": event["request"], "attempts": [],
-                                                       "response": None, "transport_failed": False}
-                requests.persist()
-                # The correction keeps this exact stage and candidate. Invalid
-                # criteria are still absent from the trusted review history.
-                return advance_review(reviewer, stage, candidate, prepared, record, requests)
-            requests.persist()
-            raise failed
-        if waiting is not None:
-            waiting["disposition"] = "superseded_unverified"
-        event.update(accepted=True, disposition="pending")
+        outcome = _handle_inconsistent_review(stage, candidate, prepared, record, requests, failed, seen, waiting, correction)
+        if outcome[0] == "reask":
+            # The correction keeps this exact stage and candidate. Invalid
+            # criteria are still absent from the trusted review history.
+            return advance_review(reviewer, stage, candidate, prepared, record, requests)
         # The caller persists this audit, exact candidate and verify stage before
         # requesting its next step. No invalid reply is appended to reviews.
-        return "verify", repaired
-    entry = {"stage": "verification" if stage == "verify" else "review", **({"issue": "release_labels"} if stage == "repair" else {}),
+        return outcome
+    entry = {"stage": "verification" if stage in {"verify", "tiebreak"} else "review",
+             **({"issue": "release_labels"} if stage == "repair" else {}),
+             **({"tiebreaker": True} if stage == "tiebreak" else {}),
              **({"reask_response": True} if correction else {}),
              "candidate_hash": digest(candidate), "request": requests.state["reserved"], "result": result}
     if waiting is not None:
@@ -1138,7 +1203,7 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
     record["reviews"].append({**entry, **_context(prepared, record["policy_hash"])})
     action, value = next_step(record["reviews"], candidate, prepared)
     if action in {"verify", "repair"} and digest(value) != digest(candidate) and digest(value) in seen:
-        return "hold", ("verification" if stage == "verify" else "review", "repeated_repair")
+        return "hold", ("verification" if stage in {"verify", "tiebreak"} else "review", "repeated_repair")
     return action, value
 
 
@@ -1334,15 +1399,60 @@ _PROTECTED_LABELS = frozenset({"security", "regression", "critical", "severity::
 
 
 def _has_operator_retry(db, row: dict | None) -> bool:
-    return bool(
-        isinstance(row, dict)
-        and row.get("id")
-        and row.get("content_hash")
-        and db.execute(
-            "SELECT 1 FROM rejection_actions WHERE item_id=? AND content_hash=? AND action='retry'",
-            (row["id"], row["content_hash"]),
-        ).fetchone()
+    if not (isinstance(row, dict) and isinstance(item_id := row.get("id"), str) and item_id
+            and isinstance(content_hash := row.get("content_hash"), str) and content_hash):
+        return False
+    if db.execute(
+        "SELECT 1 FROM rejection_actions WHERE item_id=? AND content_hash=? AND action='retry'",
+        (item_id, content_hash),
+    ).fetchone():
+        return True
+    latest = db.execute(
+        "SELECT action,created_at FROM rejection_actions WHERE item_id=? ORDER BY action_id DESC LIMIT 1",
+        (item_id,),
+    ).fetchone()
+    if latest is None or latest["action"] != "retry" or not isinstance(latest["created_at"], str):
+        return False
+    retry_at = latest["created_at"]
+    raw_payload = row.get("payload")
+    payload = (
+        saved_object(raw_payload.encode("utf-8") if isinstance(raw_payload, str) else raw_payload)
+        if isinstance(raw_payload, (str, bytes)) else None
     )
+    checked_at = payload.get("comments_checked_at") if isinstance(payload, dict) and payload.get("kind") == "gitlab_issue" else None
+    if not isinstance(checked_at, str) or not checked_at:
+        return False
+    try:
+        if parse_utc(checked_at) < parse_utc(retry_at):
+            return False
+    except ValueError:
+        return False
+    retry_dl = db.execute(
+        """SELECT COALESCE(MAX(id),0) FROM decision_log
+           WHERE item_id=? AND code IN ('operator.retried','operator.reconsidered') AND decided_at=?""",
+        (item_id, retry_at),
+    ).fetchone()[0]
+    if retry_dl:
+        terminal = db.execute(
+            """SELECT 1 FROM decision_log
+               WHERE item_id=?
+                 AND (code GLOB 'published.*' OR code GLOB 'skipped.*' OR code GLOB 'held.*'
+                      OR code GLOB 'failed.*' OR code='operator.dismissed')
+                 AND (decided_at>? OR (decided_at=? AND id>?))
+               LIMIT 1""",
+            (item_id, retry_at, retry_at, retry_dl),
+        ).fetchone()
+    else:
+        terminal = db.execute(
+            """SELECT 1 FROM decision_log
+               WHERE item_id=?
+                 AND (code GLOB 'published.*' OR code GLOB 'skipped.*' OR code GLOB 'held.*'
+                      OR code GLOB 'failed.*' OR code='operator.dismissed')
+                 AND decided_at>?
+               LIMIT 1""",
+            (item_id, retry_at),
+        ).fetchone()
+    return terminal is None
 
 
 def _security_disclosure(item: dict) -> bool:
@@ -1466,8 +1576,7 @@ def _not_recent(config, store, row, item, observed, *, existing=candidate_mod._U
         if (developed >= after(-NEW_STORY_DAYS * 86400, r["last_seen"])
                 or _security_disclosure(it)
                 or story is not None
-                or store.db.execute("SELECT 1 FROM rejection_actions WHERE item_id=? AND content_hash=? AND action='retry'",
-                                    (r["id"], r["content_hash"])).fetchone()):
+                or _has_operator_retry(store.db, r)):
             return None
         return developed
 
@@ -1498,7 +1607,120 @@ def _not_recent(config, store, row, item, observed, *, existing=candidate_mod._U
         return "stale"
 
 
-def process_item(config, store, row, writer, reviewer, observed=None, *, allow_network=True):
+class _WorkerRequestObserver(RequestObserver):
+    """Thread-safe in-memory request observer backed by a pre-reserved pool."""
+
+    def __init__(self, lock: threading.Lock, shared_used: list[int], max_pool: int):
+        self._lock = lock
+        self._shared_used = shared_used
+        self._max_pool = max_pool
+        self.used = 0
+        self._can_refund = False
+
+    def __call__(self, delta: int) -> None:
+        with self._lock:
+            if delta == 1:
+                if self._shared_used[0] >= self._max_pool:
+                    raise review.ReviewLimitReached("Review request budget exhausted")
+                self._shared_used[0] += 1
+                self.used += 1
+                self._can_refund = True
+            elif delta == -1 and self._can_refund:
+                self._shared_used[0] -= 1
+                self.used -= 1
+                self._can_refund = False
+            else:
+                raise ValueError("Invalid review request accounting")
+
+
+def _parallel_initial_review(reviewer_factory, candidate, prepared, record, requests, *, on_verify, save_verify):
+    """Run initial review and speculative verification concurrently without SQLite calls in worker threads."""
+    base_reserved = requests.state["reserved"]
+    requests.callback()(1)
+    requests.callback()(1)
+    lock = threading.Lock()
+    shared_used = [0]
+    max_pool = MAX_REVIEW_REQUESTS - base_reserved
+    obs_rev = _WorkerRequestObserver(lock, shared_used, max_pool)
+    obs_ver = _WorkerRequestObserver(lock, shared_used, max_pool)
+    is_update = prepared.get("mode") == "update"
+    cand_hash = digest(candidate)
+    ctx = _context(prepared, record["policy_hash"])
+
+    def _call(is_verify: bool, obs: _WorkerRequestObserver):
+        try:
+            rev = reviewer_factory()
+            kwargs = {
+                "coverage": copy.deepcopy(prepared["coverage"]),
+                "verification": is_verify,
+                "on_request": obs,
+                **({"update": True} if is_update else {}),
+            }
+            if hasattr(rev, "__enter__") and hasattr(rev, "__exit__"):
+                with rev:
+                    return rev.review(copy.deepcopy(candidate), copy.deepcopy(prepared["packet"]), **kwargs), None
+            try:
+                return rev.review(copy.deepcopy(candidate), copy.deepcopy(prepared["packet"]), **kwargs), None
+            finally:
+                if hasattr(rev, "close"):
+                    rev.close()
+        except Exception as exc:
+            return None, exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_rev = pool.submit(_call, False, obs_rev)
+        fut_ver = pool.submit(_call, True, obs_ver)
+        rev_res, rev_exc = fut_rev.result()
+        ver_res, ver_exc = fut_ver.result()
+
+    r_used, v_used = obs_rev.used, obs_ver.used
+    requests.actual += r_used + v_used - 2
+    if rev_exc is not None:
+        if isinstance(rev_exc, review.InconsistentReview) and r_used > 0:
+            requests.state["reserved"] = base_reserved + v_used + r_used
+            step = _handle_inconsistent_review(
+                "review", candidate, prepared, record, requests, rev_exc,
+                _seen_candidates(record, candidate, prepared), None, False,
+            )
+            return ("review", candidate) if step[0] == "reask" else step
+        requests.state["reserved"] = base_reserved + r_used + v_used
+        requests.persist()
+        raise rev_exc
+
+    requests.state["reserved"] = base_reserved + r_used + v_used
+    rev_entry = {"stage": "review", "candidate_hash": cand_hash,
+                 "request": base_reserved + r_used, "result": rev_res, **ctx}
+    record["reviews"].append(rev_entry)
+    seen = _seen_candidates(record, candidate, prepared)
+    action, value = next_step(record["reviews"], candidate, prepared)
+    if action in {"verify", "repair"} and digest(value) != cand_hash and digest(value) in seen:
+        action, value = "hold", ("review", "repeated_repair")
+
+    if not (action == "verify" and digest(value) == cand_hash):
+        return action, value
+
+    on_verify()
+    if ver_exc is not None:
+        if isinstance(ver_exc, review.InconsistentReview) and v_used > 0:
+            step = _handle_inconsistent_review(
+                "verify", candidate, prepared, record, requests, ver_exc,
+                _seen_candidates(record, candidate, prepared), None, False,
+            )
+            return ("verify", candidate) if step[0] == "reask" else step
+        save_verify()
+        raise ver_exc
+
+    ver_entry = {"stage": "verification", "candidate_hash": cand_hash,
+                 "request": base_reserved + r_used + v_used, "result": ver_res, **ctx}
+    record["reviews"].append(ver_entry)
+    action, value = next_step(record["reviews"], candidate, prepared)
+    if action in {"verify", "repair"} and digest(value) != cand_hash and digest(value) in _seen_candidates(record, candidate, prepared):
+        return "hold", ("verification", "repeated_repair")
+    return action, value
+
+
+def process_item(config, store, row, writer, reviewer, observed=None, *, allow_network=True,
+                 parallel_verify=False, reviewer_factory=None):
     """Resume writer → exact-candidate review → fresh verification of each approved or repaired text → commit.
 
     Transport errors leave the current stage durable and raise a retryable
@@ -1573,9 +1795,19 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         receipt = None
         if fresh:
             record.update(candidate=candidate, approval_key=key)
-            if record["reviews"][-1]["result"]["verdict"] == decision:
+            receipt_result = (
+                record["reviews"][-1]["result"]
+                if record["reviews"][-1]["result"]["verdict"] == decision
+                else next(
+                    (entry["result"] for entry in reversed(record["reviews"]) if entry["result"]["verdict"] == decision),
+                    None,
+                )
+                if decision == "skip"
+                else None
+            )
+            if receipt_result is not None:
                 receipt = (key, digest(candidate), prepared["source_hash"], policy, prepared["binding_hash"],
-                           strict_json(record["reviews"][-1]["result"]), strict_json(record), observed, observed)
+                           strict_json(receipt_result), strict_json(record), observed, observed)
         _save_job(record["outcome"], approval_key=key, approval_receipt=receipt)
         committed = store.commit_candidate(prepared, candidate, writer_key, now_iso(), approval_key=key,
                                            policy_hash=policy, review_record=record, decision=decision)
@@ -1681,11 +1913,34 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         if stage in {"approved", "skipped"}:  # without a usable receipt, review the writer's draft again
             stage, candidate, record = "review", prepared["candidate"], fresh
         requests = ReviewRequests(record, lambda: _save_job(stage))
+
+        def _enter_verify() -> None:
+            nonlocal stage
+            stage = "verify"
+            record["candidate"] = candidate
+
+        use_parallel = (
+            parallel_verify
+            and stage == "review"
+            and not record["reviews"]
+            and allow_network
+            and reviewer_factory is not None
+            and requests.state["reserved"] + 2 <= MAX_REVIEW_REQUESTS
+            and not proposal_needs_check(record)
+        )
         while True:
             if not allow_network:
                 return {**report, "status": "deferred"}
             try:
-                action, value = advance_review(reviewer, stage, candidate, prepared, record, requests)
+                if use_parallel:
+                    use_parallel = False
+                    action, value = _parallel_initial_review(
+                        reviewer_factory, candidate, prepared, record, requests,
+                        on_verify=_enter_verify,
+                        save_verify=lambda: _save_job("verify"),
+                    )
+                else:
+                    action, value = advance_review(reviewer, stage, candidate, prepared, record, requests)
             except review.ReviewLimitReached as exc:
                 with store.db:
                     store.require_pending_item(row, "Source item changed before review limit rejection")

@@ -2,18 +2,20 @@
 
 import json
 import sqlite3
+import threading
 
 import pytest
 
 from helpers import (
     DAMAGE, DATE, LATER, ApprovingReviewer, FakeLLM, Reviewer, Writer, add_coverage, analysis, damage_item,
-    damaged, decision_codes as codes, downgrade_job_v1, editorial_act, insert_approval, item, item_row, job,
-    job_record, make_config, make_note, mapped_item, patch_cli_pipeline, pending, queued_row, raise_once,
-    run_gate as run, saved_audit as audit, seed_legacy, seed_story, tag, update_analysis, verdict,
+    damaged, decision_codes as codes, downgrade_job_v1, editorial_act, inconsistent, insert_approval, item, item_row,
+    job, job_record, make_config, make_note, mapped_item, patch_cli_pipeline, pending, queued_row, raise_once,
+    run_gate as run, saved_audit as audit, seed_legacy, seed_story, tag, update_analysis, verdict, wire_reviewer,
 )
 from onionflash import candidate, cli, editorial, rejection, review, review_gate
 from onionflash.analyze import AnalysisError, Analyzer, cache_key, tag_notice
 from onionflash.comments import _compose
+from onionflash.llm import CompletionDeferred
 from onionflash.store import ReviewRequired, Store
 from onionflash.transport import FetchError
 from onionflash.util import digest, item_cluster
@@ -87,20 +89,23 @@ def test_verification_repairs_are_verified_fresh(context):
     assert audit(store)["outcome"] == "approved"
 
 
-def test_verification_repairs_stop_after_seven_requests(context):
-    """Raise `ReviewLimitReached` once iterative verification repairs exhaust 7 requests."""
+def test_verification_repairs_stop_after_max_requests(context):
+    """Raise `ReviewLimitReached` once iterative verification repairs exhaust `MAX_REVIEW_REQUESTS`."""
     cfg, store = context
     row = pending(store)
     repairs = [verdict("revise", repair={"summary": f"Repair number {n}."}) for n in range(7)]
     with pytest.raises(AnalysisError):
         run(cfg, store, row, Writer(), Reviewer(*repairs[:4], AnalysisError("timeout", retryable=True)))
     assert job(store)["stage"] == "verify"
+    with pytest.raises(AnalysisError):
+        run(cfg, store, row, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
+    assert job(store)["stage"] == "verify"
     writer, checker = Writer(), Reviewer(*repairs[4:])
     with pytest.raises(review.ReviewLimitReached):
         run(cfg, store, row, writer, checker)
     assert writer.calls == [] and [c[2] for c in checker.calls] == [True, True]
     assert codes(store, row) == ["failed.review.request_limit"] and store.stories() == []
-    assert job_record(store)["request_budget"]["reserved"] == 7
+    assert job_record(store)["request_budget"]["reserved"] == review_gate.MAX_REVIEW_REQUESTS
     shown = rejection.show_item(store, row["id"])["final_review"]
     assert shown["candidate"]["summary"] == "Repair number 5."
     assert shown["base_candidate"]["summary"] == analysis()["summary"]
@@ -130,7 +135,7 @@ def test_verification_refusal_that_cannot_be_repaired_holds(context, case):
 
 
 @pytest.mark.parametrize("replies,status", [
-    ([verdict(), verdict("skip", criterion="news_value")], "held"),
+    ([verdict(), verdict("hold", criterion="news_value")], "held"),
     ([verdict(), verdict("skip", criterion="new_information")], "held"),
     ([verdict("revise", criteria=("news_value", "operational_advice"), repair={"summary": "A shorter summary."}), verdict()], "held"),
     ([verdict(), verdict("revise", criteria=("news_value", "operational_advice"), repair={"summary": "A shorter summary."})], "held"),
@@ -646,7 +651,7 @@ def test_editorial_coverage_skips_followups_and_bounds(context, monkeypatch):
     with pytest.raises(ReviewRequired, match="authorize this decision"):
         store.commit_candidate(prep_w, prep_w["candidate"], "wrong", LATER, decision="skip", **rec_w)
 
-    for n in range(40):
+    for n in range(48):
         add_coverage(store, f"bg-{n:02d}", summary="Background detail. " * 80,
                      added_at="2026-11-15T00:00:00Z", updated_at="2026-11-15T00:00:00Z")
         if n >= 8:
@@ -1015,7 +1020,7 @@ def test_trusted_operator_vs_community_list_incidents_in_gate(context):
 
     prop_disputed, prop_disputed_draft = _proposal(376, "Circuit flood defense parameters", "adjusts rate-limiting parameters to mitigate")
     assert run(cfg, store, prop_disputed, Writer(prop_disputed_draft),
-               Reviewer(verdict(), verdict("skip", criterion="news_value")))["status"] == "held"
+               Reviewer(verdict(), verdict("hold", criterion="news_value")))["status"] == "held"
     assert codes(store, prop_disputed) == ["held.verification.disagreed_news"]
     elig = review_gate.approval(cfg, store, prop_disputed["id"])
     assert elig["eligible"] is True
@@ -1745,3 +1750,364 @@ def test_source_packet_matches_gitlab_project_case_while_keeping_blob_paths_case
     hist_unit = next(s for s in pkt_hist["sources"] if s["url"] == stored_issue_url)
     assert hist_unit["snapshot"] == "historical-analysis"
     assert any("Historical issue snapshot text" in p["text"] for p in hist_unit["passages"])
+
+
+@pytest.mark.parametrize("replies", [
+    [verdict(), verdict("skip", criterion="news_value"), verdict("skip", criterion="news_value")],
+    [verdict(), verdict("skip", criterion="news_value"), verdict("hold", criterion="news_value")],
+    [verdict(), verdict("skip", criterion="news_value"),
+     verdict("revise", criterion="news_value", repair={"summary": "Concise operational details."})],
+])
+def test_tiebreak_three_vote_skip_outcomes(context, replies):
+    """Skip non-official items after a 2-1 news-value vote regardless of tiebreak hold or revise action."""
+    cfg, store = context
+    row = pending(store)
+    checker = Reviewer(*replies)
+    result = run(cfg, store, row, Writer(), checker)
+    assert result["status"] == "ignored" and result["review_calls"] == 3
+    assert [c[2] for c in checker.calls] == [False, True, True]
+    assert codes(store, row) == ["skipped.verification.news_value"] and store.stories() == []
+    assert store.db.execute("SELECT last_error FROM items WHERE id=?", (row["id"],)).fetchone()[0] == "Final review skipped: news_value"
+    rec = audit(store)
+    assert rec["outcome"] == "skipped" and rec["approval_key"]
+    assert len(rec["reviews"]) == 3
+    assert "tiebreaker" not in rec["reviews"][0] and "tiebreaker" not in rec["reviews"][1]
+    assert rec["reviews"][2]["tiebreaker"] is True
+
+
+@pytest.mark.parametrize("official,replies,expected_calls", [
+    (False, [verdict(), verdict("skip", criterion="news_value"), verdict()], 3),
+    (True, [verdict("skip", criterion="news_value"), verdict(), verdict()], 3),
+    (False, [verdict(), verdict("skip", criterion="news_value"),
+             verdict("revise", criterion="operational_advice", repair={"summary": "Repaired after tiebreak."}),
+             verdict()], 4),
+    (True, [verdict("skip", criterion="news_value"), verdict(),
+            verdict("revise", criterion="operational_advice", repair={"summary": "Official repaired after tiebreak."}),
+            verdict()], 4),
+])
+def test_tiebreak_three_vote_approve_and_repair_paths(context, official, replies, expected_calls):
+    """Approve or repair-and-verify cleanly when 2 of 3 news-value votes find an item newsworthy."""
+    cfg, store = context
+    row = pending(store, item(id="https://example.org/tie-approve", url="https://example.org/tie-approve",
+                              **({"authority": "official"} if official else {})))
+    checker = Reviewer(*replies)
+    result = run(cfg, store, row, Writer(), checker)
+    assert result["status"] == "published" and result["review_calls"] == expected_calls
+    assert [c[2] for c in checker.calls] == [False] + [True] * (expected_calls - 1)
+    assert codes(store, row) == ["published.new"] and len(store.stories()) == 1
+    rec = audit(store)
+    assert len(rec["reviews"]) == expected_calls and rec["reviews"][2]["tiebreaker"] is True
+    if expected_calls == 4:
+        assert "tiebreaker" not in rec["reviews"][3]
+        assert store.stories()[0]["summary"] == replies[2]["repair"]["summary"]
+
+
+def test_tiebreak_official_not_news_hold_preservation(context):
+    """Preserve `official_not_news` holds and operator approval eligibility on 2-1 not-newsworthy official votes."""
+    cfg, store = context
+    for idx, replies in enumerate([
+        [verdict(), verdict("skip", criterion="news_value"), verdict("skip", criterion="news_value")],
+        [verdict("skip", criterion="news_value"), verdict(), verdict("skip", criterion="news_value")],
+    ]):
+        row = pending(store, item(id=f"https://example.org/official-tie-{idx}",
+                                  url=f"https://example.org/official-tie-{idx}", authority="official"))
+        checker = Reviewer(*replies)
+        result = run(cfg, store, row, Writer(), checker)
+        assert result["status"] == "held" and result["review_calls"] == 3
+        assert codes(store, row) == ["held.verification.official_not_news"]
+        rec = audit(store, row["id"])
+        assert rec["hold_code"] == "official_not_news" and rec["reviews"][2]["tiebreaker"] is True
+        assert rec["verified_facts"] is True
+        app = review_gate.approval(cfg, store, row["id"])
+        assert app["eligible"] is True and app["hash"]
+        approved = rejection.approve_item(cfg, store, row["id"], app["hash"],
+                                          "Editorial override after tiebreak", observed=LATER)
+        assert approved["story_id"] and codes(store, row) == ["held.verification.official_not_news", "operator.approved"]
+    assert len(store.stories()) == 2
+
+
+def test_tiebreak_factual_fail_and_new_information_hold(context):
+    """Hold cleanly when a tiebreaker fails factual criteria or `new_information`."""
+    cfg, store = context
+    cases = [
+        ([verdict(), verdict("skip", criterion="news_value"), verdict("hold", criterion="source_support")],
+         "held.verification.model_hold", False, False, 3),
+        ([verdict(), verdict("skip", criterion="news_value"),
+          verdict("revise", criterion="source_support", repair={"summary": "Operational details edited for facts."}),
+          verdict("hold", criterion="source_support")],
+         "held.verification.model_hold", False, False, 4),
+        ([verdict(), verdict("skip", criterion="news_value"), verdict("skip", criterion="new_information")],
+         "held.verification.disagreed_news", False, True, 3),
+    ]
+    for idx, (replies, expected_code, can_approve, expected_facts, expected_calls) in enumerate(cases):
+        row = pending(store, item(id=f"https://example.org/tie-fail-{idx}", url=f"https://example.org/tie-fail-{idx}"))
+        checker = Reviewer(*replies)
+        result = run(cfg, store, row, Writer(), checker)
+        assert result["status"] == "held" and result["review_calls"] == expected_calls
+        assert codes(store, row) == [expected_code]
+        assert audit(store, row["id"])["verified_facts"] is expected_facts
+        app = review_gate.approval(cfg, store, row["id"])
+        assert app["eligible"] is can_approve
+        if not can_approve:
+            with pytest.raises(ValueError, match="source_support|new_information"):
+                rejection.approve_item(cfg, store, row["id"], "0" * 64,
+                                       "Cannot bypass failed verification", observed=LATER)
+
+
+def test_tiebreak_interrupted_recovery_and_damaged_tiebreaker(context):
+    """Resume interrupted `tiebreak` jobs safely and fail closed on tampered `tiebreaker` state."""
+    cfg, store = context
+    row = pending(store)
+    with pytest.raises(AnalysisError):
+        run(cfg, store, row, Writer(), Reviewer(verdict(), verdict("skip", criterion="news_value"),
+                                                AnalysisError("timeout", retryable=True)))
+    assert job(store)["stage"] == "tiebreak"
+    assert job_record(store)["request_budget"]["reserved"] == 3
+    assert len(job_record(store)["reviews"]) == 2
+    assert run(cfg, store, row, Writer(), ApprovingReviewer(), allow_network=False)["status"] == "deferred"
+    resumed = Reviewer(verdict())
+    result = run(cfg, store, row, Writer(), resumed)
+    assert result["status"] == "published" and result["review_calls"] == 1
+    assert [c[2] for c in resumed.calls] == [True]
+    assert audit(store)["reviews"][2]["tiebreaker"] is True and len(store.stories()) == 1
+
+    bad_row = pending(store, item(id="https://example.org/tie-bad", url="https://example.org/tie-bad"))
+    with pytest.raises(AnalysisError):
+        run(cfg, store, bad_row, Writer(), Reviewer(verdict(), verdict("skip", criterion="news_value"),
+                                                    AnalysisError("timeout", retryable=True)))
+    rec = job_record(store, bad_row["id"])
+    rec["reviews"][1]["tiebreaker"] = True
+    with store.db:
+        store.db.execute("UPDATE review_jobs SET record_json=? WHERE item_id=?", (json.dumps(rec), bad_row["id"]))
+    with pytest.raises(AnalysisError) as exc:
+        run(cfg, store, bad_row, Writer(), ApprovingReviewer())
+    assert exc.value.code == "app.damaged_job"
+
+
+def test_tiebreak_validation_reask_and_untrusted_proposal(llm_context):
+    """Handle validation re-ask and untrusted proposal verification cleanly during `tiebreak`."""
+    cfg, store = llm_context
+    row = pending(store)
+    reask_checker = wire_reviewer(cfg, verdict(), verdict("skip", criterion="news_value"),
+                                  inconsistent({"summary": analysis()["summary"]}), verdict())
+    result = run(cfg, store, row, Writer(), reask_checker)
+    assert result["status"] == "published" and reask_checker.calls == 4 and len(store.stories()) == 1
+    rec = audit(store)
+    assert len(rec["reviews"]) == 3 and rec["reviews"][2]["tiebreaker"] is True and rec["reviews"][2]["reask_response"]
+
+    row_prop = pending(store, item(id="https://example.org/tie-prop", url="https://example.org/tie-prop"))
+    prop_checker = wire_reviewer(cfg, verdict(), verdict("skip", criterion="news_value"),
+                                 inconsistent(), verdict("skip", criterion="news_value"))
+    res_prop = run(cfg, store, row_prop, Writer(), prop_checker)
+    assert res_prop["status"] == "ignored" and prop_checker.calls == 4
+    assert codes(store, row_prop) == ["skipped.verification.news_value"]
+
+
+def test_parallel_verify_speculative_hit_and_tiebreak(context):
+    """Run initial review and speculative verification concurrently on two threads and continue cleanly to tiebreak."""
+    cfg, store = context
+    row = pending(store)
+    barrier = threading.Barrier(2, timeout=5)
+    replies = {False: verdict(), True: verdict()}
+
+    def _factory():
+        """Create an isolated reviewer waiting on the parallel barrier on the first two calls."""
+        class _ParallelReviewer:
+            """Thread-safe scripted reviewer proving simultaneous initial and verify execution."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       prior_reviews=(), on_request=None, **kwargs):
+                """Return scripted response after charging request budget and joining parallel barrier."""
+                if on_request:
+                    on_request(1)
+                barrier.wait()
+                return replies[verification]
+
+        return _ParallelReviewer()
+
+    result = review_gate.process_item(cfg, store, row, Writer(), ApprovingReviewer(),
+                                      parallel_verify=True, reviewer_factory=_factory)
+    assert result["status"] == "published" and len(store.stories()) == 1
+    assert audit(store, row["id"])["request_budget"]["reserved"] == 2
+
+    row2 = pending(store, item(id="https://example.org/pv-tie", url="https://example.org/pv-tie"))
+    barrier2 = threading.Barrier(2, timeout=5)
+    call_count = {"n": 0}
+    lock = threading.Lock()
+    tie_replies = {False: verdict(), True: verdict("skip", criterion="news_value")}
+
+    def _tie_factory():
+        """Create a reviewer running first two calls across a barrier then a sequential tiebreak."""
+        class _TieParallelReviewer:
+            """Scripted reviewer covering parallel speculative hit followed by sequential tiebreaker."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       prior_reviews=(), on_request=None, **kwargs):
+                """Synchronize first two calls via barrier, then serve tiebreak verdict sequentially."""
+                if on_request:
+                    on_request(1)
+                with lock:
+                    call_count["n"] += 1
+                    n = call_count["n"]
+                if n <= 2:
+                    barrier2.wait()
+                    return tie_replies[verification]
+                return verdict()
+
+        return _TieParallelReviewer()
+
+    result2 = review_gate.process_item(cfg, store, row2, Writer(), _tie_factory(),
+                                       parallel_verify=True, reviewer_factory=_tie_factory)
+    assert result2["status"] == "published" and len(store.stories()) == 2
+    rec2 = audit(store, row2["id"])
+    assert rec2["reviews"][2]["tiebreaker"] is True and rec2["request_budget"]["reserved"] == 3
+
+
+def test_parallel_verify_revise_and_skip_discard_paths(context):
+    """Discard stale or failing speculative verification when the initial review revises or skips."""
+    cfg, store = context
+    row_revise = pending(store)
+    seq_calls = []
+    repaired_text = "Updated mitigation details after initial review."
+
+    def _revise_factory():
+        """Return revise on initial review and a fatal hold on pre-repair speculative verify."""
+        class _ReviseReviewer:
+            """Reviewer checking candidate text on sequential verify after stale speculative verify."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       prior_reviews=(), on_request=None, **kwargs):
+                """Discard speculative hold when review proposes a repair, then approve repaired text."""
+                if on_request:
+                    on_request(1)
+                if not verification:
+                    return {**verdict("revise"), "repair": {"summary": repaired_text}}
+                if cand["summary"] != repaired_text:
+                    return verdict("hold", criterion="source_support")
+                seq_calls.append(cand["summary"])
+                return verdict()
+
+        return _ReviseReviewer()
+
+    res_rev = review_gate.process_item(cfg, store, row_revise, Writer(), _revise_factory(),
+                                       parallel_verify=True, reviewer_factory=_revise_factory)
+    assert res_rev["status"] == "published" and seq_calls == [repaired_text]
+    assert audit(store, row_revise["id"])["request_budget"]["reserved"] == 3
+
+    row_skip = pending(store, item(id="https://example.org/pv-skip", url="https://example.org/pv-skip"))
+
+    def _skip_factory():
+        """Return skip on initial review and raise FetchError on speculative verify."""
+        class _SkipErrorReviewer:
+            """Reviewer whose speculative verify error must be isolated when initial review skips."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       prior_reviews=(), on_request=None, **kwargs):
+                """Raise transport failure on verification thread while initial review skips cleanly."""
+                if on_request:
+                    on_request(1)
+                if verification:
+                    raise FetchError("speculative verify error", status=500)
+                return verdict("skip", criterion="news_value")
+
+        return _SkipErrorReviewer()
+
+    res_skip = review_gate.process_item(cfg, store, row_skip, Writer(), ApprovingReviewer(),
+                                        parallel_verify=True, reviewer_factory=_skip_factory)
+    assert res_skip["status"] == "ignored" and codes(store, row_skip) == ["skipped.review.news_value"]
+    assert audit(store, row_skip["id"])["request_budget"]["reserved"] == 2
+
+
+def test_parallel_verify_partial_failures_and_budget_guard(context):
+    """Persist stage state accurately on partial parallel failures and enforce slot budgets."""
+    cfg, store = context
+    row1 = pending(store)
+
+    def _verify_fails_factory():
+        """Approve initial review while failing speculative verification with a retryable error."""
+        class _VerifyFailsReviewer:
+            """Reviewer failing only the verification call."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       prior_reviews=(), on_request=None, **kwargs):
+                """Charge slot and fail only when `verification=True`."""
+                if on_request:
+                    on_request(1)
+                if verification:
+                    raise AnalysisError("verify timeout", retryable=True)
+                return verdict()
+
+        return _VerifyFailsReviewer()
+
+    with pytest.raises(AnalysisError):
+        review_gate.process_item(cfg, store, row1, Writer(), ApprovingReviewer(),
+                                 parallel_verify=True, reviewer_factory=_verify_fails_factory)
+    assert job(store, row1["id"])["stage"] == "verify"
+    assert len(job_record(store, row1["id"])["reviews"]) == 1
+    assert job_record(store, row1["id"])["request_budget"]["reserved"] == 2
+    assert run(cfg, store, row1, Writer(), ApprovingReviewer())["status"] == "published"
+    assert audit(store, row1["id"])["request_budget"]["reserved"] == 3
+
+    row2 = pending(store, item(id="https://example.org/pv-revfail", url="https://example.org/pv-revfail"))
+
+    def _review_fails_factory():
+        """Fail initial review while speculative verification would succeed."""
+        class _ReviewFailsReviewer:
+            """Reviewer failing initial review so speculative verification cannot advance stage."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       prior_reviews=(), on_request=None, **kwargs):
+                """Charge slot and raise retryable AnalysisError when `verification=False`."""
+                if on_request:
+                    on_request(1)
+                if not verification:
+                    raise AnalysisError("review timeout", retryable=True)
+                return verdict()
+
+        return _ReviewFailsReviewer()
+
+    with pytest.raises(AnalysisError):
+        review_gate.process_item(cfg, store, row2, Writer(), ApprovingReviewer(),
+                                 parallel_verify=True, reviewer_factory=_review_fails_factory)
+    assert job(store, row2["id"])["stage"] == "review" and job_record(store, row2["id"])["reviews"] == []
+    assert job_record(store, row2["id"])["request_budget"]["reserved"] == 2
+    assert run(cfg, store, row2, Writer(), ApprovingReviewer())["status"] == "published"
+    assert audit(store, row2["id"])["request_budget"]["reserved"] == 4
+
+    row3 = pending(store, item(id="https://example.org/pv-guard", url="https://example.org/pv-guard"))
+    for _ in range(review_gate.MAX_REVIEW_REQUESTS - 1):
+        with pytest.raises(AnalysisError):
+            run(cfg, store, row3, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
+    factory_called = []
+
+    def _guard_factory():
+        """Record if parallel factory is invoked when fewer than two slots remain."""
+        factory_called.append(True)
+        return ApprovingReviewer()
+
+    with pytest.raises(review.ReviewLimitReached):
+        review_gate.process_item(cfg, store, row3, Writer(), ApprovingReviewer(),
+                                 parallel_verify=True, reviewer_factory=_guard_factory)
+    assert factory_called == [] and job_record(store, row3["id"])["request_budget"]["reserved"] == review_gate.MAX_REVIEW_REQUESTS
+
+    row4 = pending(store, item(id="https://example.org/pv-defer", url="https://example.org/pv-defer"))
+
+    def _defer_factory():
+        """Reserve then refund pre-dispatch slot on CompletionDeferred."""
+        class _DeferReviewer:
+            """Reviewer simulating unsent CompletionDeferred refunds."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       prior_reviews=(), on_request=None, **kwargs):
+                """Charge and immediately refund request slot before raising CompletionDeferred."""
+                if on_request:
+                    on_request(1)
+                    on_request(-1)
+                raise CompletionDeferred("budget exhausted")
+
+        return _DeferReviewer()
+
+    res_defer = review_gate.process_item(cfg, store, row4, Writer(), ApprovingReviewer(),
+                                         parallel_verify=True, reviewer_factory=_defer_factory)
+    assert res_defer["status"] == "deferred"
+    assert job_record(store, row4["id"])["request_budget"]["reserved"] == 0

@@ -304,7 +304,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
                                         "cluster_key": item_cluster(identity_item),
                                         "payload": json.dumps(row_item)}}
                     stage, text = "review", candidate
-                    while (step := advance_review(reviewer, stage, text, prepared, record, requests))[0] in {"verify", "repair"}:
+                    while (step := advance_review(reviewer, stage, text, prepared, record, requests))[0] in {"verify", "repair", "tiebreak"}:
                         stage, text = step
                     action, value = step
                     first = record["reviews"][0]["result"]

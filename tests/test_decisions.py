@@ -744,3 +744,27 @@ def test_compacted_issue_rehydration_from_older_poll_preserves_newer_metadata(tm
         assert restored["comments_checked_at"] == newer_ts
         assert restored["comments_source_key"] == saved_full["comments_source_key"]
         assert restored["comments_truncated"] is False
+
+
+def test_tiebreak_decision_log_chain_records_publish_skip_and_official_hold(context):
+    """Record exact decision_log codes for 2-1 publish, 2-1 skip, and 2-1 official_not_news hold."""
+    from helpers import Reviewer, Writer, decision_codes, item, pending, run_gate, verdict
+
+    cfg, store = context
+    r_pub = pending(store, item(id="https://example.org/dl-pub", url="https://example.org/dl-pub"))
+    assert run_gate(cfg, store, r_pub, Writer(),
+                    Reviewer(verdict(), verdict("skip", criterion="news_value"), verdict()))["status"] == "published"
+    assert decision_codes(store, r_pub) == ["published.new"]
+
+    r_skip = pending(store, item(id="https://example.org/dl-skip", url="https://example.org/dl-skip"))
+    assert run_gate(cfg, store, r_skip, Writer(),
+                    Reviewer(verdict(), verdict("skip", criterion="news_value"),
+                             verdict("skip", criterion="news_value")))["status"] == "ignored"
+    assert decision_codes(store, r_skip) == ["skipped.verification.news_value"]
+
+    r_hold = pending(store, item(id="https://example.org/dl-hold", url="https://example.org/dl-hold",
+                                 authority="official"))
+    assert run_gate(cfg, store, r_hold, Writer(),
+                    Reviewer(verdict(), verdict("skip", criterion="news_value"),
+                             verdict("skip", criterion="news_value")))["status"] == "held"
+    assert decision_codes(store, r_hold) == ["held.verification.official_not_news"]

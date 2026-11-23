@@ -165,15 +165,19 @@ def test_corrective_skip_respects_only_genuine_prior_trusted_disagreement(llm_co
     cfg, store = llm_context
     row = pending(store)
     replies = ([verdict()] if with_trusted_initial else []) + [_unusable(), verdict("skip", criterion="news_value")]
+    if with_trusted_initial:
+        replies.append(verdict("skip", criterion="new_information"))
     checker = wire_reviewer(cfg, *replies)
     result = run(cfg, store, row, Writer(), checker)
     assert result["status"] == ("held" if with_trusted_initial else "ignored")
-    assert checker.calls == (3 if with_trusted_initial else 2) and store.stories() == []
+    assert checker.calls == (4 if with_trusted_initial else 2) and store.stories() == []
     audit = saved_audit(store)
-    assert len(audit["reviews"]) == (2 if with_trusted_initial else 1)
-    assert audit["reviews"][-1]["result"]["verdict"] == "skip" and audit["reviews"][-1]["reask_response"]
+    assert len(audit["reviews"]) == (3 if with_trusted_initial else 1)
+    idx = 1 if with_trusted_initial else 0
+    assert audit["reviews"][idx]["result"]["verdict"] == "skip" and audit["reviews"][idx]["reask_response"]
     if with_trusted_initial:
-        assert audit["hold_code"] == "disagreed_news" and audit["reviews"][-1]["stage"] == "verification"
+        assert audit["hold_code"] == "disagreed_news" and audit["reviews"][idx]["stage"] == "verification"
+        assert audit["reviews"][2]["tiebreaker"] is True
     else:
         assert not review_gate.recovery_status(audit)["unresolved_inconsistency"]
 
@@ -363,30 +367,32 @@ def test_route_carries_consumed_slot_and_operator_reset_starts_a_new_ledger(llm_
     assert fresh.calls == 3 and _correction(saved_audit(store))["trigger"] == 1
 
 
-def test_correction_transport_attempts_stop_at_seven(llm_context):
-    """Enforce the 7-request ceiling across repeated validation re-ask fallback failures."""
+def test_correction_transport_attempts_stop_at_max_requests(llm_context):
+    """Enforce the `MAX_REVIEW_REQUESTS` ceiling across repeated validation re-ask fallback failures."""
     cfg, store = llm_context
-    cfg["llm"]["fallback_base_urls"] = [f"https://fallback{n}.example/v1" for n in range(7)]
+    cap = review_gate.MAX_REVIEW_REQUESTS
+    cfg["llm"]["fallback_base_urls"] = [f"https://fallback{n}.example/v1" for n in range(cap)]
     row = pending(store)
-    checker = wire_reviewer(cfg, _unusable(), *(FetchError("temporary", status=500) for _ in range(6)))
+    checker = wire_reviewer(cfg, _unusable(), *(FetchError("temporary", status=500) for _ in range(cap - 1)))
     with pytest.raises(review.ReviewLimitReached):
         run(cfg, store, row, Writer(), checker)
-    assert checker.calls == len(checker.client.requests) == 7
-    assert job_record(store)["request_budget"]["reserved"] == 7
-    assert _correction(job_record(store))["attempts"] == [2, 3, 4, 5, 6, 7]
+    assert checker.calls == len(checker.client.requests) == cap
+    assert job_record(store)["request_budget"]["reserved"] == cap
+    assert _correction(job_record(store))["attempts"] == list(range(2, cap + 1))
     assert not store.stories()
 
 
 def test_last_slot_valid_correction_cannot_publish_without_verification(llm_context):
-    """Raise `ReviewLimitReached` when a 7th-slot corrective approval leaves no slot for verification."""
+    """Raise `ReviewLimitReached` when a last-slot corrective approval leaves no slot for verification."""
     cfg, store = llm_context
-    cfg["llm"]["fallback_base_urls"] = [f"https://fallback{n}.example/v1" for n in range(5)]
+    cap = review_gate.MAX_REVIEW_REQUESTS
+    cfg["llm"]["fallback_base_urls"] = [f"https://fallback{n}.example/v1" for n in range(cap - 2)]
     row = pending(store)
-    checker = wire_reviewer(cfg, *(FetchError("temporary", status=500) for _ in range(5)), _unusable(), verdict())
+    checker = wire_reviewer(cfg, *(FetchError("temporary", status=500) for _ in range(cap - 2)), _unusable(), verdict())
     with pytest.raises(review.ReviewLimitReached):
         run(cfg, store, row, Writer(), checker)
     audit = job_record(store)
-    assert checker.calls == 7 and _correction(audit)["response"] == 7
+    assert checker.calls == cap and _correction(audit)["response"] == cap
     assert len(audit["reviews"]) == 1 and audit["reviews"][0]["stage"] == "review"
     assert not store.stories()
 
@@ -554,13 +560,14 @@ def test_untrusted_merge_request_release_tag_is_not_applied_during_correction(ll
 def test_route_update_fallbacks_share_one_budget_and_operator_retry_starts_new_review(llm_context):
     """Carry fallback spend across `same_story` routing and reset only on `reset_review_work`."""
     cfg, store = llm_context
-    _, _, row, update = seed_routed_followup(cfg, store, fallbacks=4)
-    assert job(store)["stage"] == "routed" and job_record(store)["request_budget"]["reserved"] == 6
+    cap = review_gate.MAX_REVIEW_REQUESTS
+    _, _, row, update = seed_routed_followup(cfg, store, fallbacks=cap - 3)
+    assert job(store)["stage"] == "routed" and job_record(store)["request_budget"]["reserved"] == cap - 1
     checker = wire_reviewer(cfg, verdict(update=True), verdict(update=True))
     with pytest.raises(review.ReviewLimitReached):
         run(cfg, store, queued_row(store, row), Writer(update), checker)
     assert checker.calls == 1 and len(checker.client.requests) == 1
-    assert job_record(store)["request_budget"]["reserved"] == 7
+    assert job_record(store)["request_budget"]["reserved"] == cap
     assert len(store.stories()) == 1 and not store.stories()[0].get("updates")
     reset = _reset_queued_item(store, row)
     assert job_record(store)["request_budget"]["reserved"] == 0

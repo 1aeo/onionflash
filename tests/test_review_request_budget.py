@@ -43,7 +43,7 @@ _CACHE_PROOF_DAMAGE = {
 
 _BUDGET_DAMAGE = {
     "counter-bool": lambda a: a["request_budget"].update(reserved=True),
-    "counter-too-large": lambda a: a["request_budget"].update(reserved=8),
+    "counter-too-large": lambda a: a["request_budget"].update(reserved=review_gate.MAX_REVIEW_REQUESTS + 1),
     "missing-budget": lambda a: a.pop("request_budget"),
     "audit-shape": lambda a: a.update(untrusted_proposals={}),
     "after-hash": lambda a: a["untrusted_proposals"][0].update(candidate_after_hash="0" * 64),
@@ -198,13 +198,15 @@ def test_invalid_news_criteria_are_not_an_anchor_but_existing_trusted_disagreeme
     cfg, store = llm_context
     row = pending(store)
     replies = ([verdict()] if with_trusted_initial else []) + [inconsistent(), verdict("skip", criterion="news_value")]
+    if with_trusted_initial:
+        replies.append(verdict("skip", criterion="new_information"))
     checker = wire_reviewer(cfg, *replies)
     result = run(cfg, store, row, Writer(), checker)
     assert result["status"] == ("held" if with_trusted_initial else "ignored")
     audit = saved_audit(store)
-    assert len(audit["reviews"]) == (2 if with_trusted_initial else 1)
+    assert len(audit["reviews"]) == (3 if with_trusted_initial else 1)
     if with_trusted_initial:
-        assert audit["hold_code"] == "disagreed_news"
+        assert audit["hold_code"] == "disagreed_news" and audit["reviews"][2]["tiebreaker"] is True
     assert store.stories() == []
 
 
@@ -402,20 +404,21 @@ def test_saved_budget_or_proposal_corruption_fails_before_model_or_cache(llm_con
 
 @pytest.mark.parametrize("mode", ["proposals", "fallbacks"])
 def test_request_cap_counts_all_invalid_proposals_and_fallbacks(llm_context, mode):
-    """Count every invalid untrusted proposal and HTTP fallback attempt against the 7-request cap."""
+    """Count every invalid untrusted proposal and HTTP fallback attempt against the `MAX_REVIEW_REQUESTS` cap."""
     cfg, store = llm_context
     row = pending(store)
+    cap = review_gate.MAX_REVIEW_REQUESTS
     if mode == "proposals":
-        checker = wire_reviewer(cfg, *(inconsistent({"summary": f"Different unverified proposal {n}."}) for n in range(7)))
+        checker = wire_reviewer(cfg, *(inconsistent({"summary": f"Different unverified proposal {n}."}) for n in range(cap)))
     else:
-        cfg["llm"]["fallback_base_urls"] = [f"https://fallback{n}.example/v1" for n in range(9)]
-        checker = wire_reviewer(cfg, *(FetchError("unavailable", status=500) for _ in range(10)))
+        cfg["llm"]["fallback_base_urls"] = [f"https://fallback{n}.example/v1" for n in range(cap + 2)]
+        checker = wire_reviewer(cfg, *(FetchError("unavailable", status=500) for _ in range(cap + 3)))
     with pytest.raises(review.ReviewLimitReached):
         run(cfg, store, row, Writer(), checker)
-    assert checker.calls == len(checker.client.requests) == 7 and store.stories() == []
+    assert checker.calls == len(checker.client.requests) == cap and store.stories() == []
     if mode == "proposals":
-        assert len(job_record(store)["untrusted_proposals"]) == 7
-        assert job_record(store)["request_budget"]["reserved"] == 7 and job_record(store)["reviews"] == []
+        assert len(job_record(store)["untrusted_proposals"]) == cap
+        assert job_record(store)["request_budget"]["reserved"] == cap and job_record(store)["reviews"] == []
         assert review_gate.recovery_status(job_record(store))["unresolved_inconsistency"]
 
 
