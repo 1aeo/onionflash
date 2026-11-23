@@ -1308,8 +1308,27 @@ def test_editorial_polish_pass_thread_root_label_normalization_and_fallback(monk
 
     defer_writer = Analyzer(cfg, editorial_polish=True)
     defer_writer.client = FakeLLM(initial_draft, CompletionDeferred("deadline"))
-    with pytest.raises(CompletionDeferred):
-        defer_writer.analyze(src_item)
+    assert defer_writer.analyze(src_item) == initial_draft and len(defer_writer.client.requests) == 2
+
+    cfg_reasoning = copy.deepcopy(cfg)
+    cfg_reasoning["llm"].update(writer_reasoning=True, send_chat_template_kwargs=True)
+    clock_now = [0.0]
+    expired_writer = Analyzer(cfg_reasoning, deadline=10.0, editorial_polish=True)
+    expired_writer.clock = lambda: clock_now[0]
+
+    def _expiring_complete(prompt, payload, schema, schema_name, *, on_request=None):
+        clock_now[0] = 15.0
+        return initial_draft
+
+    monkeypatch.setattr(expired_writer, "complete", _expiring_complete)
+    assert expired_writer.analyze(src_item) == initial_draft
+
+    polish_profile_writer = Analyzer(cfg_reasoning, editorial_polish=True)
+    polish_profile_writer.client = FakeLLM(initial_draft, polished_reply)
+    assert polish_profile_writer.analyze(src_item)["title"] == polished_reply["title"]
+    assert polish_profile_writer.client.requests[0][1]["max_tokens"] == 32768
+    assert polish_profile_writer.client.requests[1][1]["max_tokens"] == 1200
+    assert polish_profile_writer.client.requests[1][1]["chat_template_kwargs"] == {"enable_thinking": False}
 
     # 4. Polish skipped on tag items and update mode (prior is not None), and default editorial_polish=False makes 1 call.
     default_writer = wire_analyzer(monkeypatch, initial_draft)

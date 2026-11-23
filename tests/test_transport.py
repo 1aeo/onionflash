@@ -689,13 +689,21 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
 
     def _handle(request):
         body = json.loads(request.content)
-        writer = body["max_tokens"] == 32768
+        schema_name = body["response_format"]["json_schema"]["name"]
+        stage_kind = {"onionflash_news": "writer", "onionflash_polish": "polish"}.get(schema_name, "review")
+        expected_max_tokens = {"writer": 32768, "polish": 1200, "review": review.OUTPUT_TOKENS}[stage_kind]
+        assert body["max_tokens"] == expected_max_tokens
         assert request.extensions["onionflash_deadline"] == clock[0] + 3610
         assert request.extensions["timeout"]["read"] == 3600
-        sent.append("writer" if writer else "review")
-        if (expire == "writer" and len(sent) == 1) or (expire == "review" and len(sent) == 2):
+        sent.append(stage_kind)
+        if (expire == "writer" and stage_kind == "writer") or (expire == "review" and stage_kind == "review" and sent.count("review") == 1):
             clock[0] += 300
-        return _httpx_completion(analysis(why_it_matters="") if writer else verdict())
+        if stage_kind == "writer":
+            return _httpx_completion(analysis(why_it_matters=""))
+        if stage_kind == "polish":
+            draft = json.loads(body["messages"][1]["content"])["draft"]
+            return _httpx_completion({k: draft[k] for k in ("title", "summary", "why_it_matters")})
+        return _httpx_completion(verdict())
 
     def _factory(settings, **kwargs):
         settings_seen.append(copy.deepcopy(settings))
@@ -719,7 +727,8 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
     saved = job(store)
     record = job_record(store)
     assert first["budget_reached"] and first["analysis_failed"] == 0
-    assert first["model_calls"] == len(sent) == (2 if expire == "review" else 1)
+    expected_first = {"writer": 1, "reservation": 2, "review": 3}[expire]
+    assert first["model_calls"] == len(sent) == expected_first
     assert saved["stage"] == ("verify" if expire == "review" else "review")
     assert record["request_budget"]["reserved"] == (1 if expire == "review" else 0)
     current = store.db.execute("SELECT status,attempts,rejections,last_error,next_attempt_at FROM items WHERE id=?", (row["id"],)).fetchone()
@@ -728,7 +737,7 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
     assert all(settings["timeout_seconds"] == 3600 and settings["total_timeout_seconds"] == 3610 for settings in settings_seen)
     second = cli.run(config, store)
     assert second["analysis_failed"] == 0 and second["model_calls"] == (1 if expire == "review" else 2)
-    assert sent == ["writer", "review", "review"]
+    assert sent == (["writer", "review", "review"] if expire == "writer" else ["writer", "polish", "review", "review"])
     assert len(store.stories()) == 1 and job(store) is None
 
 
@@ -1081,13 +1090,13 @@ def test_sse_truncated_length_is_non_retryable_and_limits_fail_closed(completion
 
 def test_streaming_json_fallback_midstream_timeout_and_identity_parity(completion_client):
     """Support plain JSON fallback responses, mid-stream SSE ReadTimeouts, and preserve policy_hash/cache_key."""
-    baseline_policy = "fac751e9add0193ca49981107e53a45da3bf1e27b7d3f21e93de4ce8cbfe8f92"
+    baseline_policy = "e95f37ea6b12a92b257b8544f1a24f46274623feab494fa827240cd7c671f32d"
     assert review.policy_hash(copy.deepcopy(DEFAULTS)) == baseline_policy
     row = {"content_hash": "a" * 64}
     cfg_on = copy.deepcopy(DEFAULTS)
     cfg_on["llm"]["writer_reasoning"] = True
-    assert analyze.cache_key(row, DEFAULTS["llm"]) == "b389dd4d76a6ba5fdba8842485f8ca6c9308347cdca60e01c8ef230ca69c7de1"
-    assert analyze.cache_key(row, cfg_on["llm"]) == "74f6d3dc40707bb862af24f4ead403f3fb0373fbb933f8d542e962aa6b38044c"
+    assert analyze.cache_key(row, DEFAULTS["llm"]) == "547be438db15777290b1051fffd648a09a06dd6bfa6608a0bc6b682361a8e722"
+    assert analyze.cache_key(row, cfg_on["llm"]) == "167459a184fe55fe88da98d215cd7a8373812ed8da7b8285f476776896105858"
 
     json_client, _ = completion_client(lambda _req: _httpx_completion({"mode": "json"}))
     _, req1, _ = _ledger()

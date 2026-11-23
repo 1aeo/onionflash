@@ -215,7 +215,7 @@ def _validate_cases(cases: list[dict], *, draft: bool = False) -> None:
         identities.add(case["id"])
 
 
-def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
+def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, polish=False):
     """Score final reviewed candidates and save bounded evaluation evidence privately.
 
     In draft mode the writer drafts each packet once per round, and each case on
@@ -240,7 +240,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False):
     judged, outcomes, seen = {}, {}, set()
     identity = policy_hash(config)
     with (os.fdopen(descriptor, "w", encoding="utf-8") as report, EvaluationReviewer(config, deadline=deadline) as reviewer,
-          Analyzer(config, deadline=deadline) as writer):
+          Analyzer(config, deadline=deadline, editorial_polish=polish) as writer):
         for iteration in range(1, rounds + 1):
             drafts = {}
             for case in cases:
@@ -428,6 +428,7 @@ def main(argv=None):
     parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--max-seconds", type=int, default=900)
     parser.add_argument("--draft", action="store_true", help="review the writer's own draft of each packet")
+    parser.add_argument("--polish", action="store_true", help="run editorial polish pass when drafting candidates")
     args = parser.parse_args(argv)
     os.umask(0o077)
     files = args.cases or [Path(__file__).resolve().with_name(name) for name in CASE_FILES]
@@ -445,7 +446,7 @@ def main(argv=None):
             parser.error("Unknown evaluation case")
         cases = [case for case in cases if case["id"] in selected]
     result = evaluate(config, cases, args.output, rounds=args.rounds, deadline=time.monotonic() + args.max_seconds,
-                      draft=args.draft)
+                      draft=args.draft, polish=args.polish)
     return int(bool(result["controlled_mismatches"] or result.get("false_routes") or result["target_missed"]
                     or result["errors"] or result["incomplete"]))
 

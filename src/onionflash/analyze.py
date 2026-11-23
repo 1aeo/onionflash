@@ -6,10 +6,12 @@ import copy
 import json
 import re
 
+import time
+
 from . import util as _util
 from .comments import analysis_context
 from .llm import (
-    AnalysisError, CompletionClient, apply_label_limits, generation_options,
+    AnalysisError, CompletionClient, CompletionDeferred, apply_label_limits, generation_options,
     has_malformed_tor_version, has_shouting_caps, is_complete_sentence, is_quoted_list_post,
     label_limits, strip_unreleased_tag, tag_name, unquoted_mail_text, validate_schema_field,
 )
@@ -502,62 +504,12 @@ def tag_notice(item: dict) -> dict:
     }
 
 
-_DIRAUTH_ENTITY_RE = re.compile(
-    r"\b(?:dirauth|directory\s+authorit\w*|bwauth|bandwidth\s+authorit\w*|bridge\s+authorit\w*|"
-    r"maatuska|bastet|moria1|dannenberg|dizum|faravahar|gabelmoo|longclaw|sekhmet|tor26|serge)\b",
-    re.IGNORECASE,
-)
-_DIRAUTH_OPS_RE = re.compile(
-    r"\b(?:dirauth|directory\s+authorit\w*|consensus|dirvote|voting|vote|bwauth|bandwidth\s+authorit\w*|"
-    r"bridge\s+authorit\w*|maatuska|bastet|moria1|dannenberg|dizum|faravahar|gabelmoo|longclaw|"
-    r"sekhmet|tor26|serge)\b",
-    re.IGNORECASE,
-)
-_NON_DIRAUTH_CAT_RE = re.compile(
-    r"\b(?:cve-\d{4}-\d+|trove-\d{4}-\d+|vulnerabilit\w*|exploit\w*|compromis\w*|dos|ddos|attack\w*|releas(?:e|ed|ing))\b",
-    re.IGNORECASE,
-)
-
-
-def _should_confirm_merged_mr(sources: list[dict]) -> bool:
-    if (fn := getattr(_util, "should_confirm_merged_mr", None)) is not None:
-        return bool(fn(sources))
-    return bool(sources) and all(
-        isinstance(s, dict) and s.get("kind") == "gitlab_mr" and s.get("upstream_state") == "merged"
-        for s in sources
-    )
-
-
-def _is_dirauth_category_story(sources: list[dict], dirauth_users=None) -> bool:
-    if (fn := getattr(_util, "is_dirauth_category_story", None)) is not None:
-        return bool(fn(sources))
-    if not sources or any(
-        s.get("kind") == "tag"
-        or s.get("mandatory_news_rule")
-        or _util.is_hackerone_item(s)
-        or _util.is_trove_item(s)
-        or _util.cve_ids(s)
-        or (_util.folded_labels(s) & {"security", "dos", "dos-mitigation"})
-        or _NON_DIRAUTH_CAT_RE.search(str(s.get("title") or ""))
-        for s in sources
-    ):
-        return False
-    return any(
-        (
-            (s.get("authority") == "dirauth-operator" or _util.is_dirauth_item(s, dirauth_users))
-            and _DIRAUTH_OPS_RE.search(f"{s.get('title') or ''}\n{s.get('content') or ''}")
-        )
-        or bool(_DIRAUTH_ENTITY_RE.search(str(s.get("title") or "")))
-        for s in sources
-    )
-
-
-def _normalize_editorial_labels(result: dict, source: dict, schema: dict, dirauth_users=None) -> None:
+def _normalize_editorial_labels(result: dict, source: dict, schema: dict) -> None:
     """Enforce deterministic merged-MR confidence and dirauth-category defaults during polish mode."""
     sources = [source]
-    if _should_confirm_merged_mr(sources) and "confirmed" in schema["properties"]["confidence"]["enum"]:
+    if _util.should_confirm_merged_mr(sources) and "confirmed" in schema["properties"]["confidence"]["enum"]:
         result["confidence"] = "confirmed"
-    if _is_dirauth_category_story(sources, dirauth_users) and "directory-authority" in schema["properties"]["category"]["enum"]:
+    if _util.is_dirauth_category_story(sources) and "directory-authority" in schema["properties"]["category"]["enum"]:
         old_cat = result["category"]
         result["category"] = "directory-authority"
         if old_cat != "directory-authority":
@@ -573,10 +525,11 @@ class Analyzer(CompletionClient):
 
     def __init__(self, config: dict, deadline: float | None = None, *, editorial_polish: bool = False):
         super().__init__({**config, "llm": writer_settings(config["llm"])}, deadline=deadline)
+        self._polish_llm = writer_settings({**config["llm"], "writer_reasoning": False})
         self.editorial_polish = bool(editorial_polish)
 
     def _polish_with_stated(self, draft: dict, bounded: dict, source: dict, base_schema: dict = SCHEMA) -> tuple[dict, str]:
-        """Run copy-editor polish on `title`, `summary`, and `why_it_matters` and validate against `source`."""
+        """Run non-thinking copy-editor polish on `title`, `summary`, and `why_it_matters` and validate against `source`."""
         polish_payload = {
             "draft": {
                 key: draft[key]
@@ -584,7 +537,12 @@ class Analyzer(CompletionClient):
             },
             "source": bounded,
         }
-        reply = self.complete(POLISH_PROMPT, polish_payload, POLISH_SCHEMA, "onionflash_polish")
+        prev_llm = self.llm
+        self.llm = self._polish_llm
+        try:
+            reply = self.complete(POLISH_PROMPT, polish_payload, POLISH_SCHEMA, "onionflash_polish")
+        finally:
+            self.llm = prev_llm
         if not isinstance(reply, dict) or not reply or (set(reply) - set(POLISH_SCHEMA["properties"])):
             raise AnalysisError("Polish response fields do not match schema")
         merged = copy.deepcopy(draft)
@@ -643,16 +601,19 @@ class Analyzer(CompletionClient):
             strip_unreleased_tag(result)
             self.clears = int(result["why_it_matters"] != stated.strip())
             if getattr(self, "editorial_polish", False):
-                _normalize_editorial_labels(result, source, schema, getattr(self, "dirauth_users", None))
-                try:
-                    polished, polish_stated = self._polish_with_stated(result, bounded, source, base_schema)
-                except AnalysisError as exc:
-                    if exc.retryable:
-                        raise
-                else:
-                    strip_unreleased_tag(polished)
-                    result = polished
-                    self.clears = int(self.clears or (result["why_it_matters"] != polish_stated.strip()))
+                _normalize_editorial_labels(result, source, schema)
+                if self.deadline is None or self.clock() < self.deadline:
+                    try:
+                        polished, polish_stated = self._polish_with_stated(result, bounded, source, base_schema)
+                    except CompletionDeferred:
+                        pass
+                    except AnalysisError as exc:
+                        if exc.retryable:
+                            raise
+                    else:
+                        strip_unreleased_tag(polished)
+                        result = polished
+                        self.clears = int(self.clears or (result["why_it_matters"] != polish_stated.strip()))
         return result
 
 
