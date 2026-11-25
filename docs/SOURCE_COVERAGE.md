@@ -13,7 +13,16 @@ protocol changes. The additional configured streams are:
 | Source | Configuration | Why it matters |
 | --- | --- | --- |
 | [Tor Browser Security-labeled public issues](https://gitlab.torproject.org/api/v4/projects/472/issues?labels=Security) | `tor-browser-security`, enabled | Earlier visibility into Browser security work; labels do not establish confirmed vulnerabilities or completed fixes. |
+| [Tor Browser high-impact bug issues](https://gitlab.torproject.org/api/v4/projects/472/issues?labels=Apps::Product::TorBrowser,Apps::Impact::High,Apps::Type::Bug) | `tor-browser-high-impact-bugs`, enabled | Public Tor Browser bug reports triaged with `Apps::Product::TorBrowser`, `Apps::Impact::High`, and `Apps::Type::Bug` labels, complementing `tor-browser-security`. |
 | [Anti-Censorship team issues](https://gitlab.torproject.org/api/v4/projects/549/issues) | `anti-censorship-team`, enabled | Human investigations of blocking and bridge/transport availability, including unlabeled reports. |
+| [Snowflake tags](https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/tags) | `snowflake-tags`, enabled | Official GitLab version tags for the Snowflake pluggable transport. |
+| [Snowflake issues](https://gitlab.torproject.org/api/v4/projects/43/issues) | `snowflake-issues`, enabled | Public defect, proxy/broker, and anti-censorship deployment issues for Snowflake. |
+| [Snowflake merged changes](https://gitlab.torproject.org/api/v4/projects/43/merge_requests) | `snowflake-merges`, enabled | Merged code and protocol updates for Snowflake. |
+| [WebTunnel tags](https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/tags) | `webtunnel-tags`, enabled | Official GitLab version tags for the WebTunnel pluggable transport. |
+| [WebTunnel issues](https://gitlab.torproject.org/api/v4/projects/1674/issues) | `webtunnel-issues`, enabled | Public defect and transport compatibility issues for WebTunnel. |
+| [WebTunnel merged changes](https://gitlab.torproject.org/api/v4/projects/1674/merge_requests) | `webtunnel-merges`, enabled | Merged fixes and changes for WebTunnel. |
+| [Lyrebird tags](https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/-/tags) | `lyrebird-tags`, enabled | Official GitLab version tags for the Lyrebird pluggable transport. |
+| [Lyrebird merged changes](https://gitlab.torproject.org/api/v4/projects/417/merge_requests) | `lyrebird-merges`, enabled | Merged fixes and transport changes for Lyrebird. |
 | [Tor Metrics Timeline repository](https://gitlab.torproject.org/tpo/network-health/metrics/timeline) | `tor-metrics-news`, enabled | Curated event rows from the maintained README; validated repository snapshots replace the stale Atom feed. |
 | [Tor Project Development Mailing List](https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/) | `tor-dev`, enabled | An RFC on `tor-dev` (numbered Tor proposal, `[RFC]` subject, or IETF Internet-Draft or RFC posted for comment) is news from any sender; a formal `[Proposal]`, technical critique, protocol review, or empirical multi-relay measurement from a `project-sender` or `trusted-operator` address is news (keeping `confidence` `reported`); and other `community` messages need an RFC/numbered proposal or concrete adoption/merge. |
 | [Tor Project Consensus Health Alerts](https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/) | `tor-consensus-health`, enabled (`alert_format = "consensus"`, `publish = false`) | Sustained consensus-health anomalies from DocTor rendered with fixed templates, never sent to the model writer queue. |
@@ -122,7 +131,9 @@ their configuration.
 ### Anonymous public GitLab discussion updates
 
 Reviewed November 10, 2026 against the configured Tor, Arti, Network Health
-Analysis, Network Health Team, Tor Browser, and Anti-Censorship Team projects.
+Analysis, Network Health Team, Tor Browser, and Anti-Censorship Team projects
+(and supporting `gitlab_project` configuration for Snowflake and WebTunnel
+issue streams as well as Tor Browser high-impact bug queries).
 Anonymous GraphQL requests succeeded for all six projects. The live issue-note
 connection returns the newest notes with `last`; it does not support a `sort`
 argument. [GitLab documents anonymous query access, null authorization responses,

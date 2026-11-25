@@ -5,15 +5,16 @@ from __future__ import annotations
 import copy
 import re
 
-from .analyze import SCHEMA as DRAFT_SCHEMA
+from .analyze import SCHEMA as DRAFT_SCHEMA, _numbers as _impact_numbers
 from .llm import (AnalysisError, CompletionClient, apply_label_limits, has_malformed_tor_version,
-                  has_shouting_caps, is_complete_sentence, label_limits, repair_schema,
-                  strip_unreleased_tag, validate_schema_field, validate_text)
+                  has_shouting_caps, is_complete_sentence, is_quoted_list_post, label_limits,
+                  repair_schema, strip_unreleased_tag, unquoted_mail_text, validate_schema_field,
+                  validate_text)
 from .render import prepare_story
 from .schema import FIELD_LIMITS, LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STATES, STORY_ID_RE, UPDATE_CHARS
 from .util import LIST_ARCHIVE_HOST, canonical_url, digest, is_trove_item, normalize_evidence, strict_json
 
-REVIEW_VERSION = "onionflash-review-18"
+REVIEW_VERSION = "onionflash-review-19"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details", "news_value", "new_information")
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
@@ -21,7 +22,6 @@ VERDICTS = ("approve", "revise", "hold", "skip")
 FIELDS = {key: copy.deepcopy(DRAFT_SCHEMA["properties"][key]) for key in EDITABLE}
 for field in ("title", "summary", "why_it_matters"):
     FIELDS[field]["maxLength"] = FIELD_LIMITS[field]
-FIELDS["why_it_matters"]["enum"] = [""]
 UPDATE_EDITABLE = ("update", *LABEL_FIELDS)
 UPDATE_FIELDS = {"update": {"type": "string", "maxLength": UPDATE_CHARS},
                  **{key: copy.deepcopy(FIELDS[key]) for key in LABEL_FIELDS}}
@@ -55,7 +55,11 @@ comment or source. On mailing lists (lists.torproject.org), >-quoted lines and
 while unquoted_content (when present on a packet source) isolates the sender's new
 contribution and sender_domain (when present) gives the verified From domain: never make
 a >-quoted message the headline, main event or why_it_matters, and never merge or swap a
->-quoted participant's claims, requests or relay counts with the sender. The separate
+>-quoted participant's claims, requests or relay counts with the sender. When
+thread_context or thread_root metadata is present on a mailing-list source, treat it as
+background thread-topic context ONLY — never cite it as factual evidence and never
+attribute its claims, counts or requests to the reply sender (keep attribution and
+why_it_matters strictly on unquoted_content). The separate
 coverage_background describes existing coverage for novelty comparison only: it is NEVER
 factual evidence and never fills missing packet facts."""
 
@@ -122,11 +126,18 @@ FAIL source_support whenever such a claim, request, relay count or participant (
 or '>' lines) is absent from unquoted_content, and rewrite from unquoted_content or hold.
 Claims supported by other packet sources need only that source's support.
 Attribution alone cannot make an unsupported consequence true.
-A non-empty why_it_matters passes only when it closely restates one unquoted packet
-sentence stating this event's impact or an action it asks readers to take, adding no
-inferred severity, urgency, cause, number, version or benefit; judge non-empty
-why_it_matters in source_support's reason and fail (clearing why_it_matters) for absent
-claims, >-quoted reply text, unrequested advice, generic boilerplate or casual chat. Fail
+A non-empty why_it_matters passes ONLY when it states one concise sentence describing a
+concrete operational, security or user consequence (or explicit reader action) explicitly
+stated and supported by unquoted packet text, preserving every precondition, hedge,
+platform/channel scope, affected audience and material disagreement, and adding no
+inferred severity, urgency, speculative mechanism, cause, number, version, operator
+directive or benefit (it MUST be empty on untrusted community lists.torproject.org
+posts). Evaluate non-empty why_it_matters in source_support's reason and FAIL
+source_support for absent claims, invented or speculative impacts, generic
+feature/release recaps (such as updating an engine or listing features without an
+explicitly stated consequence or reader action), dropped preconditions or hedges,
+>-quoted reply text, unrequested advice, generic filler ("improves
+reliability/security/privacy", "addresses issues to maintain privacy") or casual chat. Fail
 source_support when any field generalizes one sample, treats template checkboxes as proof
 confidential patches shipped, infers developer work, maintainer rulings or fix
 effectiveness beyond the text, omits a material packet disclosure, labels a bugfix
@@ -272,10 +283,15 @@ Compare lifecycle states explicitly (a later merge completes an earlier request)
   the distinct official incident-response announcement described above; otherwise skip.
 
 {_SHARED_VERDICT_RULES}
-Story repair and skip rules: If unsupported wording or labels can be fixed strictly from
-the packet, return "revise" with the smallest edit (prefer deleting unsupported clauses;
-never add absent impacts, mechanisms or advice; set why_it_matters to "" when any
-criterion fails because of it, else null, never writing or rewording it). If the packet
+Story repair and skip rules: If unsupported wording, dropped qualifiers or labels can be
+fixed strictly from the packet, return "revise" with the smallest edit (prefer editing or
+deleting unsupported clauses; never add absent impacts, mechanisms or advice; when
+why_it_matters fails any criterion — invented or speculative impact, generic feature/release
+recap or filler, dropped precondition/hedge/scope, unrequested advice or untrusted
+community list post — clear why_it_matters to "" UNLESS a single unquoted packet
+sentence explicitly states a concrete impact or requested reader action, in which case
+either clear it to "" or tighten it strictly to that explicit sentence without adding
+anything, else null when unchanged). If the packet
 holds a worthwhile uncovered development that the candidate omits or buries behind quoted
 old text, revise to state the sender's unquoted development from the packet, or hold;
 never skip it. Use "skip" (repair null, news_value or new_information failed) ONLY when
@@ -326,6 +342,12 @@ SAME-STORY ROUTING (coverage_background.recent is present):
   even if the merge also includes a companion workaround), or (d) a follow-up resolution, closing note or
   cross-channel report of an already-covered incident without distinct response news as defined above, or
   (e) another tag or announcement of the same product/version release without distinct incident-response news.
+  Prioritize inspecting `coverage_background.recent` entries flagged with `related` (such as
+  shared CVEs, TROVE IDs, GitLab references, directory authority names, release mentions or
+  shared technical terms) as well as recent same-product entries to catch cross-channel coverage
+  of the same concrete Tor event (for example, a mailing-list post, a GitLab issue and a fix MR
+  describing the same concrete defect, vulnerability or authority incident even without shared
+  URLs).
   In every such case — whether you fail
   new_information (verdict skip, repair null), pass all nine criteria because this stage adds new facts
   (verdict approve, repair null; never return revise or skip when all nine pass), or return verdict revise
@@ -335,8 +357,9 @@ SAME-STORY ROUTING (coverage_background.recent is present):
   distinct fixes or features not already covered as that release, a newly reported bug or regression in an
   already-released version, a distinct bug found while auditing an earlier issue, or a different incident on
   the same authority or
-  topic. Entries marked related only share a reference, version or thread; check whether they match
-  (a)-(e) rather than routing from the related marker alone.
+  topic. Entries marked related surface shared CVEs, TROVE/GitLab references, authority names,
+  versions, threads or technical terms; check whether they report the same concrete event under (a)-(e)
+  rather than routing blindly from the related marker alone.
 - An entry marked retracted is a withdrawn story: if the candidate repeats its withdrawn claim, fail
   new_information (keeping news_value pass) and return verdict hold (never skip, same_story null).
   Otherwise keep same_story null.
@@ -592,6 +615,10 @@ def _repair_fields(repair: dict, *, update: bool = False) -> dict:
 def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict:
     """Normalize a minimal semantic repair BEFORE its independent verification."""
     edits = _repair_fields(repair, update=update)
+    if (impact := edits.get("why_it_matters")):
+        products = edits.get("products") or candidate.get("products") or ()
+        if has_shouting_caps(impact) or has_malformed_tor_version(impact, products):
+            raise ReviewError("Invalid repair field")
     explicit_tags = "tags" in edits
     updated = copy.deepcopy(candidate)
     if update:
@@ -622,8 +649,38 @@ def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict
     return normalized
 
 
+def _packet_impact_context(packet: dict) -> tuple[str, bool, list[str]]:
+    """Extract packet text allowed for impact grounding, community-list status, and products."""
+    sources = packet.get("sources") or ()
+    parts: list[str] = []
+    products: list[str] = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        if isinstance(source.get("product"), str) and source["product"]:
+            products.append(source["product"])
+        passages = [p for p in (source.get("passages") or ()) if isinstance(p, dict)]
+        passage_texts = [p["text"] for p in passages if isinstance(p.get("text"), str)]
+        joined = "\n".join(passage_texts)
+        if isinstance(source.get("unquoted_content"), str) and source["unquoted_content"]:
+            parts.append(source["unquoted_content"])
+            parts.extend(p["text"] for p in passages if "author" in p and isinstance(p.get("text"), str))
+        elif is_quoted_list_post(source.get("url"), joined):
+            parts.append(unquoted_mail_text(joined))
+            parts.extend(p["text"] for p in passages if "author" in p and isinstance(p.get("text"), str))
+        else:
+            if isinstance(source.get("title"), str) and source["title"]:
+                parts.append(source["title"])
+            parts.extend(passage_texts)
+    community_list = bool(sources) and all(
+        isinstance(s, dict) and s.get("authority") == "community" and LIST_ARCHIVE_HOST in str(s.get("url") or "")
+        for s in sources
+    )
+    return "\n".join(parts), community_list, list(dict.fromkeys(products))
+
+
 def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool = False,
-              coverage: dict | None = None) -> dict:
+              coverage: dict | None = None, packet: dict | None = None) -> dict:
     """Validate a complete review. A saved one may also keep model_verdict, the model's
     own verdict where Reviewer.review replaced it."""
     saved = set() if wire else {"model_verdict"}
@@ -676,6 +733,24 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool 
                 or (wire and set(repair) != set(editable))):
             raise ReviewError("Review repair fields do not match schema")
         repair = {key: value for key, value in repair.items() if value is not None}
+        if "why_it_matters" in repair:
+            impact = validate_text(
+                repair["why_it_matters"], FIELD_LIMITS["why_it_matters"], empty=True,
+                error=ReviewError, message="Invalid repair field",
+            )
+            repair["why_it_matters"] = impact
+            if impact and packet is not None:
+                impact_ctx, community_list, pkt_products = _packet_impact_context(packet)
+                products = repair.get("products") or pkt_products
+                if (
+                    community_list
+                    or (_impact_numbers(impact) - _impact_numbers(impact_ctx))
+                    or has_shouting_caps(impact)
+                    or has_malformed_tor_version(impact, products)
+                ):
+                    repair["why_it_matters"] = ""
+            elif impact and (has_shouting_caps(impact) or has_malformed_tor_version(impact, repair.get("products") or ())):
+                repair["why_it_matters"] = ""
     elif repair is not None:
         raise ReviewError("Only a revise verdict can propose repair")
     return {**result, "same_story": same_story, "repair": repair}
@@ -683,7 +758,7 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool 
 
 def validate_review(result: dict, packet: dict, *, update: bool = False, coverage: dict | None = None) -> dict:
     """Validate saved/API responses with the same rubric and source-reference rules."""
-    return _validate(result, _packet_refs(packet), update=update, coverage=coverage)
+    return _validate(result, _packet_refs(packet), update=update, coverage=coverage, packet=packet)
 
 
 def release_labels_match_state(candidate: dict) -> bool:
@@ -861,9 +936,28 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
     ) if held]
 
 
-def _skip_stands(criteria: dict, coverage: dict | None, same_story: str | None = None) -> bool:
+_UNRELATED_EVENT_RE = re.compile(
+    r"\b(?:unrelated|wrongly\s+attached|different\s+(?:event|story|product|incident))\b",
+    re.IGNORECASE,
+)
+_NEGATED_UNRELATED_RE = re.compile(
+    r"\b(?:not|never|no|isn['’]?t|aren['’]?t|wasn['’]?t|weren['’]?t)\s+(?:an?\s+)?$",
+    re.IGNORECASE,
+)
+
+
+def _mentions_unrelated_event(reason: str) -> bool:
+    """Return whether `reason` makes an un-negated claim of an unrelated story or incident."""
+    return any(
+        not _NEGATED_UNRELATED_RE.search(reason[max(0, match.start() - 24) : match.start()])
+        for match in _UNRELATED_EVENT_RE.finditer(reason)
+    )
+
+
+def _skip_stands(criteria: dict, coverage: dict | None, same_story: str | None = None, *, update: bool = False) -> bool:
     """A skip needs a failed editorial criterion. Duplication is decided only from the
-    coverage background, so a skip for new_information alone must name a story there."""
+    coverage background, so a skip for new_information alone must name a story there
+    (or target a live prior_story in update mode unless an unrelated event is flagged)."""
     failed = {name for name in EDITORIAL_CRITERIA if criteria[name]["outcome"] == "fail"}
     if not failed:
         return False
@@ -873,7 +967,12 @@ def _skip_stands(criteria: dict, coverage: dict | None, same_story: str | None =
     names_live = any(sid == same_story or sid in reason for sid in live_ids)
     if "new_information" in failed and not names_live and any(sid in reason for sid in retracted_ids):
         return False
-    return True if failed != {"new_information"} else names_live
+    unrelated = update and _mentions_unrelated_event(reason)
+    if failed != {"new_information"}:
+        return not ("new_information" in failed and unrelated)
+    if names_live:
+        return not unrelated
+    return bool(update and prior_id and not unrelated)
 
 
 class Reviewer(CompletionClient):
@@ -932,7 +1031,7 @@ class Reviewer(CompletionClient):
         if validation_error is not None:
             prompt += VALIDATION_REASK_PROMPT
         result = self.complete(prompt, payload, schema, "onionflash_review", on_request=on_request)
-        result = _validate(result, refs, wire=True, update=update, coverage=coverage)
+        result = _validate(result, refs, wire=True, update=update, coverage=coverage, packet=packet)
         if result["repair"] is not None and not within_label_limits(result["repair"], limits):
             raise ReviewError("Review repair labels exceed this packet's limits")
         if (not update and prior_id is None and result["verdict"] == "skip" and result["same_story"] is None
@@ -942,7 +1041,7 @@ class Reviewer(CompletionClient):
             named_live = [rid for rid in recent_ids if rid in reason]
             if len(named_live) == 1 and not any(rid in reason for rid in retracted_ids):
                 result = {**result, "same_story": named_live[0]}
-        if result["verdict"] == "skip" and not _skip_stands(result["criteria"], coverage, result.get("same_story")):
+        if result["verdict"] == "skip" and not _skip_stands(result["criteria"], coverage, result.get("same_story"), update=update):
             # The record keeps the verdict that this fixed rule replaced.
             result = {**result, "verdict": "hold", "same_story": None, "model_verdict": "skip"}
         return result

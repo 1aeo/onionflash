@@ -206,12 +206,99 @@ product = "tor-browser"
 authority = "development"
 
 [[sources]]
+id = "tor-browser-high-impact-bugs"
+gitlab_project = "tpo/applications/tor-browser"
+name = "Tor Project GitLab High-Impact Bugs for Tor Browser"
+website_url = "https://gitlab.torproject.org/tpo/applications/tor-browser/-/issues?state=all&label_name%5B%5D=Apps::Impact::High&label_name%5B%5D=Apps::Type::Bug"
+kind = "gitlab_issue"
+url = "https://gitlab.torproject.org/api/v4/projects/472/issues?labels=Apps::Product::TorBrowser,Apps::Impact::High,Apps::Type::Bug"
+product = "tor-browser"
+authority = "development"
+
+[[sources]]
 id = "anti-censorship-team"
 gitlab_project = "tpo/anti-censorship/team"
 name = "Tor Project GitLab Issues for Anti-Censorship Team"
 website_url = "https://gitlab.torproject.org/tpo/anti-censorship/team/-/issues?state=all"
 kind = "gitlab_issue"
 url = "https://gitlab.torproject.org/api/v4/projects/549/issues"
+product = "network"
+authority = "development"
+
+[[sources]]
+id = "snowflake-tags"
+name = "Tor Project GitLab Tags for Snowflake"
+website_url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/tags"
+kind = "tag"
+url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/tags?format=atom"
+fallback_urls = []
+product = "network"
+authority = "official"
+
+[[sources]]
+id = "snowflake-issues"
+gitlab_project = "tpo/anti-censorship/pluggable-transports/snowflake"
+name = "Tor Project GitLab Issues for Snowflake"
+website_url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/issues?state=all"
+kind = "gitlab_issue"
+url = "https://gitlab.torproject.org/api/v4/projects/43/issues"
+product = "network"
+authority = "development"
+
+[[sources]]
+id = "snowflake-merges"
+name = "Tor Project GitLab Merged Changes for Snowflake"
+website_url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/merge_requests?state=merged"
+kind = "gitlab_mr"
+url = "https://gitlab.torproject.org/api/v4/projects/43/merge_requests"
+product = "network"
+authority = "development"
+
+[[sources]]
+id = "webtunnel-tags"
+name = "Tor Project GitLab Tags for WebTunnel"
+website_url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/tags"
+kind = "tag"
+url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/tags?format=atom"
+fallback_urls = []
+product = "network"
+authority = "official"
+
+[[sources]]
+id = "webtunnel-issues"
+gitlab_project = "tpo/anti-censorship/pluggable-transports/webtunnel"
+name = "Tor Project GitLab Issues for WebTunnel"
+website_url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/issues?state=all"
+kind = "gitlab_issue"
+url = "https://gitlab.torproject.org/api/v4/projects/1674/issues"
+product = "network"
+authority = "development"
+
+[[sources]]
+id = "webtunnel-merges"
+name = "Tor Project GitLab Merged Changes for WebTunnel"
+website_url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/merge_requests?state=merged"
+kind = "gitlab_mr"
+url = "https://gitlab.torproject.org/api/v4/projects/1674/merge_requests"
+product = "network"
+authority = "development"
+
+[[sources]]
+id = "lyrebird-tags"
+name = "Tor Project GitLab Tags for Lyrebird"
+website_url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/-/tags"
+kind = "tag"
+url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/-/tags?format=atom"
+fallback_urls = []
+product = "network"
+authority = "official"
+
+[[sources]]
+id = "lyrebird-merges"
+name = "Tor Project GitLab Merged Changes for Lyrebird"
+website_url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/-/merge_requests?state=merged"
+kind = "gitlab_mr"
+url = "https://gitlab.torproject.org/api/v4/projects/417/merge_requests"
 product = "network"
 authority = "development"
 

@@ -227,7 +227,10 @@ def test_repair_schema_offers_only_labels_the_packet_allows(monkeypatch, sources
 
 
 @pytest.mark.parametrize("patch,is_upd,match", [
-    ({"why_it_matters": "Operators must upgrade immediately."}, False, None),
+    ({"why_it_matters": "Relays are AT RISK FOR DEANONYMIZATION NOW."}, False, None),
+    ({"why_it_matters": "Tor 0.4.17 relays are affected."}, False, None),
+    ({"why_it_matters": "x" * (review.FIELD_LIMITS["why_it_matters"] + 1)}, False, None),
+    ({"why_it_matters": 123}, False, None),
     ({"sources": "changed"}, False, "immutable"),
     ({"title": STORY["title"]}, False, "does not change"),
     ({"title": ""}, False, None),
@@ -240,11 +243,87 @@ def test_repair_schema_offers_only_labels_the_packet_allows(monkeypatch, sources
     ({"update": "Forbidden in story scope."}, False, None),
 ])
 def test_apply_repair_rejects_immutable_noop_and_invalid_patches(patch, is_upd, match):
-    """Refuse immutable-field, no-op, empty, or unpunctuated repairs."""
+    """Refuse immutable-field, no-op, empty, shouting, malformed-version, or unpunctuated repairs."""
     base = _candidate(updates=[{"at": "2026-11-08T14:00:00Z", "text": "Maintainers opened a tracking ticket.",
                                 "sources": [{"url": STORY["sources"][0]["url"], "title": "Release notes"}]}])
     with pytest.raises(review.ReviewError, match=match):
         review.apply_repair(base, patch, update=is_upd)
+
+
+def test_why_it_matters_repair_grounding_and_clearing(monkeypatch):
+    """Allow grounded non-empty why_it_matters repairs while clearing ungrounded numbers, shouting, or community impact."""
+    grounded = review.apply_repair(
+        _candidate(),
+        {"why_it_matters": "  Operators can   read the release notes to assess changes.  "},
+    )
+    assert grounded["why_it_matters"] == "Operators can read the release notes to assess changes."
+
+    numbered_pkt = {
+        "sources": [{
+            "id": "S1", "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41500",
+            "title": "Consensus votes exceeding 16 MB are truncated", "kind": "gitlab_issue",
+            "authority": "development", "product": "tor", "published_at": STORY["published_at"],
+            "updated_at": STORY["updated_at"], "labels": [],
+            "passages": [{"id": "S1:P1", "text": "Votes larger than 16 MB fail serialization on 0.4.9.16."}],
+        }],
+        "missing_sources": [], "truncated": False,
+    }
+    valid_repair = "Votes over 16 MB fail serialization on 0.4.9.16."
+    res_ok = _reviewer(monkeypatch, verdict("revise", criterion="source_support", repair={"why_it_matters": valid_repair})).review(
+        _candidate(why_it_matters="All votes fail."), numbered_pkt
+    )
+    assert res_ok["repair"] == {"why_it_matters": valid_repair}
+
+    for bad_wim in (
+        "Votes over 32 MB fail serialization.",
+        "Votes over 16 MB fail on 0.4.9.99.",
+        "Votes over 16 MB cause TOR VOTES TO FAIL COMPLETELY.",
+        "Operators running Tor 0.4.17 lose votes.",
+    ):
+        cleared = _reviewer(
+            monkeypatch,
+            verdict("revise", criterion="source_support", repair={"summary": "Tightened summary.", "why_it_matters": bad_wim}),
+        ).review(_candidate(why_it_matters="Old text."), numbered_pkt)
+        assert cleared["repair"] == {"summary": "Tightened summary.", "why_it_matters": ""}
+
+    arti_pkt = copy.deepcopy(numbered_pkt)
+    arti_pkt["sources"][0]["product"] = "arti"
+    arti_pkt["sources"][0]["passages"][0]["text"] = "Tested on Tor 0.4.17 build."
+    kept_arti = _reviewer(
+        monkeypatch,
+        verdict("revise", criterion="source_support", repair={"why_it_matters": "Affects Tor 0.4.17 build tests."}),
+    ).review(_candidate(products=["arti"]), arti_pkt)
+    assert kept_arti["repair"] == {"why_it_matters": "Affects Tor 0.4.17 build tests."}
+
+    list_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/R1/"
+    comm_pkt = {
+        "sources": [{
+            "id": "S1", "url": list_url, "title": "[tor-relays] Re: 42 relays failing",
+            "kind": "feed", "authority": "community", "product": "tor",
+            "published_at": STORY["published_at"], "updated_at": STORY["updated_at"], "labels": [],
+            "unquoted_content": "Our 3 relays saw normal load.",
+            "passages": [{"id": "S1:P1", "text": "Our 3 relays saw normal load.\n> 42 relays failed."}],
+        }],
+        "missing_sources": [], "truncated": False,
+    }
+    comm_cleared = _reviewer(
+        monkeypatch,
+        verdict("revise", criterion="source_support", repair={"summary": "Sender saw 3 relays.", "why_it_matters": "Our 3 relays saw normal load."}),
+    ).review(_candidate(why_it_matters="42 relays failed."), comm_pkt)
+    assert comm_cleared["repair"] == {"summary": "Sender saw 3 relays.", "why_it_matters": ""}
+
+    trusted_pkt = copy.deepcopy(comm_pkt)
+    trusted_pkt["sources"][0]["authority"] = "trusted-operator"
+    quoted_num_cleared = _reviewer(
+        monkeypatch,
+        verdict("revise", criterion="source_support", repair={"why_it_matters": "42 relays failed."}),
+    ).review(_candidate(why_it_matters="Old text."), trusted_pkt)
+    assert quoted_num_cleared["repair"] == {"why_it_matters": ""}
+    unquoted_num_kept = _reviewer(
+        monkeypatch,
+        verdict("revise", criterion="source_support", repair={"why_it_matters": "3 relays saw normal load."}),
+    ).review(_candidate(why_it_matters="Old text."), trusted_pkt)
+    assert unquoted_num_kept["repair"] == {"why_it_matters": "3 relays saw normal load."}
 
 
 @pytest.mark.parametrize("kind,target,val", [
@@ -284,12 +363,16 @@ def test_prompts_coverage_isolation_repairs_and_transport_settings(monkeypatch):
         assert "Claims supported by other packet sources need only that source's support." in prompt
     assert _reviewer(monkeypatch, verdict("skip", criterion="news_value")).review(_candidate(state="merged"), _packet())["verdict"] == "skip"
 
+    assert "thread_context or thread_root" in review.SYSTEM_PROMPT
+    assert "cross-channel coverage" in review.ROUTING_PROMPT
+    assert "shared CVEs" in review.ROUTING_PROMPT
     public = _candidate(why_it_matters="Existing commentary")
     assert review.apply_repair(public, {"why_it_matters": ""})["why_it_matters"] == ""
     chk = _reviewer(monkeypatch, verdict())
     chk.review(public, _packet())
     wim = chk.client.bodies[0]["response_format"]["json_schema"]["schema"]["properties"]["repair"]["anyOf"][1]["properties"]["why_it_matters"]
-    assert wim["anyOf"][0]["enum"] == [""] and wim["anyOf"][1] == {"type": "null"}
+    assert wim["anyOf"][0] == {"type": "string", "maxLength": review.FIELD_LIMITS["why_it_matters"]}
+    assert "enum" not in wim["anyOf"][0] and wim["anyOf"][1] == {"type": "null"}
 
     bg = {"prior_story": None, "recent": [{"id": "B1", "title": "Earlier coverage"}], "truncated": False}
     bg_chk = _reviewer(monkeypatch, verdict(), verdict())
@@ -363,30 +446,52 @@ def test_prompts_coverage_isolation_repairs_and_transport_settings(monkeypatch):
     ("source_support", "fail", "hold"),
 ])
 @pytest.mark.parametrize("verification", [False, True])
-def test_a_skip_stands_only_on_a_failed_editorial_criterion(monkeypatch, criterion, outcome, expected, verification):
+@pytest.mark.parametrize("update", [False, True])
+def test_a_skip_stands_only_on_a_failed_editorial_criterion(monkeypatch, criterion, outcome, expected, verification, update):
     """Convert skips without a failed editorial criterion into holds while recording model_verdict."""
-    reply = verdict("skip", criterion=criterion, criteria={criterion: {"outcome": outcome, "reason": f"Story {COVERED} reports the same event."}})
-    res = _reviewer(monkeypatch, reply).review(_candidate(), _packet(), coverage=COVERAGE, verification=verification)
+    reply = verdict("skip", criterion=criterion, update=update,
+                    criteria={criterion: {"outcome": outcome, "reason": f"Story {COVERED} reports the same event."}})
+    cov = PRIOR if update else COVERAGE
+    cand = _candidate(updates=[{"at": "2026-11-08T14:00:00Z", "text": "Earlier update.",
+                                "sources": [{"url": STORY["sources"][0]["url"], "title": "Release notes"}]}]) if update else _candidate()
+    res = _reviewer(monkeypatch, reply).review(cand, _packet(), coverage=cov, verification=verification, update=update)
     assert (res["verdict"], res["repair"], res["criteria"]) == (expected, None, reply["criteria"])
     assert res.get("model_verdict") == (None if expected == "skip" else "skip")
-    assert review.validate_review(res, _packet()) == res
+    assert review.validate_review(res, _packet(), update=update) == res
     if expected == "hold":
         with pytest.raises(review.ReviewError, match="editorial criterion"):
-            review.validate_review(reply, _packet())
+            review.validate_review(reply, _packet(), update=update)
 
 
-@pytest.mark.parametrize("coverage,reason,expected", [
-    (COVERAGE, "Earlier coverage reports the same event.", "hold"),
-    (COVERAGE, f"Story {COVERED} reports the same event.", "skip"),
-    (PRIOR, f"The existing story {COVERED} already reports this.", "skip"),
-    (None, f"Story {COVERED} reports the same event.", "hold"),
-], ids=["unnamed", "recent", "prior", "no-coverage"])
-def test_a_skip_for_new_information_alone_names_a_story_from_coverage(monkeypatch, coverage, reason, expected):
-    """Require skips on new_information alone to cite a story ID from coverage."""
-    reply = verdict("skip", criterion="new_information", reason=reason)
-    assert _reviewer(monkeypatch, reply).review(_candidate(), _packet(), coverage=coverage)["verdict"] == expected
-    reply["criteria"]["news_value"]["outcome"] = "fail"
-    assert _reviewer(monkeypatch, reply).review(_candidate(), _packet(), coverage=coverage)["verdict"] == "skip"
+@pytest.mark.parametrize("update,coverage,reason,expected", [
+    (False, COVERAGE, "Earlier coverage reports the same event.", "hold"),
+    (False, COVERAGE, f"Story {COVERED} reports the same event.", "skip"),
+    (False, PRIOR, f"The existing story {COVERED} already reports this.", "skip"),
+    (False, None, f"Story {COVERED} reports the same event.", "hold"),
+    (True, PRIOR, "Already covered by prior_story; no new facts.", "skip"),
+    (True, PRIOR, f"Repeats {COVERED}.", "skip"),
+    (True, PRIOR, "Unrelated ticket wrongly attached to this story.", "hold"),
+    (True, PRIOR, f"Different event from {COVERED}.", "hold"),
+    (True, PRIOR, "Different story or product altogether.", "hold"),
+    (True, PRIOR, "Different incident on another branch.", "hold"),
+    (True, {"prior_story": {"id": COVERED, "title": "Prior"}, "recent": [{"id": "f" * 24, "title": "Retracted", "retracted": True}]},
+     f"Repeats retracted story {'f' * 24}.", "hold"),
+    (True, {"prior_story": {"id": COVERED, "title": "Prior", "retracted": True}, "recent": []},
+     "Repeats retracted prior story.", "hold"),
+    (True, None, "Already covered by prior_story.", "hold"),
+], ids=["story-unnamed", "story-recent", "story-prior", "story-no-cov",
+        "upd-no-hex-id", "upd-with-id", "upd-unrelated", "upd-different-event",
+        "upd-different-story-product", "upd-different-incident", "upd-retracted-recent",
+        "upd-retracted-prior", "upd-no-cov"])
+def test_a_skip_for_new_information_alone_names_a_story_from_coverage(monkeypatch, update, coverage, reason, expected):
+    """Require story-mode new_information skips to name a live ID, and allow update-mode redundant skips while holding unrelated/retracted ones."""
+    reply = verdict("skip", criterion="new_information", reason=reason, update=update)
+    cand = _candidate(updates=[{"at": "2026-11-08T14:00:00Z", "text": "Earlier update.",
+                                "sources": [{"url": STORY["sources"][0]["url"], "title": "Release notes"}]}]) if update else _candidate()
+    assert _reviewer(monkeypatch, reply).review(cand, _packet(), coverage=coverage, update=update)["verdict"] == expected
+    if not update:
+        reply["criteria"]["news_value"]["outcome"] = "fail"
+        assert _reviewer(monkeypatch, reply).review(cand, _packet(), coverage=coverage, update=update)["verdict"] == "skip"
 
 
 def test_update_scope_confirmed_updates_uncited_notes_and_punctuation_repairs(monkeypatch):
@@ -675,3 +780,33 @@ def test_update_repair_limits_and_final_holds_honor_established_prior_story_stat
     assert review.final_holds(
         cand_fixed, {"mode": "update", "packet": {"sources": mr_units[:2]}, "coverage": coverage_fixed}
     ) == []
+
+
+def test_skip_stands_distinguishes_negated_unrelated_event_phrases():
+    """Keep update skips when reason negates unrelated-event language while holding positive unrelated flags."""
+    live_id = "a" * 24
+    coverage = {"prior_story": {"id": live_id, "state": "developing"}, "recent": []}
+
+    neg_reply = verdict(
+        "skip",
+        criterion="new_information",
+        update=True,
+        reason=f"Repeats {live_id}; this is not a different incident.",
+    )
+    assert review._skip_stands(neg_reply["criteria"], coverage, update=True) is True
+
+    neg_no_story_reply = verdict(
+        "skip",
+        criterion="new_information",
+        update=True,
+        reason="No new facts; not an unrelated event.",
+    )
+    assert review._skip_stands(neg_no_story_reply["criteria"], coverage, update=True) is True
+
+    pos_reply = verdict(
+        "skip",
+        criterion="new_information",
+        update=True,
+        reason=f"Different incident from {live_id}.",
+    )
+    assert review._skip_stands(pos_reply["criteria"], coverage, update=True) is False

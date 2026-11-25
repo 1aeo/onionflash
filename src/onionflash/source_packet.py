@@ -145,6 +145,18 @@ def _shares(needs, floors, budget):
     return shares
 
 
+def _thread_context_metadata(thread_root: dict | None) -> dict | None:
+    if not isinstance(thread_root, dict):
+        return None
+    ctx = {
+        "title": plain_text(thread_root.get("title") or "", 200, html=False),
+        "published_at": plain_text(thread_root.get("published_at") or "", 64, html=False),
+        "url": safe_canonical_url(thread_root.get("url")) or plain_text(thread_root.get("url") or "", 500, html=False),
+        "excerpt": plain_text(thread_root.get("excerpt") or "", 360, html=False),
+    }
+    return ctx if any(ctx.values()) else None
+
+
 def build_packet(
     db,
     incoming: dict,
@@ -155,6 +167,7 @@ def build_packet(
     update: bool = False,
     dirauth_users: Iterable[str] | None = None,
     tor_core_users: Iterable[str] | None = None,
+    thread_root: dict | None = None,
 ):
     """Assemble the bounded numbered source packet and durable bindings for final review."""
     missing, bindings, units, truncated = [], {}, [], False
@@ -239,6 +252,8 @@ def build_packet(
             unit["captured_at"] = captured
         if is_quoted_list_post(unit["url"], body) and (unquoted := unquoted_mail_text(body)):
             unit["unquoted_content"] = plain_text(unquoted, LIMITS["max_source_chars"], html=False)
+        if item.get("id") == incoming.get("id") and (thread_ctx := _thread_context_metadata(thread_root)) is not None:
+            unit["thread_context"] = thread_ctx
         # First the text a writer sees for this item: its title, every note and its
         # description window; then the rest of the description. A share too small
         # for the whole source cuts description text before any note.

@@ -7,10 +7,10 @@ import httpx
 import pytest
 
 from helpers import (
-    DATE, LATER, NON_RELEASE_CATEGORIES, NON_TAG_STATES, ApprovingReviewer, FakeClient, Reviewer,
-    Writer, analysis, completion, decision_rows, finish_reviewed, item, list_rss, make_note,
-    patch_cli_pipeline, pending, public_dns, response, run_gate, seed_story, source, update_analysis,
-    verdict, wire_analyzer, write_toml,
+    DATE, LATER, NON_RELEASE_CATEGORIES, NON_TAG_STATES, ApprovingReviewer, FakeClient, FakeLLM,
+    Reviewer, Writer, analysis, completion, decision_rows, finish_reviewed, item, list_rss,
+    make_note, patch_cli_pipeline, pending, public_dns, response, run_gate, seed_story, source,
+    update_analysis, verdict, wire_analyzer, write_toml,
 )
 from onionflash import analyze, candidate, cli, collect, decisions, rejection, source_packet
 from onionflash.analyze import (
@@ -1228,3 +1228,532 @@ def test_unquoted_mail_text_keeps_from_prose_and_dated_headings_before_quotes(st
         row = {**row, "story_id": seeded["id"]}
         mode, filtered = candidate.own_update_input(store.db, row, json.loads(row["payload"]))
         assert mode == "update" and filtered["content"] == expected_kept
+
+
+def test_editorial_polish_pass_thread_root_label_normalization_and_fallback(monkeypatch):
+    """Run two-stage polish when enabled, forward thread_root safely, normalize labels, and fall back on invalid polish."""
+    from onionflash.llm import CompletionDeferred
+
+    # 1. Story polish (2 calls), headline refinement, why_it_matters preservation, and label retention.
+    src_item = item(
+        title="tor#41500: Consensus votes exceeding 16 MB fail serialization",
+        content="Consensus votes larger than 16 MB are truncated before signing on Tor 0.4.9.16.",
+        labels=[],
+    )
+    initial_draft = analysis(
+        title="Tor issue reports consensus vote truncation over 16 MB",
+        summary="A GitLab issue says consensus votes larger than 16 MB are truncated before signing on Tor 0.4.9.16.",
+        why_it_matters="Large directory votes exceeding 16 MB can be truncated before signing.",
+        category="network",
+        priority="normal",
+        confidence="reported",
+        state="developing",
+        products=["tor"],
+        tags=["network"],
+        evidence=["Consensus votes larger than 16 MB are truncated before signing on Tor 0.4.9.16."],
+    )
+    polished_reply = {
+        "title": "Tor consensus votes over 16 MB truncated before signing",
+        "summary": "Votes larger than 16 MB are truncated before signing on Tor 0.4.9.16.",
+        "why_it_matters": "Directory authority votes exceeding 16 MB on Tor 0.4.9.16 can be truncated before signing.",
+    }
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["llm"].update(base_url="https://llm.example/v1")
+    monkeypatch.setenv(cfg["llm"]["api_key_env"], "test-key")
+    polished_writer = Analyzer(cfg, editorial_polish=True)
+    polished_writer.client = FakeLLM(initial_draft, polished_reply)
+    out = polished_writer.analyze(src_item)
+    assert len(polished_writer.client.requests) == 2 and polished_writer.calls == 2
+    assert out["title"] == polished_reply["title"]
+    assert out["summary"] == polished_reply["summary"]
+    assert out["why_it_matters"] == polished_reply["why_it_matters"]
+    assert out["evidence"] == initial_draft["evidence"]
+    assert out["category"] == "network" and out["state"] == "developing"
+    polish_req = polished_writer.client.requests[1][1]
+    assert polish_req["messages"][0]["content"] == analyze.POLISH_PROMPT
+    assert polish_req["response_format"]["json_schema"]["name"] == "onionflash_polish"
+    assert polish_req["response_format"]["json_schema"]["schema"] == analyze.POLISH_SCHEMA
+    polish_payload = json.loads(polish_req["messages"][1]["content"])
+    assert polish_payload["draft"]["why_it_matters"] == initial_draft["why_it_matters"]
+
+    # 2. Partial polish reply retains omitted why_it_matters and validated fields; ungrounded polish clears why_it_matters.
+    omitted_wim_writer = Analyzer(cfg, editorial_polish=True)
+    omitted_wim_writer.client = FakeLLM(initial_draft, {"title": "Polished headline", "summary": "Polished summary."})
+    out_omitted = omitted_wim_writer.analyze(src_item)
+    assert out_omitted["title"] == "Polished headline"
+    assert out_omitted["why_it_matters"] == initial_draft["why_it_matters"] and omitted_wim_writer.clears == 0
+
+    bad_num_writer = Analyzer(cfg, editorial_polish=True)
+    bad_num_writer.client = FakeLLM(initial_draft, {**polished_reply, "why_it_matters": "Votes over 64 MB fail."})
+    out_cleared = bad_num_writer.analyze(src_item)
+    assert out_cleared["why_it_matters"] == "" and bad_num_writer.clears == 1
+
+    # 3. Fallback on non-retryable AnalysisError (invalid schema keys, shouting caps, truncated), while propagating retryable / Deadline.
+    for bad_reply in (
+        {"unexpected": "field"},
+        {**polished_reply, "title": "RELAYS AT RISK FOR DEANONYMIZATION"},
+        completion(polished_reply, finish_reason="length"),
+        {**polished_reply, "title": ""},
+    ):
+        fb_writer = Analyzer(cfg, editorial_polish=True)
+        fb_writer.client = FakeLLM(initial_draft, bad_reply)
+        fallback_out = fb_writer.analyze(src_item)
+        assert fallback_out == initial_draft and len(fb_writer.client.requests) == 2
+
+    retry_writer = Analyzer(cfg, editorial_polish=True)
+    retry_writer.client = FakeLLM(initial_draft, FetchError("unavailable", status=503))
+    with pytest.raises(AnalysisError) as retry_err:
+        retry_writer.analyze(src_item)
+    assert retry_err.value.retryable is True
+
+    defer_writer = Analyzer(cfg, editorial_polish=True)
+    defer_writer.client = FakeLLM(initial_draft, CompletionDeferred("deadline"))
+    assert defer_writer.analyze(src_item) == initial_draft and len(defer_writer.client.requests) == 2
+
+    cfg_reasoning = copy.deepcopy(cfg)
+    cfg_reasoning["llm"].update(writer_reasoning=True, send_chat_template_kwargs=True)
+    clock_now = [0.0]
+    expired_writer = Analyzer(cfg_reasoning, deadline=10.0, editorial_polish=True)
+    expired_writer.clock = lambda: clock_now[0]
+
+    def _expiring_complete(prompt, payload, schema, schema_name, *, on_request=None):
+        clock_now[0] = 15.0
+        return initial_draft
+
+    monkeypatch.setattr(expired_writer, "complete", _expiring_complete)
+    assert expired_writer.analyze(src_item) == initial_draft
+
+    polish_profile_writer = Analyzer(cfg_reasoning, editorial_polish=True)
+    polish_profile_writer.client = FakeLLM(initial_draft, polished_reply)
+    assert polish_profile_writer.analyze(src_item)["title"] == polished_reply["title"]
+    assert polish_profile_writer.client.requests[0][1]["max_tokens"] == 32768
+    assert polish_profile_writer.client.requests[1][1]["max_tokens"] == 1200
+    assert polish_profile_writer.client.requests[1][1]["chat_template_kwargs"] == {"enable_thinking": False}
+
+    # 4. Polish skipped on tag items and update mode (prior is not None), and default editorial_polish=False makes 1 call.
+    default_writer = wire_analyzer(monkeypatch, initial_draft)
+    assert default_writer.analyze(src_item) == initial_draft and len(default_writer.client.requests) == 1
+
+    tag_writer = Analyzer(cfg, editorial_polish=True)
+    tag_writer.client = FakeLLM()
+    assert tag_writer.analyze(item(kind="tag", title="tor-0.4.9.16", content=""))["state"] == "tagged"
+    assert tag_writer.client.requests == []
+
+    upd_draft = update_analysis(update="A follow-up patch landed.", evidence=[src_item["content"]])
+    upd_writer = Analyzer(cfg, editorial_polish=True)
+    upd_writer.client = FakeLLM(upd_draft)
+    assert upd_writer.analyze(src_item, prior=_prior_story())["update"] == upd_draft["update"]
+    assert len(upd_writer.client.requests) == 1
+
+    # 5. thread_root forwarded into bounded payload (never into evidence or impact_context).
+    list_url = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/R2/"
+    reply_item = item(
+        url=list_url, kind="feed", authority="trusted-operator",
+        title="[tor-relays] Re: Guard bandwidth drop",
+        content="Our 5 relays saw stable throughput today.\n> Earlier 99 relays dropped.",
+        labels=[],
+        thread_root={"title": "[tor-relays] Guard bandwidth drop", "published_at": DATE,
+                     "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/R1/",
+                     "excerpt": "We saw 77 relays drop bandwidth earlier."},
+    )
+    reply_draft = analysis(
+        title="Guard bandwidth steady on 5 observed relays",
+        summary="A relay operator reports stable throughput across 5 relays.",
+        why_it_matters="5 observed relays maintained stable throughput.",
+        category="relay", tags=["relay"], confidence="reported",
+        evidence=["Our 5 relays saw stable throughput today."],
+    )
+    tr_writer = Analyzer(cfg, editorial_polish=True)
+    tr_writer.client = FakeLLM(reply_draft, {
+        "title": "Guard bandwidth steady on 5 observed relays",
+        "summary": "A relay operator reports stable throughput across 5 relays.",
+        "why_it_matters": "77 relays dropped bandwidth earlier.",
+    })
+    tr_out = tr_writer.analyze(reply_item)
+    first_sent = json.loads(tr_writer.client.requests[0][1]["messages"][1]["content"])
+    first_evidence_enum = tr_writer.client.requests[0][1]["response_format"]["json_schema"]["schema"]["properties"]["evidence"]["items"]["enum"]
+    assert first_sent["thread_root"] == reply_item["thread_root"]
+    assert all("77 relays" not in exc for exc in first_evidence_enum)
+    assert tr_out["why_it_matters"] == "" and tr_writer.clears == 1
+
+    # 6. Merged MR confidence=confirmed & dirauth operational category=directory-authority normalization in polish mode only.
+    mr_item = item(kind="gitlab_mr", upstream_state="merged", title="Fix descriptor retry timer", content="Merged fix for descriptor retries.", labels=[])
+    mr_draft = analysis(title="Fix descriptor retry timer", summary="Merged fix for descriptor retries.", why_it_matters="",
+                        category="network", state="merged", confidence="reported", tags=["network"],
+                        evidence=["Merged fix for descriptor retries."])
+    mr_polish = {"title": "Tor merges descriptor retry timer fix", "summary": "A merged MR fixes descriptor retry timing.", "why_it_matters": ""}
+    mr_writer = Analyzer(cfg, editorial_polish=True)
+    mr_writer.client = FakeLLM(mr_draft, mr_polish)
+    assert mr_writer.analyze(mr_item)["confidence"] == "confirmed"
+
+    da_item = item(
+        url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/41920",
+        kind="gitlab_issue", authority="dirauth-operator", author="linus",
+        title="Planned IPv4/IPv6 migration for maatuska",
+        content="maatuska will migrate to a new dual-stack subnet.", labels=["Directory Authority (dirauth)"],
+    )
+    da_draft = analysis(
+        title="Maatuska directory authority plans dual-stack migration",
+        summary="A ticket plans a dual-stack IP migration for maatuska.",
+        why_it_matters="", category="network", tags=["network"],
+        evidence=["maatuska will migrate to a new dual-stack subnet."],
+    )
+    da_polish = {"title": "Maatuska directory authority plans dual-stack IP migration",
+                 "summary": "maatuska will migrate to a new dual-stack subnet.", "why_it_matters": ""}
+    da_writer = Analyzer(cfg, editorial_polish=True)
+    da_writer.client = FakeLLM(da_draft, da_polish)
+    da_out = da_writer.analyze(da_item)
+    assert da_out["category"] == "directory-authority" and da_out["tags"] == ["directory-authority"]
+
+    with monkeypatch.context() as mp:
+        mp.setattr(analyze._util, "should_confirm_merged_mr", lambda srcs: srcs[0].get("kind") == "gitlab_mr", raising=False)
+        mp.setattr(analyze._util, "is_dirauth_category_story", lambda srcs: "maatuska" in srcs[0].get("title", ""), raising=False)
+        mr_hook = Analyzer(cfg, editorial_polish=True)
+        mr_hook.client = FakeLLM(mr_draft, mr_polish)
+        assert mr_hook.analyze(mr_item)["confidence"] == "confirmed"
+        da_hook = Analyzer(cfg, editorial_polish=True)
+        da_hook.client = FakeLLM(da_draft, da_polish)
+        assert da_hook.analyze(da_item)["category"] == "directory-authority"
+
+    direct_writer = Analyzer(cfg)
+    direct_writer.client = FakeLLM(polished_reply)
+    assert direct_writer.polish_draft(initial_draft, src_item, src_item)["title"] == polished_reply["title"]
+
+    # 7. cache_key invalidates on POLISH_PROMPT / POLISH_SCHEMA for story mode, not update mode.
+    story_key = _cache_key_for()
+    upd_key = _cache_key_for(previous=_prior_story())
+    with monkeypatch.context() as mp:
+        mp.setattr(analyze, "POLISH_PROMPT", analyze.POLISH_PROMPT + "\nExtra polish note.")
+        assert _cache_key_for() != story_key and _cache_key_for(previous=_prior_story()) == upd_key
+    with monkeypatch.context() as mp:
+        mp.setitem(analyze.POLISH_SCHEMA["properties"]["title"], "maxLength", 139)
+        assert _cache_key_for() != story_key and _cache_key_for(previous=_prior_story()) == upd_key
+
+
+def test_polish_preserves_advisory_ids_and_issue_completed_action_verbs(monkeypatch):
+    """Fall back to pre-polish draft if polish drops TROVE/CVE IDs or introduces unstated completed-action verbs."""
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["llm"].update(base_url="https://llm.example/v1")
+    monkeypatch.setenv(cfg["llm"]["api_key_env"], "test-key")
+    # 1. Dropping TROVE or CVE identifier from title triggers deterministic fallback.
+    trove_item = item(
+        kind="gitlab_issue",
+        title="TROVE-2026-025: conflux LINK crash",
+        content="Conflux bug causes crash before fix.",
+        labels=["Security"],
+    )
+    trove_draft = analysis(
+        title="TROVE-2026-025: Conflux LINK bug can crash relays",
+        summary="A Conflux bug can crash relays.",
+        why_it_matters="Malicious clients could crash relays.",
+        category="security", tags=["security"],
+        evidence=["Conflux bug causes crash before fix."],
+    )
+    w_drop = Analyzer(cfg, editorial_polish=True)
+    w_drop.client = FakeLLM(trove_draft, {
+        "title": "Conflux LINK bug can crash relays in 0.4.9.10",
+        "summary": trove_draft["summary"],
+        "why_it_matters": trove_draft["why_it_matters"],
+    })
+    assert w_drop.analyze(trove_item)["title"] == trove_draft["title"]
+
+    cve_item = item(kind="feed", authority="official", title="CVE-2026-1234 release", content="Patches CVE-2026-1234 in client.", labels=[])
+    cve_draft = analysis(
+        title="CVE-2026-1234 client vulnerability patched",
+        summary="The release patches CVE-2026-1234.",
+        why_it_matters="", category="security", tags=["security"], confidence="confirmed", state="released",
+        evidence=["Patches CVE-2026-1234 in client."],
+    )
+    w_cve = Analyzer(cfg, editorial_polish=True)
+    w_cve.client = FakeLLM(cve_draft, {
+        "title": "Client vulnerability patched in latest release",
+        "summary": cve_draft["summary"],
+        "why_it_matters": "",
+    })
+    assert w_cve.analyze(cve_item)["title"] == cve_draft["title"]
+
+    # 2. Unstated completed-action verb on gitlab_issue falls back; stated verb or non-issue source succeeds.
+    iss_item = item(
+        kind="gitlab_issue",
+        title="TROVE-2026-013: assert on missing cert",
+        content="Closing ticket now that the fix is in 0.4.9.9.",
+        labels=["Security"],
+    )
+    iss_draft = analysis(
+        title="TROVE-2026-013: client assert on missing cert; fix reported in 0.4.9.9",
+        summary="Ticket closed after reporter said the fix is in 0.4.9.9.",
+        why_it_matters="A crafted descriptor can make a client assert.",
+        category="security", tags=["security"],
+        evidence=["Closing ticket now that the fix is in 0.4.9.9."],
+    )
+    w_verb = Analyzer(cfg, editorial_polish=True)
+    w_verb.client = FakeLLM(iss_draft, {
+        "title": iss_draft["title"],
+        "summary": iss_draft["summary"],
+        "why_it_matters": "A failure path removed by the fix in Tor 0.4.9.9 could crash clients.",
+    })
+    assert w_verb.analyze(iss_item)["why_it_matters"] == iss_draft["why_it_matters"]
+
+    stated_item = item(
+        kind="gitlab_issue",
+        title="Legacy flag removed in cleanup",
+        content="Maintainer removed the legacy flag in upstream commit.",
+        labels=[],
+    )
+    stated_draft = analysis(
+        title="Legacy flag update",
+        summary="Upstream updated flag handling.",
+        why_it_matters="", category="protocol", tags=["protocol"],
+        evidence=["Maintainer removed the legacy flag in upstream commit."],
+    )
+    w_stated = Analyzer(cfg, editorial_polish=True)
+    w_stated.client = FakeLLM(stated_draft, {
+        "title": "Legacy flag removed in upstream commit",
+        "summary": "Maintainer removed the legacy flag in an upstream commit.",
+        "why_it_matters": "",
+    })
+    assert w_stated.analyze(stated_item)["title"] == "Legacy flag removed in upstream commit"
+
+    non_iss = item(kind="gitlab_mr", upstream_state="merged", title="Drop old cipher", content="MR cleanup complete.", labels=[])
+    non_iss_draft = analysis(
+        title="Drop old cipher", summary="Cleanup complete.", why_it_matters="",
+        category="feature", state="merged", confidence="confirmed", tags=["feature"],
+        evidence=["MR cleanup complete."],
+    )
+    w_mr = Analyzer(cfg, editorial_polish=True)
+    w_mr.client = FakeLLM(non_iss_draft, {
+        "title": "Old cipher removed cleanly",
+        "summary": "Merged change removed old cipher support.",
+        "why_it_matters": "",
+    })
+    assert w_mr.analyze(non_iss)["title"] == "Old cipher removed cleanly"
+
+    # 3. Unstated "merged" on gitlab_issue falls back; source-stated or qualified "to be merged" passes.
+    req_merge_item = item(
+        kind="gitlab_issue",
+        title="Parser cleanup request",
+        content="This issue requests parser cleanup to be merged in core.",
+        labels=[],
+    )
+    req_merge_draft = analysis(
+        title="Parser cleanup merge requested",
+        summary="Issue requests parser cleanup to be merged.",
+        why_it_matters="Parser leaks memory before cleanup.",
+        category="protocol",
+        tags=["protocol"],
+        evidence=["This issue requests parser cleanup to be merged in core."],
+    )
+    w_bad_merged = Analyzer(cfg, editorial_polish=True)
+    w_bad_merged.client = FakeLLM(req_merge_draft, {
+        "title": "Parser cleanup merged in core",
+        "summary": "Parser cleanup was merged.",
+        "why_it_matters": "Parser leaks memory before cleanup.",
+    })
+    assert w_bad_merged.analyze(req_merge_item)["title"] == req_merge_draft["title"]
+
+    w_qual_merged = Analyzer(cfg, editorial_polish=True)
+    w_qual_merged.client = FakeLLM(req_merge_draft, {
+        "title": "Parser cleanup requests to be merged",
+        "summary": "Issue requests parser cleanup to be merged.",
+        "why_it_matters": "",
+    })
+    assert w_qual_merged.analyze(req_merge_item)["title"] == "Parser cleanup requests to be merged"
+    # Non-empty grounded draft why_it_matters is retained when polish returns "".
+    w_keep_wim = Analyzer(cfg, editorial_polish=True)
+    w_keep_wim.client = FakeLLM(req_merge_draft, {
+        "title": "Parser cleanup requests to be merged",
+        "summary": "Issue requests parser cleanup to be merged.",
+        "why_it_matters": "",
+    })
+    assert w_keep_wim.analyze(req_merge_item)["why_it_matters"] == req_merge_draft["why_it_matters"]
+
+    stated_merged_item = item(
+        kind="gitlab_issue",
+        title="Parser fix merged",
+        content="Maintainer noted the parser fix was merged yesterday.",
+        labels=[],
+    )
+    w_stated_merged = Analyzer(cfg, editorial_polish=True)
+    w_stated_merged.client = FakeLLM(
+        analysis(
+            title="Parser fix update", summary="Ticket updated.", why_it_matters="",
+            category="protocol", tags=["protocol"],
+            evidence=["Maintainer noted the parser fix was merged yesterday."],
+        ),
+        {
+            "title": "Parser fix merged upstream",
+            "summary": "Maintainer noted the parser fix was merged yesterday.",
+            "why_it_matters": "",
+        },
+    )
+    assert w_stated_merged.analyze(stated_merged_item)["title"] == "Parser fix merged upstream"
+
+
+def test_polish_strips_spurious_directory_authority_labels_and_keeps_genuine(monkeypatch):
+    """Strip spurious directory-authority labels on non-dirauth stories while preserving genuine dirauth mentions."""
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["llm"].update(base_url="https://llm.example/v1")
+    monkeypatch.setenv(cfg["llm"]["api_key_env"], "test-key")
+
+    # 1. Non-dirauth TLS / SOCKS / PoW / relay-directory-stream / CA stories lose spurious dirauth tags & category.
+    for title, content, draft_cat, draft_tags, exp_cat, exp_tags in (
+        (
+            "OpenSSL TLS groups negotiation fix",
+            "Client TLS groups negotiation update for OpenSSL integration.",
+            "protocol",
+            ["protocol", "directory-authority"],
+            "protocol",
+            ["protocol"],
+        ),
+        (
+            "SOCKS5 handshake status handling",
+            "Fixes SOCKS5 handshake error handling on local client listeners.",
+            "directory-authority",
+            ["directory-authority", "feature"],
+            "feature",
+            ["feature"],
+        ),
+        (
+            "Arti onion-service PoW queue limit",
+            "Bounded PoW queue prevents memory exhaustion in onion services.",
+            "directory-authority",
+            ["directory-authority"],
+            "network",
+            ["network"],
+        ),
+        (
+            "Relay directory-stream write fairness",
+            "Relay directory-stream buffering avoids starving circuit writes under load.",
+            "relay",
+            ["relay", "directory-authority"],
+            "relay",
+            ["relay"],
+        ),
+        (
+            "Certificate Authority revocation check update",
+            "Certificate Authority revocation checks validate sender authority headers safely.",
+            "security",
+            ["security", "directory-authority"],
+            "security",
+            ["security"],
+        ),
+    ):
+        src = item(kind="gitlab_mr", upstream_state="merged", title=title, content=content, labels=[])
+        draft = analysis(
+            title=title,
+            summary=content,
+            why_it_matters="",
+            category=draft_cat,
+            state="merged",
+            confidence="confirmed",
+            tags=draft_tags,
+            evidence=[content],
+        )
+        polish = {"title": title, "summary": content, "why_it_matters": ""}
+        writer = Analyzer(cfg, editorial_polish=True)
+        writer.client = FakeLLM(draft, polish)
+        out = writer.analyze(src)
+        assert out["category"] == exp_cat
+        assert out["tags"] == exp_tags
+
+    # 2. Genuine dirauth stories (even when release/metrics, not category=directory-authority) retain the tag.
+    for title, content, cat in (
+        (
+            "Tor 0.4.9.15 release notes",
+            "Tor 0.4.9.15 adds metrics export for directory authorities.",
+            "release",
+        ),
+        (
+            "Security fix deployed on bastet",
+            "CVE-2026-9999 mitigation applied after bastet observed vote delays.",
+            "security",
+        ),
+    ):
+        src = item(
+            kind="feed",
+            authority="official",
+            title=title,
+            content=content,
+            labels=[],
+        )
+        draft = analysis(
+            title=title,
+            summary=content,
+            why_it_matters="",
+            category=cat,
+            state="released" if cat == "release" else "fixed",
+            confidence="confirmed",
+            tags=[cat, "directory-authority"],
+            evidence=[content],
+        )
+        writer = Analyzer(cfg, editorial_polish=True)
+        writer.client = FakeLLM(draft, {"title": title, "summary": content, "why_it_matters": ""})
+        out = writer.analyze(src)
+        assert out["category"] == cat
+        assert out["tags"] == [cat, "directory-authority"]
+
+    # 3. A tor#41477-style ticket with an `arma` comment (promoting authority="dirauth-operator")
+    # and "offline" in the body must still strip spurious directory-authority labels.
+    tls_src = item(
+        kind="gitlab_issue",
+        url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/41477",
+        authority="development",
+        title="Tor falls back to OpenSSL default TLS groups",
+        content="Start it offline:\n\n tor --DisableNetwork 1",
+        public_comments=[{
+            "author": "arma",
+            "created_at": DATE,
+            "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41477#note_1",
+            "body": "A friend also reported this bug from their relay.",
+        }],
+        labels=[],
+    )
+    tls_draft = analysis(
+        title="Tor falls back to OpenSSL default TLS groups",
+        summary="An issue reports TLS group fallback on OpenSSL 4.x.",
+        why_it_matters="",
+        category="directory-authority",
+        state="developing",
+        confidence="reported",
+        tags=["directory-authority", "security", "relay"],
+        evidence=["Start it offline:\n\n tor --DisableNetwork 1"],
+    )
+    tls_writer = Analyzer(cfg, editorial_polish=True)
+    tls_writer.client = FakeLLM(tls_draft, {
+        "title": tls_draft["title"],
+        "summary": tls_draft["summary"],
+        "why_it_matters": "",
+    })
+    tls_out = tls_writer.analyze(tls_src)
+    assert tls_out["category"] == "security"
+    assert tls_out["tags"] == ["security", "relay"]
+
+    # 4. Excluded security + dirauth-labeled stories never retain category="directory-authority",
+    # even though has_dirauth_signal is True, while keeping the "directory-authority" tag.
+    sec_da_src = item(
+        kind="gitlab_issue",
+        url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/41999",
+        authority="dirauth-operator",
+        title="Security vulnerability in directory authority vote parser",
+        content="CVE-2026-4444 allows crashing a directory authority during vote parsing.",
+        labels=["Directory Authority (dirauth)", "Security"],
+    )
+    sec_da_draft = analysis(
+        title="CVE-2026-4444 crash reported in directory authority vote parser",
+        summary="A security issue affects directory authority vote parsing.",
+        why_it_matters="",
+        category="directory-authority",
+        state="developing",
+        confidence="reported",
+        tags=["directory-authority", "security"],
+        evidence=["CVE-2026-4444 allows crashing a directory authority during vote parsing."],
+    )
+    sec_da_writer = Analyzer(cfg, editorial_polish=True)
+    sec_da_writer.client = FakeLLM(sec_da_draft, {
+        "title": sec_da_draft["title"],
+        "summary": sec_da_draft["summary"],
+        "why_it_matters": "",
+    })
+    sec_da_out = sec_da_writer.analyze(sec_da_src)
+    assert sec_da_out["category"] == "security"
+    assert sec_da_out["tags"] == ["directory-authority", "security"]

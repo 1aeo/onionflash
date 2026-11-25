@@ -5,25 +5,30 @@ from __future__ import annotations
 from collections.abc import Iterable
 import copy
 import json
+import math
 import re
 
 from . import editorial, render, source_packet
 from .analyze import MIN_EVIDENCE_CHARS
 from .comments import analysis_context, budget_unchanged_note_ids, note_key, prior_notes
-from .llm import strip_unreleased_tag, unquoted_mail_text, unquoted_text
+from .llm import is_quoted_list_post, strip_unreleased_tag, unquoted_mail_text, unquoted_text
 from .schema import SEMANTIC_FIELDS, UPDATE_FIELDS
-from .util import (after, digest, gitlab_refs, gitlab_url_variants, item_identity, normalize_evidence,
-                   release_mentions, safe_canonical_url, saved_object, story_cluster, thread_subject,
-                   trove_ids)
+from .util import (
+    DIRAUTH_NICKNAME_RE, after, cve_ids, digest, duplicate_issue_refs, gitlab_refs,
+    gitlab_url_variants, is_protected_duplicate_issue, item_identity, normalize_evidence,
+    plain_text, release_mentions, safe_canonical_url, saved_object, story_cluster,
+    thread_subject, trove_ids,
+)
 
 
 UNVERIFIED_ROUTE = "Attached to an existing story for update review"
-COVERAGE_ROWS = 32
-COVERAGE_CHARS = 12000
-COVERAGE_SUMMARY_CHARS = 200
+COVERAGE_ROWS = 40
+COVERAGE_CHARS = 18000
+COVERAGE_SUMMARY_CHARS = 300
 RELATED_SUMMARY_CHARS = 400
-RELATED_LIMIT = 6
+RELATED_LIMIT = 10
 THREAD_WINDOW_DAYS = 45
+LEXICAL_WINDOW_DAYS = 90
 _UNSET = object()
 
 
@@ -295,7 +300,8 @@ def own_update_input(db, row: dict, item: dict, *, existing=_UNSET) -> tuple[str
     if existing is _UNSET:
         existing = existing_story(db, row)
     if existing is None:
-        return "story", item
+        root = _thread_root_item(db, row, item)
+        return ("story", {**item, "thread_root": root}) if root is not None else ("story", item)
     previous = json.loads(existing["payload"])
     writer, _, _ = writer_info(previous, db)
     mode = _mode(previous, item, db)
@@ -462,25 +468,75 @@ def _stories_for_urls(db, urls: list[str]) -> list[dict]:
     return _mapped_stories(db, f"LOWER(url) IN ({','.join('?' * len(variants))})", *variants) if variants else []
 
 
-def _thread_matches(db, row: dict, item: dict) -> list[dict]:
-    subject, is_reply = thread_subject(item) if row.get("source_id") else ("", False)
+def _thread_candidates(db, row: dict, item: dict, *, mapped_only: bool) -> list[tuple[str | None, dict, bool]]:
+    if db is None or not isinstance(item, dict) or not row.get("source_id") or not isinstance(item.get("published_at"), str):
+        return []
+    subject, is_reply = thread_subject(item)
     if not (subject and is_reply):
         return []
-    earliest = after(-THREAD_WINDOW_DAYS * 86400, item["published_at"])
+    try:
+        earliest = after(-THREAD_WINDOW_DAYS * 86400, item["published_at"])
+    except ValueError:
+        return []
+    where = "source_id=? AND id!=?" + (f" AND {_MAPPED_PREDICATE}" if mapped_only else "")
+    params = (row["source_id"], row.get("id") or item.get("id") or "", *([UNVERIFIED_ROUTE] if mapped_only else ()))
+    rows = db.execute(f"SELECT story_id,CAST(payload AS BLOB) FROM items WHERE {where}", params).fetchall()
+    out: list[tuple[str | None, dict, bool]] = []
+    for sid, payload_blob in rows:
+        other = saved_object(payload_blob)
+        if not (isinstance(other, dict) and isinstance(other.get("published_at"), str)):
+            continue
+        if not (earliest <= other["published_at"] <= item["published_at"]):
+            continue
+        other_subj, other_is_reply = thread_subject(other)
+        if other_subj == subject:
+            out.append((sid, other, other_is_reply))
+    return out
+
+
+def _thread_matches(db, row: dict, item: dict) -> list[dict]:
+    return _unique_live_stories(db, (sid for sid, _, _ in _thread_candidates(db, row, item, mapped_only=True)))
+
+
+def _thread_root_item(db, row: dict, item: dict) -> dict | None:
+    """Return bounded parent-thread metadata from the earliest same-list item matching `item`'s reply subject."""
+    candidates = _thread_candidates(db, row, item, mapped_only=False)
+    if not candidates:
+        return None
+    _, other, _ = min(candidates, key=lambda entry: (entry[1]["published_at"], entry[2], str(entry[1].get("url") or "")))
+    raw_body = other.get("source_content") if isinstance(other.get("source_content"), str) else (other.get("content") or "")
+    unquoted = unquoted_mail_text(raw_body) if raw_body else ""
+    return {
+        "title": plain_text(other.get("title") or "", 200, html=False),
+        "published_at": other["published_at"],
+        "url": safe_canonical_url(other.get("url")) or str(other.get("url") or ""),
+        "excerpt": plain_text(unquoted, 360, html=False),
+    }
+
+
+def _stories_closed_by_mr(db, item: dict) -> list[dict]:
+    """Return live stories mapped to merged MRs whose closing refs explicitly target `item`'s URL."""
+    item_variants = {v.lower() for v in gitlab_url_variants(item.get("url"))}
+    if not item_variants:
+        return []
     rows = db.execute(
-        f"SELECT story_id,CAST(payload AS BLOB) FROM items WHERE source_id=? AND id!=? AND {_MAPPED_PREDICATE}",
-        (row["source_id"], row.get("id") or "", UNVERIFIED_ROUTE),
+        f"""SELECT story_id, CAST(payload AS BLOB) AS payload
+            FROM items
+            WHERE {_MAPPED_PREDICATE}
+              AND (typeof(payload)!='text'
+                   OR (json_valid(payload) AND json_type(payload)='object'
+                       AND json_extract(payload,'$.kind')='gitlab_mr'))""",
+        (UNVERIFIED_ROUTE,),
     ).fetchall()
-    return _unique_live_stories(
-        db,
-        (
-            sid for sid, payload_blob in rows
-            if (other := saved_object(payload_blob))
-            and isinstance(other.get("published_at"), str)
-            and earliest <= other["published_at"] <= item["published_at"]
-            and thread_subject(other)[0] == subject
-        ),
-    )
+    matching_sids: list[str] = []
+    for sid, payload_blob in rows:
+        mr = saved_object(payload_blob)
+        if not isinstance(mr, dict) or mr.get("kind") != "gitlab_mr" or mr.get("upstream_state") != "merged":
+            continue
+        closing, _ = gitlab_refs(mr)
+        if any(ref.lower() in item_variants for ref in closing):
+            matching_sids.append(sid)
+    return _unique_live_stories(db, matching_sids)
 
 
 def associate(db, row: dict) -> tuple[dict | None, str | None]:
@@ -524,6 +580,12 @@ def associate(db, row: dict) -> tuple[dict | None, str | None]:
         closing, _ = gitlab_refs(item)
         if closing and (matches := _stories_for_urls(db, closing)):
             return (matches[0], "closing_ref") if len(matches) == 1 else (None, None)
+    if item.get("kind") == "gitlab_issue":
+        if is_protected_duplicate_issue(item) and (dup_refs := duplicate_issue_refs(item)):
+            if matches := _stories_for_urls(db, dup_refs):
+                return (matches[0], "duplicate_ref") if len(matches) == 1 else (None, None)
+        if matches := _stories_closed_by_mr(db, item):
+            return (matches[0], "closed_by_mr") if len(matches) == 1 else (None, None)
     if matches := _thread_matches(db, row, item):
         return (matches[0], "thread") if len(matches) == 1 else (None, None)
     return None, None
@@ -534,9 +596,9 @@ def existing_story(db, row: dict):
     return associate(db, row)[0]
 
 
-def _stories_for_trove(db, trove_id: str) -> list[dict]:
-    """Return live stories whose content or mapped source items explicitly cite `trove_id`."""
-    pattern = f"%{trove_id}%"
+def _stories_for_identifier(db, identifier: str, extractor) -> list[dict]:
+    """Return live stories whose content or mapped source items explicitly cite `identifier`."""
+    pattern = f"%{identifier}%"
     ids: list[str] = []
     for story_row in db.execute(
         "SELECT id,CASE WHEN typeof(payload)='text' THEN CAST(payload AS BLOB) END AS payload "
@@ -548,21 +610,90 @@ def _stories_for_trove(db, trove_id: str) -> list[dict]:
             continue
         text = "\n".join(str(story.get(k) or "") for k in ("title", "summary", "why_it_matters", "latest_update"))
         updates = "\n".join(str(u.get("text") or "") for u in (story.get("updates") or ()) if isinstance(u, dict))
-        if trove_id in trove_ids({"title": text, "content": updates}):
+        if identifier in extractor({"title": text, "content": updates}):
             ids.append(story_row["id"])
     for item_row in db.execute(
         f"SELECT story_id,CASE WHEN typeof(payload)='text' THEN CAST(payload AS BLOB) END AS payload "
         f"FROM items WHERE payload LIKE ? AND {_MAPPED_PREDICATE}",
         (pattern, UNVERIFIED_ROUTE),
     ).fetchall():
-        item = saved_object(item_row["payload"])
-        if item and trove_id in trove_ids(item):
+        mapped_item = saved_object(item_row["payload"])
+        if mapped_item and identifier in extractor(mapped_item):
             ids.append(item_row["story_id"])
     return _unique_live_stories(db, ids)
 
 
+def _stories_for_trove(db, trove_id: str) -> list[dict]:
+    """Return live stories whose content or mapped source items explicitly cite `trove_id`."""
+    return _stories_for_identifier(db, trove_id, trove_ids)
+
+
+_RARE_TOKEN_RE = re.compile(r"(?=[a-z0-9]*[a-z])[a-z0-9]{4,}")
+_LEXICAL_STOPWORDS = frozenset({
+    "tor", "arti", "tails", "browser", "onion", "flash", "project", "release", "released", "releases",
+    "update", "updated", "updates", "issue", "issues", "ticket", "tickets", "merge", "merged", "merges",
+    "request", "requests", "requested", "fix", "fixes", "fixed", "fixing", "patch", "patches", "patched",
+    "version", "versions", "client", "clients", "server", "servers", "network", "networks",
+    "relay", "relays", "change", "changes", "changed", "support", "supported", "supports",
+    "default", "defaults", "service", "services", "report", "reported", "reports", "reporting",
+    "security", "status", "state", "upstream", "downstream", "operator", "operators",
+    "maintainer", "maintainers", "developer", "developers", "author", "authors", "user", "users",
+    "thread", "threads", "reply", "replies", "message", "messages", "comment", "comments",
+    "post", "posted", "posts", "announcement", "announced", "announces", "notice", "notices",
+    "summary", "detail", "details", "description", "section", "directory", "authority", "authorities",
+    "about", "above", "across", "after", "again", "against", "already", "also", "among", "another",
+    "around", "because", "before", "being", "below", "between", "both", "case", "cases", "could",
+    "date", "dates", "does", "doing", "done", "down", "during", "each", "either", "else", "even",
+    "every", "find", "first", "following", "found", "from", "full", "further", "give", "given",
+    "gives", "good", "have", "having", "hello", "here", "high", "however", "into", "just", "keep",
+    "keeps", "kept", "known", "last", "later", "less", "like", "likely", "long", "made", "make",
+    "makes", "many", "month", "months", "more", "most", "much", "must", "near", "need", "needs",
+    "never", "next", "none", "normal", "note", "noted", "notes", "only", "open", "opened", "other",
+    "others", "over", "part", "parts", "past", "perhaps", "please", "possible", "prior", "public",
+    "rather", "recent", "recently", "regards", "said", "same", "says", "second", "seem", "seems",
+    "several", "short", "should", "show", "shown", "shows", "since", "some", "soon", "still",
+    "such", "take", "takes", "than", "thank", "thanks", "that", "their", "them", "then", "there",
+    "these", "they", "third", "this", "those", "though", "three", "through", "time", "times",
+    "today", "under", "until", "used", "using", "various", "very", "want", "wants", "week",
+    "weeks", "well", "were", "what", "when", "where", "which", "while", "will", "with", "within",
+    "without", "work", "worked", "working", "works", "would", "year", "years",
+    "https", "http", "gitlab", "torproject", "lists", "mailman3", "hyperkitty", "html", "mail",
+    "blog", "forum",
+})
+
+
+def _normalize_rare_token(token: str) -> str:
+    if len(token) >= 5 and token.endswith("s") and not token.endswith(("ss", "us", "is", "as", "os")):
+        return token[:-1]
+    return token
+
+
+def _rare_tokens(text: str) -> set[str]:
+    tokens = (_normalize_rare_token(tok) for tok in _RARE_TOKEN_RE.findall(text.casefold()))
+    return {tok for tok in tokens if tok not in _LEXICAL_STOPWORDS}
+
+
+def _item_search_text(item: dict) -> str:
+    title = item.get("title") if isinstance(item.get("title"), str) else ""
+    body = item.get("source_content") if isinstance(item.get("source_content"), str) else (item.get("content") or "")
+    if is_quoted_list_post(item.get("url"), body):
+        body = unquoted_mail_text(body)
+    comments = "\n".join(
+        str(note.get("body") or "")
+        for note in (item.get("public_comments") or ())
+        if isinstance(note, dict)
+    )
+    return "\n".join((title, body, comments))
+
+
+def _story_search_text(story: dict) -> str:
+    fields = [str(story.get(k) or "") for k in ("title", "summary", "why_it_matters", "latest_update")]
+    updates = [str(u.get("text") or "") for u in (story.get("updates") or ()) if isinstance(u, dict)]
+    return "\n".join((*fields, *updates))
+
+
 def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = frozenset()) -> list[tuple[str, str]]:
-    """Up to 6 active related (story_id, reason) pairs for coverage comparison."""
+    """Up to `RELATED_LIMIT` active related `(story_id, reason)` pairs for coverage comparison."""
     seen = set(exclude)
     pairs: list[tuple[str, str]] = []
 
@@ -586,6 +717,9 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
     for tid in trove_ids(item):
         for match in _stories_for_trove(db, tid):
             _add(match["id"], f"references {tid}")
+    for cid in cve_ids(item):
+        for match in _stories_for_identifier(db, cid, cve_ids):
+            _add(match["id"], f"references {cid}")
     release_keys = release_mentions(item)
     if (row.get("cluster_key") or "").startswith("release:") and row["cluster_key"] not in release_keys:
         release_keys.insert(0, row["cluster_key"])
@@ -598,6 +732,61 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
             _add(match["id"], reason)
     for match in _thread_matches(db, row, item):
         _add(match["id"], "same thread")
+    if len(pairs) < RELATED_LIMIT:
+        item_text = _item_search_text(item)
+        item_auths = {m.group(0).casefold() for m in DIRAUTH_NICKNAME_RE.finditer(item_text)}
+        item_tokens = _rare_tokens(item_text)
+        pub_stamp = item.get("published_at") or item.get("updated_at")
+        cutoff_90d = None
+        if isinstance(pub_stamp, str) and pub_stamp:
+            try:
+                cutoff_90d = after(-LEXICAL_WINDOW_DAYS * 86400, pub_stamp)
+            except ValueError:
+                cutoff_90d = None
+        if item_auths or (len(item_tokens) >= 2 and cutoff_90d is not None):
+            candidates: list[tuple[str, str, str]] = []
+            for srow in db.execute(
+                "SELECT s.id,s.updated_at,CASE WHEN typeof(s.payload)='text' THEN CAST(s.payload AS BLOB) END AS payload "
+                "FROM stories s LEFT JOIN editorial_controls e ON e.story_id=s.id "
+                "WHERE COALESCE(e.retracted,0)=0 ORDER BY s.updated_at DESC,s.id"
+            ).fetchall():
+                if srow["id"] in seen:
+                    continue
+                if story_obj := saved_object(srow["payload"]):
+                    candidates.append((srow["id"], srow["updated_at"], _story_search_text(story_obj)))
+            if item_auths:
+                for sid, _, stext in candidates:
+                    if item_auths & {m.group(0).casefold() for m in DIRAUTH_NICKNAME_RE.finditer(stext)}:
+                        _add(sid, "shared authority")
+                        if len(pairs) >= RELATED_LIMIT:
+                            break
+            if len(pairs) < RELATED_LIMIT and len(item_tokens) >= 2 and cutoff_90d is not None:
+                window_entries = [
+                    (sid, upd_at, _rare_tokens(stext))
+                    for sid, upd_at, stext in candidates
+                    if sid not in seen and isinstance(upd_at, str) and upd_at >= cutoff_90d
+                ]
+                df: dict[str, int] = {}
+                for _, _, stoks in window_entries:
+                    for tok in stoks:
+                        df[tok] = df.get(tok, 0) + 1
+                max_df = max(3, len(window_entries) // 3) if len(window_entries) >= 8 else len(window_entries) + 1
+                rare_item = {t for t in item_tokens if df.get(t, 0) <= max_df}
+                if len(rare_item) >= 2:
+                    scored: list[tuple[float, int, str, str]] = []
+                    for sid, upd_at, stoks in window_entries:
+                        rare_story = {t for t in stoks if df.get(t, 0) <= max_df}
+                        shared = rare_item & rare_story
+                        if len(shared) >= 2:
+                            overlap = len(shared) / min(len(rare_item), len(rare_story))
+                            if overlap >= 0.12 or len(shared) >= 4:
+                                idf_score = sum(math.log((len(window_entries) + 1) / (df.get(t, 0) + 1)) for t in shared)
+                                scored.append((idf_score, len(shared), upd_at, sid))
+                    scored.sort(reverse=True)
+                    for _, _, _, sid in scored:
+                        _add(sid, "shared technical terms")
+                        if len(pairs) >= RELATED_LIMIT:
+                            break
     return pairs
 
 
@@ -853,8 +1042,10 @@ def prepare(
         related_rows = related(db, row, item, excluded)
         earlier_ids = _earlier_decision_ids(db, row, excluded | {sid for sid, _ in related_rows})
         writer = data["editorial_item"]
+        thread_root = _thread_root_item(db, row, item) if existing is None else None
         packet, bindings = source_packet.build_packet(
-            db, item, data, public, writer, update=mode == "update", dirauth_users=dirauth_users, tor_core_users=tor_core_users
+            db, item, data, public, writer, update=mode == "update", dirauth_users=dirauth_users,
+            tor_core_users=tor_core_users, thread_root=thread_root,
         )
         binding["sources"] = bindings
         envelope.update(candidate=public, payload=data, packet=packet,

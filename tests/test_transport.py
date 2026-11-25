@@ -443,21 +443,22 @@ def test_redirect_never_forwards_completion_or_releases_spent_reservation(comple
 
 
 def test_redirects_cannot_exceed_budget_through_configured_fallbacks(completion_client):
-    """Stop fallback traversal once redirected attempts exhaust the 7-request review budget."""
+    """Stop fallback traversal once redirected attempts exhaust the `MAX_REVIEW_REQUESTS` budget."""
     record, requests, persisted, sent = *_ledger(), []
+    cap = review_gate.MAX_REVIEW_REQUESTS
 
     def _handle(request):
         assert persisted[-1]["request_budget"]["reserved"] == len(sent) + 1
         sent.append(request)
         return httpx.Response(307, headers={"location": "/same-origin-loop"})
 
-    fallbacks = [f"https://fallback-{number}.example/v1" for number in range(1, 10)]
+    fallbacks = [f"https://fallback-{number}.example/v1" for number in range(1, cap + 3)]
     client, _ = completion_client(_handle, fallbacks=fallbacks)
     with pytest.raises(review.ReviewLimitReached, match="budget exhausted"):
         _complete(client, requests)
-    _assert_charged(client, requests, record, sent, 7)
+    _assert_charged(client, requests, record, sent, cap)
     assert all(request.method == "POST" and request.url.path == "/v1/chat/completions" for request in sent)
-    assert [request.url.host for request in sent] == ["model.example", *[f"fallback-{n}.example" for n in range(1, 7)]]
+    assert [request.url.host for request in sent] == ["model.example", *[f"fallback-{n}.example" for n in range(1, cap)]]
 
 
 def test_explicit_fallback_after_redirect_has_its_own_reservation(completion_client):
@@ -539,8 +540,9 @@ def test_deadline_after_dispatch_keeps_request_charged(completion_client, failur
 
 
 def test_repeated_dispatched_timeouts_cannot_replenish_budget(completion_client):
-    """Enforce the 7-request ceiling across repeated dispatched ReadTimeouts."""
+    """Enforce the `MAX_REVIEW_REQUESTS` ceiling across repeated dispatched ReadTimeouts."""
     record, requests, _, clock, sent = *_ledger(), [0.0], []
+    cap = review_gate.MAX_REVIEW_REQUESTS
 
     def _handle(request):
         sent.append(request)
@@ -549,14 +551,14 @@ def test_repeated_dispatched_timeouts_cannot_replenish_budget(completion_client)
 
     client, _ = completion_client(_handle)
     _arm_deadline(client, clock)
-    for _ in range(7):
+    for _ in range(cap):
         clock[0] = 0.0
         with pytest.raises(AnalysisError):
             _complete(client, requests)
     clock[0] = 0.0
     with pytest.raises(review.ReviewLimitReached):
         _complete(client, requests)
-    _assert_charged(client, requests, record, sent, 7)
+    _assert_charged(client, requests, record, sent, cap)
 
 
 def test_response_body_timeout_remains_charged(completion_client):
@@ -687,13 +689,21 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
 
     def _handle(request):
         body = json.loads(request.content)
-        writer = body["max_tokens"] == 32768
+        schema_name = body["response_format"]["json_schema"]["name"]
+        stage_kind = {"onionflash_news": "writer", "onionflash_polish": "polish"}.get(schema_name, "review")
+        expected_max_tokens = {"writer": 32768, "polish": 1200, "review": review.OUTPUT_TOKENS}[stage_kind]
+        assert body["max_tokens"] == expected_max_tokens
         assert request.extensions["onionflash_deadline"] == clock[0] + 3610
         assert request.extensions["timeout"]["read"] == 3600
-        sent.append("writer" if writer else "review")
-        if (expire == "writer" and len(sent) == 1) or (expire == "review" and len(sent) == 2):
+        sent.append(stage_kind)
+        if (expire == "writer" and stage_kind == "writer") or (expire == "review" and stage_kind == "review" and sent.count("review") == 1):
             clock[0] += 300
-        return _httpx_completion(analysis(why_it_matters="") if writer else verdict())
+        if stage_kind == "writer":
+            return _httpx_completion(analysis(why_it_matters=""))
+        if stage_kind == "polish":
+            draft = json.loads(body["messages"][1]["content"])["draft"]
+            return _httpx_completion({k: draft[k] for k in ("title", "summary", "why_it_matters")})
+        return _httpx_completion(verdict())
 
     def _factory(settings, **kwargs):
         settings_seen.append(copy.deepcopy(settings))
@@ -717,7 +727,8 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
     saved = job(store)
     record = job_record(store)
     assert first["budget_reached"] and first["analysis_failed"] == 0
-    assert first["model_calls"] == len(sent) == (2 if expire == "review" else 1)
+    expected_first = {"writer": 1, "reservation": 2, "review": 3}[expire]
+    assert first["model_calls"] == len(sent) == expected_first
     assert saved["stage"] == ("verify" if expire == "review" else "review")
     assert record["request_budget"]["reserved"] == (1 if expire == "review" else 0)
     current = store.db.execute("SELECT status,attempts,rejections,last_error,next_attempt_at FROM items WHERE id=?", (row["id"],)).fetchone()
@@ -726,7 +737,7 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
     assert all(settings["timeout_seconds"] == 3600 and settings["total_timeout_seconds"] == 3610 for settings in settings_seen)
     second = cli.run(config, store)
     assert second["analysis_failed"] == 0 and second["model_calls"] == (1 if expire == "review" else 2)
-    assert sent == ["writer", "review", "review"]
+    assert sent == (["writer", "review", "review"] if expire == "writer" else ["writer", "polish", "review", "review"])
     assert len(store.stories()) == 1 and job(store) is None
 
 
@@ -1079,13 +1090,13 @@ def test_sse_truncated_length_is_non_retryable_and_limits_fail_closed(completion
 
 def test_streaming_json_fallback_midstream_timeout_and_identity_parity(completion_client):
     """Support plain JSON fallback responses, mid-stream SSE ReadTimeouts, and preserve policy_hash/cache_key."""
-    baseline_policy = "fac751e9add0193ca49981107e53a45da3bf1e27b7d3f21e93de4ce8cbfe8f92"
+    baseline_policy = "13f1f5f2590da90ac368267d99f969b337450dfd397c49b58c7b241e6f3a448d"
     assert review.policy_hash(copy.deepcopy(DEFAULTS)) == baseline_policy
     row = {"content_hash": "a" * 64}
     cfg_on = copy.deepcopy(DEFAULTS)
     cfg_on["llm"]["writer_reasoning"] = True
-    assert analyze.cache_key(row, DEFAULTS["llm"]) == "b389dd4d76a6ba5fdba8842485f8ca6c9308347cdca60e01c8ef230ca69c7de1"
-    assert analyze.cache_key(row, cfg_on["llm"]) == "74f6d3dc40707bb862af24f4ead403f3fb0373fbb933f8d542e962aa6b38044c"
+    assert analyze.cache_key(row, DEFAULTS["llm"]) == "0b41d8a1159ebffddff08127af237a4a42c30e0ab9b2a9bcddd4c52e65af6504"
+    assert analyze.cache_key(row, cfg_on["llm"]) == "549582e684ac6e4e204f60553e148a0613398fe923f770a647d3267a79a43cac"
 
     json_client, _ = completion_client(lambda _req: _httpx_completion({"mode": "json"}))
     _, req1, _ = _ledger()

@@ -7,13 +7,15 @@ import sqlite3
 import pytest
 
 from helpers import (
-    DAMAGE, DATE, Reviewer, Writer, analysis, damage_item, editorial_act, finish_reviewed, invoke_cli, item,
-    item_row, job, job_record, pending, queued_row, run_gate, seed_ignored, seed_rejected, seed_story,
+    DAMAGE, DATE, LATER, TOR_WORK_ITEM_URL, FakeClient, Reviewer, Writer, analysis, damage_item, decision_codes,
+    editorial_act, enrich_with_client, finish_reviewed, gitlab_source, gql_note, gql_notes_response, invoke_cli, item,
+    item_row, job, job_record, make_config, pending, queued_row, run_gate, seed_ignored, seed_rejected, seed_story,
     verdict, write_toml,
 )
 from onionflash import cli, editorial, rejection, review, review_gate
 from onionflash.analyze import AnalysisError, cache_key
 from onionflash.config import DEFAULTS
+from onionflash.store import Store
 from onionflash.util import after
 
 
@@ -647,3 +649,119 @@ def test_retry_item_evicts_corrupt_draft_json_and_stale_revision_draft_on_locked
     ).fetchone()
     assert json.loads(saved_res)["update"] == "Second revision fresh draft sentence."
     assert json.loads(saved_src)["content"] == "Completely different second revision body."
+
+
+def test_operator_retry_survives_gitlab_comment_enrichment_and_same_second_race(tmp_path):
+    """Preserve operator retry recency exemption after GitLab comment enrichment alters content_hash."""
+    cfg = make_config(tmp_path, sources=[gitlab_source()], comments={"enabled": True})
+    with Store(cfg["storage"]["database"]) as store:
+        old_ts = "2026-01-01T00:00:00Z"
+        src = item(source_id="tor-issues", url=TOR_WORK_ITEM_URL, kind="gitlab_issue",
+                   published_at=old_ts, updated_at=old_ts, collected_at=DATE)
+        store.ingest(src, DATE)
+        row = item_row(store, src["id"])
+        assert run_gate(cfg, store, row, Writer(), Reviewer(verdict(), verdict()))["status"] == "ignored"
+        assert decision_codes(store, row) == ["skipped.gate.not_recent"]
+
+        retry_at = LATER
+        rejection.retry_item(store, row["id"], row["content_hash"], "Please check discussion comments", observed=retry_at)
+        old_hash = store.db.execute("SELECT content_hash FROM items WHERE id=?", (row["id"],)).fetchone()[0]
+
+        enrich_ts = after(60, retry_at)
+        resp = gql_notes_response([gql_note("1", createdAt="2026-01-02T00:00:00Z",
+                                            body="Detailed old upstream comment triggering content hash change.")])
+        assert enrich_with_client(cfg, store, FakeClient([resp]), enrich_ts)["changed"] == 1
+        enriched = item_row(store, row["id"])
+        assert enriched["content_hash"] != old_hash
+        assert json.loads(enriched["payload"])["comments_checked_at"] == enrich_ts
+        assert review_gate._has_operator_retry(store.db, enriched) is True
+        assert review_gate._not_recent(cfg, store, enriched, json.loads(enriched["payload"]), after(60, enrich_ts)) is None
+
+        result = run_gate(cfg, store, enriched, Writer(), Reviewer(verdict(), verdict()))
+        assert result["status"] == "published" and len(store.stories()) == 1
+
+        # Same-second enrichment (comments_checked_at == retry_at) also qualifies while pre-retry skips stay ignored.
+    cfg2 = make_config(tmp_path / "same_second", sources=[gitlab_source()], comments={"enabled": True})
+    with Store(cfg2["storage"]["database"]) as store2:
+        old_ts = "2026-01-01T00:00:00Z"
+        src2 = item(source_id="tor-issues", url=TOR_WORK_ITEM_URL,
+                    kind="gitlab_issue", published_at=old_ts, updated_at=old_ts, collected_at=DATE)
+        store2.ingest(src2, DATE)
+        row2 = item_row(store2, src2["id"])
+        assert run_gate(cfg2, store2, row2, Writer(), Reviewer(verdict(), verdict()))["status"] == "ignored"
+        same_ts = after(120, LATER)
+        rejection.retry_item(store2, row2["id"], row2["content_hash"], "Retry same second", observed=same_ts)
+        resp2 = gql_notes_response([gql_note("2", createdAt="2026-01-03T00:00:00Z",
+                                             body="Same-second enriched comment text.")])
+        assert enrich_with_client(cfg2, store2, FakeClient([resp2]), same_ts)["changed"] == 1
+        enriched2 = item_row(store2, row2["id"])
+        assert review_gate._has_operator_retry(store2.db, enriched2) is True
+        assert run_gate(cfg2, store2, enriched2, Writer(), Reviewer(verdict(), verdict()))["status"] == "published"
+
+
+def test_operator_retry_exemption_clears_after_terminal_decision_and_skips_stale_or_non_gitlab(tmp_path, monkeypatch):
+    """Stop exempting once a post-retry terminal decision logs, or when enrichment is stale or non-GitLab."""
+    from onionflash import comments
+
+    monkeypatch.setattr(comments, "INTERVAL_SECONDS", 30)
+    cfg = make_config(tmp_path, sources=[gitlab_source()], comments={"enabled": True})
+    with Store(cfg["storage"]["database"]) as store:
+        old_ts = "2026-01-01T00:00:00Z"
+        src = item(source_id="tor-issues", url=TOR_WORK_ITEM_URL, kind="gitlab_issue",
+                   published_at=old_ts, updated_at=old_ts, collected_at=DATE)
+        store.ingest(src, DATE)
+        row = item_row(store, src["id"])
+        assert run_gate(cfg, store, row, Writer(), Reviewer(verdict(), verdict()))["status"] == "ignored"
+
+        retry_at = LATER
+        rejection.retry_item(store, row["id"], row["content_hash"], "Re-evaluate once", observed=retry_at)
+        enrich_ts = after(60, retry_at)
+        resp = gql_notes_response([gql_note("10", createdAt="2026-01-02T00:00:00Z", body="Enriched once.")])
+        assert enrich_with_client(cfg, store, FakeClient([resp]), enrich_ts)["changed"] == 1
+        enriched = item_row(store, row["id"])
+        assert review_gate._has_operator_retry(store.db, enriched) is True
+
+        # Check stale comments_checked_at BEFORE any terminal decision so the timestamp guard itself is isolated.
+        stale = dict(enriched)
+        payload = json.loads(stale["payload"])
+        payload["comments_checked_at"] = "2026-01-05T00:00:00Z"
+        stale["payload"] = json.dumps(payload)
+        assert review_gate._has_operator_retry(store.db, stale) is False
+
+        skip_result = run_gate(cfg, store, enriched, Writer(), Reviewer(verdict("skip", criterion="news_value")))
+        assert skip_result["status"] == "ignored"
+        assert review_gate._has_operator_retry(store.db, item_row(store, row["id"])) is False
+
+        # Exact-hash retry exemption also clears once a terminal decision follows that retry.
+        same_hash_src = item(id="https://example.org/exact-hash-retry", url="https://example.org/exact-hash-retry",
+                             kind="feed", published_at=old_ts, updated_at=old_ts, collected_at=DATE)
+        store.ingest(same_hash_src, DATE)
+        same_row = item_row(store, same_hash_src["id"])
+        assert run_gate(cfg, store, same_row, Writer(), Reviewer(verdict(), verdict()))["status"] == "ignored"
+        rejection.retry_item(store, same_row["id"], same_row["content_hash"], "Retry exact hash", observed=retry_at)
+        assert review_gate._has_operator_retry(store.db, item_row(store, same_row["id"])) is True
+        same_skip = run_gate(cfg, store, item_row(store, same_row["id"]), Writer(), Reviewer(verdict("skip", criterion="news_value")))
+        assert same_skip["status"] == "ignored"
+        assert review_gate._has_operator_retry(store.db, item_row(store, same_row["id"])) is False
+
+        later_ts = after(120, retry_at)
+        edited_src = {**src, "content": "Minor upstream wording fix after terminal skip.", "updated_at": after(120, old_ts)}
+        merged = comments.merge_cached_comments(store, edited_src, gitlab_source(), later_ts)
+        assert store.ingest(merged, later_ts)
+        resp_later = gql_notes_response([gql_note("11", createdAt="2026-01-03T00:00:00Z", body="Second edit.")])
+        assert enrich_with_client(cfg, store, FakeClient([resp_later]), after(60, later_ts))["changed"] == 1
+        after_terminal = item_row(store, row["id"])
+        assert review_gate._has_operator_retry(store.db, after_terminal) is False
+
+        feed_src = item(id="https://example.org/feed-item", url="https://example.org/feed-item",
+                        kind="feed", published_at=old_ts, updated_at=old_ts, collected_at=DATE)
+        store.ingest(feed_src, DATE)
+        feed_row = item_row(store, feed_src["id"])
+        run_gate(cfg, store, feed_row, Writer(), Reviewer(verdict(), verdict()))
+        feed_ignored = item_row(store, feed_src["id"])
+        rejection.retry_item(store, feed_ignored["id"], feed_ignored["content_hash"], "Retry feed", observed=retry_at)
+        feed_retried = item_row(store, feed_src["id"])
+        feed_payload = json.loads(feed_retried["payload"])
+        feed_payload["comments_checked_at"] = enrich_ts
+        mutated_feed = {**feed_retried, "content_hash": "f" * 64, "payload": json.dumps(feed_payload)}
+        assert review_gate._has_operator_retry(store.db, mutated_feed) is False

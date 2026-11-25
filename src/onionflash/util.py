@@ -428,6 +428,11 @@ DIRAUTH_GITLAB_USERS = (
     "usura",      # dizum
     "weasel",     # tor26
 )
+DIRAUTH_NICKNAMES = (
+    "maatuska", "bastet", "moria1", "dannenberg", "dizum",
+    "faravahar", "gabelmoo", "longclaw", "sekhmet", "tor26", "serge",
+)
+DIRAUTH_NICKNAME_RE = re.compile(r"\b(?:" + "|".join(DIRAUTH_NICKNAMES) + r")\b", re.I)
 _DIRAUTH_LABELS = frozenset({"directory authority (dirauth)", "dirauth"})
 DEFAULT_TOR_CORE_USERS: tuple[str, ...] = (
     "acute", "agix", "agrabeli", "ahf", "alsmith", "anadahz", "anarcat", "andreas", "anonym",
@@ -580,6 +585,48 @@ _CLOSING_SPAN = re.compile(
     re.I,
 )
 _ANY_REF = re.compile(_REF_TOKEN, re.I)
+DUP_SECURITY_GUARD_RE = re.compile(
+    r"\b(?:vulnerabilit\w*|exploit\w*|null[- ]?(?:pointer[- ]|ptr[- ])?deref\w*|use[- ]after[- ]free|buffer\s+overflow|"
+    r"out[- ]of[- ]bounds|remote\s+code(?:\s+execution)?)\b",
+    re.I,
+)
+_DUP_LABELS = frozenset({"duplicate", "status::duplicate"})
+_NOT_DUP_RE = re.compile(
+    r"\b(?:(?:is|was|are|were)n['’]?t\s+(?:a\s+)?|not\s+(?:a\s+)?|no\s+|non[- ]?)(?:duplicates?\b|dup\b)",
+    re.I,
+)
+_DUPLICATE_ISSUE_SPAN_RE = re.compile(
+    rf"\b(?:closed\s+as\s+(?:a\s+)?duplicate(?:\s+of)?|dup(?:licate)?\s+of|dup\s*:|duplicates?)\s*:?\s*"
+    rf"({_REF_TOKEN}(?:\s*(?:,|and)\s*{_REF_TOKEN})*)",
+    re.I,
+)
+_DIRAUTH_SECURITY_OR_DOS_RE = re.compile(
+    r"\b(?:vulnerabilit\w*|exploit\w*|compromis\w*|hack(?:ed|ing)?|breach\w*|tamper\w*|deanonymiz\w*|"
+    r"ddos|dos|denial[- ]of[- ]service|flood(?:ing|ed|s)?|attack(?:ed|ing|s|ers?)?|"
+    r"overflow|use[- ]after[- ]free|out[- ]of[- ]bounds|null[- ]?(?:pointer|ptr)[- ]?deref\w*|"
+    r"rce|remote\s+code|malicious|evasion|bypass\w*)\b",
+    re.I,
+)
+_DIRAUTH_OPERATIONAL_TOPIC_RE = re.compile(
+    r"\b(?:dirauth|directory\s+authorit\w*|bridge\s+authorit\w*|dirvote|consensus|vot(?:e|es|ing)|"
+    r"bwauth|bandwidth\s+authorit\w*|v3ident|signing\s+key|identity\s+key|authority\s+key|"
+    r"authority\s+list|dirauth\s+list|default\s+authorit\w*|ipv[46]|dual[- ]stack|subnet|"
+    r"migrat(?:e|ion|ing)|ip\s+(?:change|address|migrat\w*)|address\s+change|outage|offline|"
+    r"unreachable|overload\w*|hardware|descriptor\s+upload|shared[- ]random|srv|guard\s+flags?|"
+    r"missing\s+from\s+(?:the\s+)?consensus)\b",
+    re.I,
+)
+_DIRAUTH_TITLE_OP_RE = re.compile(
+    r"\b(?:address|ipv[46]|dual[- ]stack|subnet|migrat\w*|ip\b|keys?|v3ident|cert(?:ificate)?|"
+    r"rotat\w*|retir\w*|remov\w*|add(?:s|ed|ing)?|list|vot(?:e|es|ing)|consensus|dirvote|bwauth|"
+    r"overload\w*|outage|offline|unreachable|degrad\w*|timeout\w*|upload\w*|guard\s+flags?|"
+    r"srv|shared[- ]random|stale|missing|replac\w*|hardware|operational)\b",
+    re.I,
+)
+_DIRAUTH_CHORE_RE = re.compile(
+    r"\b(?:spelling\s+typo|comment\s+typo|minor\s+formatting|formatting\s+note)\b",
+    re.I,
+)
 _RELEASE_MENTION = re.compile(
     rf"\b({'|'.join(_PRODUCT_NAMES.values())})[- ]{_RELEASE_QUALIFIERS}v?(\d+\.\d+(?:[\w.-]*\w)?)(?!(?:\w|\.\w))",
     re.I,
@@ -767,3 +814,129 @@ def mandatory_news_rule(item: dict) -> str | None:
     if is_torproject_new_thread(item):
         return "torproject_new_thread"
     return None
+
+
+def is_protected_duplicate_issue(item: dict) -> bool:
+    """Return whether a duplicate GitLab issue carries security cues that bar fast-skipping."""
+    if not isinstance(item, dict):
+        return False
+    if (
+        "security" in folded_labels(item)
+        or is_hackerone_item(item)
+        or is_trove_item(item)
+        or bool(cve_ids(item))
+        or bool(trove_ids(item))
+    ):
+        return True
+    _, full_text = _item_texts(item)
+    return bool(DUP_SECURITY_GUARD_RE.search(full_text))
+
+
+def duplicate_issue_refs(item: dict) -> list[str]:
+    """Extract canonical GitLab URLs targeted by a closed duplicate issue, or `[]` when negated or ambiguous."""
+    if not isinstance(item, dict) or item.get("kind") != "gitlab_issue" or item.get("upstream_state") != "closed":
+        return []
+    _, full_text = _item_texts(item)
+    if _NOT_DUP_RE.search(full_text):
+        return []
+    matches = list(_DUPLICATE_ISSUE_SPAN_RE.finditer(full_text))
+    if matches:
+        dup_snippet = "\n".join(m.group(1) for m in matches)
+        closing, mentioned = gitlab_refs(
+            {**item, "title": "", "content": dup_snippet, "source_content": dup_snippet, "public_comments": []}
+        )
+        return list(dict.fromkeys([*closing, *mentioned]))
+    if folded_labels(item) & _DUP_LABELS:
+        closing, mentioned = gitlab_refs(item)
+        all_refs = list(dict.fromkeys([*closing, *mentioned]))
+        return all_refs if len(all_refs) == 1 else []
+    return []
+
+
+def should_confirm_merged_mr(sources: Iterable[dict] | None) -> bool:
+    """Return whether `sources` consists solely of merged GitLab merge requests."""
+    items = list(sources) if sources is not None else []
+    return bool(items) and all(
+        isinstance(s, dict)
+        and s.get("kind") == "gitlab_mr"
+        and s.get("upstream_state") == "merged"
+        and s.get("authority") != "community"
+        for s in items
+    )
+
+
+def _source_full_text(source: dict) -> str:
+    title = source.get("title") if isinstance(source.get("title"), str) else ""
+    body = next((source[k] for k in ("source_content", "content", "unquoted_content") if isinstance(source.get(k), str)), "")
+    if not body and isinstance(source.get("passages"), list):
+        body = "\n".join(
+            str(p.get("text") or "")
+            for p in source["passages"]
+            if isinstance(p, dict) and isinstance(p.get("text"), str)
+        )
+    comments = (
+        str(note.get("body") or "")
+        for note in (source.get("public_comments") if isinstance(source.get("public_comments"), list) else ())
+        if isinstance(note, dict)
+    )
+    return "\n".join((title, body, *comments))
+
+
+_DIRAUTH_SIGNAL_RE = re.compile(
+    r"\b(?:dirauth|directory[- ]authorit\w*|bridge[- ]authorit\w*|bwauth|"
+    r"bandwidth[- ]authorit\w*|dirvote|v3ident|consensus|vot(?:e|es|ing))\b",
+    re.I,
+)
+
+
+def has_dirauth_signal(source: dict) -> bool:
+    """Return whether `source` explicitly carries a directory-authority label, host nickname, or voting/consensus term."""
+    if not isinstance(source, dict):
+        return False
+    if folded_labels(source) & (_DIRAUTH_LABELS | {"directory authority"}):
+        return True
+    text = _source_full_text(source)
+    return bool(DIRAUTH_NICKNAME_RE.search(text) or _DIRAUTH_SIGNAL_RE.search(text))
+
+
+def is_dirauth_category_story(sources: Iterable[dict] | None) -> bool:
+    """Return whether `sources` describes non-security, non-release directory-authority operations."""
+    items = list(sources) if sources is not None else []
+    if not items or not all(isinstance(s, dict) for s in items):
+        return False
+    texts = [_source_full_text(s) for s in items]
+    for s, text in zip(items, texts):
+        labels = folded_labels(s)
+        probe = {**s, "content": text} if "content" not in s and "source_content" not in s else s
+        if (
+            s.get("kind") == "tag"
+            or s.get("mandatory_news_rule") in {"trove", "release_announcement"}
+            or is_trove_item(probe)
+            or bool(trove_ids(s))
+            or bool(CVE_RE.search(text))
+            or is_hackerone_item(probe)
+            or is_official_release_announcement(probe)
+            or (s.get("kind") == "feed" and item_cluster({
+                "title": str(s.get("title") or ""), "content": text, "kind": "feed",
+                "url": str(s.get("url") or ""), **({"product": s["product"]} if s.get("product") else {}),
+            }).startswith("release:"))
+            or "security" in labels
+            or "dos" in labels
+            or "ddos" in labels
+            or any(lbl.startswith("severity::") for lbl in labels)
+            or bool(_DIRAUTH_SECURITY_OR_DOS_RE.search(text))
+        ):
+            return False
+    for s, text in zip(items, texts):
+        labels = folded_labels(s)
+        if labels & (_DIRAUTH_LABELS | {"directory authority"}):
+            return True
+        if _DIRAUTH_CHORE_RE.search(text):
+            continue
+        if s.get("authority") == "dirauth-operator" and has_dirauth_signal(s) and _DIRAUTH_OPERATIONAL_TOPIC_RE.search(text):
+            return True
+        title = str(s.get("title") or "")
+        if DIRAUTH_NICKNAME_RE.search(title) or re.search(r"\b(?:dirauth|directory\s+authorit\w*|bridge\s+authorit\w*)\b", title, re.I):
+            if _DIRAUTH_TITLE_OP_RE.search(title):
+                return True
+    return False

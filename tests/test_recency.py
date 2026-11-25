@@ -7,9 +7,9 @@ import pytest
 
 from helpers import (
     FakeClient, Reviewer, Writer, analysis, decision_codes, decision_rows, editorial_act, gitlab_source,
-    item, make_note, response, run_gate, seed_story, source, verdict, wire_analyzer,
+    item, make_note, response, run_gate, seed_source_story, seed_story, source, verdict, wire_analyzer,
 )
-from onionflash import analyze, comments, editorial, rejection, review_gate
+from onionflash import analyze, candidate, comments, editorial, rejection, review_gate
 from onionflash.collect import collect_source
 from onionflash.config import DEFAULTS
 from onionflash.source_packet import build_packet, source_fingerprint
@@ -287,3 +287,54 @@ def test_closed_issues_keep_their_closing_date_without_changing_hashes_or_writer
     assert closed_packet["sources"][0]["closed_at"] == "2026-10-07T17:16:54Z"
     assert "closed_at" not in unclosed_packet["sources"][0] and "closed_at" not in none_packet["sources"][0]
     assert closed_bindings == unclosed_bindings
+
+
+def test_old_closed_security_duplicate_attaches_and_bypasses_not_recent_while_uncovered_skips(context):
+    """Attach old closed `Security` duplicates via `duplicate_ref` while skipping uncovered old tickets."""
+    cfg, store = context
+    canon_url = ISSUES + "41240"
+    canon = seed_source_story(
+        store,
+        _verified(
+            url=canon_url,
+            labels=["Security"],
+            title="Canonical security issue",
+            content="Tracks #41240 security defect.",
+            published_at="2026-08-01T00:00:00Z",
+            updated_at="2026-11-05T00:00:00Z",
+        ),
+        at=COLLECTED,
+    )
+    old_sec_dup = _verified(
+        url=ISSUES + "41244",
+        labels=["Security", "Severity::medium"],
+        upstream_state="closed",
+        closed_at="2026-09-01T00:00:00Z",
+        published_at="2026-08-01T00:00:00Z",
+        updated_at=COLLECTED,
+        title="Duplicate security issue",
+        content="Closed as a duplicate of #41240.",
+    )
+    store.ingest(old_sec_dup, COLLECTED)
+    row_dup = store.pending(5, COLLECTED)[0]
+    assert candidate.associate(store.db, row_dup)[1] == "duplicate_ref"
+    res_dup = run_gate(cfg, store, row_dup, Writer(), Reviewer(verdict(), verdict()), COLLECTED)
+    assert res_dup["status"] == "published" and len(store.stories()) == 1
+    assert store.stories()[0]["id"] == canon["id"]
+
+    old_uncovered = _verified(
+        url=ISSUES + "41249",
+        labels=["Security", "Severity::medium"],
+        upstream_state="closed",
+        closed_at="2026-09-01T00:00:00Z",
+        published_at="2026-08-01T00:00:00Z",
+        updated_at=COLLECTED,
+        title="Uncovered duplicate security issue",
+        content="Closed as a duplicate of #99999.",
+    )
+    store.ingest(old_uncovered, COLLECTED)
+    row_uncov = store.pending(5, COLLECTED)[0]
+    assert candidate.associate(store.db, row_uncov) == (None, None)
+    writer_uncov = Writer()
+    assert run_gate(cfg, store, row_uncov, writer_uncov, Reviewer(), COLLECTED)["status"] == "ignored"
+    assert writer_uncov.calls == [] and decision_codes(store, row_uncov)[-1] == SKIPPED
