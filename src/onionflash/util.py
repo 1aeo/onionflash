@@ -1023,3 +1023,172 @@ def is_dirauth_category_story(sources: Iterable[dict] | None) -> bool:
             if _DIRAUTH_TITLE_OP_RE.search(title):
                 return True
     return False
+
+
+_PROTECTED_HOUSEKEEPING_LABELS = frozenset({
+    "security", "regression", "critical", "severity::high", "severity::critical",
+})
+_HOUSEKEEPING_SECURITY_SIGNAL_RE = re.compile(
+    r"(?:"
+    r"\[security\]"
+    r"|\b(?:RUSTSEC-\d{4}-\d{4,}|GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}|CVE-\d{4}-\d{4,7}|TROVE-\d{4}-\d{3,5})\b"
+    r"|\bsecurity\s+(?:fix(?:es)?|patch(?:es)?|updat(?:e|es|ing)|bump|releas(?:e|es)|advisor(?:y|ies)|issue|vulnerabilit\w*)\b"
+    r"|\b(?:vulnerabilit\w*|exploit\w*|deanonymiz\w*|out[- ]of[- ]bounds|use[- ]after[- ]free|buffer\s+overflow|remote\s+code(?:\s+execution)?)\b"
+    r")",
+    re.I,
+)
+_HOUSEKEEPING_RUNTIME_GUARD_RE = re.compile(
+    r"\b(?:"
+    r"panic\w*|crash(?:es|ed|ing)?|deadlock\w*|oom|out[- ]of[- ]memory|exhaust\w*|ddos|dos|"
+    r"denial[- ]of[- ]service|data\s+loss|corrupt(?:ion|ed)?|compromis\w*|regress(?:ion|es)|"
+    r"broken\s+(?:for\s+users?|downloads?|signatures?|verification)"
+    r")\b",
+    re.I,
+)
+_HOUSEKEEPING_TITLE_PAT_RE = re.compile(
+    r"(?:"
+    r"\brelease\s+checklist\b|\bversion\s+bump\b|\bbump(?:ing)?\s+(?:version|deps|dependencies)\b"
+    r"|\bforward[- ]port\b.*\bchangelogs?\b|^update\s+changelogs?\b|^clean\s*up\s+comments?\b"
+    r"|^fix\s+(?:whitespace|formatting|lint(?:ing)?|clippy)\b|^bump\s+(?:cargo\.lock|lockfile)\b"
+    r"|\b(?:cargo|package|yarn|poetry|uv)\.lock\b|\blockfile\b"
+    r"|\b(?:dependabot|renovate)\b|^(?:chore|ci|typo|housekeeping|l10n|i18n|translations?)\s*:"
+    r")|\bminor\s+typo\b|\bfix(?:es|ing)?\s+(?:a\s+)?typo\b",
+    re.I,
+)
+_DEPENDENCY_CHORE_RE = re.compile(
+    r"(?:"
+    r"^(?:chore|build|fix|ci|deps)\(deps(?:-dev)?\)\s*:"
+    r"|\b(?:dependabot|renovate)(?:\[bot\])?\b"
+    r"|^(?:bump|update|upgrade)\s+dependencies\b"
+    r"|\bautomated\s+dependency\s+(?:update|bump)\b"
+    r")",
+    re.I,
+)
+_CI_PIPELINE_CHORE_RE = re.compile(
+    r"(?:"
+    r"\bgoreleaser\s+job\b"
+    r"|\b(?:broken|fix(?:es|ing)?|update|skip|disable|repair)\s+(?:the\s+)?(?:ci(?:/cd)?|gitlab[- ]ci|github\s+actions?|pipeline)\s+"
+    r"(?:job|runner|stage|step|script|config|action)\b"
+    r"|\b(?:ci(?:/cd)?|gitlab[- ]ci|pipeline)\s+job\s+(?:fails?|failing|broken)\b"
+    r"|^ci(?:\([^)]+\))?\s*:"
+    r")",
+    re.I,
+)
+_BOT_DEP_AUTHORS = frozenset({"dependabot", "dependabot[bot]", "renovate", "renovate[bot]"})
+
+_PT_FAMILY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("snowflake", re.compile(r"\bsnowflake\b", re.I)),
+    ("webtunnel", re.compile(r"\bwebtunnel\b", re.I)),
+    ("lyrebird", re.compile(r"\blyrebird\b", re.I)),
+    ("obfs4", re.compile(r"\bobfs4(?:proxy)?\b", re.I)),
+    ("conjure", re.compile(r"\bconjure\b", re.I)),
+)
+_PT_REPO_PATH_RE = re.compile(r"anti-censorship/pluggable-transports(?:/([a-z0-9_.-]+))?", re.I)
+_PT_GENERIC_RE = re.compile(r"\bpluggable[- ]transports?\b", re.I)
+_PT_HIGH_IMPACT_RE = re.compile(
+    r"\b(?:"
+    r"security|vulnerabilit\w*|exploit\w*|panic\w*|crash(?:es|ed|ing)?|exhaust\w*|ddos|dos|"
+    r"denial[- ]of[- ]service|oom|out[- ]of[- ]memory|deadlock\w*|outage\w*|unreachable|nginx|"
+    r"handshake\s+(?:fail\w*|stall\w*|broken|timeout\w*)|"
+    r"websocket\s+(?:fail\w*|stall\w*|broken|timeout\w*)|"
+    r"censorship|block(?:ed|ing)\b|regression\b|leak\w*|ttp"
+    r")\b",
+    re.I,
+)
+
+
+def _match_pt_family(text: str) -> str | None:
+    for family, pattern in _PT_FAMILY_PATTERNS:
+        if pattern.search(text):
+            return family
+    return None
+
+
+def item_pt_family(item: dict) -> str | None:
+    """Return the normalized pluggable-transport family for `item`, or None."""
+    if not isinstance(item, dict):
+        return None
+    url = str(item.get("url") or "")
+    if repo_match := _PT_REPO_PATH_RE.search(url):
+        if repo_match.group(1):
+            norm_repo = "obfs4" if repo_match.group(1).lower() == "obfs4proxy" else repo_match.group(1).lower()
+            if norm_repo in {"snowflake", "webtunnel", "lyrebird", "obfs4", "conjure"}:
+                return norm_repo
+    meta_text = " ".join(
+        str(v)
+        for v in (
+            *(item.get("labels") or ()),
+            *(item.get("tags") or ()),
+            item.get("title") or "",
+        )
+        if isinstance(v, str) and v
+    )
+    if family := _match_pt_family(meta_text):
+        return family
+    body = next((item[k] for k in ("unquoted_content", "source_content", "content") if isinstance(item.get(k), str)), "")
+    if not body and isinstance(item.get("passages"), list):
+        body = "\n".join(
+            str(p.get("text") or "")
+            for p in item["passages"]
+            if isinstance(p, dict) and isinstance(p.get("text"), str)
+        )
+    if body and _url_host(url) == LIST_ARCHIVE_HOST:
+        body = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith(">"))
+    if family := _match_pt_family(body):
+        return family
+    if _PT_REPO_PATH_RE.search(url) or _PT_GENERIC_RE.search(meta_text):
+        return "pluggable-transports"
+    return None
+
+
+def is_housekeeping_item(item: dict) -> tuple[str, str] | None:
+    """Return a deterministic housekeeping skip `(code, reason)` when safe, else None."""
+    if not isinstance(item, dict) or item.get("kind") == "tag" or item.get("origin") == "network-health":
+        return None
+    if item.get("public_comments"):
+        return None
+    labels = folded_labels(item)
+    if (
+        labels & _PROTECTED_HOUSEKEEPING_LABELS
+        or any(lbl.startswith("severity::") for lbl in labels)
+        or mandatory_news_rule(item) is not None
+        or is_hackerone_item(item)
+        or is_trove_item(item)
+        or bool(cve_ids(item))
+        or bool(trove_ids(item))
+    ):
+        return None
+    full_text = _source_full_text(item)
+    if _HOUSEKEEPING_SECURITY_SIGNAL_RE.search(full_text) or _HOUSEKEEPING_RUNTIME_GUARD_RE.search(full_text):
+        return None
+    if is_dirauth_item(item) and _DIRAUTH_OPERATIONAL_TOPIC_RE.search(full_text) and not _DIRAUTH_CHORE_RE.search(full_text):
+        return None
+    cleaned_title, _ = _strip_subject_prefixes(item.get("title"))
+    author = str(item.get("author") or "").strip().lower()
+    if _DEPENDENCY_CHORE_RE.search(cleaned_title) or author in _BOT_DEP_AUTHORS:
+        return "skipped.gate.housekeeping", "Routine non-security dependency update"
+    if _CI_PIPELINE_CHORE_RE.search(cleaned_title):
+        return "skipped.gate.housekeeping", "Routine CI or build pipeline housekeeping item"
+    if _HOUSEKEEPING_TITLE_PAT_RE.search(cleaned_title):
+        return "skipped.gate.housekeeping", "Routine checklist or housekeeping item"
+    return None
+
+
+def is_pt_high_impact(item: dict) -> bool:
+    """Return whether `item` involves a pluggable transport with a security, crash, or availability signal."""
+    if not isinstance(item, dict) or item_pt_family(item) is None:
+        return False
+    if is_housekeeping_item(item) is not None:
+        return False
+    labels = folded_labels(item)
+    if (
+        labels & _PROTECTED_HOUSEKEEPING_LABELS
+        or any(lbl.startswith("severity::") for lbl in labels)
+        or is_hackerone_item(item)
+        or is_trove_item(item)
+        or bool(cve_ids(item))
+        or bool(trove_ids(item))
+    ):
+        return True
+    full_text = _source_full_text(item)
+    return bool(_HOUSEKEEPING_SECURITY_SIGNAL_RE.search(full_text) or _PT_HIGH_IMPACT_RE.search(full_text))

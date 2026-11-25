@@ -14,10 +14,10 @@ from .comments import analysis_context, budget_unchanged_note_ids, note_key, pri
 from .llm import is_quoted_list_post, strip_unreleased_tag, unquoted_mail_text, unquoted_text
 from .schema import SEMANTIC_FIELDS, UPDATE_FIELDS
 from .util import (
-    DIRAUTH_NICKNAME_RE, after, cve_ids, digest, duplicate_issue_refs, gitlab_refs,
-    gitlab_url_variants, is_protected_duplicate_issue, item_identity, normalize_evidence,
-    plain_text, release_mentions, safe_canonical_url, saved_object, story_cluster,
-    thread_subject, trove_ids,
+    DIRAUTH_NICKNAME_RE, _url_host, after, cve_ids, digest, duplicate_issue_refs, gitlab_refs,
+    gitlab_url_variants, is_protected_duplicate_issue, item_identity, item_pt_family,
+    normalize_evidence, plain_text, release_mentions, safe_canonical_url, saved_object,
+    story_cluster, thread_subject, trove_ids,
 )
 
 
@@ -692,6 +692,39 @@ def _story_search_text(story: dict) -> str:
     return "\n".join((*fields, *updates))
 
 
+_PT_FAMILY_TOKENS = frozenset({"snowflake", "webtunnel", "lyrebird", "obfs4", "obfs4proxy", "conjure"})
+_PT_PROJECT_SCOPE_RE = re.compile(
+    r"^https://gitlab\.torproject\.org/([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+?)/-/",
+    re.I,
+)
+
+
+def _source_repo_scopes(entries: Iterable[dict]) -> set[str]:
+    scopes: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        url = str(entry.get("url") or "")
+        if match := _PT_PROJECT_SCOPE_RE.match(url):
+            scopes.add(f"gitlab:{match.group(1).lower()}")
+        elif host := _url_host(url):
+            scopes.add(f"host:{host}")
+        for field in ("source_id", "source_name", "feed", "stream", "project"):
+            val = entry.get(field)
+            if isinstance(val, str) and val.strip():
+                scopes.add(f"src:{val.strip().lower()}")
+    return scopes
+
+
+def _story_pt_family(story: dict) -> str | None:
+    tags = story.get("tags") if isinstance(story.get("tags"), list) else ()
+    for src in (story.get("sources") or ()):
+        if isinstance(src, dict):
+            if family := item_pt_family({"url": src.get("url") or "", "title": src.get("title") or "", "tags": tags}):
+                return family
+    return item_pt_family({"title": story.get("title") or "", "content": _story_search_text(story), "tags": tags})
+
+
 def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = frozenset()) -> list[tuple[str, str]]:
     """Up to `RELATED_LIMIT` active related `(story_id, reason)` pairs for coverage comparison."""
     seen = set(exclude)
@@ -736,6 +769,7 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
         item_text = _item_search_text(item)
         item_auths = {m.group(0).casefold() for m in DIRAUTH_NICKNAME_RE.finditer(item_text)}
         item_tokens = _rare_tokens(item_text)
+        item_pt = item_pt_family(item)
         pub_stamp = item.get("published_at") or item.get("updated_at")
         cutoff_90d = None
         if isinstance(pub_stamp, str) and pub_stamp:
@@ -743,8 +777,8 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
                 cutoff_90d = after(-LEXICAL_WINDOW_DAYS * 86400, pub_stamp)
             except ValueError:
                 cutoff_90d = None
-        if item_auths or (len(item_tokens) >= 2 and cutoff_90d is not None):
-            candidates: list[tuple[str, str, str]] = []
+        if item_auths or ((len(item_tokens) >= 2 or item_pt is not None) and cutoff_90d is not None):
+            candidates: list[tuple[str, str, str, dict]] = []
             for srow in db.execute(
                 "SELECT s.id,s.updated_at,CASE WHEN typeof(s.payload)='text' THEN CAST(s.payload AS BLOB) END AS payload "
                 "FROM stories s LEFT JOIN editorial_controls e ON e.story_id=s.id "
@@ -753,9 +787,9 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
                 if srow["id"] in seen:
                     continue
                 if story_obj := saved_object(srow["payload"]):
-                    candidates.append((srow["id"], srow["updated_at"], _story_search_text(story_obj)))
+                    candidates.append((srow["id"], srow["updated_at"], _story_search_text(story_obj), story_obj))
             if item_auths:
-                for sid, _, stext in candidates:
+                for sid, _, stext, _ in candidates:
                     if item_auths & {m.group(0).casefold() for m in DIRAUTH_NICKNAME_RE.finditer(stext)}:
                         _add(sid, "shared authority")
                         if len(pairs) >= RELATED_LIMIT:
@@ -763,7 +797,7 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
             if len(pairs) < RELATED_LIMIT and len(item_tokens) >= 2 and cutoff_90d is not None:
                 window_entries = [
                     (sid, upd_at, _rare_tokens(stext))
-                    for sid, upd_at, stext in candidates
+                    for sid, upd_at, stext, _ in candidates
                     if sid not in seen and isinstance(upd_at, str) and upd_at >= cutoff_90d
                 ]
                 df: dict[str, int] = {}
@@ -787,6 +821,26 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
                         _add(sid, "shared technical terms")
                         if len(pairs) >= RELATED_LIMIT:
                             break
+            if len(pairs) < RELATED_LIMIT and item_pt is not None and cutoff_90d is not None:
+                item_scopes = _source_repo_scopes((item,))
+                pt_scored: list[tuple[int, int, str, str]] = []
+                for sid, upd_at, stext, story_obj in candidates:
+                    if sid in seen or not (isinstance(upd_at, str) and upd_at >= cutoff_90d):
+                        continue
+                    if _story_pt_family(story_obj) != item_pt:
+                        continue
+                    story_scopes = _source_repo_scopes(story_obj.get("sources") or ())
+                    cross_repo = bool(item_scopes and story_scopes and item_scopes.isdisjoint(story_scopes))
+                    shared_non_pt = len((item_tokens & _rare_tokens(stext)) - _PT_FAMILY_TOKENS)
+                    if (item_pt != "pluggable-transports" and (cross_repo or shared_non_pt >= 1)) or (
+                        item_pt == "pluggable-transports" and shared_non_pt >= 1
+                    ):
+                        pt_scored.append((int(cross_repo), shared_non_pt, upd_at, sid))
+                pt_scored.sort(reverse=True)
+                for _, _, _, sid in pt_scored:
+                    _add(sid, f"related {item_pt} transport")
+                    if len(pairs) >= RELATED_LIMIT:
+                        break
     return pairs
 
 

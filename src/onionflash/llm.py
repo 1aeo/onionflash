@@ -316,24 +316,198 @@ def is_quoted_list_post(url: object, text: str) -> bool:
     return _url_host(url) == LIST_ARCHIVE_HOST and any(ln.lstrip().startswith(">") for ln in text.splitlines())
 
 
+_TRAILING_VERSION_FRAGMENT_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9.])0\.\d+(?:\.\d+)?\.|\bv?\d+\.\d+(?:\.\d+)*\.[A-Za-z]|[<>]=?\s*v?\d+(?:\.\d+)*(?:\.[A-Za-z0-9]+)?\.?)$"
+)
+_TRAILING_INCOMPLETE_WORD_RE = re.compile(
+    r"\b(?:and|or|but|for|with|to|of|from|that|which|because|since|while|when|if|the|a|an)\s*[.!]?$",
+    re.IGNORECASE,
+)
+_GENERIC_FILLER_RE = re.compile(
+    r"(?:"
+    r"\b(?:helps?\s+)?protect(?:s|ing)?\s+users?['’]?\s+privacy\b"
+    r"|\b(?:helps?\s+)?improv(?:e|es|ing)\s+(?:overall\s+)?(?:security|privacy|reliability)(?:\s*(?:,|and|or|/)\s*(?:security|privacy|reliability|stability))*"
+    r"|\b(?:helps?\s+)?enhanc(?:e|es|ing)\s+(?:overall\s+)?(?:security|privacy|reliability)(?:\s*(?:,|and|or|/)\s*(?:security|privacy|reliability|stability))*"
+    r"|\bmaintain\s+privacy\s+and\s+security\b"
+    r"|\bmaintain\s+network\s+stability\s+and\s+prevent\s+widespread\s+service\s+disruption\b"
+    r"|\bupdated\s+security\s+components\s+and\s+bug\s+fixes\b"
+    r"|\bscope\s+and\s+consequences\s+remain\s+subject\s+to\b"
+    r")",
+    re.IGNORECASE,
+)
+_UNMATCHED_IMPACT_DELIMITERS = (("(", ")"), ("[", "]"), ("“", "”"))
+
+
+def is_incomplete_or_filler_impact(text: str) -> str | None:
+    """Detect incomplete sentence fragments or generic boilerplate filler in `why_it_matters`."""
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    if stripped.endswith("?") or stripped.endswith("..") or stripped.endswith("…"):
+        return "incomplete_impact"
+    if not is_complete_sentence(stripped):
+        return "incomplete_impact"
+    if any(stripped.count(left) != stripped.count(right) for left, right in _UNMATCHED_IMPACT_DELIMITERS):
+        return "incomplete_impact"
+    if stripped.count('"') % 2 != 0 or stripped.count("`") % 2 != 0:
+        return "incomplete_impact"
+    if _TRAILING_VERSION_FRAGMENT_RE.search(stripped) or _TRAILING_INCOMPLETE_WORD_RE.search(stripped):
+        return "incomplete_impact"
+    if _GENERIC_FILLER_RE.search(stripped):
+        return "filler_impact"
+    return None
+
+
+def _source_item_unquoted_text(source: dict) -> str:
+    url = str(source.get("url") or "")
+    parts = [source["title"]] if isinstance(source.get("title"), str) and source["title"] else []
+    body = next((source[k] for k in ("source_content", "content", "unquoted_content") if isinstance(source.get(k), str)), "")
+    if not body and isinstance(source.get("passages"), list):
+        p_texts = []
+        for p in source["passages"]:
+            txt = p if isinstance(p, str) else (p.get("text") if isinstance(p, dict) else "")
+            if isinstance(txt, str) and txt:
+                p_texts.append(txt)
+        body = "\n".join(p_texts)
+    if body:
+        parts.append(unquoted_mail_text(body) if is_quoted_list_post(url, body) else body)
+    for note in (source.get("public_comments") if isinstance(source.get("public_comments"), list) else ()):
+        if isinstance(note, dict) and isinstance(note.get("body"), str) and note["body"]:
+            parts.append(note["body"])
+    return "\n".join(parts)
+
+
+def _unquoted_source_text(packet_or_item: dict) -> str:
+    if not isinstance(packet_or_item, dict):
+        return ""
+    if isinstance(packet_or_item.get("sources"), list):
+        return "\n".join(
+            _source_item_unquoted_text(src)
+            for src in packet_or_item["sources"]
+            if isinstance(src, dict)
+        )
+    return _source_item_unquoted_text(packet_or_item)
+
+
+_INTENDED_CONFIG_RE = re.compile(r"\bintended\s+(?:configuration|config|settings?|policy)\b", re.IGNORECASE)
+_SRC_CONFIG_RE = re.compile(r"\b(?:intended\s+(?:configuration|config|settings?|policy)|configured\s+\w+|torrc)\b", re.IGNORECASE)
+_LEXICAL_ADVICE_CHECKS = (
+    (re.compile(r"\badvis(?:e|ed|es|ing)\b|\badvice\b", re.IGNORECASE), re.compile(r"\badvis(?:e|ed|es|ing)\b|\badvice\b", re.IGNORECASE)),
+    (re.compile(r"\binstruct(?:ed|s|ing)\b", re.IGNORECASE), re.compile(r"\binstruct(?:ed|s|ing)\b", re.IGNORECASE)),
+    (re.compile(r"\brecommend(?:ed|s|ing)\b", re.IGNORECASE), re.compile(r"\brecommend(?:ed|s|ing|ation)\b", re.IGNORECASE)),
+)
+_DIRECTIVE_TARGET_RE = re.compile(
+    r"\b(?:"
+    r"(?:users?|operators?|maintainers?|admins?|developers?|relays?|clients?)\s+"
+    r"(?:(?:are|were|is)\s+)?(?:(?:being|strongly|explicitly)\s+)?"
+    r"(?:asked|required|told|advised|instructed|encouraged|recommended)\s+to"
+    r"|(?:announcement|post|report|issue|notice|maintainers?|developers?)\s+"
+    r"(?:asks?|ask|encourages?|recommends?|advises?|instructs?|requires?)\s+"
+    r"(?:[\w-]+\s+){0,5}?(?:to\s+)?(?:upgrad|updat|switch|install|configur|edit|replac|enabl|disabl|remov|treat|handl|apply|us(?:e|ing))"
+    r"|(?:users?|operators?|maintainers?|admins?|developers?|relays?|clients?)\s+"
+    r"(?:should|must|need\s+to)\s+(?:(?:\w+\s+){0,2})?"
+    r"(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|handle|treat|apply)"
+    r"|requir(?:es?|ing)\s+(?:[\w-]+\s+){0,3}(?:users?|operators?|relays?)\s+to\s+\w+"
+    r")\b",
+    re.IGNORECASE,
+)
+_SRC_DIRECTIVE_CUE_RE = re.compile(
+    r"\b(?:"
+    r"asks?|asked|asking"
+    r"|please\s+(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|apply)"
+    r"|encourag(?:e|es|ed|ing)"
+    r"|recommend(?:s|ed|ing|ation)?"
+    r"|advis(?:e|es|ed|ing)|advice"
+    r"|instruct(?:s|ed|ing)"
+    r"|requir(?:e|es|ed|ing)\s+(?:[\w-]+\s+){0,3}(?:users?|operators?|relays?|them|you|all)\s+to"
+    r"|must\s+(?!-\s*fix)(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|handle|apply)"
+    r"|should\s+(?!be\s+(?:affected|able\s+to)\b)(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|handle|apply)"
+    r")\b",
+    re.IGNORECASE,
+)
+_ACTION_IN_TEXT_RE = re.compile(
+    r"\b(?:to|should|must|encourages?|recommends?)\s+(?:\w+\s+){0,2}?"
+    r"(upgrade|upgrading|update|updating|switch|switching|install|installing|configure|configuring|"
+    r"edit|editing|replace|replacing|enable|enabling|disable|disabling|remove|removing|treat|handle)\b",
+    re.IGNORECASE,
+)
+_SRC_ACTION_WORDS_RE = re.compile(
+    r"\b(upgrade|upgrading|update|updating|switch|switching|install|installing|configure|configuring|"
+    r"edit|editing|replace|replacing|enable|enabling|disable|disabling|remove|removing|treat|handle)\b",
+    re.IGNORECASE,
+)
+
+
+def has_unattributed_advice(text: str, packet_or_item: dict) -> bool:
+    """Return whether `text` invents operator/user directives or configuration claims absent from unquoted source text."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    src = _unquoted_source_text(packet_or_item)
+    if _INTENDED_CONFIG_RE.search(text) and not _SRC_CONFIG_RE.search(src):
+        return True
+    if any(claim_re.search(text) and not src_re.search(src) for claim_re, src_re in _LEXICAL_ADVICE_CHECKS):
+        return True
+    if _DIRECTIVE_TARGET_RE.search(text):
+        if not _SRC_DIRECTIVE_CUE_RE.search(src):
+            return True
+        src_actions = [word.lower() for word in _SRC_ACTION_WORDS_RE.findall(src)]
+        for action_match in _ACTION_IN_TEXT_RE.finditer(text):
+            action = action_match.group(1).lower()
+            stem = action[:5]
+            if not any(word.startswith(stem) for word in src_actions):
+                return True
+            if action in {"update", "updating", "upgrade", "upgrading", "switch", "switching"}:
+                cue_near = re.compile(
+                    r"\b(?:please|ask(?:s|ed|ing)?|encourag\w*|recommend\w*|advis\w*|"
+                    r"should(?:\s+also)?(?!\s+be\s+(?:affected|able\s+to)\b)|must(?!-\s*fix))"
+                    r"\b[^.!?\n]{0,60}\b" + stem + r"(?!\s+checks?\b)",
+                    re.IGNORECASE,
+                )
+                if not cue_near.search(src):
+                    return True
+    return False
+
+
 def label_limits(sources: list[dict]) -> dict:
     """The confidence, state and category labels a story told by these sources may carry: confirmed
     needs an official source that is not a tag, or a merged merge request; tagged needs a tag
-    source; a story told only by merge requests is merged and not a release; and verified TROVE
-    advisories must stay categorized as security."""
+    source; a story told only by merge requests is merged and not a release; issues or merge
+    requests alone may not carry state released; and verified TROVE advisories must stay
+    categorized as security."""
     confirmable = any((source.get("authority") == "official" and source.get("kind") != "tag")
                       or (source.get("kind") == "gitlab_mr" and source.get("upstream_state") == "merged")
                       for source in sources)
     tagged = any(source.get("kind") == "tag" for source in sources)
     merges = bool(sources) and all(source.get("kind") == "gitlab_mr" for source in sources)
+    gitlab_only = bool(sources) and all(source.get("kind") in {"gitlab_issue", "gitlab_mr"} for source in sources)
     trove = any(is_trove_item(source) or source.get("mandatory_news_rule") == "trove" for source in sources)
     allowed_tags = [value for value in CATEGORIES if not merges or value != "release"]
+    if merges:
+        allowed_states = ["merged"]
+    else:
+        allowed_states = [
+            value for value in STATES
+            if (tagged or value != "tagged") and (not gitlab_only or value != "released")
+        ]
     return {
         "confidence": [value for value in CONFIDENCES if confirmable or value != "confirmed"],
-        "state": ["merged"] if merges else [value for value in STATES if tagged or value != "tagged"],
+        "state": allowed_states,
         "category": ["security"] if trove else allowed_tags,
         "tags": allowed_tags,
     }
+
+
+def widen_release_state_for_update(limits: dict, prior: dict | None) -> dict:
+    """Preserve `'released'` in update state `limits` when `prior` is already released or categorized as a release."""
+    if not isinstance(limits, dict) or not isinstance(prior, dict):
+        return limits
+    if prior.get("state") == "released" or prior.get("category") == "release":
+        allowed = set(limits.get("state") or ())
+        allowed.add("released")
+        limits["state"] = [value for value in STATES if value in allowed]
+    return limits
 
 
 def apply_label_limits(properties: dict, limits: dict, *, nullable: bool = False) -> None:

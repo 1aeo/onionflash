@@ -15,16 +15,17 @@ from onionflash import (
     analyze, candidate as candidate_mod, collect, comments, editorial, llm, rejection, review,
     review_gate, source_packet,
 )
-from onionflash.schema import CATEGORIES, CONFIDENCES
+from onionflash.schema import CATEGORIES, CONFIDENCES, STATES
 from onionflash.store import (
     DIRAUTH_PRIORITY, HACKERONE_PRIORITY, TOR_CORE_PRIORITY, TROVE_PRIORITY,
     TRUSTED_OPERATOR_PRIORITY, ReviewRequired, Store, item_priority,
 )
 from onionflash.util import (
     DEFAULT_TOR_CORE_USERS, cve_ids, digest, effective_authority, has_dirauth_signal,
-    is_dirauth_category_story, is_official_release_announcement, is_tor_core_item,
-    is_torproject_new_thread, is_trove_item, mandatory_news_rule, should_confirm_merged_mr,
-    tor_core_user_set, trove_ids,
+    is_dirauth_category_story, is_housekeeping_item, is_official_release_announcement,
+    is_pt_high_impact, is_tor_core_item, is_torproject_new_thread, is_trove_item,
+    item_pt_family, mandatory_news_rule, should_confirm_merged_mr, tor_core_user_set,
+    trove_ids,
 )
 
 
@@ -1153,3 +1154,253 @@ def test_should_confirm_merged_mr_and_dirauth_category_helpers():
         content="There is a spelling typo in a code comment inside dirvote.h.",
     )]) is False
     assert is_dirauth_category_story([]) is False
+
+
+def test_label_limits_blocks_released_for_gitlab_only_and_widens_for_updates():
+    """Exclude 'released' on issue/MR-only source packets while allowing updates to released stories."""
+    issue = _story_item(kind="gitlab_issue", url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/42001")
+    mr = _story_item(kind="gitlab_mr", upstream_state="merged", url="https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/901")
+    feed = _story_item(kind="feed", authority="official", url="https://blog.torproject.org/tor-0-4-9-16/")
+    tag = _story_item(kind="tag", authority="official", url="https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-0.4.9.16")
+
+    expected_non_release_gitlab = [s for s in STATES if s not in {"released", "tagged"}]
+    assert llm.label_limits([issue])["state"] == expected_non_release_gitlab
+    assert llm.label_limits([mr])["state"] == ["merged"]
+    assert llm.label_limits([issue, mr])["state"] == expected_non_release_gitlab
+    assert "released" in llm.label_limits([issue, feed])["state"]
+    assert llm.label_limits([issue, tag])["state"] == STATES
+
+    widened_from_released = llm.widen_release_state_for_update(llm.label_limits([issue]), {"state": "released", "category": "security"})
+    assert widened_from_released["state"] == [s for s in STATES if s != "tagged"]
+    widened_from_release_cat = llm.widen_release_state_for_update(llm.label_limits([mr]), {"state": "merged", "category": "release"})
+    assert widened_from_release_cat["state"] == ["released", "merged"]
+    unwidened = llm.widen_release_state_for_update(llm.label_limits([issue]), {"state": "developing", "category": "security"})
+    assert "released" not in unwidened["state"]
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("", None),
+    ("   ", None),
+    ("Onion-service operators using Arti may see reduced queue efficiency.", None),
+    ("The announcement asks relay operators to upgrade to 0.4.9.16.", None),
+    ("after a download would stall forever.", None),
+    ("The release of tor-0.4.9.16 added consensus-method 38, which should ease the pressure on the dirauths.", None),
+    ("The release addresses low-severity security vulnerabilities, prompting users to upgrade to maintain the security of their Tor implementations.", None),
+    ("A client that performs no proof-of-work can evict a queued client that did, defeating the purpose of the priority queue.", None),
+    ("Because of #41466 and #41468, the network currently has a lot of <= 0.4.8.x", "incomplete_impact"),
+    ("Relays still running <= 0.4.9.", "incomplete_impact"),
+    ("Affected deployments on version 0.4.", "incomplete_impact"),
+    ("We encourage arti and arti-client users,", "incomplete_impact"),
+    ("Looks like a must-fix to me :p", "incomplete_impact"),
+    ("Is anyone else experiencing this? Are there any mitigations?", "incomplete_impact"),
+    ("This affects relay operators with \"unclosed quotes.", "incomplete_impact"),
+    ("This prevents clients from.", "incomplete_impact"),
+    ("The change helps protect users' privacy.", "filler_impact"),
+    ("This update improves overall security and reliability.", "filler_impact"),
+    ("Scope and consequences remain subject to the linked upstream discussion.", "filler_impact"),
+])
+def test_incomplete_and_filler_impact_detection(text, expected):
+    """Catch sentence fragments, mid-version cutoffs, and vague generic filler without blocking specific impacts."""
+    assert llm.is_incomplete_or_filler_impact(text) == expected
+
+
+def test_has_unattributed_advice_catches_invented_directives_and_respects_source_prose():
+    """Flag unattributed directives/config assumptions while accepting source-supported guidance."""
+    linux_pkt = {
+        "sources": [
+            {
+                "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-announce@lists.torproject.org/message/TB16/",
+                "title": "Tor Browser 16.0 released",
+                "passages": [
+                    "Tor Browser 16.0 has now been published for all platforms.\n> * Bug 43824: Switch modules",
+                ],
+            },
+            {
+                "url": "https://blog.torproject.org/new-release-tor-browser-160/",
+                "title": "New Release: Tor Browser 16.0",
+                "passages": [
+                    "If you have been relying on Tor Browser Alpha for support for these devices, we recommend switching over to the stable release channel.",
+                    "Fortunately, very few people should be affected, as we currently receive around 200 update checks from this platform a day.",
+                    "Most remaining 32-bit users should be able to switch to the 64-bit version unless they are running outdated hardware.",
+                ],
+            },
+        ]
+    }
+    assert llm.has_unattributed_advice(
+        "Tor Browser users on 32-bit x86 Linux are no longer supported and are advised to switch to the 64-bit version.",
+        linux_pkt,
+    ) is True
+    assert llm.has_unattributed_advice(
+        "Users should update to the latest version to receive security fixes.",
+        linux_pkt,
+    ) is True
+
+    tls_item = _story_item(
+        title="OpenSSL 4.x uses default TLS group list",
+        content="Tor logs a warning and runs with OpenSSL's default group list instead of the chosen list in tortls_openssl.c.",
+    )
+    assert llm.has_unattributed_advice(
+        "Relay operators using OpenSSL 4.x may accept TLS groups that their intended configuration excludes.",
+        tls_item,
+    ) is True
+    assert llm.has_unattributed_advice(
+        "Relays accept TLS groups that the chosen list excludes, and clients may negotiate unexpected groups.",
+        tls_item,
+    ) is False
+
+    official_ask = _story_item(
+        kind="feed",
+        authority="official",
+        url="https://lists.torproject.org/pipermail/tor-announce/2026-November/000999.html",
+        title="Security release 0.4.9.15",
+        content="This release primarily affects relays so please upgrade as soon as possible.",
+    )
+    assert llm.has_unattributed_advice(
+        "Relay operators are asked to upgrade as soon as possible.",
+        official_ask,
+    ) is False
+    assert llm.has_unattributed_advice(
+        "Directory authority operators must configure new keys immediately.",
+        official_ask,
+    ) is True
+
+    method_pkt = {
+        "sources": [
+            {
+                "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41500",
+                "title": "Consensus method 38",
+                "passages": ["The release of tor-0.4.9.16 added consensus-method 38, which should ease pressure on dirauths."],
+            }
+        ]
+    }
+    assert llm.has_unattributed_advice(
+        "The release of consensus-method 38 is intended to ease pressure on directory authorities.",
+        method_pkt,
+    ) is False
+
+
+def test_housekeeping_item_filters_non_security_deps_and_ci_chores_only():
+    """Skip non-security dep bumps and CI-only chores while keeping security advisories and commented items."""
+    assert is_housekeeping_item(_story_item(
+        url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/merge_requests/410",
+        title="chore(deps): bump golangci-lint from 1.61.0 to 1.62.0",
+        content="Bumps linter dependency in CI configuration.",
+        author="dependabot[bot]",
+        labels=["dependencies"],
+    )) == ("skipped.gate.housekeeping", "Routine non-security dependency update")
+
+    assert is_housekeeping_item(_story_item(
+        url="https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/3100",
+        title="build(deps): update clap requirement from 4.5.1 to 4.5.2",
+        content="Automated dependency update via renovate.",
+        author="renovate[bot]",
+    )) == ("skipped.gate.housekeeping", "Routine non-security dependency update")
+
+    assert is_housekeeping_item(_story_item(
+        url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/work_items/120",
+        title="Fix broken goreleaser job",
+        content="GitLab CI goreleaser job fails due to deprecated snapshot flag.",
+        author="outsider",
+    )) == ("skipped.gate.housekeeping", "Routine CI or build pipeline housekeeping item")
+
+    assert is_housekeeping_item(_story_item(
+        url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/42100",
+        title="ci: pipeline job fails on debian sid runner",
+        content="Adjust runner image tag in .gitlab-ci.yml.",
+        author="outsider",
+    )) == ("skipped.gate.housekeeping", "Routine CI or build pipeline housekeeping item")
+
+    # Protected security / CVE / RUSTSEC / GHSA / commented / operational dirauth items must NEVER skip
+    for protected in (
+        _story_item(title="chore(deps): bump openssl [security]", content="Fixes security advisory.", author="dependabot[bot]"),
+        _story_item(title="build(deps): bump rustls", content="Resolves RUSTSEC-2026-0042 integer overflow.", author="dependabot[bot]"),
+        _story_item(title="fix(deps): update zlib", content="Addresses GHSA-abcd-1234-efgh memory corruption.", author="renovate[bot]"),
+        _story_item(title="chore(deps): update quinn for CVE-2026-12345", content="Mitigates CVE-2026-12345.", author="dependabot[bot]"),
+        _story_item(title="chore(deps): update serde", content="Security patch requested.", labels=["Security"], author="dependabot[bot]"),
+        _story_item(title="chore(deps): bump tokio", content="Update tokio.", public_comments=[make_note(body="Hold on, this causes a deadlock.")]),
+        _story_item(title="ci: goreleaser job hides panic regression", content="Release panic affecting clients."),
+    ):
+        assert is_housekeeping_item(protected) is None
+
+
+def test_pluggable_transport_detection_and_cross_repo_related(tmp_path):
+    """Detect PT families, score PT high-impact signals, and link cross-repo PT stories within the 90-day window."""
+    sf_issue = _story_item(
+        url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/issues/40412",
+        title="Broker panic during WebRTC offer handling",
+        content="Snowflake broker crashes with nil dereference panic under malformed SDP offers.",
+        published_at=DATE, updated_at=DATE,
+    )
+    assert item_pt_family(sf_issue) == "snowflake"
+    assert is_pt_high_impact(sf_issue) is True
+
+    sf_dep_chore = _story_item(
+        url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/merge_requests/422",
+        title="chore(deps): bump pion/stun dependency",
+        content="Routine module version bump for snowflake build.",
+        author="dependabot[bot]",
+    )
+    assert item_pt_family(sf_dep_chore) == "snowflake"
+    assert is_pt_high_impact(sf_dep_chore) is False
+
+    wt_item = _story_item(
+        url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/issues/88",
+        title="WebTunnel nginx websocket handshake stall",
+        content="Reverse proxies using nginx hit websocket timeouts.",
+    )
+    assert item_pt_family(wt_item) == "webtunnel"
+    assert is_pt_high_impact(wt_item) is True
+    assert item_pt_family(_story_item(
+        url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/-/merge_requests/15",
+        title="Fix obfs4 handshake timing",
+        content="Updates lyrebird handshake state machine.",
+    )) == "lyrebird"
+    assert item_pt_family(_story_item(
+        url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/obfs4proxy/-/issues/42",
+        title="Descriptor parsing bug",
+        content="Issue in obfs4proxy.",
+    )) == "obfs4"
+    assert item_pt_family(_story_item(
+        url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/conjure/-/issues/9",
+        title="Registration timeout",
+        content="Conjure station registration fails.",
+    )) == "conjure"
+    assert item_pt_family(_story_item(title="Routine relay change", content="Unrelated C-Tor relay patch.")) is None
+
+    # Cross-repo PT linking across snowflake, tor-browser, anti-censorship-team, and tails within 90 days
+    with Store(tmp_path / "pt_rel.sqlite3") as store:
+        sf_story = seed_source_story(
+            store,
+            sf_issue,
+            draft=_story_draft(
+                title="Snowflake broker panic during WebRTC offer handling",
+                summary="Snowflake broker crashes with nil dereference panic under malformed SDP offers.",
+                evidence=["Snowflake broker crashes with nil dereference panic under malformed SDP offers."],
+            ),
+            at="2026-10-20T00:00:00Z",
+        )
+        old_sf_story = seed_source_story(
+            store,
+            _story_item(
+                url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/issues/100",
+                title="Old Snowflake NAT telemetry note",
+                content="Historical telemetry metrics discussion from June.",
+                published_at="2026-06-01T00:00:00Z", updated_at="2026-06-01T00:00:00Z",
+            ),
+            draft=_story_draft(
+                title="Old Snowflake NAT telemetry note",
+                summary="Historical telemetry metrics discussion from June.",
+                evidence=["Historical telemetry metrics discussion from June."],
+            ),
+            at="2026-06-01T00:00:00Z",
+        )
+        tb_probe = _story_item(
+            url="https://gitlab.torproject.org/tpo/applications/tor-browser/-/work_items/43510",
+            title="Update bundled snowflake proxy in Tor Browser 16.0.4",
+            content="Pulls in updated snowflake client library for downstream browser users.",
+            published_at=DATE, updated_at=DATE,
+        )
+        rel_map = dict(candidate_mod.related(store.db, {"id": tb_probe["id"], "cluster_key": "url:tb"}, tb_probe))
+        assert rel_map.get(sf_story["id"]) == "related snowflake transport"
+        assert old_sf_story["id"] not in rel_map
+
