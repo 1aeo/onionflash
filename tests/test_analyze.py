@@ -2,6 +2,7 @@
 
 import copy
 import json
+import threading
 
 import httpx
 import pytest
@@ -1757,3 +1758,347 @@ def test_polish_strips_spurious_directory_authority_labels_and_keeps_genuine(mon
     sec_da_out = sec_da_writer.analyze(sec_da_src)
     assert sec_da_out["category"] == "security"
     assert sec_da_out["tags"] == ["directory-authority", "security"]
+
+
+def test_best_of_three_parallel_drafting_selector_and_polish(monkeypatch):
+    """Draft 3 candidates concurrently on isolated clients, select winner, and apply polish."""
+    from onionflash import llm as llm_mod
+
+    assert analyze.PROMPT_VERSION == "onionflash-24"
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["llm"].update(base_url="https://llm.example/v1", api_key_env="BEST_OF_TEST_KEY")
+    monkeypatch.setenv("BEST_OF_TEST_KEY", "synthetic-fixture-value")
+
+    src = item(
+        title="tor#41555: OpenSSL fallback affects custom cipher builds",
+        content="Reported defect affects custom OpenSSL 4.x builds when DisableNetwork is unset.",
+        labels=[],
+    )
+    ev = "Reported defect affects custom OpenSSL 4.x builds when DisableNetwork is unset."
+    drafts_by_temp = {
+        0.0: analysis(
+            title="Tor issue reports OpenSSL fallback on custom builds",
+            summary="A GitLab issue says custom OpenSSL 4.x builds fall back to default groups.",
+            why_it_matters="Improves reliability.",  # Generic filler cleared? No, validated or outperformed by slot 1.
+            category="protocol", tags=["protocol"], evidence=[ev],
+        ),
+        0.25: analysis(
+            title="OpenSSL 4.x fallback reported on custom Tor builds",
+            summary="A report states custom OpenSSL 4.x builds fall back to default TLS groups when DisableNetwork is unset.",
+            why_it_matters="",
+            category="protocol", tags=["protocol"], evidence=[ev],
+        ),
+        0.45: analysis(
+            title="OpenSSL 4.x builds fall back on custom Tor configs",
+            summary="Custom OpenSSL 4.x builds may fall back to default groups.",
+            why_it_matters="",
+            category="protocol", tags=["protocol"], evidence=[ev],
+        ),
+    }
+
+    barrier = threading.Barrier(3, timeout=5.0)
+    lock = threading.Lock()
+    observed_draft_calls: list[tuple[float, str, list[str]]] = []
+    selector_payloads: list[dict] = []
+    polish_payloads: list[dict] = []
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        name = body["response_format"]["json_schema"]["name"]
+        if name == "onionflash_news":
+            temp = float(body["temperature"])
+            sys_prompt = body["messages"][0]["content"]
+            ev_enum = body["response_format"]["json_schema"]["schema"]["properties"]["evidence"]["items"]["enum"]
+            with lock:
+                observed_draft_calls.append((temp, sys_prompt, ev_enum))
+            barrier.wait()
+            reply = drafts_by_temp[temp]
+        elif name == "onionflash_select":
+            assert body["temperature"] == 0 and "chat_template_kwargs" in body
+            assert body["chat_template_kwargs"] == {"enable_thinking": False}
+            sel_payload = json.loads(body["messages"][1]["content"])
+            selector_payloads.append(sel_payload)
+            reply = {"winner": 2, "reason": "Preserves exact OpenSSL 4.x scope without filler."}
+        elif name == "onionflash_polish":
+            pol_payload = json.loads(body["messages"][1]["content"])
+            polish_payloads.append(pol_payload)
+            reply = {
+                "title": "OpenSSL 4.x fallback reported on custom Tor builds",
+                "summary": "Custom OpenSSL 4.x builds reportedly fall back to default TLS groups when DisableNetwork is unset.",
+                "why_it_matters": "",
+            }
+        else:
+            raise AssertionError(f"Unexpected schema {name}")
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(reply)}}]})
+
+    monkeypatch.setattr(
+        llm_mod,
+        "HttpClient",
+        lambda settings, **kwargs: HttpClient(
+            settings, **kwargs, transport=httpx.MockTransport(_handle), resolver=public_dns
+        ),
+    )
+
+    with Analyzer(cfg, editorial_polish=True, best_of=3) as writer:
+        out = writer.analyze(src)
+        assert writer.calls == 5  # 3 parallel drafts + 1 selector + 1 polish
+        assert writer.clears == 0
+
+    assert sorted(t for t, _, _ in observed_draft_calls) == [0.0, 0.25, 0.45]
+    assert len({sys_p for _, sys_p, _ in observed_draft_calls}) == 3
+    assert all(enum == observed_draft_calls[0][2] for _, _, enum in observed_draft_calls)
+    assert len(selector_payloads) == 1
+    assert [c["index"] for c in selector_payloads[0]["candidates"]] == [1, 2, 3]
+    assert selector_payloads[0]["mode"] == "story"
+    assert len(polish_payloads) == 1
+    assert polish_payloads[0]["draft"]["summary"] == drafts_by_temp[0.25]["summary"]
+    assert out["title"] == "OpenSSL 4.x fallback reported on custom Tor builds"
+    assert "Custom OpenSSL 4.x builds reportedly" in out["summary"]
+
+
+def test_best_of_three_resilience_selector_fallbacks_update_mode_and_validation(monkeypatch):
+    """Handle partial candidate failures, selector errors/bad indices, update mode, and parameter validation."""
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["llm"].update(base_url="https://llm.example/v1", api_key_env="BEST_OF_RESIL_KEY")
+    monkeypatch.setenv("BEST_OF_RESIL_KEY", "synthetic-fixture-value")
+
+    for bad_bo in (0, -1, True, "3"):
+        with pytest.raises(ValueError, match="best_of"):
+            Analyzer(cfg, best_of=bad_bo)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="best_of"):
+            cache_key({"content_hash": "h"}, cfg["llm"], best_of=bad_bo)  # type: ignore[arg-type]
+    for bad_qd in (1, "yes"):
+        with pytest.raises(ValueError, match="quote_digest"):
+            Analyzer(cfg, quote_digest=bad_qd)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="quote_digest"):
+            cache_key({"content_hash": "h"}, cfg["llm"], quote_digest=bad_qd)  # type: ignore[arg-type]
+
+    src = item(title="Tor consensus bug", content="Maintainers investigate a consensus vote edge case.", labels=[])
+    ev = "Maintainers investigate a consensus vote edge case."
+    d1 = analysis(title="Consensus edge case 1", summary="Slot 1 summary.", why_it_matters="", evidence=[ev])
+    d2 = analysis(title="Consensus edge case 2", summary="Slot 2 summary.", why_it_matters="", evidence=[ev])
+    d3 = analysis(title="Consensus edge case 3", summary="Slot 3 summary.", why_it_matters="", evidence=[ev])
+
+    # 1. One candidate fails validate_analysis -> 2 survive -> selector narrows winner enum to [1, 2] and picks 2.
+    bad_d1 = analysis(title="Bad", summary="Bad.", why_it_matters="", evidence=["Not present in source text."])
+    w_partial = Analyzer(cfg, best_of=3)
+    w_partial.client = FakeLLM(bad_d1, d2, d3, {"winner": 2, "reason": "Stronger survivor."})
+    assert w_partial.analyze(src)["title"] == d3["title"]
+    assert w_partial.calls == 4
+    sel_enum = w_partial.client.requests[3][1]["response_format"]["json_schema"]["schema"]["properties"]["winner"]["enum"]
+    assert sel_enum == [1, 2]
+
+    # 2. Two candidates fail -> 1 survives -> returned directly with zero selector call.
+    w_one = Analyzer(cfg, best_of=3)
+    w_one.client = FakeLLM(FetchError("HTTP 503", status=503), d2, analysis(publish=False, evidence=[ev]))
+    assert w_one.analyze(src)["title"] == d2["title"] and w_one.calls == 3
+
+    # 3. All 3 candidates fail -> raises underlying AnalysisError.
+    w_all_fail = Analyzer(cfg, best_of=3)
+    w_all_fail.client = FakeLLM(bad_d1, bad_d1, bad_d1)
+    with pytest.raises(AnalysisError, match="exact excerpt"):
+        w_all_fail.analyze(src)
+
+    # 4. Selector failure (503 / invalid JSON) or invalid index falls back cleanly to candidate 1 (temp=0.0).
+    for bad_sel in (
+        FetchError("selector down", status=503),
+        {"winner": 9, "reason": "Out of range."},
+        {"winner": True, "reason": "Boolean must not act as int."},
+        completion({"winner": 2, "reason": "Truncated"}, finish_reason="length"),
+    ):
+        w_sel_fb = Analyzer(cfg, best_of=3)
+        w_sel_fb.client = FakeLLM(d1, d2, d3, bad_sel)
+        assert w_sel_fb.analyze(src)["title"] == d1["title"] and w_sel_fb.calls == 4
+
+    # 5. Update mode (prior is not None) runs best_of=3 + selector cleanly, skipping polish even if enabled.
+    prior = _prior_story()
+    u1 = update_analysis(update="Update candidate one.", evidence=[ev])
+    u2 = update_analysis(update="Update candidate two with exact scope.", evidence=[ev])
+    u3 = update_analysis(update="Update candidate three.", evidence=[ev])
+    w_upd = Analyzer(cfg, editorial_polish=True, best_of=3)
+    w_upd.client = FakeLLM(u1, u2, u3, {"winner": 2, "reason": "Exact scope."})
+    assert w_upd.analyze(src, prior=prior)["update"] == u2["update"]
+    assert w_upd.calls == 4
+    sel_sent = json.loads(w_upd.client.requests[3][1]["messages"][1]["content"])
+    assert sel_sent["mode"] == "update" and sel_sent["prior_story"] == analyze.prior_context(prior)
+
+    # 6. Tag item skips best_of=3 and quote_digest with zero calls.
+    w_tag = Analyzer(cfg, editorial_polish=True, best_of=3, quote_digest=True)
+    w_tag.client = FakeLLM()
+    assert w_tag.analyze(item(kind="tag", title="tor-0.4.9.16", content=""))["state"] == "tagged"
+    assert w_tag.calls == 0
+
+
+def test_quote_digest_injection_no_evidence_leak_and_cache_key_isolation(monkeypatch):
+    """Inject verified thread_digest into writer & selector without leaking non-verbatim quotes into evidence."""
+    from onionflash import comments as comments_mod
+
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["llm"].update(base_url="https://llm.example/v1", api_key_env="DIGEST_TEST_KEY")
+    monkeypatch.setenv("DIGEST_TEST_KEY", "synthetic-fixture-value")
+
+    issue_url = "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41990"
+    notes = [
+        make_note(1, "Initial crash reported on relay start.", author="alice",
+                  created_at="2026-11-08T10:00:00Z", url=issue_url),
+        make_note(2, "Wait: this only occurs with custom OpenSSL 4.x builds.", author="bob",
+                  created_at="2026-11-08T10:10:00Z", url=issue_url),
+        make_note(3, "Disagree that Linux relays are affected; cannot confirm.", author="carol",
+                  created_at="2026-11-08T10:20:00Z", url=issue_url),
+        make_note(4, "MR !777 proposed to guard cipher fallback.", author="bob",
+                  created_at="2026-11-08T10:30:00Z", url=issue_url),
+    ]
+    long_item = item(
+        url=issue_url,
+        title="Custom OpenSSL cipher fallback bug",
+        content="Initial report on OpenSSL fallback.",
+        labels=[],
+        public_comments=list(reversed(notes)),
+        comments_truncated=True,
+    )
+
+    digest_reply = {
+        "timeline": [
+            {"author": "alice", "created_at": "2026-11-08T10:00:00Z", "url": f"{issue_url}#note_1",
+             "point": "Initial crash reported."},
+            {"author": "bob", "created_at": "2026-11-08T10:30:00Z", "url": f"{issue_url}#note_4",
+             "point": "PARAPHRASED_DIGEST_TIMELINE_ONLY MR !777 proposed."},
+        ],
+        "anchors": [
+            {"quote": "Wait: this only occurs with custom OpenSSL 4.x builds.", "author": "bob", "url": f"{issue_url}#note_2"},
+            {"quote": "NON_VERBATIM_FABRICATED_DIGEST_QUOTE", "author": "carol", "url": f"{issue_url}#note_3"},
+        ],
+        "disagreements": ["@carol: Cannot confirm impact on Linux relays."],
+    }
+    ev = "Wait: this only occurs with custom OpenSSL 4.x builds."
+    d1 = analysis(title="OpenSSL fallback affects custom builds", summary="A report notes fallback on custom OpenSSL 4.x builds.",
+                  why_it_matters="", category="protocol", tags=["protocol"], evidence=[ev])
+    d2 = analysis(title="OpenSSL fallback narrowed to custom 4.x builds", summary="Comments narrow the fallback to custom OpenSSL 4.x builds.",
+                  why_it_matters="", category="protocol", tags=["protocol"], evidence=[ev])
+    d3 = analysis(title="Custom OpenSSL 4.x cipher fallback reported", summary="Maintainers discuss MR !777 while Linux impact remains unconfirmed.",
+                  why_it_matters="", category="protocol", tags=["protocol"], evidence=[ev])
+
+    writer = Analyzer(cfg, best_of=3, quote_digest=True)
+    writer.client = FakeLLM(digest_reply, d1, d2, d3, {"winner": 3, "reason": "Captures narrowing and caveat."})
+    out = writer.analyze(long_item)
+    assert out["title"] == d3["title"] and writer.calls == 5
+
+    # Check writer and selector saw verified thread_digest without non-verbatim anchor or evidence leakage.
+    first_writer_req = writer.client.requests[1][1]
+    sent_payload = json.loads(first_writer_req["messages"][1]["content"])
+    ev_enum = first_writer_req["response_format"]["json_schema"]["schema"]["properties"]["evidence"]["items"]["enum"]
+    assert "thread_digest" in sent_payload
+    assert len(sent_payload["thread_digest"]["anchors"]) == 1
+    assert sent_payload["thread_digest"]["anchors"][0]["quote"] == ev
+    assert "NON_VERBATIM_FABRICATED_DIGEST_QUOTE" not in json.dumps(sent_payload)
+    assert all("PARAPHRASED_DIGEST_TIMELINE_ONLY" not in exc for exc in ev_enum)
+    assert "thread_digest" in json.loads(writer.client.requests[4][1]["messages"][1]["content"])["source"]
+
+    # Non-verbatim digest text CANNOT pass validate_analysis evidence check.
+    with pytest.raises(AnalysisError, match="not an exact excerpt"):
+        validate_analysis(
+            analysis(evidence=["PARAPHRASED_DIGEST_TIMELINE_ONLY MR !777 proposed."]),
+            long_item,
+        )
+
+    # Fast-fail quoted-only mailing-list ack skips digest LLM call completely (0 calls).
+    list_ack = item(
+        url="https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/ACK1/",
+        kind="feed", authority="community", title="[tor-relays] Re: Crash",
+        content="On Mon Alice wrote:\n> Relay crashed on startup.\n\n+1",
+        public_comments=list(reversed(notes)), comments_truncated=True,
+    )
+    ack_writer = Analyzer(cfg, best_of=3, quote_digest=True)
+    ack_writer.client = FakeLLM()
+    with pytest.raises(AnalysisError) as ack_err:
+        ack_writer.analyze(list_ack)
+    assert ack_err.value.code == "writer.quoted_only_evidence" and ack_writer.calls == 0
+
+    # cache_key preserves default key parity while isolating best_of and quote_digest contracts.
+    row = {"content_hash": "h1"}
+    base_k = cache_key(row, cfg["llm"])
+    assert cache_key(row, cfg["llm"], best_of=1, quote_digest=False) == base_k
+    bo_k = cache_key(row, cfg["llm"], best_of=3)
+    qd_k = cache_key(row, cfg["llm"], quote_digest=True)
+    assert len({base_k, bo_k, qd_k}) == 3
+    with monkeypatch.context() as mp:
+        mp.setattr(analyze, "SELECTOR_PROMPT", analyze.SELECTOR_PROMPT + "\nExtra rule.")
+        assert cache_key(row, cfg["llm"]) == base_k and cache_key(row, cfg["llm"], best_of=3) != bo_k
+    with monkeypatch.context() as mp:
+        mp.setattr(comments_mod, "THREAD_DIGEST_PROMPT", comments_mod.THREAD_DIGEST_PROMPT + "\nExtra rule.")
+        assert cache_key(row, cfg["llm"]) == base_k and cache_key(row, cfg["llm"], quote_digest=True) != qd_k
+
+
+def test_best_of_three_clears_tracking_reasoning_profile_and_deadline_guards(monkeypatch):
+    """Track winning candidate clears accurately, preserve writer_reasoning, and respect admission deadlines."""
+    from onionflash import llm as llm_mod
+
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["llm"].update(base_url="https://llm.example/v1", api_key_env="BO_CLEARS_KEY")
+    monkeypatch.setenv("BO_CLEARS_KEY", "synthetic-fixture-value")
+
+    src = item(title="Tor consensus weight bug", content="Observed 3 affected authorities on 0.4.9.16.", labels=[])
+    ev = "Observed 3 affected authorities on 0.4.9.16."
+    cleared_draft = analysis(
+        title="Authority consensus weight bug 1",
+        summary="Observed 3 affected authorities on 0.4.9.16.",
+        why_it_matters="Observed 99 affected authorities.",
+        evidence=[ev],
+    )
+    clean_draft = analysis(
+        title="Authority consensus weight bug 2",
+        summary="Observed 3 affected authorities on 0.4.9.16.",
+        why_it_matters="Three authorities were affected on 0.4.9.16.",
+        evidence=[ev],
+    )
+    # Candidate 1 has ungrounded number cleared (clears=1), candidate 2 is clean (clears=0) and wins -> self.clears == 0.
+    w_clean = Analyzer(cfg, best_of=3)
+    w_clean.client = FakeLLM(cleared_draft, clean_draft, clean_draft, {"winner": 2, "reason": "Preserves exact count."})
+    res_clean = w_clean.analyze(src)
+    assert res_clean["why_it_matters"] == clean_draft["why_it_matters"] and w_clean.clears == 0
+
+    # If candidate 1 wins (with cleared why_it_matters), self.clears == 1.
+    w_cleared = Analyzer(cfg, best_of=3)
+    w_cleared.client = FakeLLM(cleared_draft, clean_draft, clean_draft, {"winner": 1, "reason": "Selected slot 1."})
+    res_cleared = w_cleared.analyze(src)
+    assert res_cleared["why_it_matters"] == "" and w_cleared.clears == 1
+
+    # Expired deadline before best_of=3 admission raises CompletionDeferred with 0 calls.
+    clock_now = [100.0]
+    w_expired = Analyzer(cfg, deadline=50.0, best_of=3)
+    w_expired.clock = lambda: clock_now[0]
+    w_expired.client = FakeLLM()
+    with pytest.raises(llm_mod.CompletionDeferred):
+        w_expired.analyze(src)
+    assert w_expired.calls == 0
+
+    # Deadline expiring after 3 drafts skips selector call and returns candidate 1 cleanly.
+    seen_drafts = []
+    cfg_r = copy.deepcopy(cfg)
+    cfg_r["llm"].update(writer_reasoning=True, send_chat_template_kwargs=True)
+
+    def _handle_r(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        name = body["response_format"]["json_schema"]["name"]
+        assert name == "onionflash_news"
+        assert body["chat_template_kwargs"] == {"enable_thinking": True}
+        assert body["max_tokens"] == 32768
+        with w_r._state_lock:
+            seen_drafts.append(body["temperature"])
+            if len(seen_drafts) == 3:
+                clock_now[0] = 200.0
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(clean_draft)}}]})
+
+    monkeypatch.setattr(
+        llm_mod,
+        "HttpClient",
+        lambda settings, **kwargs: HttpClient(
+            settings, **kwargs, transport=httpx.MockTransport(_handle_r), resolver=public_dns
+        ),
+    )
+    clock_now[0] = 0.0
+    with Analyzer(cfg_r, deadline=150.0, best_of=3) as w_r:
+        w_r.clock = lambda: clock_now[0]
+        res_r = w_r.analyze(src)
+        assert res_r["title"] == clean_draft["title"]
+        assert w_r.calls == 3  # Selector skipped because clock crossed deadline after the 3 drafts.

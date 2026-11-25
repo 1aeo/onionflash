@@ -1290,3 +1290,139 @@ def test_floor_dirauth_note_marked_internal_or_emptied_is_evicted(tmp_path, tran
         enrich_with_client(cfg, store2, FakeClient([gql_notes_response(pushed_out)]), "2026-11-12T10:30:00Z")
         saved_off = json.loads(store2.db.execute("SELECT payload FROM items").fetchone()[0])
         assert saved_off["authority"] == "dirauth-operator" and len(saved_off["dirauth_notes"]) == 1
+
+
+def test_long_thread_digest_triggers_deterministic_fallback_and_purity():
+    """Keep MAX_COMMENTS/TOTAL_CHARS intact and build pure chronological digests for long or truncated threads."""
+    from onionflash.comments import MAX_COMMENTS, TOTAL_CHARS, build_long_thread_digest
+    from onionflash.store import item_hash
+    from onionflash.util import normalize_evidence
+
+    assert MAX_COMMENTS == 12 and TOTAL_CHARS == 8000
+
+    short_item = _issue(
+        public_comments=[make_note(1, "Short reply.", author="alice", url=URL)],
+        comments_truncated=False,
+    )
+    assert build_long_thread_digest(short_item) is None
+    assert build_long_thread_digest(_issue(public_comments=[], comments_truncated=True)) is None
+
+    truncated_item = _issue(
+        public_comments=[make_note(2, "Root cause narrowed to TLS group list.", author="bob", url=URL)],
+        comments_truncated=True,
+    )
+    assert build_long_thread_digest(truncated_item) is not None
+
+    large_char_notes = [
+        make_note(i, f"Long comment {i}: " + ("detail " * 250), author=f"user{i}",
+                  created_at=f"2026-11-08T1{i}:00:00Z", url=URL)
+        for i in range(1, 4)
+    ]
+    assert sum(len(n["body"]) for n in large_char_notes) >= 4500
+    assert build_long_thread_digest(_issue(public_comments=large_char_notes)) is not None
+
+    # Eight-comment thread stored newest-first with initial report, narrowing, disagreement, and MR close.
+    thread_notes_chrono = [
+        make_note(1, "Initial crash reproduced on relay startup with TLS 1.3 enabled.", author="alice",
+                  created_at="2026-11-08T10:00:00Z", url=URL),
+        make_note(2, "Thanks for reporting this issue.", author="bob",
+                  created_at="2026-11-08T10:05:00Z", url=URL),
+        make_note(3, "Wait: this only affects OpenSSL 4.x builds, not 3.x relays.", author="carol",
+                  created_at="2026-11-08T10:10:00Z", url=URL),
+        make_note(4, "> Initial crash reproduced\nHowever, I cannot confirm any remote trigger.", author="dave",
+                  created_at="2026-11-08T10:15:00Z", url=URL),
+        make_note(5, "Stack trace confirms fallback cipher selection.", author="alice",
+                  created_at="2026-11-08T10:20:00Z", url=URL),
+        make_note(6, "Another test run showed identical behavior on Debian.", author="eve",
+                  created_at="2026-11-08T10:25:00Z", url=URL),
+        make_note(7, "Disagree that all guards are impacted; only non-default flags trigger it.", author="frank",
+                  created_at="2026-11-08T10:30:00Z", url=URL),
+        make_note(8, "Merged fix in MR !412 and closed tracking ticket.", author="bob",
+                  created_at="2026-11-08T10:35:00Z", url=URL),
+    ]
+    long_item = _issue(public_comments=list(reversed(thread_notes_chrono)), comments_truncated=False)
+    snapshot = copy.deepcopy(long_item)
+    before_hash = item_hash(long_item)
+
+    digest_obj = build_long_thread_digest(long_item)
+    assert long_item == snapshot and item_hash(long_item) == before_hash
+    assert digest_obj is not None
+    assert digest_obj["comment_count"] == 8 and digest_obj["comments_truncated"] is False
+    timestamps = [entry["created_at"] for entry in digest_obj["timeline"]]
+    assert timestamps == sorted(timestamps)
+    assert timestamps[0] == "2026-11-08T10:00:00Z" and timestamps[-1] == "2026-11-08T10:35:00Z"
+    assert digest_obj["anchors"]
+    for anchor in digest_obj["anchors"]:
+        assert set(anchor) == {"quote", "author", "url"}
+        matching = [n for n in thread_notes_chrono if n["author"] == anchor["author"] and n["url"] == anchor["url"]]
+        assert len(matching) == 1
+        assert normalize_evidence(anchor["quote"]) in normalize_evidence(matching[0]["body"])
+        assert not anchor["quote"].lstrip().startswith(">")
+    assert any("cannot confirm" in d.lower() or "disagree" in d.lower() for d in digest_obj["disagreements"])
+
+
+def test_long_thread_digest_llm_verification_strips_ungrounded_quotes_and_falls_back():
+    """Verify LLM-backed digest anchors against public_comments via normalize_evidence and fall back on failure."""
+    from onionflash.comments import build_long_thread_digest
+    from onionflash.util import normalize_evidence
+
+    notes = [
+        make_note(i, f"Comment {i} states “it’s limited” to OpenSSL 4.x builds.", author=f"user{i}",
+                  created_at=f"2026-11-08T10:0{i}:00Z", url=URL)
+        for i in range(1, 9)
+    ]
+    long_item = _issue(public_comments=list(reversed(notes)))
+
+    def _llm_mixed(prompt, payload, schema, name):
+        assert name == "onionflash_thread_digest"
+        assert [n["author"] for n in payload["public_comments"]] == [f"user{i}" for i in range(1, 9)]
+        return {
+            "timeline": [
+                {"author": "@user1", "created_at": "", "url": f"{URL}#note_1", "point": "Initial narrowing to OpenSSL 4.x."},
+                {"author": "user8", "created_at": "2026-11-08T10:08:00Z", "url": f"{URL}#note_8", "point": "Latest confirmation."},
+            ],
+            "anchors": [
+                # Valid quote differing only in curly quotes/apostrophe, casing, and spacing (normalize_evidence match).
+                {"quote": 'states "it\'s   LIMITED" to openssl 4.x builds.', "author": "@user1", "url": f"{URL}#note_1"},
+                # Paraphrased / hallucinated quote -> MUST be dropped.
+                {"quote": "Maintainers shipped a hotfix everywhere.", "author": "user2", "url": f"{URL}#note_2"},
+                # Verbatim quote misattributed to wrong author -> MUST be dropped.
+                {"quote": "Comment 3 states “it’s limited” to OpenSSL 4.x builds.", "author": "user4", "url": f"{URL}#note_3"},
+                # Verbatim quote with wrong URL -> MUST be dropped.
+                {"quote": "Comment 5 states “it’s limited” to OpenSSL 4.x builds.", "author": "user5", "url": f"{URL}#note_999"},
+                # Too short -> MUST be dropped.
+                {"quote": "builds.", "author": "user6", "url": f"{URL}#note_6"},
+            ],
+            "disagreements": ["@user3: Only affects OpenSSL 4.x builds."],
+        }
+
+    verified = build_long_thread_digest(long_item, llm_call=_llm_mixed)
+    assert verified is not None
+    assert [t["author"] for t in verified["timeline"]] == ["user1", "user8"]
+    assert verified["anchors"] == [
+        {"quote": 'states "it\'s   LIMITED" to openssl 4.x builds.', "author": "user1", "url": f"{URL}#note_1"}
+    ]
+    assert verified["disagreements"] == ["@user3: Only affects OpenSSL 4.x builds."]
+
+    # 1-arg callable with all-hallucinated anchors keeps timeline but drops every bad anchor.
+    bad_only = build_long_thread_digest(
+        long_item,
+        llm_call=lambda payload: {
+            "timeline": [{"author": "user1", "created_at": "", "url": "", "point": f"Count {len(payload['public_comments'])}."}],
+            "anchors": [{"quote": "Completely invented sentence not in comments.", "author": "user1", "url": f"{URL}#note_1"}],
+            "disagreements": [],
+        },
+    )
+    assert bad_only["anchors"] == [] and len(bad_only["timeline"]) == 1
+
+    # Exception or malformed reply cleanly falls back to deterministic digest.
+    for failing_call in (
+        lambda *_a: (_ for _ in ()).throw(RuntimeError("upstream timeout")),
+        lambda *_a: {"unexpected": "shape"},
+    ):
+        fallback = build_long_thread_digest(long_item, llm_call=failing_call)
+        assert fallback is not None and fallback["anchors"]
+        assert all(
+            any(normalize_evidence(a["quote"]) in normalize_evidence(n["body"]) for n in notes)
+            for a in fallback["anchors"]
+        )
