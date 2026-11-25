@@ -25,7 +25,7 @@ from onionflash.collect import CollectionError, collect_source
 from onionflash.config import DEFAULT_TRUSTED_OPERATOR_DOMAINS, DEFAULTS, _clean_endpoint_url, load_config
 from onionflash.llm import is_quoted_list_post, json_object, unquoted_mail_text
 from onionflash.source_packet import number_sources
-from onionflash.store import Store, backup_database, item_priority, source_due
+from onionflash.store import PT_SECURITY_PRIORITY, Store, backup_database, item_priority, source_due
 from onionflash.transport import DeadlineReached, FetchError, HttpClient, Response
 from onionflash.util import (
     MAX_SAVED_DEPTH, after, backoff_seconds, canonical_url, format_utc, gitlab_refs, item_cluster,
@@ -2183,4 +2183,68 @@ def test_cli_run_concurrent_partial_failures_do_not_double_defer(context, monkey
         ok_item["url"]: ("published", 0, 0),
         retry_item["url"]: ("pending", 1, 0),
         bad_item["url"]: ("pending", 1, 1),
+    }
+
+
+def test_pluggable_transport_high_impact_priority_outranks_dependency_chores(store):
+    """Boost pluggable-transport security, crash, DoS, and nginx issues ahead of chore(deps) bumps."""
+    assert PT_SECURITY_PRIORITY == 20
+    pt_crash = item(
+        url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/issues/401",
+        title="Snowflake broker panic on malformed offer",
+        content="A malformed client offer triggers a broker panic and memory exhaustion.",
+        labels=[],
+    )
+    pt_nginx = item(
+        url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/issues/19",
+        title="WebTunnel nginx proxy DoS via HTTP/2 header flood",
+        content="Repeated oversized headers cause nginx worker exhaustion.",
+        labels=[],
+    )
+    chore_bump = item(
+        url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/merge_requests/312",
+        kind="gitlab_mr",
+        title="chore(deps): bump github.com/pion/webrtc to v4.0.1",
+        content="Routine dependency version bump for CI builds.",
+        labels=[],
+    )
+    assert item_priority(pt_crash) >= PT_SECURITY_PRIORITY
+    assert item_priority(pt_nginx) >= PT_SECURITY_PRIORITY
+    assert item_priority(chore_bump) == 0
+    assert item_priority(pt_crash) > item_priority(chore_bump)
+    assert item_priority(pt_nginx) > item_priority(chore_bump)
+
+    store.ingest(chore_bump, DATE)
+    store.ingest(pt_crash, DATE)
+    queued = store.pending(10, DATE)
+    assert [r["url"] for r in queued] == [pt_crash["url"], chore_bump["url"]]
+
+
+def test_cli_opt_in_adapters_include_best_of_quote_digest_and_specialists(monkeypatch):
+    """Pass `best_of=3`, `quote_digest=True`, and `specialists=3` when target signatures accept them."""
+    seen: list[dict] = []
+
+    class _FullAnalyzer:
+        def __init__(self, config, deadline=None, editorial_polish=False, best_of=1, quote_digest=False):
+            seen.append({
+                "deadline": deadline,
+                "editorial_polish": editorial_polish,
+                "best_of": best_of,
+                "quote_digest": quote_digest,
+            })
+
+    monkeypatch.setattr(cli, "Analyzer", _FullAnalyzer)
+    cli._new_analyzer(DEFAULTS, deadline=99.0)
+    assert seen == [{"deadline": 99.0, "editorial_polish": True, "best_of": 3, "quote_digest": True}]
+
+    def _spec_process(cfg, store, row, writer, reviewer, observed=None, *, allow_network=True,
+                      parallel_verify=False, reviewer_factory=None, specialists=1):
+        """Specialist-capable process_item double."""
+
+    factory = lambda: None
+    monkeypatch.setattr(cli, "process_item", _spec_process)
+    assert cli._parallel_verify_kwargs(True, factory) == {
+        "parallel_verify": True,
+        "reviewer_factory": factory,
+        "specialists": 3,
     }
