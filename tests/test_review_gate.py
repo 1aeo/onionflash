@@ -1838,6 +1838,9 @@ def test_tiebreak_factual_fail_and_new_information_hold(context):
          "held.verification.model_hold", False, False, 4),
         ([verdict(), verdict("skip", criterion="news_value"), verdict("skip", criterion="new_information")],
          "held.verification.disagreed_news", False, True, 3),
+        ([verdict(), verdict("skip", criterion="news_value"),
+          verdict("hold", criterion="news_value", criteria={"news_value": {"outcome": "insufficient", "reason": "Inconclusive news value."}})],
+         "held.verification.disagreed_news", True, True, 3),
     ]
     for idx, (replies, expected_code, can_approve, expected_facts, expected_calls) in enumerate(cases):
         row = pending(store, item(id=f"https://example.org/tie-fail-{idx}", url=f"https://example.org/tie-fail-{idx}"))
@@ -2075,20 +2078,42 @@ def test_parallel_verify_partial_failures_and_budget_guard(context):
     assert audit(store, row2["id"])["request_budget"]["reserved"] == 4
 
     row3 = pending(store, item(id="https://example.org/pv-guard", url="https://example.org/pv-guard"))
-    for _ in range(review_gate.MAX_REVIEW_REQUESTS - 1):
+    for _ in range(review_gate.MAX_REVIEW_REQUESTS - 2):
         with pytest.raises(AnalysisError):
             run(cfg, store, row3, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
     factory_called = []
 
     def _guard_factory():
-        """Record if parallel factory is invoked when fewer than two slots remain."""
+        """Record if parallel factory is invoked when fewer than three slots remain."""
         factory_called.append(True)
         return ApprovingReviewer()
 
-    with pytest.raises(review.ReviewLimitReached):
-        review_gate.process_item(cfg, store, row3, Writer(), ApprovingReviewer(),
-                                 parallel_verify=True, reviewer_factory=_guard_factory)
-    assert factory_called == [] and job_record(store, row3["id"])["request_budget"]["reserved"] == review_gate.MAX_REVIEW_REQUESTS
+    res_seq_repair = review_gate.process_item(
+        cfg, store, row3, Writer(),
+        Reviewer({**verdict("revise"), "repair": {"summary": "Repaired cleanly within last two slots."}}, verdict()),
+        parallel_verify=True, reviewer_factory=_guard_factory,
+    )
+    assert res_seq_repair["status"] == "published" and factory_called == []
+    assert audit(store, row3["id"])["request_budget"]["reserved"] == review_gate.MAX_REVIEW_REQUESTS
+
+    # With three slots remaining (reserved == MAX_REVIEW_REQUESTS - 3), initial parallel verify is permitted.
+    row3b = pending(store, item(id="https://example.org/pv-guard-3slots", url="https://example.org/pv-guard-3slots"))
+    for _ in range(review_gate.MAX_REVIEW_REQUESTS - 3):
+        with pytest.raises(AnalysisError):
+            run(cfg, store, row3b, Writer(), Reviewer(AnalysisError("timeout", retryable=True)))
+    three_slot_factory_calls = []
+
+    def _three_slot_factory():
+        """Record that parallel factory is permitted when three slots remain."""
+        three_slot_factory_calls.append(True)
+        return ApprovingReviewer()
+
+    res_par3 = review_gate.process_item(
+        cfg, store, row3b, Writer(), ApprovingReviewer(),
+        parallel_verify=True, reviewer_factory=_three_slot_factory,
+    )
+    assert res_par3["status"] == "published" and len(three_slot_factory_calls) == 2
+    assert audit(store, row3b["id"])["request_budget"]["reserved"] == review_gate.MAX_REVIEW_REQUESTS - 1
 
     row4 = pending(store, item(id="https://example.org/pv-defer", url="https://example.org/pv-defer"))
 

@@ -940,6 +940,18 @@ _UNRELATED_EVENT_RE = re.compile(
     r"\b(?:unrelated|wrongly\s+attached|different\s+(?:event|story|product|incident))\b",
     re.IGNORECASE,
 )
+_NEGATED_UNRELATED_RE = re.compile(
+    r"\b(?:not|never|no|isn['’]?t|aren['’]?t|wasn['’]?t|weren['’]?t)\s+(?:an?\s+)?$",
+    re.IGNORECASE,
+)
+
+
+def _mentions_unrelated_event(reason: str) -> bool:
+    """Return whether `reason` makes an un-negated claim of an unrelated story or incident."""
+    return any(
+        not _NEGATED_UNRELATED_RE.search(reason[max(0, match.start() - 24) : match.start()])
+        for match in _UNRELATED_EVENT_RE.finditer(reason)
+    )
 
 
 def _skip_stands(criteria: dict, coverage: dict | None, same_story: str | None = None, *, update: bool = False) -> bool:
@@ -955,11 +967,12 @@ def _skip_stands(criteria: dict, coverage: dict | None, same_story: str | None =
     names_live = any(sid == same_story or sid in reason for sid in live_ids)
     if "new_information" in failed and not names_live and any(sid in reason for sid in retracted_ids):
         return False
+    unrelated = update and _mentions_unrelated_event(reason)
     if failed != {"new_information"}:
-        return not (update and "new_information" in failed and _UNRELATED_EVENT_RE.search(reason))
+        return not ("new_information" in failed and unrelated)
     if names_live:
-        return not (update and _UNRELATED_EVENT_RE.search(reason))
-    return bool(update and prior_id and not _UNRELATED_EVENT_RE.search(reason))
+        return not unrelated
+    return bool(update and prior_id and not unrelated)
 
 
 class Reviewer(CompletionClient):

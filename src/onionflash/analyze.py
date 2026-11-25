@@ -515,6 +515,7 @@ _ADVISORY_ID_RE = re.compile(r"\b(?:TROVE|CVE)-\d{4}-\d+\b", re.IGNORECASE)
 _POLISH_DONE_WORDS = (
     "removed", "removes", "fixed", "patched", "resolved", "deployed", "deploys",
     "disabled", "disables", "revoked", "revokes", "rotated", "rotates", "shipped", "ships",
+    "merged",
 )
 _POLISH_DONE_RE = re.compile(r"\b(" + "|".join(_POLISH_DONE_WORDS) + r")\b(?!-)")
 _POLISH_EXCUSED_RE = re.compile(
@@ -560,10 +561,11 @@ def _normalize_editorial_labels(result: dict, source: dict, schema: dict) -> Non
         if old_cat != "directory-authority":
             kept = [tag for tag in result["tags"] if tag not in {"directory-authority", old_cat}]
             result["tags"] = ["directory-authority", *kept][: SCHEMA["properties"]["tags"]["maxItems"]]
-    elif not _util.has_dirauth_signal(source):
-        tags = [tag for tag in result["tags"] if tag != "directory-authority"]
+    else:
+        has_signal = _util.has_dirauth_signal(source)
+        tags = list(result["tags"]) if has_signal else [tag for tag in result["tags"] if tag != "directory-authority"]
         if result["category"] == "directory-authority":
-            fallback = next((tag for tag in tags if tag in allowed_categories), None)
+            fallback = next((tag for tag in tags if tag != "directory-authority" and tag in allowed_categories), None)
             if fallback is None:
                 fallback = next(
                     (cat for cat in ("network", "protocol", "relay", "feature") if cat in allowed_categories),
@@ -611,7 +613,7 @@ class Analyzer(CompletionClient):
                 cleaned = validate_schema_field(
                     reply[key], rule, empty=key == "why_it_matters", message=f"Invalid model {key}",
                 )
-                if key == "why_it_matters" or cleaned:
+                if cleaned:
                     merged[key] = cleaned
         draft_ids = {m.upper() for m in _ADVISORY_ID_RE.findall(str(draft.get("title") or ""))}
         merged_ids = {m.upper() for m in _ADVISORY_ID_RE.findall(str(merged.get("title") or ""))}

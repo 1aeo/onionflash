@@ -1528,6 +1528,66 @@ def test_polish_preserves_advisory_ids_and_issue_completed_action_verbs(monkeypa
     })
     assert w_mr.analyze(non_iss)["title"] == "Old cipher removed cleanly"
 
+    # 3. Unstated "merged" on gitlab_issue falls back; source-stated or qualified "to be merged" passes.
+    req_merge_item = item(
+        kind="gitlab_issue",
+        title="Parser cleanup request",
+        content="This issue requests parser cleanup to be merged in core.",
+        labels=[],
+    )
+    req_merge_draft = analysis(
+        title="Parser cleanup merge requested",
+        summary="Issue requests parser cleanup to be merged.",
+        why_it_matters="Parser leaks memory before cleanup.",
+        category="protocol",
+        tags=["protocol"],
+        evidence=["This issue requests parser cleanup to be merged in core."],
+    )
+    w_bad_merged = Analyzer(cfg, editorial_polish=True)
+    w_bad_merged.client = FakeLLM(req_merge_draft, {
+        "title": "Parser cleanup merged in core",
+        "summary": "Parser cleanup was merged.",
+        "why_it_matters": "Parser leaks memory before cleanup.",
+    })
+    assert w_bad_merged.analyze(req_merge_item)["title"] == req_merge_draft["title"]
+
+    w_qual_merged = Analyzer(cfg, editorial_polish=True)
+    w_qual_merged.client = FakeLLM(req_merge_draft, {
+        "title": "Parser cleanup requests to be merged",
+        "summary": "Issue requests parser cleanup to be merged.",
+        "why_it_matters": "",
+    })
+    assert w_qual_merged.analyze(req_merge_item)["title"] == "Parser cleanup requests to be merged"
+    # Non-empty grounded draft why_it_matters is retained when polish returns "".
+    w_keep_wim = Analyzer(cfg, editorial_polish=True)
+    w_keep_wim.client = FakeLLM(req_merge_draft, {
+        "title": "Parser cleanup requests to be merged",
+        "summary": "Issue requests parser cleanup to be merged.",
+        "why_it_matters": "",
+    })
+    assert w_keep_wim.analyze(req_merge_item)["why_it_matters"] == req_merge_draft["why_it_matters"]
+
+    stated_merged_item = item(
+        kind="gitlab_issue",
+        title="Parser fix merged",
+        content="Maintainer noted the parser fix was merged yesterday.",
+        labels=[],
+    )
+    w_stated_merged = Analyzer(cfg, editorial_polish=True)
+    w_stated_merged.client = FakeLLM(
+        analysis(
+            title="Parser fix update", summary="Ticket updated.", why_it_matters="",
+            category="protocol", tags=["protocol"],
+            evidence=["Maintainer noted the parser fix was merged yesterday."],
+        ),
+        {
+            "title": "Parser fix merged upstream",
+            "summary": "Maintainer noted the parser fix was merged yesterday.",
+            "why_it_matters": "",
+        },
+    )
+    assert w_stated_merged.analyze(stated_merged_item)["title"] == "Parser fix merged upstream"
+
 
 def test_polish_strips_spurious_directory_authority_labels_and_keeps_genuine(monkeypatch):
     """Strip spurious directory-authority labels on non-dirauth stories while preserving genuine dirauth mentions."""
@@ -1667,3 +1727,33 @@ def test_polish_strips_spurious_directory_authority_labels_and_keeps_genuine(mon
     tls_out = tls_writer.analyze(tls_src)
     assert tls_out["category"] == "security"
     assert tls_out["tags"] == ["security", "relay"]
+
+    # 4. Excluded security + dirauth-labeled stories never retain category="directory-authority",
+    # even though has_dirauth_signal is True, while keeping the "directory-authority" tag.
+    sec_da_src = item(
+        kind="gitlab_issue",
+        url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/41999",
+        authority="dirauth-operator",
+        title="Security vulnerability in directory authority vote parser",
+        content="CVE-2026-4444 allows crashing a directory authority during vote parsing.",
+        labels=["Directory Authority (dirauth)", "Security"],
+    )
+    sec_da_draft = analysis(
+        title="CVE-2026-4444 crash reported in directory authority vote parser",
+        summary="A security issue affects directory authority vote parsing.",
+        why_it_matters="",
+        category="directory-authority",
+        state="developing",
+        confidence="reported",
+        tags=["directory-authority", "security"],
+        evidence=["CVE-2026-4444 allows crashing a directory authority during vote parsing."],
+    )
+    sec_da_writer = Analyzer(cfg, editorial_polish=True)
+    sec_da_writer.client = FakeLLM(sec_da_draft, {
+        "title": sec_da_draft["title"],
+        "summary": sec_da_draft["summary"],
+        "why_it_matters": "",
+    })
+    sec_da_out = sec_da_writer.analyze(sec_da_src)
+    assert sec_da_out["category"] == "security"
+    assert sec_da_out["tags"] == ["directory-authority", "security"]

@@ -780,3 +780,33 @@ def test_update_repair_limits_and_final_holds_honor_established_prior_story_stat
     assert review.final_holds(
         cand_fixed, {"mode": "update", "packet": {"sources": mr_units[:2]}, "coverage": coverage_fixed}
     ) == []
+
+
+def test_skip_stands_distinguishes_negated_unrelated_event_phrases():
+    """Keep update skips when reason negates unrelated-event language while holding positive unrelated flags."""
+    live_id = "a" * 24
+    coverage = {"prior_story": {"id": live_id, "state": "developing"}, "recent": []}
+
+    neg_reply = verdict(
+        "skip",
+        criterion="new_information",
+        update=True,
+        reason=f"Repeats {live_id}; this is not a different incident.",
+    )
+    assert review._skip_stands(neg_reply["criteria"], coverage, update=True) is True
+
+    neg_no_story_reply = verdict(
+        "skip",
+        criterion="new_information",
+        update=True,
+        reason="No new facts; not an unrelated event.",
+    )
+    assert review._skip_stands(neg_no_story_reply["criteria"], coverage, update=True) is True
+
+    pos_reply = verdict(
+        "skip",
+        criterion="new_information",
+        update=True,
+        reason=f"Different incident from {live_id}.",
+    )
+    assert review._skip_stands(pos_reply["criteria"], coverage, update=True) is False

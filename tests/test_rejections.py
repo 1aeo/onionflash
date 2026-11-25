@@ -719,10 +719,30 @@ def test_operator_retry_exemption_clears_after_terminal_decision_and_skips_stale
         resp = gql_notes_response([gql_note("10", createdAt="2026-01-02T00:00:00Z", body="Enriched once.")])
         assert enrich_with_client(cfg, store, FakeClient([resp]), enrich_ts)["changed"] == 1
         enriched = item_row(store, row["id"])
+        assert review_gate._has_operator_retry(store.db, enriched) is True
+
+        # Check stale comments_checked_at BEFORE any terminal decision so the timestamp guard itself is isolated.
+        stale = dict(enriched)
+        payload = json.loads(stale["payload"])
+        payload["comments_checked_at"] = "2026-01-05T00:00:00Z"
+        stale["payload"] = json.dumps(payload)
+        assert review_gate._has_operator_retry(store.db, stale) is False
 
         skip_result = run_gate(cfg, store, enriched, Writer(), Reviewer(verdict("skip", criterion="news_value")))
         assert skip_result["status"] == "ignored"
         assert review_gate._has_operator_retry(store.db, item_row(store, row["id"])) is False
+
+        # Exact-hash retry exemption also clears once a terminal decision follows that retry.
+        same_hash_src = item(id="https://example.org/exact-hash-retry", url="https://example.org/exact-hash-retry",
+                             kind="feed", published_at=old_ts, updated_at=old_ts, collected_at=DATE)
+        store.ingest(same_hash_src, DATE)
+        same_row = item_row(store, same_hash_src["id"])
+        assert run_gate(cfg, store, same_row, Writer(), Reviewer(verdict(), verdict()))["status"] == "ignored"
+        rejection.retry_item(store, same_row["id"], same_row["content_hash"], "Retry exact hash", observed=retry_at)
+        assert review_gate._has_operator_retry(store.db, item_row(store, same_row["id"])) is True
+        same_skip = run_gate(cfg, store, item_row(store, same_row["id"]), Writer(), Reviewer(verdict("skip", criterion="news_value")))
+        assert same_skip["status"] == "ignored"
+        assert review_gate._has_operator_retry(store.db, item_row(store, same_row["id"])) is False
 
         later_ts = after(120, retry_at)
         edited_src = {**src, "content": "Minor upstream wording fix after terminal skip.", "updated_at": after(120, old_ts)}
@@ -732,12 +752,6 @@ def test_operator_retry_exemption_clears_after_terminal_decision_and_skips_stale
         assert enrich_with_client(cfg, store, FakeClient([resp_later]), after(60, later_ts))["changed"] == 1
         after_terminal = item_row(store, row["id"])
         assert review_gate._has_operator_retry(store.db, after_terminal) is False
-
-        stale = dict(after_terminal)
-        payload = json.loads(stale["payload"])
-        payload["comments_checked_at"] = "2026-01-05T00:00:00Z"
-        stale["payload"] = json.dumps(payload)
-        assert review_gate._has_operator_retry(store.db, stale) is False
 
         feed_src = item(id="https://example.org/feed-item", url="https://example.org/feed-item",
                         kind="feed", published_at=old_ts, updated_at=old_ts, collected_at=DATE)

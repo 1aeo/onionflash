@@ -646,6 +646,8 @@ def next_step(reviews, candidate, prepared):
             if result.get("same_story") and _can_route(candidate, prepared, result, result.get("same_story")):
                 return "route", result["same_story"]
             return "hold", ("verification", "disagreed_news")
+        if result["criteria"]["news_value"]["outcome"] == "insufficient" and failed & review.EDITORIAL_CRITERIA == {"news_value"}:
+            return "hold", ("verification", "disagreed_news")
         votes = sum(_news(entry["result"], mandatory=mandatory) for entry in reviews[:3])
         if votes <= 1:
             if official:
@@ -683,6 +685,11 @@ def next_step(reviews, candidate, prepared):
         if verdict != "revise":
             return ("hold", (stage, "model_hold")) if later else ("verify", candidate)
     elif verdict == "skip":
+        if (
+            result["criteria"]["news_value"]["outcome"] == "insufficient"
+            and result["criteria"]["new_information"]["outcome"] != "fail"
+        ):
+            return "hold", (stage, "model_hold")
         if not official or (
             result["criteria"]["new_information"]["outcome"] == "fail"
             and (prepared.get("mode") == "update" or not result.get("same_story"))
@@ -1398,35 +1405,8 @@ _PURE_ACK_RE = re.compile(
 _PROTECTED_LABELS = frozenset({"security", "regression", "critical", "severity::high", "severity::critical"})
 
 
-def _has_operator_retry(db, row: dict | None) -> bool:
-    if not (isinstance(row, dict) and isinstance(item_id := row.get("id"), str) and item_id
-            and isinstance(content_hash := row.get("content_hash"), str) and content_hash):
-        return False
-    if db.execute(
-        "SELECT 1 FROM rejection_actions WHERE item_id=? AND content_hash=? AND action='retry'",
-        (item_id, content_hash),
-    ).fetchone():
-        return True
-    latest = db.execute(
-        "SELECT action,created_at FROM rejection_actions WHERE item_id=? ORDER BY action_id DESC LIMIT 1",
-        (item_id,),
-    ).fetchone()
-    if latest is None or latest["action"] != "retry" or not isinstance(latest["created_at"], str):
-        return False
-    retry_at = latest["created_at"]
-    raw_payload = row.get("payload")
-    payload = (
-        saved_object(raw_payload.encode("utf-8") if isinstance(raw_payload, str) else raw_payload)
-        if isinstance(raw_payload, (str, bytes)) else None
-    )
-    checked_at = payload.get("comments_checked_at") if isinstance(payload, dict) and payload.get("kind") == "gitlab_issue" else None
-    if not isinstance(checked_at, str) or not checked_at:
-        return False
-    try:
-        if parse_utc(checked_at) < parse_utc(retry_at):
-            return False
-    except ValueError:
-        return False
+def _retry_consumed_by_terminal(db, item_id: str, retry_at: str) -> bool:
+    """Return whether a terminal decision logged after `retry_at` has consumed that retry exemption."""
     retry_dl = db.execute(
         """SELECT COALESCE(MAX(id),0) FROM decision_log
            WHERE item_id=? AND code IN ('operator.retried','operator.reconsidered') AND decided_at=?""",
@@ -1452,7 +1432,43 @@ def _has_operator_retry(db, row: dict | None) -> bool:
                LIMIT 1""",
             (item_id, retry_at),
         ).fetchone()
-    return terminal is None
+    return terminal is not None
+
+
+def _has_operator_retry(db, row: dict | None) -> bool:
+    if not (isinstance(row, dict) and isinstance(item_id := row.get("id"), str) and item_id
+            and isinstance(content_hash := row.get("content_hash"), str) and content_hash):
+        return False
+    exact = db.execute(
+        "SELECT created_at FROM rejection_actions WHERE item_id=? AND content_hash=? AND action='retry' ORDER BY action_id DESC LIMIT 1",
+        (item_id, content_hash),
+    ).fetchone()
+    if exact is not None:
+        exact_at = exact["created_at"]
+        if not isinstance(exact_at, str) or not exact_at:
+            return True
+        return not _retry_consumed_by_terminal(db, item_id, exact_at)
+    latest = db.execute(
+        "SELECT action,created_at FROM rejection_actions WHERE item_id=? ORDER BY action_id DESC LIMIT 1",
+        (item_id,),
+    ).fetchone()
+    if latest is None or latest["action"] != "retry" or not isinstance(latest["created_at"], str):
+        return False
+    retry_at = latest["created_at"]
+    raw_payload = row.get("payload")
+    payload = (
+        saved_object(raw_payload.encode("utf-8") if isinstance(raw_payload, str) else raw_payload)
+        if isinstance(raw_payload, (str, bytes)) else None
+    )
+    checked_at = payload.get("comments_checked_at") if isinstance(payload, dict) and payload.get("kind") == "gitlab_issue" else None
+    if not isinstance(checked_at, str) or not checked_at:
+        return False
+    try:
+        if parse_utc(checked_at) < parse_utc(retry_at):
+            return False
+    except ValueError:
+        return False
+    return not _retry_consumed_by_terminal(db, item_id, retry_at)
 
 
 def _security_disclosure(item: dict) -> bool:
@@ -1925,7 +1941,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             and not record["reviews"]
             and allow_network
             and reviewer_factory is not None
-            and requests.state["reserved"] + 2 <= MAX_REVIEW_REQUESTS
+            and requests.state["reserved"] + 3 <= MAX_REVIEW_REQUESTS
             and not proposal_needs_check(record)
         )
         while True:
