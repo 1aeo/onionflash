@@ -548,21 +548,6 @@ def _word_stated_in_source(source_plain: str, word: str) -> bool:
     )
 
 
-_DIRAUTH_SIGNAL_RE = re.compile(
-    r"\b(?:dirauth|directory[- ]authorit\w*|bridge[- ]authorit\w*|bwauth|"
-    r"bandwidth[- ]authorit\w*|dirvote|v3ident|consensus|vot(?:e|es|ing))\b",
-    re.IGNORECASE,
-)
-
-
-def _source_has_dirauth_signal(source: dict) -> bool:
-    """Return whether `source` explicitly carries a directory-authority label, host nickname, or voting/consensus term."""
-    if _util.folded_labels(source) & (_util._DIRAUTH_LABELS | {"directory authority"}):
-        return True
-    text = f"{source.get('title') or ''}\n{source.get('content') or ''}"
-    return bool(_util.DIRAUTH_NICKNAME_RE.search(text) or _DIRAUTH_SIGNAL_RE.search(text))
-
-
 def _normalize_editorial_labels(result: dict, source: dict, schema: dict) -> None:
     """Enforce deterministic merged-MR confidence and directory-authority label guardrails during polish mode."""
     sources = [source]
@@ -575,7 +560,7 @@ def _normalize_editorial_labels(result: dict, source: dict, schema: dict) -> Non
         if old_cat != "directory-authority":
             kept = [tag for tag in result["tags"] if tag not in {"directory-authority", old_cat}]
             result["tags"] = ["directory-authority", *kept][: SCHEMA["properties"]["tags"]["maxItems"]]
-    elif not _source_has_dirauth_signal(source):
+    elif not _util.has_dirauth_signal(source):
         tags = [tag for tag in result["tags"] if tag != "directory-authority"]
         if result["category"] == "directory-authority":
             fallback = next((tag for tag in tags if tag in allowed_categories), None)

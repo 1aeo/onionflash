@@ -882,6 +882,23 @@ def _source_full_text(source: dict) -> str:
     return "\n".join((title, body, *comments))
 
 
+_DIRAUTH_SIGNAL_RE = re.compile(
+    r"\b(?:dirauth|directory[- ]authorit\w*|bridge[- ]authorit\w*|bwauth|"
+    r"bandwidth[- ]authorit\w*|dirvote|v3ident|consensus|vot(?:e|es|ing))\b",
+    re.I,
+)
+
+
+def has_dirauth_signal(source: dict) -> bool:
+    """Return whether `source` explicitly carries a directory-authority label, host nickname, or voting/consensus term."""
+    if not isinstance(source, dict):
+        return False
+    if folded_labels(source) & (_DIRAUTH_LABELS | {"directory authority"}):
+        return True
+    text = _source_full_text(source)
+    return bool(DIRAUTH_NICKNAME_RE.search(text) or _DIRAUTH_SIGNAL_RE.search(text))
+
+
 def is_dirauth_category_story(sources: Iterable[dict] | None) -> bool:
     """Return whether `sources` describes non-security, non-release directory-authority operations."""
     items = list(sources) if sources is not None else []
@@ -916,7 +933,7 @@ def is_dirauth_category_story(sources: Iterable[dict] | None) -> bool:
             return True
         if _DIRAUTH_CHORE_RE.search(text):
             continue
-        if s.get("authority") == "dirauth-operator" and _DIRAUTH_OPERATIONAL_TOPIC_RE.search(text):
+        if s.get("authority") == "dirauth-operator" and has_dirauth_signal(s) and _DIRAUTH_OPERATIONAL_TOPIC_RE.search(text):
             return True
         title = str(s.get("title") or "")
         if DIRAUTH_NICKNAME_RE.search(title) or re.search(r"\b(?:dirauth|directory\s+authorit\w*|bridge\s+authorit\w*)\b", title, re.I):

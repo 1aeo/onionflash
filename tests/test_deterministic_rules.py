@@ -21,9 +21,10 @@ from onionflash.store import (
     TRUSTED_OPERATOR_PRIORITY, ReviewRequired, Store, item_priority,
 )
 from onionflash.util import (
-    DEFAULT_TOR_CORE_USERS, cve_ids, digest, effective_authority, is_dirauth_category_story,
-    is_official_release_announcement, is_tor_core_item, is_torproject_new_thread, is_trove_item,
-    mandatory_news_rule, should_confirm_merged_mr, tor_core_user_set, trove_ids,
+    DEFAULT_TOR_CORE_USERS, cve_ids, digest, effective_authority, has_dirauth_signal,
+    is_dirauth_category_story, is_official_release_announcement, is_tor_core_item,
+    is_torproject_new_thread, is_trove_item, mandatory_news_rule, should_confirm_merged_mr,
+    tor_core_user_set, trove_ids,
 )
 
 
@@ -1116,6 +1117,16 @@ def test_should_confirm_merged_mr_and_dirauth_category_helpers():
     assert llm.is_dirauth_category_story([dirauth_op]) is True
     assert is_dirauth_category_story([dirauth_title]) is True
     assert is_dirauth_category_story([dirauth_packet_unit]) is True
+    assert all(has_dirauth_signal(item) for item in (dirauth_labeled, dirauth_op, dirauth_title, dirauth_packet_unit))
+
+    # Generic Tor bug with a dirauth commenter and operational words like "offline" without dirauth signals stays False.
+    tls_offline_with_dirauth_comment = _story_item(
+        authority="dirauth-operator", author="arma",
+        title="Tor falls back to OpenSSL default TLS groups when built against OpenSSL 4.x",
+        content="Start it offline: tor --DisableNetwork 1; OpenSSL rejects P-224 group lists.",
+    )
+    assert has_dirauth_signal(tls_offline_with_dirauth_comment) is False
+    assert is_dirauth_category_story([tls_offline_with_dirauth_comment]) is False
 
     # Exclusions: TROVE, CVE, Security/compromise, DoS/DDoS, release/tag, and non-operational chores.
     assert is_dirauth_category_story([{**dirauth_labeled, "mandatory_news_rule": "trove"}]) is False

@@ -1631,3 +1631,39 @@ def test_polish_strips_spurious_directory_authority_labels_and_keeps_genuine(mon
         out = writer.analyze(src)
         assert out["category"] == cat
         assert out["tags"] == [cat, "directory-authority"]
+
+    # 3. A tor#41477-style ticket with an `arma` comment (promoting authority="dirauth-operator")
+    # and "offline" in the body must still strip spurious directory-authority labels.
+    tls_src = item(
+        kind="gitlab_issue",
+        url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/41477",
+        authority="development",
+        title="Tor falls back to OpenSSL default TLS groups",
+        content="Start it offline:\n\n tor --DisableNetwork 1",
+        public_comments=[{
+            "author": "arma",
+            "created_at": DATE,
+            "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41477#note_1",
+            "body": "A friend also reported this bug from their relay.",
+        }],
+        labels=[],
+    )
+    tls_draft = analysis(
+        title="Tor falls back to OpenSSL default TLS groups",
+        summary="An issue reports TLS group fallback on OpenSSL 4.x.",
+        why_it_matters="",
+        category="directory-authority",
+        state="developing",
+        confidence="reported",
+        tags=["directory-authority", "security", "relay"],
+        evidence=["Start it offline:\n\n tor --DisableNetwork 1"],
+    )
+    tls_writer = Analyzer(cfg, editorial_polish=True)
+    tls_writer.client = FakeLLM(tls_draft, {
+        "title": tls_draft["title"],
+        "summary": tls_draft["summary"],
+        "why_it_matters": "",
+    })
+    tls_out = tls_writer.analyze(tls_src)
+    assert tls_out["category"] == "security"
+    assert tls_out["tags"] == ["security", "relay"]
