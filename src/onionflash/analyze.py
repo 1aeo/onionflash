@@ -6,8 +6,6 @@ import copy
 import json
 import re
 
-import time
-
 from . import util as _util
 from .comments import analysis_context
 from .llm import (
@@ -248,10 +246,12 @@ preserve named hosts or directory authorities (such as Serge, sekhmet, bastet or
 maatuska) when stated in the issue or comments, and always include material
 follow-up corroboration or maintainer triage comments. Use confidence=confirmed for a
 standalone merged gitlab_mr (upstream_state="merged") reporting its own completed merge
-unless disputed, and use category=directory-authority (with "directory-authority" in
-tags) for directory-authority operational stories (authority address/key/host migrations
-or voting/consensus operations) unless it is a release, verified TROVE advisory, security/CVE
-issue or DoS incident.
+unless disputed. Reserve category=directory-authority and the "directory-authority" tag
+strictly for sources that carry a Directory Authority label, have authority=dirauth-operator,
+or explicitly discuss directory or bridge authority operations (authority address/key/host
+migrations, authority voting, or consensus operations), and never when the story is a release,
+verified TROVE advisory, security/CVE issue, DoS incident, or an ordinary relay, client, TLS,
+SOCKS, or onion-service story.
 {causal_check}A developer changing source code is not an operator changing configuration.
 
 {impact}
@@ -548,17 +548,48 @@ def _word_stated_in_source(source_plain: str, word: str) -> bool:
     )
 
 
+_DIRAUTH_SIGNAL_RE = re.compile(
+    r"\b(?:dirauth|directory[- ]authorit\w*|bridge[- ]authorit\w*|bwauth|"
+    r"bandwidth[- ]authorit\w*|dirvote|v3ident|consensus|vot(?:e|es|ing))\b",
+    re.IGNORECASE,
+)
+
+
+def _source_has_dirauth_signal(source: dict) -> bool:
+    """Return whether `source` explicitly carries a directory-authority label, host nickname, or voting/consensus term."""
+    if _util.folded_labels(source) & (_util._DIRAUTH_LABELS | {"directory authority"}):
+        return True
+    text = f"{source.get('title') or ''}\n{source.get('content') or ''}"
+    return bool(_util.DIRAUTH_NICKNAME_RE.search(text) or _DIRAUTH_SIGNAL_RE.search(text))
+
+
 def _normalize_editorial_labels(result: dict, source: dict, schema: dict) -> None:
-    """Enforce deterministic merged-MR confidence and dirauth-category defaults during polish mode."""
+    """Enforce deterministic merged-MR confidence and directory-authority label guardrails during polish mode."""
     sources = [source]
     if _util.should_confirm_merged_mr(sources) and "confirmed" in schema["properties"]["confidence"]["enum"]:
         result["confidence"] = "confirmed"
-    if _util.is_dirauth_category_story(sources) and "directory-authority" in schema["properties"]["category"]["enum"]:
+    allowed_categories = schema["properties"]["category"]["enum"]
+    if _util.is_dirauth_category_story(sources) and "directory-authority" in allowed_categories:
         old_cat = result["category"]
         result["category"] = "directory-authority"
         if old_cat != "directory-authority":
             kept = [tag for tag in result["tags"] if tag not in {"directory-authority", old_cat}]
             result["tags"] = ["directory-authority", *kept][: SCHEMA["properties"]["tags"]["maxItems"]]
+    elif not _source_has_dirauth_signal(source):
+        tags = [tag for tag in result["tags"] if tag != "directory-authority"]
+        if result["category"] == "directory-authority":
+            fallback = next((tag for tag in tags if tag in allowed_categories), None)
+            if fallback is None:
+                fallback = next(
+                    (cat for cat in ("network", "protocol", "relay", "feature") if cat in allowed_categories),
+                    next((cat for cat in allowed_categories if cat != "directory-authority"), allowed_categories[0]),
+                )
+            result["category"] = fallback
+            if fallback not in tags:
+                tags = [fallback, *tags][: SCHEMA["properties"]["tags"]["maxItems"]]
+        if not tags and result["category"] in SCHEMA["properties"]["tags"]["items"]["enum"]:
+            tags = [result["category"]]
+        result["tags"] = tags
 
 
 class Analyzer(CompletionClient):

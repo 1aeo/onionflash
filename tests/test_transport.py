@@ -1095,8 +1095,8 @@ def test_streaming_json_fallback_midstream_timeout_and_identity_parity(completio
     row = {"content_hash": "a" * 64}
     cfg_on = copy.deepcopy(DEFAULTS)
     cfg_on["llm"]["writer_reasoning"] = True
-    assert analyze.cache_key(row, DEFAULTS["llm"]) == "41569d1a5e5a59cf3aba505301dd87809f922baddb6a264423186aa50bc55c27"
-    assert analyze.cache_key(row, cfg_on["llm"]) == "0380d3140bad69d8c77ebaed32a80c6de2a28d6db9b1e3f1abd140e14ecd6812"
+    assert analyze.cache_key(row, DEFAULTS["llm"]) == "0b41d8a1159ebffddff08127af237a4a42c30e0ab9b2a9bcddd4c52e65af6504"
+    assert analyze.cache_key(row, cfg_on["llm"]) == "549582e684ac6e4e204f60553e148a0613398fe923f770a647d3267a79a43cac"
 
     json_client, _ = completion_client(lambda _req: _httpx_completion({"mode": "json"}))
     _, req1, _ = _ledger()

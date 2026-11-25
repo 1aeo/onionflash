@@ -1527,3 +1527,107 @@ def test_polish_preserves_advisory_ids_and_issue_completed_action_verbs(monkeypa
         "why_it_matters": "",
     })
     assert w_mr.analyze(non_iss)["title"] == "Old cipher removed cleanly"
+
+
+def test_polish_strips_spurious_directory_authority_labels_and_keeps_genuine(monkeypatch):
+    """Strip spurious directory-authority labels on non-dirauth stories while preserving genuine dirauth mentions."""
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["llm"].update(base_url="https://llm.example/v1")
+    monkeypatch.setenv(cfg["llm"]["api_key_env"], "test-key")
+
+    # 1. Non-dirauth TLS / SOCKS / PoW / relay-directory-stream / CA stories lose spurious dirauth tags & category.
+    for title, content, draft_cat, draft_tags, exp_cat, exp_tags in (
+        (
+            "OpenSSL TLS groups negotiation fix",
+            "Client TLS groups negotiation update for OpenSSL integration.",
+            "protocol",
+            ["protocol", "directory-authority"],
+            "protocol",
+            ["protocol"],
+        ),
+        (
+            "SOCKS5 handshake status handling",
+            "Fixes SOCKS5 handshake error handling on local client listeners.",
+            "directory-authority",
+            ["directory-authority", "feature"],
+            "feature",
+            ["feature"],
+        ),
+        (
+            "Arti onion-service PoW queue limit",
+            "Bounded PoW queue prevents memory exhaustion in onion services.",
+            "directory-authority",
+            ["directory-authority"],
+            "network",
+            ["network"],
+        ),
+        (
+            "Relay directory-stream write fairness",
+            "Relay directory-stream buffering avoids starving circuit writes under load.",
+            "relay",
+            ["relay", "directory-authority"],
+            "relay",
+            ["relay"],
+        ),
+        (
+            "Certificate Authority revocation check update",
+            "Certificate Authority revocation checks validate sender authority headers safely.",
+            "security",
+            ["security", "directory-authority"],
+            "security",
+            ["security"],
+        ),
+    ):
+        src = item(kind="gitlab_mr", upstream_state="merged", title=title, content=content, labels=[])
+        draft = analysis(
+            title=title,
+            summary=content,
+            why_it_matters="",
+            category=draft_cat,
+            state="merged",
+            confidence="confirmed",
+            tags=draft_tags,
+            evidence=[content],
+        )
+        polish = {"title": title, "summary": content, "why_it_matters": ""}
+        writer = Analyzer(cfg, editorial_polish=True)
+        writer.client = FakeLLM(draft, polish)
+        out = writer.analyze(src)
+        assert out["category"] == exp_cat
+        assert out["tags"] == exp_tags
+
+    # 2. Genuine dirauth stories (even when release/metrics, not category=directory-authority) retain the tag.
+    for title, content, cat in (
+        (
+            "Tor 0.4.9.15 release notes",
+            "Tor 0.4.9.15 adds metrics export for directory authorities.",
+            "release",
+        ),
+        (
+            "Security fix deployed on bastet",
+            "CVE-2026-9999 mitigation applied after bastet observed vote delays.",
+            "security",
+        ),
+    ):
+        src = item(
+            kind="feed",
+            authority="official",
+            title=title,
+            content=content,
+            labels=[],
+        )
+        draft = analysis(
+            title=title,
+            summary=content,
+            why_it_matters="",
+            category=cat,
+            state="released" if cat == "release" else "fixed",
+            confidence="confirmed",
+            tags=[cat, "directory-authority"],
+            evidence=[content],
+        )
+        writer = Analyzer(cfg, editorial_polish=True)
+        writer.client = FakeLLM(draft, {"title": title, "summary": content, "why_it_matters": ""})
+        out = writer.analyze(src)
+        assert out["category"] == cat
+        assert out["tags"] == [cat, "directory-authority"]
