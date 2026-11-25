@@ -2136,3 +2136,375 @@ def test_parallel_verify_partial_failures_and_budget_guard(context):
                                          parallel_verify=True, reviewer_factory=_defer_factory)
     assert res_defer["status"] == "deferred"
     assert job_record(store, row4["id"])["request_budget"]["reserved"] == 0
+
+
+def test_parallel_specialist_gate_approves_records_metadata_and_commits(context):
+    """process_item(..., specialists=3) fans out all 3 specialist lenses, validates state, and publishes."""
+    cfg, store = context
+    row = pending(store, item(id="https://example.org/spec3-approve", url="https://example.org/spec3-approve"))
+
+    seen_calls = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(4, timeout=5)
+
+    def _factory():
+        class _ConcurrentReviewer:
+            """Reviewer checking concurrency across initial + 3 specialist passes."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                if on_request:
+                    on_request(1)
+                with lock:
+                    seen_calls.append((threading.get_ident(), verification, specialist))
+                barrier.wait()
+                return verdict("approve", update=update)
+
+        return _ConcurrentReviewer()
+
+    res = review_gate.process_item(
+        cfg,
+        store,
+        row,
+        Writer(),
+        ApprovingReviewer(),
+        parallel_verify=True,
+        reviewer_factory=_factory,
+        specialists=3,
+    )
+    assert res["status"] == "published"
+    rec = audit(store)
+    assert rec["specialists"] == 3
+    assert rec["request_budget"]["reserved"] == 4
+    assert [s["specialist"] for s in rec["reviews"][1]["specialists"]] == list(review.SPECIALISTS)
+    assert len(store.stories()) == 1
+    initial_specs = [s for _, _, s in seen_calls]
+    assert None in initial_specs
+    assert {s for s in initial_specs if s is not None} == set(review.SPECIALISTS)
+
+
+def test_parallel_specialist_verify_repairs_and_uses_specialist_budget(context):
+    """Multi-wave specialist verification runs all 3 lenses per verify wave within MAX_SPECIALIST_REVIEW_REQUESTS."""
+    cfg, store = context
+    assert review_gate.MAX_REVIEW_REQUESTS == 8
+    assert review_gate.MAX_SPECIALIST_REVIEW_REQUESTS == 20
+
+    row = pending(store, item(id="https://example.org/spec3-repair", url="https://example.org/spec3-repair"))
+    verify_calls = []
+    lock = threading.Lock()
+
+    def _repair_factory():
+        class _RepairSpecialistReviewer:
+            """Reviewer requiring three verify waves before all 3 specialist lenses approve."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                if on_request:
+                    on_request(1)
+                if not verification:
+                    if specialist is None:
+                        raw = verdict(
+                            "revise",
+                            criterion="scope_timing",
+                            reason="Clarify timing wording.",
+                            repair={"why_it_matters": "Release timing depends on the upstream review outcome."},
+                        )
+                        return review.validate_review(raw, packet, update=update, coverage=coverage)
+                    return verdict("approve", update=update)
+
+                with lock:
+                    verify_calls.append((specialist, cand.get("why_it_matters")))
+                impact = cand.get("why_it_matters")
+                if impact == "Release timing depends on the upstream review outcome.":
+                    if specialist == "attribution_scope_advice":
+                        raw = verdict(
+                            "revise",
+                            criterion="scope_timing",
+                            reason="Refine maintenance timing.",
+                            repair={"why_it_matters": "Downstream tracking waits for maintainer sign-off."},
+                        )
+                        return review.validate_review(raw, packet, update=update, coverage=coverage)
+                    return verdict("approve", update=update)
+                if impact == "Downstream tracking waits for maintainer sign-off.":
+                    if specialist == "grounding_status":
+                        raw = verdict(
+                            "revise",
+                            criterion="source_support",
+                            reason="Clear draft impact line.",
+                            repair={"why_it_matters": ""},
+                        )
+                        return review.validate_review(raw, packet, update=update, coverage=coverage)
+                    return verdict("approve", update=update)
+                return verdict("approve", update=update)
+
+        return _RepairSpecialistReviewer()
+
+    res = review_gate.process_item(
+        cfg,
+        store,
+        row,
+        Writer(),
+        ApprovingReviewer(),
+        parallel_verify=True,
+        reviewer_factory=_repair_factory,
+        specialists=3,
+    )
+    assert res["status"] == "published"
+    rec = audit(store)
+    # Initial parallel wave (4) + three specialist verify waves (3 * 3 = 9) = 13 > MAX_REVIEW_REQUESTS (8).
+    assert rec["request_budget"]["reserved"] == 13
+    assert [s for s, _ in verify_calls].count("attribution_scope_advice") == 4
+    assert store.stories()[0]["why_it_matters"] == ""
+
+    # Tampered specialist count fails closed with app.damaged_job.
+    bad_rec = json.loads(json.dumps(rec))
+    bad_rec["specialists"] = 9
+    repaired_cand = {**rec["prepared"]["candidate"], "why_it_matters": ""}
+    with pytest.raises(AnalysisError) as exc_info:
+        review_gate.validate_review_state(bad_rec, "verify", repaired_cand, rec["prepared"])
+    assert exc_info.value.code == "app.damaged_job"
+
+
+def test_parallel_specialist_resume_and_reask_paths(context):
+    """Deferred specialist verify stage resumes cleanly and hands InconsistentReview to validation reask."""
+    cfg, store = context
+    row = pending(store, item(id="https://example.org/spec3-resume", url="https://example.org/spec3-resume"))
+    phase = {"step": 1}
+
+    def _resume_factory():
+        class _ResumeReviewer:
+            """Triggers CompletionDeferred inside verify wave 1, then InconsistentReview on wave 2."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                if on_request:
+                    on_request(1)
+                if not verification:
+                    if specialist is None:
+                        raw = verdict(
+                            "revise",
+                            criterion="scope_timing",
+                            reason="Clear why_it_matters.",
+                            repair={"why_it_matters": ""},
+                        )
+                        return review.validate_review(raw, packet, update=update, coverage=coverage)
+                    return verdict("approve", update=update)
+                if phase["step"] == 1:
+                    if specialist == "novelty_news":
+                        raise CompletionDeferred("transient verify pause")
+                    return verdict("approve", update=update)
+                if phase["step"] == 2 and specialist == "grounding_status":
+                    raise review.InconsistentReview()
+                return verdict("approve", update=update)
+
+        return _ResumeReviewer()
+
+    class _ReaskChecker:
+        """Handles the validation reask after specialist InconsistentReview."""
+
+        def __init__(self):
+            self.validation_errors = []
+
+        def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                   validation_error=None, on_request=None, **kwargs):
+            if on_request:
+                on_request(1)
+                if hasattr(on_request, "response_received"):
+                    on_request.response_received()
+            self.validation_errors.append(validation_error)
+            return verdict("approve", update=update)
+
+    reask_checker = _ReaskChecker()
+    first = review_gate.process_item(
+        cfg,
+        store,
+        row,
+        Writer(),
+        reask_checker,
+        parallel_verify=True,
+        reviewer_factory=_resume_factory,
+        specialists=3,
+    )
+    assert first["status"] == "deferred"
+    saved_job = job(store)
+    assert saved_job["stage"] == "verify"
+    env = json.loads(saved_job["envelope_json"])
+    rec1 = json.loads(saved_job["record_json"])
+    review_gate.validate_review_state(rec1, saved_job["stage"], rec1["candidate"], env)
+
+    phase["step"] = 2
+    second = review_gate.process_item(
+        cfg,
+        store,
+        queued_row(store, row["id"]),
+        Writer(),
+        reask_checker,
+        parallel_verify=True,
+        reviewer_factory=_resume_factory,
+        specialists=3,
+    )
+    assert second["status"] == "published"
+    assert review.INCONSISTENT_VERDICT in reask_checker.validation_errors
+
+
+def test_evaluate_review_specialists_3_cli_and_draft_mode(tmp_path, monkeypatch):
+    """evaluate_review.py --specialists 3 exercises 3-lens merge in both candidate and --draft modes."""
+    from helpers import _ClientBase, load_evaluator
+
+    eval_mod = load_evaluator()
+    cases_path = tmp_path / "cases.json"
+    cfg_path = tmp_path / "cfg.toml"
+    cfg_path.write_text("", encoding="utf-8")
+    out_cand = tmp_path / "out_cand.jsonl"
+    out_draft = tmp_path / "out_draft.jsonl"
+    corpus = {
+        "defaults": {
+            "why_it_matters": "",
+            "priority": "normal",
+            "confidence": "reported",
+            "state": "developing",
+            "products": ["tor"],
+            "published_at": DATE,
+            "updated_at": DATE,
+            "added_at": DATE,
+        },
+        "packets": {
+            "clean-pkt": {
+                "sources": [{
+                    "url": "https://blog.torproject.org/tor-04812-released/",
+                    "title": "Tor 0.4.8.12 released",
+                    "kind": "rss",
+                    "authority": "official",
+                    "product": "tor",
+                    "published_at": DATE,
+                    "updated_at": DATE,
+                    "passages": ["Tor Project released Tor 0.4.8.12 to fix a crash bug."],
+                }]
+            },
+            "flawed-pkt": {
+                "sources": [{
+                    "url": "https://gitlab.torproject.org/tpo/core/tor/-/issues/49999",
+                    "title": "Relay bug report",
+                    "kind": "gitlab_issue",
+                    "authority": "development",
+                    "product": "tor",
+                    "published_at": DATE,
+                    "updated_at": DATE,
+                    "upstream_state": "opened",
+                    "passages": ["A user reported a relay crash on startup."],
+                }]
+            },
+        },
+        "cases": [
+            {
+                "id": "case-clean",
+                "packet": "clean-pkt",
+                "expected": "approve",
+                "candidate": {
+                    "id": "111111111111111111111111",
+                    "title": "Tor 0.4.8.12 fixes crash bug",
+                    "summary": "Tor Project released Tor 0.4.8.12 to fix a crash bug.",
+                    "category": "release",
+                    "confidence": "confirmed",
+                    "state": "released",
+                },
+            },
+            {
+                "id": "case-flawed",
+                "packet": "flawed-pkt",
+                "expected": "not_approve",
+                "unsupported": ["fixed the relay crash"],
+                "candidate": {
+                    "id": "222222222222222222222222",
+                    "title": "Relay crash fixed",
+                    "summary": "Tor Project fixed the relay crash.",
+                    "category": "security",
+                    "confidence": "reported",
+                    "state": "developing",
+                },
+            },
+        ],
+    }
+    cases_path.write_text(json.dumps(corpus), encoding="utf-8")
+
+    class _StubAnalyzer(_ClientBase):
+        """Minimal Analyzer stub producing draft candidates from writer items."""
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def analyze(self, writer_src):
+            is_release = "0.4.8.12" in writer_src["title"]
+            return {
+                "title": "Tor 0.4.8.12 fixes crash bug" if is_release else "Relay crash fixed",
+                "summary": (
+                    "Tor Project released Tor 0.4.8.12 to fix a crash bug."
+                    if is_release else "Tor Project fixed the relay crash."
+                ),
+                "why_it_matters": "",
+                "category": "release" if is_release else "security",
+                "priority": "normal",
+                "confidence": "confirmed" if is_release else "reported",
+                "state": "released" if is_release else "developing",
+                "products": ["tor"],
+                "tags": [],
+            }
+
+    seen_specialists = []
+    spec_lock = threading.Lock()
+
+    class _StubEvalReviewer(_ClientBase):
+        """Reviewer checking specialist kwarg propagation under evaluate_review."""
+
+        last_decoded = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                   specialist=None, validation_error=None, on_request=None):
+            if on_request:
+                on_request(1)
+            with spec_lock:
+                seen_specialists.append(specialist)
+            if "49999" in packet["sources"][0]["url"] and specialist == "grounding_status":
+                return verdict(
+                    "hold",
+                    criterion="status",
+                    reason="Issue is still open; fix not shipped.",
+                )
+            return verdict("approve", update=update)
+
+    monkeypatch.setattr(eval_mod, "Analyzer", _StubAnalyzer)
+    monkeypatch.setattr(eval_mod, "EvaluationReviewer", _StubEvalReviewer)
+    monkeypatch.setattr(eval_mod, "load_config", lambda *args, **kwargs: make_config(tmp_path))
+
+    rc = eval_mod.main([
+        "--config", str(cfg_path),
+        "--cases", str(cases_path),
+        "--output", str(out_cand),
+        "--specialists", "3",
+    ])
+    assert rc == 0
+    cand_lines = [json.loads(line) for line in out_cand.read_text(encoding="utf-8").splitlines()]
+    assert cand_lines[-1]["summary"]["cases"] == 2
+    assert cand_lines[-1]["summary"]["matched"] == 2
+    assert cand_lines[-1]["summary"]["errors"] == 0
+    assert cand_lines[-1]["summary"]["incomplete"] is False
+    assert set(review.SPECIALISTS) <= set(seen_specialists)
+
+    seen_specialists.clear()
+    rc_draft = eval_mod.main([
+        "--config", str(cfg_path),
+        "--cases", str(cases_path),
+        "--output", str(out_draft),
+        "--draft",
+        "--specialists", "3",
+    ])
+    assert rc_draft == 0
+    draft_lines = [json.loads(line) for line in out_draft.read_text(encoding="utf-8").splitlines()]
+    assert draft_lines[-1]["summary"]["cases"] == 2
+    assert draft_lines[-1]["summary"]["matched"] == 2
+    assert draft_lines[-1]["summary"]["errors"] == 0
+    assert set(review.SPECIALISTS) <= set(seen_specialists)
+

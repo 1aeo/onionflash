@@ -810,3 +810,322 @@ def test_skip_stands_distinguishes_negated_unrelated_event_phrases():
         reason=f"Different incident from {live_id}.",
     )
     assert review._skip_stands(pos_reply["criteria"], coverage, update=True) is False
+
+
+def _specialist_verdict(action="approve", **kwargs):
+    """Build a valid review verdict dict for specialist merge tests."""
+    return verdict(action, **kwargs)
+
+
+def test_reviewer_specialist_prompts_validation_and_policy_hash(monkeypatch):
+    """Specialist lenses inject domain guidance, preserve default None, and affect policy_hash."""
+    assert review.REVIEW_VERSION == "onionflash-review-20"
+    assert review.SPECIALISTS == (
+        "grounding_status",
+        "attribution_scope_advice",
+        "novelty_news",
+    )
+
+    cand = _candidate()
+    pkt = _packet()
+    cfg = _cfg_llm()
+    baseline_hash = review.policy_hash(cfg)
+
+    monkeypatch.setitem(
+        review.SPECIALIST_PROMPTS,
+        "grounding_status",
+        review.SPECIALIST_PROMPTS["grounding_status"] + " EXTRA",
+    )
+    assert review.policy_hash(cfg) != baseline_hash
+    monkeypatch.undo()
+
+    reviewer = wire_reviewer(
+        cfg,
+        *[_specialist_verdict("approve") for _ in range(4)],
+        monkeypatch=monkeypatch,
+    )
+
+    res_none = reviewer.review(cand, pkt, specialist=None)
+    assert res_none["verdict"] == "approve"
+    default_body = json.dumps(reviewer.client.bodies[0])
+    for spec_prompt in review.SPECIALIST_PROMPTS.values():
+        assert spec_prompt.strip().splitlines()[0] not in default_body
+
+    for idx, spec in enumerate(review.SPECIALISTS, start=1):
+        res_spec = reviewer.review(cand, pkt, specialist=spec)
+        assert res_spec["verdict"] == "approve"
+        spec_body = json.dumps(reviewer.client.bodies[idx])
+        assert f"SPECIALIST VERIFICATION FOCUS ({spec}" in spec_body
+
+    calls_before_invalid = len(reviewer.client.bodies)
+    with pytest.raises(review.ReviewError, match="Unknown review specialist"):
+        reviewer.review(cand, pkt, specialist="nonexistent")
+    assert len(reviewer.client.bodies) == calls_before_invalid
+
+
+def test_merge_specialist_verdicts_approves_unanimous_and_unions_refs():
+    """Three clean specialist approvals produce approve and union packet source_refs."""
+    v1 = _specialist_verdict("approve", ref="S1")
+    v2 = _specialist_verdict("approve", ref="S1:P1")
+    v3 = _specialist_verdict("approve", ref="S1")
+
+    merged = review.merge_specialist_verdicts([v1, v2, v3], _candidate(), _packet())
+    assert merged["verdict"] == "approve"
+    refs = merged["criteria"]["source_support"]["source_refs"]
+    assert refs == ["S1", "S1:P1"]
+
+
+def test_merge_specialist_verdicts_factual_fail_closed_and_outlier_rules():
+    """Primary factual or majority factual failures fail closed; lone out-of-domain factual failure does not."""
+    cand = _candidate()
+    pkt = _packet()
+    clean = _specialist_verdict("approve")
+
+    # Primary factual defect in grounding_status (`status`) blocks approval.
+    v_ground_hold = _specialist_verdict(
+        "hold",
+        criterion="status",
+        reason="Candidate claims patch shipped when discussion is still open.",
+    )
+    merged_hold = review.merge_specialist_verdicts(
+        [v_ground_hold, copy.deepcopy(clean), copy.deepcopy(clean)],
+        cand,
+        pkt,
+    )
+    assert merged_hold["verdict"] == "hold"
+    assert merged_hold["criteria"]["status"]["outcome"] == "fail"
+
+    # Primary factual defect in attribution_scope_advice (`operational_advice`) blocks approval.
+    v_attr_hold = _specialist_verdict(
+        "hold",
+        criterion="operational_advice",
+        reason="Candidate invents unattributed operator remediation advice.",
+    )
+    merged_attr = review.merge_specialist_verdicts(
+        [copy.deepcopy(clean), v_attr_hold, copy.deepcopy(clean)],
+        cand,
+        pkt,
+    )
+    assert merged_attr["verdict"] == "hold"
+    assert merged_attr["criteria"]["operational_advice"]["outcome"] == "fail"
+
+    # Lone out-of-domain factual objection from `novelty_news` does not cause false alarm.
+    v_ood_factual = _specialist_verdict(
+        "hold",
+        criterion="source_support",
+        reason="Out-of-domain concern while factual lenses approved.",
+    )
+    merged_ood = review.merge_specialist_verdicts(
+        [copy.deepcopy(clean), copy.deepcopy(clean), v_ood_factual],
+        cand,
+        pkt,
+    )
+    assert merged_ood["verdict"] == "approve"
+
+    # Two specialists failing the same factual criterion fail closed even if outside primary.
+    v_scope_ood = _specialist_verdict(
+        "hold",
+        criterion="status",
+        reason="Status overstated.",
+    )
+    v_news_ood = _specialist_verdict(
+        "hold",
+        criterion="status",
+        reason="Status overstated.",
+    )
+    merged_majority_factual = review.merge_specialist_verdicts(
+        [copy.deepcopy(clean), v_scope_ood, v_news_ood],
+        cand,
+        pkt,
+    )
+    assert merged_majority_factual["verdict"] == "hold"
+    assert merged_majority_factual["criteria"]["status"]["outcome"] == "fail"
+
+
+def test_merge_specialist_verdicts_non_conflicting_revise_vs_conflict_hold():
+    """Single-domain factual revise merges safely; conflicting edits fail closed to hold."""
+    cand = _candidate()
+    pkt = _packet()
+    clean = _specialist_verdict("approve")
+
+    # Single primary specialist proposing a clean repair returns revise with repair intact.
+    v_revise = _specialist_verdict(
+        "revise",
+        criterion="scope_timing",
+        reason="Clear unsupported impact line.",
+        repair={"why_it_matters": ""},
+    )
+    merged_rev = review.merge_specialist_verdicts(
+        [copy.deepcopy(clean), v_revise, copy.deepcopy(clean)],
+        cand,
+        pkt,
+    )
+    assert merged_rev["verdict"] == "revise"
+    assert merged_rev["repair"] == {"why_it_matters": ""}
+
+    # Conflicting fixes on the same non-impact field fail closed to hold instead of overwriting.
+    v_fix_a = _specialist_verdict(
+        "revise",
+        criterion="source_support",
+        reason="Trim summary wording.",
+        repair={"summary": "Version A summary."},
+    )
+    v_fix_b = _specialist_verdict(
+        "revise",
+        criterion="actor_and_action",
+        reason="Different summary wording.",
+        repair={"summary": "Version B summary."},
+    )
+    merged_conflict = review.merge_specialist_verdicts(
+        [v_fix_a, v_fix_b, copy.deepcopy(clean)],
+        cand,
+        pkt,
+    )
+    assert merged_conflict["verdict"] == "hold"
+
+
+def test_merge_specialist_verdicts_editorial_skip_requires_majority_and_story_routing():
+    """Lone editorial skip is ignored; majority skip stands and respects update/same_story rules."""
+    cand = _candidate()
+    pkt = _packet()
+    clean = _specialist_verdict("approve")
+
+    # Lone editorial skip outlier must not veto newsroom approval.
+    v_lone_skip = _specialist_verdict(
+        "skip",
+        criterion="news_value",
+        reason="Routine bugfix.",
+    )
+    merged_pass = review.merge_specialist_verdicts(
+        [v_lone_skip, copy.deepcopy(clean), copy.deepcopy(clean)],
+        cand,
+        pkt,
+    )
+    assert merged_pass["verdict"] == "approve"
+
+    # Majority (2 of 3) editorial skip stands.
+    v_skip_a = _specialist_verdict("skip", criterion="news_value", reason="Routine minor build tweak.")
+    v_skip_b = _specialist_verdict("skip", criterion="news_value", reason="Low impact maintenance.")
+    merged_skip = review.merge_specialist_verdicts(
+        [copy.deepcopy(clean), v_skip_a, v_skip_b],
+        cand,
+        pkt,
+    )
+    assert merged_skip["verdict"] == "skip"
+    assert merged_skip["criteria"]["news_value"]["outcome"] == "fail"
+
+    # Update mode: majority new_information skip naming live story stands as skip.
+    live_id = COVERED
+    upd_cand = _candidate(
+        updates=[{
+            "at": LATER,
+            "text": "Tor maintains ongoing build checks.",
+            "sources": [{"url": STORY["sources"][0]["url"], "title": STORY["sources"][0]["title"]}],
+        }]
+    )
+    upd_clean = _specialist_verdict("approve", update=True)
+    upd_skip_1 = _specialist_verdict(
+        "skip",
+        criterion="new_information",
+        update=True,
+        reason=f"Same ongoing work as {live_id}; no user-visible change.",
+    )
+    upd_skip_2 = _specialist_verdict(
+        "skip",
+        criterion="new_information",
+        update=True,
+        reason=f"Same story as {live_id} without fresh facts.",
+    )
+    merged_upd_skip = review.merge_specialist_verdicts(
+        [upd_clean, upd_skip_1, upd_skip_2],
+        upd_cand,
+        pkt,
+        update=True,
+        coverage=PRIOR,
+    )
+    assert merged_upd_skip["verdict"] == "skip"
+
+    # Story-mode routing requires majority same_story agreement.
+    r_skip_1 = _specialist_verdict(
+        "skip",
+        criterion="new_information",
+        same_story=live_id,
+        reason=f"Duplicates {live_id}.",
+    )
+    r_skip_2 = _specialist_verdict(
+        "skip",
+        criterion="new_information",
+        same_story=live_id,
+        reason=f"Covered by {live_id}.",
+    )
+    merged_route = review.merge_specialist_verdicts(
+        [copy.deepcopy(clean), r_skip_1, r_skip_2],
+        cand,
+        pkt,
+        coverage=COVERAGE,
+    )
+    assert merged_route["verdict"] == "skip"
+    assert merged_route["same_story"] == live_id
+
+
+def test_review_validation_catches_incomplete_fragment_and_unattributed_advice(monkeypatch):
+    """Validator/apply_repair reject or clear incomplete why_it_matters fragments and unattributed advice."""
+    pkt = _packet()
+    fragment = "Because of recent fixes, the network currently has a lot of <= 0.4.8.x"
+
+    # Fragment lacking terminal punctuation fails apply_repair and is cleared on _validate.
+    with pytest.raises(review.ReviewError, match="Invalid repair field"):
+        review.apply_repair(_candidate(), {"why_it_matters": fragment})
+
+    reviewer = wire_reviewer(
+        _cfg_llm(),
+        _specialist_verdict("revise", criterion="scope_timing", repair={"why_it_matters": fragment}),
+        _specialist_verdict(
+            "revise",
+            criterion="operational_advice",
+            repair={"why_it_matters": "Operators should switch to 64-bit builds immediately."},
+        ),
+        _specialist_verdict(
+            "revise",
+            criterion="scope_timing",
+            repair={"why_it_matters": "Operators should check the advisory."},
+        ),
+        monkeypatch=monkeypatch,
+    )
+    res_frag = reviewer.review(_candidate(), pkt)
+    assert res_frag["repair"]["why_it_matters"] == ""
+
+    res_adv = reviewer.review(_candidate(), pkt)
+    assert res_adv["repair"]["why_it_matters"] == ""
+
+    # When the directive verb IS present in packet context, grounded advice is preserved.
+    grounded_pkt = copy.deepcopy(pkt)
+    grounded_pkt["sources"][0]["passages"].append({"id": "S1:P2", "text": "Operators should check the advisory."})
+    res_grounded = reviewer.review(_candidate(), grounded_pkt)
+    assert res_grounded["repair"]["why_it_matters"] == "Operators should check the advisory."
+
+
+def test_widen_update_state_preserves_prior_released_and_blocks_issue_released():
+    """Prior released stories allow released updates, while bare issue stories fail confirmed_source."""
+    issue_pkt = copy.deepcopy(_packet())
+    issue_pkt["sources"][0]["kind"] = "gitlab_issue"
+    issue_pkt["sources"][0]["authority"] = "development"
+    issue_cand = _candidate(
+        category="release",
+        confidence="confirmed",
+        state="released",
+    )
+    holds = review.final_holds(
+        issue_cand,
+        {"packet": issue_pkt, "mode": "story", "payload": {"editorial_kind": "gitlab_issue"}},
+    )
+    assert "confirmed_source" in holds
+
+    limits = {"state": ["open", "fixed", "closed"]}
+    review._widen_update_state(
+        limits,
+        issue_pkt["sources"],
+        PRIOR["prior_story"] | {"state": "released", "category": "release"},
+    )
+    assert "released" in limits["state"]
+
