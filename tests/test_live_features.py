@@ -409,6 +409,13 @@ def test_sliding_window_overlaps_draft_and_review_and_skips_deterministic_before
             return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(reply)}}]})
 
         monkeypatch.setattr(
+            cli,
+            "_new_analyzer",
+            lambda c, *, deadline=None, request_semaphore=None: cli.Analyzer(
+                c, deadline=deadline, editorial_polish=True, best_of=1, quote_digest=False, request_semaphore=request_semaphore
+            ),
+        )
+        monkeypatch.setattr(
             llm,
             "HttpClient",
             lambda settings, **kwargs: HttpClient(
@@ -426,6 +433,84 @@ def test_sliding_window_overlaps_draft_and_review_and_skips_deterministic_before
         assert len(store.stories()) == 6
         assert report["analyzed"] == 8  # 6 published + 2 deterministic skips
         assert report["analysis_failed"] == 0
+
+
+def test_sliding_window_bounds_concurrent_http_under_best_of_3_and_specialists_3(context, monkeypatch):
+    """Bound concurrent writer HTTP calls to MAX_CONCURRENT_LLM_ITEMS even when best_of=3 and specialists=3 run."""
+    cfg, store = context
+    cfg["sources"] = []
+    cfg["llm"].update(base_url="https://llm.example/v1", api_key_env="SW_SEM_KEY")
+    monkeypatch.setenv("SW_SEM_KEY", "synthetic-fixture-value")
+    patch_cli_pipeline(monkeypatch, now=DATE, reviewer=None, build=lambda *_a: {})
+
+    for i in range(4):
+        store.ingest(
+            item(
+                url=f"https://example.org/sw-sem-{i}",
+                title=f"Sliding bounded report {i}",
+                content=f"Sliding bounded content {i} describing a relay consensus event.",
+            ),
+            DATE,
+        )
+
+    lock = threading.Lock()
+    in_flight = 0
+    max_in_flight = 0
+    counts = {"news": 0, "select": 0, "polish": 0, "review": 0}
+    barrier = threading.Barrier(4, timeout=5.0)
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, max_in_flight
+        body = json.loads(request.content)
+        schema_name = body["response_format"]["json_schema"]["name"]
+        if schema_name == "onionflash_news":
+            user_payload = json.loads(body["messages"][1]["content"])
+            with lock:
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+                counts["news"] += 1
+                first_wave = counts["news"] <= 4
+            try:
+                if first_wave:
+                    barrier.wait()
+                reply = analysis(
+                    title=user_payload["title"],
+                    summary=user_payload["content"],
+                    why_it_matters="",
+                    evidence=[user_payload["content"]],
+                )
+            finally:
+                with lock:
+                    in_flight -= 1
+        elif schema_name == "onionflash_select":
+            with lock:
+                counts["select"] += 1
+            reply = {"winner": 1, "reason": "Best candidate."}
+        elif schema_name == "onionflash_polish":
+            with lock:
+                counts["polish"] += 1
+            draft = json.loads(body["messages"][1]["content"])["draft"]
+            reply = {k: draft[k] for k in ("title", "summary", "why_it_matters")}
+        else:
+            with lock:
+                counts["review"] += 1
+            reply = verdict("approve")
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(reply)}}]})
+
+    monkeypatch.setattr(
+        llm,
+        "HttpClient",
+        lambda settings, **kwargs: HttpClient(
+            settings, **kwargs, transport=httpx.MockTransport(_handle), resolver=public_dns
+        ),
+    )
+
+    report = cli.run(cfg, store)
+    assert max_in_flight == cli.MAX_CONCURRENT_LLM_ITEMS == 4
+    assert counts == {"news": 12, "select": 4, "polish": 4, "review": 16}
+    assert report["model_calls"] == 36
+    assert report["analyzed"] == 4
+    assert len(store.stories()) == 4
 
 
 def test_harvest_eval_readonly_all_buckets_sanitization_and_eval_compatibility(tmp_path):

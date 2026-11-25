@@ -218,7 +218,8 @@ def _validate_cases(cases: list[dict], *, draft: bool = False) -> None:
         identities.add(case["id"])
 
 
-def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, polish=False, specialists=1):
+def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, polish=False,
+             specialists=1, best_of=1, quote_digest=False):
     """Score final reviewed candidates and save bounded evaluation evidence privately.
 
     In draft mode the writer drafts each packet once per round, and each case on
@@ -226,6 +227,8 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
     """
     if specialists not in (1, len(SPECIALISTS)):
         raise ValueError("Use 1 or 3 specialists")
+    if best_of < 1:
+        raise ValueError("best_of must be at least 1")
     output = Path(output).resolve()
     public = Path(config["storage"]["output_dir"]).resolve()
     if output == public or public in output.parents:
@@ -245,7 +248,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
     judged, outcomes, seen = {}, {}, set()
     identity = policy_hash(config)
     with (os.fdopen(descriptor, "w", encoding="utf-8") as report, EvaluationReviewer(config, deadline=deadline) as reviewer,
-          Analyzer(config, deadline=deadline, editorial_polish=polish) as writer):
+          Analyzer(config, deadline=deadline, editorial_polish=polish, best_of=best_of, quote_digest=quote_digest) as writer):
         for iteration in range(1, rounds + 1):
             drafts = {}
             for case in cases:
@@ -474,6 +477,10 @@ def main(argv=None):
     parser.add_argument("--polish", action="store_true", help="run editorial polish pass when drafting candidates")
     parser.add_argument("--specialists", type=int, choices=(1, 3), default=1,
                         help="number of specialist verification passes per verification wave (1 or 3)")
+    parser.add_argument("--best-of", type=int, choices=(1, 3), default=1,
+                        help="number of parallel draft candidates to generate and select from in --draft mode (1 or 3)")
+    parser.add_argument("--quote-digest", action="store_true",
+                        help="include quote-backed long-thread digests when drafting in --draft mode")
     args = parser.parse_args(argv)
     os.umask(0o077)
     files = args.cases or [Path(__file__).resolve().with_name(name) for name in CASE_FILES]
@@ -491,7 +498,8 @@ def main(argv=None):
             parser.error("Unknown evaluation case")
         cases = [case for case in cases if case["id"] in selected]
     result = evaluate(config, cases, args.output, rounds=args.rounds, deadline=time.monotonic() + args.max_seconds,
-                      draft=args.draft, polish=args.polish, specialists=args.specialists)
+                      draft=args.draft, polish=args.polish, specialists=args.specialists,
+                      best_of=args.best_of, quote_digest=args.quote_digest)
     return int(bool(result["controlled_mismatches"] or result.get("false_routes") or result["target_missed"]
                     or result["errors"] or result["incomplete"]))
 

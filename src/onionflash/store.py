@@ -13,13 +13,13 @@ from pathlib import Path
 import re
 import sqlite3
 
-from . import candidate, decisions, doctor, editorial, publication, render, util
+from . import candidate, decisions, doctor, editorial, publication, render
 from .candidate import ReviewRequired, item_source
 from .comments import analysis_context
 from .util import (
     after, backoff_until, canonical_json, digest, is_dirauth_item, is_hackerone_item,
-    is_tor_core_item, is_trove_item, item_cluster, item_identity, safe_canonical_url,
-    saved_object, strict_json, valid_note_list,
+    is_pt_high_impact, is_tor_core_item, is_trove_item, item_cluster, item_identity,
+    safe_canonical_url, saved_object, strict_json, valid_note_list,
 )
 
 TAG_PRIORITY = 5  # queue floor for deterministic tag notices
@@ -32,12 +32,6 @@ TROVE_PRIORITY = 40  # queue boost so verified TROVE advisories run ahead of ord
 POLL_TOLERANCE_SECONDS = 5  # absorbs scheduler start jitter after a successful poll
 MIN_REFRESH_UPDATES = 3
 MIN_NEW_UPDATES_FOR_REFRESH = 2
-
-_PT_FAMILY_RE = re.compile(r"\b(?:snowflake|webtunnel|lyrebird|obfs4proxy|obfs4|conjure)\b", re.I)
-_PT_IMPACT_RE = re.compile(
-    r"\b(?:security|panic\w*|crash\w*|exhaust\w*|d?dos|nginx|cve(?:-\d{4}-\d+)?|ttp)\b",
-    re.I,
-)
 
 _RETENTION_TABLES = {"item": ("items", "id"), "analysis": ("analyses", "cache_key")}
 _RETENTION_SCHEMA = """
@@ -294,21 +288,6 @@ def source_due(state: dict, observed: str) -> bool:
     return not due or due <= observed
 
 
-def _is_pt_high_impact(item: dict) -> bool:
-    """Return whether `item` describes a high-impact pluggable-transport security or availability issue."""
-    # Phase 2: import util.is_pt_high_impact directly once merged from w45-det.
-    if (helper := getattr(util, "is_pt_high_impact", None)) is not None:
-        return bool(helper(item))
-    body = item.get("content") or item.get("source_content") or ""
-    text = " ".join([
-        str(item.get("title") or ""),
-        str(body)[:1500],
-        " ".join(str(lbl) for lbl in (item.get("labels") or ())),
-        str(item.get("url") or ""),
-    ])
-    return bool(_PT_FAMILY_RE.search(text) and _PT_IMPACT_RE.search(text))
-
-
 def story_refresh_hash(payload: dict) -> str:
     """Return a stable digest of a story's accumulated updates and source citations."""
     return digest({"updates": payload.get("updates") or [], "sources": payload.get("sources") or []})
@@ -330,7 +309,7 @@ def item_priority(
         score += TROVE_PRIORITY
     if is_hackerone_item(item):
         score += HACKERONE_PRIORITY
-    if _is_pt_high_impact(item):
+    if is_pt_high_impact(item):
         score += PT_SECURITY_PRIORITY
     if is_dirauth_item(item, dirauth_users):
         score += DIRAUTH_PRIORITY

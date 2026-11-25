@@ -1863,6 +1863,8 @@ def test_cli_run_prefetches_drafts_concurrently_and_preserves_report_contract(co
             finally:
                 with lock:
                     in_flight -= 1
+        elif schema_name == "onionflash_select":
+            reply = {"winner": 1, "reason": "Best candidate."}
         elif schema_name == "onionflash_polish":
             draft = json.loads(body["messages"][1]["content"])["draft"]
             reply = {k: draft[k] for k in ("title", "summary", "why_it_matters")}
@@ -1883,7 +1885,7 @@ def test_cli_run_prefetches_drafts_concurrently_and_preserves_report_contract(co
     assert report["analyzed"] == 4
     assert report["analysis_failed"] == 0
     assert report["budget_reached"] is False
-    assert report["model_calls"] == 16
+    assert report["model_calls"] == 36
     assert len(store.stories()) == 4
     assert store.db.execute("SELECT COUNT(*) FROM review_jobs").fetchone()[0] == 0
     assert set(report) == {
@@ -2156,6 +2158,10 @@ def test_cli_run_concurrent_partial_failures_do_not_double_defer(context, monkey
                 evidence=[user_payload["content"]],
             )
             return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(reply)}}]})
+        if schema_name == "onionflash_select":
+            return httpx.Response(
+                200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"winner": 1, "reason": "Best candidate."})}}]}
+            )
         if schema_name == "onionflash_polish":
             draft = json.loads(body["messages"][1]["content"])["draft"]
             reply = {k: draft[k] for k in ("title", "summary", "why_it_matters")}
@@ -2173,7 +2179,7 @@ def test_cli_run_concurrent_partial_failures_do_not_double_defer(context, monkey
     report = cli.run(cfg, store)
     assert report["analyzed"] == 1
     assert report["analysis_failed"] == 2
-    assert report["model_calls"] == 6
+    assert report["model_calls"] == 15
     assert len(store.stories()) == 1
     rows = {
         r["url"]: (r["status"], r["attempts"], r["rejections"])

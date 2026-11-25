@@ -24,9 +24,9 @@ from .llm import AnalysisError, CompletionDeferred, RequestObserver, is_quoted_l
 from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, SHA256_RE, STATES
 from .store import ITEM_SAFE_COLUMNS, decode_item_row, item_hash, item_hash_fields, set_job_stage
 from .util import (
-    _DIRAUTH_LABELS, _GITLAB_OWN, _strip_subject_prefixes, after, cve_ids, digest,
+    _DIRAUTH_LABELS, _GITLAB_OWN, after, cve_ids, digest,
     dirauth_user_set, effective_authority, folded_labels, gitlab_refs, has_invalid_text_chars,
-    is_dirauth_item, is_hackerone_item, is_trove_item, item_cluster, LIST_ARCHIVE_HOST,
+    is_dirauth_item, is_hackerone_item, is_housekeeping_item, is_trove_item, item_cluster, LIST_ARCHIVE_HOST,
     mandatory_news_rule, normalize_evidence, now_iso, parse_utc, release_mentions,
     safe_canonical_url, saved_object, strict_json, thread_subject, tor_core_user_set, trove_ids,
 )
@@ -1417,15 +1417,6 @@ _DUP_SECURITY_GUARD_RE = re.compile(
     r"out[- ]of[- ]bounds|remote\s+code(?:\s+execution)?)\b",
     re.I,
 )
-_HOUSEKEEPING_TITLE_RE = re.compile(
-    r"(?:\brelease\s+checklist\b|\bversion\s+bump\b|\bbump(?:ing)?\s+(?:version|deps|dependencies)\b"
-    r"|\bforward[- ]port\b.*\bchangelogs?\b|^update\s+changelogs?\b|^clean\s*up\s+comments?\b"
-    r"|^fix\s+(?:whitespace|formatting|lint(?:ing)?|clippy)\b|^bump\s+(?:cargo\.lock|lockfile)\b"
-    r"|\b(?:cargo|package|yarn|poetry|uv)\.lock\b|\blockfile\b"
-    r"|\b(?:dependabot|renovate)\b|^(?:chore|ci|typo|housekeeping|l10n|i18n|translations?)\s*:)"
-    r"|\bminor\s+typo\b|\bfix(?:es|ing)?\s+(?:a\s+)?typo\b",
-    re.I,
-)
 _PURE_ACK_RE = re.compile(
     r"^(?:"
     r"(?:many\s+|hi[,.]?\s*)?(?:thanks?(?:\s+(?:a\s+lot|very\s+much|everyone|all))?|"
@@ -1575,13 +1566,12 @@ def _eval_deterministic_skip(
         and not (existing is not None and item.get("upstream_state") == "closed")
     ):
         return "skipped.gate.housekeeping", "Routine acknowledgment or no-content reply"
-    cleaned_title, _ = _strip_subject_prefixes(item.get("title"))
     if (
         existing is None
         and not item.get("public_comments")
-        and _HOUSEKEEPING_TITLE_RE.search(cleaned_title)
+        and (housekeeping := is_housekeeping_item(item)) is not None
     ):
-        return "skipped.gate.housekeeping", "Routine checklist or housekeeping item"
+        return housekeeping
     return None
 
 

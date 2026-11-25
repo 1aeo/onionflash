@@ -38,7 +38,6 @@ _ORIG_REVIEWER = Reviewer
 _ORIG_PROCESS_ITEM = process_item
 _ORIG_REFRESHER = refresh.StoryRefresher
 _ORIG_REFRESH_DUE_STORIES = refresh.refresh_due_stories
-_ORIG_REFRESHER = refresh.StoryRefresher
 
 _OPERATOR_ACTION_ORDER = {
     "story": ("show", "history", "correct", "retract", "restore", "unlock", "merge"),
@@ -159,7 +158,12 @@ def _effective_config(config: dict, store: Store) -> tuple[dict, list[str]]:
     return {**config, "collection": eff_collection}, tor_core_users
 
 
-def _new_analyzer(config: dict, *, deadline: float | None = None):
+def _new_analyzer(
+    config: dict,
+    *,
+    deadline: float | None = None,
+    request_semaphore: threading.Semaphore | None = None,
+):
     """Construct `Analyzer`, opting into polish, best-of-3, and quote-digest when supported."""
     kwargs: dict[str, object] = {"deadline": deadline}
     try:
@@ -172,6 +176,8 @@ def _new_analyzer(config: dict, *, deadline: float | None = None):
         kwargs["best_of"] = 3
     if "quote_digest" in params:
         kwargs["quote_digest"] = True
+    if request_semaphore is not None and "request_semaphore" in params:
+        kwargs["request_semaphore"] = request_semaphore
     return Analyzer(config, **kwargs)
 
 
@@ -330,9 +336,15 @@ def _classify_pending_row(
     return "draft", (row, copy.deepcopy(writer_item), copy.deepcopy(prior), writer_key, carry)
 
 
-def _draft_one_task(run_config: dict, run_deadline: float, writer_item_copy: dict, prior_copy: dict | None):
+def _draft_one_task(
+    run_config: dict,
+    run_deadline: float,
+    writer_item_copy: dict,
+    prior_copy: dict | None,
+    request_semaphore: threading.Semaphore | None = None,
+):
     """Run one `Analyzer` draft in an isolated client without SQLite access."""
-    with _new_analyzer(run_config, deadline=run_deadline) as worker:
+    with _new_analyzer(run_config, deadline=run_deadline, request_semaphore=request_semaphore) as worker:
         try:
             draft = (
                 worker.analyze(writer_item_copy)
@@ -436,10 +448,14 @@ def _prefetch_drafts(
     prefetched_calls = 0
     handled_ids: set[str] = set()
     budget_reached = False
+    draft_semaphore = threading.Semaphore(MAX_CONCURRENT_LLM_ITEMS)
 
     with ThreadPoolExecutor(max_workers=min(MAX_CONCURRENT_LLM_ITEMS, len(tasks))) as pool:
         submitted = [
-            ((row, writer_key, carry), pool.submit(_draft_one_task, run_config, run_deadline, writer_item_copy, prior_copy))
+            (
+                (row, writer_key, carry),
+                pool.submit(_draft_one_task, run_config, run_deadline, writer_item_copy, prior_copy, draft_semaphore),
+            )
             for row, writer_item_copy, prior_copy, writer_key, carry in tasks
         ]
         for idx, ((row, writer_key, carry), future) in enumerate(submitted):
@@ -561,6 +577,7 @@ def _run_sliding_window(
     prefetched_calls = 0
     budget_reached = False
     stopped_dispatch = False
+    draft_semaphore = threading.Semaphore(MAX_CONCURRENT_LLM_ITEMS)
 
     def _fill_window() -> None:
         nonlocal budget_reached, stopped_dispatch
@@ -590,7 +607,7 @@ def _run_sliding_window(
                 ready_rows.append(payload)
             elif kind == "draft":
                 d_row, writer_item_copy, prior_copy, writer_key, carry = payload
-                fut = pool.submit(_draft_one_task, run_config, run_deadline, writer_item_copy, prior_copy)
+                fut = pool.submit(_draft_one_task, run_config, run_deadline, writer_item_copy, prior_copy, draft_semaphore)
                 in_flight[fut] = (d_row, writer_key, carry)
 
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_LLM_ITEMS) as pool:

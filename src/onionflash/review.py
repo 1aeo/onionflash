@@ -5,12 +5,12 @@ from __future__ import annotations
 import copy
 import re
 
-from . import llm as _llm_mod
 from .analyze import SCHEMA as DRAFT_SCHEMA, _numbers as _impact_numbers
 from .llm import (AnalysisError, CompletionClient, apply_label_limits, has_malformed_tor_version,
-                  has_shouting_caps, is_complete_sentence, is_quoted_list_post, label_limits,
+                  has_shouting_caps, has_unattributed_advice, is_complete_sentence,
+                  is_incomplete_or_filler_impact, is_quoted_list_post, label_limits,
                   repair_schema, strip_unreleased_tag, unquoted_mail_text, validate_schema_field,
-                  validate_text)
+                  validate_text, widen_release_state_for_update)
 from .render import prepare_story
 from .schema import FIELD_LIMITS, LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STATES, STORY_ID_RE, UPDATE_CHARS
 from .util import LIST_ARCHIVE_HOST, canonical_url, digest, is_trove_item, normalize_evidence, strict_json
@@ -592,13 +592,7 @@ def _widen_update_state(limits: dict, sources: list[dict], prior: dict, candidat
     ):
         has_tag = any(s.get("kind") == "tag" for s in sources) or prior.get("state") == "tagged"
         limits["state"] = [s for s in STATES if has_tag or s != "tagged"]
-    # Phase 2: unify with llm.widen_release_state_for_update when present.
-    if callable(widen_fn := getattr(_llm_mod, "widen_release_state_for_update", None)):
-        widen_fn(limits, sources, prior)
-    elif ("released" not in limits["state"]
-          and limits["state"] != ["merged"]
-          and (prior.get("state") == "released" or prior.get("category") == "release")):
-        limits["state"] = [s for s in STATES if s in set(limits["state"]) or s == "released"]
+    widen_release_state_for_update(limits, prior)
 
 
 def repair_limits(
@@ -650,49 +644,6 @@ def _repair_fields(repair: dict, *, update: bool = False) -> dict:
     return normalized
 
 
-_GENERIC_IMPACT_RE = re.compile(
-    r"(?:\bprovides\s+updated\s+security\s+components\s+and\s+bug\s+fixes\b"
-    r"|\baddresses\s+(?:over\s+\d+\s+)?(?:bugzilla\s+)?issues\s+to\s+maintain\s+privacy\s+and\s+security\b"
-    r"|\bupdates\s+the\s+browser['’]?s\s+(?:core\s+engine|underlying\s+security\s+foundation)\b)",
-    re.I,
-)
-_ADVICE_DIRECTIVE_RE = re.compile(
-    r"\b(?:are|is)\s+(?:advised|encouraged|recommended|urged)\s+to\s+(?P<verb>[a-z]+)\b"
-    r"|\b(?:operators?|users?|administrators?)\s+(?:must|should|need\s+to)\s+(?P<verb2>[a-z]+)\b",
-    re.I,
-)
-_ADVICE_VERBS = frozenset({
-    "treat", "switch", "upgrade", "update", "configure", "edit", "remove", "disable", "enable", "migrate",
-})
-
-
-def _is_incomplete_or_filler_impact(text: str) -> str | None:
-    """Detect incomplete or generic-filler why_it_matters text (Phase 2: unify with llm.py)."""
-    if callable(fn := getattr(_llm_mod, "is_incomplete_or_filler_impact", None)):
-        return fn(text)
-    if not text or not text.strip():
-        return None
-    if not is_complete_sentence(text):
-        return "incomplete_sentence"
-    if _GENERIC_IMPACT_RE.search(text):
-        return "generic_filler"
-    return None
-
-
-def _has_unattributed_advice(text: str, packet: dict, impact_ctx: str | None = None) -> bool:
-    """Detect unattributed operator/user advice in why_it_matters (Phase 2: unify with llm.py)."""
-    if callable(fn := getattr(_llm_mod, "has_unattributed_advice", None)):
-        return bool(fn(text, packet))
-    if not text or not text.strip():
-        return False
-    ctx = (impact_ctx if impact_ctx is not None else _packet_impact_context(packet)[0]).casefold()
-    for match in _ADVICE_DIRECTIVE_RE.finditer(text):
-        verb = (match.group("verb") or match.group("verb2") or "").casefold()
-        if verb in _ADVICE_VERBS and verb not in ctx:
-            return True
-    return False
-
-
 def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict:
     """Normalize a minimal semantic repair BEFORE its independent verification."""
     edits = _repair_fields(repair, update=update)
@@ -701,7 +652,7 @@ def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict
         if (
             has_shouting_caps(impact)
             or has_malformed_tor_version(impact, products)
-            or _is_incomplete_or_filler_impact(impact) is not None
+            or is_incomplete_or_filler_impact(impact) is not None
         ):
             raise ReviewError("Invalid repair field")
     explicit_tags = "tags" in edits
@@ -832,14 +783,14 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool 
                     or (_impact_numbers(impact) - _impact_numbers(impact_ctx))
                     or has_shouting_caps(impact)
                     or has_malformed_tor_version(impact, products)
-                    or _is_incomplete_or_filler_impact(impact) is not None
-                    or _has_unattributed_advice(impact, packet, impact_ctx)
+                    or is_incomplete_or_filler_impact(impact) is not None
+                    or has_unattributed_advice(impact, packet)
                 ):
                     repair["why_it_matters"] = ""
             elif impact and (
                 has_shouting_caps(impact)
                 or has_malformed_tor_version(impact, repair.get("products") or ())
-                or _is_incomplete_or_filler_impact(impact) is not None
+                or is_incomplete_or_filler_impact(impact) is not None
             ):
                 repair["why_it_matters"] = ""
     elif repair is not None:
@@ -1140,6 +1091,30 @@ class Reviewer(CompletionClient):
         if result["verdict"] == "skip" and not _skip_stands(result["criteria"], coverage, result.get("same_story"), update=update):
             # The record keeps the verdict that this fixed rule replaced.
             result = {**result, "verdict": "hold", "same_story": None, "model_verdict": "skip"}
+        if (
+            not update
+            and result["verdict"] == "approve"
+            and isinstance(impact := candidate_public.get("why_it_matters"), str)
+            and impact.strip()
+        ):
+            defect = is_incomplete_or_filler_impact(impact)
+            unattributed = defect is None and has_unattributed_advice(impact, packet)
+            if defect is not None or unattributed:
+                crit = "source_support" if defect is not None else "operational_advice"
+                msg = (
+                    "why_it_matters is incomplete or generic filler unsupported by packet evidence."
+                    if defect is not None
+                    else "why_it_matters states operator or user advice absent from packet passages."
+                )
+                updated_criteria = copy.deepcopy(result["criteria"])
+                updated_criteria[crit] = {**updated_criteria[crit], "outcome": "fail", "reason": msg}
+                result = {
+                    **result,
+                    "criteria": updated_criteria,
+                    "verdict": "revise",
+                    "repair": {"why_it_matters": ""},
+                    "model_verdict": "approve",
+                }
         return result
 
 

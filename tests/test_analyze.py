@@ -260,7 +260,7 @@ def test_impact_clears_across_comments_decisions_retries_and_approvals(context, 
 
 
 @pytest.mark.parametrize("src_item,confidence,state,categories", [
-    (item(), ["reported", "suspected", "observed-anomaly"], NON_TAG_STATES, CATEGORIES),
+    (item(), ["reported", "suspected", "observed-anomaly"], [s for s in NON_TAG_STATES if s != "released"], CATEGORIES),
     (item(kind="gitlab_mr", upstream_state="merged"), CONFIDENCES, ["merged"], NON_RELEASE_CATEGORIES),
     (item(kind="feed", authority="official"), CONFIDENCES, NON_TAG_STATES, CATEGORIES),
 ], ids=["issue", "merged-request", "official-feed"])

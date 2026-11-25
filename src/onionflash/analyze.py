@@ -12,8 +12,9 @@ from . import comments as _comments, util as _util
 from .comments import THREAD_DIGEST_PROMPT, THREAD_DIGEST_SCHEMA, analysis_context, build_long_thread_digest
 from .llm import (
     AnalysisError, CompletionClient, CompletionDeferred, apply_label_limits, generation_options,
-    has_malformed_tor_version, has_shouting_caps, is_complete_sentence, is_quoted_list_post,
-    label_limits, strip_unreleased_tag, tag_name, unquoted_mail_text, validate_schema_field,
+    has_malformed_tor_version, has_shouting_caps, has_unattributed_advice, is_complete_sentence,
+    is_incomplete_or_filler_impact, is_quoted_list_post, label_limits, strip_unreleased_tag, tag_name,
+    unquoted_mail_text, validate_schema_field, widen_release_state_for_update,
 )
 from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, SOFTWARE, STATES, UPDATE_CHARS
 from .source_packet import OPTIONAL_SOURCE_FIELDS
@@ -574,6 +575,8 @@ def validate_analysis(result: dict, item: dict, schema: dict = SCHEMA) -> dict:
         or (item.get("authority") == "community" and LIST_ARCHIVE_HOST in str(item.get("url") or ""))
         or has_shouting_caps(impact)
         or has_malformed_tor_version(impact, result.get("products") or [item.get("product", "")])
+        or is_incomplete_or_filler_impact(impact) is not None
+        or has_unattributed_advice(impact, item)
     ):
         result["why_it_matters"] = ""
     return result
@@ -726,6 +729,7 @@ class Analyzer(CompletionClient):
         editorial_polish: bool = False,
         best_of: int = 1,
         quote_digest: bool = False,
+        request_semaphore: threading.Semaphore | None = None,
     ):
         if type(best_of) is not int or best_of < 1:
             raise ValueError("best_of must be a positive integer")
@@ -737,6 +741,7 @@ class Analyzer(CompletionClient):
         self.editorial_polish = bool(editorial_polish)
         self.best_of = best_of
         self.quote_digest = quote_digest
+        self._request_semaphore = request_semaphore
         self._state_lock = threading.Lock()
         self._client_lock = threading.Lock()
 
@@ -793,24 +798,30 @@ class Analyzer(CompletionClient):
         allow_direct: bool = False,
     ) -> dict:
         """Run one completion safely under either isolated worker clients or a locked shared client."""
-        if allow_direct and llm_settings is self.llm:
-            return self.complete(prompt, payload, schema, name)
-        if self._use_parallel_workers():
-            worker = CompletionClient({**self._base_config, "llm": llm_settings}, deadline=self.deadline)
-            worker.clock = self.clock
-            try:
-                return worker.complete(prompt, payload, schema, name)
-            finally:
-                with self._state_lock:
-                    self.calls += worker.calls
-                worker.close()
-        with self._client_lock:
-            prev_llm = self.llm
-            self.llm = llm_settings
-            try:
+        def _invoke() -> dict:
+            if allow_direct and llm_settings is self.llm:
                 return self.complete(prompt, payload, schema, name)
-            finally:
-                self.llm = prev_llm
+            if self._use_parallel_workers():
+                worker = CompletionClient({**self._base_config, "llm": llm_settings}, deadline=self.deadline)
+                worker.clock = self.clock
+                try:
+                    return worker.complete(prompt, payload, schema, name)
+                finally:
+                    with self._state_lock:
+                        self.calls += worker.calls
+                    worker.close()
+            with self._client_lock:
+                prev_llm = self.llm
+                self.llm = llm_settings
+                try:
+                    return self.complete(prompt, payload, schema, name)
+                finally:
+                    self.llm = prev_llm
+
+        if self._request_semaphore is None:
+            return _invoke()
+        with self._request_semaphore:
+            return _invoke()
 
     def _validate_candidate(
         self,
@@ -1131,6 +1142,7 @@ def _writer_schema(
         if not (prior.get("state") == "merged" and _all_merge_sources(prior)):
             has_tag = bounded.get("kind") == "tag" or prior.get("state") == "tagged"
             limits["state"] = [s for s in STATES if has_tag or s != "tagged"]
+            widen_release_state_for_update(limits, prior)
         if prior.get("category") == "release":
             release_states = [s for s in limits["state"] if s in {"released", "tagged"}]
             if release_states:

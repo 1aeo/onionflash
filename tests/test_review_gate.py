@@ -802,15 +802,17 @@ def test_run_report_counts_outcomes_model_calls_and_isolates_invalid_outputs(tmp
     reply_fn = lambda *_a, json_body=None, **_kw: (
         analysis(why_it_matters="")
         if json_body["response_format"]["json_schema"]["name"] == "onionflash_news"
+        else {"winner": 1, "reason": "Selected candidate."}
+        if json_body["response_format"]["json_schema"]["name"] == "onionflash_select"
         else FetchError("network request failed", retryable=True)
     )
-    monkeypatch.setattr("onionflash.llm.HttpClient", lambda *a, **kw: FakeLLM(*([reply_fn] * 4)))
+    monkeypatch.setattr("onionflash.llm.HttpClient", lambda *a, **kw: FakeLLM(*([reply_fn] * 12)))
     patch_cli_pipeline(monkeypatch, now=None, reviewer=None, build=lambda *a: {})
     with Store(cfg2["storage"]["database"]) as store:
         for name in ("one", "two"):
             store.ingest(item(url="https://example.org/" + name), DATE)
         rep2 = cli.run(cfg2, store)
-        assert (rep2["analysis_failed"], rep2["model_calls"]) == (2, 4)
+        assert (rep2["analysis_failed"], rep2["model_calls"]) == (2, 10)
     monkeypatch.undo()
 
     cfg3 = make_config(tmp_path / "r3", sources=[])

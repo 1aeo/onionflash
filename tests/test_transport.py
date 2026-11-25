@@ -690,8 +690,12 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
     def _handle(request):
         body = json.loads(request.content)
         schema_name = body["response_format"]["json_schema"]["name"]
-        stage_kind = {"onionflash_news": "writer", "onionflash_polish": "polish"}.get(schema_name, "review")
-        expected_max_tokens = {"writer": 32768, "polish": 1200, "review": review.OUTPUT_TOKENS}[stage_kind]
+        stage_kind = {
+            "onionflash_news": "writer",
+            "onionflash_select": "select",
+            "onionflash_polish": "polish",
+        }.get(schema_name, "review")
+        expected_max_tokens = {"writer": 32768, "select": 1200, "polish": 1200, "review": review.OUTPUT_TOKENS}[stage_kind]
         assert body["max_tokens"] == expected_max_tokens
         assert request.extensions["onionflash_deadline"] == clock[0] + 3610
         assert request.extensions["timeout"]["read"] == 3600
@@ -700,6 +704,8 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
             clock[0] += 300
         if stage_kind == "writer":
             return _httpx_completion(analysis(why_it_matters=""))
+        if stage_kind == "select":
+            return _httpx_completion({"winner": 1, "reason": "Selected candidate."})
         if stage_kind == "polish":
             draft = json.loads(body["messages"][1]["content"])["draft"]
             return _httpx_completion({k: draft[k] for k in ("title", "summary", "why_it_matters")})
@@ -727,7 +733,7 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
     saved = job(store)
     record = job_record(store)
     assert first["budget_reached"] and first["analysis_failed"] == 0
-    expected_first = {"writer": 1, "reservation": 2, "review": 3}[expire]
+    expected_first = {"writer": 1, "reservation": 5, "review": 6}[expire]
     assert first["model_calls"] == len(sent) == expected_first
     assert saved["stage"] == ("verify" if expire == "review" else "review")
     assert record["request_budget"]["reserved"] == (1 if expire == "review" else 0)
@@ -737,7 +743,11 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
     assert all(settings["timeout_seconds"] == 3600 and settings["total_timeout_seconds"] == 3610 for settings in settings_seen)
     second = cli.run(config, store)
     assert second["analysis_failed"] == 0 and second["model_calls"] == (1 if expire == "review" else 2)
-    assert sent == (["writer", "review", "review"] if expire == "writer" else ["writer", "polish", "review", "review"])
+    assert sent == (
+        ["writer", "review", "review"]
+        if expire == "writer"
+        else ["writer", "writer", "writer", "select", "polish", "review", "review"]
+    )
     assert len(store.stories()) == 1 and job(store) is None
 
 

@@ -200,7 +200,7 @@ def test_final_holds_on_real_cases(writer, sources, fields, expected):
 
 
 @pytest.mark.parametrize("sources,confidence,state,categories", [
-    ([ISSUE], ["reported", "suspected", "observed-anomaly"], NON_TAG_STATES, analyze.CATEGORIES),
+    ([ISSUE], ["reported", "suspected", "observed-anomaly"], [s for s in NON_TAG_STATES if s != "released"], analyze.CATEGORIES),
     ([MERGED], analyze.CONFIDENCES, ["merged"], NON_RELEASE_CATEGORIES),
     ([FEED], analyze.CONFIDENCES, NON_TAG_STATES, analyze.CATEGORIES),
     ([_unit("tag", "tor-0.4.9.16", authority="official"), FEED], analyze.CONFIDENCES, analyze.STATES, analyze.CATEGORIES),
