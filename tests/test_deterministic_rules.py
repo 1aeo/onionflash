@@ -1404,3 +1404,67 @@ def test_pluggable_transport_detection_and_cross_repo_related(tmp_path):
         assert rel_map.get(sf_story["id"]) == "related snowflake transport"
         assert old_sf_story["id"] not in rel_map
 
+
+def test_generic_pt_overlap_advice_filler_exceptions_and_pt_outage_protection(tmp_path):
+    """Enforce non-generic PT linking, profile-name/concrete-impact/imperative preservation, and PT outage safety."""
+    # Generic 'pluggable'/'transport' terms alone do not link unrelated PT stories.
+    with Store(tmp_path / "pt_generic.sqlite3") as store:
+        pt_story = seed_source_story(
+            store,
+            _story_item(
+                url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/issues/200",
+                title="Transport telemetry",
+                content="Metrics collection schedule.",
+                published_at=DATE, updated_at=DATE,
+            ),
+            draft=_story_draft(
+                title="Transport telemetry",
+                summary="Metrics collection schedule.",
+                evidence=["Metrics collection schedule."],
+                tags=["pluggable-transports"],
+            ),
+            at=DATE,
+        )
+        probe = _story_item(
+            url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/issues/201",
+            title="Pluggable transport deployment",
+            content="Status notes for pluggable deployment.",
+            published_at=DATE, updated_at=DATE,
+        )
+        rel_map = dict(candidate_mod.related(store.db, {"id": probe["id"], "cluster_key": "url:probe"}, probe))
+        assert pt_story["id"] not in rel_map
+
+    assert llm.is_incomplete_or_filler_impact("Clients must use profile A.") is None
+    assert llm.is_incomplete_or_filler_impact("Clients should avoid a.") == "incomplete_impact"
+    assert llm.is_incomplete_or_filler_impact(
+        "This change improves reliability by preventing startup failures when the state file is missing."
+    ) is None
+    assert llm.is_incomplete_or_filler_impact("This update improves overall reliability.") == "filler_impact"
+
+    pkt_unquoted_and_passage = {
+        "sources": [{
+            "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/M1/",
+            "title": "Relay thread",
+            "unquoted_content": "I observed the stall yesterday.",
+            "passages": [
+                {"id": "S1:P1", "text": "Relay thread header."},
+                {"id": "S1:P2", "author": "maintainer", "text": "Operators must configure DisableNetwork=0 explicitly."},
+            ],
+        }]
+    }
+    assert llm.has_unattributed_advice("Operators must configure DisableNetwork=0 explicitly.", pkt_unquoted_and_passage) is False
+
+    imp_pkt = _story_item(title="Tor 0.4.9.16", content="If you run a relay, please upgrade to 0.4.9.16.")
+    assert llm.has_unattributed_advice("The announcement advises relay operators to upgrade.", imp_pkt) is False
+    bare_pkt = _story_item(title="Tor 0.4.9.16", content="Tor 0.4.9.16 has been tagged.")
+    assert llm.has_unattributed_advice("The announcement advises relay operators to upgrade.", bare_pkt) is True
+
+    outage_dep = _story_item(
+        url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/merge_requests/19",
+        title="chore(deps): update websocket dependency",
+        content="Restores WebTunnel connectivity during an outage; bridges are unreachable.",
+        author="dependabot[bot]",
+        labels=["dependencies"],
+    )
+    assert is_housekeeping_item(outage_dep) is None
+    assert is_pt_high_impact(outage_dep) is True

@@ -564,7 +564,7 @@ def test_update_scope_confirmed_updates_uncited_notes_and_punctuation_repairs(mo
         "updates": [{"at": LATER, "text": "Operators reported packaging progress in comments.", "sources": [{"url": url99, "title": "Issue 99"}]}],
     }
     prep = {
-        "mode": "update", "coverage": {"prior_story": {"id": "a" * 24, "confidence": "confirmed"}},
+        "mode": "update", "coverage": {"prior_story": {"id": "a" * 24, "confidence": "confirmed", "state": "released"}},
         "limits": {"confidence": {"reported"}, "states": {"reported", "developing", "released"}, "merge_verified": False},
         "packet": {"sources": [{"id": "S1", "url": url99, "authority": "development", "kind": "gitlab_issue",
                                 "passages": [{"id": "S1.P1", "text": "Issue body text without completed verbs."},
@@ -1088,7 +1088,12 @@ def test_review_validation_catches_incomplete_fragment_and_unattributed_advice(m
         _specialist_verdict(
             "revise",
             criterion="scope_timing",
-            repair={"why_it_matters": "Operators should check the advisory."},
+            repair={"why_it_matters": "Operators should configure the relay."},
+        ),
+        _specialist_verdict(
+            "revise",
+            criterion="scope_timing",
+            repair={"why_it_matters": "Operators should configure the relay."},
         ),
         monkeypatch=monkeypatch,
     )
@@ -1098,28 +1103,52 @@ def test_review_validation_catches_incomplete_fragment_and_unattributed_advice(m
     res_adv = reviewer.review(_candidate(), pkt)
     assert res_adv["repair"]["why_it_matters"] == ""
 
-    # When the directive verb IS present in packet context, grounded advice is preserved.
+    # Unattributed directive without matching source prose is cleared, then survives once grounded.
+    res_ungrounded_cfg = reviewer.review(_candidate(), pkt)
+    assert res_ungrounded_cfg["repair"]["why_it_matters"] == ""
+
     grounded_pkt = copy.deepcopy(pkt)
-    grounded_pkt["sources"][0]["passages"].append({"id": "S1:P2", "text": "Operators should check the advisory."})
+    grounded_pkt["sources"][0]["passages"].append({"id": "S1:P2", "text": "Operators should configure the relay."})
     res_grounded = reviewer.review(_candidate(), grounded_pkt)
-    assert res_grounded["repair"]["why_it_matters"] == "Operators should check the advisory."
+    assert res_grounded["repair"]["why_it_matters"] == "Operators should configure the relay."
 
 
 def test_widen_update_state_preserves_prior_released_and_blocks_issue_released():
-    """Prior released stories allow released updates, while bare issue stories fail confirmed_source."""
+    """Prior released stories allow released updates, while bare issue stories hold on release_state independently."""
     issue_pkt = copy.deepcopy(_packet())
     issue_pkt["sources"][0]["kind"] = "gitlab_issue"
     issue_pkt["sources"][0]["authority"] = "development"
     issue_cand = _candidate(
-        category="release",
-        confidence="confirmed",
+        category="security",
+        confidence="reported",
         state="released",
     )
     holds = review.final_holds(
         issue_cand,
         {"packet": issue_pkt, "mode": "story", "payload": {"editorial_kind": "gitlab_issue"}},
     )
-    assert "confirmed_source" in holds
+    assert "release_state" in holds and "confirmed_source" not in holds
+
+    dev_holds = review.final_holds(
+        {**issue_cand, "state": "developing"},
+        {"packet": issue_pkt, "mode": "story", "payload": {"editorial_kind": "gitlab_issue"}},
+    )
+    assert dev_holds == []
+
+    prior_rel_holds = review.final_holds(
+        {
+            **issue_cand,
+            "sources": [{"url": issue_pkt["sources"][0]["url"], "title": issue_pkt["sources"][0]["title"]}],
+            "updates": [{"at": LATER, "text": "Maintainers opened a follow-up.", "sources": [{"url": issue_pkt["sources"][0]["url"], "title": "Issue"}]}],
+        },
+        {
+            "packet": issue_pkt,
+            "mode": "update",
+            "coverage": {"prior_story": {**PRIOR["prior_story"], "state": "released", "confidence": "reported"}},
+            "payload": {"editorial_kind": "gitlab_issue"},
+        },
+    )
+    assert prior_rel_holds == []
 
     limits = {"state": ["open", "fixed", "closed"]}
     review._widen_update_state(
@@ -1129,3 +1158,37 @@ def test_widen_update_state_preserves_prior_released_and_blocks_issue_released()
     )
     assert "released" in limits["state"]
 
+
+def test_merge_specialist_verdicts_prevents_triple_hold_approve_and_losing_route():
+    """Require >=2 specialist approvals to approve and never resurrect a split losing same_story target."""
+    pkt = _packet()
+    cand = _candidate()
+
+    v_ground = _specialist_verdict("hold", criterion="actor_and_action", reason="Unclear actor.")
+    v_attr = _specialist_verdict("hold", criterion="status", reason="Unclear status.")
+    v_nov = _specialist_verdict("hold", criterion="technical_details", reason="Unclear version.")
+    merged_holds = review.merge_specialist_verdicts([v_ground, v_attr, v_nov], cand, pkt)
+    assert merged_holds["verdict"] == "hold"
+    review.validate_review(merged_holds, pkt)
+
+    v_app = verdict("approve")
+    merged_override = review.merge_specialist_verdicts([v_app, v_app, v_nov], cand, pkt)
+    assert merged_override["verdict"] == "approve"
+
+    cov = {
+        "prior_story": None,
+        "recent": [
+            {"id": "a" * 24, "title": "First", "retracted": False},
+            {"id": "b" * 24, "title": "Second", "retracted": False},
+        ],
+        "truncated": False,
+    }
+    s_a = verdict("skip", criterion="new_information", reason=f"Covered by {'a' * 24}.", same_story="a" * 24)
+    s_b = verdict("skip", criterion="new_information", reason=f"Covered by {'b' * 24}.", same_story="b" * 24)
+    merged_split = review.merge_specialist_verdicts([s_a, s_b, v_app], cand, pkt, coverage=cov)
+    assert merged_split["same_story"] is None
+
+    s_a_plain = verdict("skip", criterion="new_information", reason="Already reported earlier.", same_story="a" * 24)
+    s_b_plain = verdict("skip", criterion="new_information", reason="Duplicate report.", same_story="b" * 24)
+    merged_split_hold = review.merge_specialist_verdicts([s_a_plain, s_b_plain, v_app], cand, pkt, coverage=cov)
+    assert merged_split_hold["verdict"] == "hold" and merged_split_hold["same_story"] is None

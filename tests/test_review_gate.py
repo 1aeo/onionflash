@@ -2273,6 +2273,8 @@ def test_parallel_specialist_resume_and_reask_paths(context):
     row = pending(store, item(id="https://example.org/spec3-resume", url="https://example.org/spec3-resume"))
     phase = {"step": 1}
 
+    reasked_specialists = []
+
     def _resume_factory():
         class _ResumeReviewer:
             """Triggers CompletionDeferred inside verify wave 1, then InconsistentReview on wave 2."""
@@ -2296,27 +2298,16 @@ def test_parallel_specialist_resume_and_reask_paths(context):
                         raise CompletionDeferred("transient verify pause")
                     return verdict("approve", update=update)
                 if phase["step"] == 2 and specialist == "grounding_status":
-                    raise review.InconsistentReview()
+                    if validation_error is None:
+                        raise review.InconsistentReview()
+                    if on_request and hasattr(on_request, "response_received"):
+                        on_request.response_received()
+                    reasked_specialists.append((specialist, validation_error))
                 return verdict("approve", update=update)
 
         return _ResumeReviewer()
 
-    class _ReaskChecker:
-        """Handles the validation reask after specialist InconsistentReview."""
-
-        def __init__(self):
-            self.validation_errors = []
-
-        def review(self, cand, packet, *, coverage=None, verification=False, update=False,
-                   validation_error=None, on_request=None, **kwargs):
-            if on_request:
-                on_request(1)
-                if hasattr(on_request, "response_received"):
-                    on_request.response_received()
-            self.validation_errors.append(validation_error)
-            return verdict("approve", update=update)
-
-    reask_checker = _ReaskChecker()
+    reask_checker = ApprovingReviewer()
     first = review_gate.process_item(
         cfg,
         store,
@@ -2346,7 +2337,7 @@ def test_parallel_specialist_resume_and_reask_paths(context):
         specialists=3,
     )
     assert second["status"] == "published"
-    assert review.INCONSISTENT_VERDICT in reask_checker.validation_errors
+    assert ("grounding_status", review.INCONSISTENT_VERDICT) in reasked_specialists
 
 
 def test_evaluate_review_specialists_3_cli_and_draft_mode(tmp_path, monkeypatch):
@@ -2510,3 +2501,104 @@ def test_evaluate_review_specialists_3_cli_and_draft_mode(tmp_path, monkeypatch)
     assert draft_lines[-1]["summary"]["errors"] == 0
     assert set(review.SPECIALISTS) <= set(seen_specialists)
 
+
+def test_specialist_gate_validation_preserve_hold_no_downgrade_and_factory_guard(context):
+    """Enforce unique specialist requests, factory specialist support, preserved holds, cache isolation, and fail-closed budget holds."""
+    cfg, store = context
+
+    # 1) Factory returning non-specialist ApprovingReviewer is rejected cleanly.
+    row_bad = pending(store, item(id="https://example.org/spec3-bad-fac", url="https://example.org/spec3-bad-fac"))
+    with pytest.raises(TypeError, match="specialist"):
+        review_gate.process_item(
+            cfg, store, row_bad, Writer(), ApprovingReviewer(),
+            parallel_verify=True, reviewer_factory=lambda: ApprovingReviewer(), specialists=3,
+        )
+
+    # 2) Specialist reask keeps another lens's hold instead of dropping it.
+    row_hold = pending(store, item(id="https://example.org/spec3-hold", url="https://example.org/spec3-hold"))
+
+    def _hold_factory():
+        class _HoldReaskReviewer:
+            """Throws InconsistentReview on grounding_status and holds on attribution_scope_advice."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                if on_request:
+                    on_request(1)
+                if not verification:
+                    return verdict("approve", update=update)
+                if specialist == "grounding_status":
+                    if validation_error is None:
+                        raise review.InconsistentReview()
+                    if on_request and hasattr(on_request, "response_received"):
+                        on_request.response_received()
+                    return verdict("approve", update=update)
+                if specialist == "attribution_scope_advice":
+                    return verdict("hold", criterion="actor_and_action", reason="Unsupported actor.", update=update)
+                return verdict("approve", update=update)
+
+        return _HoldReaskReviewer()
+
+    res_hold = review_gate.process_item(
+        cfg, store, row_hold, Writer(), ApprovingReviewer(),
+        parallel_verify=True, reviewer_factory=_hold_factory, specialists=3,
+    )
+    assert res_hold["status"] == "held"
+    assert store.stories() == []
+
+    # 3) Duplicate specialist request numbers fail validate_review_state.
+    row_ok = pending(store, item(id="https://example.org/spec3-dup-req", url="https://example.org/spec3-dup-req"))
+
+    def _ok_factory():
+        class _OkSpec:
+            """Specialist reviewer approving all lenses."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                """Approve one lens call."""
+                if on_request:
+                    on_request(1)
+                return verdict("approve", update=update)
+
+        return _OkSpec()
+
+    assert review_gate.process_item(
+        cfg, store, row_ok, Writer(), ApprovingReviewer(),
+        parallel_verify=True, reviewer_factory=_ok_factory, specialists=3,
+    )["status"] == "published"
+    good_rec = audit(store)
+    bad_rec = json.loads(json.dumps(good_rec))
+    bad_rec["reviews"][1]["specialists"][1]["request"] = bad_rec["reviews"][1]["specialists"][0]["request"]
+    with pytest.raises(AnalysisError) as dup_exc:
+        review_gate.validate_review_state(bad_rec, "approved", good_rec["candidate"], good_rec["prepared"], allow_cached=False)
+    assert dup_exc.value.code == "app.damaged_job"
+
+    # 4) A cached 1-verifier receipt is preserved in review_approvals but not reused for specialists=3.
+    import copy
+    from helpers import insert_approval
+    cfg2 = copy.deepcopy(cfg)
+    item_shared = item(id="https://example.org/spec3-cache-1", url="https://example.org/spec3-cache-1")
+    row_c1 = pending(store, item_shared)
+    prepared_c1 = review_gate._prepare(store, cfg2, row_c1, analysis(), DATE)
+    insert_approval(store, prepared_c1, policy=review.policy_hash(cfg2))
+    assert store.db.execute("SELECT COUNT(*) FROM review_approvals").fetchone()[0] == 1
+    res_defer_c3 = review_gate.process_item(
+        cfg2, store, queued_row(store, row_c1["id"]), Writer(), ApprovingReviewer(),
+        allow_network=False, parallel_verify=True, reviewer_factory=_ok_factory, specialists=3,
+    )
+    assert res_defer_c3["status"] == "deferred" and res_defer_c3["cache_hit"] is False
+    assert store.db.execute("SELECT COUNT(*) FROM review_approvals").fetchone()[0] == 1
+    res_c3 = review_gate.process_item(
+        cfg2, store, queued_row(store, row_c1["id"]), Writer(), ApprovingReviewer(),
+        parallel_verify=True, reviewer_factory=_ok_factory, specialists=3,
+    )
+    assert res_c3["status"] == "published" and res_c3["cache_hit"] is False and res_c3["review_calls"] >= 4
+
+    # 5) Resumed specialists=3 verify stage holds with specialist_budget when budget/reviewer cannot run all 3 lenses.
+    row_low = pending(store, item(id="https://example.org/spec3-low", url="https://example.org/spec3-low"))
+    assert review_gate.process_item(
+        cfg, store, row_low, Writer(), ApprovingReviewer(), allow_network=True,
+        parallel_verify=False, reviewer_factory=None, specialists=3,
+    )["status"] == "held"
+    low_job = job(store, row_low)
+    assert json.loads(low_job["record_json"])["hold_code"] == "specialist_budget"

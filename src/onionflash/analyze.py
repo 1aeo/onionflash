@@ -470,19 +470,33 @@ def _all_merge_sources(prior: dict) -> bool:
     return bool(sources) and all("/-/merge_requests/" in s.get("url", "") for s in sources)
 
 
+def _digest_mode(best_of: int, quote_digest: bool | None, *, default_quote_digest: bool = False) -> str:
+    """Return `'llm'`, `'deterministic'`, or `'none'` for effective thread digest selection."""
+    if quote_digest is True:
+        return "llm"
+    if quote_digest is False:
+        return "none"
+    if quote_digest is None:
+        if default_quote_digest:
+            return "llm"
+        return "deterministic" if best_of > 1 else "none"
+    raise ValueError("quote_digest must be a boolean or None")
+
+
 def cache_key(
     row: dict,
     llm: dict,
     prior: dict | None = None,
     *,
     best_of: int = 1,
-    quote_digest: bool = False,
+    quote_digest: bool | None = None,
 ) -> str:
     """Bind cached drafts to the active writer contract and update context."""
     if type(best_of) is not int or best_of < 1:
         raise ValueError("best_of must be a positive integer")
-    if type(quote_digest) is not bool:
+    if quote_digest is not None and type(quote_digest) is not bool:
         raise ValueError("quote_digest must be a boolean")
+    digest_mode = _digest_mode(best_of, quote_digest)
     prompt = SYSTEM_PROMPT if prior is None else UPDATE_PROMPT
     schema = SCHEMA if prior is None else UPDATE_SCHEMA
     effective = writer_settings(llm)
@@ -499,7 +513,9 @@ def cache_key(
         identity.extend([prior_context(prior), prior.get("category"), _all_merge_sources(prior), UPDATE_INPUT_VERSION])
     if best_of != 1:
         identity.extend(["best_of", best_of, SELECTOR_PROMPT, json.dumps(SELECTOR_SCHEMA, ensure_ascii=False, allow_nan=False)])
-    if quote_digest:
+    if digest_mode == "deterministic":
+        identity.extend(["quote_digest", "deterministic"])
+    elif digest_mode == "llm":
         identity.extend(["quote_digest", _comments.THREAD_DIGEST_PROMPT, json.dumps(_comments.THREAD_DIGEST_SCHEMA, ensure_ascii=False, allow_nan=False)])
     return digest(identity)
 
@@ -850,7 +866,12 @@ class Analyzer(CompletionClient):
         self, item: dict, notes: list[dict], *, is_update: bool, use_llm: bool
     ) -> dict | None:
         """Build a bounded, quote-verified digest for long or truncated comment threads."""
-        if is_update and len(notes) < 2 and sum(len(note["body"]) for note in notes) < 4500:
+        if (
+            is_update
+            and not item.get("comments_truncated")
+            and len(notes) < 2
+            and sum(len(note["body"]) for note in notes) < 4500
+        ):
             return None
         if not use_llm:
             return build_long_thread_digest(item, llm_call=None)
@@ -893,13 +914,14 @@ class Analyzer(CompletionClient):
             )
         except (CompletionDeferred, AnalysisError, FetchError):
             return 0
-        if not isinstance(reply, dict) or set(reply) - {"winner", "reason"}:
+        max_reason_len = SELECTOR_SCHEMA["properties"]["reason"].get("maxLength", 240)
+        if not isinstance(reply, dict) or set(reply) != {"winner", "reason"}:
             return 0
         winner = reply.get("winner")
         if type(winner) is not int or not (1 <= winner <= len(candidates)):
             return 0
         reason = reply.get("reason")
-        if reason is not None and not isinstance(reason, str):
+        if not isinstance(reason, str) or not (1 <= len(reason.strip()) <= max_reason_len):
             return 0
         return winner - 1
 
@@ -966,12 +988,9 @@ class Analyzer(CompletionClient):
         effective_best_of = self.best_of if best_of is None else best_of
         if type(effective_best_of) is not int or effective_best_of < 1:
             raise ValueError("best_of must be a positive integer")
-        if quote_digest is None:
-            effective_quote_digest = self.quote_digest
-        elif type(quote_digest) is bool:
-            effective_quote_digest = quote_digest
-        else:
+        if quote_digest is not None and type(quote_digest) is not bool:
             raise ValueError("quote_digest must be a boolean")
+        digest_mode = _digest_mode(effective_best_of, quote_digest, default_quote_digest=self.quote_digest)
         is_update = prior is not None
         if item["kind"] == "tag":
             return tag_update(item, prior) if is_update else tag_notice(item)
@@ -995,9 +1014,9 @@ class Analyzer(CompletionClient):
         source = {**item, "authority": bounded["authority"], "content": "\n".join([bounded["content"], *(note["body"] for note in notes)])}
         base_schema = UPDATE_SCHEMA if is_update else SCHEMA
         schema = _writer_schema(bounded, base_schema, prior=prior, quoted_list=quoted_list)
-        if effective_quote_digest or (effective_best_of > 1 and quote_digest is not False):
+        if digest_mode != "none":
             if (digest_block := self._build_thread_digest(
-                item, notes, is_update=is_update, use_llm=effective_quote_digest
+                item, notes, is_update=is_update, use_llm=(digest_mode == "llm")
             )) is not None:
                 bounded["thread_digest"] = digest_block
         payload = {**bounded, "prior_story": prior_context(prior)} if is_update else bounded
@@ -1141,7 +1160,11 @@ def _writer_schema(
             limits["confidence"] = ["confirmed"]
         if not (prior.get("state") == "merged" and _all_merge_sources(prior)):
             has_tag = bounded.get("kind") == "tag" or prior.get("state") == "tagged"
-            limits["state"] = [s for s in STATES if has_tag or s != "tagged"]
+            allow_released = "released" in limits["state"]
+            limits["state"] = [
+                s for s in STATES
+                if (has_tag or s != "tagged") and (allow_released or s != "released")
+            ]
             widen_release_state_for_update(limits, prior)
         if prior.get("category") == "release":
             release_states = [s for s in limits["state"] if s in {"released", "tagged"}]

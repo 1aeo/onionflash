@@ -335,18 +335,19 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
                                 _reviewer_factory, text, prepared, record, requests,
                                 on_verify=lambda: None, save_verify=lambda: None, specialists=specialists,
                             )
-                        elif (
-                            specialists > 1
-                            and stage == "verify"
-                            and not _pending_reask(record, stage, text, prepared)
-                            and requests.state["reserved"] + len(SPECIALISTS) <= requests.max_requests
-                        ):
-                            step = _parallel_specialist_verify(
-                                _reviewer_factory, text, prepared, record, requests, specialists=specialists,
-                            )
+                        elif specialists > 1 and stage == "verify":
+                            if (
+                                _pending_reask(record, stage, text, prepared)
+                                or requests.state["reserved"] + len(SPECIALISTS) > requests.max_requests
+                            ):
+                                step = ("hold", ("verification", "specialist_budget"))
+                            else:
+                                step = _parallel_specialist_verify(
+                                    _reviewer_factory, text, prepared, record, requests, specialists=specialists,
+                                )
                         else:
                             step = advance_review(reviewer, stage, text, prepared, record, requests)
-                        if step[0] not in {"verify", "repair", "tiebreak"}:
+                        if step[0] not in {"verify", "repair", "tiebreak", "review"}:
                             break
                         stage, text = step
                     action, value = step

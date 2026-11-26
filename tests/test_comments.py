@@ -1400,7 +1400,7 @@ def test_long_thread_digest_llm_verification_strips_ungrounded_quotes_and_falls_
     assert verified is not None
     assert [t["author"] for t in verified["timeline"]] == ["user1", "user8"]
     assert verified["anchors"] == [
-        {"quote": 'states "it\'s   LIMITED" to openssl 4.x builds.', "author": "user1", "url": f"{URL}#note_1"}
+        {"quote": "states “it’s limited” to OpenSSL 4.x builds.", "author": "user1", "url": f"{URL}#note_1"}
     ]
     assert verified["disagreements"] == ["@user3: Only affects OpenSSL 4.x builds."]
 
@@ -1426,3 +1426,55 @@ def test_long_thread_digest_llm_verification_strips_ungrounded_quotes_and_falls_
             any(normalize_evidence(a["quote"]) in normalize_evidence(n["body"]) for n in notes)
             for a in fallback["anchors"]
         )
+
+
+def test_long_thread_digest_excludes_quotes_and_binds_chronological_timeline():
+    """Exclude `>`-quoted spans from digest anchors/fallbacks and sort strictly verified timeline items chronologically."""
+    from onionflash.comments import build_long_thread_digest
+
+    quoted_only = make_note(
+        1,
+        "> Earlier outage persisted across relays.\n> Please investigate.",
+        author="alice",
+        created_at="2026-11-08T10:00:00Z",
+        url=URL,
+    )
+    reply_notes = [
+        quoted_only,
+        *[
+            make_note(
+                i,
+                f"> Quoted line {i}\nUnquoted finding {i} narrows the bug.",
+                author=f"dev{i}",
+                created_at=f"2026-11-08T10:{i:02d}:00Z",
+                url=URL,
+            )
+            for i in range(2, 9)
+        ],
+    ]
+    thread_item = _issue(public_comments=list(reversed(reply_notes)))
+    det = build_long_thread_digest(thread_item)
+    assert det is not None
+    assert all(entry["author"] != "alice" for entry in det["timeline"])
+
+    verified = build_long_thread_digest(
+        thread_item,
+        llm_call=lambda *_a: {
+            "timeline": [
+                {"author": "dev8", "created_at": "", "url": f"{URL}#note_8", "point": "Later finding."},
+                # Mismatched author vs URL must be dropped.
+                {"author": "dev2", "created_at": "", "url": f"{URL}#note_5", "point": "Conflicting attribution."},
+                {"author": "dev3", "created_at": "2026-11-08T10:03:00Z", "url": f"{URL}#note_3", "point": "Earlier finding."},
+            ],
+            "anchors": [
+                {"quote": "Earlier outage persisted across relays.", "author": "alice", "url": f"{URL}#note_1"},
+                {"quote": f"Unquoted finding 3 narrows the bug.", "author": "dev3", "url": f"{URL}#note_3"},
+            ],
+            "disagreements": [],
+        },
+    )
+    assert verified is not None
+    assert [e["author"] for e in verified["timeline"]] == ["dev3", "dev8"]
+    assert verified["anchors"] == [
+        {"quote": "Unquoted finding 3 narrows the bug.", "author": "dev3", "url": f"{URL}#note_3"}
+    ]

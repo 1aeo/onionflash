@@ -1159,7 +1159,11 @@ def is_housekeeping_item(item: dict) -> tuple[str, str] | None:
     ):
         return None
     full_text = _source_full_text(item)
-    if _HOUSEKEEPING_SECURITY_SIGNAL_RE.search(full_text) or _HOUSEKEEPING_RUNTIME_GUARD_RE.search(full_text):
+    if (
+        _HOUSEKEEPING_SECURITY_SIGNAL_RE.search(full_text)
+        or _HOUSEKEEPING_RUNTIME_GUARD_RE.search(full_text)
+        or (item_pt_family(item) is not None and _PT_HIGH_IMPACT_RE.search(full_text))
+    ):
         return None
     if is_dirauth_item(item) and _DIRAUTH_OPERATIONAL_TOPIC_RE.search(full_text) and not _DIRAUTH_CHORE_RE.search(full_text):
         return None

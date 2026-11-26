@@ -463,7 +463,11 @@ def test_editorial_skips_misses_coverage_verification_and_final_checks(evaluatio
         if c["expected"] == "approve"
         and (holds := final_holds(c["candidate"], {"packet": c["packet"], "payload": {"editorial_kind": c["packet"]["sources"][0]["kind"]}}))
     }
-    assert all(audit == "why-it-matters-1" and holds == ["untrusted_operator_claim"] for audit, holds in corpus_holds.values())
+    assert all(
+        (audit == "why-it-matters-1" and holds == ["untrusted_operator_claim"])
+        or (cid == "live-circuit-marking-corrected" and audit == "live-1" and holds == ["release_state"])
+        for cid, (audit, holds) in corpus_holds.items()
+    )
 
     bf = BY_ID["bugfix-is-not-security-fix"]
     rep = {**bf["candidate"], "title": "Browser update", "summary": "An Android bugfix was released."}
@@ -1161,3 +1165,76 @@ def test_corpus_hygiene_helpers_reject_credentials_redact_private_text_and_scope
     case_candidate_only = copy.deepcopy(case_with_prior)
     case_candidate_only["existing_coverage"]["prior_story"]["summary"] = "Earlier text with no number."
     assert _unexplained_case_numbers(case_candidate_only) == []
+
+
+def test_evaluate_review_specialists_initial_reask_and_low_budget_hold(evaluation, tmp_path, monkeypatch):
+    """Continue when initial parallel review returns `'review'` reask and hold fail-closed when specialist verify lacks budget."""
+    import threading
+    from onionflash import review as review_mod, review_gate as gate_mod
+
+    module, config = evaluation
+    clean_case = copy.deepcopy(BY_ID["bastet-corrected"])
+
+    # 1) Initial review throws InconsistentReview (without repair) -> returns ('review', cand) -> loop continues cleanly.
+    lock = threading.Lock()
+    calls = []
+
+    class _InitialReaskReviewer(_ClientBase):
+        """Raise InconsistentReview on first initial review, then approve on validation reask and specialists."""
+
+        last_decoded = None
+
+        def __init__(self, *args, **kwargs):
+            """Accept standard evaluation reviewer initialization args."""
+            pass
+
+        def review(self, cand, packet, *, coverage=None, verification=False, issue=None, update=False,
+                   specialist=None, validation_error=None, on_request=None):
+            """Handle initial reask and specialist verification calls."""
+            if on_request:
+                on_request(1)
+            with lock:
+                calls.append((verification, specialist, validation_error))
+            if not verification and validation_error is None:
+                raise review_mod.InconsistentReview()
+            if validation_error is not None and on_request and hasattr(on_request, "response_received"):
+                on_request.response_received()
+            return verdict("approve", update=update)
+
+    monkeypatch.setattr(module, "EvaluationReviewer", _InitialReaskReviewer)
+    res_reask = module.evaluate(config, [clean_case], tmp_path / "reask.jsonl", specialists=3)
+    assert res_reask["errors"] == 0 and res_reask["matched"] == 1
+    assert any(err == review_mod.INCONSISTENT_VERDICT for _, _, err in calls)
+
+    # 2) If stage=='verify' in specialist mode cannot fit all specialists within MAX_SPECIALIST_REVIEW_REQUESTS, hold fail-closed.
+    class _LoopingRepairReviewer(_ClientBase):
+        """Force one verify repair so the next verify wave lacks specialist budget."""
+
+        last_decoded = None
+
+        def __init__(self, *args, **kwargs):
+            """Accept standard evaluation reviewer initialization args."""
+            pass
+
+        def review(self, cand, packet, *, coverage=None, verification=False, issue=None, update=False,
+                   specialist=None, validation_error=None, on_request=None):
+            """Return majority verify revision on first wave so follow-up wave hits specialist budget cap."""
+            if on_request:
+                on_request(1)
+            if not verification:
+                return verdict("approve", update=update)
+            if specialist in {"grounding_status", "attribution_scope_advice"}:
+                return verdict(
+                    "revise",
+                    criterion="scope_timing",
+                    reason="Refine summary detail.",
+                    repair={"why_it_matters": "Operator note revision."},
+                )
+            return verdict("approve", update=update)
+
+    monkeypatch.setattr(gate_mod, "MAX_SPECIALIST_REVIEW_REQUESTS", 6)
+    monkeypatch.setattr(module, "MAX_SPECIALIST_REVIEW_REQUESTS", 6, raising=False)
+    monkeypatch.setattr(module, "EvaluationReviewer", _LoopingRepairReviewer)
+    res_low = module.evaluate(config, [clean_case], tmp_path / "low_budget.jsonl", specialists=3)
+    assert res_low["errors"] == 0 and res_low["matched"] == 0
+    assert res_low["holds"].get("held.verification.specialist_budget") == 1

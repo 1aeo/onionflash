@@ -361,7 +361,7 @@ def test_cli_counts_current_review_limit_rejection_once(llm_context, monkeypatch
     row = pending(store)
     _exhaust_budget(cfg, store, row)
     checker = wire_reviewer(cfg, verdict())
-    patch_cli_pipeline(monkeypatch, now=LATER, reviewer=lambda *_args, **_kwargs: checker, build=lambda *_args: {})
+    patch_cli_pipeline(monkeypatch, now=LATER, analyzer=Writer.factory(), reviewer=lambda *_args, **_kwargs: checker, build=lambda *_args: {})
     report = cli.run(cfg, store)
     assert checker.calls == 0
     assert report["analysis_failed"] == 1 and report["review_stale"] == 0

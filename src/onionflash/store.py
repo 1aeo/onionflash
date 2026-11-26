@@ -1152,7 +1152,10 @@ class Store:
         story_id: str,
         updated_payload: dict,
         update_count: int,
+        refreshed_hash: str,
         observed: str,
+        *,
+        base_prose: dict,
     ) -> dict:
         """Atomically update refreshed prose fields while preserving dates, sources, updates, and labels."""
         with immediate_transaction(self.db, "Story refresh commit requires a fresh transaction"):
@@ -1183,8 +1186,14 @@ class Store:
                 not isinstance(current_updates, list)
                 or len(current_updates) < MIN_REFRESH_UPDATES
                 or len(current_updates) != update_count
+                or story_refresh_hash(current_payload) != refreshed_hash
+                or any(
+                    (current_payload.get(field) if isinstance(current_payload.get(field), str) else "")
+                    != (base_prose.get(field) if isinstance(base_prose.get(field), str) else "")
+                    for field in ("title", "summary", "why_it_matters")
+                )
             ):
-                raise candidate.StaleCandidate("Story updates changed before refresh committed")
+                raise candidate.StaleCandidate("Story changed before refresh committed")
             merged = copy.deepcopy(current_payload)
             if isinstance(updated_payload.get("title"), str) and updated_payload["title"].strip():
                 merged["title"] = updated_payload["title"]

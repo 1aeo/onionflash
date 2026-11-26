@@ -488,7 +488,7 @@ SPECIALIST_PROMPTS = {
     "grounding_status": """
 SPECIALIST VERIFICATION FOCUS (grounding_status — validate all 9 criteria; focus on source_support, status, uncertainty_attribution, technical_details):
 - Verify every factual claim, precondition, opt-in/experimental requirement, and maintainer narrowing or disagreement across title, summary, why_it_matters (or updates[-1].text in latest_update mode): FAIL uncertainty_attribution or source_support when a reporter's claim or disputed defect is stated as unqualified settled fact without attribution ("The report claims...") or drops material preconditions (e.g. non-default config or experimental feature) or turns a built-in software list into operators' "intended configuration".
-- Verify status, confidence, category, and tags against packet.sources: a gitlab_issue (even closed and mentioning a release version in comments) NEVER supports confidence="confirmed", state="released", category="release", or tag "release"; a gitlab_mr alone NEVER supports state="released" or category="release". Also fail status or uncertainty_attribution if an unconfirmed user comment is treated as confirming resolution or completed action.
+- Verify status, confidence, category, and tags against packet.sources: a gitlab_issue (even closed and mentioning a release version in comments) NEVER supports introducing confidence="confirmed", state="released", category="release", or tag "release" (though in latest_update mode prior_story's already-confirmed or already-released labels may be retained unchanged); a gitlab_mr alone NEVER supports introducing state="released" or category="release". Also fail status or uncertainty_attribution if an unconfirmed user comment is treated as confirming resolution or completed action.
 - Verify technical_details and completeness: fail source_support/technical_details on ALL-CAPS shouting, nonexistent 3-part C-Tor version typos (e.g. 0.4.17), or an incomplete why_it_matters fragment lacking terminal sentence punctuation (e.g. trailing "<= 0.4.8.x", trailing comma, or unpunctuated heading/chat).
 - Do NOT false-alarm on brief/plain supported summaries, empty why_it_matters (""), or faithful attributed impacts that preserve qualifiers and end cleanly.
 """,
@@ -971,6 +971,7 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
         ("compromise_headline", compromise_headline),
         ("confirmed_source", not is_alert and candidate["confidence"] not in limits["confidence"]),
         ("merge_state", not is_alert and limits["state"] == ["merged"] and candidate["state"] != "merged"),
+        ("release_state", not is_alert and limits["state"] != ["merged"] and candidate["state"] == "released" and "released" not in limits["state"]),
         ("shouting_caps", not is_alert and any(has_shouting_caps(text) for text in texts)),
         ("malformed_version", not is_alert and any(has_malformed_tor_version(text, products) for text in texts)),
         ("untrusted_operator_claim", not is_alert and untrusted_claim),
@@ -1290,7 +1291,35 @@ def merge_specialist_verdicts(
     failed_editorial = [c for c in EDITORIAL_CRITERIA if criteria_out[c]["outcome"] != "pass"]
 
     if not failed_factual and not failed_editorial:
-        if not criteria_out["source_support"]["source_refs"]:
+        approvers = sum(1 for _, res in pairs if res["verdict"] == "approve")
+        if approvers < maj:
+            non_approving_fails = [
+                crit
+                for _, res in pairs
+                if res["verdict"] != "approve"
+                for crit in CRITERIA
+                if res["criteria"][crit]["outcome"] != "pass"
+            ]
+            crit = non_approving_fails[0] if non_approving_fails else "source_support"
+            chosen_non = next(
+                (
+                    res["criteria"][crit]
+                    for _, res in pairs
+                    if res["verdict"] != "approve" and res["criteria"][crit]["outcome"] != "pass"
+                ),
+                None,
+            )
+            criteria_out[crit] = (
+                dict(chosen_non)
+                if chosen_non is not None
+                else {
+                    **criteria_out[crit],
+                    "outcome": "insufficient",
+                    "reason": "Fewer than two specialists approved the candidate.",
+                }
+            )
+            merged = {"criteria": criteria_out, "verdict": "hold", "same_story": None, "repair": None}
+        elif not criteria_out["source_support"]["source_refs"]:
             criteria_out["source_support"] = {
                 **criteria_out["source_support"],
                 "outcome": "insufficient",
@@ -1301,17 +1330,6 @@ def merge_specialist_verdicts(
             merged = {"criteria": criteria_out, "verdict": "approve", "same_story": agreed_same_story, "repair": None}
     elif not unrelated_holds and any(criteria_out[c]["outcome"] == "fail" for c in EDITORIAL_CRITERIA):
         same_story = agreed_same_story
-        if (
-            not update
-            and prior_id is None
-            and same_story is None
-            and criteria_out["news_value"]["outcome"] == "pass"
-            and criteria_out["new_information"]["outcome"] == "fail"
-        ):
-            reason = criteria_out["new_information"]["reason"]
-            named_live = [rid for rid in recent_ids if rid in reason]
-            if len(named_live) == 1 and not any(rid in reason for rid in retracted_ids):
-                same_story = named_live[0]
         if _skip_stands(criteria_out, coverage, same_story, update=update):
             merged = {"criteria": criteria_out, "verdict": "skip", "same_story": same_story, "repair": None}
         else:

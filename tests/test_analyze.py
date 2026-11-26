@@ -1764,9 +1764,14 @@ def test_best_of_three_parallel_drafting_selector_and_polish(monkeypatch):
     """Draft 3 candidates concurrently on isolated clients, select winner, and apply polish."""
     from onionflash import llm as llm_mod
 
-    assert analyze.PROMPT_VERSION == "onionflash-24"
     cfg = copy.deepcopy(DEFAULTS)
     cfg["llm"].update(base_url="https://llm.example/v1", api_key_env="BEST_OF_TEST_KEY")
+    monkeypatch.setenv("BEST_OF_TEST_KEY", "synthetic-fixture-value")
+    probe_row = {"content_hash": "b" * 64}
+    k_before = analyze.cache_key(probe_row, cfg["llm"], best_of=3, quote_digest=True)
+    monkeypatch.setattr(analyze, "PROMPT_VERSION", analyze.PROMPT_VERSION + "-next")
+    assert analyze.cache_key(probe_row, cfg["llm"], best_of=3, quote_digest=True) != k_before
+    monkeypatch.undo()
     monkeypatch.setenv("BEST_OF_TEST_KEY", "synthetic-fixture-value")
 
     src = item(
@@ -2074,6 +2079,7 @@ def test_best_of_three_clears_tracking_reasoning_profile_and_deadline_guards(mon
 
     # Deadline expiring after 3 drafts skips selector call and returns candidate 1 cleanly.
     seen_drafts = []
+    drafts_lock = threading.Lock()
     cfg_r = copy.deepcopy(cfg)
     cfg_r["llm"].update(writer_reasoning=True, send_chat_template_kwargs=True)
 
@@ -2083,7 +2089,7 @@ def test_best_of_three_clears_tracking_reasoning_profile_and_deadline_guards(mon
         assert name == "onionflash_news"
         assert body["chat_template_kwargs"] == {"enable_thinking": True}
         assert body["max_tokens"] == 32768
-        with w_r._state_lock:
+        with drafts_lock:
             seen_drafts.append(body["temperature"])
             if len(seen_drafts) == 3:
                 clock_now[0] = 200.0
@@ -2102,3 +2108,52 @@ def test_best_of_three_clears_tracking_reasoning_profile_and_deadline_guards(mon
         res_r = w_r.analyze(src)
         assert res_r["title"] == clean_draft["title"]
         assert w_r.calls == 3  # Selector skipped because clock crossed deadline after the 3 drafts.
+
+
+def test_cache_key_digest_modes_update_truncation_selector_bounds_and_issue_release_schema():
+    """Verify digest mode cache parity, truncated 1-note update digests, strict selector bounds, and issue release limits."""
+    row = {"content_hash": "c" * 64}
+    k_none = analyze.cache_key(row, DEFAULTS["llm"], best_of=3, quote_digest=False)
+    k_det = analyze.cache_key(row, DEFAULTS["llm"], best_of=3)
+    k_llm = analyze.cache_key(row, DEFAULTS["llm"], best_of=3, quote_digest=True)
+    assert len({k_none, k_det, k_llm}) == 3
+
+    prior_dev = {
+        "id": "a" * 24,
+        "title": "Relay issue under investigation",
+        "summary": "Initial report.",
+        "why_it_matters": "",
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": ["tor"],
+        "tags": ["security"],
+        "updated_at": DATE,
+        "sources": [{"url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/1", "title": "Issue 1"}],
+        "updates": [],
+    }
+    upd_item = item(
+        url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/1",
+        title="Truncated follow-up note",
+        content="Issue description.",
+        public_comments=[make_note(1, "Maintainers narrowed the reproducer to OpenSSL 4.x builds.")],
+        comments_truncated=True,
+    )
+    upd_draft = update_analysis()
+    w = Analyzer(DEFAULTS, best_of=1)
+    assert w._build_thread_digest(upd_item, upd_item["public_comments"], is_update=True, use_llm=False) is not None
+
+    sel_writer = Analyzer(DEFAULTS, best_of=3)
+    cands = [upd_draft, {**upd_draft, "update": "Alternative valid sentence."}]
+    sel_writer.client = FakeLLM({"winner": 2})
+    assert sel_writer._select_winner(cands, {"title": "T"}, prior_dev, is_update=True) == 0
+    sel_writer.client = FakeLLM({"winner": 2, "reason": "   "})
+    assert sel_writer._select_winner(cands, {"title": "T"}, prior_dev, is_update=True) == 0
+    sel_writer.client = FakeLLM({"winner": 2, "reason": "x" * 241})
+    assert sel_writer._select_winner(cands, {"title": "T"}, prior_dev, is_update=True) == 0
+
+    schema_dev = analyze._writer_schema({"title": "T", "content": "Issue body.", "kind": "gitlab_issue"}, analyze.UPDATE_SCHEMA, prior=prior_dev)
+    assert "released" not in schema_dev["properties"]["state"]["enum"]
+    schema_rel = analyze._writer_schema({"title": "T", "content": "Issue body.", "kind": "gitlab_issue"}, analyze.UPDATE_SCHEMA, prior={**prior_dev, "state": "released"})
+    assert "released" in schema_rel["properties"]["state"]["enum"]

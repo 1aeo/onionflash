@@ -320,16 +320,19 @@ _TRAILING_VERSION_FRAGMENT_RE = re.compile(
     r"(?:(?<![A-Za-z0-9.])0\.\d+(?:\.\d+)?\.|\bv?\d+\.\d+(?:\.\d+)*\.[A-Za-z]|[<>]=?\s*v?\d+(?:\.\d+)*(?:\.[A-Za-z0-9]+)?\.?)$"
 )
 _TRAILING_INCOMPLETE_WORD_RE = re.compile(
-    r"\b(?:and|or|but|for|with|to|of|from|that|which|because|since|while|when|if|the|a|an)\s*[.!]?$",
-    re.IGNORECASE,
+    r"(?:\b(?i:and|or|but|for|with|to|of|from|that|which|because|since|while|when|if|the)\b|\b(?:a|an)\b)\s*[.!]?$"
+)
+_CONCRETE_QUALIFIER_AHEAD = (
+    r"(?!(?:\s+(?:by|when|against|from|because|after|during|where|under)\b"
+    r"|\s+of\s+(?!the\s+(?:tor\s+)?network\b)\w+))"
 )
 _GENERIC_FILLER_RE = re.compile(
     r"(?:"
-    r"\b(?:helps?\s+)?protect(?:s|ing)?\s+users?['’]?\s+privacy\b"
-    r"|\b(?:helps?\s+)?improv(?:e|es|ing)\s+(?:overall\s+)?(?:security|privacy|reliability)(?:\s*(?:,|and|or|/)\s*(?:security|privacy|reliability|stability))*"
-    r"|\b(?:helps?\s+)?enhanc(?:e|es|ing)\s+(?:overall\s+)?(?:security|privacy|reliability)(?:\s*(?:,|and|or|/)\s*(?:security|privacy|reliability|stability))*"
-    r"|\bmaintain\s+privacy\s+and\s+security\b"
-    r"|\bmaintain\s+network\s+stability\s+and\s+prevent\s+widespread\s+service\s+disruption\b"
+    r"\b(?:helps?\s+)?protect(?:s|ing)?\s+users?['’]?\s+privacy\b" + _CONCRETE_QUALIFIER_AHEAD
+    + r"|\b(?:helps?\s+)?improv(?:e|es|ing)\s+(?:overall\s+)?(?:security|privacy|reliability)(?:\s*(?:,|and|or|/)\s*(?:security|privacy|reliability|stability))*" + _CONCRETE_QUALIFIER_AHEAD
+    + r"|\b(?:helps?\s+)?enhanc(?:e|es|ing)\s+(?:overall\s+)?(?:security|privacy|reliability)(?:\s*(?:,|and|or|/)\s*(?:security|privacy|reliability|stability))*" + _CONCRETE_QUALIFIER_AHEAD
+    + r"|\bmaintain\s+privacy\s+and\s+security\b" + _CONCRETE_QUALIFIER_AHEAD
+    + r"|\bmaintain\s+network\s+stability\s+and\s+prevent\s+widespread\s+service\s+disruption\b"
     r"|\bupdated\s+security\s+components\s+and\s+bug\s+fixes\b"
     r"|\bscope\s+and\s+consequences\s+remain\s+subject\s+to\b"
     r")",
@@ -363,16 +366,22 @@ def is_incomplete_or_filler_impact(text: str) -> str | None:
 def _source_item_unquoted_text(source: dict) -> str:
     url = str(source.get("url") or "")
     parts = [source["title"]] if isinstance(source.get("title"), str) and source["title"] else []
-    body = next((source[k] for k in ("source_content", "content", "unquoted_content") if isinstance(source.get(k), str)), "")
-    if not body and isinstance(source.get("passages"), list):
+    body_key = next((k for k in ("source_content", "content", "unquoted_content") if isinstance(source.get(k), str)), None)
+    body = source[body_key] if body_key is not None else ""
+    passages = source.get("passages") if isinstance(source.get("passages"), list) else ()
+    if not body and passages:
         p_texts = []
-        for p in source["passages"]:
+        for p in passages:
             txt = p if isinstance(p, str) else (p.get("text") if isinstance(p, dict) else "")
             if isinstance(txt, str) and txt:
                 p_texts.append(txt)
         body = "\n".join(p_texts)
     if body:
         parts.append(unquoted_mail_text(body) if is_quoted_list_post(url, body) else body)
+    if body_key == "unquoted_content" and passages:
+        for p in passages:
+            if isinstance(p, dict) and p.get("author") and isinstance(p.get("text"), str) and p["text"]:
+                parts.append(p["text"])
     for note in (source.get("public_comments") if isinstance(source.get("public_comments"), list) else ()):
         if isinstance(note, dict) and isinstance(note.get("body"), str) and note["body"]:
             parts.append(note["body"])
@@ -405,7 +414,7 @@ _DIRECTIVE_TARGET_RE = re.compile(
     r"(?:asked|required|told|advised|instructed|encouraged|recommended)\s+to"
     r"|(?:announcement|post|report|issue|notice|maintainers?|developers?)\s+"
     r"(?:asks?|ask|encourages?|recommends?|advises?|instructs?|requires?)\s+"
-    r"(?:[\w-]+\s+){0,5}?(?:to\s+)?(?:upgrad|updat|switch|install|configur|edit|replac|enabl|disabl|remov|treat|handl|apply|us(?:e|ing))"
+    r"(?:[\w-]+\s+){0,5}?(?:to\s+)?(?:upgrad\w*|updat\w*|switch\w*|install\w*|configur\w*|edit\w*|replac\w*|enabl\w*|disabl\w*|remov\w*|treat\w*|handl\w*|apply|us(?:e|ing))"
     r"|(?:users?|operators?|maintainers?|admins?|developers?|relays?|clients?)\s+"
     r"(?:should|must|need\s+to)\s+(?:(?:\w+\s+){0,2})?"
     r"(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|handle|treat|apply)"
@@ -414,7 +423,9 @@ _DIRECTIVE_TARGET_RE = re.compile(
     re.IGNORECASE,
 )
 _SRC_DIRECTIVE_CUE_RE = re.compile(
-    r"\b(?:"
+    r"(?:"
+    r"(?:^|[.!?\n]\s*)(?:please\s+)?(?:upgrade|update|switch|install|configure|enable|disable|remove)(?:\s+(?:to|your|the|now|as|immediately|away|over|it|them|this|that)\b)"
+    r"|\b(?:"
     r"asks?|asked|asking"
     r"|please\s+(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|apply)"
     r"|encourag(?:e|es|ed|ing)"
@@ -424,7 +435,8 @@ _SRC_DIRECTIVE_CUE_RE = re.compile(
     r"|requir(?:e|es|ed|ing)\s+(?:[\w-]+\s+){0,3}(?:users?|operators?|relays?|them|you|all)\s+to"
     r"|must\s+(?!-\s*fix)(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|handle|apply)"
     r"|should\s+(?!be\s+(?:affected|able\s+to)\b)(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|handle|apply)"
-    r")\b",
+    r")\b"
+    r")",
     re.IGNORECASE,
 )
 _ACTION_IN_TEXT_RE = re.compile(
@@ -440,6 +452,48 @@ _SRC_ACTION_WORDS_RE = re.compile(
 )
 
 
+_DIRECTIVE_CUE_PREFIX = (
+    r"(?:please|ask(?:s|ed|ing)?|encourag\w*|recommend\w*|advis\w*|instruct\w*|"
+    r"should(?:\s+also)?(?!\s+be\s+(?:affected|able\s+to)\b)|must(?!-\s*fix))"
+)
+_EXPLICIT_IMPERATIVE_CUE_PREFIX = (
+    r"(?:please|ask(?:s|ed|ing)?|encourag\w*|instruct\w*|"
+    r"should(?:\s+also)?(?!\s+be\s+(?:affected|able\s+to)\b)|must(?!-\s*fix))"
+)
+
+
+def _has_near_imperative_cue(src: str, stem: str, cue_prefix: str) -> bool:
+    cue_near = re.compile(
+        r"(?:\b" + cue_prefix + r"\b[^.!?\n]{0,60}\b" + stem + r"(?!\s+checks?\b)"
+        r"|(?:^|[.!?\n]\s*)(?:please\s+)?" + stem + r"\w*\s+(?:to|your|the|now|as|immediately|away|over|it|them|this|that)\b)",
+        re.IGNORECASE,
+    )
+    return bool(cue_near.search(src))
+
+
+def _directive_actions_supported(
+    text: str,
+    src: str,
+    *,
+    require_all_near: bool = False,
+    cue_prefix: str = _DIRECTIVE_CUE_PREFIX,
+) -> bool:
+    if not _SRC_DIRECTIVE_CUE_RE.search(src):
+        return False
+    src_actions = [word.lower() for word in _SRC_ACTION_WORDS_RE.findall(src)]
+    matched_action = False
+    for action_match in _ACTION_IN_TEXT_RE.finditer(text):
+        matched_action = True
+        action = action_match.group(1).lower()
+        stem = action[:5]
+        if not any(word.startswith(stem) for word in src_actions):
+            return False
+        if require_all_near or action in {"update", "updating", "upgrade", "upgrading", "switch", "switching"}:
+            if not _has_near_imperative_cue(src, stem, cue_prefix):
+                return False
+    return matched_action or not require_all_near
+
+
 def has_unattributed_advice(text: str, packet_or_item: dict) -> bool:
     """Return whether `text` invents operator/user directives or configuration claims absent from unquoted source text."""
     if not isinstance(text, str) or not text.strip():
@@ -447,26 +501,20 @@ def has_unattributed_advice(text: str, packet_or_item: dict) -> bool:
     src = _unquoted_source_text(packet_or_item)
     if _INTENDED_CONFIG_RE.search(text) and not _SRC_CONFIG_RE.search(src):
         return True
-    if any(claim_re.search(text) and not src_re.search(src) for claim_re, src_re in _LEXICAL_ADVICE_CHECKS):
+    has_directive = bool(_DIRECTIVE_TARGET_RE.search(text))
+    if has_directive and not _directive_actions_supported(text, src):
         return True
-    if _DIRECTIVE_TARGET_RE.search(text):
-        if not _SRC_DIRECTIVE_CUE_RE.search(src):
+    if any(claim_re.search(text) and not src_re.search(src) for claim_re, src_re in _LEXICAL_ADVICE_CHECKS):
+        if not (
+            has_directive
+            and _directive_actions_supported(
+                text,
+                src,
+                require_all_near=True,
+                cue_prefix=_EXPLICIT_IMPERATIVE_CUE_PREFIX,
+            )
+        ):
             return True
-        src_actions = [word.lower() for word in _SRC_ACTION_WORDS_RE.findall(src)]
-        for action_match in _ACTION_IN_TEXT_RE.finditer(text):
-            action = action_match.group(1).lower()
-            stem = action[:5]
-            if not any(word.startswith(stem) for word in src_actions):
-                return True
-            if action in {"update", "updating", "upgrade", "upgrading", "switch", "switching"}:
-                cue_near = re.compile(
-                    r"\b(?:please|ask(?:s|ed|ing)?|encourag\w*|recommend\w*|advis\w*|"
-                    r"should(?:\s+also)?(?!\s+be\s+(?:affected|able\s+to)\b)|must(?!-\s*fix))"
-                    r"\b[^.!?\n]{0,60}\b" + stem + r"(?!\s+checks?\b)",
-                    re.IGNORECASE,
-                )
-                if not cue_near.search(src):
-                    return True
     return False
 
 

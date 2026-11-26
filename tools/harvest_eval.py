@@ -49,11 +49,16 @@ _ALLOWED_ITEM_PAYLOAD_KEYS = (
 _FALLBACK_DATE = "2026-11-10T12:00:00Z"
 
 
+_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
 def sanitize_text(value: object) -> str:
-    """Redact credential-like patterns and strip control characters from text."""
+    """Redact credential-like patterns and strip control characters or lone surrogates from text."""
     if not isinstance(value, str):
         return ""
-    cleaned = plain_text(value, max(len(value), 1), html=False) if any(ord(c) < 32 and c not in "\n\t" for c in value) else value
+    cleaned = _SURROGATE_RE.sub("\ufffd", value)
+    if any(ord(c) < 32 and c not in "\n\t" for c in cleaned):
+        cleaned = plain_text(cleaned, max(len(cleaned), 1), html=False)
     for pat in _SECRET_PATTERNS:
         if pat.groups >= 2:
             cleaned = pat.sub(r"\1[redacted]", cleaned)
@@ -72,18 +77,26 @@ def _sanitize_obj(obj):
     return obj
 
 
+def _safe_sanitized_url(value: object) -> str:
+    """Redact credential patterns before normalizing `value` as a safe canonical URL."""
+    if not isinstance(value, str) or not value:
+        return ""
+    return safe_canonical_url(sanitize_text(value))
+
+
 def _sanitize_item_payload(payload: dict) -> dict:
     clean = {k: _sanitize_obj(payload[k]) for k in _ALLOWED_ITEM_PAYLOAD_KEYS if k in payload}
     if "url" in clean and isinstance(clean["url"], str):
-        clean["url"] = safe_canonical_url(clean["url"]) or clean["url"]
+        clean["url"] = _safe_sanitized_url(clean["url"]) or clean["url"]
     return clean
 
 
 def _sanitize_item_row(row: sqlite3.Row, payload_obj: dict, *, story_id_override: str | None = None) -> dict:
     clean_payload = _sanitize_item_payload(payload_obj)
+    clean_url = sanitize_text(row["url"])
     return {
         "id": row["id"],
-        "url": safe_canonical_url(row["url"]) or row["url"],
+        "url": safe_canonical_url(clean_url) or clean_url,
         "source_id": row["source_id"],
         "payload": json.dumps(clean_payload, ensure_ascii=False, allow_nan=False),
         "content_hash": row["content_hash"],
@@ -122,7 +135,7 @@ def _safe_blob_json(blob) -> dict | None:
 
 
 def _packet_from_item(item_obj: dict) -> dict | None:
-    url = safe_canonical_url(item_obj.get("url"))
+    url = _safe_sanitized_url(item_obj.get("url"))
     title = sanitize_text(item_obj.get("title") or "")
     if not url or not title:
         return None
@@ -139,7 +152,7 @@ def _packet_from_item(item_obj: dict) -> dict | None:
                 passages.append({
                     "author": sanitize_text(note.get("author") or "unknown"),
                     "created_at": str(note.get("created_at") or item_obj.get("updated_at") or _FALLBACK_DATE),
-                    "url": safe_canonical_url(note.get("url")) or str(note.get("url") or url),
+                    "url": _safe_sanitized_url(note.get("url")) or sanitize_text(str(note.get("url") or url)),
                     "text": chunk,
                 })
     body_text = sanitize_text(body or title)
@@ -173,7 +186,7 @@ def _packet_to_eval_format(packet: dict) -> dict | None:
         return None
     eval_sources: list[dict] = []
     for src in packet["sources"]:
-        url = safe_canonical_url(src.get("url"))
+        url = _safe_sanitized_url(src.get("url"))
         title = sanitize_text(src.get("title") or "")
         if not url or not title:
             continue
@@ -196,7 +209,7 @@ def _packet_to_eval_format(packet: dict) -> dict | None:
                 if "author" in p:
                     entry["author"] = sanitize_text(p.get("author") or "unknown")
                     entry["created_at"] = str(p.get("created_at") or src.get("updated_at") or _FALLBACK_DATE)
-                    entry["url"] = safe_canonical_url(p.get("url")) or url
+                    entry["url"] = _safe_sanitized_url(p.get("url")) or url
                 passages.append(entry)
         if not passages:
             passages.append({"text": title})
@@ -426,16 +439,19 @@ def harvest_database(
             nonlocal total_harvested
             if not _can_add(bucket) or entry_id in seen_case_ids:
                 return False
-            packets[packet_id] = packet
+            resolved_packet_id = packet_id
+            if resolved_packet_id in packets and packets[resolved_packet_id] != packet:
+                resolved_packet_id = f"{packet_id}:{digest(packet)[:12]}"
+            packets[resolved_packet_id] = packet
             case_entry = {
                 "id": entry_id,
-                "packet": packet_id,
+                "packet": resolved_packet_id,
                 "scope": scope,
                 "candidate": candidate_obj,
                 "expected": expected,
             }
             if coverage is not None:
-                cov_id = f"cov:{packet_id}"
+                cov_id = f"cov:{resolved_packet_id}"
                 coverage_sets[cov_id] = coverage
                 case_entry["coverage_set"] = cov_id
             cases.append(case_entry)
@@ -445,7 +461,7 @@ def harvest_database(
                 "id": entry_id,
                 "bucket": bucket,
                 "subgroup": subgroup,
-                "packet": packet_id,
+                "packet": resolved_packet_id,
                 "scope": scope,
                 "expected": expected,
                 **({"item_id": item_row_obj["id"]} if item_row_obj is not None else {}),
@@ -461,7 +477,7 @@ def harvest_database(
                     "group": bucket,
                     "subgroup": subgroup,
                     "item_id": item_row_obj["id"],
-                    "packet_id": packet_id,
+                    "packet_id": resolved_packet_id,
                     "target_story_id": target_story_id,
                     "exclude_story_ids": list(exclude_story_ids or ()),
                     "item_row": _sanitize_item_row(item_row_obj, item_payload_obj, story_id_override=replay_story_id),
@@ -471,13 +487,13 @@ def harvest_database(
             return True
 
         # 1. Held review_jobs
-        if _table_exists(conn, "review_jobs") and _table_exists(conn, "items"):
-            held_rows = conn.execute(
+        if _can_add("held_review_jobs") and _table_exists(conn, "review_jobs") and _table_exists(conn, "items"):
+            held_cursor = conn.execute(
                 "SELECT item_id, stage, CAST(draft_json AS BLOB) AS draft_blob, "
                 "CAST(envelope_json AS BLOB) AS env_blob, CAST(record_json AS BLOB) AS rec_blob "
                 "FROM review_jobs WHERE stage='held' ORDER BY updated_at DESC, item_id"
-            ).fetchall()
-            for hrow in held_rows:
+            )
+            for hrow in held_cursor:
                 if not _can_add("held_review_jobs"):
                     break
                 irow, ipayload = _load_item_row_and_payload(conn, hrow["item_id"])
@@ -514,12 +530,12 @@ def harvest_database(
                 )
 
         # 2. Rejection actions
-        if _table_exists(conn, "rejection_actions") and _table_exists(conn, "items"):
-            ra_rows = conn.execute(
+        if _can_add("rejection_actions") and _table_exists(conn, "rejection_actions") and _table_exists(conn, "items"):
+            ra_cursor = conn.execute(
                 "SELECT action_id, item_id, action, before_status FROM rejection_actions ORDER BY action_id DESC"
-            ).fetchall()
+            )
             seen_ra_items: set[str] = set()
-            for rrow in ra_rows:
+            for rrow in ra_cursor:
                 if not _can_add("rejection_actions"):
                     break
                 if rrow["item_id"] in seen_ra_items:
@@ -549,14 +565,14 @@ def harvest_database(
                 )
 
         # 3. Editorial revisions
-        if _table_exists(conn, "editorial_revisions") and _table_exists(conn, "stories"):
-            ed_rows = conn.execute(
+        if _can_add("editorial_revisions") and _table_exists(conn, "editorial_revisions") and _table_exists(conn, "stories"):
+            ed_cursor = conn.execute(
                 "SELECT story_id, revision, action, CAST(before_public_json AS BLOB) AS before_blob, "
                 "CAST(after_public_json AS BLOB) AS after_blob "
                 "FROM editorial_revisions ORDER BY created_at DESC, story_id, revision DESC"
-            ).fetchall()
+            )
             seen_ed_stories: set[str] = set()
-            for erow in ed_rows:
+            for erow in ed_cursor:
                 if not _can_add("editorial_revisions"):
                     break
                 sid = erow["story_id"]
@@ -595,13 +611,13 @@ def harvest_database(
                 )
 
         # 4. High-comment items (>= 8 comments)
-        if _table_exists(conn, "items"):
-            item_rows = conn.execute(
+        if _can_add("high_comment_items") and _table_exists(conn, "items"):
+            item_cursor = conn.execute(
                 "SELECT id,url,source_id,CAST(payload AS BLOB) AS payload_blob,content_hash,cluster_key,"
                 "first_seen,last_seen,status,attempts,rejections,next_attempt_at,last_error,priority_score,story_id "
                 "FROM items ORDER BY last_seen DESC, id"
-            ).fetchall()
-            for irow in item_rows:
+            )
+            for irow in item_cursor:
                 if not _can_add("high_comment_items"):
                     break
                 ipayload = _safe_blob_json(irow["payload_blob"])
@@ -635,15 +651,15 @@ def harvest_database(
                 )
 
         # 5. Multi-update stories (>= 3 updates)
-        if _table_exists(conn, "stories"):
-            story_rows = conn.execute(
+        if _can_add("multi_update_stories") and _table_exists(conn, "stories"):
+            story_cursor = conn.execute(
                 "SELECT s.id, s.cluster_key, s.published_at, s.updated_at, "
                 "CAST(s.payload AS BLOB) AS payload_blob "
                 "FROM stories s LEFT JOIN editorial_controls e ON e.story_id=s.id "
                 "WHERE COALESCE(e.retracted, 0) != 1 "
                 "ORDER BY s.updated_at DESC, s.id"
-            ).fetchall()
-            for srow in story_rows:
+            )
+            for srow in story_cursor:
                 if not _can_add("multi_update_stories"):
                     break
                 sid = srow["id"]
@@ -781,6 +797,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--include-updates", action="store_true", help="Include update-scope and update items")
     args = parser.parse_args(argv)
 
+    db_resolved = args.db.resolve(strict=True)
+    out = args.output.resolve()
+    if out == db_resolved or (args.output.exists() and os.path.samefile(args.output, db_resolved)):
+        parser.error("--output must not identify or alias --db")
+
     os.umask(0o077)
     dataset = harvest_database(
         args.db,
@@ -788,7 +809,6 @@ def main(argv: list[str] | None = None) -> int:
         max_per_bucket=args.max_per_bucket,
         include_updates=args.include_updates,
     )
-    out = args.output.resolve()
     out.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:

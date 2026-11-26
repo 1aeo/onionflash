@@ -286,7 +286,7 @@ def verify_refreshed_story(
     merge_fn = getattr(review_mod, "merge_specialist_verdicts", None)
     use_specialists = (
         specialists > 1
-        and "specialist" in params
+        and any(p.name == "specialist" or p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
         and len(spec_names) >= 2
         and callable(merge_fn)
     )
@@ -400,7 +400,18 @@ def refresh_story(
         return {"story_id": story_id, "status": status, "reason": f"review_{verdict_name or 'rejected'}"}
 
     try:
-        committed = store.commit_story_refresh(story_id, refreshed_public, update_count, observed)
+        base_prose = {
+            field: story_payload.get(field, "") if isinstance(story_payload.get(field), str) else ""
+            for field in ("title", "summary", "why_it_matters")
+        }
+        committed = store.commit_story_refresh(
+            story_id,
+            refreshed_public,
+            update_count,
+            refreshed_hash,
+            observed,
+            base_prose=base_prose,
+        )
     except (candidate_mod.StaleCandidate, editorial.RetiredStory, candidate_mod.ReviewRequired):
         return {"story_id": story_id, "status": "skipped", "reason": "stale_or_locked"}
     return committed
@@ -474,7 +485,14 @@ def refresh_due_stories(
                 if exc.retryable:
                     stats["endpoint_failures"] += 1
                     continue
-                raise
+                logging.getLogger(__name__).warning(
+                    "Living story refresh failed for %s (%s): %s",
+                    entry.get("story_id"),
+                    exc.code,
+                    exc,
+                )
+                stats["held"] += 1
+                continue
             stats[outcome["status"]] = stats.get(outcome["status"], 0) + 1
     finally:
         stats["calls"] = max(0, getattr(active_refresher, "calls", 0) - before_calls)

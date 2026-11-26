@@ -693,6 +693,9 @@ def _story_search_text(story: dict) -> str:
 
 
 _PT_FAMILY_TOKENS = frozenset({"snowflake", "webtunnel", "lyrebird", "obfs4", "obfs4proxy", "conjure"})
+_PT_GENERIC_TOKENS = frozenset(_normalize_rare_token(tok) for tok in (
+    "pluggable", "transport", "transports", "bridge", "bridges", "proxy", "proxies",
+))
 _PT_PROJECT_SCOPE_RE = re.compile(
     r"^https://gitlab\.torproject\.org/([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+?)/-/",
     re.I,
@@ -831,7 +834,7 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
                         continue
                     story_scopes = _source_repo_scopes(story_obj.get("sources") or ())
                     cross_repo = bool(item_scopes and story_scopes and item_scopes.isdisjoint(story_scopes))
-                    shared_non_pt = len((item_tokens & _rare_tokens(stext)) - _PT_FAMILY_TOKENS)
+                    shared_non_pt = len((item_tokens & _rare_tokens(stext)) - (_PT_FAMILY_TOKENS | _PT_GENERIC_TOKENS))
                     if (item_pt != "pluggable-transports" and (cross_repo or shared_non_pt >= 1)) or (
                         item_pt == "pluggable-transports" and shared_non_pt >= 1
                     ):

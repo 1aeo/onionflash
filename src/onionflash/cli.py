@@ -158,6 +158,19 @@ def _effective_config(config: dict, store: Store) -> tuple[dict, list[str]]:
     return {**config, "collection": eff_collection}, tor_core_users
 
 
+def _draft_cache_options(analyzer=None) -> tuple[int, bool | None]:
+    """Return `(best_of, quote_digest)` matching `_new_analyzer` or a supplied writer instance."""
+    if analyzer is not None:
+        return review_gate._writer_cache_options(analyzer)
+    try:
+        params = inspect.signature(Analyzer).parameters
+    except (TypeError, ValueError):
+        params = {}
+    best_of = 3 if "best_of" in params else 1
+    quote_digest: bool | None = True if "quote_digest" in params else None
+    return best_of, quote_digest
+
+
 def _new_analyzer(
     config: dict,
     *,
@@ -172,10 +185,11 @@ def _new_analyzer(
         params = {}
     if "editorial_polish" in params:
         kwargs["editorial_polish"] = True
+    best_of, quote_digest = _draft_cache_options()
     if "best_of" in params:
-        kwargs["best_of"] = 3
-    if "quote_digest" in params:
-        kwargs["quote_digest"] = True
+        kwargs["best_of"] = best_of
+    if "quote_digest" in params and quote_digest is not None:
+        kwargs["quote_digest"] = quote_digest
     if request_semaphore is not None and "request_semaphore" in params:
         kwargs["request_semaphore"] = request_semaphore
     return Analyzer(config, **kwargs)
@@ -205,6 +219,8 @@ def _classify_pending_row(
     *,
     execute_gates: bool,
     observed: str | None = None,
+    best_of: int | None = None,
+    quote_digest: bool | None = None,
 ) -> tuple[str, object]:
     """Run deterministic pre-draft triage; when `execute_gates` is true, commit skips/citations before drafting."""
     if row.get("damaged"):
@@ -309,7 +325,11 @@ def _classify_pending_row(
     except (AnalysisError, ValueError, TypeError, KeyError):
         return ("ready", row) if execute_gates else ("skip", None)
 
-    writer_key = cache_key(row, run_config["llm"], prior)
+    if best_of is None:
+        best_of, default_qd = _draft_cache_options()
+        if quote_digest is None:
+            quote_digest = default_qd
+    writer_key = cache_key(row, run_config["llm"], prior, best_of=best_of, quote_digest=quote_digest)
     locked_reuse = (
         job is not None
         and existing is not None
@@ -333,7 +353,8 @@ def _classify_pending_row(
         and saved_draft is not None
     ):
         return ("ready", row) if execute_gates else ("skip", None)
-    return "draft", (row, copy.deepcopy(writer_item), copy.deepcopy(prior), writer_key, carry)
+    dispatch_context = digest([existing["id"] if existing is not None else None, writer_key, writer_item])
+    return "draft", (row, copy.deepcopy(writer_item), copy.deepcopy(prior), writer_key, carry, dispatch_context)
 
 
 def _draft_one_task(
@@ -370,6 +391,9 @@ def _persist_draft_outcome(
     *,
     observed: str | None = None,
     endpoint_failures: int = 0,
+    dispatch_context: str | None = None,
+    best_of: int | None = None,
+    quote_digest: bool | None = None,
 ) -> tuple[str, int]:
     """Persist a completed worker draft or record its failure on the main thread."""
     if exc is None:
@@ -405,6 +429,22 @@ def _persist_draft_outcome(
     retryable = is_analysis and exc.retryable
     if retryable and endpoint_failures >= 2:
         return "skipped_breaker", endpoint_failures
+    if dispatch_context is not None:
+        cur = store.db.execute(
+            "SELECT id,url,source_id,payload,content_hash,cluster_key,first_seen,last_seen,"
+            "status,attempts,rejections,next_attempt_at,last_error,priority_score,story_id "
+            "FROM items WHERE id=? AND content_hash=? AND status='pending'",
+            (row["id"], row["content_hash"]),
+        ).fetchone()
+        if cur is None:
+            report["review_stale"] += 1
+            return "handled", endpoint_failures + retryable
+        cur_kind, cur_payload = _classify_pending_row(
+            run_config, store, dict(cur), policy, execute_gates=False, best_of=best_of, quote_digest=quote_digest,
+        )
+        if cur_kind != "draft" or cur_payload[5] != dispatch_context:
+            report["review_stale"] += 1
+            return "handled", endpoint_failures + retryable
     deferred = store.defer(
         row["id"],
         str(exc) if is_analysis else _unexpected_error(exc),
@@ -436,9 +476,12 @@ def _prefetch_drafts(
         return 0, endpoint_failures, set(), False
 
     policy = review.policy_hash(run_config)
-    tasks: list[tuple[dict, dict, dict | None, str, dict | None]] = []
+    best_of, quote_digest = _draft_cache_options()
+    tasks: list[tuple[dict, dict, dict | None, str, dict | None, str]] = []
     for row in pending_rows[: MAX_CONCURRENT_LLM_ITEMS * 2]:
-        kind, payload = _classify_pending_row(run_config, store, row, policy, execute_gates=False)
+        kind, payload = _classify_pending_row(
+            run_config, store, row, policy, execute_gates=False, best_of=best_of, quote_digest=quote_digest,
+        )
         if kind == "draft":
             tasks.append(payload)
 
@@ -453,12 +496,12 @@ def _prefetch_drafts(
     with ThreadPoolExecutor(max_workers=min(MAX_CONCURRENT_LLM_ITEMS, len(tasks))) as pool:
         submitted = [
             (
-                (row, writer_key, carry),
+                (row, writer_key, carry, dispatch_context),
                 pool.submit(_draft_one_task, run_config, run_deadline, writer_item_copy, prior_copy, draft_semaphore),
             )
-            for row, writer_item_copy, prior_copy, writer_key, carry in tasks
+            for row, writer_item_copy, prior_copy, writer_key, carry, dispatch_context in tasks
         ]
-        for idx, ((row, writer_key, carry), future) in enumerate(submitted):
+        for idx, ((row, writer_key, carry, dispatch_context), future) in enumerate(submitted):
             if future.cancelled():
                 continue
             draft, calls, clears, exc = future.result()
@@ -476,6 +519,9 @@ def _prefetch_drafts(
                 exc,
                 observed=observed,
                 endpoint_failures=endpoint_failures,
+                dispatch_context=dispatch_context,
+                best_of=best_of,
+                quote_digest=quote_digest,
             )
             if outcome == "budget_reached":
                 budget_reached = True
@@ -571,8 +617,9 @@ def _run_sliding_window(
 ) -> tuple[int, int]:
     """Overlap a bounded window of concurrent drafts with immediate main-thread review commits."""
     policy = review.policy_hash(run_config)
+    best_of, quote_digest = _draft_cache_options(analyzer)
     pending_iter = iter(pending_rows)
-    in_flight: dict[Future, tuple[dict, str, dict | None]] = {}
+    in_flight: dict[Future, tuple[dict, str, dict | None, str]] = {}
     ready_rows: deque[dict] = deque()
     prefetched_calls = 0
     budget_reached = False
@@ -597,7 +644,8 @@ def _run_sliding_window(
             except StopIteration:
                 return
             kind, payload = _classify_pending_row(
-                run_config, store, row, policy, execute_gates=True, observed=now_iso()
+                run_config, store, row, policy, execute_gates=True, observed=now_iso(),
+                best_of=best_of, quote_digest=quote_digest,
             )
             if kind == "failed":
                 report["analysis_failed"] += 1
@@ -606,9 +654,9 @@ def _run_sliding_window(
             elif kind == "ready":
                 ready_rows.append(payload)
             elif kind == "draft":
-                d_row, writer_item_copy, prior_copy, writer_key, carry = payload
+                d_row, writer_item_copy, prior_copy, writer_key, carry, dispatch_context = payload
                 fut = pool.submit(_draft_one_task, run_config, run_deadline, writer_item_copy, prior_copy, draft_semaphore)
-                in_flight[fut] = (d_row, writer_key, carry)
+                in_flight[fut] = (d_row, writer_key, carry, dispatch_context)
 
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_LLM_ITEMS) as pool:
         _fill_window()
@@ -646,7 +694,7 @@ def _run_sliding_window(
                 break
             done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
             for fut in done:
-                d_row, writer_key, carry = in_flight.pop(fut)
+                d_row, writer_key, carry, dispatch_context = in_flight.pop(fut)
                 if fut.cancelled():
                     continue
                 draft, calls, clears, exc = fut.result()
@@ -663,6 +711,9 @@ def _run_sliding_window(
                     clears,
                     exc,
                     endpoint_failures=endpoint_failures,
+                    dispatch_context=dispatch_context,
+                    best_of=best_of,
+                    quote_digest=quote_digest,
                 )
                 if outcome == "budget_reached":
                     budget_reached = True
@@ -680,7 +731,7 @@ def _run_sliding_window(
         # Save any already-running drafts that completed during shutdown without double-deferring.
         for rem_fut in list(in_flight):
             if not rem_fut.cancelled():
-                d_row, writer_key, carry = in_flight[rem_fut]
+                d_row, writer_key, carry, dispatch_context = in_flight[rem_fut]
                 draft, calls, clears, exc = rem_fut.result()
                 prefetched_calls += calls
                 outcome, endpoint_failures = _persist_draft_outcome(
@@ -695,6 +746,9 @@ def _run_sliding_window(
                     clears,
                     exc,
                     endpoint_failures=endpoint_failures,
+                    dispatch_context=dispatch_context,
+                    best_of=best_of,
+                    quote_digest=quote_digest,
                 )
                 if outcome == "budget_reached":
                     report["budget_reached"] = True
@@ -896,7 +950,10 @@ def run(config: dict, store: Store) -> dict:
                         3
                         if (
                             Reviewer is _ORIG_REVIEWER
-                            and "specialist" in review_params
+                            and any(
+                                p.name == "specialist" or p.kind == inspect.Parameter.VAR_KEYWORD
+                                for p in review_params.values()
+                            )
                             and hasattr(review, "SPECIALISTS")
                             and hasattr(review, "merge_specialist_verdicts")
                         )

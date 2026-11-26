@@ -488,12 +488,68 @@ def _note_url_matches(req_url: str, note_url: str) -> bool:
     return bool(canon_req and canon_note and canon_req == canon_note)
 
 
+def _unquoted_note_spans(body: str) -> list[str]:
+    """Split a note body into contiguous non-quoted text spans, excluding `>`-quoted lines."""
+    blocks: list[str] = []
+    cur: list[str] = []
+    for line in body.splitlines():
+        if line.lstrip().startswith(">"):
+            if cur:
+                joined = "\n".join(cur)
+                if joined.strip():
+                    blocks.append(joined)
+                cur = []
+        else:
+            cur.append(line)
+    if cur:
+        joined = "\n".join(cur)
+        if joined.strip():
+            blocks.append(joined)
+    return blocks
+
+
+def _find_unique_literal_span(unquoted_blocks: list[str], raw_quote: str, norm_quote: str) -> str | None:
+    """Resolve `raw_quote` to one unique literal substring inside `unquoted_blocks`, or None."""
+    if not unquoted_blocks:
+        return None
+    if any(raw_quote in block for block in unquoted_blocks):
+        if len(raw_quote) <= DIGEST_MAX_QUOTE_CHARS and not has_invalid_text_chars(raw_quote):
+            return raw_quote
+        return None
+    q_tokens = norm_quote.split()
+    if not q_tokens:
+        return None
+    matches: set[str] = set()
+    window = len(q_tokens)
+    for block in unquoted_blocks:
+        spans = [(m.start(), m.end(), normalize_evidence(m.group())) for m in re.finditer(r"\S+", block)]
+        if len(spans) < window:
+            continue
+        for idx in range(len(spans) - window + 1):
+            if all(spans[idx + offset][2] == q_tokens[offset] for offset in range(window)):
+                cand = block[spans[idx][0] : spans[idx + window - 1][1]]
+                matches.add(cand)
+                if len(matches) > 1:
+                    return None
+    if len(matches) != 1:
+        return None
+    literal = next(iter(matches))
+    if (
+        not literal
+        or len(literal) > DIGEST_MAX_QUOTE_CHARS
+        or len(normalize_evidence(literal)) < DIGEST_MIN_QUOTE_CHARS
+        or has_invalid_text_chars(literal)
+    ):
+        return None
+    return literal
+
+
 def _verify_digest_anchors(raw_anchors: object, chrono_notes: list[dict]) -> list[dict]:
-    """Keep only short anchor quotes verified via `normalize_evidence` against `public_comments`."""
+    """Keep only unique literal anchor quotes from unquoted `public_comments` spans."""
     if not isinstance(raw_anchors, list):
         return []
     indexed = [
-        (note, normalize_evidence(note["body"]), note["author"].lstrip("@").strip().casefold())
+        (note, _unquoted_note_spans(note["body"]), note["author"].lstrip("@").strip().casefold())
         for note in chrono_notes
     ]
     verified: list[dict] = []
@@ -521,24 +577,23 @@ def _verify_digest_anchors(raw_anchors: object, chrono_notes: list[dict]) -> lis
             continue
         req_author = raw_author.lstrip("@").strip().casefold()
         req_url = raw_url.strip()
-        matched_note = None
-        for note, norm_body, author_cf in indexed:
-            if norm_quote not in norm_body:
-                continue
+        hits: list[tuple[dict, str]] = []
+        for note, spans, author_cf in indexed:
             if req_author and req_author != author_cf:
                 continue
             if not _note_url_matches(req_url, note["url"]):
                 continue
-            matched_note = note
-            break
-        if matched_note is None:
+            if (literal := _find_unique_literal_span(spans, quote, norm_quote)) is not None:
+                hits.append((note, literal))
+        if not hits or len({lit for _, lit in hits}) != 1:
             continue
-        dedupe_key = (norm_quote, matched_note["author"], matched_note["url"])
+        matched_note, literal_quote = hits[0]
+        dedupe_key = (normalize_evidence(literal_quote), matched_note["author"], matched_note["url"])
         if dedupe_key in seen:
             continue
         seen.add(dedupe_key)
         verified.append({
-            "quote": quote,
+            "quote": literal_quote,
             "author": matched_note["author"],
             "url": matched_note["url"],
         })
@@ -630,7 +685,8 @@ def _deterministic_long_thread_digest(
     for idx in sorted(selected_indices):
         note = chrono_notes[idx]
         _, best_sent = scored[idx]
-        point = plain_text(best_sent or note["body"], DIGEST_TEXT_CHARS, html=False)
+        fallback = " ".join(ln.strip() for ln in note["body"].splitlines() if ln.strip() and not ln.lstrip().startswith(">"))
+        point = plain_text(best_sent or fallback, DIGEST_TEXT_CHARS, html=False)
         if point:
             timeline.append({
                 "author": note["author"],
@@ -704,6 +760,44 @@ def _invoke_digest_llm(llm_call, prompt: str, payload: dict, schema: dict, name:
     return llm_call(prompt, payload, schema, name)
 
 
+def _timestamps_conflict(req_ts: str, note_ts: str) -> bool:
+    if not req_ts or not note_ts or req_ts == note_ts:
+        return False
+    try:
+        return timestamp(req_ts) != timestamp(note_ts)
+    except ValueError:
+        return True
+
+
+def _resolve_timeline_note(
+    raw_url: str,
+    author_key: str,
+    raw_ts: str,
+    by_url: dict[str, tuple[int, dict]],
+    by_author: dict[str, list[tuple[int, dict]]],
+) -> tuple[int, dict] | None:
+    """Resolve one model timeline item to a single source note, rejecting conflicting metadata."""
+    if raw_url:
+        pair = by_url.get(raw_url) or by_url.get(safe_canonical_url(raw_url))
+        if pair is None:
+            return None
+        idx, note = pair
+        if author_key and note["author"].casefold() != author_key:
+            return None
+        if _timestamps_conflict(raw_ts, note["created_at"]):
+            return None
+        return idx, note
+    if not author_key or author_key not in by_author:
+        return None
+    author_notes = by_author[author_key]
+    if raw_ts:
+        for idx, note in author_notes:
+            if not _timestamps_conflict(raw_ts, note["created_at"]):
+                return idx, note
+        return None
+    return author_notes[0]
+
+
 def _normalize_llm_digest(
     raw_digest: object, chrono_notes: list[dict], *, truncated: bool, participants: list[str]
 ) -> dict | None:
@@ -721,18 +815,18 @@ def _normalize_llm_digest(
         or not isinstance(raw_disagreements, list)
     ):
         return None
-    by_author: dict[str, dict] = {}
-    by_url: dict[str, dict] = {}
-    for note in chrono_notes:
+    by_author: dict[str, list[tuple[int, dict]]] = {}
+    by_url: dict[str, tuple[int, dict]] = {}
+    for idx, note in enumerate(chrono_notes):
         if note["author"]:
-            by_author.setdefault(note["author"].casefold(), note)
+            by_author.setdefault(note["author"].casefold(), []).append((idx, note))
         if note["url"]:
-            by_url[note["url"]] = note
+            by_url[note["url"]] = (idx, note)
             if canon := safe_canonical_url(note["url"]):
-                by_url[canon] = note
+                by_url[canon] = (idx, note)
 
-    timeline: list[dict] = []
-    for entry in raw_digest["timeline"][:DIGEST_MAX_TIMELINE]:
+    timeline_items: list[tuple[int, dict]] = []
+    for entry in raw_digest["timeline"]:
         if not isinstance(entry, dict):
             continue
         point = plain_text(entry.get("point"), DIGEST_TEXT_CHARS, html=False)
@@ -741,22 +835,22 @@ def _normalize_llm_digest(
         raw_author = entry.get("author") if isinstance(entry.get("author"), str) else ""
         author_key = raw_author.lstrip("@").strip().casefold()
         raw_url = entry.get("url").strip() if isinstance(entry.get("url"), str) else ""
-        matched_note = by_url.get(raw_url) or by_url.get(safe_canonical_url(raw_url)) or by_author.get(author_key)
-        author = (
-            matched_note["author"]
-            if matched_note is not None and (not author_key or author_key == matched_note["author"].casefold())
-            else (by_author[author_key]["author"] if author_key in by_author else "")
-        )
-        created_at = plain_text(entry.get("created_at"), 64, html=False)
-        if not created_at and matched_note is not None:
-            created_at = matched_note["created_at"]
-        url = matched_note["url"] if matched_note is not None and _note_url_matches(raw_url, matched_note["url"]) else ""
-        timeline.append({
-            "author": author,
-            "created_at": created_at,
-            "url": url,
-            "point": point,
-        })
+        raw_ts = plain_text(entry.get("created_at"), 64, html=False)
+        resolved = _resolve_timeline_note(raw_url, author_key, raw_ts, by_url, by_author)
+        if resolved is None:
+            continue
+        matched_idx, matched_note = resolved
+        timeline_items.append((
+            matched_idx,
+            {
+                "author": matched_note["author"],
+                "created_at": matched_note["created_at"],
+                "url": matched_note["url"],
+                "point": point,
+            },
+        ))
+    timeline_items.sort(key=lambda pair: pair[0])
+    timeline = [entry for _, entry in timeline_items[:DIGEST_MAX_TIMELINE]]
 
     anchors = _verify_digest_anchors(raw_digest["anchors"], chrono_notes)
 

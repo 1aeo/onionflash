@@ -31,10 +31,10 @@ from helpers import (
     update_analysis,
     verdict,
 )
-from onionflash import cli, editorial, llm, refresh, review, review_gate
-from onionflash.analyze import AnalysisError, cache_key
+from onionflash import candidate as candidate_mod, cli, editorial, llm, refresh, review, review_gate
+from onionflash.analyze import AnalysisError, Analyzer, cache_key
 from onionflash.config import DEFAULTS
-from onionflash.store import PT_SECURITY_PRIORITY, Store, item_priority
+from onionflash.store import PT_SECURITY_PRIORITY, Store, item_priority, story_refresh_hash
 from onionflash.transport import HttpClient
 from onionflash.util import after, digest
 
@@ -105,7 +105,9 @@ def test_story_refresh_eligibility_commit_preservation_and_re_eligibility(tmp_pa
                 "why_it_matters": "Operators track three verified follow-up milestones.",
             },
             3,
+            cands[0]["refreshed_hash"],
             LATER,
+            base_prose={k: before.get(k, "") for k in ("title", "summary", "why_it_matters")},
         )
         assert res["status"] == "refreshed" and res["update_count"] == 3
         after_row = store.db.execute("SELECT published_at, updated_at, payload FROM stories WHERE id=?", (s1["id"],)).fetchone()
@@ -156,6 +158,8 @@ def test_story_refresh_excludes_locked_retracted_retired_and_missing_bodies(tmp_
         # 2) Locked story (via editorial.correct -> auto-locks, or manual lock) excluded from candidates & commit.
         s_locked = seed_story(store, item(url="https://example.org/locked-src", content="Locked body content."), analysis(evidence=["Locked body content."]))
         _add_story_updates(store, s_locked["id"], 3)
+        s_unlocked = seed_story(store, item(url="https://example.org/unlocked-src", content="Unlocked body content."), analysis(evidence=["Unlocked body content."]))
+        _add_story_updates(store, s_unlocked["id"], 3)
         editorial.correct(
             store.db,
             s_locked["id"],
@@ -164,9 +168,31 @@ def test_story_refresh_excludes_locked_retracted_retired_and_missing_bodies(tmp_
             expect_hash=editorial.show(store.db, s_locked["id"])["hash"],
             observed=LATER,
         )
-        assert store.refresh_candidates(limit=5) == []
-        with pytest.raises(Exception):
-            store.commit_story_refresh(s_locked["id"], {"title": "X", "summary": "Y.", "why_it_matters": ""}, 3, LATER)
+        locked_payload = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (s_locked["id"],)).fetchone()[0])
+        unlocked_payload = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (s_unlocked["id"],)).fetchone()[0])
+        valid_refresh = {
+            "title": "Valid refreshed summary title",
+            "summary": "Consolidated updates report verified progress.",
+            "why_it_matters": "",
+        }
+        assert [c["story_id"] for c in store.refresh_candidates(limit=5)] == [s_unlocked["id"]]
+        with pytest.raises(candidate_mod.StaleCandidate, match="locked"):
+            store.commit_story_refresh(
+                s_locked["id"],
+                valid_refresh,
+                3,
+                story_refresh_hash(locked_payload),
+                LATER,
+                base_prose={k: locked_payload.get(k, "") for k in ("title", "summary", "why_it_matters")},
+            )
+        assert store.commit_story_refresh(
+            s_unlocked["id"],
+            valid_refresh,
+            3,
+            story_refresh_hash(unlocked_payload),
+            LATER,
+            base_prose={k: unlocked_payload.get(k, "") for k in ("title", "summary", "why_it_matters")},
+        )["status"] == "refreshed"
 
         # 3) Retracted/retired story excluded from candidates.
         s_ret = seed_story(store, item(url="https://example.org/retracted-src", content="Retracted body."), analysis(evidence=["Retracted body."]))
@@ -365,9 +391,11 @@ def test_sliding_window_overlaps_draft_and_review_and_skips_deterministic_before
         first_review_started = threading.Event()
         initial_three_entered = 0
         three_slow_ready = threading.Event()
+        saw_blocked_draft_during_review = False
+        wait_timeouts: list[str] = []
 
         def _handle(request: httpx.Request) -> httpx.Response:
-            nonlocal in_flight, max_in_flight, initial_three_entered
+            nonlocal in_flight, max_in_flight, initial_three_entered, saw_blocked_draft_during_review
             body = json.loads(request.content)
             schema_name = body["response_format"]["json_schema"]["name"]
             if schema_name == "onionflash_news":
@@ -387,8 +415,12 @@ def test_sliding_window_overlaps_draft_and_review_and_skips_deterministic_before
                         fifth_draft_started.set()
                 try:
                     if not is_fast and not is_followup:
-                        three_slow_ready.wait(timeout=5.0)
-                        hold_slow_drafts.wait(timeout=5.0)
+                        if not three_slow_ready.wait(timeout=5.0):
+                            with lock:
+                                wait_timeouts.append("three_slow_ready")
+                        if not hold_slow_drafts.wait(timeout=5.0):
+                            with lock:
+                                wait_timeouts.append("hold_slow_drafts")
                     reply = analysis(
                         title=title,
                         summary=user_payload["content"],
@@ -403,6 +435,9 @@ def test_sliding_window_overlaps_draft_and_review_and_skips_deterministic_before
                 reply = {k: draft[k] for k in ("title", "summary", "why_it_matters")}
             else:
                 first_review_started.set()
+                with lock:
+                    if in_flight > 0:
+                        saw_blocked_draft_during_review = True
                 if fifth_draft_started.is_set() and first_review_started.is_set():
                     hold_slow_drafts.set()
                 reply = verdict("approve")
@@ -423,7 +458,13 @@ def test_sliding_window_overlaps_draft_and_review_and_skips_deterministic_before
             ),
         )
 
-        report = cli.run(cfg, store)
+        try:
+            report = cli.run(cfg, store)
+        finally:
+            three_slow_ready.set()
+            hold_slow_drafts.set()
+        assert not wait_timeouts
+        assert saw_blocked_draft_during_review
         assert max_in_flight <= cli.MAX_CONCURRENT_LLM_ITEMS
         assert max_in_flight == 4
         assert fifth_draft_started.is_set()
@@ -637,3 +678,174 @@ def test_harvest_eval_readonly_all_buckets_sanitization_and_eval_compatibility(t
     bounded = json.loads(bounded_out.read_text())
     assert len(bounded["cases"]) <= 3
     assert all(len(v) <= 1 for v in bounded["buckets"].values())
+
+
+def test_draft_cache_parity_stale_failure_guard_refresh_errors_and_harvester_safety(tmp_path, monkeypatch):
+    """Cover CLI/gate cache parity, stale draft failure protection, refresh fault isolation, and harvester safety guards."""
+    harvest_eval = _load_tool("harvest_eval")
+    cfg = make_config(tmp_path)
+    cfg["sources"] = []
+
+    with Store(cfg["storage"]["database"]) as store:
+        # 1) _classify_pending_row uses best_of=3 / quote_digest=True cache key matching Writer/Analyzer(3, True).
+        shared_cluster = "release:tor:0.4.9.99"
+        row_it = item(
+            url="https://example.org/cache-parity",
+            title="Tor 0.4.9.99 announcement",
+            content="Tor 0.4.9.99 release candidate.",
+            kind="gitlab_mr",
+            upstream_state="merged",
+        )
+        store.ingest(row_it, DATE)
+        with store.db:
+            store.db.execute("UPDATE items SET cluster_key=? WHERE id=?", (shared_cluster, row_it["id"]))
+        row = store.pending(10, DATE)[0]
+        kind, payload = cli._classify_pending_row(cfg, store, row, review.policy_hash(cfg), execute_gates=False)
+        assert kind == "draft"
+        expected_k = cache_key(row, cfg["llm"], None, best_of=3, quote_digest=True)
+        assert payload[3] == expected_k and len(payload) == 6
+
+        # 2) Stale-context draft failure increments review_stale without charging attempts/rejections.
+        dispatch_ctx = payload[5]
+        report = {
+            "analysis_failed": 0, "review_stale": 0, "analyzed": 0,
+            "review_cache_hits": 0, "review_routed": 0,
+        }
+        prior_src = item(url="https://example.org/cache-parity-prior", title="Tor 0.4.9.99 blog", content="Prior body.")
+        store.ingest(prior_src, DATE)
+        with store.db:
+            store.db.execute("UPDATE items SET cluster_key=? WHERE id=?", (shared_cluster, prior_src["id"]))
+        seed_story(
+            store,
+            {**prior_src, "cluster_key": shared_cluster},
+            analysis(title="Tor 0.4.9.99 blog", summary="Prior body.", evidence=["Prior body."]),
+        )
+        outcome, _ = cli._persist_draft_outcome(
+            cfg, store, report, review.policy_hash(cfg), row, expected_k, None,
+            None, 0, AnalysisError("Bad reply", retryable=False),
+            observed=LATER, dispatch_context=dispatch_ctx, best_of=3, quote_digest=True,
+        )
+        assert outcome == "handled" and report["review_stale"] == 1 and report["analysis_failed"] == 0
+        cur_row = store.db.execute("SELECT status, attempts, rejections FROM items WHERE id=?", (row["id"],)).fetchone()
+        assert tuple(cur_row) == ("pending", 0, 0)
+
+    # 3) **kwargs reviewer adapter triggers specialist merge; non-retryable refresh errors don't abort cli.run build; commit rejects stale prose/sources.
+    with Store(tmp_path / "refresh_hardening.sqlite3") as store:
+        s1_item = item(url="https://example.org/ref-hard-1", title="Refresh story 1", content="Initial body 1.")
+        s1 = seed_story(store, s1_item, analysis(title="Refresh story 1", summary="Initial body 1.", evidence=["Initial body 1."]))
+        _add_story_updates(store, s1["id"], 3)
+        s2_item = item(url="https://example.org/ref-hard-2", title="Refresh story 2", content="Initial body 2.")
+        s2 = seed_story(store, s2_item, analysis(title="Refresh story 2", summary="Initial body 2.", evidence=["Initial body 2."]))
+        _add_story_updates(store, s2["id"], 3)
+
+        seen_kwarg_specs = []
+
+        class _KwargsReviewer:
+            """Reviewer forwarding **kwargs to verify specialist activation in refresh."""
+
+            def review(self, cand_pub, pkt, **kwargs):
+                """Record forwarded specialist kwarg and approve."""
+                seen_kwarg_specs.append(kwargs.get("specialist"))
+                return verdict("approve")
+
+        class _MixedRefresher:
+            """Raise non-retryable AnalysisError on story 1 and succeed on story 2."""
+
+            calls = 0
+
+            def close(self):
+                """No-op close for cli.run lifecycle cleanup."""
+
+            def synthesize(self, story_payload, pkt):
+                """Fail story 1 non-retryably and refresh story 2."""
+                self.calls += 1
+                if story_payload["id"] == s1["id"]:
+                    raise AnalysisError("Non-retryable refresh failure", retryable=False)
+                return {"title": "Refreshed story 2", "summary": "Verified across three updates.", "why_it_matters": ""}
+
+        cands = store.refresh_candidates(limit=5)
+        assert len(cands) == 2
+        pkt = {"sources": [{"id": "S1", "url": "https://example.org/x", "kind": "rss", "authority": "official", "product": "tor", "published_at": DATE, "updated_at": DATE, "passages": [{"id": "S1:P1", "text": "Text."}]}], "missing_sources": [], "truncated": False}
+        assert refresh.verify_refreshed_story(_KwargsReviewer(), {**s1, "title": "T"}, pkt, specialists=3)["verdict"] == "approve"
+        assert set(seen_kwarg_specs) == set(review.SPECIALISTS)
+
+        with monkeypatch.context() as mp:
+            mp.setattr(refresh, "refresh_story", lambda st, ent, *_a, **_kw: (_ for _ in ()).throw(AnalysisError("Bad envelope", retryable=False)) if ent["story_id"] == s1["id"] else {"story_id": ent["story_id"], "status": "refreshed"})
+            stats = refresh.refresh_due_stories(cfg, store, _KwargsReviewer(), LATER, refresher=_MixedRefresher())
+            assert stats["held"] == 1 and stats["refreshed"] == 1
+
+            # Verify cli.run() still runs build() even when refresh_story raises non-retryable AnalysisError.
+            built = []
+            cfg_cli = copy.deepcopy(cfg)
+            cfg_cli["llm"].update(base_url="https://llm.example/v1", api_key_env="KEY")
+            monkeypatch.setenv("KEY", "synthetic-fixture-value")
+            mp.setattr(cli, "Analyzer", Analyzer)
+            mp.setattr(cli, "Reviewer", ApprovingReviewer)
+            mp.setattr(cli, "build", lambda *_a: built.append(True) or {"published_stories": 2})
+            mp.setattr(refresh, "StoryRefresher", lambda *_a, **_kw: _MixedRefresher())
+            cli_report = cli.run(cfg_cli, store)
+            assert built == [True] and cli_report["published_stories"] == 2
+
+        # commit_story_refresh rejects edited prose and source additions via add_citation.
+        before_s1 = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (s1["id"],)).fetchone()[0])
+        h_s1 = story_refresh_hash(before_s1)
+        s1_cluster = store.db.execute("SELECT cluster_key FROM stories WHERE id=?", (s1["id"],)).fetchone()[0]
+        cite_it = item(url="https://example.org/cite-extra", title="Cite extra", content="Extra citation.")
+        store.ingest(cite_it, LATER)
+        with store.db:
+            store.db.execute("UPDATE items SET cluster_key=? WHERE id=?", (s1_cluster, cite_it["id"]))
+        cite_row = store.db.execute("SELECT * FROM items WHERE id=?", (cite_it["id"],)).fetchone()
+        store.add_citation(dict(cite_row), s1["id"], LATER)
+        with pytest.raises(candidate_mod.StaleCandidate):
+            store.commit_story_refresh(
+                s1["id"], {"title": "New", "summary": "New summary.", "why_it_matters": ""}, 3, h_s1, LATER,
+                base_prose={k: before_s1.get(k, "") for k in ("title", "summary", "why_it_matters")},
+            )
+        before_s2 = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (s2["id"],)).fetchone()[0])
+        h_s2 = story_refresh_hash(before_s2)
+        with store.db:
+            updated_s2 = {**before_s2, "title": "Manually edited title"}
+            store.db.execute("UPDATE stories SET payload=? WHERE id=?", (json.dumps(updated_s2), s2["id"]))
+        with pytest.raises(candidate_mod.StaleCandidate):
+            store.commit_story_refresh(
+                s2["id"], {"title": "New", "summary": "New summary.", "why_it_matters": ""}, 3, h_s2, LATER,
+                base_prose={k: before_s2.get(k, "") for k in ("title", "summary", "why_it_matters")},
+            )
+
+    # 4) harvest_eval surrogates, row URL secret redaction, packet isolation, and --output==--db guard.
+    assert harvest_eval.sanitize_text("Bad\ud800text") == "Bad\ufffdtext"
+    json.dumps(harvest_eval.sanitize_text("Bad\ud800text"), ensure_ascii=False).encode("utf-8")
+
+    db_h = tmp_path / "harvest_safety.sqlite3"
+    with Store(db_h) as store:
+        sec_it = item(
+            url="https://example.org/item?token=secret_value_12345",
+            title="Held and rejected item",
+            content="Body content.",
+        )
+        store.ingest(sec_it, DATE)
+        row_h = store.pending(10, DATE)[0]
+        from onionflash import rejection
+        for _ in range(3):
+            store.defer(sec_it["id"], "Bad", cfg["llm"], DATE, terminal=True)
+        rejection.retry_item(store, sec_it["id"], row_h["content_hash"], "Retry", LATER)
+        with store.db:
+            store.db.execute(
+                "INSERT INTO review_jobs(item_id,writer_key,policy_hash,stage,draft_json,envelope_json,record_json,prepared_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    sec_it["id"], "k" * 64, review.policy_hash(cfg), "held",
+                    json.dumps(analysis()),
+                    json.dumps({"packet": {"sources": [{"url": "https://example.org/held-snap", "title": "Held snapshot", "kind": "rss", "authority": "official", "product": "tor", "published_at": DATE, "updated_at": DATE, "passages": ["Held snapshot body."]}], "missing_sources": [], "truncated": False}}),
+                    json.dumps({"hold": ["review", "model_hold"], "candidate": analysis()}),
+                    DATE, DATE,
+                ),
+            )
+    ds = harvest_eval.harvest_database(db_h, include_updates=True)
+    held_pkt = next(c["packet"] for c in ds["cases"] if c["id"].startswith("held:"))
+    rej_pkt = next(c["packet"] for c in ds["cases"] if c["id"].startswith("rej:"))
+    assert held_pkt != rej_pkt
+    assert ds["packets"][held_pkt] != ds["packets"][rej_pkt]
+    assert "secret_value_12345" not in json.dumps(ds, ensure_ascii=False)
+    with pytest.raises(SystemExit):
+        harvest_eval.main(["--db", str(db_h), "--output", str(db_h)])
