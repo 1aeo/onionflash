@@ -2119,10 +2119,27 @@ def test_cache_key_digest_modes_update_truncation_selector_bounds_and_issue_rele
     assert len({k_none, k_det, k_llm}) == 3
 
     # Best-of keys depend on base max_output_tokens when writer_reasoning=True; single-draft keys do not.
+    llm_900 = {**DEFAULTS["llm"], "writer_reasoning": True, "max_output_tokens": 900}
     llm_1200 = {**DEFAULTS["llm"], "writer_reasoning": True, "max_output_tokens": 1200}
+    llm_1400 = {**DEFAULTS["llm"], "writer_reasoning": True, "max_output_tokens": 1400}
     llm_2400 = {**DEFAULTS["llm"], "writer_reasoning": True, "max_output_tokens": 2400}
     assert analyze.cache_key(row, llm_1200) == analyze.cache_key(row, llm_2400)
     assert analyze.cache_key(row, llm_1200, best_of=3) != analyze.cache_key(row, llm_2400, best_of=3)
+    # Effective LLM digest contract (with 1400-token floor) binds only when digest mode is "llm".
+    assert analyze.cache_key(row, llm_1400, quote_digest=True) != analyze.cache_key(row, llm_2400, quote_digest=True)
+    assert analyze.cache_key(row, llm_900, quote_digest=True) == analyze.cache_key(row, llm_1400, quote_digest=True)
+    assert analyze.cache_key(row, llm_1400, quote_digest=False) == analyze.cache_key(row, llm_2400, quote_digest=False)
+    contracts = []
+    orig_contract = analyze._llm_contract
+    with monkeypatch.context() as mp:
+        mp.setattr(analyze, "_llm_contract", lambda eff: (contracts.append(eff["max_output_tokens"]), orig_contract(eff))[1])
+        analyze.cache_key(row, llm_900, best_of=3, quote_digest=None)
+        det_tokens = list(contracts)
+        contracts.clear()
+        analyze.cache_key(row, llm_900, best_of=3, quote_digest=True)
+        llm_tokens = list(contracts)
+    assert det_tokens == [32768, 900]
+    assert llm_tokens == [32768, 900, 1400]
 
     prior_dev = {
         "id": "a" * 24,

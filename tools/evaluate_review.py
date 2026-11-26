@@ -38,9 +38,16 @@ class EvaluationReviewer(Reviewer):
     last_decoded = None
 
     def review(self, *args, **kwargs):
-        """Reset diagnostic decode capture before running a review pass."""
+        """Reset diagnostic decode capture and attach any decoded reply to raised errors."""
         self.last_decoded = None
-        return super().review(*args, **kwargs)
+        try:
+            return super().review(*args, **kwargs)
+        except Exception as exc:
+            try:
+                exc._eval_decoded_diagnostic = self.last_decoded
+            except (AttributeError, TypeError):
+                pass
+            raise
 
     def complete(self, *args, **kwargs):
         """Capture the decoded JSON response for private evaluation diagnostics."""
@@ -265,14 +272,9 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
                 requests = ReviewRequests(record, specialists=specialists)
                 totals["cases"] += 1
                 reviewer.last_decoded = None
-                worker_reviewers: list[EvaluationReviewer] = []
-                worker_lock = threading.Lock()
 
                 def _reviewer_factory():
-                    inst = EvaluationReviewer(config, deadline=deadline)
-                    with worker_lock:
-                        worker_reviewers.append(inst)
-                    return inst
+                    return EvaluationReviewer(config, deadline=deadline)
 
                 try:
                     candidate = case["candidate"]
@@ -337,10 +339,15 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
                             )
                         elif specialists > 1 and stage == "verify":
                             if _pending_reask(record, stage, text, prepared):
-                                if record.get("pending_specialist_wave") and requests.state["reserved"] < requests.max_requests:
-                                    step = _resume_specialist_reask(
-                                        _reviewer_factory, reviewer, text, prepared, record, requests,
-                                    )
+                                if record.get("pending_specialist_wave"):
+                                    if requests.state["reserved"] < requests.max_requests:
+                                        step = _resume_specialist_reask(
+                                            _reviewer_factory, reviewer, text, prepared, record, requests,
+                                        )
+                                    else:
+                                        step = ("hold", ("verification", "specialist_budget"))
+                                elif requests.state["reserved"] < requests.max_requests:
+                                    step = advance_review(reviewer, stage, text, prepared, record, requests)
                                 else:
                                     step = ("hold", ("verification", "specialist_budget"))
                             elif requests.state["reserved"] + len(SPECIALISTS) > requests.max_requests:
@@ -429,9 +436,11 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
                     record["error"] = type(exc).__name__
                     if isinstance(exc, AnalysisError):
                         record["error_reason"] = str(exc)
-                    last_diag = reviewer.last_decoded
-                    if last_diag is None:
-                        last_diag = next((r.last_decoded for r in reversed(worker_reviewers) if r.last_decoded is not None), None)
+                    last_diag = (
+                        exc._eval_decoded_diagnostic
+                        if hasattr(exc, "_eval_decoded_diagnostic")
+                        else (reviewer.last_decoded if specialists == 1 else None)
+                    )
                     if last_diag is not None:
                         record["decoded_diagnostic"] = last_diag
                     record.setdefault("matched", False)

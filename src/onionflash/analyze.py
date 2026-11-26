@@ -547,7 +547,14 @@ def cache_key(
     if digest_mode == "deterministic":
         identity.extend(["quote_digest", "deterministic"])
     elif digest_mode == "llm":
-        identity.extend(["quote_digest", _comments.THREAD_DIGEST_PROMPT, json.dumps(_comments.THREAD_DIGEST_SCHEMA, ensure_ascii=False, allow_nan=False)])
+        digest_effective = {**writer_settings({**llm, "writer_reasoning": False}), "temperature": 0}
+        digest_effective["max_output_tokens"] = max(int(digest_effective["max_output_tokens"]), 1400)
+        identity.extend([
+            "quote_digest",
+            _llm_contract(digest_effective),
+            _comments.THREAD_DIGEST_PROMPT,
+            json.dumps(_comments.THREAD_DIGEST_SCHEMA, ensure_ascii=False, allow_nan=False),
+        ])
     return digest(identity)
 
 

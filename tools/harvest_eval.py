@@ -302,16 +302,19 @@ def _sanitize_story_ref(raw_story: object) -> dict | None:
     for key in ("title", "summary", "why_it_matters", "latest_update"):
         if isinstance(raw_story.get(key), str):
             cleaned[key] = sanitize_text(raw_story[key])
-    for key in ("category", "state", "confidence", "priority", "published_at", "updated_at", "added_at"):
+    for key in ("category", "state", "confidence", "priority", "origin", "related", "published_at", "updated_at", "added_at"):
         if isinstance(raw_story.get(key), str) and raw_story[key]:
             cleaned[key] = sanitize_text(raw_story[key])
-    if isinstance(raw_story.get("retracted"), bool):
-        cleaned["retracted"] = raw_story["retracted"]
+    for key in ("retracted", "summary_truncated"):
+        if isinstance(raw_story.get(key), bool):
+            cleaned[key] = raw_story[key]
     if isinstance(raw_story.get("products"), list):
         cleaned["products"] = [p for p in raw_story["products"] if p in PRODUCTS]
     if isinstance(raw_story.get("tags"), list):
         cleaned["tags"] = [t for t in raw_story["tags"] if t in CATEGORIES]
-    if isinstance(raw_story.get("associated"), list):
+    if isinstance(raw_story.get("associated"), bool):
+        cleaned["associated"] = raw_story["associated"]
+    elif isinstance(raw_story.get("associated"), list):
         cleaned["associated"] = [sanitize_text(a) for a in raw_story["associated"] if isinstance(a, str) and a]
     if sources := _sanitize_sources(raw_story.get("sources")):
         cleaned["sources"] = sources

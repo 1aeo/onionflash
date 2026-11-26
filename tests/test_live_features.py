@@ -866,8 +866,36 @@ def test_draft_cache_parity_stale_failure_guard_refresh_errors_and_harvester_saf
                 self.calls += 1
                 return {"title": "Defect fixed in branch", "summary": "The defect was fixed.", "why_it_matters": ""}
 
+        res_hold = refresh.refresh_story(store, cands_rg[0], _OverclaimRefresher(), _Spec2Reviewer(), LATER)
+        assert res_hold["status"] == "held" and res_hold["reason"] == "final_check_completed_action"
+        with store.db:
+            store.db.execute("DELETE FROM story_refreshes WHERE story_id=?", (rg_story["id"],))
         held_out = refresh.refresh_due_stories(cfg, store, _Spec2Reviewer(), LATER, refresher=_OverclaimRefresher())
         assert held_out["held"] == 1 and held_out["refreshed"] == 0
+
+        class _SupportedRefresher:
+            """Synthesize supported prose for an open issue without completed-action overclaims."""
+
+            calls = 0
+
+            def close(self):
+                """No-op close."""
+
+            def synthesize(self, story_payload, pkt):
+                """Return supported investigation prose matching the open source status."""
+                self.calls += 1
+                return {
+                    "title": "Issue under investigation",
+                    "summary": "Investigation details remain ongoing across three updates.",
+                    "why_it_matters": "",
+                }
+
+        with store.db:
+            store.db.execute("DELETE FROM story_refreshes WHERE story_id=?", (rg_story["id"],))
+        ok_out = refresh.refresh_due_stories(cfg, store, _Spec2Reviewer(), LATER, refresher=_SupportedRefresher())
+        assert ok_out["refreshed"] == 1 and ok_out["held"] == 0
+        refreshed_row = json.loads(store.db.execute("SELECT payload FROM stories WHERE id=?", (rg_story["id"],)).fetchone()[0])
+        assert refreshed_row["summary"] == "Investigation details remain ongoing across three updates."
 
         broken_item = item(url="https://example.org/broken-refresh", title="Broken refresh source", content="Text.")
         broken_story = seed_story(store, broken_item, analysis(title="Broken refresh source", summary="Text.", evidence=["Text."]))
@@ -913,7 +941,22 @@ def test_draft_cache_parity_stale_failure_guard_refresh_errors_and_harvester_saf
                 "updates": [{"at": LATER, "text": "Follow-up event update.", "sources": [{"url": "https://example.org/upd-follow", "title": "Follow-up"}]}],
             }
             upd_pkt = {"sources": [{"url": "https://example.org/upd-follow", "title": "Follow-up", "kind": "rss", "authority": "official", "product": "tor", "published_at": LATER, "updated_at": LATER, "passages": ["Follow-up event body."]}], "missing_sources": [], "truncated": False}
-            upd_cov = {"prior_story": upd_prior, "recent": [], "truncated": False}
+            upd_cov = {
+                "prior_story": {**upd_prior, "associated": True, "origin": "network-health"},
+                "recent": [{
+                    "id": "b" * 24,
+                    "title": "Related alert",
+                    "summary": "Shortened...",
+                    "category": "network",
+                    "state": "developing",
+                    "updated_at": DATE,
+                    "summary_truncated": True,
+                    "origin": "network-health",
+                    "related": "same thread",
+                    "products": ["tor"],
+                }],
+                "truncated": False,
+            }
             store.db.execute(
                 "INSERT INTO review_jobs(item_id,writer_key,policy_hash,stage,draft_json,envelope_json,record_json,prepared_at,updated_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?)",
@@ -933,6 +976,12 @@ def test_draft_cache_parity_stale_failure_guard_refresh_errors_and_harvester_saf
     assert "#note_123" in ds["packets"][rej_pkt]["sources"][0]["passages"][0]["url"]
     upd_case = next(c for c in ds["cases"] if c["id"] == f"held:{upd_it['id']}")
     assert upd_case["scope"] == "latest_update" and upd_case["coverage_set"] in ds["coverage_sets"]
+    saved_cov = ds["coverage_sets"][upd_case["coverage_set"]]
+    assert saved_cov["prior_story"]["associated"] is True
+    assert saved_cov["prior_story"]["origin"] == "network-health"
+    assert saved_cov["recent"][0]["summary_truncated"] is True
+    assert saved_cov["recent"][0]["origin"] == "network-health"
+    assert saved_cov["recent"][0]["related"] == "same thread"
     evaluate_review = _load_tool("evaluate_review")
     evaluate_review._validate_cases(evaluate_review.expand(ds))
     assert "secret_value_12345" not in json.dumps(ds, ensure_ascii=False)

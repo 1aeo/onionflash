@@ -947,7 +947,17 @@ class Store:
                         review_gate.validate_review_state(
                             review_record, "approved", approved_candidate, prepared, allow_cached=False
                         )
-                        step_action, step_value = review_gate.next_step(review_record["reviews"], approved_candidate, prepared)
+                        rev_specs = review_record.get("specialists", 1)
+                        step_action, step_value = (
+                            review_gate.next_step(
+                                review_record["reviews"],
+                                approved_candidate,
+                                prepared,
+                                specialists=rev_specs,
+                            )
+                            if type(rev_specs) is int and rev_specs > 1
+                            else review_gate.next_step(review_record["reviews"], approved_candidate, prepared)
+                        )
                         if step_action != "approve" or step_value != approved_candidate:
                             raise ReviewRequired("Final review did not authorize this decision")
                         verdict = validate_review(

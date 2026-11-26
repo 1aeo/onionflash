@@ -475,6 +475,48 @@ _DIRECTIVE_OBJ_STOPWORDS = frozenset({
     "reports", "issue", "issues", "story", "notice", "release", "releases", "version", "versions", "channel",
     "default", "defaults", "mode", "setting", "settings", "option", "options", "flag", "flags", "output",
 })
+_SCOPE_QUALIFIER_ALIASES = {
+    "windows": "windows", "win32": "windows", "win64": "windows",
+    "macos": "macos", "osx": "macos", "darwin": "macos",
+    "linux": "linux", "android": "android", "ios": "ios",
+    "bsd": "bsd", "freebsd": "freebsd", "openbsd": "openbsd", "netbsd": "netbsd",
+    "debian": "debian", "ubuntu": "ubuntu", "fedora": "fedora", "rhel": "rhel", "centos": "centos", "alpine": "alpine",
+    "tails": "tails", "whonix": "whonix",
+    "arm64": "arm64", "aarch64": "arm64", "x86_64": "x86_64", "amd64": "x86_64", "32-bit": "32-bit", "64-bit": "64-bit",
+    "exit": "exit", "exits": "exit", "guard": "guard", "guards": "guard",
+    "bridge": "bridge", "bridges": "bridge", "relay": "relay", "relays": "relay",
+    "snowflake": "snowflake", "webtunnel": "webtunnel", "obfs4": "obfs4", "obfs4proxy": "obfs4",
+    "lyrebird": "lyrebird", "conjure": "conjure",
+    "dirauth": "dirauth", "dirauths": "dirauth", "authority": "dirauth", "authorities": "dirauth",
+    "onion": "onion", "fallback": "fallback", "fallbacks": "fallback",
+    "docker": "container", "container": "container", "containers": "container",
+    "sandbox": "sandbox", "ipv6": "ipv6", "ipv4": "ipv4",
+    "experimental": "experimental", "opt-in": "opt-in", "nightly": "nightly", "alpha": "alpha", "beta": "beta",
+}
+_SCOPE_PHRASE_PATTERNS = (
+    (re.compile(r"\bos\s+x\b", re.IGNORECASE), "macos"),
+    (re.compile(r"\bdirectory\s+authorit(?:y|ies)\b", re.IGNORECASE), "dirauth"),
+    (re.compile(r"\b(?:hidden|onion)\s+services?\b", re.IGNORECASE), "onion"),
+)
+_TAIL_SCOPE_PREP_RE = re.compile(r"\b(?:on|for|under|with|using|running)\s+([^.!?;,\n]{1,60})", re.IGNORECASE)
+
+
+def _extract_scope_qualifiers(text: str) -> set[str]:
+    """Extract canonical audience, platform, and deployment scope qualifiers from `text`."""
+    qualifiers = {canon for pattern, canon in _SCOPE_PHRASE_PATTERNS if pattern.search(text)}
+    for raw in _DIRECTIVE_OBJ_TOKEN_RE.findall(text.lower()):
+        cleaned = raw.strip("._-")
+        if canon := _SCOPE_QUALIFIER_ALIASES.get(cleaned):
+            qualifiers.add(canon)
+    return qualifiers
+
+
+def _sentence_bounds(text: str, start: int, end: int) -> str:
+    """Return the sentence within `text` containing `[start, end]`."""
+    left = max((text.rfind(sep, 0, start) for sep in ".!?\n"), default=-1)
+    right_candidates = [pos for sep in ".!?\n" if (pos := text.find(sep, end)) != -1]
+    right = min(right_candidates) if right_candidates else len(text)
+    return text[left + 1 : right]
 
 
 def _action_stem(action: str) -> str:
@@ -525,7 +567,13 @@ def _obj_tokens_match(draft_tok: str, src_tok: str) -> bool:
     return False
 
 
-def _has_near_imperative_cue(src: str, stem: str, cue_prefix: str, obj_tokens: tuple[str, ...] | list[str] = ()) -> bool:
+def _has_near_imperative_cue(
+    src: str,
+    stem: str,
+    cue_prefix: str,
+    obj_tokens: tuple[str, ...] | list[str] = (),
+    draft_quals: frozenset[str] | set[str] = frozenset(),
+) -> bool:
     cue_near = re.compile(
         r"(?:\b" + cue_prefix + r"\b[^.!?\n]{0,60}\b" + stem + r"[a-z]*\b(?!\s+checks?\b)"
         r"|(?:^|[.!?\n]\s*)(?:please\s+)?" + stem + r"[a-z]*\b(?=\s+(?:to|your|the|now|as|immediately|away|over|it|them|this|that)\b))"
@@ -535,9 +583,17 @@ def _has_near_imperative_cue(src: str, stem: str, cue_prefix: str, obj_tokens: t
     matches = list(cue_near.finditer(src))
     if not matches:
         return False
-    if not obj_tokens:
-        return True
     for match in matches:
+        sent_start = max((src.rfind(sep, 0, match.start()) for sep in ".!?\n"), default=-1) + 1
+        src_prefix = src[sent_start : match.start("tail")]
+        tail_clause = _CLAUSE_STOP_RE.split(match.group("tail"), 1)[0]
+        src_quals = _extract_scope_qualifiers(src_prefix)
+        for prep_match in _TAIL_SCOPE_PREP_RE.finditer(tail_clause):
+            src_quals.update(_extract_scope_qualifiers(prep_match.group(1)))
+        if src_quals and not src_quals.issubset(draft_quals):
+            continue
+        if not obj_tokens:
+            return True
         src_tokens = _directive_obj_tokens(match.group("tail"))
         if all(any(_obj_tokens_match(d_tok, s_tok) for s_tok in src_tokens) for d_tok in obj_tokens):
             return True
@@ -562,11 +618,8 @@ def _directive_actions_supported(
         if not any(word.startswith(stem) for word in src_actions):
             return False
         obj_tokens = _directive_obj_tokens(text[action_match.end() :])
-        if (
-            require_all_near
-            or obj_tokens
-            or action in {"update", "updating", "upgrade", "upgrading", "switch", "switching"}
-        ) and not _has_near_imperative_cue(src, stem, cue_prefix, obj_tokens=obj_tokens):
+        draft_quals = _extract_scope_qualifiers(_sentence_bounds(text, action_match.start(), action_match.end()))
+        if not _has_near_imperative_cue(src, stem, cue_prefix, obj_tokens=obj_tokens, draft_quals=draft_quals):
             return False
     return matched_action or not require_all_near
 
