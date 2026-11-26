@@ -29,10 +29,14 @@ def public_files() -> set[str]:
 
 _ARTICLE = r"news/[A-Za-z0-9_-]{1,64}/(?:index\.html|story\.json)"
 _TOPIC = "(?:" + "|".join(re.escape(topic) for topic in render.CATEGORIES) + ")"
+_SOFTWARE = "(?:" + "|".join(re.escape(sw) for sw in render.SOFTWARE) + ")"
+_FILTER_PREFIX = (
+    r"(?:topics/" + _TOPIC + r"/(?:software/" + _SOFTWARE + r"/)?|software/" + _SOFTWARE + r"/)"
+)
 _FIXED = "|".join(re.escape(name) for name in sorted(public_files()))
 _PATH = re.compile(
-    r"(?:" + _ARTICLE + r"|tags/" + _TOPIC + r"\.xml|(?:topics/" + _TOPIC
-    + r"/)?(?:page/[1-9][0-9]{0,8}/)?index\.html|" + _FIXED + r")\Z"
+    r"(?:" + _ARTICLE + r"|tags/" + _TOPIC + r"\.xml|software/" + _SOFTWARE + r"\.xml|"
+    + _FILTER_PREFIX + r"?(?:page/[1-9][0-9]{0,8}/)?index\.html|" + _FIXED + r")\Z"
 )
 
 
@@ -81,6 +85,14 @@ def initialize(db) -> None:
         CREATE INDEX IF NOT EXISTS public_story_topics_added
             ON public_story_topics(topic,added_at DESC,updated_at DESC,story_id DESC);
         CREATE INDEX IF NOT EXISTS public_story_topics_story ON public_story_topics(story_id);
+        CREATE TABLE IF NOT EXISTS public_story_software (
+            software TEXT NOT NULL, story_id TEXT NOT NULL,
+            added_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            PRIMARY KEY(software,story_id)
+        );
+        CREATE INDEX IF NOT EXISTS public_story_software_added
+            ON public_story_software(software,added_at DESC,updated_at DESC,story_id DESC);
+        CREATE INDEX IF NOT EXISTS public_story_software_story ON public_story_software(story_id);
         CREATE TABLE IF NOT EXISTS public_render_queue (
             story_id TEXT PRIMARY KEY, last_error TEXT
         );
@@ -289,19 +301,74 @@ def _render_accepted(db, site: dict, base: str, accepted) -> tuple[dict, str]:
     return story, article
 
 
-def _accepted(db, *, order: str = "added_at", batch_size: int = 100, topic: str | None = None):
+_NOT_OMITTED_SQL = (
+    "NOT EXISTS (SELECT 1 FROM public_catalog_checks chk JOIN public_catalog pc ON pc.story_id=chk.story_id "
+    "WHERE chk.story_id={col} AND chk.template_hash=? AND chk.omitted=1 "
+    "AND pc.template_hash!=? AND pc.json_sha256=chk.json_sha256)"
+)
+
+
+def _delete_story_indexes(db, story_id: str) -> int:
+    return (
+        db.execute("DELETE FROM public_story_topics WHERE story_id=?", (story_id,)).rowcount
+        + db.execute("DELETE FROM public_story_software WHERE story_id=?", (story_id,)).rowcount
+    )
+
+
+def _filter_stats(
+    db, *, topic: str | None = None, software: str | None = None, omitted_ids: list[str] = (), identity: str = ""
+) -> tuple[int, str | None]:
+    if topic and software:
+        from_sql = (
+            "FROM public_story_topics t CROSS JOIN public_story_software s "
+            "ON s.story_id=t.story_id AND s.software=? WHERE t.topic=?"
+        )
+        col = "t.story_id"
+        updated_col = "t.updated_at"
+        params: list[object] = [software, topic]
+    elif topic:
+        from_sql = "FROM public_story_topics t WHERE t.topic=?"
+        col = "t.story_id"
+        updated_col = "t.updated_at"
+        params = [topic]
+    else:
+        from_sql = "FROM public_story_software s WHERE s.software=?"
+        col = "s.story_id"
+        updated_col = "s.updated_at"
+        params = [software]
+    omitted_sql = f" AND {_NOT_OMITTED_SQL.format(col=col)}" if omitted_ids else ""
+    if omitted_ids:
+        params.extend((identity, identity))
+    return db.execute(
+        f"SELECT COUNT(*), MAX({updated_col}) {from_sql} AND {col} NOT IN (SELECT story_id FROM story_aliases){omitted_sql}",
+        params,
+    ).fetchone()
+
+
+def _accepted(db, *, order: str = "added_at", batch_size: int = 100, topic: str | None = None, software: str | None = None):
     cursor = None
     secondary = "updated_at" if order == "added_at" else "published_at"
     current = store_mod.get_meta(db, "publication_template")
-    prefix = "t." if topic else "c."
-    from_sql = (
-        "FROM public_story_topics t JOIN public_catalog c ON c.story_id=t.story_id WHERE t.topic=? AND "
-        if topic
-        else "FROM public_catalog c WHERE "
-    )
+    prefix = "t." if topic else ("s." if software else "c.")
+    if topic and software:
+        from_sql = (
+            "FROM public_story_topics t "
+            "CROSS JOIN public_story_software s ON s.story_id=t.story_id AND s.software=? "
+            "JOIN public_catalog c ON c.story_id=t.story_id WHERE t.topic=? AND "
+        )
+        filter_params: tuple[str, ...] = (software, topic)
+    elif topic:
+        from_sql = "FROM public_story_topics t JOIN public_catalog c ON c.story_id=t.story_id WHERE t.topic=? AND "
+        filter_params = (topic,)
+    elif software:
+        from_sql = "FROM public_story_software s JOIN public_catalog c ON c.story_id=s.story_id WHERE s.software=? AND "
+        filter_params = (software,)
+    else:
+        from_sql = "FROM public_catalog c WHERE "
+        filter_params = ()
     while True:
         cursor_sql = f" AND ({prefix}{order},{prefix}{secondary},{prefix}story_id) < (?,?,?)" if cursor else ""
-        params = (*((topic,) if topic else ()), *(cursor or ()), batch_size)
+        params = (*filter_params, *(cursor or ()), batch_size)
         rows = db.execute(
             f"""SELECT c.story_id,c.published_at,c.updated_at,c.added_at,c.template_hash,c.json_sha256,c.public_json
                 {from_sql}{prefix}story_id NOT IN (SELECT story_id FROM story_aliases){cursor_sql}
@@ -317,39 +384,52 @@ def _accepted(db, *, order: str = "added_at", batch_size: int = 100, topic: str 
 
 
 def _feeds(artifacts: Artifacts, db, site: dict, base: str) -> None:
+    targets: list[tuple[str | None, str | None]] = [
+        (None, None),
+        *((category, None) for category in render.CATEGORIES),
+        *((None, software) for software in render.SOFTWARE),
+    ]
     with ExitStack() as stack:
         writers = {
-            category: stack.enter_context(artifacts.stream(render.feed_path(category), "application/rss+xml; charset=utf-8"))
-            for category in (None, *render.CATEGORIES)
+            key: stack.enter_context(artifacts.stream(render.feed_path(*key), "application/rss+xml; charset=utf-8"))
+            for key in targets
         }
-        counts = dict.fromkeys(writers, 0)
+        counts = dict.fromkeys(targets, 0)
         json_writer = stack.enter_context(artifacts.stream("feed.json", "application/feed+json; charset=utf-8"))
         json_writer.write(render.json_feed_header(site, base))
         for story in _accepted(db, order="updated_at"):
             xml = None
-            for category, writer in writers.items():
-                if category and category not in story["tags"]:
+            tag_set = set(story["tags"])
+            sw_set = set(render.story_software(story))
+            for key, writer in writers.items():
+                category, software = key
+                if category is not None and category not in tag_set:
                     continue
-                if not counts[category]:
-                    writer.write(render.rss_header(site, base, render.feed_path(category), story["updated_at"], category))
+                if software is not None and software not in sw_set:
+                    continue
+                if not counts[key]:
+                    writer.write(
+                        render.rss_header(site, base, render.feed_path(category, software), story["updated_at"], category, software)
+                    )
                 if xml is None:
                     xml = render.ET.tostring(render._rss_item(story, base), encoding="utf-8")
                 writer.write(xml)
-                if category is None:
-                    if counts[None]:
+                if key == (None, None):
+                    if counts[key]:
                         json_writer.write(b",\n")
                     json_writer.write(json.dumps(render._json_feed_item(story, base), ensure_ascii=False).encode("utf-8"))
-                counts[category] += 1
-        for category, writer in writers.items():
-            if not counts[category]:
-                writer.write(render.rss_header(site, base, render.feed_path(category), None, category))
+                counts[key] += 1
+        for key, writer in writers.items():
+            category, software = key
+            if not counts[key]:
+                writer.write(render.rss_header(site, base, render.feed_path(category, software), None, category, software))
             writer.write(b"</channel></rss>")
         json_writer.write(b"]}\n")
 
 
-def _remove_obsolete_pages(artifacts: Artifacts, pages: int, topic: str | None = None) -> None:
+def _remove_obsolete_pages(artifacts: Artifacts, pages: int, topic: str | None = None, software: str | None = None) -> None:
     for page in itertools.count(pages + 1):
-        relative = render._page_url("", page, topic) + "index.html"
+        relative = render._page_url("", page, topic, software) + "index.html"
         if artifacts.db.execute("SELECT 1 FROM public_artifacts WHERE path=?", (relative,)).fetchone() is None:
             return
         _target(artifacts.output, relative).unlink(missing_ok=True)
@@ -358,20 +438,23 @@ def _remove_obsolete_pages(artifacts: Artifacts, pages: int, topic: str | None =
 
 
 def _listing(artifacts: Artifacts, site: dict, base: str, health: list, *, count: int,
-             latest: str | None, refresh: bool, topic: str | None = None) -> None:
+             latest: str | None, refresh: bool, topic: str | None = None, software: str | None = None) -> None:
     page_size = site["page_size"]
     pages = max(1, (count + page_size - 1) // page_size)
-    stories = _accepted(artifacts.db, topic=topic)
+    stories = _accepted(artifacts.db, topic=topic, software=software)
     for page in range(1, pages + 1 if refresh else 2):
         batch = list(itertools.islice(stories, page_size))
-        relative = render._page_url("", page, topic) + "index.html"
+        relative = render._page_url("", page, topic, software) + "index.html"
         artifacts.text(
             relative,
-            render.index_html(site, base, batch, health if page == 1 else [], total=count, page=page, pages=pages, latest=latest, topic=topic),
+            render.index_html(
+                site, base, batch, health if page == 1 else [],
+                total=count, page=page, pages=pages, latest=latest, topic=topic, software=software,
+            ),
             "text/html; charset=utf-8",
         )
     if refresh:
-        _remove_obsolete_pages(artifacts, pages, topic)
+        _remove_obsolete_pages(artifacts, pages, topic, software)
 
 
 def _pointer(artifacts: Artifacts, db, site: dict, base: str, identity: str, story_id: str, survivor_id: str) -> None:
@@ -384,7 +467,7 @@ def _pointer(artifacts: Artifacts, db, site: dict, base: str, identity: str, sto
     pointer = render.pointer_json(base, story_id, survivor_id)
     with db:
         public_json, checksum = artifacts.write_article(story_id, article, pointer)
-        removed = db.execute("DELETE FROM public_story_topics WHERE story_id=?", (story_id,)).rowcount
+        removed = _delete_story_indexes(db, story_id)
         if accepted["json_sha256"] != checksum or accepted["template_hash"] == "" or removed:
             store_mod.bump_meta(db, "publication_catalog_revision")
         db.execute(
@@ -500,9 +583,9 @@ def build(config: dict, store, *, force: bool = False) -> dict:
                 _pointer(artifacts, db, site, base, identity, row["id"], alias[1])
             else:
                 with db:
-                    removed_topics = db.execute("DELETE FROM public_story_topics WHERE story_id=?", (row["id"],)).rowcount
+                    removed_indexes = _delete_story_indexes(db, row["id"])
                     _dequeue(db, row["id"])
-                    if removed_topics or _catalog_row(db, row["id"]) is not None:
+                    if removed_indexes or _catalog_row(db, row["id"]) is not None:
                         store_mod.bump_meta(db, "publication_catalog_revision")
                         store_mod.set_meta(db, publication_dirty="1")
             continue
@@ -533,7 +616,7 @@ def build(config: dict, store, *, force: bool = False) -> dict:
             if accepted is not None or (accepted := _catalog_row(db, row["id"])) is None:
                 if accepted is not None:
                     with db:
-                        if db.execute("DELETE FROM public_story_topics WHERE story_id=?", (row["id"],)).rowcount:
+                        if _delete_story_indexes(db, row["id"]):
                             store_mod.bump_meta(db, "publication_catalog_revision")
                             store_mod.set_meta(db, publication_dirty="1")
                 continue
@@ -541,7 +624,7 @@ def build(config: dict, store, *, force: bool = False) -> dict:
                 story, article = _render_accepted(db, site, base, accepted)
             except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
                 with db:
-                    if db.execute("DELETE FROM public_story_topics WHERE story_id=?", (row["id"],)).rowcount:
+                    if _delete_story_indexes(db, row["id"]):
                         store_mod.bump_meta(db, "publication_catalog_revision")
                         store_mod.set_meta(db, publication_dirty="1")
                 continue
@@ -564,6 +647,24 @@ def build(config: dict, store, *, force: bool = False) -> dict:
                     "INSERT INTO public_story_topics(topic,story_id,added_at,updated_at) VALUES(?,?,?,?)",
                     expected_topics,
                 )
+            expected_software = [
+                (sw, story["id"], story["added_at"], story["updated_at"]) for sw in render.story_software(story)
+            ]
+            software_stale = previous is None or previous["json_sha256"] != checksum or {
+                tuple(sw_row)
+                for sw_row in db.execute(
+                    "SELECT software,story_id,added_at,updated_at FROM public_story_software WHERE story_id=?",
+                    (story["id"],),
+                )
+            } != set(expected_software)
+            if software_stale:
+                if not topics_stale:
+                    store_mod.bump_meta(db, "publication_catalog_revision")
+                db.execute("DELETE FROM public_story_software WHERE story_id=?", (story["id"],))
+                db.executemany(
+                    "INSERT INTO public_story_software(software,story_id,added_at,updated_at) VALUES(?,?,?,?)",
+                    expected_software,
+                )
             db.execute(
                 """INSERT INTO public_catalog(story_id,published_at,updated_at,added_at,source_hash,template_hash,json_sha256,public_json)
                    VALUES(?,?,?,?,'',?,?,?) ON CONFLICT(story_id) DO UPDATE SET
@@ -574,7 +675,11 @@ def build(config: dict, store, *, force: bool = False) -> dict:
             if not quarantined:
                 _dequeue(db, story["id"])
     with db:
-        if db.execute("DELETE FROM public_story_topics WHERE story_id IN (SELECT story_id FROM story_aliases)").rowcount:
+        removed_aliases = (
+            db.execute("DELETE FROM public_story_topics WHERE story_id IN (SELECT story_id FROM story_aliases)").rowcount
+            + db.execute("DELETE FROM public_story_software WHERE story_id IN (SELECT story_id FROM story_aliases)").rowcount
+        )
+        if removed_aliases:
             store_mod.bump_meta(db, "publication_catalog_revision")
             store_mod.set_meta(db, publication_dirty="1")
     omitted_ids = _sync_catalog_checks(db, identity)
@@ -585,17 +690,12 @@ def build(config: dict, store, *, force: bool = False) -> dict:
            FROM public_catalog"""
     ).fetchone()
     retired_catalog = total_catalog - active_catalog
-    not_omitted_sql = (
-        "NOT EXISTS (SELECT 1 FROM public_catalog_checks chk JOIN public_catalog pc ON pc.story_id=chk.story_id "
-        "WHERE chk.story_id={col} AND chk.template_hash=? AND chk.omitted=1 "
-        "AND pc.template_hash!=? AND pc.json_sha256=chk.json_sha256)"
-    )
     if omitted_ids:
         count, latest = db.execute(
             f"""SELECT COUNT(*), MAX(c.updated_at)
                 FROM public_catalog c
                 WHERE c.story_id NOT IN (SELECT story_id FROM story_aliases)
-                  AND {not_omitted_sql.format(col='c.story_id')}""",
+                  AND {_NOT_OMITTED_SQL.format(col='c.story_id')}""",
             (identity, identity),
         ).fetchone()
     else:
@@ -619,22 +719,16 @@ def build(config: dict, store, *, force: bool = False) -> dict:
         artifacts.text("_headers", render.headers_text(base), "text/plain; charset=utf-8")
         _listing(artifacts, site, base, health, count=count, latest=latest, refresh=refresh)
         if refresh:
-            for topic in render.CATEGORIES:
-                if omitted_ids:
-                    t_count, t_latest = db.execute(
-                        f"""SELECT COUNT(*), MAX(t.updated_at)
-                            FROM public_story_topics t
-                            WHERE t.topic=?
-                              AND t.story_id NOT IN (SELECT story_id FROM story_aliases)
-                              AND {not_omitted_sql.format(col='t.story_id')}""",
-                        (topic, identity, identity),
-                    ).fetchone()
-                else:
-                    t_count, t_latest = db.execute(
-                        "SELECT COUNT(*),MAX(updated_at) FROM public_story_topics WHERE topic=? AND story_id NOT IN (SELECT story_id FROM story_aliases)",
-                        (topic,),
-                    ).fetchone()
-                _listing(artifacts, site, base, [], count=t_count, latest=t_latest, refresh=True, topic=topic)
+            filter_views = [
+                *((topic, None) for topic in render.CATEGORIES),
+                *((None, software) for software in render.SOFTWARE),
+                *((topic, software) for topic in render.CATEGORIES for software in render.SOFTWARE),
+            ]
+            for topic, software in filter_views:
+                f_count, f_latest = _filter_stats(
+                    db, topic=topic, software=software, omitted_ids=omitted_ids, identity=identity
+                )
+                _listing(artifacts, site, base, [], count=f_count, latest=f_latest, refresh=True, topic=topic, software=software)
             _feeds(artifacts, db, site, base)
         changed = store_mod.get_meta(db, "publication_dirty") == "1"
         if changed:

@@ -13,7 +13,17 @@ CONFIDENCES = ["confirmed", "reported", "suspected", "observed-anomaly"]
 STATES = ["developing", "mitigation-available", "fixed", "resolved", "released", "merged", "tagged"]
 # Pages and operators may also use states the writer never chooses.
 PUBLIC_STATES = STATES + ["no-longer-listed"]
-PRODUCTS = ["tor", "arti", "tor-browser", "torspec", "network"]
+SOFTWARE = [
+    "tor",
+    "arti",
+    "tor-browser",
+    "snowflake",
+    "webtunnel",
+    "lyrebird",
+    "torspec",
+    "tails",
+]
+PRODUCTS = [*SOFTWARE, "network"]
 UPDATE_CHARS = 300  # the text of one dated update
 
 STORY_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")

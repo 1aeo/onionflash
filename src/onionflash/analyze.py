@@ -13,9 +13,12 @@ from .llm import (
     has_malformed_tor_version, has_shouting_caps, is_complete_sentence, is_quoted_list_post,
     label_limits, strip_unreleased_tag, tag_name, unquoted_mail_text, validate_schema_field,
 )
-from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, STATES, UPDATE_CHARS
+from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, SOFTWARE, STATES, UPDATE_CHARS
 from .source_packet import OPTIONAL_SOURCE_FIELDS
-from .util import LIST_ARCHIVE_HOST, digest, effective_authority, mandatory_news_rule, normalize_evidence as _plain
+from .util import (
+    LIST_ARCHIVE_HOST, digest, effective_authority, gitlab_repo_name,
+    mandatory_news_rule, normalize_evidence as _plain, software_from_url,
+)
 
 PROMPT_VERSION = "onionflash-23"
 # Change this when update input filtering changes, independently of prompt prose.
@@ -261,6 +264,9 @@ privacy impacts or extra advice. Source-host location alone does not establish
 confirmation. Reserve confirmed for an official Tor Project announcement or a merged
 merge request's own change; use reported for issues, comments, maintainer statements,
 list posts and community claims. Confidence and editorial priority are separate.
+Populate products with the exact lowercase GitLab repository name of each affected
+Tor software (tor, arti, tor-browser, snowflake, webtunnel, lyrebird, torspec, tails),
+falling back to network only when no specific software repository applies.
 
 Return 1-3 literal supporting excerpts from the supplied title, content or a comment
 body in evidence. Each must have at least {MIN_EVIDENCE_CHARS} characters after whitespace normalization.
@@ -460,6 +466,15 @@ def validate_analysis(result: dict, item: dict, schema: dict = SCHEMA) -> dict:
         impact_context = unquoted_ctx
     if any(has_shouting_caps(result.get(key, "")) for key in ("title", "summary", "update")):
         raise AnalysisError("Model draft contains all-caps shouting")
+    if "products" in result:
+        inferred = (
+            [item["product"] if item.get("product") in SOFTWARE else software_from_url(item.get("url"))]
+            if item.get("kind") == "tag"
+            else [software_from_url(item.get("url")), item.get("product") if item.get("product") in SOFTWARE else None]
+        )
+        merged = list(dict.fromkeys([*result["products"], *(slug for slug in inferred if slug)]))
+        max_products = fields["products"].get("maxItems")
+        result["products"] = merged[:max_products] if isinstance(max_products, int) else merged
     # The impact sentence may restate only numbers and versions from the title, content or comment
     # bodies the writer saw, and is cleared on untrusted list posts, shouting or malformed versions.
     impact = result.get("why_it_matters")
@@ -485,27 +500,47 @@ def tag_update(item: dict, prior: dict) -> dict:
     }
 
 
+_TAG_LABELS = {
+    "tor": "Tor",
+    "arti": "Arti",
+    "tor-browser": "Tor Browser",
+    "snowflake": "Snowflake",
+    "webtunnel": "WebTunnel",
+    "lyrebird": "Lyrebird",
+    "torspec": "Tor specification",
+    "tails": "Tails",
+}
+
+
 def tag_notice(item: dict) -> dict:
     """Report only the observed tag entry, without inferring a release."""
     name = tag_name(item)
-    product = {
-        "tor": "Tor",
-        "arti": "Arti",
-        "tor-browser": "Tor Browser",
-        "torspec": "Tor specification",
-        "network": "Upstream",
-    }[item["product"]]
-    display_name = name if len(name) <= 96 else name[:95] + "…"
+    software = item["product"] if item["product"] in SOFTWARE else software_from_url(item.get("url"))
+    if software is not None:
+        label = _TAG_LABELS[software]
+        products = [software]
+    else:
+        repo = gitlab_repo_name(item.get("url")) if item["product"] == "network" else None
+        label = repo or "Upstream"
+        products = [item["product"]]
+    prefix = f"{label} tag observed: "
+    max_tag_len = max(1, min(96, SCHEMA["properties"]["title"]["maxLength"] - len(prefix)))
+    display_name = name if len(name) <= max_tag_len else name[: max_tag_len - 1] + "…"
+    summary = (
+        f"The upstream {label} feed lists the tag “{name}”. This notice records the upstream tag entry linked below."
+        if label != "Upstream"
+        else f"The upstream feed lists the tag “{name}”. This notice records the upstream tag entry linked below."
+    )
     return {
         "publish": True,
-        "title": f"{product} tag observed: {display_name}",
-        "summary": f"The upstream feed lists the tag “{name}”. This notice records the upstream tag entry linked below.",
+        "title": f"{prefix}{display_name}",
+        "summary": summary,
         "why_it_matters": "",
         "category": "release",
         "priority": "normal",
         "confidence": "reported",
         "state": "tagged",
-        "products": [item["product"]],
+        "products": products,
         "tags": ["release"],
         "evidence": [name],
     }

@@ -570,12 +570,40 @@ def effective_authority(
     return "development"
 
 
-_PRODUCT_NAMES = {"tor-browser": r"tor[- ]browser", "arti": "arti", "tor": "tor"}
+_PRODUCT_NAMES = {
+    "tor-browser": r"tor[- ]browser",
+    "snowflake": "snowflake",
+    "webtunnel": "webtunnel",
+    "lyrebird": "lyrebird",
+    "arti": "arti",
+    "tor": "tor",
+}
 _VERSION = re.compile(r"\d+\.\d+(?:\.\d+){0,2}(?:[-.]?(?:alpha|beta|rc|a)\.?\d*)?")
 _RELEASE_QUALIFIERS = r"(?:(?:new|stable|alpha|beta|security|bugfix|releases?|version)\s+)*"
 _RELEASE_AFTER = re.compile(r"\s+(?:is\s+)?(?:now\s+)?available\b")
 _RELEASE_EOL = re.compile(r"\b(?:end[- ]of[- ]life|eol|out of support|no longer supported)\b")
 GITLAB_PROJECT_PATH = r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+"
+GITLAB_SOFTWARE_PROJECTS = {
+    "tpo/core/tor": "tor",
+    "tpo/core/arti": "arti",
+    "tpo/applications/tor-browser": "tor-browser",
+    "tpo/anti-censorship/pluggable-transports/snowflake": "snowflake",
+    "tpo/anti-censorship/pluggable-transports/webtunnel": "webtunnel",
+    "tpo/anti-censorship/pluggable-transports/lyrebird": "lyrebird",
+    "tpo/core/torspec": "torspec",
+    "tpo/tails/tails": "tails",
+}
+_GITLAB_TORPROJECT_URL = re.compile(
+    r"^https://gitlab\.torproject\.org/([^?#]+?)/-/(?:issues|work_items|merge_requests|tags|blob|releases|commit)/\S+",
+    re.I,
+)
+_GITLAB_PROJECT_FULL = re.compile(GITLAB_PROJECT_PATH)
+_BLOG_RELEASE_PREFIXES = (
+    ("/new-release-tor-browser-", "tor-browser"),
+    ("/new-release-tails-", "tails"),
+    ("/new-release-arti-", "arti"),
+    ("/new-release-tor-", "tor"),
+)
 _GITLAB_OWN = re.compile(rf"^(https://[^/?#]+)/({GITLAB_PROJECT_PATH})/-/(?:issues|work_items|merge_requests|tags|blob)/\S+", re.I)
 _GITLAB_URL_REF = re.compile(rf"^(https://[^/?#]+)/({GITLAB_PROJECT_PATH})/-/(issues|work_items|merge_requests)/(\d+)(?:/|$)", re.I)
 _GITLAB_SHORT_REF = re.compile(rf"^(?:({GITLAB_PROJECT_PATH}))?([#!])(\d+)$")
@@ -736,13 +764,68 @@ def gitlab_refs(item: dict) -> tuple[list[str], list[str]]:
     return closing, mentioned
 
 
+def gitlab_project_path(url: object) -> str | None:
+    """Extract the lowercase project path from a Tor Project GitLab URL."""
+    if not isinstance(url, str):
+        return None
+    match = _GITLAB_TORPROJECT_URL.match(url.strip())
+    if not match:
+        return None
+    project = match.group(1)
+    if not _GITLAB_PROJECT_FULL.fullmatch(project) or any(part in {".", ".."} for part in project.split("/")):
+        return None
+    return project.lower()
+
+
+def gitlab_repo_name(url: object) -> str | None:
+    """Return the lowercase repository leaf name from a Tor Project GitLab URL."""
+    path = gitlab_project_path(url)
+    return path.rsplit("/", 1)[-1] if path else None
+
+
+def software_from_url(url: object) -> str | None:
+    """Map an upstream Tor Project GitLab or blog release URL to a software slug."""
+    path = gitlab_project_path(url)
+    if path is not None:
+        return GITLAB_SOFTWARE_PROJECTS.get(path)
+    if not isinstance(url, str):
+        return None
+    raw = url.strip()
+    if not raw:
+        return None
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() != "https" or parsed.netloc.lower() != "blog.torproject.org":
+        return None
+    blog_path = parsed.path.lower()
+    for prefix, software in _BLOG_RELEASE_PREFIXES:
+        if blog_path.startswith(prefix):
+            return software
+    return None
+
+
+def software_from_sources(sources: Iterable[object]) -> list[str]:
+    """Return deduplicated software slugs extracted from source entries or URLs."""
+    if not sources:
+        return []
+    found: list[str] = []
+    for entry in sources:
+        url = entry.get("url") if isinstance(entry, dict) else entry
+        software = software_from_url(url)
+        if software and software not in found:
+            found.append(software)
+    return found
+
+
 def release_mentions(item: dict) -> list[str]:
     """Extract release:<product>:<version> keys explicitly named with their product."""
     found = []
     for match in _RELEASE_MENTION.finditer(_item_texts(item)[1]):
         raw_prod, version = match.group(1).lower(), match.group(2).lower()
         if _VERSION.fullmatch(version):
-            product = "tor-browser" if raw_prod.startswith("tor") and len(raw_prod) > 3 else raw_prod
+            product = "tor-browser" if raw_prod in {"tor-browser", "tor browser"} else raw_prod
             found.append(f"release:{product}:{version}")
     return list(dict.fromkeys(found))
 
