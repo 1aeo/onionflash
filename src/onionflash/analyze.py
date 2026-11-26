@@ -530,6 +530,8 @@ def cache_key(
                 json.dumps(schema, ensure_ascii=False, allow_nan=False)]
     if prior is None:
         identity.extend([POLISH_PROMPT, json.dumps(POLISH_SCHEMA, ensure_ascii=False, allow_nan=False)])
+        if digest_mode != "none":
+            identity.extend(["comments_truncated", _row_comments_truncated(row, item)])
     else:
         # Category and this source predicate also shape the update grammar.
         identity.extend([prior_context(prior), prior.get("category"), _all_merge_sources(prior), UPDATE_INPUT_VERSION])

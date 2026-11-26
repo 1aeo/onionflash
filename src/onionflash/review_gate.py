@@ -971,6 +971,44 @@ def _pending_reask(record, stage, candidate, prepared):
     return True
 
 
+def _validate_specialist_entry(record: dict, entry: dict, proposals: list[dict]) -> None:
+    """Validate one saved 3-specialist verification entry and cross-check it against its merged result."""
+    if (record.get("specialists") != len(review.SPECIALISTS)
+            or entry.get("stage") != "verification"
+            or "tiebreaker" in entry or "issue" in entry
+            or not isinstance(entry["specialists"], list)
+            or [spec.get("specialist") for spec in entry["specialists"] if isinstance(spec, dict)] != list(review.SPECIALISTS)):
+        raise ValueError()
+    other_requests = (
+        {e.get("request") for e in record["reviews"] if e is not entry}
+        | {p.get("request") for p in proposals if p.get("disposition") != "discarded_context"}
+    )
+    spec_reqs: list[int] = []
+    for spec in entry["specialists"]:
+        if (not isinstance(spec, dict)
+                or set(spec) != {"specialist", "request", "verdict", "same_story", "failed"}
+                or type(spec["request"]) is not int or not 1 <= spec["request"] <= entry["request"]
+                or spec["request"] in other_requests
+                or spec["verdict"] not in review.VERDICTS
+                or (spec["verdict"] == "approve") != (not spec["failed"])
+                or (spec["same_story"] is not None
+                    and (not isinstance(spec["same_story"], str) or not review.STORY_ID_RE.fullmatch(spec["same_story"])))
+                or not isinstance(spec["failed"], list)
+                or any(crit not in review.CRITERIA for crit in spec["failed"])):
+            raise ValueError()
+        spec_reqs.append(spec["request"])
+    if len(set(spec_reqs)) != len(spec_reqs):
+        raise ValueError()
+    merged = entry["result"]
+    merged_criteria = merged["criteria"]
+    maj = 2 if len(entry["specialists"]) == 3 else len(entry["specialists"])
+    for crit in review.FACTUAL_CRITERIA:
+        in_domain_fail = any(crit in review.SPECIALIST_DOMAINS[spec["specialist"]] and crit in spec["failed"] for spec in entry["specialists"])
+        majority_fail = sum(crit in spec["failed"] for spec in entry["specialists"]) >= maj
+        if (in_domain_fail or majority_fail) and (merged_criteria[crit]["outcome"] == "pass" or merged["verdict"] == "approve"):
+            raise ValueError()
+
+
 def validate_review_state(record, stage, candidate, prepared, *, allow_cached=True):
     """Fail closed on damaged bookkeeping before it can reach a cached approval."""
     req_budget = ReviewRequests(record)
@@ -996,34 +1034,10 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                                                   or entry.get("stage") != "verification"
                                                   or "issue" in entry))):
                 raise ValueError()
-            if "specialists" in entry:
-                if (record.get("specialists") != len(review.SPECIALISTS)
-                        or entry.get("stage") != "verification"
-                        or "tiebreaker" in entry or "issue" in entry
-                        or not isinstance(entry["specialists"], list)
-                        or [spec.get("specialist") for spec in entry["specialists"] if isinstance(spec, dict)] != list(review.SPECIALISTS)):
-                    raise ValueError()
-                other_requests = (
-                    {e.get("request") for e in record["reviews"] if e is not entry}
-                    | {p.get("request") for p in proposals if p.get("disposition") != "discarded_context"}
-                )
-                spec_reqs: list[int] = []
-                for spec in entry["specialists"]:
-                    if (not isinstance(spec, dict)
-                            or set(spec) != {"specialist", "request", "verdict", "same_story", "failed"}
-                            or type(spec["request"]) is not int or not 1 <= spec["request"] <= entry["request"]
-                            or spec["request"] in other_requests
-                            or spec["verdict"] not in review.VERDICTS
-                            or (spec["same_story"] is not None
-                                and (not isinstance(spec["same_story"], str) or not review.STORY_ID_RE.fullmatch(spec["same_story"])))
-                            or not isinstance(spec["failed"], list)
-                            or any(crit not in review.CRITERIA for crit in spec["failed"])):
-                        raise ValueError()
-                    spec_reqs.append(spec["request"])
-                if len(set(spec_reqs)) != len(spec_reqs):
-                    raise ValueError()
             review.validate_review(entry["result"], prepared["packet"],
                                    update=prepared.get("mode") == "update", coverage=prepared.get("coverage"))
+            if "specialists" in entry:
+                _validate_specialist_entry(record, entry, proposals)
         for proposal in proposals:
             if (not isinstance(proposal, dict) or set(proposal) != fields
                     or proposal["error"] != review.INCONSISTENT_VERDICT
@@ -1751,6 +1765,16 @@ class _WorkerRequestObserver(RequestObserver):
             else:
                 raise ValueError("Invalid review request accounting")
 
+    def response_received(self) -> None:
+        """Disallow post-response refunds once a completion response has been received."""
+        with self._lock:
+            self._can_refund = False
+
+    def transport_failed(self) -> None:
+        """Disallow refunds once a transport attempt has already been dispatched."""
+        with self._lock:
+            self._can_refund = False
+
 
 def _supports_kwarg(fn, name: str) -> bool:
     try:
@@ -2056,8 +2080,7 @@ def _parallel_specialist_verify(reviewer_factory, candidate, prepared, record, r
         requests.callback()(1)
     lock = threading.Lock()
     shared_used = [0]
-    max_pool = requests.max_requests - base_reserved
-    obs_specs = [_WorkerRequestObserver(lock, shared_used, max_pool) for _ in review.SPECIALISTS]
+    obs_specs = [_WorkerRequestObserver(lock, shared_used, spec_count) for _ in review.SPECIALISTS]
     cand_hash = digest(candidate)
     ctx = _context(prepared, record["policy_hash"])
 
@@ -2091,8 +2114,7 @@ def _sequential_specialist_verify(reviewer, candidate, prepared, record, request
         requests.callback()(1)
     lock = threading.Lock()
     shared_used = [0]
-    max_pool = requests.max_requests - base_reserved
-    obs_specs = [_WorkerRequestObserver(lock, shared_used, max_pool) for _ in review.SPECIALISTS]
+    obs_specs = [_WorkerRequestObserver(lock, shared_used, spec_count) for _ in review.SPECIALISTS]
     cand_hash = digest(candidate)
     ctx = _context(prepared, record["policy_hash"])
     outcomes = [
@@ -2120,7 +2142,6 @@ def _parallel_initial_review(reviewer_factory, candidate, prepared, record, requ
     base_reserved = requests.state["reserved"]
     lock = threading.Lock()
     shared_used = [0]
-    max_pool = requests.max_requests - base_reserved
     cand_hash = digest(candidate)
     ctx = _context(prepared, record["policy_hash"])
 
@@ -2128,8 +2149,8 @@ def _parallel_initial_review(reviewer_factory, candidate, prepared, record, requ
         total_slots = 1 + len(review.SPECIALISTS)
         for _ in range(total_slots):
             requests.callback()(1)
-        obs_rev = _WorkerRequestObserver(lock, shared_used, max_pool)
-        obs_specs = [_WorkerRequestObserver(lock, shared_used, max_pool) for _ in review.SPECIALISTS]
+        obs_rev = _WorkerRequestObserver(lock, shared_used, total_slots)
+        obs_specs = [_WorkerRequestObserver(lock, shared_used, total_slots) for _ in review.SPECIALISTS]
         with ThreadPoolExecutor(max_workers=total_slots) as pool:
             fut_rev = pool.submit(_call_reviewer_worker, reviewer_factory, candidate, prepared, obs_rev, is_verify=False)
             fut_specs = [
@@ -2176,8 +2197,8 @@ def _parallel_initial_review(reviewer_factory, candidate, prepared, record, requ
 
     requests.callback()(1)
     requests.callback()(1)
-    obs_rev = _WorkerRequestObserver(lock, shared_used, max_pool)
-    obs_ver = _WorkerRequestObserver(lock, shared_used, max_pool)
+    obs_rev = _WorkerRequestObserver(lock, shared_used, 2)
+    obs_ver = _WorkerRequestObserver(lock, shared_used, 2)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         fut_rev = pool.submit(_call_reviewer_worker, reviewer_factory, candidate, prepared, obs_rev, is_verify=False)

@@ -2129,17 +2129,21 @@ def test_cache_key_digest_modes_update_truncation_selector_bounds_and_issue_rele
     assert analyze.cache_key(row, llm_1400, quote_digest=True) != analyze.cache_key(row, llm_2400, quote_digest=True)
     assert analyze.cache_key(row, llm_900, quote_digest=True) == analyze.cache_key(row, llm_1400, quote_digest=True)
     assert analyze.cache_key(row, llm_1400, quote_digest=False) == analyze.cache_key(row, llm_2400, quote_digest=False)
-    contracts = []
-    orig_contract = analyze._llm_contract
+    assert analyze.cache_key(row, llm_1400, best_of=1, quote_digest=None) == analyze.cache_key(row, llm_1400, best_of=1, quote_digest=False)
+    det_key = analyze.cache_key(row, llm_1400, best_of=3, quote_digest=None)
+    off_key = analyze.cache_key(row, llm_1400, best_of=3, quote_digest=False)
+    llm_key = analyze.cache_key(row, llm_1400, best_of=3, quote_digest=True)
     with monkeypatch.context() as mp:
-        mp.setattr(analyze, "_llm_contract", lambda eff: (contracts.append(eff["max_output_tokens"]), orig_contract(eff))[1])
-        analyze.cache_key(row, llm_900, best_of=3, quote_digest=None)
-        det_tokens = list(contracts)
-        contracts.clear()
-        analyze.cache_key(row, llm_900, best_of=3, quote_digest=True)
-        llm_tokens = list(contracts)
-    assert det_tokens == [32768, 900]
-    assert llm_tokens == [32768, 900, 1400]
+        mp.setattr(analyze._comments, "THREAD_DIGEST_PROMPT", "changed-digest-prompt")
+        assert analyze.cache_key(row, llm_1400, best_of=3, quote_digest=None) == det_key
+        assert analyze.cache_key(row, llm_1400, best_of=3, quote_digest=False) == off_key
+        assert analyze.cache_key(row, llm_1400, best_of=3, quote_digest=True) != llm_key
+    # Standalone comments_truncated binds only when digests are active (best_of>1 or quote_digest=True).
+    row_untrunc_sa = {"content_hash": "c" * 64, "payload": json.dumps({"comments_truncated": False})}
+    row_trunc_sa = {"content_hash": "c" * 64, "payload": json.dumps({"comments_truncated": True})}
+    assert analyze.cache_key(row_untrunc_sa, DEFAULTS["llm"]) == analyze.cache_key(row_trunc_sa, DEFAULTS["llm"])
+    assert analyze.cache_key(row_untrunc_sa, DEFAULTS["llm"], quote_digest=True) != analyze.cache_key(row_trunc_sa, DEFAULTS["llm"], quote_digest=True)
+    assert analyze.cache_key(row_untrunc_sa, DEFAULTS["llm"], best_of=3) != analyze.cache_key(row_trunc_sa, DEFAULTS["llm"], best_of=3)
 
     prior_dev = {
         "id": "a" * 24,

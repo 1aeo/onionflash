@@ -410,15 +410,18 @@ _LEXICAL_ADVICE_CHECKS = (
 _DIRECTIVE_TARGET_RE = re.compile(
     r"\b(?:"
     r"(?:users?|operators?|maintainers?|admins?|developers?|relays?|clients?)\s+"
+    r"(?:(?:on|for|under|with|using|running)\s+(?:[a-z0-9._-]+\s+){1,5})?"
     r"(?:(?:are|were|is)\s+)?(?:(?:being|strongly|explicitly)\s+)?"
     r"(?:asked|required|told|advised|instructed|encouraged|recommended)\s+to"
     r"|(?:announcement|post|report|issue|notice|maintainers?|developers?)\s+"
     r"(?:asks?|ask|encourages?|recommends?|advises?|instructs?|requires?)\s+"
     r"(?:[\w-]+\s+){0,5}?(?:to\s+)?(?:upgrad\w*|updat\w*|switch\w*|install\w*|configur\w*|edit\w*|replac\w*|enabl\w*|disabl\w*|remov\w*|treat\w*|handl\w*|apply|us(?:e|ing))"
     r"|(?:users?|operators?|maintainers?|admins?|developers?|relays?|clients?)\s+"
+    r"(?:(?:on|for|under|with|using|running)\s+(?:[a-z0-9._-]+\s+){1,5})?"
     r"(?:should|must|need\s+to)\s+(?:(?:\w+\s+){0,2})?"
     r"(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|handle|treat|apply)"
-    r"|requir(?:es?|ing)\s+(?:[\w-]+\s+){0,3}(?:users?|operators?|relays?)\s+to\s+\w+"
+    r"|requir(?:es?|ing)\s+(?:[\w-]+\s+){0,3}(?:users?|operators?|relays?)\s+"
+    r"(?:(?:on|for|under|with|using|running)\s+(?:[a-z0-9._-]+\s+){1,5})?to\s+\w+"
     r")\b",
     re.IGNORECASE,
 )
@@ -498,7 +501,13 @@ _SCOPE_PHRASE_PATTERNS = (
     (re.compile(r"\bdirectory\s+authorit(?:y|ies)\b", re.IGNORECASE), "dirauth"),
     (re.compile(r"\b(?:hidden|onion)\s+services?\b", re.IGNORECASE), "onion"),
 )
-_TAIL_SCOPE_PREP_RE = re.compile(r"\b(?:on|for|under|with|using|running)\s+([^.!?;,\n]{1,60})", re.IGNORECASE)
+_HARD_CLAUSE_STOP_RE = re.compile(r"[.!?;:\n]|—|--")
+_INDEP_CLAUSE_SPLIT_RE = re.compile(r",\s+(?:and|but|while|whereas|however|meanwhile)\b", re.IGNORECASE)
+_GOVERNING_INTRO_RE = re.compile(
+    r"^\s*(?:if|when|for|on|under|in|with|using|running|unless|where|only)\b",
+    re.IGNORECASE,
+)
+_TAIL_SCOPE_COND_RE = re.compile(r"\b(?:on|for|under|with|using|running|if|when)\s+([^.!?;,\n]{1,60})", re.IGNORECASE)
 
 
 def _extract_scope_qualifiers(text: str) -> set[str]:
@@ -511,12 +520,22 @@ def _extract_scope_qualifiers(text: str) -> set[str]:
     return qualifiers
 
 
-def _sentence_bounds(text: str, start: int, end: int) -> str:
-    """Return the sentence within `text` containing `[start, end]`."""
-    left = max((text.rfind(sep, 0, start) for sep in ".!?\n"), default=-1)
-    right_candidates = [pos for sep in ".!?\n" if (pos := text.find(sep, end)) != -1]
-    right = min(right_candidates) if right_candidates else len(text)
-    return text[left + 1 : right]
+def _directive_scope_qualifiers(text: str, start: int, action_end: int) -> set[str]:
+    """Return canonical qualifiers from the matched directive clause and governing conditions only."""
+    left_matches = list(_HARD_CLAUSE_STOP_RE.finditer(text, 0, start))
+    hard_left = left_matches[-1].end() if left_matches else 0
+    right_match = _HARD_CLAUSE_STOP_RE.search(text, action_end)
+    hard_right = right_match.start() if right_match else len(text)
+    prefix = _INDEP_CLAUSE_SPLIT_RE.split(text[hard_left:action_end])[-1]
+    parts = prefix.split(",")
+    qualifiers = _extract_scope_qualifiers(parts[-1])
+    for leading in parts[:-1]:
+        if _GOVERNING_INTRO_RE.match(leading):
+            qualifiers.update(_extract_scope_qualifiers(leading))
+    tail = _INDEP_CLAUSE_SPLIT_RE.split(text[action_end:hard_right], 1)[0]
+    for prep_match in _TAIL_SCOPE_COND_RE.finditer(tail):
+        qualifiers.update(_extract_scope_qualifiers(prep_match.group(1)))
+    return qualifiers
 
 
 def _action_stem(action: str) -> str:
@@ -584,12 +603,7 @@ def _has_near_imperative_cue(
     if not matches:
         return False
     for match in matches:
-        sent_start = max((src.rfind(sep, 0, match.start()) for sep in ".!?\n"), default=-1) + 1
-        src_prefix = src[sent_start : match.start("tail")]
-        tail_clause = _CLAUSE_STOP_RE.split(match.group("tail"), 1)[0]
-        src_quals = _extract_scope_qualifiers(src_prefix)
-        for prep_match in _TAIL_SCOPE_PREP_RE.finditer(tail_clause):
-            src_quals.update(_extract_scope_qualifiers(prep_match.group(1)))
+        src_quals = _directive_scope_qualifiers(src, match.start(), match.start("tail"))
         if src_quals and not src_quals.issubset(draft_quals):
             continue
         if not obj_tokens:
@@ -618,7 +632,7 @@ def _directive_actions_supported(
         if not any(word.startswith(stem) for word in src_actions):
             return False
         obj_tokens = _directive_obj_tokens(text[action_match.end() :])
-        draft_quals = _extract_scope_qualifiers(_sentence_bounds(text, action_match.start(), action_match.end()))
+        draft_quals = _directive_scope_qualifiers(text, action_match.start(), action_match.end())
         if not _has_near_imperative_cue(src, stem, cue_prefix, obj_tokens=obj_tokens, draft_quals=draft_quals):
             return False
     return matched_action or not require_all_near

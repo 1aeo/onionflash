@@ -1493,6 +1493,11 @@ def test_generic_pt_overlap_advice_filler_exceptions_and_pt_outage_protection(tm
     assert llm.has_unattributed_advice("Operators must enable logging.", win_src) is True
     assert llm.has_unattributed_advice("Windows operators must enable logging.", win_src) is False
     assert llm.has_unattributed_advice("Operators on Windows must enable logging.", win_src) is False
+    assert llm.has_unattributed_advice("Operators must enable logging; Windows users already have logs.", win_src) is True
+    non_dir_win = _story_item(title="Windows log info", content="Tor logs warnings when enabled.")
+    assert llm.has_unattributed_advice("Operators on Windows must enable logging.", non_dir_win) is True
+    sep_win_src = _story_item(title="Separate clause note", content="The Windows tests passed; operators must enable logging.")
+    assert llm.has_unattributed_advice("Operators must enable logging.", sep_win_src) is False
 
     exit_src = _story_item(title="Exit logging note", content="Exit relay operators must enable logging.")
     assert llm.has_unattributed_advice("Relay operators must enable logging.", exit_src) is True

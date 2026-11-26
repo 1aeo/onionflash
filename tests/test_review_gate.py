@@ -3062,3 +3062,100 @@ def test_specialist_upgrade_tiebreak_general_reask_atomic_wave_and_eval_diag(con
     recs = {r["case"]: r for r in lines if "case" in r}
     assert "decoded_diagnostic" not in recs["c-no-diag"]
     assert recs["c-own-diag"]["decoded_diagnostic"] == {"broken": "novelty_worker_only"}
+
+    # 5) Saved specialist entry cross-check rejects in-domain factual fail beside merged approve, while allowing single out-of-domain fail.
+    row_tamper = pending(store, item(id="https://example.org/spec3-cross-check", url="https://example.org/spec3-cross-check"))
+    prep_tamper = review_gate._prepare(store, cfg, row_tamper, analysis(), DATE)
+    ctx_tamper = review_gate._context(prep_tamper, review.policy_hash(cfg))
+    bad_spec_rec = {
+        **review_gate._new_record(row_tamper, policy_hash=review.policy_hash(cfg)),
+        "specialists": 3,
+        "candidate": prep_tamper["candidate"],
+        "request_budget": {"reserved": 4, "inconsistent_requests": [], "validation_reask": None},
+        "reviews": [
+            {"stage": "review", "candidate_hash": digest(prep_tamper["candidate"]), "request": 1, "result": verdict("approve"), **ctx_tamper},
+            {
+                "stage": "verification",
+                "candidate_hash": digest(prep_tamper["candidate"]),
+                "request": 4,
+                "result": verdict("approve"),
+                "specialists": [
+                    {"specialist": "grounding_status", "request": 2, "verdict": "hold", "same_story": None, "failed": ["source_support"]},
+                    {"specialist": "attribution_scope_advice", "request": 3, "verdict": "approve", "same_story": None, "failed": []},
+                    {"specialist": "novelty_news", "request": 4, "verdict": "approve", "same_story": None, "failed": []},
+                ],
+                **ctx_tamper,
+            },
+        ],
+    }
+    with pytest.raises(AnalysisError) as exc_tamper:
+        review_gate.validate_review_state(bad_spec_rec, "approved", prep_tamper["candidate"], prep_tamper, allow_cached=False)
+    assert exc_tamper.value.code == "app.damaged_job"
+
+    ood_pass_rec = copy.deepcopy(bad_spec_rec)
+    ood_pass_rec["reviews"][1]["specialists"] = [
+        {"specialist": "grounding_status", "request": 2, "verdict": "approve", "same_story": None, "failed": []},
+        {"specialist": "attribution_scope_advice", "request": 3, "verdict": "approve", "same_story": None, "failed": []},
+        {"specialist": "novelty_news", "request": 4, "verdict": "hold", "same_story": None, "failed": ["source_support"]},
+    ]
+    approved_key = review_gate._approval_key(prep_tamper["candidate"], ctx_tamper, review.policy_hash(cfg))
+    ood_pass_rec.update(outcome="approved", approval_key=approved_key)
+    review_gate.validate_review_state(ood_pass_rec, "approved", prep_tamper["candidate"], prep_tamper, allow_cached=False)
+
+    # 6) Worker pool in specialist verify is strictly capped at its 3 durable slots & disallows post-dispatch refund.
+    obs_guard = review_gate._WorkerRequestObserver(threading.Lock(), [0], 2)
+    obs_guard(1)
+    obs_guard.transport_failed()
+    with pytest.raises(ValueError):
+        obs_guard(-1)
+
+    extra_barrier = threading.Barrier(4, timeout=5)
+
+    class _ExtraRequestRev:
+        """Attempt two requests inside one specialist worker call."""
+
+        def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                   specialist=None, validation_error=None, on_request=None):
+            """Reserve once normally, then attempt an extra unreserved request on grounding_status."""
+            if on_request:
+                on_request(1)
+            extra_barrier.wait()
+            if on_request and specialist == "grounding_status":
+                on_request(1)
+            return verdict("approve", update=update)
+
+    row_cap = pending(store, item(id="https://example.org/spec3-durable-cap", url="https://example.org/spec3-durable-cap"))
+    with pytest.raises(review.ReviewLimitReached):
+        review_gate.process_item(
+            cfg, store, row_cap, Writer(), ApprovingReviewer(),
+            parallel_verify=True, reviewer_factory=lambda: _ExtraRequestRev(), specialists=3,
+        )
+
+    # 7) evaluate_review catches CompletionDeferred cleanly, marks incomplete=True, and writes its summary line.
+    class _DeferEvalReviewer(_ClientBase):
+        """Approve first case and raise CompletionDeferred on second case."""
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def complete(self, *args, **kwargs):
+            """Unused stub complete."""
+            return {}
+
+        def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                   specialist=None, issue=None, validation_error=None, on_request=None):
+            """Approve 51001 and raise CompletionDeferred on 51002."""
+            if "51002" in packet["sources"][0]["url"]:
+                raise CompletionDeferred("deadline reached")
+            if on_request:
+                on_request(1)
+            return verdict("approve", update=update)
+
+    monkeypatch.setattr(eval_mod, "EvaluationReviewer", _DeferEvalReviewer)
+    out_defer = tmp_path / "defer_out.jsonl"
+    assert eval_mod.main(["--config", str(cfg_path), "--cases", str(cases_path), "--output", str(out_defer)]) == 1
+    defer_lines = [json.loads(line) for line in out_defer.read_text(encoding="utf-8").splitlines()]
+    assert len(defer_lines) == 2
+    assert defer_lines[-1]["summary"]["incomplete"] is True
+    assert defer_lines[-1]["summary"]["cases"] == 1
+    assert defer_lines[-1]["summary"]["errors"] == 0

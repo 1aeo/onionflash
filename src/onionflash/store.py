@@ -1076,7 +1076,7 @@ class Store:
         """Select eligible live multi-update stories needing a cohesive summary refresh."""
         if limit <= 0:
             return []
-        rows = self.db.execute(
+        cursor = self.db.execute(
             """SELECT s.id, s.cluster_key, s.published_at, s.updated_at,
                       CASE WHEN typeof(s.payload)='text' THEN CAST(s.payload AS BLOB) END AS payload_blob,
                       sr.last_refreshed_at, sr.update_count AS sr_update_count,
@@ -1091,48 +1091,51 @@ class Store:
                      WHERE a.story_id=s.id OR a.cluster_key=s.cluster_key
                  )
                ORDER BY s.updated_at DESC, s.id"""
-        ).fetchall()
+        )
         selected: list[dict] = []
-        for row in rows:
-            if editorial.retired(self.db, story_id=row["id"], cluster_key=row["cluster_key"]) is not None:
-                continue
-            payload = saved_object(row["payload_blob"])
-            if payload is None or payload.get("origin") == "network-health":
-                continue
-            updates = payload.get("updates")
-            if not isinstance(updates, list) or len(updates) < MIN_REFRESH_UPDATES:
-                continue
-            current_hash = story_refresh_hash(payload)
-            prev_count = row["sr_update_count"]
-            if prev_count is not None:
-                if not (
-                    prev_count < len(updates)
-                    and (len(updates) - prev_count) >= MIN_NEW_UPDATES_FOR_REFRESH
-                    and row["sr_refreshed_hash"] != current_hash
-                ):
+        try:
+            for row in cursor:
+                if editorial.retired(self.db, story_id=row["id"], cluster_key=row["cluster_key"]) is not None:
                     continue
-            selected.append({
-                "id": row["id"],
-                "story_id": row["id"],
-                "cluster_key": row["cluster_key"],
-                "published_at": row["published_at"],
-                "updated_at": row["updated_at"],
-                "payload": payload,
-                "update_count": len(updates),
-                "refreshed_hash": current_hash,
-                "previous_refresh": (
-                    {
-                        "last_refreshed_at": row["last_refreshed_at"],
-                        "update_count": prev_count,
-                        "refreshed_hash": row["sr_refreshed_hash"],
-                        "status": row["sr_status"],
-                    }
-                    if prev_count is not None
-                    else None
-                ),
-            })
-            if len(selected) >= limit:
-                break
+                payload = saved_object(row["payload_blob"])
+                if payload is None or payload.get("origin") == "network-health":
+                    continue
+                updates = payload.get("updates")
+                if not isinstance(updates, list) or len(updates) < MIN_REFRESH_UPDATES:
+                    continue
+                current_hash = story_refresh_hash(payload)
+                prev_count = row["sr_update_count"]
+                if prev_count is not None:
+                    if not (
+                        prev_count < len(updates)
+                        and (len(updates) - prev_count) >= MIN_NEW_UPDATES_FOR_REFRESH
+                        and row["sr_refreshed_hash"] != current_hash
+                    ):
+                        continue
+                selected.append({
+                    "id": row["id"],
+                    "story_id": row["id"],
+                    "cluster_key": row["cluster_key"],
+                    "published_at": row["published_at"],
+                    "updated_at": row["updated_at"],
+                    "payload": payload,
+                    "update_count": len(updates),
+                    "refreshed_hash": current_hash,
+                    "previous_refresh": (
+                        {
+                            "last_refreshed_at": row["last_refreshed_at"],
+                            "update_count": prev_count,
+                            "refreshed_hash": row["sr_refreshed_hash"],
+                            "status": row["sr_status"],
+                        }
+                        if prev_count is not None
+                        else None
+                    ),
+                })
+                if len(selected) >= limit:
+                    break
+        finally:
+            cursor.close()
         return selected
 
     def record_refresh_status(

@@ -15,7 +15,7 @@ import time
 
 from onionflash.analyze import AnalysisError, Analyzer
 from onionflash.config import load_config
-from onionflash.llm import is_quoted_list_post, unquoted_mail_text
+from onionflash.llm import CompletionDeferred, is_quoted_list_post, unquoted_mail_text
 from onionflash.render import prepare_story
 from onionflash.review import EDITABLE, SPECIALISTS, Reviewer, final_holds, policy_hash
 from onionflash.review_gate import (OUTCOME_STAGES, ReviewRequests, _parallel_initial_review,
@@ -431,6 +431,10 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
                         outcomes[iteration, case["id"]] = ok
                     else:
                         totals["controlled_mismatches"] += not matched
+                except CompletionDeferred:
+                    totals["cases"] -= 1
+                    totals["incomplete"] = True
+                    break
                 except (AnalysisError, ValueError, TypeError, KeyError) as exc:
                     totals["errors"] += 1
                     record["error"] = type(exc).__name__
