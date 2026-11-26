@@ -489,7 +489,7 @@ SPECIALIST_PROMPTS = {
 SPECIALIST VERIFICATION FOCUS (grounding_status — validate all 9 criteria; focus on source_support, status, uncertainty_attribution, technical_details):
 - Verify every factual claim, precondition, opt-in/experimental requirement, and maintainer narrowing or disagreement across title, summary, why_it_matters (or updates[-1].text in latest_update mode): FAIL uncertainty_attribution or source_support when a reporter's claim or disputed defect is stated as unqualified settled fact without attribution ("The report claims...") or drops material preconditions (e.g. non-default config or experimental feature) or turns a built-in software list into operators' "intended configuration".
 - Verify status, confidence, category, and tags against packet.sources: a gitlab_issue (even closed and mentioning a release version in comments) NEVER supports introducing confidence="confirmed", state="released", category="release", or tag "release" (though in latest_update mode prior_story's already-confirmed or already-released labels may be retained unchanged); a gitlab_mr alone NEVER supports introducing state="released" or category="release". Also fail status or uncertainty_attribution if an unconfirmed user comment is treated as confirming resolution or completed action.
-- Verify technical_details and completeness: fail source_support/technical_details on ALL-CAPS shouting, nonexistent 3-part C-Tor version typos (e.g. 0.4.17), or an incomplete why_it_matters fragment lacking terminal sentence punctuation (e.g. trailing "<= 0.4.8.x", trailing comma, or unpunctuated heading/chat).
+- Verify technical_details and completeness: fail source_support/technical_details on ALL-CAPS shouting, nonexistent 3-part C-Tor version typos (e.g. 0.4.17), or (in standalone story mode) an incomplete why_it_matters fragment lacking terminal sentence punctuation (e.g. trailing "<= 0.4.8.x", trailing comma, or unpunctuated heading/chat).
 - Do NOT false-alarm on brief/plain supported summaries, empty why_it_matters (""), or faithful attributed impacts that preserve qualifiers and end cleanly.
 """,
     "attribution_scope_advice": """
@@ -505,6 +505,15 @@ SPECIALIST VERIFICATION FOCUS (novelty_news — validate all 9 criteria; focus o
 - When prior_story is null and recent covers the same concrete change under routing rules (a)-(e), set same_story to that live recent entry's id unless the distinct official incident-response exception applies (evaluating further defenses or expecting further releases). Never route to retracted or network-health entries, or across distinct versions/incidents.
 - Enforce the 14-day recency window (honoring HackerOne, mandatory_news_rule, and Severity::high/critical exceptions), mandatory_news_rule ("trove", "release_announcement", "torproject_new_thread"), HackerOne triage, dirauth operational rules, and tor-dev 5-case proposal/critique rules.
 - In latest_update mode, skip (naming prior_story.id verbatim) redundant echoes/check-ins/me-too replies while passing material lifecycle transitions, new measurements, maintainer disputes, or new response plans. Keep factual criteria passing unless a clear defect exists.
+""",
+}
+UPDATE_SPECIALIST_PROMPTS = {
+    "attribution_scope_advice": """
+SPECIALIST VERIFICATION FOCUS (attribution_scope_advice — latest_update mode; validate all 9 criteria; focus on actor_and_action, scope_timing, and operational_advice):
+- Check ONLY candidate.updates[-1].text (and post-update labels) for recommendations, requirements, or operational claims ("are advised to", "should switch to", "must treat", "must configure", "intended configuration excludes"): FAIL operational_advice unless an explicit packet passage in candidate.updates[-1].sources directs that exact actor to take that action.
+- Do NOT evaluate, fail, or modify read-only title, summary, or why_it_matters carried from prior_story (even if prior why_it_matters states earlier advice or qualifiers).
+- Check actor_and_action and scope_timing in candidate.updates[-1].text: distinguish requested vs merged/completed actions (a merged revert MR is NOT "requested"), software defaults vs operator configuration, and keep stated roles strictly source-bound (never calling someone a developer without committed C-Tor code evidence, and never swapping >-quoted mailing-list participants with the sender).
+- Do NOT false-alarm on factual updates, valid attributed action reports ("The announcement asks...", "The report says..."), or explicit official upgrade requests stated in the cited update passages.
 """,
 }
 # The problem that review_gate.next_step names when it asks a review to repair release labels.
@@ -557,8 +566,9 @@ def policy_hash(config: dict) -> str:
     identity = {key: llm[key] for key in ("model", "base_url", "fallback_base_urls", "max_output_tokens",
                                          "enable_thinking", "send_chat_template_kwargs")}
     return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, ROUTING_PROMPT, UPDATE_SYSTEM_PROMPT,
-                   UPDATE_VERIFY_PROMPT, SPECIALISTS, SPECIALIST_PROMPTS, RELEASE_ISSUE, INCONSISTENT_VERDICT,
-                   VALIDATION_REASK_PROMPT, SCHEMA, UPDATE_REPAIR, identity, CompletionClient.REQUEST_POLICY])
+                   UPDATE_VERIFY_PROMPT, SPECIALISTS, SPECIALIST_PROMPTS, UPDATE_SPECIALIST_PROMPTS,
+                   RELEASE_ISSUE, INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT, SCHEMA, UPDATE_REPAIR,
+                   identity, CompletionClient.REQUEST_POLICY])
 
 
 def _text(value, maximum: int) -> None:
@@ -585,13 +595,33 @@ def _coverage_ids(coverage: dict | None) -> tuple[str | None, list[str], set[str
     return prior_id, sorted(live), retracted
 
 
+def _cited_packet_sources(
+    packet_sources: list[dict],
+    update_sources: list[dict] | tuple[dict, ...] | None,
+) -> list[dict]:
+    if not update_sources:
+        return []
+    exact_urls = {canonical_url(s["url"]) for s in update_sources if isinstance(s, dict) and isinstance(s.get("url"), str)}
+    base_urls = {url.split("#", 1)[0] for url in exact_urls}
+    return [
+        source for source in packet_sources
+        if isinstance(source, dict)
+        and isinstance(source.get("url"), str)
+        and canonical_url(source["url"]).split("#", 1)[0] in base_urls
+    ]
+
+
 def _widen_update_state(limits: dict, sources: list[dict], prior: dict, candidate_sources=()) -> None:
+    has_tag = any(s.get("kind") == "tag" for s in sources) or prior.get("state") == "tagged"
     if limits["state"] == ["merged"] and (
         (isinstance(prior.get("state"), str) and prior["state"] in STATES and prior["state"] != "merged")
         or any(isinstance(s, dict) and "/-/merge_requests/" not in str(s.get("url") or "") for s in (candidate_sources or ()))
     ):
-        has_tag = any(s.get("kind") == "tag" for s in sources) or prior.get("state") == "tagged"
-        limits["state"] = [s for s in STATES if has_tag or s != "tagged"]
+        limits["state"] = [s for s in STATES if (has_tag or s != "tagged") and s != "released"]
+    elif has_tag and limits["state"] != ["merged"] and "tagged" not in limits["state"]:
+        allowed = set(limits["state"])
+        allowed.add("tagged")
+        limits["state"] = [s for s in STATES if s in allowed]
     widen_release_state_for_update(limits, prior)
 
 
@@ -601,6 +631,7 @@ def repair_limits(
     *,
     update: bool = False,
     candidate_sources: list[dict] | tuple[dict, ...] | None = None,
+    update_sources: list[dict] | tuple[dict, ...] | None = None,
 ) -> dict:
     """Use the same source and prior-label bounds for every kind of proposed edit."""
     limits = label_limits(packet["sources"])
@@ -608,7 +639,10 @@ def repair_limits(
         prior = (coverage or {}).get("prior_story") or {}
         if prior.get("confidence") == "confirmed":
             limits["confidence"] = ["confirmed"]
-        _widen_update_state(limits, packet["sources"], prior, candidate_sources)
+        cited = _cited_packet_sources(packet["sources"], update_sources)
+        if cited:
+            limits["state"] = label_limits(cited)["state"]
+        _widen_update_state(limits, cited or packet["sources"], prior, candidate_sources)
     return limits
 
 
@@ -933,12 +967,15 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
         prior = (prepared.get("coverage") or {}).get("prior_story") or {}
         if prior.get("confidence") == "confirmed" and "confirmed" not in limits["confidence"]:
             limits = {**limits, "confidence": [*limits["confidence"], "confirmed"]}
-        _widen_update_state(limits, sources, prior, candidate.get("sources"))
         entry = candidate["updates"][-1]
         exact_urls = {canonical_url(source["url"]) for source in entry["sources"]}
         cited_urls = {url.split("#", 1)[0] for url in exact_urls}
         cited_sources = [(source, source_url) for source in sources
                          if (source_url := canonical_url(source["url"])).split("#", 1)[0] in cited_urls]
+        cited_units = [source for source, _ in cited_sources]
+        if cited_units:
+            limits = {**limits, "state": label_limits(cited_units)["state"]}
+        _widen_update_state(limits, cited_units or sources, prior, candidate.get("sources"))
         claimed = (_claimed_done(entry["text"])
                    if any(source.get("kind") == "gitlab_issue" for source, _ in cited_sources) else [])
         proof = _plain("\n".join(
@@ -1049,7 +1086,11 @@ class Reviewer(CompletionClient):
                 check["properties"]["source_refs"]["items"]["enum"] = sorted(refs)
         # A repair offers only the labels this packet allows.
         repair = schema["properties"]["repair"]["anyOf"][1]["properties"]
-        limits = repair_limits(packet, coverage, update=update, candidate_sources=candidate_public.get("sources"))
+        update_sources = (candidate_public.get("updates") or [{}])[-1].get("sources") if update else None
+        limits = repair_limits(
+            packet, coverage, update=update, candidate_sources=candidate_public.get("sources"),
+            update_sources=update_sources,
+        )
         apply_label_limits(repair, limits, nullable=True)
         # Each call starts with the rubric, exact candidate and bounded context.
         # A prior model response, critique or approval is never part of its history.
@@ -1075,7 +1116,8 @@ class Reviewer(CompletionClient):
         if not update and (coverage or {}).get("recent"):
             prompt = prompt + ROUTING_PROMPT
         if specialist is not None:
-            prompt = prompt + "\n" + SPECIALIST_PROMPTS[specialist]
+            spec_prompt = UPDATE_SPECIALIST_PROMPTS.get(specialist, SPECIALIST_PROMPTS[specialist]) if update else SPECIALIST_PROMPTS[specialist]
+            prompt = prompt + "\n" + spec_prompt
         if validation_error is not None:
             prompt += VALIDATION_REASK_PROMPT
         result = self.complete(prompt, payload, schema, "onionflash_review", on_request=on_request)
@@ -1168,7 +1210,10 @@ def merge_specialist_verdicts(
     pairs = list(zip(spec_names, validated))
     maj = 2 if len(pairs) == 3 else len(pairs)
     prior_id, recent_ids, retracted_ids = _coverage_ids(coverage)
-    limits = repair_limits(packet, coverage, update=update, candidate_sources=candidate.get("sources"))
+    update_sources = (candidate.get("updates") or [{}])[-1].get("sources") if update else None
+    limits = repair_limits(
+        packet, coverage, update=update, candidate_sources=candidate.get("sources"), update_sources=update_sources,
+    )
 
     criteria_out: dict[str, dict] = {}
     for criterion in FACTUAL_CRITERIA:

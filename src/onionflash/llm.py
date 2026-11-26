@@ -317,7 +317,7 @@ def is_quoted_list_post(url: object, text: str) -> bool:
 
 
 _TRAILING_VERSION_FRAGMENT_RE = re.compile(
-    r"(?:(?<![A-Za-z0-9.])0\.\d+(?:\.\d+)?\.|\bv?\d+\.\d+(?:\.\d+)*\.[A-Za-z]|[<>]=?\s*v?\d+(?:\.\d+)*(?:\.[A-Za-z0-9]+)?\.?)$"
+    r"(?:(?<![A-Za-z0-9.])0\.\d+(?:\.\d+)?\.|\bv?\d+\.\d+(?:\.\d+)*\.[A-Za-z]|[<>]=?\s*(?:v?\d+(?:\.\d+)*\.[xX]\.?|v?\d+\.|\.?))$"
 )
 _TRAILING_INCOMPLETE_WORD_RE = re.compile(
     r"(?:\b(?i:and|or|but|for|with|to|of|from|that|which|because|since|while|when|if|the)\b|\b(?:a|an)\b)\s*[.!]?$"
@@ -424,17 +424,17 @@ _DIRECTIVE_TARGET_RE = re.compile(
 )
 _SRC_DIRECTIVE_CUE_RE = re.compile(
     r"(?:"
-    r"(?:^|[.!?\n]\s*)(?:please\s+)?(?:upgrade|update|switch|install|configure|enable|disable|remove)(?:\s+(?:to|your|the|now|as|immediately|away|over|it|them|this|that)\b)"
+    r"(?:^|[.!?\n]\s*)(?:please\s+)?(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|treat|handle|apply)(?:\s+(?:to|your|the|now|as|immediately|away|over|it|them|this|that)\b)"
     r"|\b(?:"
     r"asks?|asked|asking"
-    r"|please\s+(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|apply)"
+    r"|please\s+(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|treat|handle|apply)"
     r"|encourag(?:e|es|ed|ing)"
     r"|recommend(?:s|ed|ing|ation)?"
     r"|advis(?:e|es|ed|ing)|advice"
     r"|instruct(?:s|ed|ing)"
     r"|requir(?:e|es|ed|ing)\s+(?:[\w-]+\s+){0,3}(?:users?|operators?|relays?|them|you|all)\s+to"
-    r"|must\s+(?!-\s*fix)(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|handle|apply)"
-    r"|should\s+(?!be\s+(?:affected|able\s+to)\b)(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|handle|apply)"
+    r"|must\s+(?!-\s*fix)(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|treat|handle|apply)"
+    r"|should\s+(?!be\s+(?:affected|able\s+to)\b)(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|treat|handle|apply)"
     r")\b"
     r")",
     re.IGNORECASE,
@@ -442,12 +442,12 @@ _SRC_DIRECTIVE_CUE_RE = re.compile(
 _ACTION_IN_TEXT_RE = re.compile(
     r"\b(?:to|should|must|encourages?|recommends?)\s+(?:\w+\s+){0,2}?"
     r"(upgrade|upgrading|update|updating|switch|switching|install|installing|configure|configuring|"
-    r"edit|editing|replace|replacing|enable|enabling|disable|disabling|remove|removing|treat|handle)\b",
+    r"edit|editing|replace|replacing|enable|enabling|disable|disabling|remove|removing|treat|treating|handle|handling|apply|applying)\b",
     re.IGNORECASE,
 )
 _SRC_ACTION_WORDS_RE = re.compile(
     r"\b(upgrade|upgrading|update|updating|switch|switching|install|installing|configure|configuring|"
-    r"edit|editing|replace|replacing|enable|enabling|disable|disabling|remove|removing|treat|handle)\b",
+    r"edit|editing|replace|replacing|enable|enabling|disable|disabling|remove|removing|treat|treating|handle|handling|apply|applying)\b",
     re.IGNORECASE,
 )
 
@@ -460,15 +460,88 @@ _EXPLICIT_IMPERATIVE_CUE_PREFIX = (
     r"(?:please|ask(?:s|ed|ing)?|encourag\w*|instruct\w*|"
     r"should(?:\s+also)?(?!\s+be\s+(?:affected|able\s+to)\b)|must(?!-\s*fix))"
 )
+_CLAUSE_STOP_RE = re.compile(
+    r"[.!?;,\n]|\s+(?:to\s+(?:prevent|avoid|receive|maintain|ensure|protect|mitigate|keep)|because|since|so\s+that|which|that|if|when|while|after|before)\b|—|--",
+    re.IGNORECASE,
+)
+_DIRECTIVE_OBJ_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
+_DIRECTIVE_OBJ_STOPWORDS = frozenset({
+    "a", "an", "the", "this", "that", "these", "those", "it", "them", "their", "your", "our", "its",
+    "to", "for", "of", "in", "on", "at", "by", "with", "from", "as", "into", "over", "away", "up", "out",
+    "and", "or", "all", "any", "new", "latest", "newest", "current", "existing", "immediately", "now", "soon",
+    "asap", "explicitly", "properly", "carefully", "users", "user", "operators", "operator", "maintainers",
+    "maintainer", "admins", "admin", "developers", "developer", "relays", "relay", "clients", "client",
+    "bridges", "bridge", "authorities", "authority", "possible", "affected", "tor", "arti", "report",
+    "reports", "issue", "issues", "story", "notice", "release", "releases", "version", "versions", "channel",
+    "default", "defaults", "mode", "setting", "settings", "option", "options", "flag", "flags", "output",
+})
 
 
-def _has_near_imperative_cue(src: str, stem: str, cue_prefix: str) -> bool:
+def _action_stem(action: str) -> str:
+    if action.startswith("upgrad"):
+        return "upgrad"
+    if action.startswith("updat"):
+        return "updat"
+    if action.startswith("appl"):
+        return "appl"
+    return action[:5]
+
+
+def _normalize_obj_token(token: str) -> str:
+    if len(token) > 4 and token.endswith("ing"):
+        base = token[:-3]
+        if len(base) >= 3 and base[-1] == base[-2]:
+            base = base[:-1]
+        return base
+    if len(token) > 4 and token.endswith("ation"):
+        return token[:-5]
+    if len(token) > 4 and token.endswith("ed"):
+        return token[:-2]
+    if len(token) > 3 and token.endswith("s"):
+        return token[:-1]
+    return token
+
+
+def _directive_obj_tokens(fragment: str) -> list[str]:
+    clause = _CLAUSE_STOP_RE.split(fragment, 1)[0]
+    tokens: list[str] = []
+    for raw in _DIRECTIVE_OBJ_TOKEN_RE.findall(clause.lower()):
+        cleaned = raw.strip("._-")
+        if not cleaned or cleaned in _DIRECTIVE_OBJ_STOPWORDS:
+            continue
+        if cleaned not in tokens:
+            tokens.append(cleaned)
+    return tokens
+
+
+def _obj_tokens_match(draft_tok: str, src_tok: str) -> bool:
+    if draft_tok == src_tok:
+        return True
+    norm_d, norm_s = _normalize_obj_token(draft_tok), _normalize_obj_token(src_tok)
+    if norm_d == norm_s:
+        return True
+    if min(len(norm_d), len(norm_s)) >= 4 and (norm_d.startswith(norm_s) or norm_s.startswith(norm_d)):
+        return True
+    return False
+
+
+def _has_near_imperative_cue(src: str, stem: str, cue_prefix: str, obj_tokens: tuple[str, ...] | list[str] = ()) -> bool:
     cue_near = re.compile(
-        r"(?:\b" + cue_prefix + r"\b[^.!?\n]{0,60}\b" + stem + r"(?!\s+checks?\b)"
-        r"|(?:^|[.!?\n]\s*)(?:please\s+)?" + stem + r"\w*\s+(?:to|your|the|now|as|immediately|away|over|it|them|this|that)\b)",
+        r"(?:\b" + cue_prefix + r"\b[^.!?\n]{0,60}\b" + stem + r"[a-z]*\b(?!\s+checks?\b)"
+        r"|(?:^|[.!?\n]\s*)(?:please\s+)?" + stem + r"[a-z]*\b(?=\s+(?:to|your|the|now|as|immediately|away|over|it|them|this|that)\b))"
+        r"(?P<tail>[^.!?\n]{0,120})",
         re.IGNORECASE,
     )
-    return bool(cue_near.search(src))
+    matches = list(cue_near.finditer(src))
+    if not matches:
+        return False
+    if not obj_tokens:
+        return True
+    for match in matches:
+        src_tokens = _directive_obj_tokens(match.group("tail"))
+        if all(any(_obj_tokens_match(d_tok, s_tok) for s_tok in src_tokens) for d_tok in obj_tokens):
+            return True
+    return False
 
 
 def _directive_actions_supported(
@@ -485,12 +558,16 @@ def _directive_actions_supported(
     for action_match in _ACTION_IN_TEXT_RE.finditer(text):
         matched_action = True
         action = action_match.group(1).lower()
-        stem = action[:5]
+        stem = _action_stem(action)
         if not any(word.startswith(stem) for word in src_actions):
             return False
-        if require_all_near or action in {"update", "updating", "upgrade", "upgrading", "switch", "switching"}:
-            if not _has_near_imperative_cue(src, stem, cue_prefix):
-                return False
+        obj_tokens = _directive_obj_tokens(text[action_match.end() :])
+        if (
+            require_all_near
+            or obj_tokens
+            or action in {"update", "updating", "upgrade", "upgrading", "switch", "switching"}
+        ) and not _has_near_imperative_cue(src, stem, cue_prefix, obj_tokens=obj_tokens):
+            return False
     return matched_action or not require_all_near
 
 
@@ -548,10 +625,10 @@ def label_limits(sources: list[dict]) -> dict:
 
 
 def widen_release_state_for_update(limits: dict, prior: dict | None) -> dict:
-    """Preserve `'released'` in update state `limits` when `prior` is already released or categorized as a release."""
+    """Preserve `'released'` in update state `limits` only when `prior` already has `state == 'released'`."""
     if not isinstance(limits, dict) or not isinstance(prior, dict):
         return limits
-    if prior.get("state") == "released" or prior.get("category") == "release":
+    if prior.get("state") == "released":
         allowed = set(limits.get("state") or ())
         allowed.add("released")
         limits["state"] = [value for value in STATES if value in allowed]

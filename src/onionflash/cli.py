@@ -329,7 +329,9 @@ def _classify_pending_row(
         best_of, default_qd = _draft_cache_options()
         if quote_digest is None:
             quote_digest = default_qd
-    writer_key = cache_key(row, run_config["llm"], prior, best_of=best_of, quote_digest=quote_digest)
+    writer_key = cache_key(
+        row, run_config["llm"], prior, best_of=best_of, quote_digest=quote_digest, item=writer_item,
+    )
     locked_reuse = (
         job is not None
         and existing is not None

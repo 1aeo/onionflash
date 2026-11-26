@@ -721,11 +721,17 @@ def _source_repo_scopes(entries: Iterable[dict]) -> set[str]:
 
 def _story_pt_family(story: dict) -> str | None:
     tags = story.get("tags") if isinstance(story.get("tags"), list) else ()
+    generic_fallback: str | None = None
     for src in (story.get("sources") or ()):
         if isinstance(src, dict):
             if family := item_pt_family({"url": src.get("url") or "", "title": src.get("title") or "", "tags": tags}):
-                return family
-    return item_pt_family({"title": story.get("title") or "", "content": _story_search_text(story), "tags": tags})
+                if family != "pluggable-transports":
+                    return family
+                generic_fallback = family
+    text_family = item_pt_family({"title": story.get("title") or "", "content": _story_search_text(story), "tags": tags})
+    if text_family and text_family != "pluggable-transports":
+        return text_family
+    return generic_fallback or text_family
 
 
 def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = frozenset()) -> list[tuple[str, str]]:

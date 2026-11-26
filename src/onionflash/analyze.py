@@ -21,7 +21,7 @@ from .source_packet import OPTIONAL_SOURCE_FIELDS
 from .transport import FetchError
 from .util import (
     LIST_ARCHIVE_HOST, digest, effective_authority, gitlab_repo_name,
-    mandatory_news_rule, normalize_evidence as _plain, software_from_url,
+    mandatory_news_rule, normalize_evidence as _plain, saved_object, software_from_url,
 )
 
 PROMPT_VERSION = "onionflash-24"
@@ -483,6 +483,30 @@ def _digest_mode(best_of: int, quote_digest: bool | None, *, default_quote_diges
     raise ValueError("quote_digest must be a boolean or None")
 
 
+def _llm_contract(effective: dict) -> dict:
+    """Return the normalized model and decoding contract fields included in cache keys."""
+    return {
+        "model": effective["model"],
+        "base_url": effective["base_url"],
+        "fallback_base_urls": effective["fallback_base_urls"],
+        "generation": generation_options(effective),
+        "max_response_bytes": effective["max_response_bytes"],
+    }
+
+
+def _row_comments_truncated(row: dict, item: dict | None) -> bool:
+    if isinstance(item, dict):
+        return bool(item.get("comments_truncated"))
+    if isinstance(row.get("comments_truncated"), bool):
+        return row["comments_truncated"]
+    raw_payload = row.get("payload")
+    if isinstance(raw_payload, str):
+        parsed = saved_object(raw_payload.encode("utf-8", errors="replace"), allow_surrogates=True)
+        if isinstance(parsed, dict):
+            return bool(parsed.get("comments_truncated"))
+    return False
+
+
 def cache_key(
     row: dict,
     llm: dict,
@@ -490,6 +514,7 @@ def cache_key(
     *,
     best_of: int = 1,
     quote_digest: bool | None = None,
+    item: dict | None = None,
 ) -> str:
     """Bind cached drafts to the active writer contract and update context."""
     if type(best_of) is not int or best_of < 1:
@@ -500,10 +525,7 @@ def cache_key(
     prompt = SYSTEM_PROMPT if prior is None else UPDATE_PROMPT
     schema = SCHEMA if prior is None else UPDATE_SCHEMA
     effective = writer_settings(llm)
-    contract = {"model": effective["model"], "base_url": effective["base_url"],
-                "fallback_base_urls": effective["fallback_base_urls"],
-                "generation": generation_options(effective),
-                "max_response_bytes": effective["max_response_bytes"]}
+    contract = _llm_contract(effective)
     identity = [row["content_hash"], contract, PROMPT_VERSION, prompt,
                 json.dumps(schema, ensure_ascii=False, allow_nan=False)]
     if prior is None:
@@ -511,8 +533,17 @@ def cache_key(
     else:
         # Category and this source predicate also shape the update grammar.
         identity.extend([prior_context(prior), prior.get("category"), _all_merge_sources(prior), UPDATE_INPUT_VERSION])
+        if digest_mode != "none":
+            identity.extend(["comments_truncated", _row_comments_truncated(row, item)])
     if best_of != 1:
-        identity.extend(["best_of", best_of, SELECTOR_PROMPT, json.dumps(SELECTOR_SCHEMA, ensure_ascii=False, allow_nan=False)])
+        selector_effective = {**writer_settings({**llm, "writer_reasoning": False}), "temperature": 0}
+        identity.extend([
+            "best_of",
+            best_of,
+            _llm_contract(selector_effective),
+            SELECTOR_PROMPT,
+            json.dumps(SELECTOR_SCHEMA, ensure_ascii=False, allow_nan=False),
+        ])
     if digest_mode == "deterministic":
         identity.extend(["quote_digest", "deterministic"])
     elif digest_mode == "llm":

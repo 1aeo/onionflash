@@ -19,8 +19,8 @@ from onionflash.llm import is_quoted_list_post, unquoted_mail_text
 from onionflash.render import prepare_story
 from onionflash.review import EDITABLE, SPECIALISTS, Reviewer, final_holds, policy_hash
 from onionflash.review_gate import (OUTCOME_STAGES, ReviewRequests, _parallel_initial_review,
-                                    _parallel_specialist_verify, _pending_reask, advance_review,
-                                    initial_review_state, recovery_status)
+                                    _parallel_specialist_verify, _pending_reask, _resume_specialist_reask,
+                                    advance_review, initial_review_state, recovery_status)
 from onionflash.schema import ITEM_ID_RE
 from onionflash.source_packet import LIMITS, OPTIONAL_SOURCE_FIELDS, normalize_labels, number_sources
 from onionflash.util import effective_authority, item_cluster, mandatory_news_rule, plain_text, safe_canonical_url, story_cluster
@@ -336,10 +336,14 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
                                 on_verify=lambda: None, save_verify=lambda: None, specialists=specialists,
                             )
                         elif specialists > 1 and stage == "verify":
-                            if (
-                                _pending_reask(record, stage, text, prepared)
-                                or requests.state["reserved"] + len(SPECIALISTS) > requests.max_requests
-                            ):
+                            if _pending_reask(record, stage, text, prepared):
+                                if record.get("pending_specialist_wave") and requests.state["reserved"] < requests.max_requests:
+                                    step = _resume_specialist_reask(
+                                        _reviewer_factory, reviewer, text, prepared, record, requests,
+                                    )
+                                else:
+                                    step = ("hold", ("verification", "specialist_budget"))
+                            elif requests.state["reserved"] + len(SPECIALISTS) > requests.max_requests:
                                 step = ("hold", ("verification", "specialist_budget"))
                             else:
                                 step = _parallel_specialist_verify(

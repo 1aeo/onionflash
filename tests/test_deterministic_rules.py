@@ -1172,8 +1172,8 @@ def test_label_limits_blocks_released_for_gitlab_only_and_widens_for_updates():
 
     widened_from_released = llm.widen_release_state_for_update(llm.label_limits([issue]), {"state": "released", "category": "security"})
     assert widened_from_released["state"] == [s for s in STATES if s != "tagged"]
-    widened_from_release_cat = llm.widen_release_state_for_update(llm.label_limits([mr]), {"state": "merged", "category": "release"})
-    assert widened_from_release_cat["state"] == ["released", "merged"]
+    unwidened_tagged_rel = llm.widen_release_state_for_update(llm.label_limits([issue]), {"state": "tagged", "category": "release"})
+    assert "released" not in unwidened_tagged_rel["state"]
     unwidened = llm.widen_release_state_for_update(llm.label_limits([issue]), {"state": "developing", "category": "security"})
     assert "released" not in unwidened["state"]
 
@@ -1183,6 +1183,7 @@ def test_label_limits_blocks_released_for_gitlab_only_and_widens_for_updates():
     ("   ", None),
     ("Onion-service operators using Arti may see reduced queue efficiency.", None),
     ("The announcement asks relay operators to upgrade to 0.4.9.16.", None),
+    ("The fallback affects builds running <= 1.2.3.", None),
     ("after a download would stall forever.", None),
     ("The release of tor-0.4.9.16 added consensus-method 38, which should ease the pressure on the dirauths.", None),
     ("The release addresses low-severity security vulnerabilities, prompting users to upgrade to maintain the security of their Tor implementations.", None),
@@ -1468,3 +1469,30 @@ def test_generic_pt_overlap_advice_filler_exceptions_and_pt_outage_protection(tm
     )
     assert is_housekeeping_item(outage_dep) is None
     assert is_pt_high_impact(outage_dep) is True
+
+    # Auth-bypass / access-control dependency fixes must never be skipped as housekeeping.
+    auth_bypass_dep = _story_item(
+        url="https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/999",
+        title="chore(deps): update access-control dependency",
+        content="Fixes an authentication bypass that lets unauthenticated clients access restricted onion services.",
+    )
+    assert is_housekeeping_item(auth_bypass_dep) is None
+
+    # Directive treat + object binding (rejects swapped object, accepts paraphrase).
+    treat_src = _story_item(title="Arti note", content="Operators must treat the report as provisional.")
+    assert llm.has_unattributed_advice("Operators must treat the report as provisional.", treat_src) is False
+    assert llm.has_unattributed_advice("Operators must treat the report as confirmed.", treat_src) is True
+    log_src = _story_item(title="Logging note", content="Operators must enable logging.")
+    assert llm.has_unattributed_advice("Operators must enable logging.", log_src) is False
+    assert llm.has_unattributed_advice("Operators must enable telemetry.", log_src) is True
+    log_para = _story_item(title="Logging note", content="Operators must enable relay logs.")
+    assert llm.has_unattributed_advice("Operators must enable logging.", log_para) is False
+
+    # Generic 'pluggable-transports' tag on a non-PT first source must not mask a later Snowflake source.
+    assert candidate_mod._story_pt_family({
+        "tags": ["pluggable-transports"],
+        "sources": [
+            {"url": "https://gitlab.torproject.org/tpo/core/tor/-/issues/1", "title": "Core tracking issue"},
+            {"url": "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/issues/42", "title": "Snowflake broker"},
+        ],
+    }) == "snowflake"

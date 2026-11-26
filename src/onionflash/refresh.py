@@ -313,7 +313,14 @@ def verify_refreshed_story(
             verdicts = [fut.result() for fut in [pool.submit(_run_one, s) for s in selected_specs]]
     else:
         verdicts = [_run_one(s) for s in selected_specs]
-    return merge_fn(verdicts, refreshed_candidate, packet)
+    try:
+        merge_params = inspect.signature(merge_fn).parameters
+    except (TypeError, ValueError):
+        merge_params = {}
+    merge_kwargs: dict[str, object] = {}
+    if "specialists" in merge_params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in merge_params.values()):
+        merge_kwargs["specialists"] = selected_specs
+    return merge_fn(verdicts, refreshed_candidate, packet, **merge_kwargs)
 
 
 def refresh_story(
@@ -334,12 +341,22 @@ def refresh_story(
     update_count = candidate_entry["update_count"]
     refreshed_hash = candidate_entry["refreshed_hash"]
 
-    packet, missing_reason = build_story_refresh_packet(
-        store.db,
-        story_payload,
-        dirauth_users=dirauth_users,
-        tor_core_users=tor_core_users,
-    )
+    try:
+        packet, missing_reason = build_story_refresh_packet(
+            store.db,
+            story_payload,
+            dirauth_users=dirauth_users,
+            tor_core_users=tor_core_users,
+        )
+    except (ValueError, TypeError, KeyError, AttributeError):
+        store.record_refresh_status(
+            story_id,
+            update_count=update_count,
+            refreshed_hash=refreshed_hash,
+            status="held",
+            observed=observed,
+        )
+        return {"story_id": story_id, "status": "held", "reason": "invalid_packet"}
     if packet is None:
         store.record_refresh_status(
             story_id,
@@ -398,6 +415,27 @@ def refresh_story(
             observed=observed,
         )
         return {"story_id": story_id, "status": status, "reason": f"review_{verdict_name or 'rejected'}"}
+
+    primary_kind = (packet["sources"][0].get("kind") or "") if packet.get("sources") else ""
+    prepared_for_holds = {
+        "mode": "story",
+        "packet": packet,
+        "payload": {"editorial_kind": primary_kind},
+    }
+    holds = [
+        h
+        for h in review_mod.final_holds(refreshed_public, prepared_for_holds)
+        if not (h == "release_state" and story_payload.get("state") == "released")
+    ]
+    if holds:
+        store.record_refresh_status(
+            story_id,
+            update_count=update_count,
+            refreshed_hash=refreshed_hash,
+            status="held",
+            observed=observed,
+        )
+        return {"story_id": story_id, "status": "held", "reason": f"final_check_{holds[0]}"}
 
     try:
         base_prose = {

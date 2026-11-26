@@ -1356,8 +1356,8 @@ def test_long_thread_digest_triggers_deterministic_fallback_and_purity():
         assert set(anchor) == {"quote", "author", "url"}
         matching = [n for n in thread_notes_chrono if n["author"] == anchor["author"] and n["url"] == anchor["url"]]
         assert len(matching) == 1
-        assert normalize_evidence(anchor["quote"]) in normalize_evidence(matching[0]["body"])
-        assert not anchor["quote"].lstrip().startswith(">")
+        unquoted_spans = comments._unquoted_note_spans(matching[0]["body"])
+        assert any(anchor["quote"] in span for span in unquoted_spans)
     assert any("cannot confirm" in d.lower() or "disagree" in d.lower() for d in digest_obj["disagreements"])
 
 
@@ -1478,3 +1478,37 @@ def test_long_thread_digest_excludes_quotes_and_binds_chronological_timeline():
     assert verified["anchors"] == [
         {"quote": "Unquoted finding 3 narrows the bug.", "author": "dev3", "url": f"{URL}#note_3"}
     ]
+
+    # Exact U+2028 line separator preservation, unique note anchor resolution, ambiguous timeline rejection, and quoted-only note timeline rejection.
+    u2028_note = make_note(1, "First span\u2028Second span.", author="sep", created_at="2026-11-08T09:59:00Z", url=URL)
+    dup_a = make_note(2, "Still investigating the cause.", author="alice", created_at="2026-11-08T10:00:00Z", url=URL)
+    dup_a2 = make_note(3, "Alice follow-up measurement completed.", author="alice", created_at="2026-11-08T10:01:00Z", url=URL)
+    dup_b = make_note(4, "Still investigating the cause.", author="bob", created_at="2026-11-08T10:02:00Z", url=URL)
+    quote_only_c = make_note(5, "> Quoted earlier statement only.", author="carol", created_at="2026-11-08T10:03:00Z", url=URL)
+    unique_d = make_note(6, "Maintainer confirmed root cause.", author="dave", created_at="2026-11-08T10:04:00Z", url=URL)
+    extra_e = make_note(7, "Additional relay measurement collected.", author="eve", created_at="2026-11-08T10:05:00Z", url=URL)
+    extra_f = make_note(8, "Opened follow-up MR for patch.", author="frank", created_at="2026-11-08T10:06:00Z", url=URL)
+    edge_item = _issue(public_comments=[extra_f, extra_e, unique_d, quote_only_c, dup_b, dup_a2, dup_a, u2028_note])
+    edge_res = build_long_thread_digest(
+        edge_item,
+        llm_call=lambda *_a: {
+            "timeline": [
+                {"author": "alice", "created_at": "", "url": "", "point": "Ambiguous alice point without URL or ts."},
+                {"author": "carol", "created_at": "2026-11-08T10:03:00Z", "url": f"{URL}#note_5", "point": "Point on quoted-only note."},
+                {"author": "dave", "created_at": "2026-11-08T10:04:00Z", "url": f"{URL}#note_6", "point": "Confirmed root cause."},
+            ],
+            "anchors": [
+                {"quote": "First span\nSecond span.", "author": "sep", "url": f"{URL}#note_1"},
+                {"quote": "Still investigating the cause.", "author": "", "url": ""},
+                {"quote": "Still investigating the cause.", "author": "", "url": f"{URL}#note_4"},
+            ],
+            "disagreements": [],
+        },
+    )
+    assert edge_res is not None
+    assert [t["author"] for t in edge_res["timeline"]] == ["dave"]
+    assert edge_res["anchors"] == [
+        {"quote": "First span\u2028Second span.", "author": "sep", "url": f"{URL}#note_1"},
+        {"quote": "Still investigating the cause.", "author": "bob", "url": f"{URL}#note_4"},
+    ]
+    assert edge_res["anchors"][0]["quote"] in u2028_note["body"]

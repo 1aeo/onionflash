@@ -2110,13 +2110,19 @@ def test_best_of_three_clears_tracking_reasoning_profile_and_deadline_guards(mon
         assert w_r.calls == 3  # Selector skipped because clock crossed deadline after the 3 drafts.
 
 
-def test_cache_key_digest_modes_update_truncation_selector_bounds_and_issue_release_schema():
-    """Verify digest mode cache parity, truncated 1-note update digests, strict selector bounds, and issue release limits."""
+def test_cache_key_digest_modes_update_truncation_selector_bounds_and_issue_release_schema(monkeypatch):
+    """Verify digest mode cache parity, selector/truncation keys, truncated 1-note update digests, strict selector bounds, and issue release limits."""
     row = {"content_hash": "c" * 64}
     k_none = analyze.cache_key(row, DEFAULTS["llm"], best_of=3, quote_digest=False)
     k_det = analyze.cache_key(row, DEFAULTS["llm"], best_of=3)
     k_llm = analyze.cache_key(row, DEFAULTS["llm"], best_of=3, quote_digest=True)
     assert len({k_none, k_det, k_llm}) == 3
+
+    # Best-of keys depend on base max_output_tokens when writer_reasoning=True; single-draft keys do not.
+    llm_1200 = {**DEFAULTS["llm"], "writer_reasoning": True, "max_output_tokens": 1200}
+    llm_2400 = {**DEFAULTS["llm"], "writer_reasoning": True, "max_output_tokens": 2400}
+    assert analyze.cache_key(row, llm_1200) == analyze.cache_key(row, llm_2400)
+    assert analyze.cache_key(row, llm_1200, best_of=3) != analyze.cache_key(row, llm_2400, best_of=3)
 
     prior_dev = {
         "id": "a" * 24,
@@ -2133,6 +2139,17 @@ def test_cache_key_digest_modes_update_truncation_selector_bounds_and_issue_rele
         "sources": [{"url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/1", "title": "Issue 1"}],
         "updates": [],
     }
+    row_untrunc = {"content_hash": "c" * 64, "payload": json.dumps({"comments_truncated": False})}
+    row_trunc = {"content_hash": "c" * 64, "payload": json.dumps({"comments_truncated": True})}
+    assert (
+        analyze.cache_key(row_untrunc, DEFAULTS["llm"], prior_dev, best_of=3)
+        != analyze.cache_key(row_trunc, DEFAULTS["llm"], prior_dev, best_of=3)
+    )
+    assert (
+        analyze.cache_key(row, DEFAULTS["llm"], prior_dev, best_of=3, item={"comments_truncated": False})
+        != analyze.cache_key(row, DEFAULTS["llm"], prior_dev, best_of=3, item={"comments_truncated": True})
+    )
+
     upd_item = item(
         url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/1",
         title="Truncated follow-up note",
@@ -2144,16 +2161,23 @@ def test_cache_key_digest_modes_update_truncation_selector_bounds_and_issue_rele
     w = Analyzer(DEFAULTS, best_of=1)
     assert w._build_thread_digest(upd_item, upd_item["public_comments"], is_update=True, use_llm=False) is not None
 
-    sel_writer = Analyzer(DEFAULTS, best_of=3)
+    sel_cfg = copy.deepcopy(DEFAULTS)
+    sel_cfg["llm"].update(base_url="https://llm.example/v1", api_key_env="SEL_TEST_KEY")
+    monkeypatch.setenv("SEL_TEST_KEY", "synthetic-fixture-value")
+    sel_writer = Analyzer(sel_cfg, best_of=3)
     cands = [upd_draft, {**upd_draft, "update": "Alternative valid sentence."}]
     sel_writer.client = FakeLLM({"winner": 2})
-    assert sel_writer._select_winner(cands, {"title": "T"}, prior_dev, is_update=True) == 0
+    assert sel_writer._select_winner(cands, {"title": "T"}, prior_dev, is_update=True) == 0 and sel_writer.calls == 1
     sel_writer.client = FakeLLM({"winner": 2, "reason": "   "})
-    assert sel_writer._select_winner(cands, {"title": "T"}, prior_dev, is_update=True) == 0
+    assert sel_writer._select_winner(cands, {"title": "T"}, prior_dev, is_update=True) == 0 and sel_writer.calls == 2
     sel_writer.client = FakeLLM({"winner": 2, "reason": "x" * 241})
-    assert sel_writer._select_winner(cands, {"title": "T"}, prior_dev, is_update=True) == 0
+    assert sel_writer._select_winner(cands, {"title": "T"}, prior_dev, is_update=True) == 0 and sel_writer.calls == 3
+    sel_writer.client = FakeLLM({"winner": 2, "reason": "Second draft captures the update cleanly."})
+    assert sel_writer._select_winner(cands, {"title": "T"}, prior_dev, is_update=True) == 1 and sel_writer.calls == 4
 
     schema_dev = analyze._writer_schema({"title": "T", "content": "Issue body.", "kind": "gitlab_issue"}, analyze.UPDATE_SCHEMA, prior=prior_dev)
     assert "released" not in schema_dev["properties"]["state"]["enum"]
     schema_rel = analyze._writer_schema({"title": "T", "content": "Issue body.", "kind": "gitlab_issue"}, analyze.UPDATE_SCHEMA, prior={**prior_dev, "state": "released"})
     assert "released" in schema_rel["properties"]["state"]["enum"]
+    schema_tagged_rel = analyze._writer_schema({"title": "T", "content": "Issue body.", "kind": "gitlab_issue"}, analyze.UPDATE_SCHEMA, prior={**prior_dev, "state": "tagged", "category": "release"})
+    assert "released" not in schema_tagged_rel["properties"]["state"]["enum"]

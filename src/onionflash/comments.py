@@ -418,12 +418,18 @@ def fetch_comments(client, source, item):
     )
 
 
-def analysis_context(item):
+def analysis_context(item, *, include_url: bool = False):
     """Return the writer's description window and the notes it sees verbatim, newest first.
 
     Notes are structured entries, so a body cannot pose as another author's note.
     """
-    notes = [{key: note[key] for key in ("author", "created_at", "body")} for note in item.get("public_comments") or []]
+    notes = [
+        {
+            **{key: note[key] for key in ("author", "created_at", "body")},
+            **({"url": note["url"]} if include_url and isinstance(note.get("url"), str) and note["url"] else {}),
+        }
+        for note in item.get("public_comments") or []
+    ]
     room = max(0, INPUT_CHARS - sum(len(note["body"]) for note in notes))
     # Payloads stored before descriptions moved back to content keep it in source_content.
     return item.get("source_content", item.get("content", ""))[:room], notes
@@ -489,23 +495,29 @@ def _note_url_matches(req_url: str, note_url: str) -> bool:
 
 
 def _unquoted_note_spans(body: str) -> list[str]:
-    """Split a note body into contiguous non-quoted text spans, excluding `>`-quoted lines."""
+    """Split a note body into contiguous non-quoted text spans, preserving original separators."""
     blocks: list[str] = []
     cur: list[str] = []
-    for line in body.splitlines():
+    for line in body.splitlines(keepends=True):
         if line.lstrip().startswith(">"):
             if cur:
-                joined = "\n".join(cur)
+                joined = "".join(cur)
                 if joined.strip():
                     blocks.append(joined)
                 cur = []
         else:
             cur.append(line)
     if cur:
-        joined = "\n".join(cur)
+        joined = "".join(cur)
         if joined.strip():
             blocks.append(joined)
     return blocks
+
+
+def _note_unquoted_text(body: str) -> str:
+    """Return bounded plain text derived exclusively from unquoted lines of a comment body."""
+    unquoted = " ".join(span.strip() for span in _unquoted_note_spans(body) if span.strip())
+    return plain_text(unquoted, DIGEST_TEXT_CHARS, html=False)
 
 
 def _find_unique_literal_span(unquoted_blocks: list[str], raw_quote: str, norm_quote: str) -> str | None:
@@ -577,15 +589,19 @@ def _verify_digest_anchors(raw_anchors: object, chrono_notes: list[dict]) -> lis
             continue
         req_author = raw_author.lstrip("@").strip().casefold()
         req_url = raw_url.strip()
-        hits: list[tuple[dict, str]] = []
-        for note, spans, author_cf in indexed:
-            if req_author and req_author != author_cf:
+        if req_url:
+            url_candidates = [entry for entry in indexed if _note_url_matches(req_url, entry[0]["url"])]
+            if len(url_candidates) != 1:
                 continue
-            if not _note_url_matches(req_url, note["url"]):
+        else:
+            url_candidates = indexed
+        hits: list[tuple[dict, str]] = []
+        for note, spans, author_cf in url_candidates:
+            if req_author and req_author != author_cf:
                 continue
             if (literal := _find_unique_literal_span(spans, quote, norm_quote)) is not None:
                 hits.append((note, literal))
-        if not hits or len({lit for _, lit in hits}) != 1:
+        if len(hits) != 1:
             continue
         matched_note, literal_quote = hits[0]
         dedupe_key = (normalize_evidence(literal_quote), matched_note["author"], matched_note["url"])
@@ -773,15 +789,15 @@ def _resolve_timeline_note(
     raw_url: str,
     author_key: str,
     raw_ts: str,
-    by_url: dict[str, tuple[int, dict]],
+    by_url: dict[str, list[tuple[int, dict]]],
     by_author: dict[str, list[tuple[int, dict]]],
 ) -> tuple[int, dict] | None:
-    """Resolve one model timeline item to a single source note, rejecting conflicting metadata."""
+    """Resolve one model timeline item to a single source note, rejecting ambiguous or conflicting metadata."""
     if raw_url:
-        pair = by_url.get(raw_url) or by_url.get(safe_canonical_url(raw_url))
-        if pair is None:
+        candidates = by_url.get(raw_url) or by_url.get(safe_canonical_url(raw_url)) or ()
+        if len(candidates) != 1:
             return None
-        idx, note = pair
+        idx, note = candidates[0]
         if author_key and note["author"].casefold() != author_key:
             return None
         if _timestamps_conflict(raw_ts, note["created_at"]):
@@ -791,11 +807,9 @@ def _resolve_timeline_note(
         return None
     author_notes = by_author[author_key]
     if raw_ts:
-        for idx, note in author_notes:
-            if not _timestamps_conflict(raw_ts, note["created_at"]):
-                return idx, note
-        return None
-    return author_notes[0]
+        matches = [(idx, note) for idx, note in author_notes if not _timestamps_conflict(raw_ts, note["created_at"])]
+        return matches[0] if len(matches) == 1 else None
+    return author_notes[0] if len(author_notes) == 1 else None
 
 
 def _normalize_llm_digest(
@@ -816,14 +830,14 @@ def _normalize_llm_digest(
     ):
         return None
     by_author: dict[str, list[tuple[int, dict]]] = {}
-    by_url: dict[str, tuple[int, dict]] = {}
+    by_url: dict[str, list[tuple[int, dict]]] = {}
     for idx, note in enumerate(chrono_notes):
         if note["author"]:
             by_author.setdefault(note["author"].casefold(), []).append((idx, note))
         if note["url"]:
-            by_url[note["url"]] = (idx, note)
-            if canon := safe_canonical_url(note["url"]):
-                by_url[canon] = (idx, note)
+            by_url.setdefault(note["url"], []).append((idx, note))
+            if (canon := safe_canonical_url(note["url"])) and canon != note["url"]:
+                by_url.setdefault(canon, []).append((idx, note))
 
     timeline_items: list[tuple[int, dict]] = []
     for entry in raw_digest["timeline"]:
@@ -840,6 +854,8 @@ def _normalize_llm_digest(
         if resolved is None:
             continue
         matched_idx, matched_note = resolved
+        if not normalize_evidence(_note_unquoted_text(matched_note["body"])):
+            continue
         timeline_items.append((
             matched_idx,
             {

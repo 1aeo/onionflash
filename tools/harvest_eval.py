@@ -139,7 +139,7 @@ def _packet_from_item(item_obj: dict) -> dict | None:
     title = sanitize_text(item_obj.get("title") or "")
     if not url or not title:
         return None
-    body, notes = analysis_context(item_obj)
+    body, notes = analysis_context(item_obj, include_url=True)
     if not body and isinstance(item_obj.get("content"), str):
         body = item_obj["content"]
     size = source_packet.LIMITS["passage_chars"]
@@ -152,7 +152,7 @@ def _packet_from_item(item_obj: dict) -> dict | None:
                 passages.append({
                     "author": sanitize_text(note.get("author") or "unknown"),
                     "created_at": str(note.get("created_at") or item_obj.get("updated_at") or _FALLBACK_DATE),
-                    "url": _safe_sanitized_url(note.get("url")) or sanitize_text(str(note.get("url") or url)),
+                    "url": _safe_sanitized_url(note.get("url")) or url,
                     "text": chunk,
                 })
     body_text = sanitize_text(body or title)
@@ -262,6 +262,83 @@ def _fallback_candidate_from_item(item_obj: dict, story_id: str) -> dict:
     }
 
 
+def _sanitize_sources(raw_sources: object) -> list[dict]:
+    if not isinstance(raw_sources, list):
+        return []
+    out: list[dict] = []
+    for src in raw_sources:
+        if not isinstance(src, dict):
+            continue
+        url = _safe_sanitized_url(src.get("url"))
+        if not url:
+            continue
+        title = sanitize_text(src.get("title") or "") or url
+        out.append({"url": url, "title": title})
+    return out
+
+
+def _sanitize_updates(raw_updates: object) -> list[dict]:
+    if not isinstance(raw_updates, list):
+        return []
+    out: list[dict] = []
+    for upd in raw_updates:
+        if not isinstance(upd, dict):
+            continue
+        text = sanitize_text(upd.get("text") or "").strip()
+        sources = _sanitize_sources(upd.get("sources"))
+        at = upd.get("at")
+        if text and sources and isinstance(at, str) and at:
+            out.append({"at": at, "text": text, "sources": sources})
+    return out
+
+
+def _sanitize_story_ref(raw_story: object) -> dict | None:
+    if not isinstance(raw_story, dict):
+        return None
+    sid = raw_story.get("id")
+    if not isinstance(sid, str) or not STORY_ID_RE.fullmatch(sid):
+        return None
+    cleaned: dict = {"id": sid}
+    for key in ("title", "summary", "why_it_matters", "latest_update"):
+        if isinstance(raw_story.get(key), str):
+            cleaned[key] = sanitize_text(raw_story[key])
+    for key in ("category", "state", "confidence", "priority", "published_at", "updated_at", "added_at"):
+        if isinstance(raw_story.get(key), str) and raw_story[key]:
+            cleaned[key] = sanitize_text(raw_story[key])
+    if isinstance(raw_story.get("retracted"), bool):
+        cleaned["retracted"] = raw_story["retracted"]
+    if isinstance(raw_story.get("products"), list):
+        cleaned["products"] = [p for p in raw_story["products"] if p in PRODUCTS]
+    if isinstance(raw_story.get("tags"), list):
+        cleaned["tags"] = [t for t in raw_story["tags"] if t in CATEGORIES]
+    if isinstance(raw_story.get("associated"), list):
+        cleaned["associated"] = [sanitize_text(a) for a in raw_story["associated"] if isinstance(a, str) and a]
+    if sources := _sanitize_sources(raw_story.get("sources")):
+        cleaned["sources"] = sources
+    if updates := _sanitize_updates(raw_story.get("updates")):
+        cleaned["updates"] = updates
+    return cleaned
+
+
+def _sanitize_coverage(raw_cov: object) -> dict | None:
+    if not isinstance(raw_cov, dict):
+        return None
+    out: dict = {}
+    if raw_cov.get("prior_story") is not None:
+        if (prior := _sanitize_story_ref(raw_cov["prior_story"])) is None:
+            return None
+        out["prior_story"] = prior
+    else:
+        out["prior_story"] = None
+    recent_clean: list[dict] = []
+    for entry in (raw_cov.get("recent") or ()):
+        if (clean_entry := _sanitize_story_ref(entry)) is not None:
+            recent_clean.append(clean_entry)
+    out["recent"] = recent_clean
+    out["truncated"] = bool(raw_cov.get("truncated", False))
+    return out
+
+
 def _normalize_case_candidate(raw_cand: dict | None, packet: dict, fallback_id: str, item_obj: dict | None = None) -> dict | None:
     sources = [{"url": s["url"], "title": s["title"]} for s in packet["sources"]]
     base = copy.deepcopy(raw_cand) if isinstance(raw_cand, dict) else _fallback_candidate_from_item(item_obj or {}, fallback_id)
@@ -281,6 +358,12 @@ def _normalize_case_candidate(raw_cand: dict | None, packet: dict, fallback_id: 
     tags = [t for t in (base.get("tags") or []) if t in CATEGORIES]
     base["tags"] = tags or [base["category"]]
     base["sources"] = sources
+    if "updates" in base:
+        clean_updates = _sanitize_updates(base.get("updates"))
+        if clean_updates:
+            base["updates"] = clean_updates
+        else:
+            base.pop("updates", None)
     base["title"] = sanitize_text(base.get("title") or "")[: FIELD_LIMITS["title"]]
     base["summary"] = sanitize_text(base.get("summary") or "")[: FIELD_LIMITS["summary"]]
     base["why_it_matters"] = sanitize_text(base.get("why_it_matters") or "")[: FIELD_LIMITS["why_it_matters"]]
@@ -452,6 +535,8 @@ def harvest_database(
             }
             if coverage is not None:
                 cov_id = f"cov:{resolved_packet_id}"
+                if cov_id in coverage_sets and coverage_sets[cov_id] != coverage:
+                    cov_id = f"{cov_id}:{digest(coverage)[:12]}"
                 coverage_sets[cov_id] = coverage
                 case_entry["coverage_set"] = cov_id
             cases.append(case_entry)
@@ -512,9 +597,20 @@ def harvest_database(
                 cand = _normalize_case_candidate(raw_cand, pkt, digest(["held", irow["id"]])[:24], ipayload)
                 if cand is None:
                     continue
+                cov = None
+                scope = "story"
+                if is_update_job:
+                    cov = _sanitize_coverage(env.get("coverage") or (rec.get("prepared") or {}).get("coverage"))
+                    if (
+                        cov is None
+                        or not isinstance(cov.get("prior_story"), dict)
+                        or not cand.get("updates")
+                    ):
+                        continue
+                    scope = "latest_update"
                 hold_info = rec.get("hold")
                 subgroup = ".".join(hold_info) if isinstance(hold_info, list) else (str(hold_info) if hold_info else "held")
-                target_sid = irow["story_id"] or env.get("story_id")
+                target_sid = irow["story_id"] or ((cov or {}).get("prior_story") or {}).get("id") or env.get("story_id")
                 _register_entry(
                     bucket="held_review_jobs",
                     subgroup=subgroup,
@@ -527,6 +623,8 @@ def harvest_database(
                     item_payload_obj=ipayload,
                     target_story_id=target_sid,
                     exclude_story_ids=[] if (is_update_job or not target_sid) else [target_sid],
+                    coverage=cov,
+                    scope=scope,
                 )
 
         # 2. Rejection actions

@@ -1034,6 +1034,9 @@ _HOUSEKEEPING_SECURITY_SIGNAL_RE = re.compile(
     r"|\b(?:RUSTSEC-\d{4}-\d{4,}|GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}|CVE-\d{4}-\d{4,7}|TROVE-\d{4}-\d{3,5})\b"
     r"|\bsecurity\s+(?:fix(?:es)?|patch(?:es)?|updat(?:e|es|ing)|bump|releas(?:e|es)|advisor(?:y|ies)|issue|vulnerabilit\w*)\b"
     r"|\b(?:vulnerabilit\w*|exploit\w*|deanonymiz\w*|out[- ]of[- ]bounds|use[- ]after[- ]free|buffer\s+overflow|remote\s+code(?:\s+execution)?)\b"
+    r"|\b(?:auth(?:entication|orization)?[- ]bypass\w*|access[- ]control[- ]bypass\w*|privilege\s+escalation)\b"
+    r"|\bbypass(?:es|ed|ing)?\s+(?:[a-z0-9_-]+\s+){0,2}(?:auth(?:entication|orization)?|access[- ]control)\b"
+    r"|\bunauthenticated\s+(?:clients?|users?|requests?)?\s*access\b"
     r")",
     re.I,
 )

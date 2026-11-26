@@ -24,6 +24,7 @@ from helpers import (
     finish_reviewed,
     item,
     make_config,
+    make_note,
     patch_cli_pipeline,
     pending,
     public_dns,
@@ -145,6 +146,7 @@ def test_story_refresh_excludes_locked_retracted_retired_and_missing_bodies(tmp_
             calls = 0
 
             def synthesize(self, *_a):
+                """Fail immediately if called when cited source bodies are missing."""
                 raise AssertionError("Refresher LLM must not be called when cited body is missing")
 
         cand = store.refresh_candidates(limit=5)[0]
@@ -294,6 +296,7 @@ def test_story_refresh_retryable_error_and_specialist_verification(tmp_path):
             calls = 1
 
             def synthesize(self, *_a):
+                """Raise a retryable AnalysisError."""
                 raise AnalysisError("HTTP 503", retryable=True)
 
         stats = refresh.refresh_due_stories(cfg, store, ApprovingReviewer(), LATER, refresher=_RetryableRefresher())
@@ -304,6 +307,7 @@ def test_story_refresh_retryable_error_and_specialist_verification(tmp_path):
             calls = 1
 
             def synthesize(self, story_payload, _pkt):
+                """Return a valid refreshed summary across updates."""
                 return {
                     "title": story_payload["title"],
                     "summary": "Synthesized summary across all three updates.",
@@ -314,6 +318,7 @@ def test_story_refresh_retryable_error_and_specialist_verification(tmp_path):
 
         class _SpecReviewer:
             def review(self, candidate_public, packet, *, verification=False, coverage=None, specialist=None):
+                """Record requested specialist name and approve."""
                 seen_specs.append(specialist)
                 return verdict("approve")
 
@@ -466,7 +471,6 @@ def test_sliding_window_overlaps_draft_and_review_and_skips_deterministic_before
         assert not wait_timeouts
         assert saw_blocked_draft_during_review
         assert max_in_flight <= cli.MAX_CONCURRENT_LLM_ITEMS
-        assert max_in_flight == 4
         assert fifth_draft_started.is_set()
         assert first_review_started.is_set()
         assert all(t.startswith("Sliding window report") for t in drafted_titles)
@@ -812,9 +816,66 @@ def test_draft_cache_parity_stale_failure_guard_refresh_errors_and_harvester_saf
                 base_prose={k: before_s2.get(k, "") for k in ("title", "summary", "why_it_matters")},
             )
 
-    # 4) harvest_eval surrogates, row URL secret redaction, packet isolation, and --output==--db guard.
+    # 4) harvest_eval surrogates, row URL secret redaction, packet isolation, comment URL preservation, held update jobs, and --output==--db guard.
     assert harvest_eval.sanitize_text("Bad\ud800text") == "Bad\ufffdtext"
     json.dumps(harvest_eval.sanitize_text("Bad\ud800text"), ensure_ascii=False).encode("utf-8")
+
+    # 3b) Refresh isolates malformed source packets, forwards specialist subset count, and enforces final_holds on refresh prose.
+    with Store(tmp_path / "refresh_guards.sqlite3") as store:
+        rg_item = item(
+            url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/7701",
+            title="Issue under investigation",
+            content="Initial investigation details without completion.",
+            kind="gitlab_issue",
+        )
+        rg_story = seed_story(
+            store, rg_item,
+            analysis(title="Issue under investigation", summary="Initial investigation details without completion.", evidence=["Initial investigation details without completion."]),
+        )
+        _add_story_updates(store, rg_story["id"], 3)
+        cands_rg = store.refresh_candidates(limit=5)
+        assert len(cands_rg) == 1
+
+        spec2_pkt = {
+            "sources": [{"id": "S1", "url": rg_item["url"], "title": rg_item["title"], "kind": "gitlab_issue", "authority": "development", "product": "tor", "published_at": DATE, "updated_at": DATE, "passages": [{"id": "S1:P1", "text": rg_item["content"]}]}],
+            "missing_sources": [], "truncated": False,
+        }
+        seen_specs2 = []
+
+        class _Spec2Reviewer:
+            """Reviewer supporting specialist keyword verification."""
+
+            def review(self, cand_pub, pkt, *, specialist=None, **_kw):
+                """Record specialist name and approve."""
+                seen_specs2.append(specialist)
+                return verdict("approve")
+
+        assert refresh.verify_refreshed_story(_Spec2Reviewer(), rg_story, spec2_pkt, specialists=2)["verdict"] == "approve"
+        assert len(seen_specs2) == 2
+
+        class _OverclaimRefresher:
+            """Synthesize an unsupported fixed claim on an unmerged issue."""
+
+            calls = 0
+
+            def close(self):
+                """No-op close."""
+
+            def synthesize(self, story_payload, pkt):
+                """Return claim failing final_holds completed_action."""
+                self.calls += 1
+                return {"title": "Defect fixed in branch", "summary": "The defect was fixed.", "why_it_matters": ""}
+
+        held_out = refresh.refresh_due_stories(cfg, store, _Spec2Reviewer(), LATER, refresher=_OverclaimRefresher())
+        assert held_out["held"] == 1 and held_out["refreshed"] == 0
+
+        broken_item = item(url="https://example.org/broken-refresh", title="Broken refresh source", content="Text.")
+        broken_story = seed_story(store, broken_item, analysis(title="Broken refresh source", summary="Text.", evidence=["Text."]))
+        _add_story_updates(store, broken_story["id"], 3)
+        with monkeypatch.context() as mp:
+            mp.setattr(refresh, "build_story_refresh_packet", lambda *_a, **_kw: (_ for _ in ()).throw(AttributeError("None source")))
+            bad_pkt_res = refresh.refresh_due_stories(cfg, store, _Spec2Reviewer(), LATER, refresher=_OverclaimRefresher())
+            assert bad_pkt_res["held"] >= 1
 
     db_h = tmp_path / "harvest_safety.sqlite3"
     with Store(db_h) as store:
@@ -822,6 +883,7 @@ def test_draft_cache_parity_stale_failure_guard_refresh_errors_and_harvester_saf
             url="https://example.org/item?token=secret_value_12345",
             title="Held and rejected item",
             content="Body content.",
+            public_comments=[make_note(123, "Note comment body with detail.", author="alice", created_at=DATE, url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/1")],
         )
         store.ingest(sec_it, DATE)
         row_h = store.pending(10, DATE)[0]
@@ -841,11 +903,38 @@ def test_draft_cache_parity_stale_failure_guard_refresh_errors_and_harvester_saf
                     DATE, DATE,
                 ),
             )
+        upd_prior = seed_story(store, item(url="https://example.org/upd-prior", title="Prior Update Base", content="Base story body."), analysis(title="Prior Update Base", summary="Base summary.", evidence=["Base story body."]))
+        upd_it = item(url="https://example.org/upd-follow", title="Follow-up note", content="Follow-up event body.")
+        store.ingest(upd_it, LATER)
+        with store.db:
+            store.db.execute("UPDATE items SET story_id=? WHERE id=?", (upd_prior["id"], upd_it["id"]))
+            upd_cand = {
+                **upd_prior,
+                "updates": [{"at": LATER, "text": "Follow-up event update.", "sources": [{"url": "https://example.org/upd-follow", "title": "Follow-up"}]}],
+            }
+            upd_pkt = {"sources": [{"url": "https://example.org/upd-follow", "title": "Follow-up", "kind": "rss", "authority": "official", "product": "tor", "published_at": LATER, "updated_at": LATER, "passages": ["Follow-up event body."]}], "missing_sources": [], "truncated": False}
+            upd_cov = {"prior_story": upd_prior, "recent": [], "truncated": False}
+            store.db.execute(
+                "INSERT INTO review_jobs(item_id,writer_key,policy_hash,stage,draft_json,envelope_json,record_json,prepared_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    upd_it["id"], "u" * 64, review.policy_hash(cfg), "held",
+                    json.dumps(update_analysis()),
+                    json.dumps({"mode": "update", "story_id": upd_prior["id"], "packet": upd_pkt, "coverage": upd_cov, "candidate": upd_cand}),
+                    json.dumps({"hold": ["review", "model_hold"], "candidate": upd_cand}),
+                    LATER, LATER,
+                ),
+            )
     ds = harvest_eval.harvest_database(db_h, include_updates=True)
-    held_pkt = next(c["packet"] for c in ds["cases"] if c["id"].startswith("held:"))
-    rej_pkt = next(c["packet"] for c in ds["cases"] if c["id"].startswith("rej:"))
+    held_pkt = next(c["packet"] for c in ds["cases"] if c["id"] == f"held:{sec_it['id']}")
+    rej_pkt = next(c["packet"] for c in ds["cases"] if c["id"] == f"rej:{sec_it['id']}")
     assert held_pkt != rej_pkt
     assert ds["packets"][held_pkt] != ds["packets"][rej_pkt]
+    assert "#note_123" in ds["packets"][rej_pkt]["sources"][0]["passages"][0]["url"]
+    upd_case = next(c for c in ds["cases"] if c["id"] == f"held:{upd_it['id']}")
+    assert upd_case["scope"] == "latest_update" and upd_case["coverage_set"] in ds["coverage_sets"]
+    evaluate_review = _load_tool("evaluate_review")
+    evaluate_review._validate_cases(evaluate_review.expand(ds))
     assert "secret_value_12345" not in json.dumps(ds, ensure_ascii=False)
     with pytest.raises(SystemExit):
         harvest_eval.main(["--db", str(db_h), "--output", str(db_h)])

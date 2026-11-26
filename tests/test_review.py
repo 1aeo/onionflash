@@ -1192,3 +1192,77 @@ def test_merge_specialist_verdicts_prevents_triple_hold_approve_and_losing_route
     s_b_plain = verdict("skip", criterion="new_information", reason="Duplicate report.", same_story="b" * 24)
     merged_split_hold = review.merge_specialist_verdicts([s_a_plain, s_b_plain, v_app], cand, pkt, coverage=cov)
     assert merged_split_hold["verdict"] == "hold" and merged_split_hold["same_story"] is None
+
+
+def test_update_release_state_scoping_and_update_specialist_prompts(monkeypatch):
+    """Scope update state limits to cited update sources, keep merged developing updates non-released, and scope attribution prompts."""
+    feed_unit = {
+        "id": "S1", "url": "https://blog.torproject.org/tor-note/", "title": "Initial note",
+        "kind": "feed", "authority": "official", "passages": [{"id": "S1:P1", "text": "Initial blog post."}],
+    }
+    issue_unit = {
+        "id": "S2", "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/77", "title": "Follow-up issue",
+        "kind": "gitlab_issue", "authority": "development", "upstream_state": "opened",
+        "passages": [{"id": "S2:P1", "text": "Follow-up bug discussion."}],
+    }
+    mr_unit = {
+        "id": "S3", "url": "https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/78", "title": "Follow-up MR",
+        "kind": "gitlab_mr", "authority": "development", "upstream_state": "merged",
+        "passages": [{"id": "S3:P1", "text": "Merged follow-up patch."}],
+    }
+    cov_dev = {"prior_story": {"id": "c" * 24, "confidence": "reported", "state": "developing", "category": "security"}, "recent": []}
+    upd_sources_issue = [{"url": issue_unit["url"], "title": issue_unit["title"]}]
+    upd_sources_mr = [{"url": mr_unit["url"], "title": mr_unit["title"]}]
+    all_sources = [{"url": u["url"], "title": u["title"]} for u in (feed_unit, issue_unit, mr_unit)]
+
+    limits_issue = review.repair_limits(
+        {"sources": [feed_unit, issue_unit]}, cov_dev, update=True,
+        candidate_sources=all_sources[:2], update_sources=upd_sources_issue,
+    )
+    assert "released" not in limits_issue["state"]
+    limits_mr = review.repair_limits(
+        {"sources": [feed_unit, mr_unit]}, cov_dev, update=True,
+        candidate_sources=[all_sources[0], all_sources[2]], update_sources=upd_sources_mr,
+    )
+    assert "released" not in limits_mr["state"]
+
+    upd_cand_issue = _candidate(
+        state="released",
+        category="release",
+        tags=["release"],
+        sources=all_sources[:2],
+        updates=[{"at": LATER, "text": "Follow-up bug discussion.", "sources": upd_sources_issue}],
+    )
+    assert "release_state" in review.final_holds(
+        upd_cand_issue, {"mode": "update", "packet": {"sources": [feed_unit, issue_unit]}, "coverage": cov_dev},
+    )
+    upd_cand_mr = _candidate(
+        state="released",
+        category="release",
+        tags=["release"],
+        sources=[all_sources[0], all_sources[2]],
+        updates=[{"at": LATER, "text": "Merged follow-up patch.", "sources": upd_sources_mr}],
+    )
+    assert "release_state" in review.final_holds(
+        upd_cand_mr, {"mode": "update", "packet": {"sources": [feed_unit, mr_unit]}, "coverage": cov_dev},
+    )
+
+    seen_prompts: list[str] = []
+    rev = review.Reviewer(_cfg_llm())
+    monkeypatch.setattr(
+        rev,
+        "complete",
+        lambda prompt, *_a, **_kw: seen_prompts.append(prompt) or verdict("approve", update=True),
+    )
+    rev.review(
+        _candidate(
+            sources=[{"url": issue_unit["url"], "title": issue_unit["title"]}],
+            updates=[{"at": LATER, "text": "Follow-up bug discussion.", "sources": upd_sources_issue}],
+        ),
+        {"sources": [{**issue_unit, "id": "S1", "passages": [{"id": "S1:P1", "text": "Follow-up bug discussion."}]}], "missing_sources": [], "truncated": False},
+        update=True,
+        coverage=cov_dev,
+        specialist="attribution_scope_advice",
+    )
+    assert "Check ONLY candidate.updates[-1].text" in seen_prompts[-1]
+    assert "Do NOT evaluate, fail, or modify read-only title, summary, or why_it_matters" in seen_prompts[-1]
