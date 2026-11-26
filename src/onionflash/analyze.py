@@ -523,7 +523,8 @@ def tag_notice(item: dict) -> dict:
         repo = gitlab_repo_name(item.get("url")) if item["product"] == "network" else None
         label = repo or "Upstream"
         products = [item["product"]]
-    prefix = f"{label} tag observed: "
+    title_label = label if len(label) <= 64 else label[:63] + "…"
+    prefix = f"{title_label} tag observed: "
     max_tag_len = max(1, min(96, SCHEMA["properties"]["title"]["maxLength"] - len(prefix)))
     display_name = name if len(name) <= max_tag_len else name[: max_tag_len - 1] + "…"
     summary = (

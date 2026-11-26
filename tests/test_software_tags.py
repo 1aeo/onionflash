@@ -181,6 +181,28 @@ def test_tag_notice_labels_fallback_and_length_bounds():
     assert len(bounded["title"]) <= analyze.SCHEMA["properties"]["title"]["maxLength"]
     assert bounded["title"].endswith("…")
 
+    long_repo = "r" * 130
+    long_repo_notice = analyze.tag_notice(
+        tag(
+            product="network",
+            title="v1.2.3",
+            url=f"https://gitlab.torproject.org/tpo/anti-censorship/{long_repo}/-/tags/v1.2.3",
+        )
+    )
+    assert len(long_repo_notice["title"]) <= analyze.SCHEMA["properties"]["title"]["maxLength"]
+    assert long_repo_notice["title"].endswith(": v1.2.3")
+    assert long_repo_notice["products"] == ["network"]
+
+    long_both = analyze.tag_notice(
+        tag(
+            product="network",
+            title="tag-" + ("z" * 100),
+            url=f"https://gitlab.torproject.org/tpo/anti-censorship/{long_repo}/-/tags/{'z' * 20}",
+        )
+    )
+    assert len(long_both["title"]) <= analyze.SCHEMA["properties"]["title"]["maxLength"]
+    assert "… tag observed: tag-" in long_both["title"]
+
 
 def test_validate_analysis_merges_deterministic_software_within_limit():
     """Merge deterministic software slugs into products without breaking tag parity or schema bounds."""
