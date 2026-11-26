@@ -774,6 +774,10 @@ def merge(db, story_id: str, survivor_id: str, *, reason: str, expect_hash: str 
                 (stamp, psha, pjson, aid),
             )
             db.execute("DELETE FROM public_story_topics WHERE story_id=?", (aid,))
+            if db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_story_software'"
+            ).fetchone():
+                db.execute("DELETE FROM public_story_software WHERE story_id=?", (aid,))
             _enqueue_render(db, aid)
         if transferred_network:
             _enqueue_render(db, survivor_id)

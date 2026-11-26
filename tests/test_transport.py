@@ -1090,13 +1090,13 @@ def test_sse_truncated_length_is_non_retryable_and_limits_fail_closed(completion
 
 def test_streaming_json_fallback_midstream_timeout_and_identity_parity(completion_client):
     """Support plain JSON fallback responses, mid-stream SSE ReadTimeouts, and preserve policy_hash/cache_key."""
-    baseline_policy = "13f1f5f2590da90ac368267d99f969b337450dfd397c49b58c7b241e6f3a448d"
+    baseline_policy = "d0e8c5fe1f9042cb2bb0c580980aaa91d3666fc265b6bb837a4c698a9d20703f"
     assert review.policy_hash(copy.deepcopy(DEFAULTS)) == baseline_policy
     row = {"content_hash": "a" * 64}
     cfg_on = copy.deepcopy(DEFAULTS)
     cfg_on["llm"]["writer_reasoning"] = True
-    assert analyze.cache_key(row, DEFAULTS["llm"]) == "0b41d8a1159ebffddff08127af237a4a42c30e0ab9b2a9bcddd4c52e65af6504"
-    assert analyze.cache_key(row, cfg_on["llm"]) == "549582e684ac6e4e204f60553e148a0613398fe923f770a647d3267a79a43cac"
+    assert analyze.cache_key(row, DEFAULTS["llm"]) == "762b0ed8fe0fedb84281b9da6f18d07ee4ffd02db68dfe172fd18595d046c1db"
+    assert analyze.cache_key(row, cfg_on["llm"]) == "96d51391205f09d8ba48dd2e444fe6b0c02fd1dd12de54eaae65ab7de2e48369"
 
     json_client, _ = completion_client(lambda _req: _httpx_completion({"mode": "json"}))
     _, req1, _ = _ledger()

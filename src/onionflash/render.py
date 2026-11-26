@@ -19,10 +19,11 @@ from .schema import (
     PRIORITIES,
     PRODUCTS,
     PUBLIC_STATES,
+    SOFTWARE,
     STORY_ID_RE,
     UPDATE_CHARS,
 )
-from .util import format_utc as _iso, parse_utc as _date, safe_canonical_url
+from .util import format_utc as _iso, parse_utc as _date, safe_canonical_url, software_from_sources
 
 ASSET_FILES = {"style.css": "text/css; charset=utf-8", "mark.svg": "image/svg+xml"}
 ATOM_NS = "http://www.w3.org/2005/Atom"
@@ -50,9 +51,22 @@ def _retracted(story: dict) -> bool:
     return (story.get("editorial") or {}).get("status") == "retracted"
 
 
-def feed_path(topic: str | None = None) -> str:
-    """Return the relative RSS feed path for `topic`, or `feed.xml` for all news."""
-    return f"tags/{topic}.xml" if topic else "feed.xml"
+def story_software(story: dict) -> list[str]:
+    """Return validated schema software slugs associated with `story` in order."""
+    return [product for product in (story.get("products") or ()) if isinstance(product, str) and product in SOFTWARE]
+
+
+def feed_path(topic: str | None = None, software: str | None = None) -> str:
+    """Return the relative RSS feed path for `software`, `topic`, or `feed.xml` for all news."""
+    if topic is not None and topic not in CATEGORIES:
+        raise ValueError("Unknown topic")
+    if software is not None:
+        if software not in SOFTWARE:
+            raise ValueError("Unknown software")
+        return f"software/{software}.xml"
+    if topic is not None:
+        return f"tags/{topic}.xml"
+    return "feed.xml"
 
 
 def _text(value: object, limit: int) -> str:
@@ -122,12 +136,18 @@ def prepare_story(story: dict, *, editorial: dict | None = None, allow_empty_sou
     tags = list(dict.fromkeys(tag for tag in [category, *story.get("tags", [])] if isinstance(tag, str) and tag in CATEGORIES))
     published = _date(story.get("published_at"))
     updated = max(published, _date(story.get("updated_at")))
+    explicit_products = list(dict.fromkeys(product for product in story.get("products", []) if isinstance(product, str) and product in PRODUCTS))
+    products = (
+        explicit_products
+        if story.get("origin") == "network-health"
+        else list(dict.fromkeys([*explicit_products, *software_from_sources(sources)]))
+    )
     public = {
         "id": story_id, "title": title, "summary": summary,
         "why_it_matters": _text(story.get("why_it_matters"), FIELD_LIMITS["why_it_matters"]),
         "category": category, "priority": priority, "confidence": confidence,
         "state": state, "tags": tags, "sources": sources,
-        "products": list(dict.fromkeys(product for product in story.get("products", []) if isinstance(product, str) and product in PRODUCTS)),
+        "products": products,
         "published_at": _iso(published), "updated_at": _iso(updated),
         # When Onion Flash first published the story; older records fall back to the source date.
         "added_at": _iso(_date(story.get("added_at") or story.get("published_at"))),
@@ -152,9 +172,12 @@ def _permalink(base: str, story_or_id: dict | str) -> str:
     return f'{base.rstrip("/")}/news/{sid}/'
 
 
-def _badges(story: dict) -> str:
+def _badges(story: dict, base: str) -> str:
     retracted = _retracted(story)
     parts = [f'<span class="category-label">{CATEGORIES[story["category"]]}</span>']
+    if not retracted:
+        for sw in story_software(story):
+            parts.append(f'<a class="software-label" href="{_escape(_page_url(base, 1, software=sw))}">{_escape(sw)}</a>')
     if story.get("editorial"):
         parts.append(f'<span class="editorial-badge">{"Retracted" if retracted else "Corrected"}</span>')
     if not retracted:
@@ -217,7 +240,7 @@ def _card(story: dict, base: str) -> str:
     if story["updated_at"] > story["added_at"] and not story.get("updates"):
         updated = f'<span class="updated-note">Updated {_time(story["updated_at"])}</span>'
     return f'''<article class="story" id="story-{story['id']}">
-      <div class="story-topline">{_badges(story)}<span class="story-date">{_time(story['added_at'])}</span></div>
+      <div class="story-topline">{_badges(story, base)}<span class="story-date">{_time(story['added_at'])}</span></div>
       <h2><a href="{_escape(_permalink(base, story))}">{_escape(story['title'])}</a></h2>
       {_editorial_notice(story)}
       <p class="story-summary">{_escape(story['summary'])}</p>{_latest_update(story)}
@@ -351,10 +374,22 @@ def _rss_item(story: dict, base: str) -> ET.Element:
     return item
 
 
-def rss_header(site: dict, base: str, path: str, latest: str | None, category: str | None = None) -> bytes:
+def rss_header(
+    site: dict,
+    base: str,
+    path: str,
+    latest: str | None,
+    category: str | None = None,
+    software: str | None = None,
+) -> bytes:
     """Render the opening UTF-8 XML and `<channel>` metadata bytes for an RSS feed."""
+    if software is not None and software not in SOFTWARE:
+        raise ValueError("Unknown software")
+    if category is not None and category not in CATEGORIES:
+        raise ValueError("Unknown topic")
     channel = ET.Element("channel")
-    title = _text(site["title"], 80) + (f" · {CATEGORIES[category]}" if category else "")
+    suffix = f" · {software}" if software else (f" · {CATEGORIES[category]}" if category else "")
+    title = _text(site["title"], 80) + suffix
     for key, value in {"title": title, "link": base, "description": _text(site["description"], 400), "language": "en"}.items():
         ET.SubElement(channel, key).text = value
     ET.SubElement(channel, f"{{{ATOM_NS}}}link", href=base + path, rel="self", type="application/rss+xml")
@@ -386,55 +421,94 @@ def json_feed_header(site: dict, base: str) -> bytes:
     return (json.dumps(metadata, ensure_ascii=False)[:-1] + ', "items": [').encode("utf-8")
 
 
-def _page_url(base: str, page: int, topic: str | None = None) -> str:
+def _page_url(base: str, page: int, topic: str | None = None, software: str | None = None) -> str:
+    url = (base.rstrip("/") + "/") if base else ""
     if topic is not None:
         if topic not in CATEGORIES:
             raise ValueError("Unknown topic")
-        base += f"topics/{topic}/"
-    return base if page == 1 else f"{base}page/{page}/"
+        url += f"topics/{topic}/"
+    if software is not None:
+        if software not in SOFTWARE:
+            raise ValueError("Unknown software")
+        url += f"software/{software}/"
+    return url if page == 1 else f"{url}page/{page}/"
 
 
-def _pagination(base: str, page: int, pages: int, topic: str | None = None) -> str:
+def _pagination(base: str, page: int, pages: int, topic: str | None = None, software: str | None = None) -> str:
     if pages <= 1:
         return ""
-    previous = f'<a href="{_escape(_page_url(base, page - 1, topic))}" rel="prev">← Newer stories</a>' if page > 1 else ""
-    following = f'<a href="{_escape(_page_url(base, page + 1, topic))}" rel="next">Older stories →</a>' if page < pages else ""
+    previous = f'<a href="{_escape(_page_url(base, page - 1, topic, software))}" rel="prev">← Newer stories</a>' if page > 1 else ""
+    following = f'<a href="{_escape(_page_url(base, page + 1, topic, software))}" rel="next">Older stories →</a>' if page < pages else ""
     return f'<nav class="pagination" aria-label="News pages">{previous}<span>Page {page} of {pages}</span>{following}</nav>'
 
 
-def index_html(site: dict, base: str, homepage: list[dict], source_health: list[dict], *, total: int, page: int = 1, pages: int = 1, latest: str | None = None, topic: str | None = None) -> str:
-    """Render a paginated homepage or topic listing HTML document."""
-    canonical = _page_url(base, page, topic)
+def index_html(
+    site: dict,
+    base: str,
+    homepage: list[dict],
+    source_health: list[dict],
+    *,
+    total: int,
+    page: int = 1,
+    pages: int = 1,
+    latest: str | None = None,
+    topic: str | None = None,
+    software: str | None = None,
+) -> str:
+    """Render a paginated homepage, topic, software, or combined listing HTML document."""
+    root = (base.rstrip("/") + "/") if base else ""
+    canonical = _page_url(root, page, topic, software)
     topics = " ".join(
-        f'<a href="{_escape(_page_url(base, 1, key))}"' + (' aria-current="page"' if key == topic else '') + f'>{label}</a>'
+        f'<a href="{_escape(_page_url(root, 1, key, software))}"' + (' aria-current="page"' if key == topic else '') + f'>{label}</a>'
         for key, label in [(None, "All news"), *CATEGORIES.items()]
     )
+    software_filters = " ".join(
+        f'<a href="{_escape(_page_url(root, 1, topic, key))}"' + (' aria-current="page"' if key == software else '') + f'>{_escape(label)}</a>'
+        for key, label in [(None, "All software"), *((slug, slug) for slug in SOFTWARE)]
+    )
     topic_label = CATEGORIES[topic] if topic else None
-    heading = f"{topic_label} news" if topic else "Tor news, distilled."
-    feed_label = f"{topic_label} RSS feed" if topic else "Subscribe via RSS"
+    if topic_label and software:
+        heading = f"{topic_label} · {software} news"
+        empty_heading = "No stories in this view yet."
+        archive_scope = f"{topic_label.lower()} {software} "
+        feed_label = f"{software} RSS feed"
+    elif software:
+        heading = f"{software} news"
+        empty_heading = "No stories for this software yet."
+        archive_scope = f"{software} "
+        feed_label = f"{software} RSS feed"
+    elif topic_label:
+        heading = f"{topic_label} news"
+        empty_heading = "No stories in this topic yet."
+        archive_scope = f"{topic_label.lower()} "
+        feed_label = f"{topic_label} RSS feed"
+    else:
+        heading = "Tor news, distilled."
+        empty_heading = "The feed is getting started."
+        archive_scope = ""
+        feed_label = "Subscribe via RSS"
     latest_label = f'Latest story update {_time(latest, full=True)}' if latest else 'No stories published yet'
-    cards = "".join(_card(story, base) for story in homepage)
+    cards = "".join(_card(story, root) for story in homepage)
     if not cards:
-        empty_heading = "No stories in this topic yet." if topic else "The feed is getting started."
         cards = f'<section class="empty-state"><h2>{empty_heading}</h2><p>Stories appear here after collection and source checks. Subscribe to the RSS feed for new stories.</p></section>'
     body = f'''<main id="main" class="page">
 <section class="intro"><div><p class="eyebrow">Security. Releases. The network.</p><h1>{heading}</h1><p class="intro-copy">The developments that matter, with the sources to understand them.</p></div>{f'<div class="edition-note"><span class="live-dot" aria-hidden="true"></span>{latest_label}</div>' if page == 1 else ''}</section>
 <div class="news-layout"><section class="news-column" aria-label="Latest news">
-<nav class="topics" aria-label="News topics">{topics}</nav>
+<div class="filter-bars"><nav class="topics" aria-label="News topics">{topics}</nav><nav class="software-filters" aria-label="Software">{software_filters}</nav></div>
 <div class="section-heading"><h2>Latest dispatches</h2><span>{len(homepage)} {'story' if len(homepage) == 1 else 'stories'}</span></div>
 <div class="news-list">{cards}</div>
-{_pagination(base, page, pages, topic)}
-{f'<p class="archive-note">{total} stories in the complete {topic_label.lower() + " " if topic else ""}history.</p>' if pages > 1 else ''}
+{_pagination(root, page, pages, topic, software)}
+{f'<p class="archive-note">{total} stories in the complete {archive_scope}history.</p>' if pages > 1 else ''}
 </section><aside class="sidebar" aria-label="About this feed">
-<section class="subscribe-box"><span class="sidebar-kicker">Follow the feed</span><h2>Stay in the loop.</h2><p>Important Tor developments, delivered to your feed reader.</p><a class="subscribe-link" href="{_escape(base + feed_path(topic))}">{feed_label}</a><a class="secondary-feed" href="{_escape(base)}feed.json">All news JSON Feed</a></section>
+<section class="subscribe-box"><span class="sidebar-kicker">Follow the feed</span><h2>Stay in the loop.</h2><p>Important Tor developments, delivered to your feed reader.</p><a class="subscribe-link" href="{_escape(root + feed_path(topic, software))}">{feed_label}</a><a class="secondary-feed" href="{_escape(root)}feed.json">All news JSON Feed</a></section>
 <section class="about-feed"><h2>Context comes first.</h2><p>Reports, fixes, and releases are grouped into concise stories. Every summary links to its sources.</p><p>Labels distinguish confirmed findings from reports and suspected incidents.</p></section>
 {_health_details(source_health)}
 <p class="sidebar-footnote">An independent project by <a href="https://1aeo.com/">1AEO</a>.</p>
 </aside></div></main>'''
-    title = _text(site["title"], 80) + " — " + (heading if topic else "Tor news, distilled")
+    title = _text(site["title"], 80) + " — " + (heading if (topic or software) else "Tor news, distilled")
     if page > 1:
         title += f", page {page}"
-    return _shell(site, base, title, _text(site["description"], 400), body, canonical)
+    return _shell(site, root, title, _text(site["description"], 400), body, canonical)
 
 
 def article_html(site: dict, base: str, story: dict) -> str:
@@ -445,7 +519,7 @@ def article_html(site: dict, base: str, story: dict) -> str:
         if story.get("origin") == "network-health"
         else "This is an AI-assisted summary of the linked public sources. Consult the original reports for details and operator guidance."
     )
-    inner = f'''{_badges(story)}<h1>{_escape(story['title'])}</h1>
+    inner = f'''{_badges(story, base)}<h1>{_escape(story['title'])}</h1>
 {_editorial_notice(story)}
 <div class="article-dates">First published {_time(story['added_at'], full=True)}{f' <span>·</span> Last updated {_time(story["updated_at"], full=True)}' if story['updated_at'] > story['added_at'] else ''}</div>
 <p class="article-summary">{_escape(story['summary'])}</p>

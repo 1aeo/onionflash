@@ -232,7 +232,7 @@ website_url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-trans
 kind = "tag"
 url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/tags?format=atom"
 fallback_urls = []
-product = "network"
+product = "snowflake"
 authority = "official"
 
 [[sources]]
@@ -242,7 +242,7 @@ name = "Tor Project GitLab Issues for Snowflake"
 website_url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/issues?state=all"
 kind = "gitlab_issue"
 url = "https://gitlab.torproject.org/api/v4/projects/43/issues"
-product = "network"
+product = "snowflake"
 authority = "development"
 
 [[sources]]
@@ -251,7 +251,7 @@ name = "Tor Project GitLab Merged Changes for Snowflake"
 website_url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/merge_requests?state=merged"
 kind = "gitlab_mr"
 url = "https://gitlab.torproject.org/api/v4/projects/43/merge_requests"
-product = "network"
+product = "snowflake"
 authority = "development"
 
 [[sources]]
@@ -261,7 +261,7 @@ website_url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-trans
 kind = "tag"
 url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/tags?format=atom"
 fallback_urls = []
-product = "network"
+product = "webtunnel"
 authority = "official"
 
 [[sources]]
@@ -271,7 +271,7 @@ name = "Tor Project GitLab Issues for WebTunnel"
 website_url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/issues?state=all"
 kind = "gitlab_issue"
 url = "https://gitlab.torproject.org/api/v4/projects/1674/issues"
-product = "network"
+product = "webtunnel"
 authority = "development"
 
 [[sources]]
@@ -280,7 +280,7 @@ name = "Tor Project GitLab Merged Changes for WebTunnel"
 website_url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/merge_requests?state=merged"
 kind = "gitlab_mr"
 url = "https://gitlab.torproject.org/api/v4/projects/1674/merge_requests"
-product = "network"
+product = "webtunnel"
 authority = "development"
 
 [[sources]]
@@ -290,7 +290,7 @@ website_url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-trans
 kind = "tag"
 url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/-/tags?format=atom"
 fallback_urls = []
-product = "network"
+product = "lyrebird"
 authority = "official"
 
 [[sources]]
@@ -299,7 +299,7 @@ name = "Tor Project GitLab Merged Changes for Lyrebird"
 website_url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/-/merge_requests?state=merged"
 kind = "gitlab_mr"
 url = "https://gitlab.torproject.org/api/v4/projects/417/merge_requests"
-product = "network"
+product = "lyrebird"
 authority = "development"
 
 [[sources]]

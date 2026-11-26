@@ -756,14 +756,14 @@ def test_example_config_and_validation_guards(tmp_path, monkeypatch):
     assert sources["tor-browser-security"]["enabled"] and sources["tor-browser-security"]["authority"] == "development"
     assert sources["anti-censorship-team"]["enabled"] and sources["tor-dev"]["enabled"]
     expected_new = {
-        "snowflake-tags": ("tag", "network", "official", None, "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/tags?format=atom"),
-        "snowflake-issues": ("gitlab_issue", "network", "development", "tpo/anti-censorship/pluggable-transports/snowflake", "https://gitlab.torproject.org/api/v4/projects/43/issues"),
-        "snowflake-merges": ("gitlab_mr", "network", "development", None, "https://gitlab.torproject.org/api/v4/projects/43/merge_requests"),
-        "webtunnel-tags": ("tag", "network", "official", None, "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/tags?format=atom"),
-        "webtunnel-issues": ("gitlab_issue", "network", "development", "tpo/anti-censorship/pluggable-transports/webtunnel", "https://gitlab.torproject.org/api/v4/projects/1674/issues"),
-        "webtunnel-merges": ("gitlab_mr", "network", "development", None, "https://gitlab.torproject.org/api/v4/projects/1674/merge_requests"),
-        "lyrebird-tags": ("tag", "network", "official", None, "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/-/tags?format=atom"),
-        "lyrebird-merges": ("gitlab_mr", "network", "development", None, "https://gitlab.torproject.org/api/v4/projects/417/merge_requests"),
+        "snowflake-tags": ("tag", "snowflake", "official", None, "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/tags?format=atom"),
+        "snowflake-issues": ("gitlab_issue", "snowflake", "development", "tpo/anti-censorship/pluggable-transports/snowflake", "https://gitlab.torproject.org/api/v4/projects/43/issues"),
+        "snowflake-merges": ("gitlab_mr", "snowflake", "development", None, "https://gitlab.torproject.org/api/v4/projects/43/merge_requests"),
+        "webtunnel-tags": ("tag", "webtunnel", "official", None, "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/tags?format=atom"),
+        "webtunnel-issues": ("gitlab_issue", "webtunnel", "development", "tpo/anti-censorship/pluggable-transports/webtunnel", "https://gitlab.torproject.org/api/v4/projects/1674/issues"),
+        "webtunnel-merges": ("gitlab_mr", "webtunnel", "development", None, "https://gitlab.torproject.org/api/v4/projects/1674/merge_requests"),
+        "lyrebird-tags": ("tag", "lyrebird", "official", None, "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/-/tags?format=atom"),
+        "lyrebird-merges": ("gitlab_mr", "lyrebird", "development", None, "https://gitlab.torproject.org/api/v4/projects/417/merge_requests"),
         "tor-browser-high-impact-bugs": ("gitlab_issue", "tor-browser", "development", "tpo/applications/tor-browser", canonical_url("https://gitlab.torproject.org/api/v4/projects/472/issues?labels=Apps::Product::TorBrowser,Apps::Impact::High,Apps::Type::Bug")),
     }
     for sid, (kind, product, authority, project, url) in expected_new.items():
