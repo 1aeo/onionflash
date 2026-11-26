@@ -1503,6 +1503,24 @@ def test_generic_pt_overlap_advice_filler_exceptions_and_pt_outage_protection(tm
     assert llm.has_unattributed_advice("Relay operators must enable logging.", exit_src) is True
     assert llm.has_unattributed_advice("Exit relay operators must enable logging.", exit_src) is False
 
+    two_sent_relay = _story_item(
+        title="Tor 0.4.9.16",
+        content="Tor 0.4.9.16 fixes a relay crash. Please upgrade to 0.4.9.16.",
+    )
+    assert llm.has_unattributed_advice("The announcement asks users to upgrade.", two_sent_relay) is False
+    two_sent_win = _story_item(
+        title="Tor 0.4.9.16",
+        content="Windows builds had a typo.\r\nUpgrade to 0.4.9.16 now.",
+    )
+    assert llm.has_unattributed_advice("Users are asked to upgrade to 0.4.9.16.", two_sent_win) is False
+    assert llm.has_unattributed_advice("The announcement asks users to upgrade.", imp_pkt) is True
+    tail_win = _story_item(
+        title="Tor 0.4.9.16",
+        content="Tor 0.4.9.16 fixes a crash. Please upgrade to 0.4.9.16 on Windows.",
+    )
+    assert llm.has_unattributed_advice("The announcement asks users to upgrade.", tail_win) is True
+    assert llm.has_unattributed_advice("The announcement asks Windows users to upgrade.", tail_win) is False
+
     # Generic 'pluggable-transports' tag on a non-PT first source must not mask a later Snowflake source.
     assert candidate_mod._story_pt_family({
         "tags": ["pluggable-transports"],

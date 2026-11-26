@@ -501,13 +501,16 @@ _SCOPE_PHRASE_PATTERNS = (
     (re.compile(r"\bdirectory\s+authorit(?:y|ies)\b", re.IGNORECASE), "dirauth"),
     (re.compile(r"\b(?:hidden|onion)\s+services?\b", re.IGNORECASE), "onion"),
 )
-_HARD_CLAUSE_STOP_RE = re.compile(r"[.!?;:\n]|—|--")
+_HARD_CLAUSE_STOP_RE = re.compile(r"\.(?!\d)|[!?;:\n]|—|--")
 _INDEP_CLAUSE_SPLIT_RE = re.compile(r",\s+(?:and|but|while|whereas|however|meanwhile)\b", re.IGNORECASE)
 _GOVERNING_INTRO_RE = re.compile(
     r"^\s*(?:if|when|for|on|under|in|with|using|running|unless|where|only)\b",
     re.IGNORECASE,
 )
-_TAIL_SCOPE_COND_RE = re.compile(r"\b(?:on|for|under|with|using|running|if|when)\s+([^.!?;,\n]{1,60})", re.IGNORECASE)
+_TAIL_SCOPE_COND_RE = re.compile(
+    r"\b(?:on|for|under|with|using|running|if|when)\s+((?:[^.!?;,\n]|\.(?=\d)){1,60})",
+    re.IGNORECASE,
+)
 
 
 def _extract_scope_qualifiers(text: str) -> set[str]:
@@ -603,7 +606,9 @@ def _has_near_imperative_cue(
     if not matches:
         return False
     for match in matches:
-        src_quals = _directive_scope_qualifiers(src, match.start(), match.start("tail"))
+        matched = match.group(0)
+        lead = len(matched) - len(matched.lstrip(".!?").lstrip())
+        src_quals = _directive_scope_qualifiers(src, match.start() + lead, match.start("tail"))
         if src_quals and not src_quals.issubset(draft_quals):
             continue
         if not obj_tokens:
