@@ -54,7 +54,7 @@ def _seed_published_story(
 
 
 def test_schema_software_and_products_order():
-    """Define the eight upstream software slugs ahead of the network fallback."""
+    """Define the ten upstream software slugs ahead of the network fallback."""
     assert schema.SOFTWARE == [
         "tor",
         "arti",
@@ -64,6 +64,8 @@ def test_schema_software_and_products_order():
         "lyrebird",
         "torspec",
         "tails",
+        "oniux",
+        "orbot",
     ]
     assert schema.PRODUCTS == [*schema.SOFTWARE, "network"]
 
@@ -79,6 +81,7 @@ def test_gitlab_url_and_source_software_extraction():
         ("https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/-/releases/v0.5.0", "tpo/anti-censorship/pluggable-transports/lyrebird", "lyrebird", "lyrebird"),
         ("https://gitlab.torproject.org/tpo/core/torspec/-/commit/deadbeef", "tpo/core/torspec", "torspec", "torspec"),
         ("HTTPS://GitLab.TorProject.ORG/TPO/Tails/Tails/-/issues/20500", "tpo/tails/tails", "tails", "tails"),
+        ("https://gitlab.torproject.org/tpo/core/oniux/-/tags/v0.15.0", "tpo/core/oniux", "oniux", "oniux"),
         ("https://gitlab.torproject.org/tpo/core/tor/-/blob/main/dir/-/issues/1", "tpo/core/tor", "tor", "tor"),
         ("https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/future-pt/-/tags/v0.1.0", "tpo/anti-censorship/pluggable-transports/future-pt", "future-pt", None),
     ]
@@ -112,6 +115,12 @@ def test_gitlab_url_and_source_software_extraction():
     assert util.software_from_url("https://blog.torproject.org/new-release-arti-1-4-0/") == "arti"
     assert util.software_from_url("https://blog.torproject.org/2025/01/new-release-tor-1/") is None
     assert util.software_from_url("https://example.org/new-release-tor-1/") is None
+    assert util.software_from_url("https://github.com/guardianproject/orbot-android/releases/tag/17.7.0-RC-1") == "orbot"
+    assert util.software_from_url("https://github.com/guardianproject/orbot-apple/releases/tag/1.8.0") == "orbot"
+    assert util.software_from_url("https://github.com/guardianproject/orbot/releases/tag/v1.0.0") == "orbot"
+    assert util.software_from_url("http://github.com/guardianproject/orbot-android/releases") is None
+    assert util.software_from_url("https://github.com:8443/guardianproject/orbot-android/releases") is None
+    assert util.software_from_url("https://github.com/other/orbot-android/releases") is None
 
     found = util.software_from_sources([
         {"url": "https://example.org/post"},
@@ -120,8 +129,10 @@ def test_gitlab_url_and_source_software_extraction():
         {"url": "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/merge_requests/11"},
         "https://blog.torproject.org/new-release-tails-7-0/",
         "https://tails.net/news/version_7.18/",
+        "https://gitlab.torproject.org/tpo/core/oniux/-/tags/v0.15.0",
+        "https://github.com/guardianproject/orbot-android/releases/tag/17.7.0",
     ])
-    assert found == ["snowflake", "tor-browser", "tails"]
+    assert found == ["snowflake", "tor-browser", "tails", "oniux", "orbot"]
 
 
 def test_release_mentions_and_clusters_for_pluggable_transports():
@@ -172,6 +183,8 @@ def test_tag_notice_labels_fallback_and_length_bounds():
         "lyrebird": "Lyrebird",
         "torspec": "Tor specification",
         "tails": "Tails",
+        "oniux": "oniux",
+        "orbot": "Orbot",
     }
     for slug, label in expected_labels.items():
         notice = analyze.tag_notice(tag(product=slug, title=f"{slug}-1.0.0", url=f"https://example.org/tags/{slug}-1.0.0"))

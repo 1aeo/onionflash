@@ -575,6 +575,8 @@ _PRODUCT_NAMES = {
     "snowflake": "snowflake",
     "webtunnel": "webtunnel",
     "lyrebird": "lyrebird",
+    "oniux": "oniux",
+    "orbot": "orbot",
     "arti": "arti",
     "tor": "tor",
 }
@@ -597,6 +599,7 @@ GITLAB_SOFTWARE_PROJECTS = {
     "tpo/anti-censorship/pluggable-transports/lyrebird": "lyrebird",
     "tpo/core/torspec": "torspec",
     "tpo/tails/tails": "tails",
+    "tpo/core/oniux": "oniux",
 }
 _GITLAB_TORPROJECT_URL = re.compile(
     r"^https://gitlab\.torproject\.org/([^?#]+?)/-/(?:issues|work_items|merge_requests|tags|blob|releases|commit)/\S+",
@@ -806,7 +809,7 @@ def gitlab_repo_name(url: object) -> str | None:
 
 
 def software_from_url(url: object) -> str | None:
-    """Map an upstream Tor Project GitLab, blog release, or Tails URL to a software slug."""
+    """Map an upstream Tor Project GitLab, blog release, Tails, or Orbot URL to a software slug."""
     path = gitlab_project_path(url)
     if path is not None:
         return GITLAB_SOFTWARE_PROJECTS.get(path)
@@ -819,11 +822,20 @@ def software_from_url(url: object) -> str | None:
         parsed = urlsplit(raw)
     except ValueError:
         return None
-    if parsed.scheme.lower() != "https":
+    if parsed.scheme.lower() != "https" or parsed.port is not None:
         return None
     netloc = parsed.netloc.lower()
     if netloc in {"tails.net", "www.tails.net"}:
         return "tails"
+    if netloc in {"github.com", "www.github.com"}:
+        gh_path = parsed.path.lower()
+        if gh_path.startswith((
+            "/guardianproject/orbot-android/",
+            "/guardianproject/orbot-apple/",
+            "/guardianproject/orbot/",
+        )) or gh_path in {"/guardianproject/orbot-android", "/guardianproject/orbot-apple", "/guardianproject/orbot"}:
+            return "orbot"
+        return None
     if netloc != "blog.torproject.org":
         return None
     blog_path = parsed.path.lower()

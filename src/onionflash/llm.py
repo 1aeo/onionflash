@@ -6,6 +6,7 @@ import codecs
 import json
 import os
 import re
+import threading
 import time
 import unicodedata
 from collections.abc import Iterable
@@ -1102,12 +1103,86 @@ def parse_sse_completion(chunks: Iterable[bytes], *, max_content_bytes: int) -> 
 
 
 class CompletionClient:
-    """Shared chat-completion HTTP client with endpoint failover and schema enforcement."""
+    """Shared chat-completion HTTP client with active endpoint pooling, failover and schema enforcement."""
 
     stage = "writer"
+    POOL_COOLDOWN_SECONDS = 60.0
     REQUEST_POLICY = {"transport": {"retry_attempts": 1, "max_redirects": 0},
                       "deadline_refund": "before_dispatch_only",
                       "run_deadline": "admission_before_and_after_reservation"}
+
+    _pool_lock = threading.Lock()
+    _pool_state: dict[tuple[str, ...], dict] = {}
+
+    @classmethod
+    def _reset_pool_state(cls) -> None:
+        """Clear shared endpoint pool counters (intended for unit tests)."""
+        with cls._pool_lock:
+            cls._pool_state.clear()
+
+    @classmethod
+    def _pool_urls(cls, llm_cfg: dict) -> tuple[str, ...]:
+        pool = [u for u in (llm_cfg.get("pool_base_urls") or ()) if isinstance(u, str) and u]
+        if not pool:
+            return ()
+        base = llm_cfg.get("base_url")
+        raw = [base, *pool] if isinstance(base, str) and base else pool
+        return tuple(dict.fromkeys(raw))
+
+    @classmethod
+    def _pool_claim_next(
+        cls,
+        pool_urls: tuple[str, ...],
+        fallbacks_only: list[str],
+        tried: set[str],
+        now: float,
+    ) -> str:
+        """Atomically select and claim the least-loaded healthy untried pool endpoint."""
+        with cls._pool_lock:
+            entry = cls._pool_state.setdefault(
+                pool_urls,
+                {
+                    "in_flight": {url: 0 for url in pool_urls},
+                    "unhealthy_until": {},
+                    "rr": 0,
+                },
+            )
+            in_flight = entry["in_flight"]
+            unhealthy = entry["unhealthy_until"]
+            n = len(pool_urls)
+            start = entry["rr"]
+            rotated = [
+                (idx, url)
+                for idx in range(n)
+                if (url := pool_urls[(start + idx) % n]) not in tried
+            ]
+            if rotated:
+                healthy = [(in_flight.get(url, 0), idx, url) for idx, url in rotated if unhealthy.get(url, 0.0) <= now]
+                if healthy:
+                    chosen = min(healthy)[2]
+                else:
+                    chosen = min((unhealthy[url], in_flight.get(url, 0), idx, url) for idx, url in rotated)[3]
+                entry["rr"] = (start + 1) % n
+                in_flight[chosen] = in_flight.get(chosen, 0) + 1
+                return chosen
+        for fb in fallbacks_only:
+            if fb not in tried:
+                return fb
+        raise RuntimeError("No untried endpoint available in pool")
+
+    @classmethod
+    def _pool_release(cls, pool_urls: tuple[str, ...], url: str, *, healthy: bool | None = None, now: float = 0.0) -> None:
+        if not pool_urls or url not in pool_urls:
+            return
+        with cls._pool_lock:
+            entry = cls._pool_state.get(pool_urls)
+            if entry is None:
+                return
+            entry["in_flight"][url] = max(0, entry["in_flight"].get(url, 0) - 1)
+            if healthy is True:
+                entry["unhealthy_until"].pop(url, None)
+            elif healthy is False:
+                entry["unhealthy_until"][url] = now + cls.POOL_COOLDOWN_SECONDS
 
     def __init__(self, config: dict, deadline: float | None = None):
         self.deadline = deadline  # absolute monotonic admission boundary, not a transport cutoff
@@ -1147,7 +1222,8 @@ class CompletionClient:
     def complete(self, prompt: str, payload: dict, schema: dict, name: str, *, on_request=None) -> dict:
         """One fresh request; drafting, review and link checks share transport policy."""
         self._admit()
-        if not self.llm["base_url"]:
+        pool_configured = bool(self._pool_urls(self.llm))
+        if not self.llm["base_url"] and not pool_configured:
             raise AnalysisError("LLM endpoint is not configured", retryable=True)
         key = os.environ.get(self.llm["api_key_env"], "")
         if not key:
@@ -1176,8 +1252,18 @@ class CompletionClient:
         max_bytes = int(self.http_settings.get("max_response_bytes", 4 * 1024 * 1024))
         stream_limit = max(max_bytes * SSE_WIRE_MULTIPLIER, MIN_SSE_WIRE_BYTES)
         req_headers = {"Authorization": "Bearer " + key, "Accept-Encoding": "identity"}
+        fallbacks = [u for u in (self.llm.get("fallback_base_urls") or ()) if isinstance(u, str) and u]
+        pool_urls = self._pool_urls(self.llm)
+        if pool_urls:
+            fallbacks_only = [u for u in dict.fromkeys(fallbacks) if u not in pool_urls]
+            total_attempts = len(pool_urls) + len(fallbacks_only)
+        else:
+            fallbacks_only = []
+            legacy_endpoints = iter([self.llm["base_url"], *fallbacks])
+            total_attempts = 1 + len(fallbacks)
+        tried: set[str] = set()
         failure = None
-        for base_url in [self.llm["base_url"], *self.llm["fallback_base_urls"]]:
+        for _ in range(total_attempts):
             self._admit(failure)
             if on_request is not None:
                 on_request(1)  # Reserve durably before any endpoint attempt.
@@ -1187,7 +1273,14 @@ class CompletionClient:
                 if on_request is not None:
                     on_request(-1)
                 raise
+            base_url = (
+                self._pool_claim_next(pool_urls, fallbacks_only, tried, self.clock())
+                if pool_urls
+                else next(legacy_endpoints)
+            )
+            tried.add(base_url)
             self.calls += 1
+            healthy: bool | None = None
             try:
                 if isinstance(self.client, _HTTP_CLIENT_CLASS):
                     response = self.client.request(
@@ -1212,8 +1305,11 @@ class CompletionClient:
                             response.headers,
                             response.url,
                         )
+                healthy = True
                 break
             except FetchError as exc:
+                if not isinstance(exc, DeadlineReached):
+                    healthy = False
                 # An endpoint or credential problem is not this item's fault.
                 current_failure = AnalysisError(
                     "LLM request failed" + (f" (HTTP {exc.status})" if exc.status else ""),
@@ -1229,6 +1325,14 @@ class CompletionClient:
                 if isinstance(exc, DeadlineReached):
                     raise failure or current_failure from None
                 failure = current_failure
+            finally:
+                if pool_urls:
+                    self._pool_release(
+                        pool_urls,
+                        base_url,
+                        healthy=healthy,
+                        now=self.clock() if healthy is False else 0.0,
+                    )
         else:
             raise failure
         if isinstance(on_request, RequestObserver):

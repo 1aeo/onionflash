@@ -22,6 +22,8 @@ SOFTWARE = [
     "lyrebird",
     "torspec",
     "tails",
+    "oniux",
+    "orbot",
 ]
 PRODUCTS = [*SOFTWARE, "network"]
 UPDATE_CHARS = 300  # the text of one dated update

@@ -7,12 +7,13 @@ import os
 from pathlib import Path
 import re
 import stat
+import threading
 import unicodedata
 from urllib.parse import urlsplit
 
 import pytest
 
-from helpers import DATE, ROOT, ApprovingReviewer, _ClientBase, _meter_request, load_evaluator, verdict
+from helpers import DATE, ROOT, ApprovingReviewer, _ClientBase, _meter_request, analysis, load_evaluator, make_config, verdict, write_toml
 from onionflash import review_gate
 from onionflash.config import DEFAULTS
 from onionflash.review import CRITERIA, RELEASE_ISSUE, _packet_refs, final_holds, release_labels_match_state, validate_review
@@ -1238,3 +1239,75 @@ def test_evaluate_review_specialists_initial_reask_and_low_budget_hold(evaluatio
     res_low = module.evaluate(config, [clean_case], tmp_path / "low_budget.jsonl", specialists=3)
     assert res_low["errors"] == 0 and res_low["matched"] == 0
     assert res_low["holds"].get("held.verification.specialist_budget") == 1
+
+
+def test_evaluate_parallel_concurrency_matches_sequential(tmp_path, monkeypatch):
+    """Verify `--concurrency 3` produces identical summary counts and valid JSONL without duplicating drafts."""
+    module = MOD
+    config = make_config(tmp_path)
+    config["llm"].update(base_url="https://model.example/v1", api_key_env="REVIEW_TEST_KEY")
+    monkeypatch.setenv("REVIEW_TEST_KEY", "synthetic-fixture-value")
+    corpus = json.loads((Path(__file__).resolve().parents[1] / "tools/review_cases.json").read_text())
+    cases = module.expand(corpus)[:4]
+
+    draft_calls = 0
+    draft_lock = threading.Lock()
+
+    class _FakeRev(_ClientBase):
+        last_decoded = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def review(self, cand, packet, *, coverage=None, verification=False, issue=None, update=False,
+                   specialist=None, validation_error=None, on_request=None):
+            if on_request:
+                on_request(1)
+            return verdict("approve", update=update)
+
+    class _FakeWriter(_ClientBase):
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def analyze(self, item, prior=None):
+            nonlocal draft_calls
+            with draft_lock:
+                draft_calls += 1
+            return analysis(
+                title=item["title"],
+                summary=item["content"],
+                why_it_matters="",
+                evidence=[item["content"][:40]],
+            )
+
+    monkeypatch.setattr(module, "EvaluationReviewer", _FakeRev)
+    monkeypatch.setattr(module, "Analyzer", _FakeWriter)
+
+    seq_out = tmp_path / "seq.jsonl"
+    par_out = tmp_path / "par.jsonl"
+    seq_res = module.evaluate(config, cases, seq_out, concurrency=1)
+    par_res = module.evaluate(config, cases, par_out, concurrency=3)
+    assert seq_res == par_res
+    par_lines = [json.loads(line) for line in par_out.read_text().splitlines()]
+    assert len(par_lines) == len(cases) + 1
+    assert par_lines[-1]["summary"] == par_res
+    assert {row["case"] for row in par_lines[:-1]} == {c["id"] for c in cases}
+
+    shared_pair = [{**cases[0], "id": "shared-a"}, {**cases[0], "id": "shared-b"}]
+    shared_out = tmp_path / "shared_draft.jsonl"
+    module.evaluate(config, shared_pair, shared_out, draft=True, concurrency=2)
+    assert draft_calls == 1
+
+    first_draft_id = module.draft_cases(corpus)[0]["id"]
+    draft_par_out = tmp_path / "draft_par.jsonl"
+    rc = module.main([
+        "--config", str(write_toml(tmp_path, '[llm]\nbase_url = "https://model.example/v1"\n')),
+        "--cases", str(Path(__file__).resolve().parents[1] / "tools/review_cases.json"),
+        "--case-id", first_draft_id,
+        "--output", str(draft_par_out),
+        "--draft",
+        "--concurrency", "3",
+    ])
+    assert isinstance(rc, int)
+    assert draft_calls == 2
+    assert len(draft_par_out.read_text().splitlines()) == 2

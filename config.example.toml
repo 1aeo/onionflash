@@ -31,6 +31,8 @@ enabled = false
 # read from the ONIONFLASH_LLM_API_KEY environment variable.
 base_url = "${ONIONFLASH_LLM_BASE_URL}"
 fallback_base_urls = []
+pool_base_urls = []
+max_concurrent_requests = 4
 model = "qwen3.8-27b"
 # For a private LAN endpoint, explicitly set allow_http=true (if necessary)
 # and allowed_networks to the exact server IPs as /32 or /128 CIDRs.
@@ -320,6 +322,53 @@ kind = "gitlab_mr"
 url = "https://gitlab.torproject.org/api/v4/projects/417/merge_requests"
 product = "lyrebird"
 authority = "development"
+
+[[sources]]
+id = "oniux-tags"
+name = "Tor Project GitLab Tags for oniux"
+website_url = "https://gitlab.torproject.org/tpo/core/oniux/-/tags"
+kind = "tag"
+url = "https://gitlab.torproject.org/tpo/core/oniux/-/tags?format=atom"
+fallback_urls = []
+product = "oniux"
+authority = "official"
+
+[[sources]]
+id = "oniux-issues"
+gitlab_project = "tpo/core/oniux"
+name = "Tor Project GitLab Issues for oniux"
+website_url = "https://gitlab.torproject.org/tpo/core/oniux/-/issues?state=all"
+kind = "gitlab_issue"
+url = "https://gitlab.torproject.org/api/v4/projects/3212/issues"
+product = "oniux"
+authority = "development"
+
+[[sources]]
+id = "oniux-merges"
+name = "Tor Project GitLab Merged Changes for oniux"
+website_url = "https://gitlab.torproject.org/tpo/core/oniux/-/merge_requests?state=merged"
+kind = "gitlab_mr"
+url = "https://gitlab.torproject.org/api/v4/projects/3212/merge_requests"
+product = "oniux"
+authority = "development"
+
+[[sources]]
+id = "orbot-android-releases"
+name = "Orbot for Android Releases"
+website_url = "https://github.com/guardianproject/orbot-android/releases"
+kind = "feed"
+url = "https://github.com/guardianproject/orbot-android/releases.atom"
+product = "orbot"
+authority = "official"
+
+[[sources]]
+id = "orbot-apple-releases"
+name = "Orbot for iOS and macOS Releases"
+website_url = "https://github.com/guardianproject/orbot-apple/releases"
+kind = "feed"
+url = "https://github.com/guardianproject/orbot-apple/releases.atom"
+product = "orbot"
+authority = "official"
 
 [[sources]]
 id = "tor-metrics-news"

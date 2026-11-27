@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import gzip
 import json
 import socket
+import threading
 import time
 from unittest.mock import Mock
 import zlib
@@ -1102,13 +1103,19 @@ def test_sse_truncated_length_is_non_retryable_and_limits_fail_closed(completion
 
 def test_streaming_json_fallback_midstream_timeout_and_identity_parity(completion_client):
     """Support plain JSON fallback responses, mid-stream SSE ReadTimeouts, and preserve policy_hash/cache_key."""
-    baseline_policy = "99ee8a189a2e32c9a401c952cb9890048fded40436ea1825abfbe81797fd75ca"
+    baseline_policy = "e53e0384a853d286697f055dc6c644b9a955c07b71787e3868c800902453e846"
     assert review.policy_hash(copy.deepcopy(DEFAULTS)) == baseline_policy
+    cfg_pool_empty = copy.deepcopy(DEFAULTS)
+    cfg_pool_empty["llm"]["pool_base_urls"] = []
+    assert review.policy_hash(cfg_pool_empty) == baseline_policy
+    cfg_pool_set = copy.deepcopy(DEFAULTS)
+    cfg_pool_set["llm"]["pool_base_urls"] = ["https://node2.example/v1"]
+    assert review.policy_hash(cfg_pool_set) != baseline_policy
     row = {"content_hash": "a" * 64}
     cfg_on = copy.deepcopy(DEFAULTS)
     cfg_on["llm"]["writer_reasoning"] = True
-    assert analyze.cache_key(row, DEFAULTS["llm"]) == "2958a77cb975044bcda52ce6215d36c9e742a96f50f76d3aac59c5c6da472afd"
-    assert analyze.cache_key(row, cfg_on["llm"]) == "0c6bada1be6aed47f6db4bea464e824c52e544fd351b25739e06a2a777b558f8"
+    assert analyze.cache_key(row, DEFAULTS["llm"]) == "36451b56df11731ed0ced04ad77e04eddad10f05fd45cb5e8189f2bc041cb4b7"
+    assert analyze.cache_key(row, cfg_on["llm"]) == "7d169250b2d18c83b0b011684ec217ae96371c61eae94e06c68a1155ce3e484f"
 
     json_client, _ = completion_client(lambda _req: _httpx_completion({"mode": "json"}))
     _, req1, _ = _ledger()
@@ -1130,3 +1137,96 @@ def test_streaming_json_fallback_midstream_timeout_and_identity_parity(completio
     with pytest.raises(AnalysisError):
         _complete(slow_client, req2)
     assert slow_client.calls == req2.actual == record["request_budget"]["reserved"] == 1
+
+
+def test_pool_base_urls_load_balancing_cooldown_and_recovery(completion_client, monkeypatch):
+    """Distribute pooled completions across healthy peers, cool down failed peers, and recover."""
+    CompletionClient._reset_pool_state()
+    clock = [100.0]
+    seen_hosts: list[str] = []
+    fail_node1 = True
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        seen_hosts.append(request.url.host)
+        if request.url.host == "node1.example" and fail_node1:
+            raise httpx.ConnectError("node1 down", request=request)
+        return _httpx_completion({"host": request.url.host})
+
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["llm"].update(
+        base_url="https://node1.example/v1",
+        pool_base_urls=["https://node2.example/v1"],
+        fallback_base_urls=["https://backup.example/v1"],
+        api_key_env="TEST_LLM_KEY",
+    )
+    monkeypatch.setenv("TEST_LLM_KEY", "secret-token")
+    client = CompletionClient(cfg)
+    client.clock = lambda: clock[0]
+    monkeypatch.setattr(
+        llm,
+        "HttpClient",
+        lambda settings, **kwargs: HttpClient(settings, **kwargs, transport=httpx.MockTransport(_handle), resolver=public_dns),
+    )
+
+    # First call hits node1, fails, falls through to node2 in the pool, and succeeds.
+    record1, req1, _ = _ledger()
+    assert _complete(client, req1) == {"host": "node2.example"}
+    assert seen_hosts == ["node1.example", "node2.example"]
+    assert client.calls == 2 and req1.actual == 2 and record1["request_budget"]["reserved"] == 2
+
+    # Second call while node1 is in cooldown skips straight to healthy node2 (1 request).
+    seen_hosts.clear()
+    clock[0] = 110.0
+    _, req2, _ = _ledger()
+    assert _complete(client, req2) == {"host": "node2.example"}
+    assert seen_hosts == ["node2.example"]
+
+    # After cooldown expires and node1 recovers, both nodes receive traffic again.
+    seen_hosts.clear()
+    fail_node1 = False
+    clock[0] = 200.0
+    _, req3, _ = _ledger()
+    res3 = _complete(client, req3)
+    assert res3["host"] in {"node1.example", "node2.example"}
+    _, req4, _ = _ledger()
+    res4 = _complete(client, req4)
+    assert {res3["host"], res4["host"]} == {"node1.example", "node2.example"}
+    CompletionClient._reset_pool_state()
+
+
+def test_pool_base_urls_balances_concurrent_in_flight_requests(monkeypatch):
+    """Route concurrent requests to the pool node with fewer in-flight requests."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    CompletionClient._reset_pool_state()
+    barrier = threading.Barrier(2, timeout=5.0)
+    seen_hosts: list[str] = []
+    lock = threading.Lock()
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        with lock:
+            seen_hosts.append(request.url.host)
+        barrier.wait()
+        return _httpx_completion({"host": request.url.host})
+
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["llm"].update(
+        base_url="https://node1.example/v1",
+        pool_base_urls=["https://node2.example/v1"],
+        api_key_env="TEST_LLM_KEY",
+    )
+    monkeypatch.setenv("TEST_LLM_KEY", "secret-token")
+    monkeypatch.setattr(
+        llm,
+        "HttpClient",
+        lambda settings, **kwargs: HttpClient(settings, **kwargs, transport=httpx.MockTransport(_handle), resolver=public_dns),
+    )
+
+    def _worker():
+        with CompletionClient(cfg) as c:
+            return c.complete("prompt", {"a": 1}, {"type": "object", "properties": {"host": {"type": "string"}}, "required": ["host"], "additionalProperties": False}, "test")["host"]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        hosts = list(pool.map(lambda _: _worker(), range(2)))
+    assert sorted(hosts) == ["node1.example", "node2.example"]
+    CompletionClient._reset_pool_state()
