@@ -1266,3 +1266,123 @@ def test_update_release_state_scoping_and_update_specialist_prompts(monkeypatch)
     )
     assert "Check ONLY candidate.updates[-1].text" in seen_prompts[-1]
     assert "Do NOT evaluate, fail, or modify read-only title, summary, or why_it_matters" in seen_prompts[-1]
+
+
+def test_completed_action_dependency_behavior_and_source_stated_forms():
+    """Avoid false completed_action holds on descriptive dependency defaults and source-stated forms while keeping unstated holds."""
+    # 1. Descriptive external dependency / environment behavior does not claim Tor action.
+    openssl_issue = _unit(
+        "gitlab_issue",
+        "Tor falls back to OpenSSL's default TLS groups when built against OpenSSL 4.x",
+        "OpenSSL 4.0.0 compiles the TLS groups RFC 8422 deprecates out by default.",
+        "Support of deprecated elliptic curves in TLS according to [RFC 8422] was disabled at compile-time by default.",
+        state="opened",
+    )
+    openssl_no_verb = _unit(
+        "gitlab_issue",
+        "Tor falls back to OpenSSL's default TLS groups when built against OpenSSL 4.x",
+        "OpenSSL 4.0.0 compiles the TLS groups RFC 8422 deprecates out by default.",
+        state="opened",
+    )
+    for summary_text in (
+        "The reporter attributes the failure to P-224 while OpenSSL 4.x disables RFC 8422-deprecated curves by default.",
+        "OpenSSL 4.x, which disables RFC 8422-deprecated curves by default, rejects P-224.",
+        "RFC 8422-deprecated curves are disabled by default in OpenSSL 4.x.",
+        "OpenSSL 4.0.0 disabled RFC 8422-deprecated curves at compile-time by default.",
+        "Debian 13 removes legacy curves in its default build.",
+        "Nginx 1.28 disables HTTP/2 by default.",
+    ):
+        cand = _candidate(
+            title="Tor 0.4.9.16 falls back to OpenSSL 4.x default TLS groups",
+            summary=summary_text,
+            why_it_matters="",
+            category="protocol",
+            tags=["protocol"],
+            confidence="reported",
+            state="developing",
+        )
+        assert review.final_holds(cand, {"packet": {"sources": [openssl_issue]}, "payload": {"editorial_kind": "gitlab_issue"}}) == []
+        assert review.final_holds(cand, {"packet": {"sources": [openssl_no_verb]}, "payload": {"editorial_kind": "gitlab_issue"}}) == []
+
+    # 2. Source-stated completed-action frames (including "What I did was ... and remove ...", "applied ... of disabling ...", and tense variants).
+    broker_issue = _unit(
+        "gitlab_issue",
+        "Upgrade Nginx on snowflake broker for vulnerabilities",
+        "What I did was edit four files in /etc/nginx: sites-available/site-a, "
+        "sites-available/site-b, sites-enabled/site-c, "
+        "sites-enabled/site-d, and remove `http2` from the `listen` line.",
+        "I applied the recommended mitigation of disabling HTTP/2.",
+        state="closed",
+    )
+    broker_cand = _candidate(
+        title="Snowflake broker HTTP/2 disabled after reported Nginx vulnerabilities",
+        summary="dcf said they removed `http2` from four `/etc/nginx` `listen` lines as the recommended mitigation.",
+        why_it_matters="Comments record an applied HTTP/2 mitigation with HTTP/2 kept disabled for now.",
+        category="security",
+        tags=["security"],
+        confidence="reported",
+        state="developing",
+    )
+    assert review.final_holds(broker_cand, {"packet": {"sources": [broker_issue]}, "payload": {"editorial_kind": "gitlab_issue"}}) == []
+
+    for src_text, cand_summary in (
+        ("Tor removed the deprecated option in 0.4.9.16.", "Tor removes the deprecated option in 0.4.9.16."),
+        ("Tor removes bastet from the list.", "Tor removed bastet."),
+        ("Tor removed bastet, and operators will rotate keys if tests pass.", "Tor removed bastet."),
+        ("The patch was shipped in 1.2.0.", "Tor ships the patch in 1.2.0."),
+        ("I did disable HTTP/2 yesterday.", "Operators disabled HTTP/2 yesterday."),
+        ("I did edit config and remove the obsolete listener.", "Operators removed the obsolete listener."),
+        ("What I did was edit config and remove the listener.", "The maintainer removed the listener."),
+        ("What I did was investigate the crash and remove the listener.", "The maintainer removed the listener."),
+    ):
+        src_u = _unit("gitlab_issue", "Tracker", src_text, state="opened")
+        cand = _candidate(
+            title="Tracker update",
+            summary=cand_summary,
+            why_it_matters="",
+            category="protocol",
+            tags=["protocol"],
+            confidence="reported",
+            state="developing",
+        )
+        assert review.final_holds(cand, {"packet": {"sources": [src_u]}, "payload": {"editorial_kind": "gitlab_issue"}}) == []
+
+    # 3. Genuine unstated completed-action claims on open GitLab issues still trigger completed_action.
+    for src_u, bad_fields in (
+        (ISSUE, {"summary": "Tor removes bastet from the directory authority list."}),
+        (ISSUE, {"summary": "Tor disables TLS 1.1 by default."}),
+        (openssl_no_verb, {"summary": "Tor has disabled TLS 1.1 by default in OpenSSL builds."}),
+        (ISSUE, {"summary": "The compromised node disables logging."}),
+        (CRASH, {"title": "Fixed the bug", "summary": "Patched crash."}),
+        (_unit("gitlab_issue", "Bastet", "If Tor removes bastet, clients will drop it.", state="opened"),
+         {"summary": "Tor removed bastet."}),
+        (_unit("gitlab_issue", "Bastet", "Tor removes bastet if the compromise is confirmed.", state="opened"),
+         {"summary": "Tor removed bastet."}),
+        (_unit("gitlab_issue", "Bastet", "Tor removes bastet unless operators object.", state="opened"),
+         {"summary": "Tor removed bastet."}),
+        (_unit("gitlab_issue", "Upgrade Nginx", "Waiting for upstream fixes in 1.30.7.", state="opened"),
+         {"summary": "Nginx patched CVE-2026-123007 on the broker."}),
+        (_unit("gitlab_issue", "Mitigation", "What I did was propose to remove `http2`.", "We considered disabling HTTP/2.", state="opened"),
+         {"summary": "dcf removed `http2`."}),
+        (_unit("gitlab_issue", "Listener", "What I did was investigate whether we can remove the listener.", state="opened"),
+         {"summary": "The maintainer removed the listener."}),
+        (_unit("gitlab_issue", "Mitigation", "What I did was not remove `http2`.", state="opened"),
+         {"summary": "dcf removed `http2`."}),
+        (_unit("gitlab_issue", "Mitigation", "Applied the mitigation without disabling HTTP/2.", state="opened"),
+         {"summary": "HTTP/2 was disabled."}),
+        (_unit("gitlab_issue", "Bug", "Release notes mention security fixes.", state="opened"),
+         {"summary": "The crash was fixed."}),
+    ):
+        cand = _candidate(**{
+            "title": "Open issue summary",
+            "summary": "Open issue details.",
+            "why_it_matters": "",
+            "category": "security",
+            "tags": ["security"],
+            "confidence": "reported",
+            "state": "developing",
+            **bad_fields,
+        })
+        assert "completed_action" in review.final_holds(
+            cand, {"packet": {"sources": [src_u]}, "payload": {"editorial_kind": "gitlab_issue"}}
+        )

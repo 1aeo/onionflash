@@ -7,10 +7,11 @@ import re
 
 from .analyze import SCHEMA as DRAFT_SCHEMA, _numbers as _impact_numbers
 from .llm import (AnalysisError, CompletionClient, apply_label_limits, has_malformed_tor_version,
-                  has_shouting_caps, has_unattributed_advice, is_complete_sentence,
-                  is_incomplete_or_filler_impact, is_quoted_list_post, label_limits,
-                  repair_schema, strip_unreleased_tag, unquoted_mail_text, validate_schema_field,
-                  validate_text, widen_release_state_for_update)
+                  has_shouting_caps, has_unattributed_advice, is_action_stated_in_source,
+                  is_complete_sentence, is_excused_done_verb, is_incomplete_or_filler_impact,
+                  is_quoted_list_post, label_limits, repair_schema, strip_unreleased_tag,
+                  unquoted_mail_text, validate_schema_field, validate_text,
+                  widen_release_state_for_update)
 from .render import prepare_story
 from .schema import FIELD_LIMITS, LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STATES, STORY_ID_RE, UPDATE_CHARS
 from .util import LIST_ARCHIVE_HOST, canonical_url, digest, is_trove_item, normalize_evidence, strict_json
@@ -850,11 +851,6 @@ DONE = {"removed": "remove", "removes": "remove", "fixed": "fix", "patched": "pa
         "revoked": "revoke", "revokes": "revoke", "rotated": "rotate", "rotates": "rotate",
         "shipped": "ship", "ships": "ship"}
 _DONE_WORD = re.compile(r"\b(" + "|".join(DONE) + r")\b(?!-)")
-# A story's word right after a modal, negation or request claims nothing: "to be removed".
-_EXCUSED = re.compile(r"\b(?:should|must|will|would|could|may|might|to|be|not|never|yet|no|without|asks?|"
-                      r"requests?|proposes?|wants?|plans?|needs?)\s+(?:(?:yet|been|be|being|to)\s+)*$")
-# Nor does a source's word within three words of one: "will be deployed".
-_UNPROVEN = re.compile(r"\b(?:not|never|cannot|should|must|will|would|could|may|might|to|no)\b(?:\s+\w+){0,3}\s*$")
 _HEDGED = re.compile(r"(?:plausib|suspect|possib|potential|alleg|unconfirmed|likely|(?:may|might|could)\s+(?:have\s+)?be(?:en)?)"
                      r"\w*\s+(?:\w+\s+){0,2}(?:compromis|hack|breach)")
 _COMPROMISE = re.compile(r"compromis|hack|breach")
@@ -939,16 +935,18 @@ def _untrusted_incident_mention(raw_text: str) -> bool:
 
 
 def _stated(text: str, word: str) -> bool:
-    return any(not _UNPROVEN.search(text[max(0, match.start() - 45):match.start()])
-               for match in re.finditer(rf"\b{word}\b(?!-)", text))
+    return is_action_stated_in_source(text, word, base_forms=DONE)
 
 
 def _claimed_done(*texts: str) -> list[str]:
     claimed = []
     for raw in texts:
         text = _plain(raw)
-        claimed += [match[1] for match in _DONE_WORD.finditer(text)
-                    if not _EXCUSED.search(text[max(0, match.start() - 90):match.start()])]
+        claimed += [
+            match[1]
+            for match in _DONE_WORD.finditer(text)
+            if not is_excused_done_verb(text, match.start(), match.end(), match[1])
+        ]
     return claimed
 
 
@@ -1004,7 +1002,7 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
     is_alert = candidate.get("origin") == "network-health"
     products = candidate.get("products", ())
     return [reason for reason, held in (
-        ("completed_action", any(not (_stated(proof, word) or _stated(merged, DONE[word])) for word in claimed)),
+        ("completed_action", any(not (_stated(proof, word) or _stated(merged, DONE[word]) or _stated(merged, word)) for word in claimed)),
         ("compromise_headline", compromise_headline),
         ("confirmed_source", not is_alert and candidate["confidence"] not in limits["confidence"]),
         ("merge_state", not is_alert and limits["state"] == ["merged"] and candidate["state"] != "merged"),
