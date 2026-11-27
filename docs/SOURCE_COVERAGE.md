@@ -22,7 +22,9 @@ protocol changes. The additional configured streams are:
 | [WebTunnel issues](https://gitlab.torproject.org/api/v4/projects/1674/issues) | `webtunnel-issues`, enabled | Public defect and transport compatibility issues for WebTunnel. |
 | [WebTunnel merged changes](https://gitlab.torproject.org/api/v4/projects/1674/merge_requests) | `webtunnel-merges`, enabled | Merged fixes and changes for WebTunnel. |
 | [Lyrebird tags](https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/-/tags) | `lyrebird-tags`, enabled | Official GitLab version tags for the Lyrebird pluggable transport. |
+| [Lyrebird issues](https://gitlab.torproject.org/api/v4/projects/417/issues) | `lyrebird-issues`, enabled | Public defect and transport compatibility issues for Lyrebird. |
 | [Lyrebird merged changes](https://gitlab.torproject.org/api/v4/projects/417/merge_requests) | `lyrebird-merges`, enabled | Merged fixes and transport changes for Lyrebird. |
+| [Tails Official News and Releases](https://tails.net/news/index.en.html) | `tails-news`, enabled | Official Tails release announcements and project news feed. |
 | [Tor Metrics Timeline repository](https://gitlab.torproject.org/tpo/network-health/metrics/timeline) | `tor-metrics-news`, enabled | Curated event rows from the maintained README; validated repository snapshots replace the stale Atom feed. |
 | [Tor Project Development Mailing List](https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/) | `tor-dev`, enabled | An RFC on `tor-dev` (numbered Tor proposal, `[RFC]` subject, or IETF Internet-Draft or RFC posted for comment) is news from any sender; a formal `[Proposal]`, technical critique, protocol review, or empirical multi-relay measurement from a `project-sender` or `trusted-operator` address is news (keeping `confidence` `reported`); and other `community` messages need an RFC/numbered proposal or concrete adoption/merge. |
 | [Tor Project Consensus Health Alerts](https://lists.torproject.org/mailman3/hyperkitty/list/tor-consensus-health@lists.torproject.org/) | `tor-consensus-health`, enabled (`alert_format = "consensus"`, `publish = false`) | Sustained consensus-health anomalies from DocTor rendered with fixed templates, never sent to the model writer queue. |
@@ -132,7 +134,7 @@ their configuration.
 
 Reviewed November 10, 2026 against the configured Tor, Arti, Network Health
 Analysis, Network Health Team, Tor Browser, and Anti-Censorship Team projects
-(and supporting `gitlab_project` configuration for Snowflake and WebTunnel
+(and supporting `gitlab_project` configuration for Snowflake, WebTunnel, and Lyrebird
 issue streams as well as Tor Browser high-impact bug queries).
 Anonymous GraphQL requests succeeded for all six projects. The live issue-note
 connection returns the newest notes with `last`; it does not support a `sort`

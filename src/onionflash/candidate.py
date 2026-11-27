@@ -14,10 +14,10 @@ from .comments import analysis_context, budget_unchanged_note_ids, note_key, pri
 from .llm import is_quoted_list_post, strip_unreleased_tag, unquoted_mail_text, unquoted_text
 from .schema import SEMANTIC_FIELDS, UPDATE_FIELDS
 from .util import (
-    DIRAUTH_NICKNAME_RE, _url_host, after, cve_ids, digest, duplicate_issue_refs, gitlab_refs,
-    gitlab_url_variants, is_protected_duplicate_issue, item_identity, item_pt_family,
-    normalize_evidence, plain_text, release_mentions, safe_canonical_url, saved_object,
-    story_cluster, thread_subject, trove_ids,
+    DIRAUTH_NICKNAME_RE, _PRODUCT_NAMES, _RELEASE_MENTION, _url_host, after, cve_ids, digest,
+    duplicate_issue_refs, gitlab_refs, gitlab_url_variants, is_protected_duplicate_issue,
+    item_cluster, item_identity, item_pt_family, normalize_evidence, plain_text, release_mentions,
+    safe_canonical_url, saved_object, story_cluster, thread_subject, trove_ids,
 )
 
 
@@ -734,6 +734,59 @@ def _story_pt_family(story: dict) -> str | None:
     return generic_fallback or text_family
 
 
+_RELEASE_PROD_PATTERNS = {**_PRODUCT_NAMES, "tails": "tails"}
+_SENTENCE_SPLIT_RE = re.compile(r"\n+|(?<!\d)\.(?!\d)(?:\s+|$)|[!?]+")
+
+
+def release_story_key(cluster_key: str, story_obj: dict) -> str | None:
+    """Return a canonical `release:<product>:<version>` key for a release/tag story, or None."""
+    if isinstance(cluster_key, str) and cluster_key.startswith("release:"):
+        return cluster_key
+    if story_obj.get("state") not in {"released", "tagged"} and story_obj.get("category") != "release":
+        return None
+    title = str(story_obj.get("title") or "")
+    products = story_obj.get("products") or ()
+    software = [p for p in products if p != "network"]
+    inferred_prod = (
+        "tails"
+        if ("tails" in products or re.match(r"^\s*(?:new\s+release\s*:\s*)?tails\b", title, re.I))
+        else (software[0] if len(software) == 1 else "network")
+    )
+    clustered = item_cluster({"kind": "feed", "title": title, "content": "", "url": "", "product": inferred_prod})
+    if clustered.startswith("release:"):
+        return clustered
+    versions = release_mentions({"title": title})
+    return versions[0] if versions else None
+
+
+def item_mentions_product_version(item_text: str, prod: str, ver: str) -> bool:
+    """Return whether `item_text` mentions `ver` alongside `prod` without another product claiming it."""
+    prod_pat = _RELEASE_PROD_PATTERNS.get(prod)
+    if not prod_pat or not ver:
+        return False
+    claimed_other = [
+        (m.start(2), m.end(2))
+        for m in _RELEASE_MENTION.finditer(item_text)
+        if m.group(2).lower() == ver.lower()
+        and ("tor-browser" if m.group(1).lower() in {"tor-browser", "tor browser"} else m.group(1).lower()) != prod
+    ]
+    ver_pat = re.compile(rf"(?<![\w.])v?{re.escape(ver)}(?!\.\d)(?![A-Za-z])", re.I)
+    prod_re = re.compile(rf"\b{prod_pat}\b" + (r"(?!\s+project\b)" if prod == "tor" else ""), re.I)
+    is_ctor_ver = prod == "tor" and ver.startswith("0.") and ver.count(".") >= 3
+    last_end = 0
+    for sep in (*_SENTENCE_SPLIT_RE.finditer(item_text), None):
+        seg_end = sep.start() if sep is not None else len(item_text)
+        sentence = item_text[last_end:seg_end]
+        if (is_ctor_ver or prod_re.search(sentence)) and any(
+            not any(s <= (last_end + m.start()) <= e for s, e in claimed_other)
+            for m in ver_pat.finditer(sentence)
+        ):
+            return True
+        if sep is not None:
+            last_end = sep.end()
+    return False
+
+
 def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = frozenset()) -> list[tuple[str, str]]:
     """Up to `RELATED_LIMIT` active related `(story_id, reason)` pairs for coverage comparison."""
     seen = set(exclude)
@@ -776,6 +829,25 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
         _add(match["id"], "same thread")
     if len(pairs) < RELATED_LIMIT:
         item_text = _item_search_text(item)
+        candidates: list[tuple[str, str, str, str, dict]] = []
+        for srow in db.execute(
+            "SELECT s.id,s.cluster_key,s.updated_at,CASE WHEN typeof(s.payload)='text' THEN CAST(s.payload AS BLOB) END AS payload "
+            "FROM stories s LEFT JOIN editorial_controls e ON e.story_id=s.id "
+            "WHERE COALESCE(e.retracted,0)=0 ORDER BY s.updated_at DESC,s.id"
+        ).fetchall():
+            if srow["id"] in seen:
+                continue
+            if story_obj := saved_object(srow["payload"]):
+                candidates.append((srow["id"], srow["cluster_key"], srow["updated_at"], _story_search_text(story_obj), story_obj))
+        release_key_set = set(release_keys)
+        for sid, scluster, _, _, story_obj in candidates:
+            if (rel_key := release_story_key(scluster, story_obj)) is None:
+                continue
+            _, prod, ver = rel_key.split(":", 2)
+            if rel_key in release_key_set or item_mentions_product_version(item_text, prod, ver):
+                _add(sid, f"mentions {prod.replace('-', ' ')} {ver}")
+                if len(pairs) >= RELATED_LIMIT:
+                    break
         item_auths = {m.group(0).casefold() for m in DIRAUTH_NICKNAME_RE.finditer(item_text)}
         item_tokens = _rare_tokens(item_text)
         item_pt = item_pt_family(item)
@@ -786,19 +858,9 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
                 cutoff_90d = after(-LEXICAL_WINDOW_DAYS * 86400, pub_stamp)
             except ValueError:
                 cutoff_90d = None
-        if item_auths or ((len(item_tokens) >= 2 or item_pt is not None) and cutoff_90d is not None):
-            candidates: list[tuple[str, str, str, dict]] = []
-            for srow in db.execute(
-                "SELECT s.id,s.updated_at,CASE WHEN typeof(s.payload)='text' THEN CAST(s.payload AS BLOB) END AS payload "
-                "FROM stories s LEFT JOIN editorial_controls e ON e.story_id=s.id "
-                "WHERE COALESCE(e.retracted,0)=0 ORDER BY s.updated_at DESC,s.id"
-            ).fetchall():
-                if srow["id"] in seen:
-                    continue
-                if story_obj := saved_object(srow["payload"]):
-                    candidates.append((srow["id"], srow["updated_at"], _story_search_text(story_obj), story_obj))
+        if len(pairs) < RELATED_LIMIT and (item_auths or ((len(item_tokens) >= 2 or item_pt is not None) and cutoff_90d is not None)):
             if item_auths:
-                for sid, _, stext, _ in candidates:
+                for sid, _, _, stext, _ in candidates:
                     if item_auths & {m.group(0).casefold() for m in DIRAUTH_NICKNAME_RE.finditer(stext)}:
                         _add(sid, "shared authority")
                         if len(pairs) >= RELATED_LIMIT:
@@ -806,7 +868,7 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
             if len(pairs) < RELATED_LIMIT and len(item_tokens) >= 2 and cutoff_90d is not None:
                 window_entries = [
                     (sid, upd_at, _rare_tokens(stext))
-                    for sid, upd_at, stext, _ in candidates
+                    for sid, _, upd_at, stext, _ in candidates
                     if sid not in seen and isinstance(upd_at, str) and upd_at >= cutoff_90d
                 ]
                 df: dict[str, int] = {}
@@ -833,7 +895,7 @@ def related(db, row: dict, item: dict, exclude: set[str] | frozenset[str] = froz
             if len(pairs) < RELATED_LIMIT and item_pt is not None and cutoff_90d is not None:
                 item_scopes = _source_repo_scopes((item,))
                 pt_scored: list[tuple[int, int, str, str]] = []
-                for sid, upd_at, stext, story_obj in candidates:
+                for sid, _, upd_at, stext, story_obj in candidates:
                     if sid in seen or not (isinstance(upd_at, str) and upd_at >= cutoff_90d):
                         continue
                     if _story_pt_family(story_obj) != item_pt:

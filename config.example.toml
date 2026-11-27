@@ -129,6 +129,15 @@ product = "network"
 authority = "official"
 
 [[sources]]
+id = "tails-news"
+name = "Tails Official News and Releases"
+website_url = "https://tails.net/news/index.en.html"
+kind = "feed"
+url = "https://tails.net/news/index.en.rss"
+product = "tails"
+authority = "official"
+
+[[sources]]
 id = "tor-issues"
 gitlab_project = "tpo/core/tor"
 name = "Tor Project GitLab Issues for Tor"
@@ -292,6 +301,16 @@ url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/ly
 fallback_urls = []
 product = "lyrebird"
 authority = "official"
+
+[[sources]]
+id = "lyrebird-issues"
+gitlab_project = "tpo/anti-censorship/pluggable-transports/lyrebird"
+name = "Tor Project GitLab Issues for Lyrebird"
+website_url = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/-/issues?state=all"
+kind = "gitlab_issue"
+url = "https://gitlab.torproject.org/api/v4/projects/417/issues"
+product = "lyrebird"
+authority = "development"
 
 [[sources]]
 id = "lyrebird-merges"

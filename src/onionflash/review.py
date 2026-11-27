@@ -141,21 +141,44 @@ stated and supported by unquoted packet text, preserving every precondition, hed
 platform/channel scope, affected audience and material disagreement, and adding no
 inferred severity, urgency, speculative mechanism, cause, number, version, operator
 directive or benefit (it MUST be empty on untrusted community lists.torproject.org
-posts). Evaluate non-empty why_it_matters in source_support's reason and FAIL
+posts). Evaluate non-empty why_it_matters independently on its own wording — NEVER excuse omitted
+attribution, hedges, preconditions (such as a non-default setting or experimental feature),
+or material maintainer disagreement merely because summary already included them.
+Even if a bug report's own summary or "## Impact" section states a consequence unqualifiedly
+in declarative present tense, copying or paraphrasing that claim into why_it_matters WITHOUT
+the packet's non-default/opt-in/experimental preconditions (such as a non-default config option
+or experimental feature flag), uncertainty hedge ("may"/"reportedly"), or reporter attribution
+("The report says...") FAILS source_support and uncertainty_attribution — revise (clear
+why_it_matters to "" or add exact preconditions and attribution) or hold. Do not fail
+why_it_matters merely for paraphrasing a packet-supported consequence without verbatim
+wording, nor for repeating a concrete operational, security, or user consequence already
+stated in summary (a supported why_it_matters MAY repeat its own summary — never dismiss it
+as a "generic recap of the summary" merely because it adds no new facts beyond summary),
+when it preserves material preconditions (such as experimental features), uncertainty
+hedges ("may"), or attribution ("The report says...").
+Evaluate non-empty why_it_matters in source_support's reason and FAIL
 source_support for absent claims, invented or speculative impacts, generic
-feature/release recaps (such as updating an engine or listing features without an
-explicitly stated consequence or reader action), dropped preconditions or hedges,
+feature/release recaps (bland release/feature listings such as updating an engine or
+listing features without an explicitly stated consequence or reader action), dropped
+preconditions or hedges,
 >-quoted reply text, unrequested advice, generic filler ("improves
 reliability/security/privacy", "addresses issues to maintain privacy") or casual chat. Fail
 source_support when any field generalizes one sample, treats template checkboxes as proof
 confidential patches shipped, infers developer work, maintainer rulings or fix
 effectiveness beyond the text, omits a material packet disclosure, labels a bugfix
-release security without a vulnerability, or assigns any category other than "security" to
+release security without a vulnerability, assigns any category other than "security" to
 a verified TROVE advisory (packet source with mandatory_news_rule="trove", where repair
-MUST set category to "security" and include "security" in tags).
+MUST set category to "security" and include "security" in tags), OR whenever a merged
+gitlab_mr (including its summary or why_it_matters) describes the reverted or merged change
+itself as "is requested" or "proposed", or inflates a client bug or restart-loop
+description into an unstated "network-wide incident", "outage", or "unable to connect"
+absent from packet passages.
 actor_and_action: preserve who does what. A developer changing compiled source is not a
 relay operator changing configuration. Preserve requested versus actual action;
-why_it_matters keeps the role terms and audience of the source sentence it restates.
+why_it_matters keeps the role terms and audience of the source sentence it restates. On a
+merged gitlab_mr, describing the merged or reverted change itself as "is requested" or
+"proposed" fails actor_and_action and status (distinguish an attributed issue request such
+as "The report ... requests removal" when a companion gitlab_issue makes that request).
 Check each personal role or affiliation in every target field, including repeated mentions.
 {_PERSONAL_ROLE_RULE} Correct every occurrence of an unsupported role across all affected
 target fields, not just the headline: use the person's name alone (when the packet text
@@ -170,7 +193,9 @@ deployment and resolution. Closing or updating an issue, or checklists/condition
 does not prove a patch merged or shipped; an open checklist does not negate an explicit
 official release statement. Fail status if headline or summary states an open issue's
 requested change as completed (removed, fixed, resolved) without a merged MR or release;
-do not fail status merely because state is developing.
+conversely, fail status if summary or why_it_matters on a merged gitlab_mr describes the
+reverted or merged change as "is requested" or "proposed". Do not fail status merely because
+state is developing.
 uncertainty_attribution: keep plausible/suspected/reported qualifiers in headline, body
 and why_it_matters; a community report or public comment on an official host is not
 project confirmation, and observations, outages, overload, counters or missing responses
@@ -185,10 +210,15 @@ person is a developer or C Tor developer. Reserve
 confidence confirmed strictly for an official non-tag Tor Project announcement or a merged
 gitlab_mr; keep reported for issues, comments, hackerone, dirauth-operator, tor-core,
 project-sender, trusted-operator and community posts, and report mailing-list proposals as
-proposed (state developing, confidence reported, never adopted). Check candidate.confidence
-in reason and fail whenever confirmed lacks an official non-tag announcement or merged
-gitlab_mr, when a headline or why_it_matters drops a material precondition or turns an
-anecdotal reply into confirmation, or when a comment's scope narrowing replaces the
+proposed (state developing, confidence reported, never adopted). Check candidate.confidence AND standalone why_it_matters (when non-empty) explicitly in
+reason without crediting qualifiers that appear only in summary: fail whenever confirmed
+lacks an official non-tag announcement or merged gitlab_mr, when a headline or why_it_matters
+copies or restates a reported, disputed, or conditional defect (including from a report's
+"## Impact" section) as unqualified present-tense fact while omitting ALL of the packet's
+non-default/experimental preconditions (such as a non-default setting or experimental
+feature), uncertainty hedges ("may"), and reporter attribution ("The report says..."),
+even if summary mentions those caveats and maintainer disputes; also fail when why_it_matters
+turns an anecdotal reply into confirmation or a comment's scope narrowing replaces the
 original issue report as unattributed fact.
 scope_timing: retain actual affected product, scope, dates and sequence. Updated
 issue/comment timestamps do not make an old incident new or currently ongoing.
@@ -289,12 +319,17 @@ attributed and tentative; skip them only when the supplied coverage already stat
 For such an announcement, name the response work and whether it was already covered in
 new_information's reason before deciding on routing; do not consider only the version or upgrade advice.
 Compare lifecycle states explicitly (a later merge completes an earlier request):
-- When prior_story is present, this candidate UPDATES that same article. Pass meaningful
-  fixes, resolutions, merges, releases, or material maintainer corrections/narrowings/
-  disputes of prior_story (never skip a material correction or dispute; revise or hold if
-  the candidate repeats a contradicted claim); skip only when the packet adds no material
-  facts. If prior_story concerns an unrelated event, fail new_information and hold; never
-  rewrite prior_story to an event covered by another entry.
+- When prior_story is present, this candidate UPDATES that same article: compare the ENTIRE
+  candidate.summary and EVERY packet source/comment sentence-by-sentence against prior_story
+  (never assume the candidate is identical merely because title, state, or opening sentences
+  match prior_story). Pass meaningful fixes, resolutions, merges, releases, post-release
+  anomalies or metrics_timeline observations (such as client consensus re-requests), new
+  maintainer impact assessments or mitigation guidance, or material maintainer
+  corrections/narrowings/disputes not yet in prior_story (never skip a material correction,
+  dispute, or newly added post-release/maintainer fact; revise or hold if the candidate
+  repeats a contradicted claim); skip only when the entire packet adds no material facts
+  beyond prior_story. If prior_story concerns an unrelated event, fail new_information and
+  hold; never rewrite prior_story to an event covered by another entry.
 - When prior_story is null, this candidate is a NEW article: if recent coverage covers the
   same event, require a material new lifecycle stage (fix, merge, resolution, release) or
   the distinct official incident-response announcement described above; otherwise skip.
@@ -358,7 +393,10 @@ SAME-STORY ROUTING (coverage_background.recent is present):
   entries with summary_truncated true show only the opening sentence, so match shared technical mechanisms
   even if the merge also includes a companion workaround), or (d) a follow-up resolution, closing note or
   cross-channel report of an already-covered incident without distinct response news as defined above, or
-  (e) another tag or announcement of the same product/version release without distinct incident-response news.
+  (e) another tag, announcement, or Tor Project transport, bridge, or relay rollout/deployment upgrade
+  notice for an already-covered release version (such as updating Snowflake or relay hosts to that
+  already-covered Tor release) without a distinct new bug/incident, uncovered official incident-response
+  plan, or separate product release.
   Prioritize inspecting `coverage_background.recent` entries flagged with `related` (such as
   shared CVEs, TROVE IDs, GitLab references, directory authority names, release mentions or
   shared technical terms) as well as recent same-product entries to catch cross-channel coverage
@@ -370,10 +408,11 @@ SAME-STORY ROUTING (coverage_background.recent is present):
   (verdict approve, repair null; never return revise or skip when all nine pass), or return verdict revise
   when a criterion failed — you MUST set same_story to that recent entry's id so the application attaches
   the item to that story for update review.
-- Keep same_story null for: a different software version's release, a general release shipping multiple
-  distinct fixes or features not already covered as that release, a newly reported bug or regression in an
-  already-released version, a distinct bug found while auditing an earlier issue, or a different incident on
-  the same authority or
+- Keep same_story null for: a different software version's release, a separate product release (such as
+  Tails or Tor Browser bundling a Tor version), a community/third-party distro package rebuild mentioning
+  a covered version, a general release shipping multiple distinct fixes or features not already covered as
+  that release, a newly reported bug or regression in an already-released version, a distinct bug found
+  while auditing an earlier issue, or a different incident on the same authority or
   topic. Entries marked related surface shared CVEs, TROVE/GitLab references, authority names,
   versions, threads or technical terms; check whether they report the same concrete event under (a)-(e)
   rather than routing blindly from the related marker alone.
@@ -496,22 +535,22 @@ publishes this exact update.
 SPECIALIST_PROMPTS = {
     "grounding_status": """
 SPECIALIST VERIFICATION FOCUS (grounding_status — validate all 9 criteria; focus on source_support, status, uncertainty_attribution, technical_details):
-- Verify every factual claim, precondition, opt-in/experimental requirement, and maintainer narrowing or disagreement across title, summary, why_it_matters (or updates[-1].text in latest_update mode): FAIL uncertainty_attribution or source_support when a reporter's claim or disputed defect is stated as unqualified settled fact without attribution ("The report claims...") or drops material preconditions (e.g. non-default config or experimental feature) or turns a built-in software list into operators' "intended configuration".
-- Verify status, confidence, category, and tags against packet.sources: a gitlab_issue (even closed and mentioning a release version in comments) NEVER supports introducing confidence="confirmed", state="released", category="release", or tag "release" (though in latest_update mode prior_story's already-confirmed or already-released labels may be retained unchanged); a gitlab_mr alone NEVER supports introducing state="released" or category="release". Also fail status or uncertainty_attribution if an unconfirmed user comment is treated as confirming resolution or completed action.
+- FIRST verify candidate.confidence, candidate.state, candidate.category, and candidate.tags against packet.sources kinds: a gitlab_issue (even closed and mentioning a release version in comments) NEVER supports introducing confidence="confirmed", state="released", category="release", or tag "release" (though in latest_update mode prior_story's already-confirmed or already-released labels may be retained unchanged); a gitlab_mr alone NEVER supports introducing state="released" or category="release". Whenever a gitlab_issue-only packet has confidence="confirmed" or state="released" or category="release" or "release" in tags, FAIL status and uncertainty_attribution and revise those labels (or hold). Fail status and source_support whenever a merged gitlab_mr (in summary or why_it_matters) describes the reverted or merged change itself as "is requested" or "proposed", OR inflates a client bug or restart-loop description into an unstated "network-wide incident", "outage", or "unable to connect" absent from packet passages. Also fail status or uncertainty_attribution if an unconfirmed user comment is treated as confirming resolution or completed action.
+- Verify every factual claim, precondition, opt-in/experimental requirement, and maintainer narrowing or disagreement across title, summary, and why_it_matters independently (or updates[-1].text in latest_update mode): NEVER excuse missing attribution, hedges, non-default/experimental preconditions, or maintainer disputes in why_it_matters just because summary already included them. When why_it_matters states a reported, disputed (e.g. maintainer doubting DoS impact), or conditional defect (e.g. non-default setting or experimental feature) as an unqualified universal fact, FAIL source_support and uncertainty_attribution and revise (why_it_matters: "" or add exact preconditions and attribution) or hold. Also fail when a built-in software list is turned into operators' "intended configuration".
 - Verify technical_details and completeness: fail source_support/technical_details on ALL-CAPS shouting, nonexistent 3-part C-Tor version typos (e.g. 0.4.17), or (in standalone story mode) an incomplete why_it_matters fragment lacking terminal sentence punctuation (e.g. trailing "<= 0.4.8.x", trailing comma, or unpunctuated heading/chat).
-- Do NOT false-alarm on brief/plain supported summaries, empty why_it_matters (""), or faithful attributed impacts that preserve qualifiers and end cleanly.
+- Do NOT false-alarm on brief/plain supported summaries, empty why_it_matters (""), faithful attributed impacts ("The report says...", "The announcement asks..."), supported impacts repeating concrete consequences already in summary, or faithful hedged operational/mechanism consequences preserving material qualifiers and preconditions (e.g. "may experience..." with experimental features — reserve "generic recap" strictly for bland release/feature listings without an explicitly stated consequence or reader action).
 """,
     "attribution_scope_advice": """
 SPECIALIST VERIFICATION FOCUS (attribution_scope_advice — validate all 9 criteria; focus on actor_and_action, scope_timing, operational_advice, and why_it_matters fidelity):
 - Check EVERY recommendation, requirement, or operational claim ("are advised to", "should switch to", "must treat", "must configure", "intended configuration excludes") in summary, why_it_matters, and updates[-1].text: FAIL operational_advice (and clear unattributed why_it_matters to "") unless an explicit packet passage directs that exact actor to take that action (never invent advice such as switching to 64-bit or treating a bug as must-fix from casual maintainer chat).
-- Check actor_and_action and scope_timing: distinguish requested vs merged/completed actions (a merged revert MR is NOT "requested"), software defaults vs operator configuration, and keep stated roles strictly source-bound (never calling someone a developer without committed C-Tor code evidence, and never swapping >-quoted mailing-list participants or thread_root with the sender).
-- Check why_it_matters fidelity: FAIL source_support (and clear why_it_matters to "" via revise or hold) when why_it_matters is an incomplete sentence fragment without terminal punctuation, casual chat, generic feature/release filler ("provides updated security components and bug fixes", "to maintain privacy and security", "updates the browser's core engine"), or omits material platform/opt-in/dispute qualifiers.
-- Do NOT false-alarm on empty why_it_matters (""), valid attributed impacts ("The announcement asks...", "The report says..."), or explicit official upgrade requests stated in the packet.
+- Check actor_and_action and scope_timing independently across title, summary, AND why_it_matters: on a merged gitlab_mr, FAIL actor_and_action and source_support (and clear why_it_matters to "" or revise/hold) whenever summary or why_it_matters describes the reverted or merged change itself as "is requested" or "proposed" (distinct from an attributed companion gitlab_issue request), OR inflates a client bug or restart-loop description into an unstated "network-wide incident", "outage", or "unable to connect" absent from packet passages. Distinguish software defaults vs operator configuration, and keep stated roles strictly source-bound (never calling someone a developer without committed C-Tor code evidence, and never swapping >-quoted mailing-list participants or thread_root with the sender).
+- Check why_it_matters standing alone without excusing omitted hedges, preconditions, or maintainer disputes just because summary stated them: even when why_it_matters copies a reporter's "## Impact" sentence verbatim from a gitlab_issue or HackerOne report, FAIL source_support and uncertainty_attribution (and clear why_it_matters to "" via revise or hold) when why_it_matters states a reported, disputed (e.g. maintainer doubting DoS impact), or conditional defect (e.g. non-default setting or experimental feature) as an unqualified universal fact omitting ALL preconditions, "may" hedges, and reporter attribution ("The report says..."), OR is an incomplete sentence fragment without terminal punctuation, casual chat, or generic feature/release filler ("provides updated security components and bug fixes", "to maintain privacy and security", "updates the browser's core engine").
+- Do NOT false-alarm on empty why_it_matters (""), valid attributed impacts ("The announcement asks...", "The report says..."), faithful hedged impacts preserving material preconditions (e.g. "may experience..." with experimental features), or explicit official upgrade requests stated in the packet.
 """,
     "novelty_news": """
 SPECIALIST VERIFICATION FOCUS (novelty_news — validate all 9 criteria; focus on news_value, new_information, and same_story routing):
-- Evaluate novelty and routing strictly against coverage_background (prior_story, recent, and updates[:-1] in latest_update mode): compare specific defects, versions, releases, MRs/issues, and status changes rather than surface wording.
-- When prior_story is null and recent covers the same concrete change under routing rules (a)-(e), set same_story to that live recent entry's id unless the distinct official incident-response exception applies (evaluating further defenses or expecting further releases). Never route to retracted or network-health entries, or across distinct versions/incidents.
+- Evaluate novelty and routing strictly against coverage_background (prior_story, recent, and updates[:-1] in latest_update mode): compare specific defects, versions, releases, MRs/issues, and status changes rather than surface wording. When prior_story is present in standalone story mode, compare the ENTIRE candidate.summary and every packet source/comment sentence-by-sentence against prior_story (never assume identity merely because title, state, or opening sentences match prior_story; pass new post-release anomalies, metrics_timeline observations, and new maintainer impact assessments or mitigation guidance not yet in prior_story).
+- When prior_story is null and recent covers the same concrete change under routing rules (a)-(e) — including a Tor Project transport, bridge, or relay rollout/deployment notice upgrading hosts to an already-covered Tor release version without a distinct new bug/incident or uncovered official response plan — set same_story to that live recent entry's id unless the distinct official incident-response exception applies (evaluating further defenses or expecting further releases). Never route to retracted or network-health entries, across distinct versions/incidents, separate product releases (e.g. Tails or Tor Browser), community distro rebuilds, or distinct newly reported bugs in a released version (which stay standalone with same_story null).
 - Enforce the 14-day recency window (honoring HackerOne, mandatory_news_rule, and Severity::high/critical exceptions), mandatory_news_rule ("trove", "release_announcement", "torproject_new_thread"), HackerOne triage, dirauth operational rules, and tor-dev 5-case proposal/critique rules.
 - In standalone reviews (prior_story is null), enforce strict news_value criteria (verdict "skip" when new_information passes): internal crate/module API plumbing MRs (e.g. `tor-netdoc:` parser/signature/trait helpers), internal TODO cleanups, minor whitespace parsing tweaks, unit-test improvements, and incremental sub-tasks toward unfinished components MUST fail news_value (verdict "skip") unless they ship a user/operator-visible capability, fix a security/DoS/crash/interoperability bug in released software, or alter a consensus/protocol default.
 - In latest_update mode (prior_story is not null), keep news_value passing for the on-topic published story (do not apply standalone internal-plumbing exclusions to material factual corrections) and use new_information to skip redundant echoes/check-ins/me-too replies (naming prior_story.id verbatim) while passing material lifecycle transitions, factual corrections, new measurements, maintainer disputes, or new response plans. Keep factual criteria passing unless a clear defect exists.
@@ -764,6 +803,33 @@ def _packet_impact_context(packet: dict) -> tuple[str, bool, list[str]]:
         for s in sources
     )
     return "\n".join(parts), community_list, list(dict.fromkeys(products))
+
+
+_PACKET_CONDITIONAL_FEATURE_RE = re.compile(
+    r"\b(?:not\s+the\s+default|non-default|opt[- ]in|__is_experimental|"
+    r"experimental\s+(?:feature|flag|option|setting|support))\b",
+    re.IGNORECASE,
+)
+_QUALIFIED_IMPACT_RE = re.compile(
+    r"\b(?:non-default|not\s+(?:the\s+)?default|experimental|opt[- ]in|"
+    r"enabled|configured|config(?:uration)?|option|setting|feature|flag|when|if|unless|"
+    r"may|might|could|potentially|possibly|plausibly|likely|reportedly|suspected|allegedly|"
+    r"report|reporter|issue|post|comment|announcement|advisory|author|maintainer|"
+    r"researcher|sender|according\s+to|says|said|states|stated|notes|noted|"
+    r"claims|claimed|suggests|suggested|describes|described|warns|warned)\b",
+    re.IGNORECASE,
+)
+
+
+def has_unhedged_conditional_impact(impact: str, packet: dict, candidate: dict) -> bool:
+    """Return whether a reported story's `why_it_matters` omits preconditions, hedges, and attribution
+    for a packet-stated non-default or experimental defect."""
+    if not impact or not impact.strip() or candidate.get("confidence") != "reported":
+        return False
+    impact_ctx, _, _ = _packet_impact_context(packet)
+    if not _PACKET_CONDITIONAL_FEATURE_RE.search(impact_ctx):
+        return False
+    return _QUALIFIED_IMPACT_RE.search(impact) is None
 
 
 def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool = False,
@@ -1108,7 +1174,7 @@ class Reviewer(CompletionClient):
         apply_label_limits(repair, limits, nullable=True)
         # Each call starts with the rubric, exact candidate and bounded context.
         # A prior model response, critique or approval is never part of its history.
-        payload = {"candidate": candidate_public, "packet": packet}
+        payload = {"candidate": candidate_public}
         if update:
             payload["review_scope"] = "latest_update"
         if coverage is not None:
@@ -1119,6 +1185,7 @@ class Reviewer(CompletionClient):
                 wire_coverage = {**coverage, "prior_story": {
                     key: prior[key] for key in ("id", "state", "confidence", "updated_at", "associated") if key in prior}}
             payload["coverage_background"] = wire_coverage
+        payload["packet"] = packet
         if issue is not None:
             payload["application_issue"] = issue
         if validation_error is not None:
@@ -1158,13 +1225,24 @@ class Reviewer(CompletionClient):
         ):
             defect = is_incomplete_or_filler_impact(impact)
             unattributed = defect is None and has_unattributed_advice(impact, packet)
-            if defect is not None or unattributed:
-                crit = "source_support" if defect is not None else "operational_advice"
-                msg = (
-                    "why_it_matters is incomplete or generic filler unsupported by packet evidence."
-                    if defect is not None
-                    else "why_it_matters states operator or user advice absent from packet passages."
-                )
+            unhedged_optin = (
+                defect is None
+                and not unattributed
+                and has_unhedged_conditional_impact(impact, packet, candidate_public)
+            )
+            if defect is not None or unattributed or unhedged_optin:
+                if defect is not None:
+                    crit = "source_support"
+                    msg = "why_it_matters is incomplete or generic filler unsupported by packet evidence."
+                elif unattributed:
+                    crit = "operational_advice"
+                    msg = "why_it_matters states operator or user advice absent from packet passages."
+                else:
+                    crit = "uncertainty_attribution"
+                    msg = (
+                        "why_it_matters states a conditional/experimental reported defect as unqualified fact "
+                        "without attribution, hedges, or preconditions."
+                    )
                 updated_criteria = copy.deepcopy(result["criteria"])
                 updated_criteria[crit] = {**updated_criteria[crit], "outcome": "fail", "reason": msg}
                 result = {

@@ -1436,3 +1436,123 @@ def test_tiebreaker_prompt_internal_plumbing_guidance_and_insufficient_splits(mo
     split_low_passers = review.merge_specialist_verdicts([v_app, v_skip_nv, v_hold_ni], cand, pkt)
     assert split_low_passers["verdict"] == "hold"
     assert split_low_passers["criteria"]["news_value"]["outcome"] == "insufficient"
+
+
+def test_review_prompts_cover_standalone_impact_merged_mr_inflation_and_rollout_routing():
+    """Verify review prompts enforce standalone why_it_matters, merged MR action/inflation, and rollout routing."""
+    sys_norm = " ".join(review.SYSTEM_PROMPT.split())
+    route_norm = " ".join(review.ROUTING_PROMPT.split())
+    ground_norm = " ".join(review.SPECIALIST_PROMPTS["grounding_status"].split())
+    attr_norm = " ".join(review.SPECIALIST_PROMPTS["attribution_scope_advice"].split())
+    novelty_norm = " ".join(review.SPECIALIST_PROMPTS["novelty_news"].split())
+
+    for prompt in (sys_norm, ground_norm, attr_norm):
+        assert "why_it_matters" in prompt
+        assert "is requested" in prompt
+        assert "network-wide incident" in prompt
+        assert "unable to connect" in prompt
+    assert "non-default" in ground_norm and "experimental" in ground_norm
+    assert "non-default" in attr_norm and "experimental" in attr_norm
+    assert "rollout/deployment" in route_norm
+    assert "newly reported bug" in route_norm
+    assert "rollout/deployment" in novelty_norm
+    assert "newly reported bugs" in novelty_norm
+
+
+def test_unhedged_conditional_impact_deterministic_guard(monkeypatch):
+    """Reported defects with non-default/experimental packet cues require qualifications in why_it_matters."""
+    pkt = {
+        "sources": [
+            {
+                "id": "S1",
+                "url": "https://gitlab.torproject.org/tpo/core/arti/-/work_items/999",
+                "title": "PoW queue bypass",
+                "kind": "gitlab_issue",
+                "authority": "development",
+                "product": "arti",
+                "published_at": STORY["published_at"],
+                "updated_at": STORY["updated_at"],
+                "labels": [],
+                "passages": [
+                    {
+                        "id": "S1:P1",
+                        "text": "The defect requires enable_pow = true (not the default) and __is_experimental.",
+                    }
+                ],
+            }
+        ],
+        "missing_sources": [],
+        "truncated": False,
+    }
+    unhedged_cand = _candidate(
+        confidence="reported",
+        state="developing",
+        category="security",
+        tags=["security"],
+        products=["arti"],
+        sources=[{"url": pkt["sources"][0]["url"], "title": "PoW queue bypass"}],
+        why_it_matters="A zero-proof client evicts queued clients from the queue.",
+    )
+    assert review.has_unhedged_conditional_impact(unhedged_cand["why_it_matters"], pkt, unhedged_cand) is True
+
+    for qualified in (
+        "Operators enabling experimental proof-of-work features may experience reduced queue efficiency.",
+        "The report says a zero-proof client evicts queued clients from the queue.",
+    ):
+        qualified_cand = {**unhedged_cand, "why_it_matters": qualified}
+        assert review.has_unhedged_conditional_impact(qualified, pkt, qualified_cand) is False
+
+    confirmed_cand = {**unhedged_cand, "confidence": "confirmed"}
+    assert review.has_unhedged_conditional_impact(confirmed_cand["why_it_matters"], pkt, confirmed_cand) is False
+
+    plain_pkt = copy.deepcopy(pkt)
+    plain_pkt["sources"][0]["passages"][0]["text"] = "The defect affects default queue processing."
+    assert review.has_unhedged_conditional_impact(unhedged_cand["why_it_matters"], plain_pkt, unhedged_cand) is False
+
+    rev = _reviewer(monkeypatch, verdict("approve"))
+    res = rev.review(unhedged_cand, pkt)
+    assert res["verdict"] == "revise"
+    assert res["model_verdict"] == "approve"
+    assert res["repair"] == {"why_it_matters": ""}
+    assert res["criteria"]["uncertainty_attribution"]["outcome"] == "fail"
+
+
+def test_review_payload_places_coverage_before_packet(monkeypatch):
+    """Place `coverage_background` before `packet` in review payloads when coverage is present."""
+    pkt = {
+        "sources": [
+            {
+                "id": "S1",
+                "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/41200",
+                "title": "Relay circuit timeout issue",
+                "kind": "gitlab_issue",
+                "authority": "development",
+                "product": "tor",
+                "published_at": STORY["published_at"],
+                "updated_at": STORY["updated_at"],
+                "labels": [],
+                "passages": [{"id": "S1:P1", "text": "Operators report circuit timeouts after upgrading."}],
+            }
+        ],
+        "missing_sources": [],
+        "truncated": False,
+    }
+    seen_keys: list[list[str]] = []
+    rev_cov = review.Reviewer(_cfg_llm())
+    monkeypatch.setattr(
+        rev_cov,
+        "complete",
+        lambda _p, payload, *_a, **_kw: seen_keys.append(list(payload.keys())) or verdict("approve"),
+    )
+    prior_cand = _candidate(
+        confidence="reported",
+        state="developing",
+        category="network",
+        tags=["network"],
+        products=["tor"],
+        sources=[{"url": pkt["sources"][0]["url"], "title": "Relay circuit timeout issue"}],
+        why_it_matters="",
+    )
+    cov = {"prior_story": {**prior_cand, "id": "prior001"}, "recent": [], "truncated": False}
+    rev_cov.review(prior_cand, pkt, coverage=cov)
+    assert seen_keys == [["candidate", "coverage_background", "packet"]]
