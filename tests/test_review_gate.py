@@ -3364,6 +3364,31 @@ def test_specialist_3_tiebreak_paths_resume_cache_and_evaluation(context, tmp_pa
     )
     assert res_cache["status"] == "published" and res_cache["cache_hit"] is True and res_cache["review_calls"] == 0
 
+    # Interrupted commit after a tiebreak skip naming a live recent `same_story` normalizes the receipt and resumes offline.
+    recent_story_id = store.db.execute("SELECT id FROM stories LIMIT 1").fetchone()["id"]
+    row_tb_skip_cache = pending(store, item(id="https://example.org/s3-tb-skip-cache", url="https://example.org/s3-tb-skip-cache"))
+    tb_skip_same = verdict("skip", criterion="news_value", reason="Internal plumbing only.", same_story=recent_story_id)
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            store,
+            "commit_candidate",
+            lambda *_a, **_kw: (_ for _ in ()).throw(AnalysisError("Commit interrupted", retryable=True)),
+        )
+        with pytest.raises(AnalysisError):
+            review_gate.process_item(
+                cfg, store, row_tb_skip_cache, Writer(), _TiebreakSpyReviewer(tb_skip_same),
+                parallel_verify=True, reviewer_factory=_split_factory("insuff_1_2"), specialists=3,
+            )
+    saved_job_rec = json.loads(job(store, row_tb_skip_cache)["record_json"])
+    assert saved_job_rec["reviews"][-1]["result"]["same_story"] == recent_story_id
+    res_skip_cache = review_gate.process_item(
+        cfg, store, queued_row(store, row_tb_skip_cache["id"]), Writer(), _TiebreakSpyReviewer(tb_skip_same),
+        allow_network=False, parallel_verify=True, reviewer_factory=_split_factory("insuff_1_2"), specialists=3,
+    )
+    assert res_skip_cache["status"] == "ignored" and res_skip_cache["cache_hit"] is True and res_skip_cache["review_calls"] == 0
+    assert codes(store, row_tb_skip_cache) == ["skipped.verification.news_value"]
+    assert audit(store, row_tb_skip_cache["id"])["reviews"][-1]["result"]["same_story"] == recent_story_id
+
     # 8) tools/evaluate_review.py handles specialists=3 news_value split + tiebreaker cleanly.
     tools_path = Path(__file__).resolve().parents[1] / "tools" / "evaluate_review.py"
     spec = importlib.util.spec_from_file_location("evaluate_review", tools_path)

@@ -1571,6 +1571,11 @@ def test_housekeeping_item_skips_test_and_internal_todo_chores_preserving_guards
             title="Clean up internal module scaffolding",
             content="Moves private helper functions between internal files.",
         ),
+        _story_item(
+            url="https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/3207",
+            title="Remove parser TODOs",
+            content="Deletes obsolete inline comments in the descriptor parser.",
+        ),
     ]
     for chore in cleanup_chores:
         assert is_housekeeping_item(chore) == (
@@ -1579,6 +1584,21 @@ def test_housekeeping_item_skips_test_and_internal_todo_chores_preserving_guards
         )
 
     non_skips = [
+        _story_item(
+            url="https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/3208",
+            title="Add unit tests and enable IPv6 relay descriptors by default",
+            content="Adds test coverage and enables IPv6 relay descriptors.",
+        ),
+        _story_item(
+            url="https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/3209",
+            title="Support IPv6 relay descriptors and remove parser TODOs",
+            content="Adds IPv6 descriptor support and deletes stale TODO comments.",
+        ),
+        _story_item(
+            url="https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/3210",
+            title="Remove parser TODOs",
+            content="This also enables IPv6 relay descriptors by default.",
+        ),
         _story_item(
             url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/42201",
             title="Fix dirauth consensus vote verification crash",

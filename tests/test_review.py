@@ -1412,6 +1412,9 @@ def test_tiebreaker_prompt_internal_plumbing_guidance_and_insufficient_splits(mo
     ):
         assert "tor-netdoc:" in prompt
         assert "TODO" in prompt
+        assert "prior_story is null" in prompt
+        assert "latest_update" in prompt
+    assert "source authority and tor-dev eligibility rules" in review.NEWS_TIEBREAK_PROMPT
 
     v_app = verdict("approve")
     v_skip_nv = _specialist_verdict("skip", criterion="news_value", reason="Internal crate plumbing.")

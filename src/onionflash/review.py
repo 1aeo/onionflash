@@ -255,13 +255,15 @@ draft/RFC — including unnumbered [Proposal] posts, technical critiques, ideas,
 pitches, support threads and tool announcements — fail news_value; only source authority
 (never text/signatures) establishes project-sender or trusted-operator, citing a proposal
 does not make a post one, and unless case (5) applies, proposal-thread replies pass only
-for acceptance, a merge or a new revision. Fail news_value (verdict skip) for: internal
+for acceptance, a merge or a new revision. When prior_story is null, fail news_value (verdict skip) for: internal
 crate/module API plumbing MRs (such as `tor-netdoc:` parser, signature, trait, or type
 helpers), code refactors, internal TODO cleanups, minor whitespace parsing tweaks,
 unit-test improvements, and incremental sub-tasks toward unfinished components — all of
 these MUST fail news_value (verdict skip) unless they ship a user- or operator-visible
 capability, fix a security, DoS, crash, or interoperability bug in released software, or
-alter a consensus or protocol default. Also fail news_value (verdict skip) for:
+alter a consensus or protocol default (in latest_update mode when prior_story is not null,
+keep news_value passing for the on-topic published story and use new_information to
+distinguish material corrections from redundant echoes). Also fail news_value (verdict skip) for:
 stall/crash/reactor fixes on unreleased branches, docs/spec sections for existing designs,
 user questions, release checklists, routine CI/data-refresh/test tags, open feature
 requests or exploratory benchmarks without adoption/merge, third-party tool notices,
@@ -511,15 +513,15 @@ SPECIALIST VERIFICATION FOCUS (novelty_news — validate all 9 criteria; focus o
 - Evaluate novelty and routing strictly against coverage_background (prior_story, recent, and updates[:-1] in latest_update mode): compare specific defects, versions, releases, MRs/issues, and status changes rather than surface wording.
 - When prior_story is null and recent covers the same concrete change under routing rules (a)-(e), set same_story to that live recent entry's id unless the distinct official incident-response exception applies (evaluating further defenses or expecting further releases). Never route to retracted or network-health entries, or across distinct versions/incidents.
 - Enforce the 14-day recency window (honoring HackerOne, mandatory_news_rule, and Severity::high/critical exceptions), mandatory_news_rule ("trove", "release_announcement", "torproject_new_thread"), HackerOne triage, dirauth operational rules, and tor-dev 5-case proposal/critique rules.
-- Enforce strict news_value criteria (verdict "skip" when new_information passes): internal crate/module API plumbing MRs (e.g. `tor-netdoc:` parser/signature/trait helpers), internal TODO cleanups, minor whitespace parsing tweaks, unit-test improvements, and incremental sub-tasks toward unfinished components MUST fail news_value (verdict "skip") unless they ship a user/operator-visible capability, fix a security/DoS/crash/interoperability bug in released software, or alter a consensus/protocol default.
-- In latest_update mode, skip (naming prior_story.id verbatim) redundant echoes/check-ins/me-too replies while passing material lifecycle transitions, new measurements, maintainer disputes, or new response plans. Keep factual criteria passing unless a clear defect exists.
+- In standalone reviews (prior_story is null), enforce strict news_value criteria (verdict "skip" when new_information passes): internal crate/module API plumbing MRs (e.g. `tor-netdoc:` parser/signature/trait helpers), internal TODO cleanups, minor whitespace parsing tweaks, unit-test improvements, and incremental sub-tasks toward unfinished components MUST fail news_value (verdict "skip") unless they ship a user/operator-visible capability, fix a security/DoS/crash/interoperability bug in released software, or alter a consensus/protocol default.
+- In latest_update mode (prior_story is not null), keep news_value passing for the on-topic published story (do not apply standalone internal-plumbing exclusions to material factual corrections) and use new_information to skip redundant echoes/check-ins/me-too replies (naming prior_story.id verbatim) while passing material lifecycle transitions, factual corrections, new measurements, maintainer disputes, or new response plans. Keep factual criteria passing unless a clear defect exists.
 """,
 }
 NEWS_TIEBREAK_PROMPT = """
 NEWS-VALUE TIEBREAKER FOCUS (resolve the news_value split cleanly while validating all 9 criteria):
 - Earlier reviews split on news_value. Make an independent, decisive tiebreaker judgment rather than defaulting to hold.
-- Fail news_value (verdict "skip", keeping factual criteria passing unless clearly violated) for internal crate/module API plumbing MRs (such as `tor-netdoc:` parser, signature, trait, or helper additions), code refactors, internal TODO cleanups, minor whitespace parsing tweaks, unit-test improvements, and incremental sub-tasks toward unfinished components, UNLESS they ship a user/operator-visible capability, fix a security/DoS/crash/interoperability bug in released software, or alter a consensus/protocol default.
-- Pass news_value (verdict "approve" if all factual criteria and new_information also pass, or "revise" only when a fixable factual defect exists) when the unquoted packet reports concrete user, operator, security, consensus/dirauth operational, release/tag, or substantive proposal/measurement news.
+- In standalone reviews (prior_story is null), fail news_value (verdict "skip", keeping factual criteria passing unless clearly violated) for internal crate/module API plumbing MRs (such as `tor-netdoc:` parser, signature, trait, or helper additions), code refactors, internal TODO cleanups, minor whitespace parsing tweaks, unit-test improvements, and incremental sub-tasks toward unfinished components, UNLESS they ship a user/operator-visible capability, fix a security/DoS/crash/interoperability bug in released software, or alter a consensus/protocol default. In latest_update mode (prior_story is not null), keep news_value passing for an on-topic published story and use new_information to distinguish material factual corrections or developments from redundant updates.
+- Pass news_value (verdict "approve" if all factual criteria and new_information also pass, or "revise" only when a fixable factual defect exists) when the unquoted packet reports concrete user, operator, security, consensus/dirauth operational, release/tag, or substantive proposal/measurement news that satisfies the base rubric's source authority and tor-dev eligibility rules (requiring a numbered Tor proposal, [RFC] tag, IETF draft/RFC, or project-sender/trusted-operator standing for unnumbered proposals, critiques, or measurements).
 - Verify all factual criteria independently as well: never approve unsupported assertions, dropped qualifiers, unattributed advice, or invalid labels.
 """
 UPDATE_SPECIALIST_PROMPTS = {

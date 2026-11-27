@@ -2409,6 +2409,8 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                         "repair": None,
                         "model_verdict": last_res["verdict"],
                     }
+            if decision == "skip" and receipt_result is not None and receipt_result.get("same_story") is not None:
+                receipt_result = {**receipt_result, "same_story": None}
             if receipt_result is not None:
                 receipt = (key, digest(candidate), prepared["source_hash"], policy, prepared["binding_hash"],
                            strict_json(receipt_result), strict_json(record), observed, observed)
