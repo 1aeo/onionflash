@@ -104,6 +104,10 @@ def test_gitlab_url_and_source_software_extraction():
 
     assert util.software_from_url("https://blog.torproject.org/new-release-tor-browser-14-5/") == "tor-browser"
     assert util.software_from_url("https://BLOG.torproject.org/New-Release-Tails-7-0/") == "tails"
+    assert util.software_from_url("https://tails.net/news/version_7.18/") == "tails"
+    assert util.software_from_url("https://www.tails.net/news/index.en.rss") == "tails"
+    assert util.software_from_url("http://tails.net/news/version_7.18/") is None
+    assert util.software_from_url("https://tails.net:8443/news/version_7.18/") is None
     assert util.software_from_url("https://blog.torproject.org/new-release-tor-0-4-9-16/") == "tor"
     assert util.software_from_url("https://blog.torproject.org/new-release-arti-1-4-0/") == "arti"
     assert util.software_from_url("https://blog.torproject.org/2025/01/new-release-tor-1/") is None
@@ -115,18 +119,46 @@ def test_gitlab_url_and_source_software_extraction():
         "https://blog.torproject.org/new-release-tor-browser-14-5/",
         {"url": "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/merge_requests/11"},
         "https://blog.torproject.org/new-release-tails-7-0/",
+        "https://tails.net/news/version_7.18/",
     ])
     assert found == ["snowflake", "tor-browser", "tails"]
 
 
 def test_release_mentions_and_clusters_for_pluggable_transports():
-    """Detect pluggable transport release mentions while leaving Tails prose unclustered."""
+    """Detect pluggable transport release mentions and Tails news releases cleanly."""
     assert util.release_mentions({"title": "Snowflake 2.10.1 released", "content": "Details"}) == ["release:snowflake:2.10.1"]
     assert util.release_mentions({"title": "WebTunnel 0.1.0 is now available", "content": "Details"}) == ["release:webtunnel:0.1.0"]
     assert util.release_mentions({"title": "Lyrebird 0.5.0 available", "content": "Details"}) == ["release:lyrebird:0.5.0"]
     assert util.release_mentions({"title": "Tor Browser 14.5.1 available", "content": "Details"}) == ["release:tor-browser:14.5.1"]
     assert util.release_mentions({"title": "Tails 7.16 available", "content": "Tails 7.16 details"}) == []
     assert util.item_cluster({"title": "Snowflake 2.10.1 available", "content": "", "product": "network", "url": "https://example.org/s"}) == "release:snowflake:2.10.1"
+
+    tails_news_item = {
+        "kind": "feed",
+        "authority": "official",
+        "product": "tails",
+        "url": "https://tails.net/news/version_7.18/",
+        "title": "Tails 7.18",
+        "content": "Tails 7.18 updates Tor Browser and the Tor client.",
+    }
+    assert util.item_cluster(tails_news_item) == "release:tails:7.18"
+    assert util.is_official_release_announcement(tails_news_item) is True
+    assert util.mandatory_news_rule(tails_news_item) == "release_announcement"
+    tails_out_item = {**tails_news_item, "title": "Tails 7.18 is out!"}
+    assert util.item_cluster(tails_out_item) == "release:tails:7.18"
+    assert util.is_official_release_announcement(tails_out_item) is True
+    tails_delayed = {**tails_news_item, "title": "Tails 7.18 delayed"}
+    assert util.item_cluster(tails_delayed).startswith("url:")
+    assert util.is_official_release_announcement(tails_delayed) is False
+    tails_issue = {
+        "kind": "gitlab_issue",
+        "authority": "development",
+        "product": "tails",
+        "url": "https://gitlab.torproject.org/tpo/tails/tails/-/work_items/20501",
+        "title": "Tails 7.18 fails to boot on Mac",
+        "content": "Boot hangs after greeter.",
+    }
+    assert not util.item_cluster(tails_issue).startswith("release:")
 
 
 def test_tag_notice_labels_fallback_and_length_bounds():

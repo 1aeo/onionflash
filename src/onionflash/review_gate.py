@@ -24,7 +24,7 @@ from .llm import AnalysisError, CompletionDeferred, RequestObserver, is_quoted_l
 from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, SHA256_RE, STATES
 from .store import ITEM_SAFE_COLUMNS, decode_item_row, item_hash, item_hash_fields, set_job_stage
 from .util import (
-    _DIRAUTH_LABELS, _GITLAB_OWN, after, cve_ids, digest,
+    _DIRAUTH_LABELS, _GITLAB_OWN, _PRODUCT_NAMES, after, cve_ids, digest,
     dirauth_user_set, effective_authority, folded_labels, gitlab_refs, has_invalid_text_chars,
     is_dirauth_item, is_hackerone_item, is_housekeeping_item, is_trove_item, item_cluster, LIST_ARCHIVE_HOST,
     mandatory_news_rule, normalize_evidence, now_iso, parse_utc, release_mentions,
@@ -579,12 +579,7 @@ def _can_route(candidate: dict, prepared: dict, result: dict, target_id) -> bool
         # is already covered; a positive novelty judgment must not become an update.
         return False
     if release_hint.startswith("release:") and target.get("state") in {"tagged", "released"}:
-        products = target.get("products") or ()
-        versions = release_mentions({"title": target.get("title", "")})
-        target_release = versions[0] if versions else item_cluster({
-            "kind": "feed", "title": target.get("title", ""), "content": "", "url": "",
-            "product": products[0] if len(products) == 1 else "network"})
-        if target_release != release_hint:
+        if (candidate_mod.release_story_key("", target) or "") != release_hint:
             return False
     cand_products = set(candidate.get("products") or ())
     if isinstance(item.get("product"), str) and item["product"]:
@@ -593,6 +588,45 @@ def _can_route(candidate: dict, prepared: dict, result: dict, target_id) -> bool
         return True
     if set().union(*gitlab_refs(item)) & set().union(*gitlab_refs({"url": "", "title": "", "content": _story_text(target)})):
         return True
+    target_text = _story_text(target)
+    target_probe = {"title": target.get("title") or "", "content": target_text}
+    if set(release_mentions(item)) & set(release_mentions(target_probe)):
+        return True
+    if (set(trove_ids(item)) & set(trove_ids(target_probe))) or (set(cve_ids(item)) & set(cve_ids(target_probe))):
+        return True
+    item_text = "\n".join(
+        str(p or "")
+        for p in (
+            item.get("title"),
+            item.get("source_content") if isinstance(item.get("source_content"), str) else item.get("content"),
+            *(n.get("body") for n in (item.get("public_comments") or ()) if isinstance(n, dict)),
+        )
+        if p
+    )
+    cand_text = "\n".join(str(candidate.get(k) or "") for k in ("title", "summary", "why_it_matters"))
+    combined_text = f"{item_text}\n{cand_text}"
+    item_vers = {m.casefold() for m in _VERSION_TOKEN.findall(combined_text)}
+    target_vers = {m.casefold() for m in _VERSION_TOKEN.findall(target_text)}
+    if (shared_vers := item_vers & target_vers) and (
+        target.get("state") in {"tagged", "released"} or target.get("category") == "release"
+    ):
+        target_prods = {p for p in (target.get("products") or ()) if p != "network"}
+        if any(
+            candidate_mod.item_mentions_product_version(combined_text, prod, ver)
+            for prod in target_prods
+            for ver in shared_vers
+        ):
+            return True
+        if any(
+            re.search(rf"\b{pat}\b" + (r"(?!\s+project\b)" if prod == "tor" else ""), combined_text, re.I)
+            and any(
+                not candidate_mod.version_claimed_by_other_product(combined_text, prod, ver)
+                for ver in shared_vers
+            )
+            for prod in target_prods
+            if (pat := _PRODUCT_NAMES.get(prod))
+        ):
+            return True
     item_subj, _ = thread_subject(item)
     target_subj, _ = thread_subject({"url": item.get("url"), "title": target.get("title")})
     return bool(item_subj and item_subj == target_subj)

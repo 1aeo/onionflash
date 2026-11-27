@@ -582,6 +582,11 @@ _VERSION = re.compile(r"\d+\.\d+(?:\.\d+){0,2}(?:[-.]?(?:alpha|beta|rc|a)\.?\d*)
 _RELEASE_QUALIFIERS = r"(?:(?:new|stable|alpha|beta|security|bugfix|releases?|version)\s+)*"
 _RELEASE_AFTER = re.compile(r"\s+(?:is\s+)?(?:now\s+)?available\b")
 _RELEASE_EOL = re.compile(r"\b(?:end[- ]of[- ]life|eol|out of support|no longer supported)\b")
+_TAILS_RELEASE_TITLE = re.compile(
+    rf"^\s*(?:new\s+release\s*:\s*)?tails[- ]{_RELEASE_QUALIFIERS}v?(\d+\.\d+(?:\.\d+)?)"
+    r"(?=$|\s+(?:(?:is\s+)?(?:(?:now\s+)?available|out)\b|released\b)(?:[!.]+|\s|$)|[!.]+$)",
+    re.I,
+)
 GITLAB_PROJECT_PATH = r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+"
 GITLAB_SOFTWARE_PROJECTS = {
     "tpo/core/tor": "tor",
@@ -703,6 +708,23 @@ def item_cluster(item: dict) -> str:
             and not _RELEASE_EOL.search(title)
         ):
             return f"release:{product}:{match.group(1)}"
+    if (
+        (
+            product == "tails"
+            or software_from_url(item.get("url")) == "tails"
+            or (product == "network" and item.get("kind") in {"feed", "tag"})
+        )
+        and item.get("kind") in {"tag", "feed", None}
+        and (re.search(r"\breleased\b", title) or not re.search(r"\b(?:delayed|postponed)\b", title))
+        and not _RELEASE_EOL.search(title)
+    ):
+        tails_match = _TAILS_RELEASE_TITLE.match(title)
+        if tails_match and _VERSION.fullmatch(tails_match.group(1)):
+            return f"release:tails:{tails_match.group(1)}"
+        if item.get("kind") == "tag" and product == "tails":
+            tag_match = re.fullmatch(r"\s*(?:tails[- ]*)?v?(\d+\.\d+(?:\.\d+)?)\s*", title)
+            if tag_match and _VERSION.fullmatch(tag_match.group(1)):
+                return f"release:tails:{tag_match.group(1)}"
     body = re.sub(r"\s+", " ", item["content"]).strip().lower()
     if len(body) >= 180 and item.get("kind") in {"gitlab_issue", "gitlab_mr"}:
         clean_title = re.sub(r"^(?:dirauth|authority|security|tor|arti):\s*", "", re.sub(r"\s+", " ", title).strip())
@@ -784,7 +806,7 @@ def gitlab_repo_name(url: object) -> str | None:
 
 
 def software_from_url(url: object) -> str | None:
-    """Map an upstream Tor Project GitLab or blog release URL to a software slug."""
+    """Map an upstream Tor Project GitLab, blog release, or Tails URL to a software slug."""
     path = gitlab_project_path(url)
     if path is not None:
         return GITLAB_SOFTWARE_PROJECTS.get(path)
@@ -797,7 +819,12 @@ def software_from_url(url: object) -> str | None:
         parsed = urlsplit(raw)
     except ValueError:
         return None
-    if parsed.scheme.lower() != "https" or parsed.netloc.lower() != "blog.torproject.org":
+    if parsed.scheme.lower() != "https":
+        return None
+    netloc = parsed.netloc.lower()
+    if netloc in {"tails.net", "www.tails.net"}:
+        return "tails"
+    if netloc != "blog.torproject.org":
         return None
     blog_path = parsed.path.lower()
     for prefix, software in _BLOG_RELEASE_PREFIXES:

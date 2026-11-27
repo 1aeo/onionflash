@@ -1124,3 +1124,228 @@ def test_related_expands_cve_authority_and_rare_lexical_overlap(store):
             url=f"https://example.org/cve-cap-{n}", title=f"Tracking {cve}", content=f"Details for {cve}.",
         ), draft=analysis(title=f"Tracking {cve}", summary=f"Details for {cve}.", evidence=[f"Details for {cve}."]))
     assert len(candidate.related(store.db, {"id": ten_target["id"], "cluster_key": "url:ten"}, ten_target)) == 10
+
+
+def test_cross_product_release_rollout_related_and_can_route(context):
+    """Pin and route cross-product deployment notices for covered Tor releases while keeping separate releases blocked."""
+    cfg, store = context
+    tor_rel_item = item(
+        kind="feed",
+        authority="official",
+        product="tor",
+        url="https://lists.torproject.org/tor-announce/tor-0-4-9-17",
+        title="Tor stable 0.4.9.17 released",
+        content="Tor 0.4.9.17 released with relay IPv6 DoS mitigations.",
+        published_at=DATE,
+        updated_at=DATE,
+    )
+    tor_rel = seed_source_story(
+        store,
+        tor_rel_item,
+        draft=analysis(
+            title="Tor stable 0.4.9.17 released",
+            summary="The Tor Project released 0.4.9.17 with relay IPv6 DoS mitigations.",
+            why_it_matters="",
+            category="release",
+            tags=["release"],
+            confidence="confirmed",
+            state="released",
+            products=["tor"],
+            evidence=["Tor 0.4.9.17 released with relay IPv6 DoS mitigations."],
+        ),
+    )
+
+    unrelated_nginx = seed_source_story(
+        store,
+        item(
+            kind="feed",
+            authority="official",
+            product="arti",
+            url="https://example.org/arti-1-4-2",
+            title="Arti 1.4.2 released",
+            content="Arti 1.4.2 released with RPC improvements.",
+        ),
+        draft=analysis(
+            title="Arti 1.4.2 released",
+            summary="Arti 1.4.2 released with RPC improvements.",
+            why_it_matters="",
+            category="release",
+            tags=["release"],
+            confidence="confirmed",
+            state="released",
+            products=["arti"],
+            evidence=["Arti 1.4.2 released with RPC improvements."],
+        ),
+    )
+
+    rollout_item = item(
+        kind="gitlab_issue",
+        authority="dirauth-operator",
+        product="snowflake",
+        url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/work_items/40584",
+        title="Update tor on snowflake bridges to 0.4.9.17 for security fixes",
+        content="Upgraded tor on snowflake-01 and snowflake-02 to 0.4.9.17.",
+        published_at=LATER,
+        updated_at=LATER,
+    )
+    rollout_row = pending(store, rollout_item, LATER)
+    rel = candidate.related(store.db, rollout_row, rollout_item)
+    assert (tor_rel["id"], "mentions tor 0.4.9.17") in rel
+    assert all(sid != unrelated_nginx["id"] for sid, _ in rel)
+
+    rollout_cand = analysis(
+        title="Snowflake bridges updated to Tor 0.4.9.17",
+        summary="Operators upgraded snowflake-01 and snowflake-02 to Tor 0.4.9.17.",
+        why_it_matters="",
+        category="security",
+        tags=["security"],
+        confidence="reported",
+        state="developing",
+        products=["snowflake"],
+        evidence=["Upgraded tor on snowflake-01 and snowflake-02 to 0.4.9.17."],
+    )
+    prepared_rollout = store.prepare_candidate(rollout_row, rollout_cand, LATER)
+    assert any(entry["id"] == tor_rel["id"] for entry in prepared_rollout["coverage"]["recent"])
+
+    # Even if `related` is absent on the recent entry, cross-product version overlap permits routing.
+    stripped_prepared = {
+        **prepared_rollout,
+        "coverage": {
+            "prior_story": None,
+            "recent": [
+                {k: v for k, v in entry.items() if k != "related"}
+                for entry in prepared_rollout["coverage"]["recent"]
+            ],
+            "truncated": False,
+        },
+    }
+    route_verdict = verdict("approve", same_story=tor_rel["id"])
+    assert review_gate._can_route(prepared_rollout["candidate"], stripped_prepared, route_verdict, tor_rel["id"]) is True
+
+    # Conversely, a separate product release (Tails 7.18 bundling Tor 0.4.9.17) must not route onto Tor 0.4.9.17.
+    tails_item = item(
+        kind="feed",
+        authority="official",
+        product="tails",
+        url="https://tails.net/news/version_7.18/",
+        title="Tails 7.18",
+        content="Tails 7.18 updates the bundled Tor client to 0.4.9.17.",
+        published_at=LATER,
+        updated_at=LATER,
+    )
+    tails_row = pending(store, tails_item, LATER)
+    tails_prep = store.prepare_candidate(
+        tails_row,
+        analysis(
+            title="Tails 7.18 released with Tor 0.4.9.17",
+            summary="Tails 7.18 updates the Tor client to 0.4.9.17.",
+            why_it_matters="",
+            category="release",
+            tags=["release"],
+            confidence="confirmed",
+            state="released",
+            products=["tails"],
+            evidence=["Tails 7.18 updates the bundled Tor client to 0.4.9.17."],
+        ),
+        LATER,
+    )
+    assert review_gate._can_route(tails_prep["candidate"], tails_prep, route_verdict, tor_rel["id"]) is False
+
+    # And a mention of "Tor Project ... Arti 1.4.2" must not pin Tor 1.4.2.
+    tor_142 = seed_source_story(
+        store,
+        item(
+            kind="feed",
+            authority="official",
+            product="tor",
+            url="https://lists.torproject.org/tor-announce/tor-1-4-2",
+            title="Tor 1.4.2 released",
+            content="Tor 1.4.2 released.",
+        ),
+        draft=analysis(
+            title="Tor 1.4.2 released",
+            summary="Tor 1.4.2 released.",
+            why_it_matters="",
+            category="release",
+            tags=["release"],
+            confidence="confirmed",
+            state="released",
+            products=["tor"],
+            evidence=["Tor 1.4.2 released."],
+        ),
+    )
+    arti_post = item(
+        kind="feed",
+        authority="official",
+        product="arti",
+        url="https://blog.torproject.org/arti-1-4-2",
+        title="Tor Project released Arti 1.4.2",
+        content="Tor Project released Arti 1.4.2 today.",
+        published_at=LATER,
+        updated_at=LATER,
+    )
+    arti_rel = candidate.related(store.db, pending(store, arti_post, LATER), arti_post)
+    assert (unrelated_nginx["id"], "mentions arti 1.4.2") in arti_rel
+    assert all(sid != tor_142["id"] for sid, _ in arti_rel)
+
+    # Full run_gate routes the Snowflake rollout issue cleanly to Tor 0.4.9.17.
+    out = run_gate(cfg, store, rollout_row, Writer(rollout_cand), Reviewer(verdict("approve", same_story=tor_rel["id"])), LATER)
+    assert out["status"] == "routed"
+    assert queued_row(store, rollout_item["id"], LATER)["story_id"] == tor_rel["id"]
+
+    # Complete version token boundary (1.4.2 vs 1.4.20) and cross-product version ownership in _can_route.
+    assert candidate.item_mentions_product_version("Arti 1.4.20 released", "arti", "1.4.2") is False
+    assert candidate.item_mentions_product_version("Arti v1.4.2 released", "arti", "1.4.2") is True
+    assert candidate.item_mentions_product_version("Snowflake v1.4.2 fails when launched from Arti", "arti", "1.4.2") is False
+    assert candidate.item_mentions_product_version("Snowflake v1.4.2 fails when launched from Arti", "snowflake", "1.4.2") is True
+
+    arti_142 = seed_source_story(
+        store,
+        item(
+            kind="feed",
+            authority="official",
+            product="arti",
+            url="https://blog.torproject.org/arti-1-4-2-rel",
+            title="Arti 1.4.2 released",
+            content="Arti 1.4.2 released.",
+        ),
+        draft=analysis(
+            title="Arti 1.4.2 released",
+            summary="Arti 1.4.2 released.",
+            why_it_matters="",
+            category="release",
+            tags=["release"],
+            confidence="confirmed",
+            state="released",
+            products=["arti"],
+            evidence=["Arti 1.4.2 released."],
+        ),
+    )
+    sf_arti_item = item(
+        kind="gitlab_issue",
+        authority="development",
+        product="snowflake",
+        url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/work_items/999",
+        title="Snowflake 1.4.2 fails when launched from Arti",
+        content="Snowflake 1.4.2 fails to start under version 1.4.2.",
+        published_at=LATER,
+        updated_at=LATER,
+    )
+    sf_arti_cand = analysis(
+        title="Snowflake 1.4.2 fails when launched from Arti",
+        summary="Snowflake 1.4.2 fails when launched from Arti.",
+        why_it_matters="",
+        category="network",
+        tags=["network"],
+        confidence="reported",
+        state="developing",
+        products=["snowflake"],
+        evidence=["Snowflake 1.4.2 fails to start under version 1.4.2."],
+    )
+    sf_arti_prep = store.prepare_candidate(pending(store, sf_arti_item, LATER), sf_arti_cand, LATER)
+    assert review_gate._can_route(
+        sf_arti_prep["candidate"],
+        sf_arti_prep,
+        verdict("approve", same_story=arti_142["id"]),
+        arti_142["id"],
+    ) is False

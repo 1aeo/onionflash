@@ -29,7 +29,8 @@ from onionflash.store import PT_SECURITY_PRIORITY, Store, backup_database, item_
 from onionflash.transport import DeadlineReached, FetchError, HttpClient, Response
 from onionflash.util import (
     MAX_SAVED_DEPTH, after, backoff_seconds, canonical_url, format_utc, gitlab_refs, item_cluster,
-    parse_utc, plain_text, saved_object, timestamp,
+    is_official_release_announcement, mandatory_news_rule, parse_utc, plain_text, saved_object,
+    software_from_url, timestamp,
 )
 
 LIST_URL = "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/feed/"
@@ -751,7 +752,7 @@ def test_example_config_and_validation_guards(tmp_path, monkeypatch):
         with pytest.raises(ValueError, match="Invalid LLM base URL"):
             load_config(p)
     monkeypatch.setenv("ONIONFLASH_LLM_BASE_URL", "https://model.example/v1")
-    assert cfg["storage"]["database"] == str(tmp_path / "state/onionflash.sqlite3") and len(cfg["sources"]) == 29 and cfg["llm"]["fallback_base_urls"] == []
+    assert cfg["storage"]["database"] == str(tmp_path / "state/onionflash.sqlite3") and len(cfg["sources"]) == 31 and cfg["llm"]["fallback_base_urls"] == []
     sources = {s["id"]: s for s in cfg["sources"]}
     assert sources["tor-browser-security"]["enabled"] and sources["tor-browser-security"]["authority"] == "development"
     assert sources["anti-censorship-team"]["enabled"] and sources["tor-dev"]["enabled"]
@@ -763,7 +764,9 @@ def test_example_config_and_validation_guards(tmp_path, monkeypatch):
         "webtunnel-issues": ("gitlab_issue", "webtunnel", "development", "tpo/anti-censorship/pluggable-transports/webtunnel", "https://gitlab.torproject.org/api/v4/projects/1674/issues"),
         "webtunnel-merges": ("gitlab_mr", "webtunnel", "development", None, "https://gitlab.torproject.org/api/v4/projects/1674/merge_requests"),
         "lyrebird-tags": ("tag", "lyrebird", "official", None, "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/-/tags?format=atom"),
+        "lyrebird-issues": ("gitlab_issue", "lyrebird", "development", "tpo/anti-censorship/pluggable-transports/lyrebird", "https://gitlab.torproject.org/api/v4/projects/417/issues"),
         "lyrebird-merges": ("gitlab_mr", "lyrebird", "development", None, "https://gitlab.torproject.org/api/v4/projects/417/merge_requests"),
+        "tails-news": ("feed", "tails", "official", None, "https://tails.net/news/index.en.rss"),
         "tor-browser-high-impact-bugs": ("gitlab_issue", "tor-browser", "development", "tpo/applications/tor-browser", canonical_url("https://gitlab.torproject.org/api/v4/projects/472/issues?labels=Apps::Product::TorBrowser,Apps::Impact::High,Apps::Type::Bug")),
     }
     for sid, (kind, product, authority, project, url) in expected_new.items():
@@ -778,6 +781,22 @@ def test_example_config_and_validation_guards(tmp_path, monkeypatch):
         if kind == "tag":
             notice = tag_notice(tag(source_id=sid, product=product, title=f"{sid}-v1.0", url=f"{stream['website_url']}/v1.0"))
             assert notice["state"] == "tagged" and notice["products"] == [product]
+    assert sources["tails-news"]["website_url"] == "https://tails.net/news/index.en.html"
+    assert software_from_url("https://tails.net/news/version_7.18/") == "tails"
+    assert software_from_url("https://www.tails.net/news/index.en.html") == "tails"
+    assert software_from_url("http://tails.net/news/version_7.18/") is None
+    assert software_from_url("https://tails.net.example.org/news/version_7.18/") is None
+    tails_entry = {
+        "kind": "feed",
+        "authority": "official",
+        "product": "tails",
+        "url": "https://tails.net/news/version_7.18/",
+        "title": "Tails 7.18",
+        "content": "Tails 7.18 is out.",
+    }
+    assert item_cluster(tails_entry) == "release:tails:7.18"
+    assert is_official_release_announcement(tails_entry) is True
+    assert mandatory_news_rule(tails_entry) == "release_announcement"
     tb_client = FakeClient([response(b"[]")])
     collect_source(tb_client, sources["tor-browser-high-impact-bugs"], {}, cfg["collection"], DATE)
     assert parse_qs(urlsplit(tb_client.calls[0][1]).query)["labels"] == ["Apps::Product::TorBrowser,Apps::Impact::High,Apps::Type::Bug"]
