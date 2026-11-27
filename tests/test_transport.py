@@ -695,8 +695,10 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
             "onionflash_select": "select",
             "onionflash_polish": "polish",
         }.get(schema_name, "review")
-        expected_max_tokens = {"writer": 32768, "select": 1200, "polish": 1200, "review": review.OUTPUT_TOKENS}[stage_kind]
+        expected_max_tokens = {"writer": 32768, "select": 32768, "polish": 1200, "review": review.OUTPUT_TOKENS}[stage_kind]
         assert body["max_tokens"] == expected_max_tokens
+        if stage_kind == "select":
+            assert body["chat_template_kwargs"] == {"enable_thinking": True}
         assert request.extensions["onionflash_deadline"] == clock[0] + 3610
         assert request.extensions["timeout"]["read"] == 3600
         sent.append(stage_kind)
@@ -1105,8 +1107,8 @@ def test_streaming_json_fallback_midstream_timeout_and_identity_parity(completio
     row = {"content_hash": "a" * 64}
     cfg_on = copy.deepcopy(DEFAULTS)
     cfg_on["llm"]["writer_reasoning"] = True
-    assert analyze.cache_key(row, DEFAULTS["llm"]) == "93706cd7b008cd74a05bb0ef011775c09e069800c29c9ef700aaa416a645b885"
-    assert analyze.cache_key(row, cfg_on["llm"]) == "c95f4fcbf5ca9233de6a47bd798170c9525d157ed5ddf8a118565ae1024160c2"
+    assert analyze.cache_key(row, DEFAULTS["llm"]) == "2958a77cb975044bcda52ce6215d36c9e742a96f50f76d3aac59c5c6da472afd"
+    assert analyze.cache_key(row, cfg_on["llm"]) == "0c6bada1be6aed47f6db4bea464e824c52e544fd351b25739e06a2a777b558f8"
 
     json_client, _ = completion_client(lambda _req: _httpx_completion({"mode": "json"}))
     _, req1, _ = _ledger()

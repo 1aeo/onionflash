@@ -2118,13 +2118,18 @@ def test_cache_key_digest_modes_update_truncation_selector_bounds_and_issue_rele
     k_llm = analyze.cache_key(row, DEFAULTS["llm"], best_of=3, quote_digest=True)
     assert len({k_none, k_det, k_llm}) == 3
 
-    # Best-of keys depend on base max_output_tokens when writer_reasoning=True; single-draft keys do not.
+    # Best-of keys ignore base max_output_tokens when writer_reasoning=True (selector shares reasoning profile),
+    # while non-reasoning best-of keys still bind base max_output_tokens.
     llm_900 = {**DEFAULTS["llm"], "writer_reasoning": True, "max_output_tokens": 900}
     llm_1200 = {**DEFAULTS["llm"], "writer_reasoning": True, "max_output_tokens": 1200}
     llm_1400 = {**DEFAULTS["llm"], "writer_reasoning": True, "max_output_tokens": 1400}
     llm_2400 = {**DEFAULTS["llm"], "writer_reasoning": True, "max_output_tokens": 2400}
     assert analyze.cache_key(row, llm_1200) == analyze.cache_key(row, llm_2400)
-    assert analyze.cache_key(row, llm_1200, best_of=3) != analyze.cache_key(row, llm_2400, best_of=3)
+    assert analyze.cache_key(row, llm_1200, best_of=3) == analyze.cache_key(row, llm_2400, best_of=3)
+    assert analyze.cache_key(row, llm_1200, best_of=3) != analyze.cache_key(row, {**llm_1200, "writer_reasoning": False}, best_of=3)
+    assert analyze.cache_key(row, {**DEFAULTS["llm"], "max_output_tokens": 1200}, best_of=3) != analyze.cache_key(
+        row, {**DEFAULTS["llm"], "max_output_tokens": 2400}, best_of=3
+    )
     # Effective LLM digest contract (with 1400-token floor) binds only when digest mode is "llm".
     assert analyze.cache_key(row, llm_1400, quote_digest=True) != analyze.cache_key(row, llm_2400, quote_digest=True)
     assert analyze.cache_key(row, llm_900, quote_digest=True) == analyze.cache_key(row, llm_1400, quote_digest=True)
@@ -2202,3 +2207,296 @@ def test_cache_key_digest_modes_update_truncation_selector_bounds_and_issue_rele
     assert "released" in schema_rel["properties"]["state"]["enum"]
     schema_tagged_rel = analyze._writer_schema({"title": "T", "content": "Issue body.", "kind": "gitlab_issue"}, analyze.UPDATE_SCHEMA, prior={**prior_dev, "state": "tagged", "category": "release"})
     assert "released" not in schema_tagged_rel["properties"]["state"]["enum"]
+
+
+def test_selector_inherits_writer_reasoning_profile_and_cache_key(monkeypatch):
+    """Inherit full reasoning profile in `_select_winner` when `writer_reasoning=True`, keeping non-thinking temp=0 when False."""
+    from onionflash import llm as llm_mod
+
+    src = item(title="Tor TLS handshake defect", content="Reported defect affects OpenSSL builds.", labels=[])
+    ev = "Reported defect affects OpenSSL builds."
+    d1 = analysis(title="Draft one", summary="First candidate.", why_it_matters="", evidence=[ev])
+    d2 = analysis(title="Draft two", summary="Second candidate.", why_it_matters="", evidence=[ev])
+    d3 = analysis(title="Draft three", summary="Third candidate.", why_it_matters="", evidence=[ev])
+    drafts = [d1, d2, d3]
+
+    def _run_case(reasoning: bool) -> dict:
+        cfg = copy.deepcopy(DEFAULTS)
+        cfg["llm"].update(
+            base_url="https://llm.example/v1",
+            api_key_env="SEL_REASONING_KEY",
+            writer_reasoning=reasoning,
+            send_chat_template_kwargs=True,
+        )
+        monkeypatch.setenv("SEL_REASONING_KEY", "synthetic-fixture-value")
+        select_bodies: list[dict] = []
+        select_transport_bytes: list[int] = []
+        draft_idx = [0]
+        lock = threading.Lock()
+
+        def _factory(settings, **kwargs):
+            def _handle(request: httpx.Request) -> httpx.Response:
+                body = json.loads(request.content)
+                name = body["response_format"]["json_schema"]["name"]
+                if name == "onionflash_news":
+                    with lock:
+                        reply = drafts[draft_idx[0] % len(drafts)]
+                        draft_idx[0] += 1
+                elif name == "onionflash_select":
+                    select_bodies.append(body)
+                    select_transport_bytes.append(settings["max_response_bytes"])
+                    reply = {"winner": 2, "reason": "Clearer candidate."}
+                else:
+                    raise AssertionError(f"Unexpected schema {name}")
+                return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(reply)}}]})
+
+            return HttpClient(settings, **kwargs, transport=httpx.MockTransport(_handle), resolver=public_dns)
+
+        monkeypatch.setattr(llm_mod, "HttpClient", _factory)
+        with Analyzer(cfg, best_of=3) as writer:
+            out = writer.analyze(src)
+            assert out["title"] == d2["title"]
+            assert writer.calls == 4
+        assert len(select_bodies) == 1
+        return {"body": select_bodies[0], "max_response_bytes": select_transport_bytes[0]}
+
+    on_res = _run_case(True)
+    on_body = on_res["body"]
+    assert on_body["chat_template_kwargs"] == {"enable_thinking": True}
+    assert on_body["temperature"] == 1.0
+    assert on_body["max_tokens"] == 32768
+    assert on_body["top_p"] == 0.95
+    assert on_body["top_k"] == 20
+    assert on_body["min_p"] == 0.0
+    assert on_body["presence_penalty"] == 0.0
+    assert on_body["repetition_penalty"] == 1.0
+    assert on_body["reasoning_effort"] == "xhigh"
+    assert on_res["max_response_bytes"] == 2097152
+
+    off_res = _run_case(False)
+    off_body = off_res["body"]
+    assert off_body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert off_body["temperature"] == 0
+    assert off_body["max_tokens"] == 1200
+    assert "reasoning_effort" not in off_body
+    assert off_res["max_response_bytes"] == 65536
+
+    row = {"content_hash": "d" * 64}
+    k_on = cache_key(row, {**DEFAULTS["llm"], "writer_reasoning": True}, best_of=3)
+    k_on_t0 = cache_key(row, {**DEFAULTS["llm"], "writer_reasoning": True, "temperature": 0}, best_of=3)
+    k_off = cache_key(row, {**DEFAULTS["llm"], "writer_reasoning": False}, best_of=3)
+    k_off_t = cache_key(row, {**DEFAULTS["llm"], "writer_reasoning": False, "temperature": 0.4}, best_of=3)
+    assert k_on == k_on_t0
+    assert k_on != k_off
+    assert k_off != k_off_t
+
+
+def test_impact_reask_recovers_attributed_why_it_matters_and_guards_failures(monkeypatch):
+    """Run one bounded non-thinking re-ask only when `has_unattributed_advice` solely clears `why_it_matters`."""
+    from onionflash import llm as llm_mod
+
+    src = item(
+        kind="feed",
+        authority="official",
+        url="https://blog.torproject.org/security-update/",
+        title="Tor 0.4.9.16 security release",
+        content="This release fixes a relay crash. If you run a relay on Windows, please upgrade to 0.4.9.16.",
+    )
+    ev = "If you run a relay on Windows, please upgrade to 0.4.9.16."
+    unattr_draft = analysis(
+        title="Tor 0.4.9.16 security release",
+        summary="The Tor Project released 0.4.9.16 fixing a relay crash.",
+        why_it_matters="Relay operators must upgrade to 0.4.9.16 immediately.",
+        category="release",
+        tags=["release"],
+        confidence="confirmed",
+        state="released",
+        evidence=[ev],
+    )
+    attributed = "The announcement asks relay operators on Windows to upgrade to 0.4.9.16."
+
+    # 1. Direct validate_analysis stays pure and fail-closed.
+    assert validate_analysis(copy.deepcopy(unattr_draft), src)["why_it_matters"] == ""
+
+    # 2. Analyzer.analyze re-asks once (non-thinking, temp=0 even when writer_reasoning=True) and recovers.
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["llm"].update(base_url="https://llm.example/v1", api_key_env="REASK_KEY", writer_reasoning=True)
+    monkeypatch.setenv("REASK_KEY", "synthetic-fixture-value")
+    writer = Analyzer(cfg)
+    writer.client = FakeLLM(unattr_draft, {"why_it_matters": f" {attributed} "})
+    out = writer.analyze(src)
+    assert out["why_it_matters"] == attributed and writer.clears == 0 and writer.calls == 2
+    reask_req = writer.client.requests[1][1]
+    assert reask_req["response_format"]["json_schema"]["name"] == "onionflash_impact_reask"
+    assert reask_req["response_format"]["json_schema"]["schema"] == analyze.IMPACT_REASK_SCHEMA
+    assert reask_req["messages"][0]["content"] == analyze.IMPACT_REASK_PROMPT
+    assert reask_req["temperature"] == 0 and reask_req["chat_template_kwargs"] == {"enable_thinking": False}
+    reask_payload = json.loads(reask_req["messages"][1]["content"])
+    assert reask_payload["draft"]["rejected_why_it_matters"] == "Relay operators must upgrade to 0.4.9.16 immediately."
+
+    # 3. Best-of-3 re-asks ONLY on winning candidate when it fails sole unattributed advice, and skips if clean wins.
+    clean_winner = {**unattr_draft, "title": "Clean winner", "why_it_matters": attributed}
+    bo_clean = Analyzer(cfg, best_of=3)
+    bo_clean.client = FakeLLM(unattr_draft, clean_winner, unattr_draft, {"winner": 2, "reason": "Attributed impact."})
+    res_clean = bo_clean.analyze(src)
+    assert res_clean["why_it_matters"] == attributed and bo_clean.clears == 0 and bo_clean.calls == 4
+
+    bo_reask = Analyzer(cfg, best_of=3)
+    bo_reask.client = FakeLLM(
+        unattr_draft,
+        {**unattr_draft, "title": "Slot two"},
+        {**unattr_draft, "title": "Slot three"},
+        {"winner": 2, "reason": "Clearer summary."},
+        {"why_it_matters": attributed},
+    )
+    res_bo_reask = bo_reask.analyze(src)
+    assert res_bo_reask["title"] == "Slot two" and res_bo_reask["why_it_matters"] == attributed
+    assert bo_reask.clears == 0 and bo_reask.calls == 5
+
+    # 4. No re-ask when another clearing reason is also present, on update mode, or past deadline.
+    for other_bad in (
+        "Operators must upgrade to 0.4.8.99 immediately.",
+        "OPERATORS MUST UPGRADE NOW.",
+        "Operators must upgrade to Tor 0.4.17.",
+        "Operators must upgrade to improve overall security and reliability.",
+        "Operators must upgrade immediately",
+    ):
+        no_reask = Analyzer(cfg)
+        no_reask.client = FakeLLM({**unattr_draft, "why_it_matters": other_bad})
+        res_no = no_reask.analyze(src)
+        assert res_no["why_it_matters"] == "" and no_reask.clears == 1 and no_reask.calls == 1
+
+    comm_src = item(
+        url="https://lists.torproject.org/mailman3/hyperkitty/list/tor-relays@lists.torproject.org/message/C1/",
+        kind="feed",
+        authority="community",
+        content="Operators should check logs.",
+    )
+    comm_writer = Analyzer(cfg)
+    comm_writer.client = FakeLLM(
+        analysis(why_it_matters="Operators must check logs.", evidence=["Operators should check logs."])
+    )
+    assert comm_writer.analyze(comm_src)["why_it_matters"] == "" and comm_writer.clears == 1 and comm_writer.calls == 1
+
+    upd_writer = Analyzer(cfg)
+    upd_writer.client = FakeLLM(update_analysis(update="The announcement asks operators to upgrade.", evidence=[ev]))
+    assert upd_writer.analyze(src, prior=_prior_story())["update"] == "The announcement asks operators to upgrade."
+    assert upd_writer.calls == 1
+
+    clock_now = [0.0]
+    exp_writer = Analyzer(cfg, deadline=10.0)
+    exp_writer.clock = lambda: clock_now[0]
+    monkeypatch.setattr(exp_writer, "complete", lambda *_a, **_kw: clock_now.__setitem__(0, 15.0) or copy.deepcopy(unattr_draft))
+    exp_out = exp_writer.analyze(src)
+    assert exp_out["why_it_matters"] == "" and exp_writer.clears == 1
+
+    # 5. Re-ask fails closed to "" and clears=1 on invalid/empty/unguarded rewrites and transport/deadline errors.
+    for bad_rewritten in (
+        {"why_it_matters": ""},
+        {"unexpected": "field"},
+        {"why_it_matters": "Relay operators must upgrade to 0.4.9.16 immediately."},
+        {"why_it_matters": "The announcement asks relay operators on Windows to upgrade to 0.4.8.99."},
+        {"why_it_matters": "The announcement asks OPERATORS TO UPGRADE NOW."},
+        {"why_it_matters": "The announcement asks Tor 0.4.17 operators on Windows to upgrade."},
+        {"why_it_matters": "The announcement asks relay operators on Windows to upgrade without punctuation"},
+        {"why_it_matters": "This update improves overall security and reliability."},
+        {"why_it_matters": "The announcement asks relay operators on Windows to upgrade. " + "x" * 500},
+        llm_mod.CompletionDeferred("deadline"),
+        AnalysisError("HTTP 503", retryable=True),
+        FetchError("timeout", status=504),
+    ):
+        fb = Analyzer(cfg)
+        fb.client = FakeLLM(unattr_draft, bad_rewritten)
+        fb_out = fb.analyze(src)
+        assert fb_out["why_it_matters"] == "" and fb.clears == 1 and fb.calls == 2
+
+    # 6. cache_key binds IMPACT_REASK_PROMPT and IMPACT_REASK_SCHEMA only when prior is None.
+    row = {"content_hash": "e" * 64}
+    k_story = cache_key(row, DEFAULTS["llm"])
+    k_upd = cache_key(row, DEFAULTS["llm"], prior=_prior_story())
+    with monkeypatch.context() as mp:
+        mp.setattr(analyze, "IMPACT_REASK_PROMPT", analyze.IMPACT_REASK_PROMPT + "\nExtra rule.")
+        assert cache_key(row, DEFAULTS["llm"]) != k_story
+        assert cache_key(row, DEFAULTS["llm"], prior=_prior_story()) == k_upd
+    with monkeypatch.context() as mp:
+        mp.setitem(analyze.IMPACT_REASK_SCHEMA["properties"]["why_it_matters"], "maxLength", 499)
+        assert cache_key(row, DEFAULTS["llm"]) != k_story
+        assert cache_key(row, DEFAULTS["llm"], prior=_prior_story()) == k_upd
+
+
+def test_polish_completed_action_excuses_dependency_behavior_and_accepts_source_frames(monkeypatch):
+    """Allow descriptive dependency behavior and source-stated past-action frames in polish while blocking unstated Tor verbs."""
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["llm"].update(base_url="https://llm.example/v1")
+    monkeypatch.setenv(cfg["llm"]["api_key_env"], "test-key")
+
+    assert analyze._claimed_done_words("OpenSSL 4.x disables RFC 8422-deprecated curves by default.") == set()
+    assert analyze._claimed_done_words("RFC 8422-deprecated curves are disabled by default in OpenSSL 4.x.") == set()
+    assert analyze._claimed_done_words("Debian 13 removes legacy configuration.") == set()
+    assert analyze._claimed_done_words("Tor removes bastet from the directory authority list.") == {"removes"}
+    assert analyze._claimed_done_words("Tor disables TLS 1.1 by default.") == {"disables"}
+
+    openssl_issue = item(
+        kind="gitlab_issue",
+        title="Tor falls back to OpenSSL default TLS groups",
+        content="OpenSSL 4.0.0 compiles deprecated RFC 8422 curves out by default.",
+        labels=[],
+    )
+    openssl_draft = analysis(
+        title="Tor falls back to OpenSSL 4.x default TLS groups",
+        summary="OpenSSL 4.0.0 compiles deprecated curves out by default.",
+        why_it_matters="", category="protocol", tags=["protocol"],
+        evidence=["OpenSSL 4.0.0 compiles deprecated RFC 8422 curves out by default."],
+    )
+    w_dep = Analyzer(cfg, editorial_polish=True)
+    w_dep.client = FakeLLM(openssl_draft, {
+        "title": "Tor falls back to OpenSSL 4.x default TLS groups",
+        "summary": "Tor falls back because OpenSSL 4.x disables RFC 8422-deprecated curves by default.",
+        "why_it_matters": "",
+    })
+    assert "OpenSSL 4.x disables RFC 8422-deprecated curves by default." in w_dep.analyze(openssl_issue)["summary"]
+
+    mitigation_issue = item(
+        kind="gitlab_issue",
+        title="Upgrade Nginx on snowflake broker",
+        content=(
+            "I applied the recommended mitigation of disabling HTTP/2. "
+            "What I did was edit four files in /etc/nginx: sites-available/a, sites-enabled/b, "
+            "and remove `http2` from the `listen` line."
+        ),
+        labels=["Security"],
+    )
+    mitigation_draft = analysis(
+        title="Snowflake broker HTTP/2 mitigation applied",
+        summary="An operator edited /etc/nginx configuration.",
+        why_it_matters="", category="security", tags=["security"],
+        evidence=["I applied the recommended mitigation of disabling HTTP/2."],
+    )
+    w_mit = Analyzer(cfg, editorial_polish=True)
+    w_mit.client = FakeLLM(mitigation_draft, {
+        "title": "Snowflake broker HTTP/2 disabled after mitigation",
+        "summary": "An operator removed `http2` from `/etc/nginx` listen lines.",
+        "why_it_matters": "",
+    })
+    mit_out = w_mit.analyze(mitigation_issue)
+    assert "disabled" in mit_out["title"] and "removed" in mit_out["summary"]
+
+    open_req = item(
+        kind="gitlab_issue",
+        title="dirauth: Remove bastet from list",
+        content="In the meantime, remove bastet from source as we cannot trust it.",
+        labels=["Security"],
+    )
+    open_req_draft = analysis(
+        title="Issue requests removing bastet from authority list",
+        summary="The issue requests removing bastet from source.",
+        why_it_matters="", category="security", tags=["security"],
+        evidence=["In the meantime, remove bastet from source as we cannot trust it."],
+    )
+    w_req = Analyzer(cfg, editorial_polish=True)
+    w_req.client = FakeLLM(open_req_draft, {
+        "title": "Tor removes bastet from authority list",
+        "summary": "Tor removed bastet from source.",
+        "why_it_matters": "",
+    })
+    assert w_req.analyze(open_req)["title"] == open_req_draft["title"]

@@ -667,6 +667,184 @@ def has_unattributed_advice(text: str, packet_or_item: dict) -> bool:
     return False
 
 
+_DONE_EXCUSED_PREFIX_RE = re.compile(
+    r"\b(?:should|must|will|would|could|may|might|to|be|not|never|yet|no|without|asks?|"
+    r"requests?|proposes?|wants?|plans?|needs?)\s+(?:(?:yet|been|be|being|to|kept|left)\s+)*$"
+)
+_DONE_UNPROVEN_PREFIX_RE = re.compile(
+    r"\b(?:not|never|cannot|should|must|will|would|could|may|might|to|no)\b(?:\s+\w+){0,3}\s*$"
+)
+_DONE_CLAUSE_BOUNDARY_RE = re.compile(
+    r"(?:\.(?=\s|$)|[!?;\n]|\b(?:while|whereas|because|since|although|though|when|where|if|unless|that|and|but|or)\b)"
+)
+_EXT_DEP_CORE_NAMES = (
+    r"openssl|libressl|boringssl|wolfssl|mbedtls|gnutls|nss|rustls|"
+    r"zlib|zstd|brotli|sqlite|libevent|jemalloc|glibc|musl|"
+    r"firefox|gecko|chromium|webkit|noscript|"
+    r"rustc|cargo|rust\s+v?\d+(?:\.\d+|\.x)*\+?|"
+    r"golang|go\s+v?\d+(?:\.\d+|\.x)*\+?|"
+    r"python|nodejs|node\.js|llvm|clang|gcc|systemd|"
+    r"linux|debian|ubuntu|fedora|alpine|rhel|centos|freebsd|openbsd|netbsd|macos|os\s+x|darwin|windows|android|ios|"
+    r"(?:(?:the|an?|this|upstream)\s+)?(?:(?:underlying|host|target|upstream)\s+)?"
+    r"(?:library|libraries|dependency|dependencies|kernel|compiler|runtime|operating\s+system|libc)"
+)
+_EXT_DAEMON_NAMES = r"nginx|apache|haproxy|unbound|caddy|envoy"
+_DEP_VERSION_TAIL = (
+    r"(?:\s+v?\d+(?:\.\d+|\.x)*[a-z0-9.+-]*)?"
+    r"(?:\s*\([^()\n]{1,40}\))?"
+    r"(?:,?\s+(?:which|that))?"
+    r"(?:\s+(?:also|now|already|always|effectively|silently|typically|generally|by\s+default))*"
+)
+_EXT_DEP_CORE_SUBJECT_RE = re.compile(rf"\b(?:{_EXT_DEP_CORE_NAMES})\b{_DEP_VERSION_TAIL}\s+$")
+_EXT_DAEMON_SUBJECT_RE = re.compile(rf"\b(?:{_EXT_DAEMON_NAMES})\b{_DEP_VERSION_TAIL}\s+$")
+_DEFAULT_BEHAVIOR_CUE_RE = re.compile(
+    r"\b(?:by\s+default|at\s+compile[- ]time|at\s+build[- ]time|in\s+default\s+(?:builds?|config(?:uration)?)|"
+    r"in\s+its\s+default\s+(?:config(?:uration)?|build)|out\s+of\s+the\s+box|default\s+builds?)\b"
+)
+_EXT_ANY_DEP_IN_CLAUSE_RE = re.compile(rf"\b(?:{_EXT_DEP_CORE_NAMES}|{_EXT_DAEMON_NAMES})\b")
+_TOR_ACTOR_SUBJECT_RE = re.compile(
+    r"\b(?:tor(?:\s+browser)?|arti|snowflake|webtunnel|lyrebird|tails|orbot|oniux|"
+    r"developers?|maintainers?|operators?)\s+$"
+)
+
+_DONE_SENTENCE_SPLIT_RE = re.compile(r"(?:\.(?=\s|$)|[!?]|;)")
+_REQUEST_OR_NEG_PREFIX_RE = re.compile(
+    r"\b(?:asks?|asked|requests?|requested|proposes?|proposed|suggests?|suggested|recommends?|recommended|"
+    r"wants?|wanted|plans?|planned|needs?|needed|tries?|tried|attempts?|attempted|"
+    r"instead\s+of|avoid(?:s|ed)?|prevent(?:s|ed)?|refus(?:e|es|ed)|fail(?:s|ed)?\s+to|without)\b(?:\s+\w+){0,3}\s*$"
+)
+_WHAT_DID_WAS_RE = re.compile(r"\bwhat\s+(?:i|we|they|he|she|@?[a-z0-9_-]+)\s+did\s+was\b")
+_DID_COMPLETED_RE = re.compile(
+    r"\b(?:i|we|they|he|she|@?[a-z0-9_-]+)\s+did\s+(?!not\b|never\b)"
+    r"(?:(?:in\s+fact|indeed|already|actually)\s+)?$"
+)
+_DID_COMPOUND_RE = re.compile(
+    r"\b(?:i|we|they|he|she|@?[a-z0-9_-]+)\s+did\s+(?!not\b|never\b)"
+    r"(?:(?:in\s+fact|indeed|already|actually)\s+)?[a-z]+\b[^.!?;\n]{0,180}\band\s+$"
+)
+_AFTER_DID_BLOCKED_RE = re.compile(
+    r"^\s*(?:not|never)\b|"
+    r"\b(?:asks?|asked|requests?|requested|proposes?|proposed|suggests?|suggested|recommends?|recommended|"
+    r"wants?|wanted|plans?|planned|needs?|needed|tries?|tried|attempts?|attempted)\b"
+)
+_APPLIED_GERUND_RE = re.compile(
+    r"(?:"
+    r"\b(?P<verb>applied|implemented|mitigated|resolved|fixed|completed|finished|performed|executed)\b[^.!?;]{0,60}\b(?:of|by)\s+$"
+    r"|\b(?P<verb2>completed|finished)\s+$"
+    r")"
+)
+_BASE_ING_FORMS = {
+    "remove": "removing",
+    "fix": "fixing",
+    "patch": "patching",
+    "resolve": "resolving",
+    "deploy": "deploying",
+    "disable": "disabling",
+    "revoke": "revoking",
+    "rotate": "rotating",
+    "ship": "shipping",
+    "merge": "merging",
+}
+STRICT_DONE_EQUIV_FORMS = {
+    "removed": ("removed", "removes"),
+    "removes": ("removes", "removed"),
+    "resolved": ("resolved", "resolves"),
+    "resolves": ("resolves", "resolved"),
+    "deployed": ("deployed", "deploys"),
+    "deploys": ("deploys", "deployed"),
+    "disabled": ("disabled", "disables"),
+    "disables": ("disables", "disabled"),
+    "revoked": ("revoked", "revokes"),
+    "revokes": ("revokes", "revoked"),
+    "rotated": ("rotated", "rotates"),
+    "rotates": ("rotates", "rotated"),
+    "shipped": ("shipped",),
+    "ships": ("ships", "shipped"),
+    "merged": ("merged", "merges"),
+    "merges": ("merges", "merged"),
+}
+
+
+def is_excused_done_verb(text: str, start: int, end: int, word: str) -> bool:
+    """Return whether normalized `text[start:end]` (`word`) is modal/negated or descriptive dependency behavior."""
+    if _DONE_EXCUSED_PREFIX_RE.search(text[max(0, start - 90) : start]):
+        return True
+    left_win = text[max(0, start - 120) : start]
+    clause_before = _DONE_CLAUSE_BOUNDARY_RE.split(left_win)[-1]
+    right_win = text[end : min(len(text), end + 120)]
+    clause_after = _DONE_CLAUSE_BOUNDARY_RE.split(right_win, 1)[0]
+    if word in {"disables", "removes", "ships"}:
+        if _EXT_DEP_CORE_SUBJECT_RE.search(clause_before):
+            return True
+        if _EXT_DAEMON_SUBJECT_RE.search(clause_before) and _DEFAULT_BEHAVIOR_CUE_RE.search(
+            clause_before + word + clause_after
+        ):
+            return True
+    if word in {"disabled", "removed", "shipped"} and not _TOR_ACTOR_SUBJECT_RE.search(clause_before):
+        clause_full = clause_before + word + clause_after
+        if _DEFAULT_BEHAVIOR_CUE_RE.search(clause_full) and _EXT_ANY_DEP_IN_CLAUSE_RE.search(clause_full):
+            return True
+    return False
+
+
+def _sentence_bounds(text: str, start: int, end: int) -> tuple[int, int]:
+    sent_start = 0
+    for sep in _DONE_SENTENCE_SPLIT_RE.finditer(text, 0, start):
+        sent_start = sep.end()
+    next_sep = _DONE_SENTENCE_SPLIT_RE.search(text, end)
+    sent_end = next_sep.start() if next_sep else len(text)
+    return sent_start, sent_end
+
+
+def _is_factual_sentence(text: str, sent_start: int, sent_end: int, start: int) -> bool:
+    if sent_end < len(text) and text[sent_end : sent_end + 1] == "?":
+        return False
+    sent_before = text[sent_start:start].lstrip()
+    return not sent_before.startswith(("if ", "whether ", "unless "))
+
+
+def is_action_stated_in_source(source_plain: str, word: str, *, base_forms: dict[str, str]) -> bool:
+    """Return whether `word` is stated in normalized `source_plain` without negation, modal, or request framing."""
+    for form in STRICT_DONE_EQUIV_FORMS.get(word, (word,)):
+        for match in re.finditer(rf"\b{form}\b(?!-)", source_plain):
+            if not _DONE_UNPROVEN_PREFIX_RE.search(source_plain[max(0, match.start() - 45) : match.start()]):
+                return True
+    base = base_forms.get(word)
+    if base is None:
+        return False
+    for match in re.finditer(rf"\b{base}\b(?!-)", source_plain):
+        prev45 = source_plain[max(0, match.start() - 45) : match.start()]
+        if _DONE_UNPROVEN_PREFIX_RE.search(prev45) or _REQUEST_OR_NEG_PREFIX_RE.search(prev45):
+            continue
+        sent_start, sent_end = _sentence_bounds(source_plain, match.start(), match.end())
+        if not _is_factual_sentence(source_plain, sent_start, sent_end, match.start()):
+            continue
+        sent_before = source_plain[sent_start : match.start()]
+        was_matches = list(_WHAT_DID_WAS_RE.finditer(sent_before))
+        if was_matches:
+            after_was = sent_before[was_matches[-1].end() :]
+            if not _AFTER_DID_BLOCKED_RE.search(after_was):
+                return True
+        if _DID_COMPLETED_RE.search(sent_before):
+            return True
+        if _DID_COMPOUND_RE.search(sent_before) and not _AFTER_DID_BLOCKED_RE.search(sent_before):
+            return True
+    if (ing := _BASE_ING_FORMS.get(base)) is not None:
+        for match in re.finditer(rf"\b{ing}\b(?!-)", source_plain):
+            sent_start, sent_end = _sentence_bounds(source_plain, match.start(), match.end())
+            if not _is_factual_sentence(source_plain, sent_start, sent_end, match.start()):
+                continue
+            sent_before = source_plain[sent_start : match.start()]
+            clause = sent_before[-90:]
+            if (ger_match := _APPLIED_GERUND_RE.search(clause)) is not None:
+                v_offset = ger_match.start("verb") if ger_match.group("verb") is not None else ger_match.start("verb2")
+                v_pos = max(0, len(sent_before) - len(clause)) + v_offset + sent_start
+                v_prev = source_plain[max(0, v_pos - 45) : v_pos]
+                if not _DONE_UNPROVEN_PREFIX_RE.search(v_prev) and not _REQUEST_OR_NEG_PREFIX_RE.search(v_prev):
+                    return True
+    return False
+
+
 def label_limits(sources: list[dict]) -> dict:
     """The confidence, state and category labels a story told by these sources may carry: confirmed
     needs an official source that is not a tag, or a merged merge request; tagged needs a tag
