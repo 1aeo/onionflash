@@ -1513,6 +1513,8 @@ def test_unhedged_conditional_impact_deterministic_guard(monkeypatch):
     for qualified in (
         "Operators enabling experimental proof-of-work features may experience reduced queue efficiency.",
         "The report says a zero-proof client evicts queued clients from the queue.",
+        "The researchers report that a zero-proof client evicts queued clients.",
+        "Maintainers have warned that zero-proof clients evict queued clients.",
     ):
         qualified_cand = {**unhedged_cand, "why_it_matters": qualified}
         assert review.has_unhedged_conditional_impact(qualified, pkt, qualified_cand) is False

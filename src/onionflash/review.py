@@ -815,10 +815,11 @@ _QUALIFIED_IMPACT_RE = re.compile(
     r"enabled|configured|when|if|unless|"
     r"may|might|could|potentially|possibly|plausibly|likely|reportedly|suspected|allegedly|"
     r"according\s+to|"
-    r"(?:in|per|from)\s+(?:the|this|that|an?)\s+(?:report|issue|post|comment|announcement|advisory|thread|disclosure)|"
-    r"(?:(?:the|this|that|an?)\s+)?(?:report|reporter|issue|post|comment|announcement|advisory|author|maintainer|researcher|sender)\s+"
-    r"(?:says|said|states|stated|notes|noted|claims|claimed|suggests|suggested|describes|described|"
-    r"warns|warned|argues|argued|alleges|alleged|indicates|indicated|asserts|asserted|reports|reported|highlights|highlighted|asks|asked)|"
+    r"(?:in|per|from)\s+(?:the|this|that|these|those|an?)\s+(?:reports?|issues?|posts?|comments?|announcements?|advisory|advisories|threads?|disclosures?)|"
+    r"(?:(?:the|this|that|these|those|an?|some|several)\s+)?(?:reports?|reporters?|issues?|posts?|comments?|announcements?|advisory|advisories|authors?|maintainers?|researchers?|developers?|senders?)\s+"
+    r"(?:(?:have|has|had)\s+)?"
+    r"(?:say|says|said|state|states|stated|note|notes|noted|claim|claims|claimed|suggest|suggests|suggested|describe|describes|described|"
+    r"warn|warns|warned|argue|argues|argued|allege|alleges|alleged|indicate|indicates|indicated|assert|asserts|asserted|report|reports|reported|highlight|highlights|highlighted|ask|asks|asked)|"
     r"says|said|states|stated|notes|noted|claims|claimed|suggests|suggested|describes|described|warns|warned|alleges|alleged)\b",
     re.IGNORECASE,
 )
