@@ -1078,6 +1078,38 @@ _CI_PIPELINE_CHORE_RE = re.compile(
     re.I,
 )
 _BOT_DEP_AUTHORS = frozenset({"dependabot", "dependabot[bot]", "renovate", "renovate[bot]"})
+_TEST_CHORE_RE = re.compile(
+    r"^(?:(?!(?:security|advisory)\s*:)(?:[a-z0-9_./-]+:\s+)?)?"
+    r"(?:tests?(?:\([^)]+\))?\s*:"
+    r"|(?:improve|add|fix|update|refactor|clean\s*up)\s+(?:default\s+)?(?:unit\s+|integration\s+|dirauth\s+)?tests?\b)"
+    r"(?!.*\b(?:and\s+fix(?:es|ed)?|bugfix|cve|trove|regression|vulnerabilit\w*|leak)\b)",
+    re.I,
+)
+_INTERNAL_CLEANUP_RE = re.compile(
+    r"^(?!(?:security|advisory)\s*:)(?:[a-z0-9_./-]+:\s+)?"
+    r"(?:"
+    r"(?:fix(?:ing)?|clean\s*up|resolve|remove)\s+(?:the\s+)?(?:\w+\s+){0,3}todos?\b"
+    r"|(?:refactor|clean\s*up)\s+internal\b"
+    r")(?!.*\b(?:security|vulnerabilit\w*|regression|api\s+break|breaking|bug)\b)",
+    re.I,
+)
+_HOUSEKEEPING_BEHAVIOR_CHANGE_RE = re.compile(
+    r"\b(?:"
+    r"by\s+default|new\s+default|"
+    r"default\s+(?:behaviou?r|setting|config(?:uration)?|mode|value|enabled|disabled)|"
+    r"(?:chang|switch|alter)\w*\s+(?:the\s+)?default|"
+    r"behaviou?r\s+change|breaking\s+change|api\s+break|"
+    r"(?:user|operator)[- ]visible|"
+    r"add\s+support\s+for|"
+    r"ship(?:s|ped|ping)?\s+(?:\w+\s+){0,3}(?:feature|capability|option|command|flag|transport)"
+    r")\b",
+    re.I,
+)
+_TITLE_COMPOUND_CHANGE_RE = re.compile(
+    r"(?:\band\b|[,;+])\s*"
+    r"(?:enabl|disabl|support|implement|add|introduc|ship|chang|switch|dropp?|deprecat|migrat|fix|patch|resolv|expos|allow|block|limit|enforc)\w*\b",
+    re.I,
+)
 
 _PT_FAMILY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("snowflake", re.compile(r"\bsnowflake\b", re.I)),
@@ -1178,6 +1210,13 @@ def is_housekeeping_item(item: dict) -> tuple[str, str] | None:
         return "skipped.gate.housekeeping", "Routine CI or build pipeline housekeeping item"
     if _HOUSEKEEPING_TITLE_PAT_RE.search(cleaned_title):
         return "skipped.gate.housekeeping", "Routine checklist or housekeeping item"
+    has_behavior_change = bool(
+        _HOUSEKEEPING_BEHAVIOR_CHANGE_RE.search(full_text) or _TITLE_COMPOUND_CHANGE_RE.search(cleaned_title)
+    )
+    if not has_behavior_change and _TEST_CHORE_RE.search(cleaned_title):
+        return "skipped.gate.housekeeping", "Routine test suite housekeeping item"
+    if not has_behavior_change and _INTERNAL_CLEANUP_RE.search(cleaned_title):
+        return "skipped.gate.housekeeping", "Routine internal refactor or TODO cleanup item"
     return None
 
 

@@ -36,6 +36,9 @@ CODES = frozenset({
     "failed.app.invalid_tag_name", "failed.app.unexpected", "failed.app.damaged_item", "failed.app.damaged_job",
     "failed.app.source_proof_unavailable",
     "merged.auto.same_event",
+    "refreshed.summary",
+    *(f"skipped.refresh.{reason}" for reason in ("ineligible", "missing_sources", "review_skip", "stale_or_locked")),
+    *(f"held.refresh.{reason}" for reason in ("invalid_packet", "invalid_output", "review_rejected", "final_check")),
     "operator.retried", "operator.reconsidered", "operator.dismissed", "operator.approved", "operator.merged",
 })
 EDITORIAL = ("new_information", "news_value")

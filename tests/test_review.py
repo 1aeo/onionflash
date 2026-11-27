@@ -336,6 +336,7 @@ def test_why_it_matters_repair_grounding_and_clearing(monkeypatch):
     ("attr", "UPDATE_VERIFY_PROMPT", None),
     ("attr", "ROUTING_PROMPT", None),
     ("attr", "VALIDATION_REASK_PROMPT", None),
+    ("attr", "NEWS_TIEBREAK_PROMPT", None),
 ])
 def test_policy_hash_changes_on_model_endpoint_and_prompt_mutations(monkeypatch, kind, target, val):
     """Change policy_hash when model, endpoint, or prompt constants change, ignoring API keys."""
@@ -1386,3 +1387,52 @@ def test_completed_action_dependency_behavior_and_source_stated_forms():
         assert "completed_action" in review.final_holds(
             cand, {"packet": {"sources": [src_u]}, "payload": {"editorial_kind": "gitlab_issue"}}
         )
+
+
+def test_tiebreaker_prompt_internal_plumbing_guidance_and_insufficient_splits(monkeypatch):
+    """Append `NEWS_TIEBREAK_PROMPT` on tiebreaker calls, reinforce internal-plumbing criteria, and keep splits fail-closed."""
+    seen_prompts: list[str] = []
+    rev = review.Reviewer(_cfg_llm())
+    monkeypatch.setattr(
+        rev,
+        "complete",
+        lambda prompt, *_a, **_kw: seen_prompts.append(prompt) or verdict("approve"),
+    )
+    pkt = _packet()
+    cand = _candidate()
+    rev.review(cand, pkt, verification=True, tiebreaker=False)
+    assert review.NEWS_TIEBREAK_PROMPT not in seen_prompts[-1]
+    rev.review(cand, pkt, verification=True, tiebreaker=True)
+    assert review.NEWS_TIEBREAK_PROMPT in seen_prompts[-1]
+
+    for prompt in (
+        review.SYSTEM_PROMPT,
+        review.SPECIALIST_PROMPTS["novelty_news"],
+        review.NEWS_TIEBREAK_PROMPT,
+    ):
+        assert "tor-netdoc:" in prompt
+        assert "TODO" in prompt
+        assert "prior_story is null" in prompt
+        assert "latest_update" in prompt
+    assert "source authority and tor-dev eligibility rules" in review.NEWS_TIEBREAK_PROMPT
+
+    v_app = verdict("approve")
+    v_skip_nv = _specialist_verdict("skip", criterion="news_value", reason="Internal crate plumbing.")
+    v_hold_nv = _specialist_verdict(
+        "hold",
+        criterion="news_value",
+        criteria={"news_value": {"outcome": "insufficient", "reason": "Borderline news value."}},
+    )
+    v_hold_ni = _specialist_verdict(
+        "hold",
+        criterion="new_information",
+        criteria={"new_information": {"outcome": "insufficient", "reason": "Unclear prior overlap."}},
+    )
+
+    split_1_2 = review.merge_specialist_verdicts([v_app, v_skip_nv, v_hold_nv], cand, pkt)
+    assert split_1_2["verdict"] == "hold"
+    assert split_1_2["criteria"]["news_value"]["outcome"] == "insufficient"
+
+    split_low_passers = review.merge_specialist_verdicts([v_app, v_skip_nv, v_hold_ni], cand, pkt)
+    assert split_low_passers["verdict"] == "hold"
+    assert split_low_passers["criteria"]["news_value"]["outcome"] == "insufficient"

@@ -39,10 +39,10 @@ NEW_STORY_DAYS = 14
 HIGH_SECURITY_SEVERITIES = frozenset({"severity::high", "severity::critical"})
 # The repairs that may follow the first review, a release-label repair request counting as one, each
 # checked by another fresh verification, plus at most one 3rd tiebreaker vote on news_value:
-# an item gets at most MAX_VERIFY_REPAIRS + 3 review requests.
+# an item gets at most MAX_VERIFY_REPAIRS + 3 review requests (or +3 beyond all waves under specialists).
 MAX_VERIFY_REPAIRS = 5
 MAX_REVIEW_REQUESTS = MAX_VERIFY_REPAIRS + 3
-MAX_SPECIALIST_REVIEW_REQUESTS = (MAX_VERIFY_REPAIRS + 1) * len(review.SPECIALISTS) + 2
+MAX_SPECIALIST_REVIEW_REQUESTS = (MAX_VERIFY_REPAIRS + 1) * len(review.SPECIALISTS) + 3
 OFFICIAL_AUTHORITIES = frozenset({"official", "hackerone", "dirauth-operator"})
 OUTCOME_STAGES = {"approve": "approved", "skip": "skipped", "hold": "held", "route": "routed"}
 # Each hold reason and its operator text, which follows "Final review held: " in last_error. A hold
@@ -619,18 +619,29 @@ def _is_official(item: dict, prepared: dict) -> bool:
 
 
 def _is_editorial_news_tie(reviews: list[dict], *, mandatory: bool) -> bool:
-    """Return True only when review and verification split strictly between approve and skip(news_value)."""
-    if mandatory or len(reviews) != 2 or any(entry.get("tiebreaker") or entry.get("specialists") for entry in reviews):
+    """Return True only when review and verification split strictly on news_value."""
+    if mandatory or len(reviews) != 2:
         return False
     first, second = reviews
+    if first.get("tiebreaker") or first.get("specialists") or second.get("tiebreaker"):
+        return False
     if first.get("stage") != "review" or second.get("stage") != "verification":
         return False
     res0, res1 = first["result"], second["result"]
-    if "hold" in (res0["verdict"], res1["verdict"]):
-        return False
     failed0 = {name for name, check in res0["criteria"].items() if check["outcome"] != "pass"}
     failed1 = {name for name, check in res1["criteria"].items() if check["outcome"] != "pass"}
     if "new_information" in failed0 or "new_information" in failed1:
+        return False
+    if (
+        second.get("specialists")
+        and res0["verdict"] == "approve"
+        and not failed0
+        and res1["verdict"] == "hold"
+        and failed1 == {"news_value"}
+        and res1["criteria"]["news_value"]["outcome"] == "insufficient"
+    ):
+        return True
+    if "hold" in (res0["verdict"], res1["verdict"]):
         return False
     pair = ((res0["verdict"], failed0), (res1["verdict"], failed1))
     return pair in (
@@ -655,8 +666,22 @@ def next_step(reviews, candidate, prepared, *, specialists: int = 1):
     verdict = result["verdict"]
     failed = {name for name, check in result["criteria"].items() if check["outcome"] != "pass"}
     official = _is_official(item, prepared)
-    needs_specialist_verify = specialists > 1 and stage == "verification" and not latest.get("specialists")
-    is_tiebreak_pair = specialists == 1 and _is_editorial_news_tie(reviews[:2], mandatory=mandatory)
+    cand_hash = latest.get("candidate_hash")
+    needs_specialist_verify = (
+        specialists > 1
+        and stage == "verification"
+        and not latest.get("specialists")
+        and not (
+            latest.get("tiebreaker")
+            and any(
+                entry.get("stage") == "verification"
+                and entry.get("candidate_hash") == cand_hash
+                and entry.get("specialists")
+                for entry in reviews[:-1]
+            )
+        )
+    )
+    is_tiebreak_pair = _is_editorial_news_tie(reviews[:2], mandatory=mandatory)
     if len(reviews) == 3 and (latest.get("tiebreaker") or is_tiebreak_pair):
         new_info_ok = result["criteria"]["new_information"]["outcome"] == "pass"
         if not new_info_ok:
@@ -671,7 +696,7 @@ def next_step(reviews, candidate, prepared, *, specialists: int = 1):
                 return "hold", ("verification", "official_not_news")
             return "skip", candidate
     else:
-        if specialists == 1 and len(reviews) == 2 and _is_editorial_news_tie(reviews, mandatory=mandatory):
+        if len(reviews) == 2 and _is_editorial_news_tie(reviews, mandatory=mandatory):
             return "tiebreak", candidate
         has_tiebreak = len(reviews) > 3 and (reviews[2].get("tiebreaker") or is_tiebreak_pair)
         news_anchor = reviews[2] if has_tiebreak else reviews[0]
@@ -1306,7 +1331,10 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
                                  issue=review.RELEASE_ISSUE if stage == "repair" else None,
                                  on_request=requests.callback(correction=correction),
                                  **({"validation_error": review.INCONSISTENT_VERDICT} if correction else {}),
-                                 **({"update": True} if prepared.get("mode") == "update" else {}))
+                                 **({"update": True} if prepared.get("mode") == "update" else {}),
+                                 **({"tiebreaker": True}
+                                    if stage == "tiebreak" and _supports_kwarg(reviewer.review, "tiebreaker")
+                                    else {}))
     except review.InconsistentReview as exc:
         if requests.actual == before:
             raise
@@ -2266,8 +2294,16 @@ def _has_specialist_evidence(rec: dict, cand_hash: str, required: int, *, verdic
     if verdict_name == "approve" or verifications:
         if not verifications:
             return False
-        specs = verifications[-1].get("specialists")
-        if not isinstance(specs, list) or [s.get("specialist") for s in specs if isinstance(s, dict)] != list(review.SPECIALISTS):
+        def _valid_specs(entry: dict) -> bool:
+            specs = entry.get("specialists")
+            return isinstance(specs, list) and [
+                s.get("specialist") for s in specs if isinstance(s, dict)
+            ] == list(review.SPECIALISTS)
+
+        if verifications[-1].get("tiebreaker") is True:
+            if not any(not entry.get("tiebreaker") and _valid_specs(entry) for entry in verifications[:-1]):
+                return False
+        elif not _valid_specs(verifications[-1]):
             return False
     return True
 
@@ -2363,6 +2399,18 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                 if decision == "skip"
                 else None
             )
+            if decision == "skip" and receipt_result is None:
+                last_res = record["reviews"][-1]["result"]
+                if any(last_res["criteria"][name]["outcome"] == "fail" for name in review.EDITORIAL_CRITERIA):
+                    receipt_result = {
+                        **last_res,
+                        "verdict": "skip",
+                        "same_story": None,
+                        "repair": None,
+                        "model_verdict": last_res["verdict"],
+                    }
+            if decision == "skip" and receipt_result is not None and receipt_result.get("same_story") is not None:
+                receipt_result = {**receipt_result, "same_story": None}
             if receipt_result is not None:
                 receipt = (key, digest(candidate), prepared["source_hash"], policy, prepared["binding_hash"],
                            strict_json(receipt_result), strict_json(record), observed, observed)
@@ -2483,7 +2531,10 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             stage, candidate, record = "review", prepared["candidate"], fresh
         if effective_specialists > 1 and record.get("specialists") != effective_specialists:
             upgrade_at = record["request_budget"]["reserved"]
-            if stage == "tiebreak" or any(entry.get("tiebreaker") for entry in record["reviews"]):
+            if (
+                (stage == "tiebreak" or any(entry.get("tiebreaker") for entry in record["reviews"]))
+                and not any(entry.get("specialists") for entry in record["reviews"])
+            ):
                 stage, candidate, record = "review", prepared["candidate"], fresh
             if upgrade_at > 0 and "specialist_upgrade_at" not in record:
                 record["specialist_upgrade_at"] = upgrade_at

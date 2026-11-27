@@ -768,3 +768,47 @@ def test_tiebreak_decision_log_chain_records_publish_skip_and_official_hold(cont
                     Reviewer(verdict(), verdict("skip", criterion="news_value"),
                              verdict("skip", criterion="news_value")))["status"] == "held"
     assert decision_codes(store, r_hold) == ["held.verification.official_not_news"]
+
+
+def test_refresh_decision_codes_integrate_with_summary_and_list_entries(context):
+    """Ensure all refresh decision codes work across `CODES`, `list_entries`, `codes_after`, and `summary`."""
+    cfg, store = context
+    expected_refresh_codes = {
+        "refreshed.summary",
+        "skipped.refresh.ineligible",
+        "skipped.refresh.missing_sources",
+        "skipped.refresh.review_skip",
+        "skipped.refresh.stale_or_locked",
+        "held.refresh.invalid_packet",
+        "held.refresh.invalid_output",
+        "held.refresh.review_rejected",
+        "held.refresh.final_check",
+    }
+    assert expected_refresh_codes <= decisions.CODES
+
+    first = decisions.latest_id(store.db)
+    with store.db:
+        for idx, code in enumerate(sorted(expected_refresh_codes), 1):
+            decisions.record_subject(
+                store.db,
+                f"refresh:story-{idx}:3:abcdef123456",
+                code,
+                LATER,
+                story_id=f"story-{idx}",
+                once=False,
+                title=f"Story {idx}",
+                update_count=3,
+                reason="test_reason",
+                **({"hold_code": "completed_action"} if code.startswith("held.") else {}),
+            )
+
+    counts = decisions.codes_after(store.db, first)
+    assert counts == {code: 1 for code in expected_refresh_codes}
+    held_list = decisions.list_entries(store.db, DATE, code="held.refresh")
+    assert {row["code"] for row in held_list["decisions"]} == {
+        code for code in expected_refresh_codes if code.startswith("held.refresh.")
+    }
+    summary = decisions.summary(store.db, DATE)
+    assert summary["outcomes"]["refreshed"] == 1
+    assert summary["outcomes"]["held"] == 4
+    assert summary["outcomes"]["skipped"] == 4
