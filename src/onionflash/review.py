@@ -811,12 +811,12 @@ _PACKET_CONDITIONAL_FEATURE_RE = re.compile(
     re.IGNORECASE,
 )
 _QUALIFIED_IMPACT_RE = re.compile(
-    r"\b(?:non-default|not\s+(?:the\s+)?default|experimental|opt[- ]in|"
-    r"enabled|configured|config(?:uration)?|option|setting|feature|flag|when|if|unless|"
+    r"\b(?:non-default|not\s+(?:the\s+)?default|experimental|opt[- ]in|disabled\s+by\s+default|"
+    r"enabled|configured|when|if|unless|"
     r"may|might|could|potentially|possibly|plausibly|likely|reportedly|suspected|allegedly|"
-    r"reporter|maintainer|researcher|author|sender|according\s+to|"
+    r"according\s+to|"
     r"(?:in|per|from)\s+(?:the|this|that|an?)\s+(?:report|issue|post|comment|announcement|advisory|thread|disclosure)|"
-    r"(?:the|this|that|an?)\s+(?:report|reporter|issue|post|comment|announcement|advisory|author|maintainer|researcher|sender)\s+"
+    r"(?:(?:the|this|that|an?)\s+)?(?:report|reporter|issue|post|comment|announcement|advisory|author|maintainer|researcher|sender)\s+"
     r"(?:says|said|states|stated|notes|noted|claims|claimed|suggests|suggested|describes|described|"
     r"warns|warned|argues|argued|alleges|alleged|indicates|indicated|asserts|asserted|reports|reported|highlights|highlighted|asks|asked)|"
     r"says|said|states|stated|notes|noted|claims|claimed|suggests|suggested|describes|described|warns|warned|alleges|alleged)\b",

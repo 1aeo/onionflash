@@ -1296,6 +1296,8 @@ def test_cross_product_release_rollout_related_and_can_route(context):
     # Complete version token boundary (1.4.2 vs 1.4.20) and cross-product version ownership in _can_route.
     assert candidate.item_mentions_product_version("Arti 1.4.20 released", "arti", "1.4.2") is False
     assert candidate.item_mentions_product_version("Arti v1.4.2 released", "arti", "1.4.2") is True
+    assert candidate.item_mentions_product_version("Snowflake v1.4.2 fails when launched from Arti", "arti", "1.4.2") is False
+    assert candidate.item_mentions_product_version("Snowflake v1.4.2 fails when launched from Arti", "snowflake", "1.4.2") is True
 
     arti_142 = seed_source_story(
         store,

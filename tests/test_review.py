@@ -1499,6 +1499,16 @@ def test_unhedged_conditional_impact_deterministic_guard(monkeypatch):
         pkt,
         unhedged_cand,
     ) is True
+    assert review.has_unhedged_conditional_impact(
+        "A zero-proof client bypasses the proof-of-work feature and evicts queued clients.",
+        pkt,
+        unhedged_cand,
+    ) is True
+    assert review.has_unhedged_conditional_impact(
+        "The bug enables a zero-proof client to evict queued clients.",
+        pkt,
+        unhedged_cand,
+    ) is True
 
     for qualified in (
         "Operators enabling experimental proof-of-work features may experience reduced queue efficiency.",

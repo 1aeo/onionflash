@@ -764,7 +764,10 @@ def _other_product_version_spans(item_text: str, prod: str, ver: str) -> list[tu
         return []
     ver_fold = ver.lower()
     return [
-        (m.start(2), m.end(2))
+        (
+            m.start(2) - 1 if m.start(2) > m.start(1) and item_text[m.start(2) - 1].lower() == "v" else m.start(2),
+            m.end(2),
+        )
         for m in _RELEASE_MENTION.finditer(item_text)
         if m.group(2).lower() == ver_fold
         and ("tor-browser" if m.group(1).lower() in {"tor-browser", "tor browser"} else m.group(1).lower()) != prod
