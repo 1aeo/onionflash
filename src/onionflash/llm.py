@@ -316,24 +316,395 @@ def is_quoted_list_post(url: object, text: str) -> bool:
     return _url_host(url) == LIST_ARCHIVE_HOST and any(ln.lstrip().startswith(">") for ln in text.splitlines())
 
 
+_TRAILING_VERSION_FRAGMENT_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9.])0\.\d+(?:\.\d+)?\.|\bv?\d+\.\d+(?:\.\d+)*\.[A-Za-z]|[<>]=?\s*(?:v?\d+(?:\.\d+)*\.[xX]\.?|v?\d+\.|\.?))$"
+)
+_TRAILING_INCOMPLETE_WORD_RE = re.compile(
+    r"(?:\b(?i:and|or|but|for|with|to|of|from|that|which|because|since|while|when|if|the)\b|\b(?:a|an)\b)\s*[.!]?$"
+)
+_CONCRETE_QUALIFIER_AHEAD = (
+    r"(?!(?:\s+(?:by|when|against|from|because|after|during|where|under)\b"
+    r"|\s+of\s+(?!the\s+(?:tor\s+)?network\b)\w+))"
+)
+_GENERIC_FILLER_RE = re.compile(
+    r"(?:"
+    r"\b(?:helps?\s+)?protect(?:s|ing)?\s+users?['’]?\s+privacy\b" + _CONCRETE_QUALIFIER_AHEAD
+    + r"|\b(?:helps?\s+)?improv(?:e|es|ing)\s+(?:overall\s+)?(?:security|privacy|reliability)(?:\s*(?:,|and|or|/)\s*(?:security|privacy|reliability|stability))*" + _CONCRETE_QUALIFIER_AHEAD
+    + r"|\b(?:helps?\s+)?enhanc(?:e|es|ing)\s+(?:overall\s+)?(?:security|privacy|reliability)(?:\s*(?:,|and|or|/)\s*(?:security|privacy|reliability|stability))*" + _CONCRETE_QUALIFIER_AHEAD
+    + r"|\bmaintain\s+privacy\s+and\s+security\b" + _CONCRETE_QUALIFIER_AHEAD
+    + r"|\bmaintain\s+network\s+stability\s+and\s+prevent\s+widespread\s+service\s+disruption\b"
+    r"|\bupdated\s+security\s+components\s+and\s+bug\s+fixes\b"
+    r"|\bscope\s+and\s+consequences\s+remain\s+subject\s+to\b"
+    r")",
+    re.IGNORECASE,
+)
+_UNMATCHED_IMPACT_DELIMITERS = (("(", ")"), ("[", "]"), ("“", "”"))
+
+
+def is_incomplete_or_filler_impact(text: str) -> str | None:
+    """Detect incomplete sentence fragments or generic boilerplate filler in `why_it_matters`."""
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    if stripped.endswith("?") or stripped.endswith("..") or stripped.endswith("…"):
+        return "incomplete_impact"
+    if not is_complete_sentence(stripped):
+        return "incomplete_impact"
+    if any(stripped.count(left) != stripped.count(right) for left, right in _UNMATCHED_IMPACT_DELIMITERS):
+        return "incomplete_impact"
+    if stripped.count('"') % 2 != 0 or stripped.count("`") % 2 != 0:
+        return "incomplete_impact"
+    if _TRAILING_VERSION_FRAGMENT_RE.search(stripped) or _TRAILING_INCOMPLETE_WORD_RE.search(stripped):
+        return "incomplete_impact"
+    if _GENERIC_FILLER_RE.search(stripped):
+        return "filler_impact"
+    return None
+
+
+def _source_item_unquoted_text(source: dict) -> str:
+    url = str(source.get("url") or "")
+    parts = [source["title"]] if isinstance(source.get("title"), str) and source["title"] else []
+    body_key = next((k for k in ("source_content", "content", "unquoted_content") if isinstance(source.get(k), str)), None)
+    body = source[body_key] if body_key is not None else ""
+    passages = source.get("passages") if isinstance(source.get("passages"), list) else ()
+    if not body and passages:
+        p_texts = []
+        for p in passages:
+            txt = p if isinstance(p, str) else (p.get("text") if isinstance(p, dict) else "")
+            if isinstance(txt, str) and txt:
+                p_texts.append(txt)
+        body = "\n".join(p_texts)
+    if body:
+        parts.append(unquoted_mail_text(body) if is_quoted_list_post(url, body) else body)
+    if body_key == "unquoted_content" and passages:
+        for p in passages:
+            if isinstance(p, dict) and p.get("author") and isinstance(p.get("text"), str) and p["text"]:
+                parts.append(p["text"])
+    for note in (source.get("public_comments") if isinstance(source.get("public_comments"), list) else ()):
+        if isinstance(note, dict) and isinstance(note.get("body"), str) and note["body"]:
+            parts.append(note["body"])
+    return "\n".join(parts)
+
+
+def _unquoted_source_text(packet_or_item: dict) -> str:
+    if not isinstance(packet_or_item, dict):
+        return ""
+    if isinstance(packet_or_item.get("sources"), list):
+        return "\n".join(
+            _source_item_unquoted_text(src)
+            for src in packet_or_item["sources"]
+            if isinstance(src, dict)
+        )
+    return _source_item_unquoted_text(packet_or_item)
+
+
+_INTENDED_CONFIG_RE = re.compile(r"\bintended\s+(?:configuration|config|settings?|policy)\b", re.IGNORECASE)
+_SRC_CONFIG_RE = re.compile(r"\b(?:intended\s+(?:configuration|config|settings?|policy)|configured\s+\w+|torrc)\b", re.IGNORECASE)
+_LEXICAL_ADVICE_CHECKS = (
+    (re.compile(r"\badvis(?:e|ed|es|ing)\b|\badvice\b", re.IGNORECASE), re.compile(r"\badvis(?:e|ed|es|ing)\b|\badvice\b", re.IGNORECASE)),
+    (re.compile(r"\binstruct(?:ed|s|ing)\b", re.IGNORECASE), re.compile(r"\binstruct(?:ed|s|ing)\b", re.IGNORECASE)),
+    (re.compile(r"\brecommend(?:ed|s|ing)\b", re.IGNORECASE), re.compile(r"\brecommend(?:ed|s|ing|ation)\b", re.IGNORECASE)),
+)
+_DIRECTIVE_TARGET_RE = re.compile(
+    r"\b(?:"
+    r"(?:users?|operators?|maintainers?|admins?|developers?|relays?|clients?)\s+"
+    r"(?:(?:on|for|under|with|using|running)\s+(?:[a-z0-9._-]+\s+){1,5})?"
+    r"(?:(?:are|were|is)\s+)?(?:(?:being|strongly|explicitly)\s+)?"
+    r"(?:asked|required|told|advised|instructed|encouraged|recommended)\s+to"
+    r"|(?:announcement|post|report|issue|notice|maintainers?|developers?)\s+"
+    r"(?:asks?|ask|encourages?|recommends?|advises?|instructs?|requires?)\s+"
+    r"(?:[\w-]+\s+){0,5}?(?:to\s+)?(?:upgrad\w*|updat\w*|switch\w*|install\w*|configur\w*|edit\w*|replac\w*|enabl\w*|disabl\w*|remov\w*|treat\w*|handl\w*|apply|us(?:e|ing))"
+    r"|(?:users?|operators?|maintainers?|admins?|developers?|relays?|clients?)\s+"
+    r"(?:(?:on|for|under|with|using|running)\s+(?:[a-z0-9._-]+\s+){1,5})?"
+    r"(?:should|must|need\s+to)\s+(?:(?:\w+\s+){0,2})?"
+    r"(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|handle|treat|apply)"
+    r"|requir(?:es?|ing)\s+(?:[\w-]+\s+){0,3}(?:users?|operators?|relays?)\s+"
+    r"(?:(?:on|for|under|with|using|running)\s+(?:[a-z0-9._-]+\s+){1,5})?to\s+\w+"
+    r")\b",
+    re.IGNORECASE,
+)
+_SRC_DIRECTIVE_CUE_RE = re.compile(
+    r"(?:"
+    r"(?:^|[.!?\n]\s*)(?:please\s+)?(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|treat|handle|apply)(?:\s+(?:to|your|the|now|as|immediately|away|over|it|them|this|that)\b)"
+    r"|\b(?:"
+    r"asks?|asked|asking"
+    r"|please\s+(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|treat|handle|apply)"
+    r"|encourag(?:e|es|ed|ing)"
+    r"|recommend(?:s|ed|ing|ation)?"
+    r"|advis(?:e|es|ed|ing)|advice"
+    r"|instruct(?:s|ed|ing)"
+    r"|requir(?:e|es|ed|ing)\s+(?:[\w-]+\s+){0,3}(?:users?|operators?|relays?|them|you|all)\s+to"
+    r"|must\s+(?!-\s*fix)(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|treat|handle|apply)"
+    r"|should\s+(?!be\s+(?:affected|able\s+to)\b)(?:upgrade|update|switch|install|configure|edit|replace|enable|disable|remove|treat|handle|apply)"
+    r")\b"
+    r")",
+    re.IGNORECASE,
+)
+_ACTION_IN_TEXT_RE = re.compile(
+    r"\b(?:to|should|must|encourages?|recommends?)\s+(?:\w+\s+){0,2}?"
+    r"(upgrade|upgrading|update|updating|switch|switching|install|installing|configure|configuring|"
+    r"edit|editing|replace|replacing|enable|enabling|disable|disabling|remove|removing|treat|treating|handle|handling|apply|applying)\b",
+    re.IGNORECASE,
+)
+_SRC_ACTION_WORDS_RE = re.compile(
+    r"\b(upgrade|upgrading|update|updating|switch|switching|install|installing|configure|configuring|"
+    r"edit|editing|replace|replacing|enable|enabling|disable|disabling|remove|removing|treat|treating|handle|handling|apply|applying)\b",
+    re.IGNORECASE,
+)
+
+
+_DIRECTIVE_CUE_PREFIX = (
+    r"(?:please|ask(?:s|ed|ing)?|encourag\w*|recommend\w*|advis\w*|instruct\w*|"
+    r"should(?:\s+also)?(?!\s+be\s+(?:affected|able\s+to)\b)|must(?!-\s*fix))"
+)
+_EXPLICIT_IMPERATIVE_CUE_PREFIX = (
+    r"(?:please|ask(?:s|ed|ing)?|encourag\w*|instruct\w*|"
+    r"should(?:\s+also)?(?!\s+be\s+(?:affected|able\s+to)\b)|must(?!-\s*fix))"
+)
+_CLAUSE_STOP_RE = re.compile(
+    r"[.!?;,\n]|\s+(?:to\s+(?:prevent|avoid|receive|maintain|ensure|protect|mitigate|keep)|because|since|so\s+that|which|that|if|when|while|after|before)\b|—|--",
+    re.IGNORECASE,
+)
+_DIRECTIVE_OBJ_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
+_DIRECTIVE_OBJ_STOPWORDS = frozenset({
+    "a", "an", "the", "this", "that", "these", "those", "it", "them", "their", "your", "our", "its",
+    "to", "for", "of", "in", "on", "at", "by", "with", "from", "as", "into", "over", "away", "up", "out",
+    "and", "or", "all", "any", "new", "latest", "newest", "current", "existing", "immediately", "now", "soon",
+    "asap", "explicitly", "properly", "carefully", "users", "user", "operators", "operator", "maintainers",
+    "maintainer", "admins", "admin", "developers", "developer", "relays", "relay", "clients", "client",
+    "bridges", "bridge", "authorities", "authority", "possible", "affected", "tor", "arti", "report",
+    "reports", "issue", "issues", "story", "notice", "release", "releases", "version", "versions", "channel",
+    "default", "defaults", "mode", "setting", "settings", "option", "options", "flag", "flags", "output",
+})
+_SCOPE_QUALIFIER_ALIASES = {
+    "windows": "windows", "win32": "windows", "win64": "windows",
+    "macos": "macos", "osx": "macos", "darwin": "macos",
+    "linux": "linux", "android": "android", "ios": "ios",
+    "bsd": "bsd", "freebsd": "freebsd", "openbsd": "openbsd", "netbsd": "netbsd",
+    "debian": "debian", "ubuntu": "ubuntu", "fedora": "fedora", "rhel": "rhel", "centos": "centos", "alpine": "alpine",
+    "tails": "tails", "whonix": "whonix",
+    "arm64": "arm64", "aarch64": "arm64", "x86_64": "x86_64", "amd64": "x86_64", "32-bit": "32-bit", "64-bit": "64-bit",
+    "exit": "exit", "exits": "exit", "guard": "guard", "guards": "guard",
+    "bridge": "bridge", "bridges": "bridge", "relay": "relay", "relays": "relay",
+    "snowflake": "snowflake", "webtunnel": "webtunnel", "obfs4": "obfs4", "obfs4proxy": "obfs4",
+    "lyrebird": "lyrebird", "conjure": "conjure",
+    "dirauth": "dirauth", "dirauths": "dirauth", "authority": "dirauth", "authorities": "dirauth",
+    "onion": "onion", "fallback": "fallback", "fallbacks": "fallback",
+    "docker": "container", "container": "container", "containers": "container",
+    "sandbox": "sandbox", "ipv6": "ipv6", "ipv4": "ipv4",
+    "experimental": "experimental", "opt-in": "opt-in", "nightly": "nightly", "alpha": "alpha", "beta": "beta",
+}
+_SCOPE_PHRASE_PATTERNS = (
+    (re.compile(r"\bos\s+x\b", re.IGNORECASE), "macos"),
+    (re.compile(r"\bdirectory\s+authorit(?:y|ies)\b", re.IGNORECASE), "dirauth"),
+    (re.compile(r"\b(?:hidden|onion)\s+services?\b", re.IGNORECASE), "onion"),
+)
+_HARD_CLAUSE_STOP_RE = re.compile(r"\.(?!\d)|[!?;:\n]|—|--")
+_INDEP_CLAUSE_SPLIT_RE = re.compile(r",\s+(?:and|but|while|whereas|however|meanwhile)\b", re.IGNORECASE)
+_GOVERNING_INTRO_RE = re.compile(
+    r"^\s*(?:if|when|for|on|under|in|with|using|running|unless|where|only)\b",
+    re.IGNORECASE,
+)
+_TAIL_SCOPE_COND_RE = re.compile(
+    r"\b(?:on|for|under|with|using|running|if|when)\s+((?:[^.!?;,\n]|\.(?=\d)){1,60})",
+    re.IGNORECASE,
+)
+
+
+def _extract_scope_qualifiers(text: str) -> set[str]:
+    """Extract canonical audience, platform, and deployment scope qualifiers from `text`."""
+    qualifiers = {canon for pattern, canon in _SCOPE_PHRASE_PATTERNS if pattern.search(text)}
+    for raw in _DIRECTIVE_OBJ_TOKEN_RE.findall(text.lower()):
+        cleaned = raw.strip("._-")
+        if canon := _SCOPE_QUALIFIER_ALIASES.get(cleaned):
+            qualifiers.add(canon)
+    return qualifiers
+
+
+def _directive_scope_qualifiers(text: str, start: int, action_end: int) -> set[str]:
+    """Return canonical qualifiers from the matched directive clause and governing conditions only."""
+    left_matches = list(_HARD_CLAUSE_STOP_RE.finditer(text, 0, start))
+    hard_left = left_matches[-1].end() if left_matches else 0
+    right_match = _HARD_CLAUSE_STOP_RE.search(text, action_end)
+    hard_right = right_match.start() if right_match else len(text)
+    prefix = _INDEP_CLAUSE_SPLIT_RE.split(text[hard_left:action_end])[-1]
+    parts = prefix.split(",")
+    qualifiers = _extract_scope_qualifiers(parts[-1])
+    for leading in parts[:-1]:
+        if _GOVERNING_INTRO_RE.match(leading):
+            qualifiers.update(_extract_scope_qualifiers(leading))
+    tail = _INDEP_CLAUSE_SPLIT_RE.split(text[action_end:hard_right], 1)[0]
+    for prep_match in _TAIL_SCOPE_COND_RE.finditer(tail):
+        qualifiers.update(_extract_scope_qualifiers(prep_match.group(1)))
+    return qualifiers
+
+
+def _action_stem(action: str) -> str:
+    if action.startswith("upgrad"):
+        return "upgrad"
+    if action.startswith("updat"):
+        return "updat"
+    if action.startswith("appl"):
+        return "appl"
+    return action[:5]
+
+
+def _normalize_obj_token(token: str) -> str:
+    if len(token) > 4 and token.endswith("ing"):
+        base = token[:-3]
+        if len(base) >= 3 and base[-1] == base[-2]:
+            base = base[:-1]
+        return base
+    if len(token) > 4 and token.endswith("ation"):
+        return token[:-5]
+    if len(token) > 4 and token.endswith("ed"):
+        return token[:-2]
+    if len(token) > 3 and token.endswith("s"):
+        return token[:-1]
+    return token
+
+
+def _directive_obj_tokens(fragment: str) -> list[str]:
+    clause = _CLAUSE_STOP_RE.split(fragment, 1)[0]
+    tokens: list[str] = []
+    for raw in _DIRECTIVE_OBJ_TOKEN_RE.findall(clause.lower()):
+        cleaned = raw.strip("._-")
+        if not cleaned or cleaned in _DIRECTIVE_OBJ_STOPWORDS:
+            continue
+        if cleaned not in tokens:
+            tokens.append(cleaned)
+    return tokens
+
+
+def _obj_tokens_match(draft_tok: str, src_tok: str) -> bool:
+    if draft_tok == src_tok:
+        return True
+    norm_d, norm_s = _normalize_obj_token(draft_tok), _normalize_obj_token(src_tok)
+    if norm_d == norm_s:
+        return True
+    if min(len(norm_d), len(norm_s)) >= 4 and (norm_d.startswith(norm_s) or norm_s.startswith(norm_d)):
+        return True
+    return False
+
+
+def _has_near_imperative_cue(
+    src: str,
+    stem: str,
+    cue_prefix: str,
+    obj_tokens: tuple[str, ...] | list[str] = (),
+    draft_quals: frozenset[str] | set[str] = frozenset(),
+) -> bool:
+    cue_near = re.compile(
+        r"(?:\b" + cue_prefix + r"\b[^.!?\n]{0,60}\b" + stem + r"[a-z]*\b(?!\s+checks?\b)"
+        r"|(?:^|[.!?\n]\s*)(?:please\s+)?" + stem + r"[a-z]*\b(?=\s+(?:to|your|the|now|as|immediately|away|over|it|them|this|that)\b))"
+        r"(?P<tail>[^.!?\n]{0,120})",
+        re.IGNORECASE,
+    )
+    matches = list(cue_near.finditer(src))
+    if not matches:
+        return False
+    for match in matches:
+        matched = match.group(0)
+        lead = len(matched) - len(matched.lstrip(".!?").lstrip())
+        src_quals = _directive_scope_qualifiers(src, match.start() + lead, match.start("tail"))
+        if src_quals and not src_quals.issubset(draft_quals):
+            continue
+        if not obj_tokens:
+            return True
+        src_tokens = _directive_obj_tokens(match.group("tail"))
+        if all(any(_obj_tokens_match(d_tok, s_tok) for s_tok in src_tokens) for d_tok in obj_tokens):
+            return True
+    return False
+
+
+def _directive_actions_supported(
+    text: str,
+    src: str,
+    *,
+    require_all_near: bool = False,
+    cue_prefix: str = _DIRECTIVE_CUE_PREFIX,
+) -> bool:
+    if not _SRC_DIRECTIVE_CUE_RE.search(src):
+        return False
+    src_actions = [word.lower() for word in _SRC_ACTION_WORDS_RE.findall(src)]
+    matched_action = False
+    for action_match in _ACTION_IN_TEXT_RE.finditer(text):
+        matched_action = True
+        action = action_match.group(1).lower()
+        stem = _action_stem(action)
+        if not any(word.startswith(stem) for word in src_actions):
+            return False
+        obj_tokens = _directive_obj_tokens(text[action_match.end() :])
+        draft_quals = _directive_scope_qualifiers(text, action_match.start(), action_match.end())
+        if not _has_near_imperative_cue(src, stem, cue_prefix, obj_tokens=obj_tokens, draft_quals=draft_quals):
+            return False
+    return matched_action or not require_all_near
+
+
+def has_unattributed_advice(text: str, packet_or_item: dict) -> bool:
+    """Return whether `text` invents operator/user directives or configuration claims absent from unquoted source text."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    src = _unquoted_source_text(packet_or_item)
+    if _INTENDED_CONFIG_RE.search(text) and not _SRC_CONFIG_RE.search(src):
+        return True
+    has_directive = bool(_DIRECTIVE_TARGET_RE.search(text))
+    if has_directive and not _directive_actions_supported(text, src):
+        return True
+    if any(claim_re.search(text) and not src_re.search(src) for claim_re, src_re in _LEXICAL_ADVICE_CHECKS):
+        if not (
+            has_directive
+            and _directive_actions_supported(
+                text,
+                src,
+                require_all_near=True,
+                cue_prefix=_EXPLICIT_IMPERATIVE_CUE_PREFIX,
+            )
+        ):
+            return True
+    return False
+
+
 def label_limits(sources: list[dict]) -> dict:
     """The confidence, state and category labels a story told by these sources may carry: confirmed
     needs an official source that is not a tag, or a merged merge request; tagged needs a tag
-    source; a story told only by merge requests is merged and not a release; and verified TROVE
-    advisories must stay categorized as security."""
+    source; a story told only by merge requests is merged and not a release; issues or merge
+    requests alone may not carry state released; and verified TROVE advisories must stay
+    categorized as security."""
     confirmable = any((source.get("authority") == "official" and source.get("kind") != "tag")
                       or (source.get("kind") == "gitlab_mr" and source.get("upstream_state") == "merged")
                       for source in sources)
     tagged = any(source.get("kind") == "tag" for source in sources)
     merges = bool(sources) and all(source.get("kind") == "gitlab_mr" for source in sources)
+    gitlab_only = bool(sources) and all(source.get("kind") in {"gitlab_issue", "gitlab_mr"} for source in sources)
     trove = any(is_trove_item(source) or source.get("mandatory_news_rule") == "trove" for source in sources)
     allowed_tags = [value for value in CATEGORIES if not merges or value != "release"]
+    if merges:
+        allowed_states = ["merged"]
+    else:
+        allowed_states = [
+            value for value in STATES
+            if (tagged or value != "tagged") and (not gitlab_only or value != "released")
+        ]
     return {
         "confidence": [value for value in CONFIDENCES if confirmable or value != "confirmed"],
-        "state": ["merged"] if merges else [value for value in STATES if tagged or value != "tagged"],
+        "state": allowed_states,
         "category": ["security"] if trove else allowed_tags,
         "tags": allowed_tags,
     }
+
+
+def widen_release_state_for_update(limits: dict, prior: dict | None) -> dict:
+    """Preserve `'released'` in update state `limits` only when `prior` already has `state == 'released'`."""
+    if not isinstance(limits, dict) or not isinstance(prior, dict):
+        return limits
+    if prior.get("state") == "released":
+        allowed = set(limits.get("state") or ())
+        allowed.add("released")
+        limits["state"] = [value for value in STATES if value in allowed]
+    return limits
 
 
 def apply_label_limits(properties: dict, limits: dict, *, nullable: bool = False) -> None:

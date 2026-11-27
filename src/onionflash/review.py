@@ -7,17 +7,25 @@ import re
 
 from .analyze import SCHEMA as DRAFT_SCHEMA, _numbers as _impact_numbers
 from .llm import (AnalysisError, CompletionClient, apply_label_limits, has_malformed_tor_version,
-                  has_shouting_caps, is_complete_sentence, is_quoted_list_post, label_limits,
+                  has_shouting_caps, has_unattributed_advice, is_complete_sentence,
+                  is_incomplete_or_filler_impact, is_quoted_list_post, label_limits,
                   repair_schema, strip_unreleased_tag, unquoted_mail_text, validate_schema_field,
-                  validate_text)
+                  validate_text, widen_release_state_for_update)
 from .render import prepare_story
 from .schema import FIELD_LIMITS, LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STATES, STORY_ID_RE, UPDATE_CHARS
 from .util import LIST_ARCHIVE_HOST, canonical_url, digest, is_trove_item, normalize_evidence, strict_json
 
-REVIEW_VERSION = "onionflash-review-19"
+REVIEW_VERSION = "onionflash-review-20"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details", "news_value", "new_information")
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
+FACTUAL_CRITERIA = tuple(criterion for criterion in CRITERIA if criterion not in EDITORIAL_CRITERIA)
+SPECIALISTS = ("grounding_status", "attribution_scope_advice", "novelty_news")
+SPECIALIST_DOMAINS = {
+    "grounding_status": frozenset({"source_support", "status", "uncertainty_attribution", "technical_details"}),
+    "attribution_scope_advice": frozenset({"actor_and_action", "scope_timing", "operational_advice"}),
+    "novelty_news": frozenset(EDITORIAL_CRITERIA),
+}
 VERDICTS = ("approve", "revise", "hold", "skip")
 FIELDS = {key: copy.deepcopy(DRAFT_SCHEMA["properties"][key]) for key in EDITABLE}
 for field in ("title", "summary", "why_it_matters"):
@@ -476,6 +484,38 @@ This is a fresh verification request. Evaluate candidate.updates[-1] and the pos
 independently without relying on any earlier review; they may contain mistakes from an earlier edit. Your approval
 publishes this exact update.
 """
+SPECIALIST_PROMPTS = {
+    "grounding_status": """
+SPECIALIST VERIFICATION FOCUS (grounding_status — validate all 9 criteria; focus on source_support, status, uncertainty_attribution, technical_details):
+- Verify every factual claim, precondition, opt-in/experimental requirement, and maintainer narrowing or disagreement across title, summary, why_it_matters (or updates[-1].text in latest_update mode): FAIL uncertainty_attribution or source_support when a reporter's claim or disputed defect is stated as unqualified settled fact without attribution ("The report claims...") or drops material preconditions (e.g. non-default config or experimental feature) or turns a built-in software list into operators' "intended configuration".
+- Verify status, confidence, category, and tags against packet.sources: a gitlab_issue (even closed and mentioning a release version in comments) NEVER supports introducing confidence="confirmed", state="released", category="release", or tag "release" (though in latest_update mode prior_story's already-confirmed or already-released labels may be retained unchanged); a gitlab_mr alone NEVER supports introducing state="released" or category="release". Also fail status or uncertainty_attribution if an unconfirmed user comment is treated as confirming resolution or completed action.
+- Verify technical_details and completeness: fail source_support/technical_details on ALL-CAPS shouting, nonexistent 3-part C-Tor version typos (e.g. 0.4.17), or (in standalone story mode) an incomplete why_it_matters fragment lacking terminal sentence punctuation (e.g. trailing "<= 0.4.8.x", trailing comma, or unpunctuated heading/chat).
+- Do NOT false-alarm on brief/plain supported summaries, empty why_it_matters (""), or faithful attributed impacts that preserve qualifiers and end cleanly.
+""",
+    "attribution_scope_advice": """
+SPECIALIST VERIFICATION FOCUS (attribution_scope_advice — validate all 9 criteria; focus on actor_and_action, scope_timing, operational_advice, and why_it_matters fidelity):
+- Check EVERY recommendation, requirement, or operational claim ("are advised to", "should switch to", "must treat", "must configure", "intended configuration excludes") in summary, why_it_matters, and updates[-1].text: FAIL operational_advice (and clear unattributed why_it_matters to "") unless an explicit packet passage directs that exact actor to take that action (never invent advice such as switching to 64-bit or treating a bug as must-fix from casual maintainer chat).
+- Check actor_and_action and scope_timing: distinguish requested vs merged/completed actions (a merged revert MR is NOT "requested"), software defaults vs operator configuration, and keep stated roles strictly source-bound (never calling someone a developer without committed C-Tor code evidence, and never swapping >-quoted mailing-list participants or thread_root with the sender).
+- Check why_it_matters fidelity: FAIL source_support (and clear why_it_matters to "" via revise or hold) when why_it_matters is an incomplete sentence fragment without terminal punctuation, casual chat, generic feature/release filler ("provides updated security components and bug fixes", "to maintain privacy and security", "updates the browser's core engine"), or omits material platform/opt-in/dispute qualifiers.
+- Do NOT false-alarm on empty why_it_matters (""), valid attributed impacts ("The announcement asks...", "The report says..."), or explicit official upgrade requests stated in the packet.
+""",
+    "novelty_news": """
+SPECIALIST VERIFICATION FOCUS (novelty_news — validate all 9 criteria; focus on news_value, new_information, and same_story routing):
+- Evaluate novelty and routing strictly against coverage_background (prior_story, recent, and updates[:-1] in latest_update mode): compare specific defects, versions, releases, MRs/issues, and status changes rather than surface wording.
+- When prior_story is null and recent covers the same concrete change under routing rules (a)-(e), set same_story to that live recent entry's id unless the distinct official incident-response exception applies (evaluating further defenses or expecting further releases). Never route to retracted or network-health entries, or across distinct versions/incidents.
+- Enforce the 14-day recency window (honoring HackerOne, mandatory_news_rule, and Severity::high/critical exceptions), mandatory_news_rule ("trove", "release_announcement", "torproject_new_thread"), HackerOne triage, dirauth operational rules, and tor-dev 5-case proposal/critique rules.
+- In latest_update mode, skip (naming prior_story.id verbatim) redundant echoes/check-ins/me-too replies while passing material lifecycle transitions, new measurements, maintainer disputes, or new response plans. Keep factual criteria passing unless a clear defect exists.
+""",
+}
+UPDATE_SPECIALIST_PROMPTS = {
+    "attribution_scope_advice": """
+SPECIALIST VERIFICATION FOCUS (attribution_scope_advice — latest_update mode; validate all 9 criteria; focus on actor_and_action, scope_timing, and operational_advice):
+- Check ONLY candidate.updates[-1].text (and post-update labels) for recommendations, requirements, or operational claims ("are advised to", "should switch to", "must treat", "must configure", "intended configuration excludes"): FAIL operational_advice unless an explicit packet passage in candidate.updates[-1].sources directs that exact actor to take that action.
+- Do NOT evaluate, fail, or modify read-only title, summary, or why_it_matters carried from prior_story (even if prior why_it_matters states earlier advice or qualifiers).
+- Check actor_and_action and scope_timing in candidate.updates[-1].text: distinguish requested vs merged/completed actions (a merged revert MR is NOT "requested"), software defaults vs operator configuration, and keep stated roles strictly source-bound (never calling someone a developer without committed C-Tor code evidence, and never swapping >-quoted mailing-list participants with the sender).
+- Do NOT false-alarm on factual updates, valid attributed action reports ("The announcement asks...", "The report says..."), or explicit official upgrade requests stated in the cited update passages.
+""",
+}
 # The problem that review_gate.next_step names when it asks a review to repair release labels.
 RELEASE_ISSUE = ("A release category or tag needs state released or tagged: remove the release labels, "
                  "or correct the state, as the packet supports.")
@@ -526,8 +566,9 @@ def policy_hash(config: dict) -> str:
     identity = {key: llm[key] for key in ("model", "base_url", "fallback_base_urls", "max_output_tokens",
                                          "enable_thinking", "send_chat_template_kwargs")}
     return digest([REVIEW_VERSION, SYSTEM_PROMPT, VERIFY_PROMPT, ROUTING_PROMPT, UPDATE_SYSTEM_PROMPT,
-                   UPDATE_VERIFY_PROMPT, RELEASE_ISSUE, INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT,
-                   SCHEMA, UPDATE_REPAIR, identity, CompletionClient.REQUEST_POLICY])
+                   UPDATE_VERIFY_PROMPT, SPECIALISTS, SPECIALIST_PROMPTS, UPDATE_SPECIALIST_PROMPTS,
+                   RELEASE_ISSUE, INCONSISTENT_VERDICT, VALIDATION_REASK_PROMPT, SCHEMA, UPDATE_REPAIR,
+                   identity, CompletionClient.REQUEST_POLICY])
 
 
 def _text(value, maximum: int) -> None:
@@ -554,13 +595,34 @@ def _coverage_ids(coverage: dict | None) -> tuple[str | None, list[str], set[str
     return prior_id, sorted(live), retracted
 
 
+def _cited_packet_sources(
+    packet_sources: list[dict],
+    update_sources: list[dict] | tuple[dict, ...] | None,
+) -> list[dict]:
+    if not update_sources:
+        return []
+    exact_urls = {canonical_url(s["url"]) for s in update_sources if isinstance(s, dict) and isinstance(s.get("url"), str)}
+    base_urls = {url.split("#", 1)[0] for url in exact_urls}
+    return [
+        source for source in packet_sources
+        if isinstance(source, dict)
+        and isinstance(source.get("url"), str)
+        and canonical_url(source["url"]).split("#", 1)[0] in base_urls
+    ]
+
+
 def _widen_update_state(limits: dict, sources: list[dict], prior: dict, candidate_sources=()) -> None:
+    has_tag = any(s.get("kind") == "tag" for s in sources) or prior.get("state") == "tagged"
     if limits["state"] == ["merged"] and (
         (isinstance(prior.get("state"), str) and prior["state"] in STATES and prior["state"] != "merged")
         or any(isinstance(s, dict) and "/-/merge_requests/" not in str(s.get("url") or "") for s in (candidate_sources or ()))
     ):
-        has_tag = any(s.get("kind") == "tag" for s in sources) or prior.get("state") == "tagged"
-        limits["state"] = [s for s in STATES if has_tag or s != "tagged"]
+        limits["state"] = [s for s in STATES if (has_tag or s != "tagged") and s != "released"]
+    elif has_tag and limits["state"] != ["merged"] and "tagged" not in limits["state"]:
+        allowed = set(limits["state"])
+        allowed.add("tagged")
+        limits["state"] = [s for s in STATES if s in allowed]
+    widen_release_state_for_update(limits, prior)
 
 
 def repair_limits(
@@ -569,6 +631,7 @@ def repair_limits(
     *,
     update: bool = False,
     candidate_sources: list[dict] | tuple[dict, ...] | None = None,
+    update_sources: list[dict] | tuple[dict, ...] | None = None,
 ) -> dict:
     """Use the same source and prior-label bounds for every kind of proposed edit."""
     limits = label_limits(packet["sources"])
@@ -576,7 +639,10 @@ def repair_limits(
         prior = (coverage or {}).get("prior_story") or {}
         if prior.get("confidence") == "confirmed":
             limits["confidence"] = ["confirmed"]
-        _widen_update_state(limits, packet["sources"], prior, candidate_sources)
+        cited = _cited_packet_sources(packet["sources"], update_sources)
+        if cited:
+            limits["state"] = label_limits(cited)["state"]
+        _widen_update_state(limits, cited or packet["sources"], prior, candidate_sources)
     return limits
 
 
@@ -617,7 +683,11 @@ def apply_repair(candidate: dict, repair: dict, *, update: bool = False) -> dict
     edits = _repair_fields(repair, update=update)
     if (impact := edits.get("why_it_matters")):
         products = edits.get("products") or candidate.get("products") or ()
-        if has_shouting_caps(impact) or has_malformed_tor_version(impact, products):
+        if (
+            has_shouting_caps(impact)
+            or has_malformed_tor_version(impact, products)
+            or is_incomplete_or_filler_impact(impact) is not None
+        ):
             raise ReviewError("Invalid repair field")
     explicit_tags = "tags" in edits
     updated = copy.deepcopy(candidate)
@@ -747,9 +817,15 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool 
                     or (_impact_numbers(impact) - _impact_numbers(impact_ctx))
                     or has_shouting_caps(impact)
                     or has_malformed_tor_version(impact, products)
+                    or is_incomplete_or_filler_impact(impact) is not None
+                    or has_unattributed_advice(impact, packet)
                 ):
                     repair["why_it_matters"] = ""
-            elif impact and (has_shouting_caps(impact) or has_malformed_tor_version(impact, repair.get("products") or ())):
+            elif impact and (
+                has_shouting_caps(impact)
+                or has_malformed_tor_version(impact, repair.get("products") or ())
+                or is_incomplete_or_filler_impact(impact) is not None
+            ):
                 repair["why_it_matters"] = ""
     elif repair is not None:
         raise ReviewError("Only a revise verdict can propose repair")
@@ -891,12 +967,15 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
         prior = (prepared.get("coverage") or {}).get("prior_story") or {}
         if prior.get("confidence") == "confirmed" and "confirmed" not in limits["confidence"]:
             limits = {**limits, "confidence": [*limits["confidence"], "confirmed"]}
-        _widen_update_state(limits, sources, prior, candidate.get("sources"))
         entry = candidate["updates"][-1]
         exact_urls = {canonical_url(source["url"]) for source in entry["sources"]}
         cited_urls = {url.split("#", 1)[0] for url in exact_urls}
         cited_sources = [(source, source_url) for source in sources
                          if (source_url := canonical_url(source["url"])).split("#", 1)[0] in cited_urls]
+        cited_units = [source for source, _ in cited_sources]
+        if cited_units:
+            limits = {**limits, "state": label_limits(cited_units)["state"]}
+        _widen_update_state(limits, cited_units or sources, prior, candidate.get("sources"))
         claimed = (_claimed_done(entry["text"])
                    if any(source.get("kind") == "gitlab_issue" for source, _ in cited_sources) else [])
         proof = _plain("\n".join(
@@ -929,6 +1008,7 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
         ("compromise_headline", compromise_headline),
         ("confirmed_source", not is_alert and candidate["confidence"] not in limits["confidence"]),
         ("merge_state", not is_alert and limits["state"] == ["merged"] and candidate["state"] != "merged"),
+        ("release_state", not is_alert and limits["state"] != ["merged"] and candidate["state"] == "released" and "released" not in limits["state"]),
         ("shouting_caps", not is_alert and any(has_shouting_caps(text) for text in texts)),
         ("malformed_version", not is_alert and any(has_malformed_tor_version(text, products) for text in texts)),
         ("untrusted_operator_claim", not is_alert and untrusted_claim),
@@ -984,9 +1064,12 @@ class Reviewer(CompletionClient):
         super().__init__({**config, "llm": _llm(config)}, deadline=deadline)
 
     def review(self, candidate_public: dict, packet: dict, *, coverage: dict | None = None, verification: bool = False,
-               issue: str | None = None, update: bool = False, validation_error: str | None = None, on_request=None) -> dict:
+               issue: str | None = None, update: bool = False, validation_error: str | None = None,
+               specialist: str | None = None, on_request=None) -> dict:
         """Review one exact candidate without carrying forward earlier model replies; `issue` names a
         problem the application found in it."""
+        if specialist is not None and specialist not in SPECIALISTS:
+            raise ReviewError(f"Unknown review specialist: {specialist!r}")
         refs = _packet_refs(packet)
         schema = copy.deepcopy(SCHEMA)
         if update:
@@ -1003,7 +1086,11 @@ class Reviewer(CompletionClient):
                 check["properties"]["source_refs"]["items"]["enum"] = sorted(refs)
         # A repair offers only the labels this packet allows.
         repair = schema["properties"]["repair"]["anyOf"][1]["properties"]
-        limits = repair_limits(packet, coverage, update=update, candidate_sources=candidate_public.get("sources"))
+        update_sources = (candidate_public.get("updates") or [{}])[-1].get("sources") if update else None
+        limits = repair_limits(
+            packet, coverage, update=update, candidate_sources=candidate_public.get("sources"),
+            update_sources=update_sources,
+        )
         apply_label_limits(repair, limits, nullable=True)
         # Each call starts with the rubric, exact candidate and bounded context.
         # A prior model response, critique or approval is never part of its history.
@@ -1028,6 +1115,9 @@ class Reviewer(CompletionClient):
                   else (VERIFY_PROMPT if verification else SYSTEM_PROMPT))
         if not update and (coverage or {}).get("recent"):
             prompt = prompt + ROUTING_PROMPT
+        if specialist is not None:
+            spec_prompt = UPDATE_SPECIALIST_PROMPTS.get(specialist, SPECIALIST_PROMPTS[specialist]) if update else SPECIALIST_PROMPTS[specialist]
+            prompt = prompt + "\n" + spec_prompt
         if validation_error is not None:
             prompt += VALIDATION_REASK_PROMPT
         result = self.complete(prompt, payload, schema, "onionflash_review", on_request=on_request)
@@ -1044,4 +1134,287 @@ class Reviewer(CompletionClient):
         if result["verdict"] == "skip" and not _skip_stands(result["criteria"], coverage, result.get("same_story"), update=update):
             # The record keeps the verdict that this fixed rule replaced.
             result = {**result, "verdict": "hold", "same_story": None, "model_verdict": "skip"}
+        if (
+            not update
+            and result["verdict"] == "approve"
+            and isinstance(impact := candidate_public.get("why_it_matters"), str)
+            and impact.strip()
+        ):
+            defect = is_incomplete_or_filler_impact(impact)
+            unattributed = defect is None and has_unattributed_advice(impact, packet)
+            if defect is not None or unattributed:
+                crit = "source_support" if defect is not None else "operational_advice"
+                msg = (
+                    "why_it_matters is incomplete or generic filler unsupported by packet evidence."
+                    if defect is not None
+                    else "why_it_matters states operator or user advice absent from packet passages."
+                )
+                updated_criteria = copy.deepcopy(result["criteria"])
+                updated_criteria[crit] = {**updated_criteria[crit], "outcome": "fail", "reason": msg}
+                result = {
+                    **result,
+                    "criteria": updated_criteria,
+                    "verdict": "revise",
+                    "repair": {"why_it_matters": ""},
+                    "model_verdict": "approve",
+                }
         return result
+
+
+def _merge_refs(*ref_lists: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for refs in ref_lists:
+        for ref in refs:
+            if ref not in seen:
+                seen.add(ref)
+                merged.append(ref)
+                if len(merged) >= 12:
+                    return merged
+    return merged
+
+
+def _in_specialist_domain(specialist: str, criterion: str, verdict_result: dict) -> bool:
+    if criterion in SPECIALIST_DOMAINS[specialist]:
+        return True
+    if specialist == "attribution_scope_advice" and criterion == "source_support":
+        repair = verdict_result.get("repair")
+        if isinstance(repair, dict) and "why_it_matters" in repair:
+            return True
+        reason = verdict_result["criteria"]["source_support"]["reason"].casefold()
+        return any(tok in reason for tok in ("why_it_matters", "why it matters", "impact", "fragment",
+                                             "incomplete", "filler", "unattributed"))
+    return False
+
+
+def merge_specialist_verdicts(
+    verdicts: list[dict],
+    candidate: dict,
+    packet: dict,
+    *,
+    update: bool = False,
+    coverage: dict | None = None,
+    specialists: tuple[str, ...] | list[str] = SPECIALISTS,
+) -> dict:
+    """Synthesize specialist verification verdicts fail-closed while preserving precision."""
+    spec_names = tuple(specialists)
+    if (
+        not isinstance(verdicts, list)
+        or not verdicts
+        or len(verdicts) != len(spec_names)
+        or len(set(spec_names)) != len(spec_names)
+        or set(spec_names) - set(SPECIALISTS)
+    ):
+        raise ReviewError("Invalid specialist verdicts")
+    validated = [validate_review(copy.deepcopy(v), packet, update=update, coverage=coverage) for v in verdicts]
+    pairs = list(zip(spec_names, validated))
+    maj = 2 if len(pairs) == 3 else len(pairs)
+    prior_id, recent_ids, retracted_ids = _coverage_ids(coverage)
+    update_sources = (candidate.get("updates") or [{}])[-1].get("sources") if update else None
+    limits = repair_limits(
+        packet, coverage, update=update, candidate_sources=candidate.get("sources"), update_sources=update_sources,
+    )
+
+    criteria_out: dict[str, dict] = {}
+    for criterion in FACTUAL_CRITERIA:
+        failers = [(spec, res) for spec, res in pairs if res["criteria"][criterion]["outcome"] != "pass"]
+        primary_failers = [(spec, res) for spec, res in failers if _in_specialist_domain(spec, criterion, res)]
+        if primary_failers or len(failers) >= maj:
+            pool = primary_failers or failers
+            chosen = next((res for _, res in pool if res["criteria"][criterion]["outcome"] == "fail"), pool[0][1])
+            criteria_out[criterion] = {
+                "reason": chosen["criteria"][criterion]["reason"],
+                "source_refs": _merge_refs(*(res["criteria"][criterion]["source_refs"] for _, res in failers)),
+                "outcome": chosen["criteria"][criterion]["outcome"],
+            }
+        else:
+            passers = [(spec, res) for spec, res in pairs if res["criteria"][criterion]["outcome"] == "pass"]
+            primary_passers = [(spec, res) for spec, res in passers if criterion in SPECIALIST_DOMAINS[spec]]
+            chosen = (primary_passers or passers)[0][1]
+            criteria_out[criterion] = {
+                "reason": chosen["criteria"][criterion]["reason"],
+                "source_refs": _merge_refs(*(res["criteria"][criterion]["source_refs"] for _, res in passers)),
+                "outcome": "pass",
+            }
+
+    def _pick(group: list[tuple[str, dict]], preferred: str = "novelty_news") -> dict:
+        return next((res for spec, res in group if spec == preferred), group[0][1])
+
+    unrelated_holds = [
+        (spec, res) for spec, res in pairs
+        if update and res["verdict"] == "hold" and _mentions_unrelated_event(res["criteria"]["new_information"]["reason"])
+    ]
+    ni_fails = [(spec, res) for spec, res in pairs if res["criteria"]["new_information"]["outcome"] == "fail"]
+    ni_nonpass = [(spec, res) for spec, res in pairs if res["criteria"]["new_information"]["outcome"] != "pass"]
+    nv_fails = [(spec, res) for spec, res in pairs if res["criteria"]["news_value"]["outcome"] == "fail"]
+    nv_nonpass = [(spec, res) for spec, res in pairs if res["criteria"]["news_value"]["outcome"] != "pass"]
+    ed_passers = [
+        (spec, res) for spec, res in pairs
+        if res["criteria"]["news_value"]["outcome"] == "pass"
+        and res["criteria"]["new_information"]["outcome"] == "pass"
+    ]
+
+    if unrelated_holds:
+        chosen_ni = _pick(unrelated_holds)
+        ni_outcome = chosen_ni["criteria"]["new_information"]["outcome"]
+        criteria_out["new_information"] = {
+            "reason": chosen_ni["criteria"]["new_information"]["reason"],
+            "source_refs": _merge_refs(*(res["criteria"]["new_information"]["source_refs"] for _, res in unrelated_holds)),
+            "outcome": ni_outcome if ni_outcome != "pass" else "fail",
+        }
+    elif len(ni_fails) >= maj:
+        chosen_ni = _pick(ni_fails)
+        criteria_out["new_information"] = {
+            "reason": chosen_ni["criteria"]["new_information"]["reason"],
+            "source_refs": _merge_refs(*(res["criteria"]["new_information"]["source_refs"] for _, res in ni_fails)),
+            "outcome": "fail",
+        }
+    elif len(ni_nonpass) >= maj:
+        chosen_ni = _pick(ni_nonpass)
+        criteria_out["new_information"] = {
+            "reason": chosen_ni["criteria"]["new_information"]["reason"],
+            "source_refs": _merge_refs(*(res["criteria"]["new_information"]["source_refs"] for _, res in ni_nonpass)),
+            "outcome": "insufficient",
+        }
+    else:
+        ni_passers = [(spec, res) for spec, res in pairs if res["criteria"]["new_information"]["outcome"] == "pass"]
+        chosen_ni = _pick(ni_passers)
+        criteria_out["new_information"] = {
+            "reason": chosen_ni["criteria"]["new_information"]["reason"],
+            "source_refs": _merge_refs(*(res["criteria"]["new_information"]["source_refs"] for _, res in ni_passers)),
+            "outcome": "pass",
+        }
+
+    if len(nv_fails) >= maj:
+        chosen_nv = _pick(nv_fails)
+        criteria_out["news_value"] = {
+            "reason": chosen_nv["criteria"]["news_value"]["reason"],
+            "source_refs": _merge_refs(*(res["criteria"]["news_value"]["source_refs"] for _, res in nv_fails)),
+            "outcome": "fail",
+        }
+    elif len(nv_nonpass) >= maj:
+        chosen_nv = _pick(nv_nonpass)
+        criteria_out["news_value"] = {
+            "reason": chosen_nv["criteria"]["news_value"]["reason"],
+            "source_refs": _merge_refs(*(res["criteria"]["news_value"]["source_refs"] for _, res in nv_nonpass)),
+            "outcome": "insufficient",
+        }
+    elif criteria_out["new_information"]["outcome"] == "pass" and len(ed_passers) < maj and not unrelated_holds:
+        chosen_nv = _pick(nv_nonpass or ni_nonpass)
+        criteria_out["news_value"] = {
+            "reason": (chosen_nv["criteria"]["news_value"]["reason"]
+                       if nv_nonpass else "Specialists disagreed on news value and novelty."),
+            "source_refs": _merge_refs(*(res["criteria"]["news_value"]["source_refs"] for _, res in (nv_nonpass or pairs))),
+            "outcome": "insufficient",
+        }
+    else:
+        nv_passers = [(spec, res) for spec, res in pairs if res["criteria"]["news_value"]["outcome"] == "pass"]
+        chosen_nv = _pick(nv_passers)
+        criteria_out["news_value"] = {
+            "reason": chosen_nv["criteria"]["news_value"]["reason"],
+            "source_refs": _merge_refs(*(res["criteria"]["news_value"]["source_refs"] for _, res in nv_passers)),
+            "outcome": "pass",
+        }
+
+    agreed_same_story = None
+    if recent_ids:
+        votes: dict[str, int] = {}
+        for _, res in pairs:
+            sid = res.get("same_story")
+            if isinstance(sid, str) and sid in recent_ids:
+                votes[sid] = votes.get(sid, 0) + 1
+            elif not update and prior_id is None and res["criteria"]["new_information"]["outcome"] == "fail":
+                reason = res["criteria"]["new_information"]["reason"]
+                named = [rid for rid in recent_ids if rid in reason]
+                if len(named) == 1 and not any(r in reason for r in retracted_ids):
+                    votes[named[0]] = votes.get(named[0], 0) + 1
+        top = [sid for sid, count in votes.items() if count >= maj]
+        if len(top) == 1:
+            agreed_same_story = top[0]
+
+    failed_factual = [c for c in FACTUAL_CRITERIA if criteria_out[c]["outcome"] != "pass"]
+    failed_editorial = [c for c in EDITORIAL_CRITERIA if criteria_out[c]["outcome"] != "pass"]
+
+    if not failed_factual and not failed_editorial:
+        approvers = sum(1 for _, res in pairs if res["verdict"] == "approve")
+        if approvers < maj:
+            non_approving_fails = [
+                crit
+                for _, res in pairs
+                if res["verdict"] != "approve"
+                for crit in CRITERIA
+                if res["criteria"][crit]["outcome"] != "pass"
+            ]
+            crit = non_approving_fails[0] if non_approving_fails else "source_support"
+            chosen_non = next(
+                (
+                    res["criteria"][crit]
+                    for _, res in pairs
+                    if res["verdict"] != "approve" and res["criteria"][crit]["outcome"] != "pass"
+                ),
+                None,
+            )
+            criteria_out[crit] = (
+                dict(chosen_non)
+                if chosen_non is not None
+                else {
+                    **criteria_out[crit],
+                    "outcome": "insufficient",
+                    "reason": "Fewer than two specialists approved the candidate.",
+                }
+            )
+            merged = {"criteria": criteria_out, "verdict": "hold", "same_story": None, "repair": None}
+        elif not criteria_out["source_support"]["source_refs"]:
+            criteria_out["source_support"] = {
+                **criteria_out["source_support"],
+                "outcome": "insufficient",
+                "reason": "No packet source reference cited.",
+            }
+            merged = {"criteria": criteria_out, "verdict": "hold", "same_story": None, "repair": None}
+        else:
+            merged = {"criteria": criteria_out, "verdict": "approve", "same_story": agreed_same_story, "repair": None}
+    elif not unrelated_holds and any(criteria_out[c]["outcome"] == "fail" for c in EDITORIAL_CRITERIA):
+        same_story = agreed_same_story
+        if _skip_stands(criteria_out, coverage, same_story, update=update):
+            merged = {"criteria": criteria_out, "verdict": "skip", "same_story": same_story, "repair": None}
+        else:
+            merged = {"criteria": criteria_out, "verdict": "hold", "same_story": None, "repair": None,
+                      "model_verdict": "skip"}
+    elif failed_factual and not unrelated_holds:
+        active_pairs = [(spec, res) for spec, res in pairs
+                        if any(res["criteria"][c]["outcome"] != "pass" for c in failed_factual)]
+        combined: dict = {}
+        repair_ok = all(
+            res["verdict"] == "revise"
+            and isinstance(res.get("repair"), dict)
+            and bool(res["repair"])
+            and within_label_limits(res["repair"], limits)
+            for _, res in active_pairs
+        )
+        if repair_ok:
+            for _, res in active_pairs:
+                for key, value in res["repair"].items():
+                    if key in combined and combined[key] != value:
+                        if key == "why_it_matters" and (combined[key] == "" or value == ""):
+                            combined[key] = ""
+                        else:
+                            repair_ok = False
+                            break
+                    else:
+                        combined[key] = value
+                if not repair_ok:
+                    break
+        if repair_ok and combined and within_label_limits(combined, limits):
+            try:
+                apply_repair(candidate, combined, update=update)
+            except ReviewError:
+                merged = {"criteria": criteria_out, "verdict": "hold", "same_story": None, "repair": None}
+            else:
+                merged = {"criteria": criteria_out, "verdict": "revise", "same_story": agreed_same_story,
+                          "repair": combined}
+        else:
+            merged = {"criteria": criteria_out, "verdict": "hold", "same_story": None, "repair": None}
+    else:
+        merged = {"criteria": criteria_out, "verdict": "hold", "same_story": None, "repair": None}
+
+    return validate_review(merged, packet, update=update, coverage=coverage)

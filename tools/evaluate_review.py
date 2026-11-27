@@ -10,14 +10,17 @@ import argparse
 import json
 import os
 from pathlib import Path
+import threading
 import time
 
 from onionflash.analyze import AnalysisError, Analyzer
 from onionflash.config import load_config
-from onionflash.llm import is_quoted_list_post, unquoted_mail_text
+from onionflash.llm import CompletionDeferred, is_quoted_list_post, unquoted_mail_text
 from onionflash.render import prepare_story
-from onionflash.review import EDITABLE, Reviewer, final_holds, policy_hash
-from onionflash.review_gate import OUTCOME_STAGES, ReviewRequests, advance_review, initial_review_state, recovery_status
+from onionflash.review import EDITABLE, SPECIALISTS, Reviewer, final_holds, policy_hash
+from onionflash.review_gate import (OUTCOME_STAGES, ReviewRequests, _parallel_initial_review,
+                                    _parallel_specialist_verify, _pending_reask, _resume_specialist_reask,
+                                    advance_review, initial_review_state, recovery_status)
 from onionflash.schema import ITEM_ID_RE
 from onionflash.source_packet import LIMITS, OPTIONAL_SOURCE_FIELDS, normalize_labels, number_sources
 from onionflash.util import effective_authority, item_cluster, mandatory_news_rule, plain_text, safe_canonical_url, story_cluster
@@ -35,9 +38,16 @@ class EvaluationReviewer(Reviewer):
     last_decoded = None
 
     def review(self, *args, **kwargs):
-        """Reset diagnostic decode capture before running a review pass."""
+        """Reset diagnostic decode capture and attach any decoded reply to raised errors."""
         self.last_decoded = None
-        return super().review(*args, **kwargs)
+        try:
+            return super().review(*args, **kwargs)
+        except Exception as exc:
+            try:
+                exc._eval_decoded_diagnostic = self.last_decoded
+            except (AttributeError, TypeError):
+                pass
+            raise
 
     def complete(self, *args, **kwargs):
         """Capture the decoded JSON response for private evaluation diagnostics."""
@@ -215,12 +225,17 @@ def _validate_cases(cases: list[dict], *, draft: bool = False) -> None:
         identities.add(case["id"])
 
 
-def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, polish=False):
+def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, polish=False,
+             specialists=1, best_of=1, quote_digest=False):
     """Score final reviewed candidates and save bounded evaluation evidence privately.
 
     In draft mode the writer drafts each packet once per round, and each case on
     that packet reviews the draft in place of its own candidate.
     """
+    if specialists not in (1, len(SPECIALISTS)):
+        raise ValueError("Use 1 or 3 specialists")
+    if best_of < 1:
+        raise ValueError("best_of must be at least 1")
     output = Path(output).resolve()
     public = Path(config["storage"]["output_dir"]).resolve()
     if output == public or public in output.parents:
@@ -240,7 +255,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
     judged, outcomes, seen = {}, {}, set()
     identity = policy_hash(config)
     with (os.fdopen(descriptor, "w", encoding="utf-8") as report, EvaluationReviewer(config, deadline=deadline) as reviewer,
-          Analyzer(config, deadline=deadline, editorial_polish=polish) as writer):
+          Analyzer(config, deadline=deadline, editorial_polish=polish, best_of=best_of, quote_digest=quote_digest) as writer):
         for iteration in range(1, rounds + 1):
             drafts = {}
             for case in cases:
@@ -251,11 +266,16 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
                 scope = case.get("scope", "story")
                 record = {"case": case["id"], "round": iteration, "scope": scope, "expected": case["expected"],
                           **({"expected_same_story": case["expected_same_story"]} if "expected_same_story" in case else {}),
+                          **({"specialists": specialists} if specialists > 1 else {}),
                           "policy_hash": identity, "candidate": case["candidate"], "packet": case["packet"],
                           "existing_coverage": case.get("existing_coverage"), "reviews": [], **initial_review_state()}
-                requests = ReviewRequests(record)
+                requests = ReviewRequests(record, specialists=specialists)
                 totals["cases"] += 1
                 reviewer.last_decoded = None
+
+                def _reviewer_factory():
+                    return EvaluationReviewer(config, deadline=deadline)
+
                 try:
                     candidate = case["candidate"]
                     # The reviews follow the gate's steps. The first source is the item that wrote the candidate,
@@ -304,7 +324,42 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
                                         "cluster_key": item_cluster(identity_item),
                                         "payload": json.dumps(row_item)}}
                     stage, text = "review", candidate
-                    while (step := advance_review(reviewer, stage, text, prepared, record, requests))[0] in {"verify", "repair", "tiebreak"}:
+                    use_parallel = specialists > 1
+                    while True:
+                        if (
+                            use_parallel
+                            and stage == "review"
+                            and not record["reviews"]
+                            and requests.state["reserved"] + len(SPECIALISTS) + 2 <= requests.max_requests
+                        ):
+                            use_parallel = False
+                            step = _parallel_initial_review(
+                                _reviewer_factory, text, prepared, record, requests,
+                                on_verify=lambda: None, save_verify=lambda: None, specialists=specialists,
+                            )
+                        elif specialists > 1 and stage == "verify":
+                            if _pending_reask(record, stage, text, prepared):
+                                if record.get("pending_specialist_wave"):
+                                    if requests.state["reserved"] < requests.max_requests:
+                                        step = _resume_specialist_reask(
+                                            _reviewer_factory, reviewer, text, prepared, record, requests,
+                                        )
+                                    else:
+                                        step = ("hold", ("verification", "specialist_budget"))
+                                elif requests.state["reserved"] < requests.max_requests:
+                                    step = advance_review(reviewer, stage, text, prepared, record, requests)
+                                else:
+                                    step = ("hold", ("verification", "specialist_budget"))
+                            elif requests.state["reserved"] + len(SPECIALISTS) > requests.max_requests:
+                                step = ("hold", ("verification", "specialist_budget"))
+                            else:
+                                step = _parallel_specialist_verify(
+                                    _reviewer_factory, text, prepared, record, requests, specialists=specialists,
+                                )
+                        else:
+                            step = advance_review(reviewer, stage, text, prepared, record, requests)
+                        if step[0] not in {"verify", "repair", "tiebreak", "review"}:
+                            break
                         stage, text = step
                     action, value = step
                     first = record["reviews"][0]["result"]
@@ -376,13 +431,22 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
                         outcomes[iteration, case["id"]] = ok
                     else:
                         totals["controlled_mismatches"] += not matched
+                except CompletionDeferred:
+                    totals["cases"] -= 1
+                    totals["incomplete"] = True
+                    break
                 except (AnalysisError, ValueError, TypeError, KeyError) as exc:
                     totals["errors"] += 1
                     record["error"] = type(exc).__name__
                     if isinstance(exc, AnalysisError):
                         record["error_reason"] = str(exc)
-                    if reviewer.last_decoded is not None:
-                        record["decoded_diagnostic"] = reviewer.last_decoded
+                    last_diag = (
+                        exc._eval_decoded_diagnostic
+                        if hasattr(exc, "_eval_decoded_diagnostic")
+                        else (reviewer.last_decoded if specialists == 1 else None)
+                    )
+                    if last_diag is not None:
+                        record["decoded_diagnostic"] = last_diag
                     record.setdefault("matched", False)
                 record["review_request_count"] = requests.actual
                 record.update(recovery_status(record))
@@ -429,6 +493,12 @@ def main(argv=None):
     parser.add_argument("--max-seconds", type=int, default=900)
     parser.add_argument("--draft", action="store_true", help="review the writer's own draft of each packet")
     parser.add_argument("--polish", action="store_true", help="run editorial polish pass when drafting candidates")
+    parser.add_argument("--specialists", type=int, choices=(1, 3), default=1,
+                        help="number of specialist verification passes per verification wave (1 or 3)")
+    parser.add_argument("--best-of", type=int, choices=(1, 3), default=1,
+                        help="number of parallel draft candidates to generate and select from in --draft mode (1 or 3)")
+    parser.add_argument("--quote-digest", action="store_true",
+                        help="include quote-backed long-thread digests when drafting in --draft mode")
     args = parser.parse_args(argv)
     os.umask(0o077)
     files = args.cases or [Path(__file__).resolve().with_name(name) for name in CASE_FILES]
@@ -446,7 +516,8 @@ def main(argv=None):
             parser.error("Unknown evaluation case")
         cases = [case for case in cases if case["id"] in selected]
     result = evaluate(config, cases, args.output, rounds=args.rounds, deadline=time.monotonic() + args.max_seconds,
-                      draft=args.draft, polish=args.polish)
+                      draft=args.draft, polish=args.polish, specialists=args.specialists,
+                      best_of=args.best_of, quote_digest=args.quote_digest)
     return int(bool(result["controlled_mismatches"] or result.get("false_routes") or result["target_missed"]
                     or result["errors"] or result["incomplete"]))
 

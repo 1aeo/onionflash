@@ -1,5 +1,6 @@
 """The final-candidate gate resumes completed stages and never publishes unchecked."""
 
+import copy
 import json
 import sqlite3
 import threading
@@ -802,15 +803,17 @@ def test_run_report_counts_outcomes_model_calls_and_isolates_invalid_outputs(tmp
     reply_fn = lambda *_a, json_body=None, **_kw: (
         analysis(why_it_matters="")
         if json_body["response_format"]["json_schema"]["name"] == "onionflash_news"
+        else {"winner": 1, "reason": "Selected candidate."}
+        if json_body["response_format"]["json_schema"]["name"] == "onionflash_select"
         else FetchError("network request failed", retryable=True)
     )
-    monkeypatch.setattr("onionflash.llm.HttpClient", lambda *a, **kw: FakeLLM(*([reply_fn] * 4)))
+    monkeypatch.setattr("onionflash.llm.HttpClient", lambda *a, **kw: FakeLLM(*([reply_fn] * 12)))
     patch_cli_pipeline(monkeypatch, now=None, reviewer=None, build=lambda *a: {})
     with Store(cfg2["storage"]["database"]) as store:
         for name in ("one", "two"):
             store.ingest(item(url="https://example.org/" + name), DATE)
         rep2 = cli.run(cfg2, store)
-        assert (rep2["analysis_failed"], rep2["model_calls"]) == (2, 4)
+        assert (rep2["analysis_failed"], rep2["model_calls"]) == (2, 10)
     monkeypatch.undo()
 
     cfg3 = make_config(tmp_path / "r3", sources=[])
@@ -2136,3 +2139,1023 @@ def test_parallel_verify_partial_failures_and_budget_guard(context):
                                          parallel_verify=True, reviewer_factory=_defer_factory)
     assert res_defer["status"] == "deferred"
     assert job_record(store, row4["id"])["request_budget"]["reserved"] == 0
+
+
+def test_parallel_specialist_gate_approves_records_metadata_and_commits(context):
+    """process_item(..., specialists=3) fans out all 3 specialist lenses, validates state, and publishes."""
+    cfg, store = context
+    row = pending(store, item(id="https://example.org/spec3-approve", url="https://example.org/spec3-approve"))
+
+    seen_calls = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(4, timeout=5)
+
+    def _factory():
+        class _ConcurrentReviewer:
+            """Reviewer checking concurrency across initial + 3 specialist passes."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                """Record concurrent review pass and approve after barrier."""
+                if on_request:
+                    on_request(1)
+                with lock:
+                    seen_calls.append((threading.get_ident(), verification, specialist))
+                barrier.wait()
+                return verdict("approve", update=update)
+
+        return _ConcurrentReviewer()
+
+    res = review_gate.process_item(
+        cfg,
+        store,
+        row,
+        Writer(),
+        ApprovingReviewer(),
+        parallel_verify=True,
+        reviewer_factory=_factory,
+        specialists=3,
+    )
+    assert res["status"] == "published"
+    rec = audit(store)
+    assert rec["specialists"] == 3
+    assert rec["request_budget"]["reserved"] == 4
+    assert [s["specialist"] for s in rec["reviews"][1]["specialists"]] == list(review.SPECIALISTS)
+    assert len(store.stories()) == 1
+    initial_specs = [s for _, _, s in seen_calls]
+    assert None in initial_specs
+    assert {s for s in initial_specs if s is not None} == set(review.SPECIALISTS)
+
+
+def test_parallel_specialist_verify_repairs_and_uses_specialist_budget(context):
+    """Multi-wave specialist verification runs all 3 lenses per verify wave within MAX_SPECIALIST_REVIEW_REQUESTS."""
+    cfg, store = context
+    assert review_gate.MAX_REVIEW_REQUESTS == 8
+    assert review_gate.MAX_SPECIALIST_REVIEW_REQUESTS == 20
+
+    row = pending(store, item(id="https://example.org/spec3-repair", url="https://example.org/spec3-repair"))
+    verify_calls = []
+    lock = threading.Lock()
+
+    def _repair_factory():
+        class _RepairSpecialistReviewer:
+            """Reviewer requiring three verify waves before all 3 specialist lenses approve."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                """Propose staged specialist repairs across three verify waves."""
+                if on_request:
+                    on_request(1)
+                if not verification:
+                    if specialist is None:
+                        raw = verdict(
+                            "revise",
+                            criterion="scope_timing",
+                            reason="Clarify timing wording.",
+                            repair={"why_it_matters": "Release timing depends on the upstream review outcome."},
+                        )
+                        return review.validate_review(raw, packet, update=update, coverage=coverage)
+                    return verdict("approve", update=update)
+
+                with lock:
+                    verify_calls.append((specialist, cand.get("why_it_matters")))
+                impact = cand.get("why_it_matters")
+                if impact == "Release timing depends on the upstream review outcome.":
+                    if specialist == "attribution_scope_advice":
+                        raw = verdict(
+                            "revise",
+                            criterion="scope_timing",
+                            reason="Refine maintenance timing.",
+                            repair={"why_it_matters": "Downstream tracking waits for maintainer sign-off."},
+                        )
+                        return review.validate_review(raw, packet, update=update, coverage=coverage)
+                    return verdict("approve", update=update)
+                if impact == "Downstream tracking waits for maintainer sign-off.":
+                    if specialist == "grounding_status":
+                        raw = verdict(
+                            "revise",
+                            criterion="source_support",
+                            reason="Clear draft impact line.",
+                            repair={"why_it_matters": ""},
+                        )
+                        return review.validate_review(raw, packet, update=update, coverage=coverage)
+                    return verdict("approve", update=update)
+                return verdict("approve", update=update)
+
+        return _RepairSpecialistReviewer()
+
+    res = review_gate.process_item(
+        cfg,
+        store,
+        row,
+        Writer(),
+        ApprovingReviewer(),
+        parallel_verify=True,
+        reviewer_factory=_repair_factory,
+        specialists=3,
+    )
+    assert res["status"] == "published"
+    rec = audit(store)
+    # Initial parallel wave (4) + three specialist verify waves (3 * 3 = 9) = 13 > MAX_REVIEW_REQUESTS (8).
+    assert rec["request_budget"]["reserved"] == 13
+    assert [s for s, _ in verify_calls].count("attribution_scope_advice") == 4
+    assert store.stories()[0]["why_it_matters"] == ""
+
+    # Tampered specialist count fails closed with app.damaged_job.
+    bad_rec = json.loads(json.dumps(rec))
+    bad_rec["specialists"] = 9
+    repaired_cand = {**rec["prepared"]["candidate"], "why_it_matters": ""}
+    with pytest.raises(AnalysisError) as exc_info:
+        review_gate.validate_review_state(bad_rec, "verify", repaired_cand, rec["prepared"])
+    assert exc_info.value.code == "app.damaged_job"
+
+
+def test_parallel_specialist_resume_and_reask_paths(context):
+    """Deferred specialist verify stage resumes cleanly and hands InconsistentReview to validation reask."""
+    cfg, store = context
+    row = pending(store, item(id="https://example.org/spec3-resume", url="https://example.org/spec3-resume"))
+    phase = {"step": 1}
+
+    reasked_specialists = []
+
+    def _resume_factory():
+        class _ResumeReviewer:
+            """Triggers CompletionDeferred inside verify wave 1, then InconsistentReview on wave 2."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                """Simulate deferred verify wave followed by validation reask."""
+                if on_request:
+                    on_request(1)
+                if not verification:
+                    if specialist is None:
+                        raw = verdict(
+                            "revise",
+                            criterion="scope_timing",
+                            reason="Clear why_it_matters.",
+                            repair={"why_it_matters": ""},
+                        )
+                        return review.validate_review(raw, packet, update=update, coverage=coverage)
+                    return verdict("approve", update=update)
+                if phase["step"] == 1:
+                    if specialist == "novelty_news":
+                        raise CompletionDeferred("transient verify pause")
+                    return verdict("approve", update=update)
+                if phase["step"] == 2 and specialist == "grounding_status":
+                    if validation_error is None:
+                        raise review.InconsistentReview()
+                    if on_request and hasattr(on_request, "response_received"):
+                        on_request.response_received()
+                    reasked_specialists.append((specialist, validation_error))
+                return verdict("approve", update=update)
+
+        return _ResumeReviewer()
+
+    reask_checker = ApprovingReviewer()
+    first = review_gate.process_item(
+        cfg,
+        store,
+        row,
+        Writer(),
+        reask_checker,
+        parallel_verify=True,
+        reviewer_factory=_resume_factory,
+        specialists=3,
+    )
+    assert first["status"] == "deferred"
+    saved_job = job(store)
+    assert saved_job["stage"] == "verify"
+    env = json.loads(saved_job["envelope_json"])
+    rec1 = json.loads(saved_job["record_json"])
+    review_gate.validate_review_state(rec1, saved_job["stage"], rec1["candidate"], env)
+
+    phase["step"] = 2
+    second = review_gate.process_item(
+        cfg,
+        store,
+        queued_row(store, row["id"]),
+        Writer(),
+        reask_checker,
+        parallel_verify=True,
+        reviewer_factory=_resume_factory,
+        specialists=3,
+    )
+    assert second["status"] == "published"
+    assert ("grounding_status", review.INCONSISTENT_VERDICT) in reasked_specialists
+
+
+def test_evaluate_review_specialists_3_cli_and_draft_mode(tmp_path, monkeypatch):
+    """evaluate_review.py --specialists 3 exercises 3-lens merge in both candidate and --draft modes."""
+    from helpers import _ClientBase, load_evaluator
+
+    eval_mod = load_evaluator()
+    cases_path = tmp_path / "cases.json"
+    cfg_path = tmp_path / "cfg.toml"
+    cfg_path.write_text("", encoding="utf-8")
+    out_cand = tmp_path / "out_cand.jsonl"
+    out_draft = tmp_path / "out_draft.jsonl"
+    corpus = {
+        "defaults": {
+            "why_it_matters": "",
+            "priority": "normal",
+            "confidence": "reported",
+            "state": "developing",
+            "products": ["tor"],
+            "published_at": DATE,
+            "updated_at": DATE,
+            "added_at": DATE,
+        },
+        "packets": {
+            "clean-pkt": {
+                "sources": [{
+                    "url": "https://blog.torproject.org/tor-04812-released/",
+                    "title": "Tor 0.4.8.12 released",
+                    "kind": "rss",
+                    "authority": "official",
+                    "product": "tor",
+                    "published_at": DATE,
+                    "updated_at": DATE,
+                    "passages": ["Tor Project released Tor 0.4.8.12 to fix a crash bug."],
+                }]
+            },
+            "flawed-pkt": {
+                "sources": [{
+                    "url": "https://gitlab.torproject.org/tpo/core/tor/-/issues/49999",
+                    "title": "Relay bug report",
+                    "kind": "gitlab_issue",
+                    "authority": "development",
+                    "product": "tor",
+                    "published_at": DATE,
+                    "updated_at": DATE,
+                    "upstream_state": "opened",
+                    "passages": ["A user reported a relay crash on startup."],
+                }]
+            },
+        },
+        "cases": [
+            {
+                "id": "case-clean",
+                "packet": "clean-pkt",
+                "expected": "approve",
+                "candidate": {
+                    "id": "111111111111111111111111",
+                    "title": "Tor 0.4.8.12 fixes crash bug",
+                    "summary": "Tor Project released Tor 0.4.8.12 to fix a crash bug.",
+                    "category": "release",
+                    "confidence": "confirmed",
+                    "state": "released",
+                },
+            },
+            {
+                "id": "case-flawed",
+                "packet": "flawed-pkt",
+                "expected": "not_approve",
+                "unsupported": ["fixed the relay crash"],
+                "candidate": {
+                    "id": "222222222222222222222222",
+                    "title": "Relay crash fixed",
+                    "summary": "Tor Project fixed the relay crash.",
+                    "category": "security",
+                    "confidence": "reported",
+                    "state": "developing",
+                },
+            },
+        ],
+    }
+    cases_path.write_text(json.dumps(corpus), encoding="utf-8")
+
+    class _StubAnalyzer(_ClientBase):
+        """Minimal Analyzer stub producing draft candidates from writer items."""
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def analyze(self, writer_src):
+            """Return a deterministic candidate for evaluate_review tests."""
+            is_release = "0.4.8.12" in writer_src["title"]
+            return {
+                "title": "Tor 0.4.8.12 fixes crash bug" if is_release else "Relay crash fixed",
+                "summary": (
+                    "Tor Project released Tor 0.4.8.12 to fix a crash bug."
+                    if is_release else "Tor Project fixed the relay crash."
+                ),
+                "why_it_matters": "",
+                "category": "release" if is_release else "security",
+                "priority": "normal",
+                "confidence": "confirmed" if is_release else "reported",
+                "state": "released" if is_release else "developing",
+                "products": ["tor"],
+                "tags": [],
+            }
+
+    seen_specialists = []
+    spec_lock = threading.Lock()
+
+    class _StubEvalReviewer(_ClientBase):
+        """Reviewer checking specialist kwarg propagation under evaluate_review."""
+
+        last_decoded = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                   specialist=None, validation_error=None, on_request=None):
+            """Record specialist lens and hold on open-issue case."""
+            if on_request:
+                on_request(1)
+            with spec_lock:
+                seen_specialists.append(specialist)
+            if "49999" in packet["sources"][0]["url"] and specialist == "grounding_status":
+                return verdict(
+                    "hold",
+                    criterion="status",
+                    reason="Issue is still open; fix not shipped.",
+                )
+            return verdict("approve", update=update)
+
+    monkeypatch.setattr(eval_mod, "Analyzer", _StubAnalyzer)
+    monkeypatch.setattr(eval_mod, "EvaluationReviewer", _StubEvalReviewer)
+    monkeypatch.setattr(eval_mod, "load_config", lambda *args, **kwargs: make_config(tmp_path))
+
+    rc = eval_mod.main([
+        "--config", str(cfg_path),
+        "--cases", str(cases_path),
+        "--output", str(out_cand),
+        "--specialists", "3",
+    ])
+    assert rc == 0
+    cand_lines = [json.loads(line) for line in out_cand.read_text(encoding="utf-8").splitlines()]
+    assert cand_lines[-1]["summary"]["cases"] == 2
+    assert cand_lines[-1]["summary"]["matched"] == 2
+    assert cand_lines[-1]["summary"]["errors"] == 0
+    assert cand_lines[-1]["summary"]["incomplete"] is False
+    assert set(review.SPECIALISTS) <= set(seen_specialists)
+
+    seen_specialists.clear()
+    rc_draft = eval_mod.main([
+        "--config", str(cfg_path),
+        "--cases", str(cases_path),
+        "--output", str(out_draft),
+        "--draft",
+        "--specialists", "3",
+    ])
+    assert rc_draft == 0
+    draft_lines = [json.loads(line) for line in out_draft.read_text(encoding="utf-8").splitlines()]
+    assert draft_lines[-1]["summary"]["cases"] == 2
+    assert draft_lines[-1]["summary"]["matched"] == 2
+    assert draft_lines[-1]["summary"]["errors"] == 0
+    assert set(review.SPECIALISTS) <= set(seen_specialists)
+
+
+def test_specialist_gate_validation_preserve_hold_no_downgrade_and_factory_guard(context):
+    """Enforce unique specialist requests, factory specialist support, preserved holds, cache isolation, and fail-closed budget holds."""
+    cfg, store = context
+
+    # 1) Factory returning non-specialist ApprovingReviewer is rejected cleanly.
+    row_bad = pending(store, item(id="https://example.org/spec3-bad-fac", url="https://example.org/spec3-bad-fac"))
+    with pytest.raises(TypeError, match="specialist"):
+        review_gate.process_item(
+            cfg, store, row_bad, Writer(), ApprovingReviewer(),
+            parallel_verify=True, reviewer_factory=lambda: ApprovingReviewer(), specialists=3,
+        )
+
+    # 2) Specialist reask keeps another lens's hold instead of dropping it.
+    row_hold = pending(store, item(id="https://example.org/spec3-hold", url="https://example.org/spec3-hold"))
+
+    def _hold_factory():
+        class _HoldReaskReviewer:
+            """Throws InconsistentReview on grounding_status and holds on attribution_scope_advice."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                """Raise InconsistentReview on one lens while another lens holds."""
+                if on_request:
+                    on_request(1)
+                if not verification:
+                    return verdict("approve", update=update)
+                if specialist == "grounding_status":
+                    if validation_error is None:
+                        raise review.InconsistentReview()
+                    if on_request and hasattr(on_request, "response_received"):
+                        on_request.response_received()
+                    return verdict("approve", update=update)
+                if specialist == "attribution_scope_advice":
+                    return verdict("hold", criterion="actor_and_action", reason="Unsupported actor.", update=update)
+                return verdict("approve", update=update)
+
+        return _HoldReaskReviewer()
+
+    res_hold = review_gate.process_item(
+        cfg, store, row_hold, Writer(), ApprovingReviewer(),
+        parallel_verify=True, reviewer_factory=_hold_factory, specialists=3,
+    )
+    assert res_hold["status"] == "held"
+    assert store.stories() == []
+
+    # 3) Duplicate specialist request numbers fail validate_review_state.
+    row_ok = pending(store, item(id="https://example.org/spec3-dup-req", url="https://example.org/spec3-dup-req"))
+
+    def _ok_factory():
+        class _OkSpec:
+            """Specialist reviewer approving all lenses."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                """Approve one lens call and acknowledge validation reask responses."""
+                if on_request:
+                    on_request(1)
+                    if validation_error is not None and hasattr(on_request, "response_received"):
+                        on_request.response_received()
+                return verdict("approve", update=update)
+
+        return _OkSpec()
+
+    assert review_gate.process_item(
+        cfg, store, row_ok, Writer(), ApprovingReviewer(),
+        parallel_verify=True, reviewer_factory=_ok_factory, specialists=3,
+    )["status"] == "published"
+    good_rec = audit(store)
+    row_ok2 = pending(store, item(id="https://example.org/spec3-dup-req-2", url="https://example.org/spec3-dup-req-2"))
+    draft2 = analysis(title="Dup req 2", summary="Summary.", evidence=["Release summary."])
+    prep2 = review_gate._prepare(store, cfg, row_ok2, draft2, DATE)
+    rec2 = copy.deepcopy(good_rec)
+    rec2["input_row"] = row_ok2
+    rec2["input_hash"] = row_ok2["content_hash"]
+    for entry in rec2["reviews"]:
+        entry["source_hash"] = prep2["source_hash"]
+        entry["coverage_hash"] = prep2["coverage_hash"]
+        entry["binding_hash"] = prep2["binding_hash"]
+        entry["policy_hash"] = review.policy_hash(cfg)
+    key2 = review_gate._approval_key(prep2["candidate"], prep2, review.policy_hash(cfg))
+    rec2["candidate"] = prep2["candidate"]
+    rec2["approval_key"] = key2
+    rec2["reviews"][0]["candidate_hash"] = digest(prep2["candidate"])
+    rec2["reviews"][1]["candidate_hash"] = digest(prep2["candidate"])
+    review_gate.validate_review_state(rec2, "approved", prep2["candidate"], prep2, allow_cached=False)
+    bad_rec = json.loads(json.dumps(rec2))
+    bad_rec["reviews"][1]["specialists"][1]["request"] = bad_rec["reviews"][1]["specialists"][0]["request"]
+    with pytest.raises(AnalysisError) as dup_exc:
+        review_gate.validate_review_state(bad_rec, "approved", prep2["candidate"], prep2, allow_cached=False)
+    assert dup_exc.value.code == "app.damaged_job"
+
+    # 4) A cached 1-verifier receipt with a matching saved draft is used offline by specialists=1 and declined without deletion by specialists=3.
+    cfg2 = copy.deepcopy(cfg)
+    item_shared = item(id="https://example.org/spec3-cache-1", url="https://example.org/spec3-cache-1")
+    row_c1 = pending(store, item_shared)
+    prepared_c1 = review_gate._prepare(store, cfg2, row_c1, analysis(), DATE)
+    insert_approval(store, prepared_c1, policy=review.policy_hash(cfg2))
+    wkey_c1 = cache_key(row_c1, cfg2["llm"])
+    review_gate._save(
+        store, row_c1, wkey_c1, review.policy_hash(cfg2),
+        "drafted", analysis(), None, review_gate._new_record(row_c1, writer={"key": wkey_c1}), DATE, prepared_at=DATE,
+    )
+    assert store.db.execute("SELECT COUNT(*) FROM review_approvals").fetchone()[0] == 1
+    res_defer_c3 = review_gate.process_item(
+        cfg2, store, queued_row(store, row_c1["id"]), Writer(), ApprovingReviewer(),
+        allow_network=False, parallel_verify=True, reviewer_factory=_ok_factory, specialists=3,
+    )
+    assert res_defer_c3["status"] == "deferred" and res_defer_c3["cache_hit"] is False
+    assert store.db.execute("SELECT COUNT(*) FROM review_approvals").fetchone()[0] == 1
+    res_c1 = review_gate.process_item(
+        cfg2, store, queued_row(store, row_c1["id"]), Writer(), ApprovingReviewer(),
+        allow_network=False, specialists=1,
+    )
+    assert res_c1["status"] == "published" and res_c1["cache_hit"] is True
+
+    # 5) Resumed verify job with insufficient remaining slots holds as specialist_budget without starting any lens.
+    row_low = pending(store, item(id="https://example.org/spec3-low", url="https://example.org/spec3-low"))
+    rev_low_count = 0
+
+    class _CountingSpecRev:
+        """Counting specialist-capable reviewer verifying no lens runs under insufficient budget."""
+
+        def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                   specialist=None, validation_error=None, on_request=None):
+            """Count any unexpected call and approve."""
+            nonlocal rev_low_count
+            rev_low_count += 1
+            if on_request:
+                on_request(1)
+            return verdict("approve", update=update)
+
+    prep_low = review_gate._prepare(store, cfg, row_low, analysis(), DATE)
+    wkey_low = cache_key(row_low, cfg["llm"])
+    low_rec = {
+        **review_gate._new_record(row_low, writer={"key": wkey_low}),
+        "specialists": 3,
+        "policy_hash": review.policy_hash(cfg),
+        "candidate": prep_low["candidate"],
+        "reviews": [{
+            "stage": "review",
+            "candidate_hash": digest(prep_low["candidate"]),
+            "request": 1,
+            "result": verdict("approve"),
+            **review_gate._context(prep_low, review.policy_hash(cfg)),
+        }],
+    }
+    low_rec["request_budget"]["reserved"] = review_gate.MAX_SPECIALIST_REVIEW_REQUESTS - 2
+    review_gate._save(
+        store, row_low, wkey_low, review.policy_hash(cfg),
+        "verify", analysis(), prep_low, low_rec, DATE, prepared_at=DATE,
+    )
+    assert review_gate.process_item(
+        cfg, store, queued_row(store, row_low["id"]), Writer(), _CountingSpecRev(),
+        allow_network=True, parallel_verify=False, reviewer_factory=None, specialists=3,
+    )["status"] == "held"
+    low_job = job(store, row_low)
+    assert rev_low_count == 0 and json.loads(low_job["record_json"])["hold_code"] == "specialist_budget"
+
+    # 6) Spoofed specialists=3 top-level count without per-lens verification records is rejected on cache & saved-job paths; factory reviewer without specialist kwarg is still closed.
+    closed_factories = []
+
+    def _bad_closable_factory():
+        class _ClosableNoSpec:
+            """Closable reviewer lacking `specialist` kwarg."""
+
+            def __enter__(self):
+                """Return self."""
+                return self
+
+            def __exit__(self, *_a):
+                """Record close."""
+                closed_factories.append(True)
+
+            def review(self, cand, packet, coverage=None, verification=False, update=False, validation_error=None, on_request=None):
+                """No specialist kwarg."""
+                return verdict("approve", update=update)
+
+        return _ClosableNoSpec()
+
+    _, cap_exc = review_gate._call_reviewer_worker(
+        _bad_closable_factory, prep_low["candidate"], prep_low,
+        review_gate._WorkerRequestObserver(threading.Lock(), [0], 5),
+        is_verify=True, specialist="grounding_status",
+    )
+    assert isinstance(cap_exc, TypeError) and closed_factories == [True]
+
+    item_spoof = item(id="https://example.org/spec3-spoof", url="https://example.org/spec3-spoof")
+    row_spoof = pending(store, item_spoof)
+    prep_spoof = review_gate._prepare(store, cfg2, row_spoof, analysis(), DATE)
+    insert_approval(store, prep_spoof, policy=review.policy_hash(cfg2))
+    spoof_key = review_gate._approval_key(prep_spoof["candidate"], prep_spoof, review.policy_hash(cfg2))
+    raw_rr = json.loads(store.db.execute("SELECT review_record_json FROM review_approvals WHERE key=?", (spoof_key,)).fetchone()[0])
+    raw_rr["specialists"] = 3
+    with store.db:
+        store.db.execute("UPDATE review_approvals SET review_record_json=? WHERE key=?", (json.dumps(raw_rr), spoof_key))
+    wkey_spoof = cache_key(row_spoof, cfg2["llm"])
+    review_gate._save(
+        store, row_spoof, wkey_spoof, review.policy_hash(cfg2),
+        "drafted", analysis(), None, review_gate._new_record(row_spoof, writer={"key": wkey_spoof}), DATE, prepared_at=DATE,
+    )
+    assert review_gate.process_item(
+        cfg2, store, queued_row(store, row_spoof["id"]), Writer(), ApprovingReviewer(),
+        allow_network=False, parallel_verify=True, reviewer_factory=_ok_factory, specialists=3,
+    )["status"] == "deferred"
+
+    # 7) 2-1 specialist skip(news_value) holds as disagreed_news instead of falling into 1-verifier general tiebreak.
+    def _split_2_1_factory():
+        class _SplitSpec:
+            """Return approve on review and 2-1 skip on news_value across specialists."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                """Serve approve on review/first lens and skip(news_value) on 2 lenses."""
+                if on_request:
+                    on_request(1)
+                if specialist in {"attribution_scope_advice", "novelty_news"}:
+                    return verdict("skip", criterion="news_value", reason="Not newsworthy enough.")
+                return verdict("approve", update=update)
+
+        return _SplitSpec()
+
+    row_2_1 = pending(store, item(id="https://example.org/spec3-2-1-skip", url="https://example.org/spec3-2-1-skip"))
+    res_2_1 = review_gate.process_item(
+        cfg, store, row_2_1, Writer(), ApprovingReviewer(),
+        parallel_verify=True, reviewer_factory=_split_2_1_factory, specialists=3,
+    )
+    assert res_2_1["status"] == "held" and res_2_1["review_calls"] == 4
+    assert json.loads(job(store, row_2_1)["record_json"])["hold_code"] == "disagreed_news"
+
+    # 8) Confirmed transport failure during specialist reask resumes single failed lens cleanly reusing saved wave replies.
+    reask_state = {"calls": 0}
+    resumed_calls = []
+
+    def _reask_resume_factory():
+        class _ReaskSpec:
+            """Fail grounding_status validation, fail reask once on transport, and hold on attribution_scope_advice."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                """Simulate inconsistent grounding_status with retryable transport error plus sibling hold."""
+                reask_state["calls"] += 1
+                if on_request:
+                    on_request(1)
+                if specialist == "grounding_status" and validation_error is None:
+                    raise review.InconsistentReview()
+                if specialist == "grounding_status" and validation_error is not None:
+                    if on_request:
+                        on_request.transport_failed()
+                    raise AnalysisError("Transient timeout", retryable=True)
+                if specialist == "attribution_scope_advice":
+                    return verdict("hold", criterion="actor_and_action", reason="Unsupported actor.", update=update)
+                return verdict("approve", update=update)
+
+        return _ReaskSpec()
+
+    def _resumed_track_factory():
+        class _ResumedTrackSpec:
+            """Record resumed specialist call and validation_error while approving."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                """Record specialist + validation_error on resume and approve."""
+                resumed_calls.append((specialist, validation_error))
+                if on_request:
+                    on_request(1)
+                if on_request and validation_error is not None and hasattr(on_request, "response_received"):
+                    on_request.response_received()
+                return verdict("approve", update=update)
+
+        return _ResumedTrackSpec()
+
+    row_wave = pending(store, item(id="https://example.org/spec3-reask-resume", url="https://example.org/spec3-reask-resume"))
+    with pytest.raises(AnalysisError):
+        review_gate.process_item(
+            cfg, store, row_wave, Writer(), ApprovingReviewer(),
+            parallel_verify=True, reviewer_factory=_reask_resume_factory, specialists=3,
+        )
+    wave_job = job(store, row_wave)
+    wave_rec = json.loads(wave_job["record_json"])
+    assert wave_job["stage"] == "verify" and "pending_specialist_wave" in wave_rec
+    res_resumed = review_gate.process_item(
+        cfg, store, queued_row(store, row_wave["id"]), Writer(), ApprovingReviewer(),
+        parallel_verify=True, reviewer_factory=_resumed_track_factory, specialists=3,
+    )
+    assert resumed_calls == [("grounding_status", review.INCONSISTENT_VERDICT)]
+    assert res_resumed["status"] == "held" and res_resumed["review_calls"] == 1
+    assert json.loads(job(store, row_wave)["record_json"])["hold_code"] == "model_hold"
+    assert "pending_specialist_wave" not in json.loads(job(store, row_wave)["record_json"])
+
+    # 9) Legacy ledger with reserved=8 un-reasked proposal keeps its original cap when upgraded to specialists=3.
+    row_leg = pending(store, item(id="https://example.org/spec3-legacy-cap", url="https://example.org/spec3-legacy-cap"))
+    prep_leg = review_gate._prepare(store, cfg, row_leg, analysis(), DATE)
+    leg_ctx = review_gate._context(prep_leg, review.policy_hash(cfg))
+    leg_rec = {
+        **review_gate._new_record(row_leg),
+        "specialists": 3,
+        "specialist_upgrade_at": 8,
+        "policy_hash": review.policy_hash(cfg),
+        "candidate": prep_leg["candidate"],
+        "request_budget": {"reserved": 8, "inconsistent_requests": [8], "validation_reask": None},
+        "untrusted_proposals": [{
+            "error": review.INCONSISTENT_VERDICT,
+            "request": 8,
+            "stage": "review",
+            "mode": "story",
+            "candidate_before_hash": digest(prep_leg["candidate"]),
+            "candidate_after_hash": None,
+            "context": leg_ctx,
+            "changed_fields": [],
+            "repair": None,
+            "accepted": False,
+            "disposition": "unusable",
+            "reask_trigger": False,
+            "reask_response": False,
+        }],
+    }
+    review_gate.validate_review_state(leg_rec, "review", prep_leg["candidate"], prep_leg, allow_cached=False)
+
+
+def test_specialist_upgrade_tiebreak_general_reask_atomic_wave_and_eval_diag(context, tmp_path, monkeypatch):
+    """Cover saved tiebreak upgrade reset, general reask upgrade into full specialists, atomic wave save, and failing worker diagnostics."""
+    from helpers import _ClientBase, load_evaluator
+
+    cfg, store = context
+
+    # 1) Atomic persist: when persist fails during InconsistentReview reask setup, wave & trigger live on the same record snapshot.
+    persist_snapshots = []
+
+    class _AtomicSpecRev:
+        """Raise InconsistentReview on grounding_status and approve siblings."""
+
+        def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                   specialist=None, validation_error=None, on_request=None):
+            """Trigger inconsistent reply on grounding_status initial verify wave."""
+            if on_request:
+                on_request(1)
+            if specialist == "grounding_status" and validation_error is None:
+                raise review.InconsistentReview()
+            if on_request and validation_error is not None and hasattr(on_request, "response_received"):
+                on_request.response_received()
+            return verdict("approve", update=update)
+
+    row_atomic = pending(store, item(id="https://example.org/spec3-atomic-wave", url="https://example.org/spec3-atomic-wave"))
+    prep_atomic = review_gate._prepare(store, cfg, row_atomic, analysis(), DATE)
+    ctx_atomic = review_gate._context(prep_atomic, review.policy_hash(cfg))
+    rec_atomic = {
+        **review_gate._new_record(row_atomic, policy_hash=review.policy_hash(cfg)),
+        "specialists": 3,
+        "candidate": prep_atomic["candidate"],
+        "reviews": [{
+            "stage": "review",
+            "candidate_hash": digest(prep_atomic["candidate"]),
+            "request": 1,
+            "result": verdict("approve"),
+            **ctx_atomic,
+        }],
+        "request_budget": {"reserved": 1, "inconsistent_requests": [], "validation_reask": None},
+    }
+
+    class _AbortPersist(RuntimeError):
+        pass
+
+    def _snap_persist():
+        persist_snapshots.append(copy.deepcopy(rec_atomic))
+        if rec_atomic["request_budget"]["validation_reask"] is not None:
+            raise _AbortPersist("crash on first persist")
+
+    reqs_atomic = review_gate.ReviewRequests(rec_atomic, persist=_snap_persist, specialists=3)
+    with pytest.raises(_AbortPersist):
+        review_gate._parallel_specialist_verify(
+            lambda: _AtomicSpecRev(), prep_atomic["candidate"], prep_atomic, rec_atomic, reqs_atomic, specialists=3,
+        )
+    assert persist_snapshots[-1]["request_budget"]["validation_reask"]["trigger"] == 4
+    assert "pending_specialist_wave" in persist_snapshots[-1]
+    assert persist_snapshots[-1]["pending_specialist_wave"]["trigger"] == 4
+    assert persist_snapshots[-1]["pending_specialist_wave"]["failed_specialist"] == "grounding_status"
+
+    # 2) Saved general tiebreak resumes cleanly at specialists=1, but restarts under specialists=3 retaining budget.
+    class _TiebreakGenReviewer:
+        """Split review vs verification on news_value so job lands in tiebreak stage."""
+
+        def __init__(self, final_verdict="approve"):
+            self.calls = []
+            self.final_verdict = final_verdict
+
+        def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                   issue=None, validation_error=None, on_request=None):
+            """Split initial review/verify on news_value then crash on first tiebreak."""
+            if on_request:
+                on_request(1)
+            self.calls.append((verification, len(self.calls)))
+            if not verification:
+                return verdict("approve", update=update)
+            if len(self.calls) == 2:
+                return verdict("skip", criterion="news_value", reason="Minor change.", update=update)
+            if self.final_verdict == "crash":
+                raise AnalysisError("Tiebreak interrupted", retryable=True)
+            return verdict(self.final_verdict, update=update)
+
+    row_tb1 = pending(store, item(id="https://example.org/tb-gen", url="https://example.org/tb-gen"))
+    with pytest.raises(AnalysisError):
+        review_gate.process_item(cfg, store, row_tb1, Writer(), _TiebreakGenReviewer("crash"), specialists=1)
+    assert job(store, row_tb1)["stage"] == "tiebreak"
+    gen_res = review_gate.process_item(cfg, store, queued_row(store, row_tb1["id"]), Writer(), ApprovingReviewer(), specialists=1)
+    assert gen_res["status"] == "published" and gen_res["review_calls"] == 1
+
+    row_tb3 = pending(store, item(id="https://example.org/tb-upgrade", url="https://example.org/tb-upgrade"))
+    with pytest.raises(AnalysisError):
+        review_gate.process_item(cfg, store, row_tb3, Writer(), _TiebreakGenReviewer("crash"), specialists=1)
+    assert job(store, row_tb3)["stage"] == "tiebreak"
+    tb_specs = []
+
+    def _tb_spec_factory():
+        class _TbSpec:
+            """Specialist reviewer recording lens execution after tiebreak reset."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                """Record specialist invocations and approve."""
+                if on_request:
+                    on_request(1)
+                tb_specs.append((verification, specialist))
+                return verdict("approve", update=update)
+
+        return _TbSpec()
+
+    up_res = review_gate.process_item(
+        cfg, store, queued_row(store, row_tb3["id"]), Writer(), ApprovingReviewer(),
+        parallel_verify=True, reviewer_factory=_tb_spec_factory, specialists=3,
+    )
+    assert up_res["status"] == "published" and up_res["review_calls"] == 4
+    assert {s for _, s in tb_specs if s is not None} == set(review.SPECIALISTS)
+    assert audit(store, row_tb3["id"])["request_budget"]["reserved"] == 7
+
+    # 3) Retryable general validation_reask resumes on specialists=3 without specialist_budget hold and still runs full specialists.
+    gen_reask_calls = []
+
+    class _GenReaskReviewer:
+        """Trigger retryable general validation_reask at verify stage on specialists=1."""
+
+        def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                   issue=None, validation_error=None, on_request=None):
+            """Approve review, fail verify validation once, then fail reask transport."""
+            if on_request:
+                on_request(1)
+            if not verification:
+                return verdict("approve", update=update)
+            if validation_error is None:
+                raise review.InconsistentReview()
+            if on_request:
+                on_request.transport_failed()
+            raise AnalysisError("Transient general reask timeout", retryable=True)
+
+    class _MixedUpgradeReviewer:
+        """Accept both general correction calls and specialist verification calls."""
+
+        def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                   specialist=None, issue=None, validation_error=None, on_request=None):
+            """Record correction vs specialist calls and approve."""
+            gen_reask_calls.append((specialist, validation_error))
+            if on_request:
+                on_request(1)
+            if on_request and validation_error is not None and hasattr(on_request, "response_received"):
+                on_request.response_received()
+            return verdict("approve", update=update)
+
+    row_gr = pending(store, item(id="https://example.org/gen-reask-upgrade", url="https://example.org/gen-reask-upgrade"))
+    with pytest.raises(AnalysisError):
+        review_gate.process_item(cfg, store, row_gr, Writer(), _GenReaskReviewer(), specialists=1)
+    gr_job = job(store, row_gr)
+    gr_rec = json.loads(gr_job["record_json"])
+    assert gr_job["stage"] == "verify" and "pending_specialist_wave" not in gr_rec
+    assert gr_rec["request_budget"]["validation_reask"]["transport_failed"] is True
+
+    gr_res = review_gate.process_item(
+        cfg, store, queued_row(store, row_gr["id"]), Writer(), _MixedUpgradeReviewer(),
+        parallel_verify=True, reviewer_factory=lambda: _MixedUpgradeReviewer(), specialists=3,
+    )
+    assert gr_res["status"] == "published" and gr_res["review_calls"] == 4
+    assert (None, review.INCONSISTENT_VERDICT) in gen_reask_calls
+    assert {s for s, _ in gen_reask_calls if s is not None} == set(review.SPECIALISTS)
+    gr_audit = audit(store, row_gr["id"])
+    assert gr_audit["reviews"][-1]["specialists"] and len(gr_audit["reviews"][-1]["specialists"]) == 3
+
+    # 4) evaluate_review attaches decoded_diagnostic strictly from the failing worker, never a sibling worker.
+    eval_mod = load_evaluator()
+    cases_path = tmp_path / "diag_cases.json"
+    cfg_path = tmp_path / "diag_cfg.toml"
+    cfg_path.write_text("", encoding="utf-8")
+    out_path = tmp_path / "diag_out.jsonl"
+    cases_path.write_text(json.dumps({
+        "defaults": {
+            "why_it_matters": "", "priority": "normal", "confidence": "reported", "state": "developing",
+            "products": ["tor"], "published_at": DATE, "updated_at": DATE, "added_at": DATE,
+        },
+        "packets": {
+            "p1": {"sources": [{
+                "url": "https://gitlab.torproject.org/tpo/core/tor/-/issues/51001", "title": "Diag case 1",
+                "kind": "gitlab_issue", "authority": "development", "product": "tor", "published_at": DATE, "updated_at": DATE,
+                "upstream_state": "opened", "passages": ["Report one."],
+            }]},
+            "p2": {"sources": [{
+                "url": "https://gitlab.torproject.org/tpo/core/tor/-/issues/51002", "title": "Diag case 2",
+                "kind": "gitlab_issue", "authority": "development", "product": "tor", "published_at": DATE, "updated_at": DATE,
+                "upstream_state": "opened", "passages": ["Report two."],
+            }]},
+        },
+        "cases": [
+            {"id": "c-no-diag", "packet": "p1", "expected": "hold", "candidate": {
+                "id": "333333333333333333333333", "title": "Issue 51001", "summary": "Report one.", "category": "security",
+            }},
+            {"id": "c-own-diag", "packet": "p2", "expected": "hold", "candidate": {
+                "id": "444444444444444444444444", "title": "Issue 51002", "summary": "Report two.", "category": "security",
+            }},
+        ],
+    }), encoding="utf-8")
+
+    class _DiagEvalReviewer(_ClientBase):
+        """Simulate sibling approvals with last_decoded alongside failing specialist workers with/without last_decoded."""
+
+        last_decoded = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def complete(self, *args, **kwargs):
+            """Unused stub complete."""
+            return {}
+
+        def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                   specialist=None, validation_error=None, on_request=None):
+            """Set per-worker last_decoded and fail novelty_news with or without a decoded payload."""
+            self.last_decoded = None
+            try:
+                if on_request:
+                    on_request(1)
+                if "51001" in packet["sources"][0]["url"] and specialist == "novelty_news":
+                    raise AnalysisError("Decode failed before payload", retryable=False)
+                if "51002" in packet["sources"][0]["url"] and specialist == "novelty_news":
+                    self.last_decoded = {"broken": "novelty_worker_only"}
+                    raise AnalysisError("Bad novelty verdict", retryable=False)
+                self.last_decoded = {"verdict": "approve", "worker": specialist}
+                return verdict("approve", update=update)
+            except Exception as exc:
+                exc._eval_decoded_diagnostic = self.last_decoded
+                raise
+
+    monkeypatch.setattr(eval_mod, "EvaluationReviewer", _DiagEvalReviewer)
+    monkeypatch.setattr(eval_mod, "load_config", lambda *args, **kwargs: make_config(tmp_path))
+    assert eval_mod.main(["--config", str(cfg_path), "--cases", str(cases_path), "--output", str(out_path), "--specialists", "3"]) == 1
+    lines = [json.loads(line) for line in out_path.read_text(encoding="utf-8").splitlines()]
+    recs = {r["case"]: r for r in lines if "case" in r}
+    assert "decoded_diagnostic" not in recs["c-no-diag"]
+    assert recs["c-own-diag"]["decoded_diagnostic"] == {"broken": "novelty_worker_only"}
+
+    # 5) Saved specialist entry cross-check rejects in-domain factual fail beside merged approve, while allowing single out-of-domain fail.
+    row_tamper = pending(store, item(id="https://example.org/spec3-cross-check", url="https://example.org/spec3-cross-check"))
+    prep_tamper = review_gate._prepare(store, cfg, row_tamper, analysis(), DATE)
+    ctx_tamper = review_gate._context(prep_tamper, review.policy_hash(cfg))
+    bad_spec_rec = {
+        **review_gate._new_record(row_tamper, policy_hash=review.policy_hash(cfg)),
+        "specialists": 3,
+        "candidate": prep_tamper["candidate"],
+        "request_budget": {"reserved": 4, "inconsistent_requests": [], "validation_reask": None},
+        "reviews": [
+            {"stage": "review", "candidate_hash": digest(prep_tamper["candidate"]), "request": 1, "result": verdict("approve"), **ctx_tamper},
+            {
+                "stage": "verification",
+                "candidate_hash": digest(prep_tamper["candidate"]),
+                "request": 4,
+                "result": verdict("approve"),
+                "specialists": [
+                    {"specialist": "grounding_status", "request": 2, "verdict": "hold", "same_story": None, "failed": ["source_support"]},
+                    {"specialist": "attribution_scope_advice", "request": 3, "verdict": "approve", "same_story": None, "failed": []},
+                    {"specialist": "novelty_news", "request": 4, "verdict": "approve", "same_story": None, "failed": []},
+                ],
+                **ctx_tamper,
+            },
+        ],
+    }
+    with pytest.raises(AnalysisError) as exc_tamper:
+        review_gate.validate_review_state(bad_spec_rec, "approved", prep_tamper["candidate"], prep_tamper, allow_cached=False)
+    assert exc_tamper.value.code == "app.damaged_job"
+
+    ood_pass_rec = copy.deepcopy(bad_spec_rec)
+    ood_pass_rec["reviews"][1]["specialists"] = [
+        {"specialist": "grounding_status", "request": 2, "verdict": "approve", "same_story": None, "failed": []},
+        {"specialist": "attribution_scope_advice", "request": 3, "verdict": "approve", "same_story": None, "failed": []},
+        {"specialist": "novelty_news", "request": 4, "verdict": "hold", "same_story": None, "failed": ["source_support"]},
+    ]
+    approved_key = review_gate._approval_key(prep_tamper["candidate"], ctx_tamper, review.policy_hash(cfg))
+    ood_pass_rec.update(outcome="approved", approval_key=approved_key)
+    review_gate.validate_review_state(ood_pass_rec, "approved", prep_tamper["candidate"], prep_tamper, allow_cached=False)
+
+    # 6) Worker pool in specialist verify is strictly capped at its 3 durable slots & disallows post-dispatch refund.
+    obs_guard = review_gate._WorkerRequestObserver(threading.Lock(), [0], 2)
+    obs_guard(1)
+    obs_guard.transport_failed()
+    with pytest.raises(ValueError):
+        obs_guard(-1)
+
+    extra_barrier = threading.Barrier(4, timeout=5)
+
+    class _ExtraRequestRev:
+        """Attempt two requests inside one specialist worker call."""
+
+        def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                   specialist=None, validation_error=None, on_request=None):
+            """Reserve once normally, then attempt an extra unreserved request on grounding_status."""
+            if on_request:
+                on_request(1)
+            extra_barrier.wait()
+            if on_request and specialist == "grounding_status":
+                on_request(1)
+            return verdict("approve", update=update)
+
+    row_cap = pending(store, item(id="https://example.org/spec3-durable-cap", url="https://example.org/spec3-durable-cap"))
+    with pytest.raises(review.ReviewLimitReached):
+        review_gate.process_item(
+            cfg, store, row_cap, Writer(), ApprovingReviewer(),
+            parallel_verify=True, reviewer_factory=lambda: _ExtraRequestRev(), specialists=3,
+        )
+
+    # 7) evaluate_review catches CompletionDeferred cleanly, marks incomplete=True, and writes its summary line.
+    class _DeferEvalReviewer(_ClientBase):
+        """Approve first case and raise CompletionDeferred on second case."""
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def complete(self, *args, **kwargs):
+            """Unused stub complete."""
+            return {}
+
+        def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                   specialist=None, issue=None, validation_error=None, on_request=None):
+            """Approve 51001 and raise CompletionDeferred on 51002."""
+            if "51002" in packet["sources"][0]["url"]:
+                raise CompletionDeferred("deadline reached")
+            if on_request:
+                on_request(1)
+            return verdict("approve", update=update)
+
+    monkeypatch.setattr(eval_mod, "EvaluationReviewer", _DeferEvalReviewer)
+    out_defer = tmp_path / "defer_out.jsonl"
+    assert eval_mod.main(["--config", str(cfg_path), "--cases", str(cases_path), "--output", str(out_defer)]) == 1
+    defer_lines = [json.loads(line) for line in out_defer.read_text(encoding="utf-8").splitlines()]
+    assert len(defer_lines) == 2
+    assert defer_lines[-1]["summary"]["incomplete"] is True
+    assert defer_lines[-1]["summary"]["cases"] == 1
+    assert defer_lines[-1]["summary"]["errors"] == 0

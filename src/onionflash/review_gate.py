@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import copy
+import inspect
 import json
 import re
 import threading
@@ -23,9 +24,9 @@ from .llm import AnalysisError, CompletionDeferred, RequestObserver, is_quoted_l
 from .schema import CATEGORIES, CONFIDENCES, PRIORITIES, PRODUCTS, SHA256_RE, STATES
 from .store import ITEM_SAFE_COLUMNS, decode_item_row, item_hash, item_hash_fields, set_job_stage
 from .util import (
-    _DIRAUTH_LABELS, _GITLAB_OWN, _strip_subject_prefixes, after, cve_ids, digest,
+    _DIRAUTH_LABELS, _GITLAB_OWN, after, cve_ids, digest,
     dirauth_user_set, effective_authority, folded_labels, gitlab_refs, has_invalid_text_chars,
-    is_dirauth_item, is_hackerone_item, is_trove_item, item_cluster, LIST_ARCHIVE_HOST,
+    is_dirauth_item, is_hackerone_item, is_housekeeping_item, is_trove_item, item_cluster, LIST_ARCHIVE_HOST,
     mandatory_news_rule, normalize_evidence, now_iso, parse_utc, release_mentions,
     safe_canonical_url, saved_object, strict_json, thread_subject, tor_core_user_set, trove_ids,
 )
@@ -41,6 +42,7 @@ HIGH_SECURITY_SEVERITIES = frozenset({"severity::high", "severity::critical"})
 # an item gets at most MAX_VERIFY_REPAIRS + 3 review requests.
 MAX_VERIFY_REPAIRS = 5
 MAX_REVIEW_REQUESTS = MAX_VERIFY_REPAIRS + 3
+MAX_SPECIALIST_REVIEW_REQUESTS = (MAX_VERIFY_REPAIRS + 1) * len(review.SPECIALISTS) + 2
 OFFICIAL_AUTHORITIES = frozenset({"official", "hackerone", "dirauth-operator"})
 OUTCOME_STAGES = {"approve": "approved", "skip": "skipped", "hold": "held", "route": "routed"}
 # Each hold reason and its operator text, which follows "Final review held: " in last_error. A hold
@@ -56,11 +58,13 @@ HOLDS = {
     "official_not_news": "review found an official item not newsworthy",
     "repairs_exhausted": "review still refused after the repair limit",
     "release_labels": "release labels need a released or tagged state",
+    "specialist_budget": "specialist verification could not complete all lenses",
     # review.final_holds, which holds a verified approval
     "completed_action": "the story reports a completed action that its sources do not",
     "compromise_headline": "the headline drops the sources' doubt about a compromise",
     "confirmed_source": "confirmed needs an official announcement or a merged merge request",
     "merge_state": "a story told only by merge requests must be marked merged",
+    "release_state": "an issue-only candidate cannot be marked released",
     "shouting_caps": "the candidate contains unnormalized all-caps shouting",
     "malformed_version": "the candidate cites a nonexistent three-part C-Tor version",
     "untrusted_operator_claim": "an uncorroborated mailing-list incident claim needs a trusted source",
@@ -107,10 +111,22 @@ def _load_job(db, item_id: str):
     return job, *(saved_object(job[k]) for k in ("draft", "envelope", "record"))
 
 
+def _max_review_requests(record=None, *, specialists: int = 1) -> int:
+    if specialists == len(review.SPECIALISTS) or (
+        isinstance(record, dict) and record.get("specialists") == len(review.SPECIALISTS)
+    ):
+        return MAX_SPECIALIST_REVIEW_REQUESTS
+    return MAX_REVIEW_REQUESTS
+
+
 def _carried_requests(record):
     """A different automatic review target invalidates proof, not spent requests."""
     ReviewRequests(record)
-    return {"request_budget": copy.deepcopy(record["request_budget"]),
+    extra = {"specialists": record["specialists"]} if record.get("specialists") == len(review.SPECIALISTS) else {}
+    if type(record.get("specialist_upgrade_at")) is int and extra:
+        extra["specialist_upgrade_at"] = record["specialist_upgrade_at"]
+    return {**extra,
+            "request_budget": copy.deepcopy(record["request_budget"]),
             "untrusted_proposals": [{**copy.deepcopy(proposal), "disposition": "discarded_context"}
                                     for proposal in record["untrusted_proposals"]]}
 
@@ -604,7 +620,7 @@ def _is_official(item: dict, prepared: dict) -> bool:
 
 def _is_editorial_news_tie(reviews: list[dict], *, mandatory: bool) -> bool:
     """Return True only when review and verification split strictly between approve and skip(news_value)."""
-    if mandatory or len(reviews) != 2 or any(entry.get("tiebreaker") for entry in reviews):
+    if mandatory or len(reviews) != 2 or any(entry.get("tiebreaker") or entry.get("specialists") for entry in reviews):
         return False
     first, second = reviews
     if first.get("stage") != "review" or second.get("stage") != "verification":
@@ -623,7 +639,7 @@ def _is_editorial_news_tie(reviews: list[dict], *, mandatory: bool) -> bool:
     )
 
 
-def next_step(reviews, candidate, prepared):
+def next_step(reviews, candidate, prepared, *, specialists: int = 1):
     """What follows the latest review of `candidate`, decided from the chain of reviews alone.
 
     ("route", story_id) attaches an unmapped item to an existing story, ("verify", text) sends text
@@ -639,7 +655,8 @@ def next_step(reviews, candidate, prepared):
     verdict = result["verdict"]
     failed = {name for name, check in result["criteria"].items() if check["outcome"] != "pass"}
     official = _is_official(item, prepared)
-    is_tiebreak_pair = _is_editorial_news_tie(reviews[:2], mandatory=mandatory)
+    needs_specialist_verify = specialists > 1 and stage == "verification" and not latest.get("specialists")
+    is_tiebreak_pair = specialists == 1 and _is_editorial_news_tie(reviews[:2], mandatory=mandatory)
     if len(reviews) == 3 and (latest.get("tiebreaker") or is_tiebreak_pair):
         new_info_ok = result["criteria"]["new_information"]["outcome"] == "pass"
         if not new_info_ok:
@@ -654,7 +671,7 @@ def next_step(reviews, candidate, prepared):
                 return "hold", ("verification", "official_not_news")
             return "skip", candidate
     else:
-        if len(reviews) == 2 and _is_editorial_news_tie(reviews, mandatory=mandatory):
+        if specialists == 1 and len(reviews) == 2 and _is_editorial_news_tie(reviews, mandatory=mandatory):
             return "tiebreak", candidate
         has_tiebreak = len(reviews) > 3 and (reviews[2].get("tiebreaker") or is_tiebreak_pair)
         news_anchor = reviews[2] if has_tiebreak else reviews[0]
@@ -674,7 +691,7 @@ def next_step(reviews, candidate, prepared):
                 if latest.get("issue") or len(reviews) > MAX_VERIFY_REPAIRS:
                     return "hold", (stage, "release_labels")
                 return "repair", candidate
-            return "approve", candidate
+            return ("verify" if needs_specialist_verify else "approve"), candidate
         return "hold", (stage, "model_hold")
     # An official item that fails only news value is the operator's to judge, once a fresh
     # verification has passed its facts; a duplicate still skips.
@@ -694,7 +711,11 @@ def next_step(reviews, candidate, prepared):
             result["criteria"]["new_information"]["outcome"] == "fail"
             and (prepared.get("mode") == "update" or not result.get("same_story"))
         ):
-            return ("verify" if stage == "review" and not later and _can_auto_merge_review(candidate, prepared, result) else "skip"), candidate
+            return (
+                "verify"
+                if (needs_specialist_verify or (stage == "review" and not later and _can_auto_merge_review(candidate, prepared, result)))
+                else "skip"
+            ), candidate
         if result.get("same_story") and stage == "review" and not later:
             return "verify", candidate
     if verdict == "approve":
@@ -705,7 +726,7 @@ def next_step(reviews, candidate, prepared):
             if latest.get("issue") or len(reviews) > MAX_VERIFY_REPAIRS:
                 return "hold", (stage, "release_labels")
             return "repair", candidate
-        return ("verify" if stage == "review" else "approve"), candidate
+        return ("verify" if (stage == "review" or needs_specialist_verify) else "approve"), candidate
     if verdict != "revise" or (later and failed & review.EDITORIAL_CRITERIA and not disputed):
         return "hold", (stage, "release_labels" if latest.get("issue") else "model_hold")
     if _literal_tag(prepared):
@@ -724,29 +745,46 @@ def next_step(reviews, candidate, prepared):
     return "verify", repaired
 
 
+def _next_step(reviews, candidate, prepared, *, specialists: int = 1):
+    if specialists != 1 and _supports_kwarg(next_step, "specialists"):
+        return next_step(reviews, candidate, prepared, specialists=specialists)
+    return next_step(reviews, candidate, prepared)
+
+
 class ReviewRequests:
     """Reserve endpoint attempts before sending; interruptions never replenish them."""
 
-    def __init__(self, record, persist=lambda: None):
+    def __init__(self, record, persist=lambda: None, *, specialists: int = 1):
         self.record, self.persist, self.actual = record, persist, 0
         if not isinstance(record, dict) or not isinstance(record.get("reviews"), list):
             raise AnalysisError("Saved review state is damaged", code="app.damaged_job")
+        if "specialists" in record and (
+            type(record["specialists"]) is not int or record["specialists"] != len(review.SPECIALISTS)
+        ):
+            raise AnalysisError("Saved review state is damaged", code="app.damaged_job")
+        self.max_requests = _max_review_requests(record, specialists=specialists)
         if "request_budget" not in record or not isinstance(record.get("untrusted_proposals"), list):
             raise AnalysisError("Saved review ledger is missing", code="app.damaged_job")
         state = record["request_budget"]
         if (not isinstance(state, dict) or set(state) != {"reserved", "inconsistent_requests", "validation_reask"}
                 or type(state.get("reserved")) is not int
-                or not len(record["reviews"]) <= state["reserved"] <= MAX_REVIEW_REQUESTS
+                or not len(record["reviews"]) <= state["reserved"] <= self.max_requests
                 or not isinstance(state.get("inconsistent_requests"), list)
                 or any(type(n) is not int or not 1 <= n <= state["reserved"] for n in state["inconsistent_requests"])
                 or state["inconsistent_requests"] != sorted(set(state["inconsistent_requests"]))):
             raise AnalysisError("Saved review request budget is damaged", code="app.damaged_job")
+        if "specialist_upgrade_at" in record:
+            upgrade_at = record["specialist_upgrade_at"]
+            if (record.get("specialists") != len(review.SPECIALISTS)
+                    or type(upgrade_at) is not int
+                    or not 1 <= upgrade_at <= min(MAX_REVIEW_REQUESTS, state["reserved"])):
+                raise AnalysisError("Saved review state is damaged", code="app.damaged_job")
         correction = state["validation_reask"]
         if correction is not None:
             if (not isinstance(correction, dict)
                     or set(correction) != {"trigger", "attempts", "response", "transport_failed"}
                     or type(correction.get("trigger")) is not int
-                    or not 1 <= correction["trigger"] < MAX_REVIEW_REQUESTS
+                    or not 1 <= correction["trigger"] < self.max_requests
                     or correction["trigger"] > state["reserved"]
                     or not isinstance(correction.get("attempts"), list)
                     or any(type(n) is not int or not correction["trigger"] < n <= state["reserved"]
@@ -776,7 +814,7 @@ class ReviewRequests:
                 if correction and (reask is None or reask["response"] is not None):
                     raise AnalysisError("Validation correction is not pending", code="app.damaged_job")
                 if delta == 1:
-                    if state["reserved"] >= MAX_REVIEW_REQUESTS:
+                    if state["reserved"] >= requests.max_requests:
                         raise review.ReviewLimitReached("Review request budget exhausted")
                     if correction and reask["attempts"] and not reask["transport_failed"]:
                         raise AnalysisError("Validation correction is already in flight", code="app.damaged_job")
@@ -873,11 +911,20 @@ def _validate_reask(record, stage):
     responses += [(proposal, True) for proposal in proposals]
     if any(type(entry.get("reask_response", False)) is not bool for entry, _ in responses):
         raise ValueError()
+    upgrade_at = record.get("specialist_upgrade_at")
     if correction is None:
         if triggers or any(entry.get("reask_response", False) for entry, _ in responses):
             raise ValueError()
-        if any(not p["accepted"] and p["request"] < MAX_REVIEW_REQUESTS for p in proposals):
-            raise ValueError()
+        for proposal in proposals:
+            if proposal["accepted"]:
+                continue
+            gov_cap = (
+                MAX_REVIEW_REQUESTS
+                if type(upgrade_at) is int and proposal["request"] <= upgrade_at
+                else _max_review_requests(record)
+            )
+            if proposal["request"] < gov_cap:
+                raise ValueError()
         return
     if len(triggers) != 1 or triggers[0]["request"] != correction["trigger"] or triggers[0]["accepted"]:
         raise ValueError()
@@ -924,9 +971,48 @@ def _pending_reask(record, stage, candidate, prepared):
     return True
 
 
+def _validate_specialist_entry(record: dict, entry: dict, proposals: list[dict]) -> None:
+    """Validate one saved 3-specialist verification entry and cross-check it against its merged result."""
+    if (record.get("specialists") != len(review.SPECIALISTS)
+            or entry.get("stage") != "verification"
+            or "tiebreaker" in entry or "issue" in entry
+            or not isinstance(entry["specialists"], list)
+            or [spec.get("specialist") for spec in entry["specialists"] if isinstance(spec, dict)] != list(review.SPECIALISTS)):
+        raise ValueError()
+    other_requests = (
+        {e.get("request") for e in record["reviews"] if e is not entry}
+        | {p.get("request") for p in proposals if p.get("disposition") != "discarded_context"}
+    )
+    spec_reqs: list[int] = []
+    for spec in entry["specialists"]:
+        if (not isinstance(spec, dict)
+                or set(spec) != {"specialist", "request", "verdict", "same_story", "failed"}
+                or type(spec["request"]) is not int or not 1 <= spec["request"] <= entry["request"]
+                or spec["request"] in other_requests
+                or spec["verdict"] not in review.VERDICTS
+                or (spec["verdict"] == "approve") != (not spec["failed"])
+                or (spec["same_story"] is not None
+                    and (not isinstance(spec["same_story"], str) or not review.STORY_ID_RE.fullmatch(spec["same_story"])))
+                or not isinstance(spec["failed"], list)
+                or any(crit not in review.CRITERIA for crit in spec["failed"])):
+            raise ValueError()
+        spec_reqs.append(spec["request"])
+    if len(set(spec_reqs)) != len(spec_reqs):
+        raise ValueError()
+    merged = entry["result"]
+    merged_criteria = merged["criteria"]
+    maj = 2 if len(entry["specialists"]) == 3 else len(entry["specialists"])
+    for crit in review.FACTUAL_CRITERIA:
+        in_domain_fail = any(crit in review.SPECIALIST_DOMAINS[spec["specialist"]] and crit in spec["failed"] for spec in entry["specialists"])
+        majority_fail = sum(crit in spec["failed"] for spec in entry["specialists"]) >= maj
+        if (in_domain_fail or majority_fail) and (merged_criteria[crit]["outcome"] == "pass" or merged["verdict"] == "approve"):
+            raise ValueError()
+
+
 def validate_review_state(record, stage, candidate, prepared, *, allow_cached=True):
     """Fail closed on damaged bookkeeping before it can reach a cached approval."""
-    budget = ReviewRequests(record).state
+    req_budget = ReviewRequests(record)
+    budget = req_budget.state
     proposals = record["untrusted_proposals"]
     dispositions = {"pending", "superseded_unverified", "discarded_context", "unusable", "literal_tag", "labels", "repeated",
                     "checked_approve", "checked_revise", "checked_hold", "checked_skip"}
@@ -939,7 +1025,7 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                 raise ValueError()
         elif not isinstance(prepared, dict):
             raise ValueError()
-        if len(proposals) > MAX_REVIEW_REQUESTS:
+        if len(proposals) > req_budget.max_requests:
             raise ValueError()
         for entry in record["reviews"]:
             if (not isinstance(entry, dict) or entry.get("stage") not in {"review", "verification"}
@@ -950,6 +1036,8 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                 raise ValueError()
             review.validate_review(entry["result"], prepared["packet"],
                                    update=prepared.get("mode") == "update", coverage=prepared.get("coverage"))
+            if "specialists" in entry:
+                _validate_specialist_entry(record, entry, proposals)
         for proposal in proposals:
             if (not isinstance(proposal, dict) or set(proposal) != fields
                     or proposal["error"] != review.INCONSISTENT_VERDICT
@@ -1005,6 +1093,36 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                     or any(entry["candidate_hash"] == waiting[0]["candidate_after_hash"]
                            and entry.get("request", 0) > waiting[0]["request"] for entry in record["reviews"])):
                 raise ValueError()
+        if "pending_specialist_wave" in record:
+            wave = record["pending_specialist_wave"]
+            correction = budget["validation_reask"]
+            if (stage != "verify" or record.get("specialists") != len(review.SPECIALISTS)
+                    or correction is None or correction["response"] is not None
+                    or not isinstance(wave, dict)
+                    or set(wave) != {"trigger", "candidate_hash", "context", "failed_specialist", "completed"}
+                    or wave["trigger"] != correction["trigger"]
+                    or wave["candidate_hash"] != digest(candidate)
+                    or wave["context"] != _context(prepared, record["policy_hash"])
+                    or wave["failed_specialist"] not in review.SPECIALISTS
+                    or not isinstance(wave["completed"], list)
+                    or [c.get("specialist") for c in wave["completed"] if isinstance(c, dict)]
+                    != [s for s in review.SPECIALISTS if s != wave["failed_specialist"]]):
+                raise ValueError()
+            other_requests = (
+                {e.get("request") for e in record["reviews"]}
+                | {p.get("request") for p in proposals if p.get("disposition") != "discarded_context"}
+            )
+            wave_reqs: list[int] = []
+            for comp in wave["completed"]:
+                if (not isinstance(comp, dict) or set(comp) != {"specialist", "request", "result"}
+                        or type(comp["request"]) is not int or not 1 <= comp["request"] < wave["trigger"]
+                        or comp["request"] in other_requests):
+                    raise ValueError()
+                review.validate_review(comp["result"], prepared["packet"],
+                                       update=prepared.get("mode") == "update", coverage=prepared.get("coverage"))
+                wave_reqs.append(comp["request"])
+            if len(set(wave_reqs)) != len(wave_reqs):
+                raise ValueError()
         _validate_candidate_path(record, stage, candidate, prepared, allow_cached=allow_cached)
     except (ValueError, TypeError, KeyError, AttributeError, review.ReviewError):
         raise AnalysisError("Saved review proposal state is damaged", code="app.damaged_job") from None
@@ -1041,7 +1159,7 @@ def _validate_candidate_path(record, stage, candidate, prepared, *, allow_cached
                     or any(entry.get(key) != value for key, value in context.items())):
                 raise ValueError()
             trusted.append(entry)
-            action, value = next_step(trusted, current, prepared)
+            action, value = _next_step(trusted, current, prepared, specialists=record.get("specialists", 1))
             last_action, last_value = action, value
             if action in {"verify", "repair", "tiebreak"}:
                 if digest(value) != digest(current) and digest(value) in seen:
@@ -1085,7 +1203,7 @@ def _validate_candidate_path(record, stage, candidate, prepared, *, allow_cached
     if stage == "routed" and last_action == "route" and record.get("routed_to") != last_value:
         raise ValueError()
     if (stage != expected_stage and not guarded_approval and not cached_terminal and not merged_handoff
-            and not (stage == "held" and record.get("hold_code") in {"missing_sources", "repeat_hold"})):
+            and not (stage == "held" and record.get("hold_code") in {"missing_sources", "repeat_hold", "specialist_budget"})):
         raise ValueError()
 
 
@@ -1101,7 +1219,11 @@ def _allowed_proposal(before, after, prepared, repair):
         candidate_mod.validate_approved(before, after, "update" if update else "story")
     except candidate_mod.ReviewRequired:
         return False
-    limits = review.repair_limits(prepared["packet"], prepared.get("coverage"), update=update, candidate_sources=before.get("sources"))
+    update_sources = (before.get("updates") or [{}])[-1].get("sources") if update else None
+    limits = review.repair_limits(
+        prepared["packet"], prepared.get("coverage"), update=update,
+        candidate_sources=before.get("sources"), update_sources=update_sources,
+    )
     return review.within_label_limits(repair, limits) and (update or review.within_label_limits(after, limits))
 
 
@@ -1123,7 +1245,7 @@ def recovery_status(record):
             "unresolved_inconsistency": unresolved}
 
 
-def _handle_inconsistent_review(stage, candidate, prepared, record, requests, failed, seen, waiting, correction):
+def _handle_inconsistent_review(stage, candidate, prepared, record, requests, failed, seen, waiting, *, correction, on_reask=None):
     """Record an inconsistent review reply and return ('verify', repaired) or ('reask', candidate)."""
     event = {"error": review.INCONSISTENT_VERDICT, "request": requests.state["reserved"], "stage": stage,
              "mode": prepared.get("mode", "story"),
@@ -1150,10 +1272,12 @@ def _handle_inconsistent_review(stage, candidate, prepared, record, requests, fa
             event["disposition"] = "repeated"
             raise review.ReviewError("Untrusted edit repeats a reviewed candidate")
     except review.ReviewError:
-        if requests.state["validation_reask"] is None and requests.state["reserved"] < MAX_REVIEW_REQUESTS:
+        if requests.state["validation_reask"] is None and requests.state["reserved"] < requests.max_requests:
             event["reask_trigger"] = True
             requests.state["validation_reask"] = {"trigger": event["request"], "attempts": [],
                                                    "response": None, "transport_failed": False}
+            if on_reask is not None:
+                on_reask(event["request"])
             requests.persist()
             return "reask", candidate
         requests.persist()
@@ -1190,7 +1314,9 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
     if correction and requests.state["validation_reask"]["response"] != requests.state["reserved"]:
         raise AnalysisError("Validation response was not observed", code="app.damaged_job")
     if failed is not None:
-        outcome = _handle_inconsistent_review(stage, candidate, prepared, record, requests, failed, seen, waiting, correction)
+        outcome = _handle_inconsistent_review(
+            stage, candidate, prepared, record, requests, failed, seen, waiting, correction=correction,
+        )
         if outcome[0] == "reask":
             # The correction keeps this exact stage and candidate. Invalid
             # criteria are still absent from the trusted review history.
@@ -1208,7 +1334,7 @@ def advance_review(reviewer, stage, candidate, prepared, record, requests):
             raise AnalysisError("Proposal verification identity changed", code="app.damaged_job")
         waiting["disposition"] = "checked_" + entry["result"]["verdict"]
     record["reviews"].append({**entry, **_context(prepared, record["policy_hash"])})
-    action, value = next_step(record["reviews"], candidate, prepared)
+    action, value = _next_step(record["reviews"], candidate, prepared, specialists=record.get("specialists", 1))
     if action in {"verify", "repair"} and digest(value) != digest(candidate) and digest(value) in seen:
         return "hold", ("verification" if stage in {"verify", "tiebreak"} else "review", "repeated_repair")
     return action, value
@@ -1265,6 +1391,7 @@ def _attach_item(store, row: dict, draft: dict, writer_key: str, routed_record: 
 
 def _hold(store, row, draft, writer_key, record, observed, stage, reason):
     """One semantic hold is terminal; only source change/operator retry requeues."""
+    record.pop("pending_specialist_wave", None)
     record.update(outcome="held", hold_code=reason, hold_reason=HOLDS[reason],
                   verified_facts=not proposal_needs_check(record) and _verified(record["reviews"]))
     with store.db:
@@ -1380,15 +1507,6 @@ _DUP_LABELS = frozenset({"duplicate", "status::duplicate"})
 _DUP_SECURITY_GUARD_RE = re.compile(
     r"\b(?:vulnerabilit\w*|exploit\w*|null[- ]?(?:pointer[- ]|ptr[- ])?deref\w*|use[- ]after[- ]free|buffer\s+overflow|"
     r"out[- ]of[- ]bounds|remote\s+code(?:\s+execution)?)\b",
-    re.I,
-)
-_HOUSEKEEPING_TITLE_RE = re.compile(
-    r"(?:\brelease\s+checklist\b|\bversion\s+bump\b|\bbump(?:ing)?\s+(?:version|deps|dependencies)\b"
-    r"|\bforward[- ]port\b.*\bchangelogs?\b|^update\s+changelogs?\b|^clean\s*up\s+comments?\b"
-    r"|^fix\s+(?:whitespace|formatting|lint(?:ing)?|clippy)\b|^bump\s+(?:cargo\.lock|lockfile)\b"
-    r"|\b(?:cargo|package|yarn|poetry|uv)\.lock\b|\blockfile\b"
-    r"|\b(?:dependabot|renovate)\b|^(?:chore|ci|typo|housekeeping|l10n|i18n|translations?)\s*:)"
-    r"|\bminor\s+typo\b|\bfix(?:es|ing)?\s+(?:a\s+)?typo\b",
     re.I,
 )
 _PURE_ACK_RE = re.compile(
@@ -1540,13 +1658,12 @@ def _eval_deterministic_skip(
         and not (existing is not None and item.get("upstream_state") == "closed")
     ):
         return "skipped.gate.housekeeping", "Routine acknowledgment or no-content reply"
-    cleaned_title, _ = _strip_subject_prefixes(item.get("title"))
     if (
         existing is None
         and not item.get("public_comments")
-        and _HOUSEKEEPING_TITLE_RE.search(cleaned_title)
+        and (housekeeping := is_housekeeping_item(item)) is not None
     ):
-        return "skipped.gate.housekeeping", "Routine checklist or housekeeping item"
+        return housekeeping
     return None
 
 
@@ -1648,44 +1765,444 @@ class _WorkerRequestObserver(RequestObserver):
             else:
                 raise ValueError("Invalid review request accounting")
 
+    def response_received(self) -> None:
+        """Disallow post-response refunds once a completion response has been received."""
+        with self._lock:
+            self._can_refund = False
 
-def _parallel_initial_review(reviewer_factory, candidate, prepared, record, requests, *, on_verify, save_verify):
-    """Run initial review and speculative verification concurrently without SQLite calls in worker threads."""
+    def transport_failed(self) -> None:
+        """Disallow refunds once a transport attempt has already been dispatched."""
+        with self._lock:
+            self._can_refund = False
+
+
+def _supports_kwarg(fn, name: str) -> bool:
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(param.name == name or param.kind == inspect.Parameter.VAR_KEYWORD for param in params)
+
+
+def _writer_cache_options(writer) -> tuple[int, bool | None]:
+    """Return `(best_of, quote_digest)` matching how `writer` builds drafts."""
+    best_of = getattr(writer, "best_of", 1)
+    if type(best_of) is not int or best_of < 1:
+        best_of = 1
+    quote_digest = True if getattr(writer, "quote_digest", None) is True else None
+    return best_of, quote_digest
+
+
+def _require_specialist_support(rev) -> None:
+    if rev is None or not _supports_kwarg(rev.review, "specialist"):
+        raise TypeError("Reviewer does not accept required 'specialist' keyword argument")
+
+
+def _call_reviewer_worker(reviewer_factory, candidate, prepared, obs: _WorkerRequestObserver, *,
+                          is_verify: bool, specialist: str | None = None, close_worker: bool = True):
+    try:
+        rev = reviewer_factory()
+        kwargs = {
+            "coverage": copy.deepcopy(prepared["coverage"]),
+            "verification": is_verify,
+            "on_request": obs,
+            **({"update": True} if prepared.get("mode") == "update" else {}),
+        }
+
+        def _invoke():
+            if specialist is not None:
+                _require_specialist_support(rev)
+                kwargs["specialist"] = specialist
+            return rev.review(copy.deepcopy(candidate), copy.deepcopy(prepared["packet"]), **kwargs), None
+
+        if close_worker and hasattr(rev, "__enter__") and hasattr(rev, "__exit__"):
+            with rev:
+                return _invoke()
+        try:
+            return _invoke()
+        finally:
+            if close_worker and hasattr(rev, "close"):
+                rev.close()
+    except Exception as exc:
+        return None, exc
+
+
+def _reask_specialist_worker(reviewer_factory, reviewer, candidate, prepared, requests, *, specialist: str):
+    """Run one validation-reask call for the single failed specialist lens."""
+    obs = requests.callback(correction=True)
+    if reviewer_factory is not None:
+        rev = reviewer_factory()
+        close_after = True
+    else:
+        rev = reviewer
+        close_after = False
+    kwargs = {
+        "coverage": copy.deepcopy(prepared["coverage"]),
+        "verification": True,
+        "specialist": specialist,
+        "validation_error": review.INCONSISTENT_VERDICT,
+        "on_request": obs,
+        **({"update": True} if prepared.get("mode") == "update" else {}),
+    }
+
+    def _invoke():
+        _require_specialist_support(rev)
+        return rev.review(copy.deepcopy(candidate), copy.deepcopy(prepared["packet"]), **kwargs)
+
+    try:
+        if close_after and hasattr(rev, "__enter__") and hasattr(rev, "__exit__"):
+            with rev:
+                res = _invoke()
+        else:
+            try:
+                res = _invoke()
+            finally:
+                if close_after and hasattr(rev, "close"):
+                    rev.close()
+    except review.InconsistentReview as exc:
+        return None, exc
+    except Exception:
+        reask = requests.state["validation_reask"]
+        if reask is not None and reask["response"] is not None and requests.record.pop("pending_specialist_wave", None) is not None:
+            requests.persist()
+        raise
+    if requests.state["validation_reask"]["response"] != requests.state["reserved"]:
+        raise AnalysisError("Validation response was not observed", code="app.damaged_job")
+    return res, None
+
+
+def _specialist_meta(spec_results: list[dict], s_used_list: list[int], base_offset: int, max_req: int, *,
+                     failed_idx: int | None = None, reask_req: int | None = None) -> list[dict]:
+    meta: list[dict | None] = [None] * len(review.SPECIALISTS)
+    running = base_offset
+    for idx, (specialist, used, res) in enumerate(zip(review.SPECIALISTS, s_used_list, spec_results)):
+        if idx == failed_idx:
+            continue
+        running += used
+        req_num = max(1, min(max_req, running))
+        meta[idx] = {
+            "specialist": specialist,
+            "request": req_num,
+            "verdict": res["verdict"],
+            "same_story": res.get("same_story"),
+            "failed": [crit for crit in review.CRITERIA if res["criteria"][crit]["outcome"] != "pass"],
+        }
+    if failed_idx is not None and reask_req is not None:
+        res = spec_results[failed_idx]
+        meta[failed_idx] = {
+            "specialist": review.SPECIALISTS[failed_idx],
+            "request": reask_req,
+            "verdict": res["verdict"],
+            "same_story": res.get("same_story"),
+            "failed": [crit for crit in review.CRITERIA if res["criteria"][crit]["outcome"] != "pass"],
+        }
+    return [entry for entry in meta if entry is not None]
+
+
+def _pending_specialist_wave_data(
+    spec_results: list[dict], s_used_list: list[int], base_offset: int, trigger_req: int,
+    failed_idx: int, cand_hash: str, ctx: dict,
+) -> dict:
+    running = base_offset
+    completed: list[dict] = []
+    upper = max(1, trigger_req - 1)
+    for idx, (specialist, used, res) in enumerate(zip(review.SPECIALISTS, s_used_list, spec_results)):
+        if idx == failed_idx:
+            continue
+        running += used
+        req_num = max(1, min(upper, running))
+        completed.append({"specialist": specialist, "request": req_num, "result": copy.deepcopy(res)})
+    return {
+        "trigger": trigger_req,
+        "candidate_hash": cand_hash,
+        "context": copy.deepcopy(ctx),
+        "failed_specialist": review.SPECIALISTS[failed_idx],
+        "completed": completed,
+    }
+
+
+def _resume_specialist_reask(reviewer_factory, reviewer, candidate, prepared, record, requests):
+    """Resume an interrupted single-lens validation reask using saved sibling specialist replies."""
+    wave = record.get("pending_specialist_wave")
+    cand_hash = digest(candidate)
+    ctx = _context(prepared, record["policy_hash"])
+    if not isinstance(wave, dict) or wave.get("candidate_hash") != cand_hash or wave.get("context") != ctx:
+        raise AnalysisError("Validation correction wave changed", code="app.damaged_job")
+    waiting = pending_proposal(record)
+    seen = _seen_candidates(record, candidate, prepared)
+    trigger_req = wave["trigger"]
+    failed_specialist = wave["failed_specialist"]
+    reask_res, reask_exc = _reask_specialist_worker(
+        reviewer_factory, reviewer, candidate, prepared, requests,
+        specialist=failed_specialist,
+    )
+    if reask_exc is not None:
+        record.pop("pending_specialist_wave", None)
+        if requests.state["reserved"] > trigger_req:
+            return _handle_inconsistent_review(
+                "verify", candidate, prepared, record, requests, reask_exc,
+                seen, waiting, correction=True,
+            )
+        requests.persist()
+        raise reask_exc
+    reask_req = requests.state["reserved"]
+    by_spec = {entry["specialist"]: (entry["request"], entry["result"]) for entry in wave["completed"]}
+    by_spec[failed_specialist] = (reask_req, reask_res)
+    record.pop("pending_specialist_wave", None)
+    spec_results = [by_spec[spec][1] for spec in review.SPECIALISTS]
+    merged = review.merge_specialist_verdicts(
+        spec_results, candidate, prepared["packet"],
+        update=prepared.get("mode") == "update", coverage=prepared["coverage"],
+    )
+    meta = [
+        {
+            "specialist": spec,
+            "request": by_spec[spec][0],
+            "verdict": by_spec[spec][1]["verdict"],
+            "same_story": by_spec[spec][1].get("same_story"),
+            "failed": [crit for crit in review.CRITERIA if by_spec[spec][1]["criteria"][crit]["outcome"] != "pass"],
+        }
+        for spec in review.SPECIALISTS
+    ]
+    ver_entry = {
+        "stage": "verification",
+        "reask_response": True,
+        "candidate_hash": cand_hash,
+        "request": reask_req,
+        "result": merged,
+        "specialists": meta,
+        **ctx,
+    }
+    if waiting is not None:
+        if ver_entry["candidate_hash"] != waiting["candidate_after_hash"]:
+            raise AnalysisError("Proposal verification identity changed", code="app.damaged_job")
+        waiting["disposition"] = "checked_" + merged["verdict"]
+    record["reviews"].append(ver_entry)
+    action, value = _next_step(record["reviews"], candidate, prepared, specialists=record.get("specialists", 1))
+    if action in {"verify", "repair"} and digest(value) != cand_hash and digest(value) in _seen_candidates(record, candidate, prepared):
+        return "hold", ("verification", "repeated_repair")
+    return action, value
+
+
+def _resolve_specialist_wave(spec_outcomes, s_used_list: list[int], candidate, prepared, record, requests,
+                             *, base_offset: int, cand_hash: str, ctx: dict, waiting=None,
+                             on_non_inconsistent=None, reviewer_factory=None, reviewer=None):
+    results, excs = zip(*spec_outcomes)
+    non_inconsistent = [(idx, exc) for idx, exc in enumerate(excs)
+                        if exc is not None and not isinstance(exc, review.InconsistentReview)]
+    if non_inconsistent:
+        if on_non_inconsistent is not None:
+            on_non_inconsistent()
+        else:
+            requests.persist()
+        raise non_inconsistent[0][1]
+
+    reasked = False
+    spec_results = list(results)
+    failed_idx: int | None = None
+    reask_req: int | None = None
+    inconsistent = [(idx, exc) for idx, exc in enumerate(excs)
+                    if isinstance(exc, review.InconsistentReview) and s_used_list[idx] > 0]
+    if inconsistent:
+        if len(inconsistent) > 1:
+            requests.persist()
+            raise inconsistent[0][1]
+        failed_idx, inc_exc = inconsistent[0]
+        seen = _seen_candidates(record, candidate, prepared)
+
+        def _attach_pending_wave(trigger_req_num: int) -> None:
+            record["pending_specialist_wave"] = _pending_specialist_wave_data(
+                spec_results, s_used_list, base_offset, trigger_req_num, failed_idx, cand_hash, ctx,
+            )
+
+        step = _handle_inconsistent_review(
+            "verify", candidate, prepared, record, requests, inc_exc,
+            seen, waiting, correction=False, on_reask=_attach_pending_wave,
+        )
+        if step[0] == "verify":
+            return step
+        trigger_req = requests.state["reserved"]
+        reask_res, reask_exc = _reask_specialist_worker(
+            reviewer_factory, reviewer, candidate, prepared, requests,
+            specialist=review.SPECIALISTS[failed_idx],
+        )
+        if reask_exc is not None:
+            record.pop("pending_specialist_wave", None)
+            if requests.state["reserved"] > trigger_req:
+                return _handle_inconsistent_review(
+                    "verify", candidate, prepared, record, requests, reask_exc,
+                    seen, waiting, correction=True,
+                )
+            requests.persist()
+            raise reask_exc
+        record.pop("pending_specialist_wave", None)
+        spec_results[failed_idx] = reask_res
+        reasked = True
+        reask_req = requests.state["reserved"]
+
+    merged = review.merge_specialist_verdicts(
+        spec_results, candidate, prepared["packet"],
+        update=prepared.get("mode") == "update", coverage=prepared["coverage"],
+    )
+    max_req = requests.state["reserved"]
+    ver_entry = {
+        "stage": "verification",
+        **({"reask_response": True} if reasked else {}),
+        "candidate_hash": cand_hash,
+        "request": max_req,
+        "result": merged,
+        "specialists": _specialist_meta(
+            spec_results, s_used_list, base_offset, max_req, failed_idx=failed_idx, reask_req=reask_req,
+        ),
+        **ctx,
+    }
+    if waiting is not None:
+        if ver_entry["candidate_hash"] != waiting["candidate_after_hash"]:
+            raise AnalysisError("Proposal verification identity changed", code="app.damaged_job")
+        waiting["disposition"] = "checked_" + merged["verdict"]
+    record["reviews"].append(ver_entry)
+    action, value = _next_step(record["reviews"], candidate, prepared, specialists=record.get("specialists", 1))
+    if action in {"verify", "repair"} and digest(value) != cand_hash and digest(value) in _seen_candidates(record, candidate, prepared):
+        return "hold", ("verification", "repeated_repair")
+    return action, value
+
+
+def _parallel_specialist_verify(reviewer_factory, candidate, prepared, record, requests, *,
+                                reviewer=None, specialists: int = 3):
+    """Run all specialist verification passes concurrently and synthesize their verdicts fail-closed."""
+    if specialists != len(review.SPECIALISTS):
+        raise ValueError("specialists must match review.SPECIALISTS")
+    validate_review_state(record, "verify", candidate, prepared)
+    waiting = pending_proposal(record)
     base_reserved = requests.state["reserved"]
-    requests.callback()(1)
-    requests.callback()(1)
+    spec_count = len(review.SPECIALISTS)
+    for _ in range(spec_count):
+        requests.callback()(1)
     lock = threading.Lock()
     shared_used = [0]
-    max_pool = MAX_REVIEW_REQUESTS - base_reserved
-    obs_rev = _WorkerRequestObserver(lock, shared_used, max_pool)
-    obs_ver = _WorkerRequestObserver(lock, shared_used, max_pool)
-    is_update = prepared.get("mode") == "update"
+    obs_specs = [_WorkerRequestObserver(lock, shared_used, spec_count) for _ in review.SPECIALISTS]
     cand_hash = digest(candidate)
     ctx = _context(prepared, record["policy_hash"])
 
-    def _call(is_verify: bool, obs: _WorkerRequestObserver):
-        try:
-            rev = reviewer_factory()
-            kwargs = {
-                "coverage": copy.deepcopy(prepared["coverage"]),
-                "verification": is_verify,
-                "on_request": obs,
-                **({"update": True} if is_update else {}),
-            }
-            if hasattr(rev, "__enter__") and hasattr(rev, "__exit__"):
-                with rev:
-                    return rev.review(copy.deepcopy(candidate), copy.deepcopy(prepared["packet"]), **kwargs), None
-            try:
-                return rev.review(copy.deepcopy(candidate), copy.deepcopy(prepared["packet"]), **kwargs), None
-            finally:
-                if hasattr(rev, "close"):
-                    rev.close()
-        except Exception as exc:
-            return None, exc
+    with ThreadPoolExecutor(max_workers=spec_count) as pool:
+        futs = [
+            pool.submit(_call_reviewer_worker, reviewer_factory, candidate, prepared, obs, is_verify=True, specialist=spec)
+            for spec, obs in zip(review.SPECIALISTS, obs_specs)
+        ]
+        outcomes = [fut.result() for fut in futs]
+
+    s_used_list = [obs.used for obs in obs_specs]
+    total_s_used = sum(s_used_list)
+    requests.actual += total_s_used - spec_count
+    requests.state["reserved"] = base_reserved + total_s_used
+    return _resolve_specialist_wave(
+        outcomes, s_used_list, candidate, prepared, record, requests,
+        base_offset=base_reserved, cand_hash=cand_hash, ctx=ctx, waiting=waiting,
+        reviewer_factory=reviewer_factory, reviewer=reviewer,
+    )
+
+
+def _sequential_specialist_verify(reviewer, candidate, prepared, record, requests, *, specialists: int = 3):
+    """Run all specialist verification passes sequentially using `reviewer` without closing it."""
+    if specialists != len(review.SPECIALISTS):
+        raise ValueError("specialists must match review.SPECIALISTS")
+    validate_review_state(record, "verify", candidate, prepared)
+    waiting = pending_proposal(record)
+    base_reserved = requests.state["reserved"]
+    spec_count = len(review.SPECIALISTS)
+    for _ in range(spec_count):
+        requests.callback()(1)
+    lock = threading.Lock()
+    shared_used = [0]
+    obs_specs = [_WorkerRequestObserver(lock, shared_used, spec_count) for _ in review.SPECIALISTS]
+    cand_hash = digest(candidate)
+    ctx = _context(prepared, record["policy_hash"])
+    outcomes = [
+        _call_reviewer_worker(
+            lambda: reviewer, candidate, prepared, obs, is_verify=True, specialist=spec, close_worker=False,
+        )
+        for spec, obs in zip(review.SPECIALISTS, obs_specs)
+    ]
+    s_used_list = [obs.used for obs in obs_specs]
+    total_s_used = sum(s_used_list)
+    requests.actual += total_s_used - spec_count
+    requests.state["reserved"] = base_reserved + total_s_used
+    return _resolve_specialist_wave(
+        outcomes, s_used_list, candidate, prepared, record, requests,
+        base_offset=base_reserved, cand_hash=cand_hash, ctx=ctx, waiting=waiting,
+        reviewer=reviewer,
+    )
+
+
+def _parallel_initial_review(reviewer_factory, candidate, prepared, record, requests, *, on_verify, save_verify,
+                             specialists: int = 1, reviewer=None):
+    """Run initial review and speculative verification concurrently without SQLite calls in worker threads."""
+    if specialists not in (1, len(review.SPECIALISTS)):
+        raise ValueError("specialists must be 1 or 3")
+    base_reserved = requests.state["reserved"]
+    lock = threading.Lock()
+    shared_used = [0]
+    cand_hash = digest(candidate)
+    ctx = _context(prepared, record["policy_hash"])
+
+    if specialists == len(review.SPECIALISTS):
+        total_slots = 1 + len(review.SPECIALISTS)
+        for _ in range(total_slots):
+            requests.callback()(1)
+        obs_rev = _WorkerRequestObserver(lock, shared_used, total_slots)
+        obs_specs = [_WorkerRequestObserver(lock, shared_used, total_slots) for _ in review.SPECIALISTS]
+        with ThreadPoolExecutor(max_workers=total_slots) as pool:
+            fut_rev = pool.submit(_call_reviewer_worker, reviewer_factory, candidate, prepared, obs_rev, is_verify=False)
+            fut_specs = [
+                pool.submit(_call_reviewer_worker, reviewer_factory, candidate, prepared, obs, is_verify=True, specialist=spec)
+                for spec, obs in zip(review.SPECIALISTS, obs_specs)
+            ]
+            rev_res, rev_exc = fut_rev.result()
+            spec_outcomes = [fut.result() for fut in fut_specs]
+
+        r_used = obs_rev.used
+        s_used_list = [obs.used for obs in obs_specs]
+        total_s_used = sum(s_used_list)
+        requests.actual += r_used + total_s_used - total_slots
+        if rev_exc is not None:
+            if isinstance(rev_exc, review.InconsistentReview) and r_used > 0:
+                requests.state["reserved"] = base_reserved + total_s_used + r_used
+                step = _handle_inconsistent_review(
+                    "review", candidate, prepared, record, requests, rev_exc,
+                    _seen_candidates(record, candidate, prepared), None, correction=False,
+                )
+                return ("review", candidate) if step[0] == "reask" else step
+            requests.state["reserved"] = base_reserved + r_used + total_s_used
+            requests.persist()
+            raise rev_exc
+
+        requests.state["reserved"] = base_reserved + r_used + total_s_used
+        rev_entry = {"stage": "review", "candidate_hash": cand_hash,
+                     "request": base_reserved + r_used, "result": rev_res, **ctx}
+        record["reviews"].append(rev_entry)
+        seen = _seen_candidates(record, candidate, prepared)
+        action, value = _next_step(record["reviews"], candidate, prepared, specialists=specialists)
+        if action in {"verify", "repair"} and digest(value) != cand_hash and digest(value) in seen:
+            action, value = "hold", ("review", "repeated_repair")
+
+        if not (action == "verify" and digest(value) == cand_hash):
+            return action, value
+
+        on_verify()
+        return _resolve_specialist_wave(
+            spec_outcomes, s_used_list, candidate, prepared, record, requests,
+            base_offset=base_reserved + r_used, cand_hash=cand_hash, ctx=ctx,
+            on_non_inconsistent=save_verify, reviewer_factory=reviewer_factory, reviewer=reviewer,
+        )
+
+    requests.callback()(1)
+    requests.callback()(1)
+    obs_rev = _WorkerRequestObserver(lock, shared_used, 2)
+    obs_ver = _WorkerRequestObserver(lock, shared_used, 2)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        fut_rev = pool.submit(_call, False, obs_rev)
-        fut_ver = pool.submit(_call, True, obs_ver)
+        fut_rev = pool.submit(_call_reviewer_worker, reviewer_factory, candidate, prepared, obs_rev, is_verify=False)
+        fut_ver = pool.submit(_call_reviewer_worker, reviewer_factory, candidate, prepared, obs_ver, is_verify=True)
         rev_res, rev_exc = fut_rev.result()
         ver_res, ver_exc = fut_ver.result()
 
@@ -1696,7 +2213,7 @@ def _parallel_initial_review(reviewer_factory, candidate, prepared, record, requ
             requests.state["reserved"] = base_reserved + v_used + r_used
             step = _handle_inconsistent_review(
                 "review", candidate, prepared, record, requests, rev_exc,
-                _seen_candidates(record, candidate, prepared), None, False,
+                _seen_candidates(record, candidate, prepared), None, correction=False,
             )
             return ("review", candidate) if step[0] == "reask" else step
         requests.state["reserved"] = base_reserved + r_used + v_used
@@ -1708,7 +2225,7 @@ def _parallel_initial_review(reviewer_factory, candidate, prepared, record, requ
                  "request": base_reserved + r_used, "result": rev_res, **ctx}
     record["reviews"].append(rev_entry)
     seen = _seen_candidates(record, candidate, prepared)
-    action, value = next_step(record["reviews"], candidate, prepared)
+    action, value = _next_step(record["reviews"], candidate, prepared, specialists=specialists)
     if action in {"verify", "repair"} and digest(value) != cand_hash and digest(value) in seen:
         action, value = "hold", ("review", "repeated_repair")
 
@@ -1720,7 +2237,7 @@ def _parallel_initial_review(reviewer_factory, candidate, prepared, record, requ
         if isinstance(ver_exc, review.InconsistentReview) and v_used > 0:
             step = _handle_inconsistent_review(
                 "verify", candidate, prepared, record, requests, ver_exc,
-                _seen_candidates(record, candidate, prepared), None, False,
+                _seen_candidates(record, candidate, prepared), None, correction=False,
             )
             return ("verify", candidate) if step[0] == "reask" else step
         save_verify()
@@ -1729,14 +2246,34 @@ def _parallel_initial_review(reviewer_factory, candidate, prepared, record, requ
     ver_entry = {"stage": "verification", "candidate_hash": cand_hash,
                  "request": base_reserved + r_used + v_used, "result": ver_res, **ctx}
     record["reviews"].append(ver_entry)
-    action, value = next_step(record["reviews"], candidate, prepared)
+    action, value = _next_step(record["reviews"], candidate, prepared, specialists=specialists)
     if action in {"verify", "repair"} and digest(value) != cand_hash and digest(value) in _seen_candidates(record, candidate, prepared):
         return "hold", ("verification", "repeated_repair")
     return action, value
 
 
+def _has_specialist_evidence(rec: dict, cand_hash: str, required: int, *, verdict_name: str | None = None) -> bool:
+    if required <= 1:
+        return True
+    if rec.get("specialists") != required:
+        return False
+    verifications = [
+        entry for entry in rec.get("reviews", ())
+        if isinstance(entry, dict)
+        and entry.get("stage") == "verification"
+        and entry.get("candidate_hash") == cand_hash
+    ]
+    if verdict_name == "approve" or verifications:
+        if not verifications:
+            return False
+        specs = verifications[-1].get("specialists")
+        if not isinstance(specs, list) or [s.get("specialist") for s in specs if isinstance(s, dict)] != list(review.SPECIALISTS):
+            return False
+    return True
+
+
 def process_item(config, store, row, writer, reviewer, observed=None, *, allow_network=True,
-                 parallel_verify=False, reviewer_factory=None):
+                 parallel_verify=False, reviewer_factory=None, specialists: int = 1):
     """Resume writer → exact-candidate review → fresh verification of each approved or repaired text → commit.
 
     Transport errors leave the current stage durable and raise a retryable
@@ -1745,6 +2282,8 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
     a saved job that cannot be read does. next_step bounds the repairs; a hold
     marks the item rejected immediately.
     """
+    if specialists not in (1, len(review.SPECIALISTS)):
+        raise ValueError("specialists must be 1 or 3")
     observed = observed or now_iso()
     report = {"status": "pending", "writer_calls": 0, "review_calls": 0, "cache_hit": False}
 
@@ -1781,7 +2320,10 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
     except candidate_mod.StaleCandidate:
         return {**report, "status": "stale"}
 
-    writer_key = cache_key(row, config["llm"], prior)
+    writer_best_of, writer_quote_digest = _writer_cache_options(writer)
+    writer_key = cache_key(
+        row, config["llm"], prior, best_of=writer_best_of, quote_digest=writer_quote_digest, item=writer_item,
+    )
     locked_reuse = (job is not None and existing is not None and editorial.is_locked(store.db, existing["id"])
                     and same_source and saved_draft is not None)
     carry = None
@@ -1875,6 +2417,10 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             # The same candidate held before: a source reverted to a held revision,
             # or an item was requeued without reset_review_work. Do not review it again.
             return _hold_item("gate", "repeat_hold")
+        effective_specialists = max(
+            specialists,
+            record.get("specialists", 1) if isinstance(record.get("specialists"), int) else 1,
+        )
         key = _approval_key(candidate, prepared, policy)
         cached = None if proposal_needs_check(record) else store.db.execute(
             """SELECT CASE WHEN typeof(result_json)='text' THEN CAST(result_json AS BLOB) END AS result_blob,
@@ -1882,6 +2428,8 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                FROM review_approvals WHERE key=?""",
             (key,),
         ).fetchone()
+        cached_proof = None
+        cached_verdict = None
         if cached is not None:
             try:
                 raw_verdict, proof = saved_object(cached["result_blob"]), saved_object(cached["record_blob"])
@@ -1904,44 +2452,57 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                 with store.db:
                     store.db.execute("DELETE FROM review_approvals WHERE key=?", (key,))
             else:
-                record["approval"] = proof
-                record["approval_key"] = key
-                if verdict["verdict"] == "approve" and (held := review.final_holds(candidate, prepared)):
-                    return _hold_item("final_check", held[0], cache_hit=True)
-                return _commit_decision(verdict["verdict"], key, cache_hit=True)
+                if _has_specialist_evidence(proof, digest(candidate), effective_specialists, verdict_name=verdict["verdict"]):
+                    cached_proof = proof
+                    cached_verdict = verdict
+        if cached_proof is not None and cached_verdict is not None:
+            record["approval"] = cached_proof
+            record["approval_key"] = key
+            if cached_verdict["verdict"] == "approve" and (held := review.final_holds(candidate, prepared)):
+                return _hold_item("final_check", held[0], cache_hit=True)
+            return _commit_decision(cached_verdict["verdict"], key, cache_hit=True)
         if (
             stage == "approved"
             and not proposal_needs_check(record)
             and record.get("outcome") == "approved"
             and record.get("approval_key") == key
             and job["approval_key"] == key
+            and _has_specialist_evidence(record, digest(candidate), effective_specialists, verdict_name="approve")
             and record.get("reviews")
             and record["reviews"][-1]["result"]["verdict"] != "approve"
             and mandatory_news_rule({
                 **item_payload,
                 "authority": effective_authority(item_payload, prepared.get("dirauth_users"), prepared.get("tor_core_users")),
             }) is not None
-            and next_step(record["reviews"], candidate, prepared) == ("approve", candidate)
+            and _next_step(record["reviews"], candidate, prepared, specialists=record.get("specialists", 1)) == ("approve", candidate)
         ):
             if held := review.final_holds(candidate, prepared):
                 return _hold_item("final_check", held[0])
             return _commit_decision("approve", key)
         if stage in {"approved", "skipped"}:  # without a usable receipt, review the writer's draft again
             stage, candidate, record = "review", prepared["candidate"], fresh
-        requests = ReviewRequests(record, lambda: _save_job(stage))
+        if effective_specialists > 1 and record.get("specialists") != effective_specialists:
+            upgrade_at = record["request_budget"]["reserved"]
+            if stage == "tiebreak" or any(entry.get("tiebreaker") for entry in record["reviews"]):
+                stage, candidate, record = "review", prepared["candidate"], fresh
+            if upgrade_at > 0 and "specialist_upgrade_at" not in record:
+                record["specialist_upgrade_at"] = upgrade_at
+            record["specialists"] = effective_specialists
+        requests = ReviewRequests(record, lambda: _save_job(stage), specialists=effective_specialists)
 
         def _enter_verify() -> None:
             nonlocal stage
             stage = "verify"
             record["candidate"] = candidate
 
+        needed_initial = (len(review.SPECIALISTS) + 2) if effective_specialists > 1 else 3
         use_parallel = (
             parallel_verify
             and stage == "review"
             and not record["reviews"]
             and allow_network
             and reviewer_factory is not None
-            and requests.state["reserved"] + 3 <= MAX_REVIEW_REQUESTS
+            and requests.state["reserved"] + needed_initial <= requests.max_requests
             and not proposal_needs_check(record)
         )
         while True:
@@ -1954,7 +2515,40 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                         reviewer_factory, candidate, prepared, record, requests,
                         on_verify=_enter_verify,
                         save_verify=lambda: _save_job("verify"),
+                        specialists=effective_specialists,
+                        reviewer=reviewer,
                     )
+                elif effective_specialists > 1 and stage == "verify":
+                    if _pending_reask(record, stage, candidate, prepared):
+                        reask_factory = reviewer_factory if (parallel_verify and reviewer_factory is not None) else None
+                        if record.get("pending_specialist_wave"):
+                            if (
+                                requests.state["reserved"] < requests.max_requests
+                                and (reask_factory is not None or _supports_kwarg(reviewer.review, "specialist"))
+                            ):
+                                action, value = _resume_specialist_reask(
+                                    reask_factory, reviewer, candidate, prepared, record, requests,
+                                )
+                            else:
+                                action, value = "hold", ("verification", "specialist_budget")
+                        elif requests.state["reserved"] < requests.max_requests:
+                            action, value = advance_review(reviewer, stage, candidate, prepared, record, requests)
+                        else:
+                            action, value = "hold", ("verification", "specialist_budget")
+                    elif requests.state["reserved"] + len(review.SPECIALISTS) > requests.max_requests:
+                        action, value = "hold", ("verification", "specialist_budget")
+                    elif parallel_verify and reviewer_factory is not None:
+                        action, value = _parallel_specialist_verify(
+                            reviewer_factory, candidate, prepared, record, requests,
+                            reviewer=reviewer, specialists=effective_specialists,
+                        )
+                    elif _supports_kwarg(reviewer.review, "specialist"):
+                        action, value = _sequential_specialist_verify(
+                            reviewer, candidate, prepared, record, requests,
+                            specialists=effective_specialists,
+                        )
+                    else:
+                        action, value = "hold", ("verification", "specialist_budget")
                 else:
                     action, value = advance_review(reviewer, stage, candidate, prepared, record, requests)
             except review.ReviewLimitReached as exc:

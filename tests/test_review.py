@@ -200,7 +200,7 @@ def test_final_holds_on_real_cases(writer, sources, fields, expected):
 
 
 @pytest.mark.parametrize("sources,confidence,state,categories", [
-    ([ISSUE], ["reported", "suspected", "observed-anomaly"], NON_TAG_STATES, analyze.CATEGORIES),
+    ([ISSUE], ["reported", "suspected", "observed-anomaly"], [s for s in NON_TAG_STATES if s != "released"], analyze.CATEGORIES),
     ([MERGED], analyze.CONFIDENCES, ["merged"], NON_RELEASE_CATEGORIES),
     ([FEED], analyze.CONFIDENCES, NON_TAG_STATES, analyze.CATEGORIES),
     ([_unit("tag", "tor-0.4.9.16", authority="official"), FEED], analyze.CONFIDENCES, analyze.STATES, analyze.CATEGORIES),
@@ -564,7 +564,7 @@ def test_update_scope_confirmed_updates_uncited_notes_and_punctuation_repairs(mo
         "updates": [{"at": LATER, "text": "Operators reported packaging progress in comments.", "sources": [{"url": url99, "title": "Issue 99"}]}],
     }
     prep = {
-        "mode": "update", "coverage": {"prior_story": {"id": "a" * 24, "confidence": "confirmed"}},
+        "mode": "update", "coverage": {"prior_story": {"id": "a" * 24, "confidence": "confirmed", "state": "released"}},
         "limits": {"confidence": {"reported"}, "states": {"reported", "developing", "released"}, "merge_verified": False},
         "packet": {"sources": [{"id": "S1", "url": url99, "authority": "development", "kind": "gitlab_issue",
                                 "passages": [{"id": "S1.P1", "text": "Issue body text without completed verbs."},
@@ -810,3 +810,459 @@ def test_skip_stands_distinguishes_negated_unrelated_event_phrases():
         reason=f"Different incident from {live_id}.",
     )
     assert review._skip_stands(pos_reply["criteria"], coverage, update=True) is False
+
+
+def _specialist_verdict(action="approve", **kwargs):
+    """Build a valid review verdict dict for specialist merge tests."""
+    return verdict(action, **kwargs)
+
+
+def test_reviewer_specialist_prompts_validation_and_policy_hash(monkeypatch):
+    """Specialist lenses inject domain guidance, preserve default None, and affect policy_hash."""
+    assert review.REVIEW_VERSION == "onionflash-review-20"
+    assert review.SPECIALISTS == (
+        "grounding_status",
+        "attribution_scope_advice",
+        "novelty_news",
+    )
+
+    cand = _candidate()
+    pkt = _packet()
+    cfg = _cfg_llm()
+    baseline_hash = review.policy_hash(cfg)
+
+    monkeypatch.setitem(
+        review.SPECIALIST_PROMPTS,
+        "grounding_status",
+        review.SPECIALIST_PROMPTS["grounding_status"] + " EXTRA",
+    )
+    assert review.policy_hash(cfg) != baseline_hash
+    monkeypatch.undo()
+
+    reviewer = wire_reviewer(
+        cfg,
+        *[_specialist_verdict("approve") for _ in range(4)],
+        monkeypatch=monkeypatch,
+    )
+
+    res_none = reviewer.review(cand, pkt, specialist=None)
+    assert res_none["verdict"] == "approve"
+    default_body = json.dumps(reviewer.client.bodies[0])
+    for spec_prompt in review.SPECIALIST_PROMPTS.values():
+        assert spec_prompt.strip().splitlines()[0] not in default_body
+
+    for idx, spec in enumerate(review.SPECIALISTS, start=1):
+        res_spec = reviewer.review(cand, pkt, specialist=spec)
+        assert res_spec["verdict"] == "approve"
+        spec_body = json.dumps(reviewer.client.bodies[idx])
+        assert f"SPECIALIST VERIFICATION FOCUS ({spec}" in spec_body
+
+    calls_before_invalid = len(reviewer.client.bodies)
+    with pytest.raises(review.ReviewError, match="Unknown review specialist"):
+        reviewer.review(cand, pkt, specialist="nonexistent")
+    assert len(reviewer.client.bodies) == calls_before_invalid
+
+
+def test_merge_specialist_verdicts_approves_unanimous_and_unions_refs():
+    """Three clean specialist approvals produce approve and union packet source_refs."""
+    v1 = _specialist_verdict("approve", ref="S1")
+    v2 = _specialist_verdict("approve", ref="S1:P1")
+    v3 = _specialist_verdict("approve", ref="S1")
+
+    merged = review.merge_specialist_verdicts([v1, v2, v3], _candidate(), _packet())
+    assert merged["verdict"] == "approve"
+    refs = merged["criteria"]["source_support"]["source_refs"]
+    assert refs == ["S1", "S1:P1"]
+
+
+def test_merge_specialist_verdicts_factual_fail_closed_and_outlier_rules():
+    """Primary factual or majority factual failures fail closed; lone out-of-domain factual failure does not."""
+    cand = _candidate()
+    pkt = _packet()
+    clean = _specialist_verdict("approve")
+
+    # Primary factual defect in grounding_status (`status`) blocks approval.
+    v_ground_hold = _specialist_verdict(
+        "hold",
+        criterion="status",
+        reason="Candidate claims patch shipped when discussion is still open.",
+    )
+    merged_hold = review.merge_specialist_verdicts(
+        [v_ground_hold, copy.deepcopy(clean), copy.deepcopy(clean)],
+        cand,
+        pkt,
+    )
+    assert merged_hold["verdict"] == "hold"
+    assert merged_hold["criteria"]["status"]["outcome"] == "fail"
+
+    # Primary factual defect in attribution_scope_advice (`operational_advice`) blocks approval.
+    v_attr_hold = _specialist_verdict(
+        "hold",
+        criterion="operational_advice",
+        reason="Candidate invents unattributed operator remediation advice.",
+    )
+    merged_attr = review.merge_specialist_verdicts(
+        [copy.deepcopy(clean), v_attr_hold, copy.deepcopy(clean)],
+        cand,
+        pkt,
+    )
+    assert merged_attr["verdict"] == "hold"
+    assert merged_attr["criteria"]["operational_advice"]["outcome"] == "fail"
+
+    # Lone out-of-domain factual objection from `novelty_news` does not cause false alarm.
+    v_ood_factual = _specialist_verdict(
+        "hold",
+        criterion="source_support",
+        reason="Out-of-domain concern while factual lenses approved.",
+    )
+    merged_ood = review.merge_specialist_verdicts(
+        [copy.deepcopy(clean), copy.deepcopy(clean), v_ood_factual],
+        cand,
+        pkt,
+    )
+    assert merged_ood["verdict"] == "approve"
+
+    # Two specialists failing the same factual criterion fail closed even if outside primary.
+    v_scope_ood = _specialist_verdict(
+        "hold",
+        criterion="status",
+        reason="Status overstated.",
+    )
+    v_news_ood = _specialist_verdict(
+        "hold",
+        criterion="status",
+        reason="Status overstated.",
+    )
+    merged_majority_factual = review.merge_specialist_verdicts(
+        [copy.deepcopy(clean), v_scope_ood, v_news_ood],
+        cand,
+        pkt,
+    )
+    assert merged_majority_factual["verdict"] == "hold"
+    assert merged_majority_factual["criteria"]["status"]["outcome"] == "fail"
+
+
+def test_merge_specialist_verdicts_non_conflicting_revise_vs_conflict_hold():
+    """Single-domain factual revise merges safely; conflicting edits fail closed to hold."""
+    cand = _candidate()
+    pkt = _packet()
+    clean = _specialist_verdict("approve")
+
+    # Single primary specialist proposing a clean repair returns revise with repair intact.
+    v_revise = _specialist_verdict(
+        "revise",
+        criterion="scope_timing",
+        reason="Clear unsupported impact line.",
+        repair={"why_it_matters": ""},
+    )
+    merged_rev = review.merge_specialist_verdicts(
+        [copy.deepcopy(clean), v_revise, copy.deepcopy(clean)],
+        cand,
+        pkt,
+    )
+    assert merged_rev["verdict"] == "revise"
+    assert merged_rev["repair"] == {"why_it_matters": ""}
+
+    # Conflicting fixes on the same non-impact field fail closed to hold instead of overwriting.
+    v_fix_a = _specialist_verdict(
+        "revise",
+        criterion="source_support",
+        reason="Trim summary wording.",
+        repair={"summary": "Version A summary."},
+    )
+    v_fix_b = _specialist_verdict(
+        "revise",
+        criterion="actor_and_action",
+        reason="Different summary wording.",
+        repair={"summary": "Version B summary."},
+    )
+    merged_conflict = review.merge_specialist_verdicts(
+        [v_fix_a, v_fix_b, copy.deepcopy(clean)],
+        cand,
+        pkt,
+    )
+    assert merged_conflict["verdict"] == "hold"
+
+
+def test_merge_specialist_verdicts_editorial_skip_requires_majority_and_story_routing():
+    """Lone editorial skip is ignored; majority skip stands and respects update/same_story rules."""
+    cand = _candidate()
+    pkt = _packet()
+    clean = _specialist_verdict("approve")
+
+    # Lone editorial skip outlier must not veto newsroom approval.
+    v_lone_skip = _specialist_verdict(
+        "skip",
+        criterion="news_value",
+        reason="Routine bugfix.",
+    )
+    merged_pass = review.merge_specialist_verdicts(
+        [v_lone_skip, copy.deepcopy(clean), copy.deepcopy(clean)],
+        cand,
+        pkt,
+    )
+    assert merged_pass["verdict"] == "approve"
+
+    # Majority (2 of 3) editorial skip stands.
+    v_skip_a = _specialist_verdict("skip", criterion="news_value", reason="Routine minor build tweak.")
+    v_skip_b = _specialist_verdict("skip", criterion="news_value", reason="Low impact maintenance.")
+    merged_skip = review.merge_specialist_verdicts(
+        [copy.deepcopy(clean), v_skip_a, v_skip_b],
+        cand,
+        pkt,
+    )
+    assert merged_skip["verdict"] == "skip"
+    assert merged_skip["criteria"]["news_value"]["outcome"] == "fail"
+
+    # Update mode: majority new_information skip naming live story stands as skip.
+    live_id = COVERED
+    upd_cand = _candidate(
+        updates=[{
+            "at": LATER,
+            "text": "Tor maintains ongoing build checks.",
+            "sources": [{"url": STORY["sources"][0]["url"], "title": STORY["sources"][0]["title"]}],
+        }]
+    )
+    upd_clean = _specialist_verdict("approve", update=True)
+    upd_skip_1 = _specialist_verdict(
+        "skip",
+        criterion="new_information",
+        update=True,
+        reason=f"Same ongoing work as {live_id}; no user-visible change.",
+    )
+    upd_skip_2 = _specialist_verdict(
+        "skip",
+        criterion="new_information",
+        update=True,
+        reason=f"Same story as {live_id} without fresh facts.",
+    )
+    merged_upd_skip = review.merge_specialist_verdicts(
+        [upd_clean, upd_skip_1, upd_skip_2],
+        upd_cand,
+        pkt,
+        update=True,
+        coverage=PRIOR,
+    )
+    assert merged_upd_skip["verdict"] == "skip"
+
+    # Story-mode routing requires majority same_story agreement.
+    r_skip_1 = _specialist_verdict(
+        "skip",
+        criterion="new_information",
+        same_story=live_id,
+        reason=f"Duplicates {live_id}.",
+    )
+    r_skip_2 = _specialist_verdict(
+        "skip",
+        criterion="new_information",
+        same_story=live_id,
+        reason=f"Covered by {live_id}.",
+    )
+    merged_route = review.merge_specialist_verdicts(
+        [copy.deepcopy(clean), r_skip_1, r_skip_2],
+        cand,
+        pkt,
+        coverage=COVERAGE,
+    )
+    assert merged_route["verdict"] == "skip"
+    assert merged_route["same_story"] == live_id
+
+
+def test_review_validation_catches_incomplete_fragment_and_unattributed_advice(monkeypatch):
+    """Validator/apply_repair reject or clear incomplete why_it_matters fragments and unattributed advice."""
+    pkt = _packet()
+    fragment = "Because of recent fixes, the network currently has a lot of <= 0.4.8.x"
+
+    # Fragment lacking terminal punctuation fails apply_repair and is cleared on _validate.
+    with pytest.raises(review.ReviewError, match="Invalid repair field"):
+        review.apply_repair(_candidate(), {"why_it_matters": fragment})
+
+    reviewer = wire_reviewer(
+        _cfg_llm(),
+        _specialist_verdict("revise", criterion="scope_timing", repair={"why_it_matters": fragment}),
+        _specialist_verdict(
+            "revise",
+            criterion="operational_advice",
+            repair={"why_it_matters": "Operators should switch to 64-bit builds immediately."},
+        ),
+        _specialist_verdict(
+            "revise",
+            criterion="scope_timing",
+            repair={"why_it_matters": "Operators should configure the relay."},
+        ),
+        _specialist_verdict(
+            "revise",
+            criterion="scope_timing",
+            repair={"why_it_matters": "Operators should configure the relay."},
+        ),
+        monkeypatch=monkeypatch,
+    )
+    res_frag = reviewer.review(_candidate(), pkt)
+    assert res_frag["repair"]["why_it_matters"] == ""
+
+    res_adv = reviewer.review(_candidate(), pkt)
+    assert res_adv["repair"]["why_it_matters"] == ""
+
+    # Unattributed directive without matching source prose is cleared, then survives once grounded.
+    res_ungrounded_cfg = reviewer.review(_candidate(), pkt)
+    assert res_ungrounded_cfg["repair"]["why_it_matters"] == ""
+
+    grounded_pkt = copy.deepcopy(pkt)
+    grounded_pkt["sources"][0]["passages"].append({"id": "S1:P2", "text": "Operators should configure the relay."})
+    res_grounded = reviewer.review(_candidate(), grounded_pkt)
+    assert res_grounded["repair"]["why_it_matters"] == "Operators should configure the relay."
+
+
+def test_widen_update_state_preserves_prior_released_and_blocks_issue_released():
+    """Prior released stories allow released updates, while bare issue stories hold on release_state independently."""
+    issue_pkt = copy.deepcopy(_packet())
+    issue_pkt["sources"][0]["kind"] = "gitlab_issue"
+    issue_pkt["sources"][0]["authority"] = "development"
+    issue_cand = _candidate(
+        category="security",
+        confidence="reported",
+        state="released",
+    )
+    holds = review.final_holds(
+        issue_cand,
+        {"packet": issue_pkt, "mode": "story", "payload": {"editorial_kind": "gitlab_issue"}},
+    )
+    assert "release_state" in holds and "confirmed_source" not in holds
+
+    dev_holds = review.final_holds(
+        {**issue_cand, "state": "developing"},
+        {"packet": issue_pkt, "mode": "story", "payload": {"editorial_kind": "gitlab_issue"}},
+    )
+    assert dev_holds == []
+
+    prior_rel_holds = review.final_holds(
+        {
+            **issue_cand,
+            "sources": [{"url": issue_pkt["sources"][0]["url"], "title": issue_pkt["sources"][0]["title"]}],
+            "updates": [{"at": LATER, "text": "Maintainers opened a follow-up.", "sources": [{"url": issue_pkt["sources"][0]["url"], "title": "Issue"}]}],
+        },
+        {
+            "packet": issue_pkt,
+            "mode": "update",
+            "coverage": {"prior_story": {**PRIOR["prior_story"], "state": "released", "confidence": "reported"}},
+            "payload": {"editorial_kind": "gitlab_issue"},
+        },
+    )
+    assert prior_rel_holds == []
+
+    limits = {"state": ["open", "fixed", "closed"]}
+    review._widen_update_state(
+        limits,
+        issue_pkt["sources"],
+        PRIOR["prior_story"] | {"state": "released", "category": "release"},
+    )
+    assert "released" in limits["state"]
+
+
+def test_merge_specialist_verdicts_prevents_triple_hold_approve_and_losing_route():
+    """Require >=2 specialist approvals to approve and never resurrect a split losing same_story target."""
+    pkt = _packet()
+    cand = _candidate()
+
+    v_ground = _specialist_verdict("hold", criterion="actor_and_action", reason="Unclear actor.")
+    v_attr = _specialist_verdict("hold", criterion="status", reason="Unclear status.")
+    v_nov = _specialist_verdict("hold", criterion="technical_details", reason="Unclear version.")
+    merged_holds = review.merge_specialist_verdicts([v_ground, v_attr, v_nov], cand, pkt)
+    assert merged_holds["verdict"] == "hold"
+    review.validate_review(merged_holds, pkt)
+
+    v_app = verdict("approve")
+    merged_override = review.merge_specialist_verdicts([v_app, v_app, v_nov], cand, pkt)
+    assert merged_override["verdict"] == "approve"
+
+    cov = {
+        "prior_story": None,
+        "recent": [
+            {"id": "a" * 24, "title": "First", "retracted": False},
+            {"id": "b" * 24, "title": "Second", "retracted": False},
+        ],
+        "truncated": False,
+    }
+    s_a = verdict("skip", criterion="new_information", reason=f"Covered by {'a' * 24}.", same_story="a" * 24)
+    s_b = verdict("skip", criterion="new_information", reason=f"Covered by {'b' * 24}.", same_story="b" * 24)
+    merged_split = review.merge_specialist_verdicts([s_a, s_b, v_app], cand, pkt, coverage=cov)
+    assert merged_split["same_story"] is None
+
+    s_a_plain = verdict("skip", criterion="new_information", reason="Already reported earlier.", same_story="a" * 24)
+    s_b_plain = verdict("skip", criterion="new_information", reason="Duplicate report.", same_story="b" * 24)
+    merged_split_hold = review.merge_specialist_verdicts([s_a_plain, s_b_plain, v_app], cand, pkt, coverage=cov)
+    assert merged_split_hold["verdict"] == "hold" and merged_split_hold["same_story"] is None
+
+
+def test_update_release_state_scoping_and_update_specialist_prompts(monkeypatch):
+    """Scope update state limits to cited update sources, keep merged developing updates non-released, and scope attribution prompts."""
+    feed_unit = {
+        "id": "S1", "url": "https://blog.torproject.org/tor-note/", "title": "Initial note",
+        "kind": "feed", "authority": "official", "passages": [{"id": "S1:P1", "text": "Initial blog post."}],
+    }
+    issue_unit = {
+        "id": "S2", "url": "https://gitlab.torproject.org/tpo/core/tor/-/work_items/77", "title": "Follow-up issue",
+        "kind": "gitlab_issue", "authority": "development", "upstream_state": "opened",
+        "passages": [{"id": "S2:P1", "text": "Follow-up bug discussion."}],
+    }
+    mr_unit = {
+        "id": "S3", "url": "https://gitlab.torproject.org/tpo/core/tor/-/merge_requests/78", "title": "Follow-up MR",
+        "kind": "gitlab_mr", "authority": "development", "upstream_state": "merged",
+        "passages": [{"id": "S3:P1", "text": "Merged follow-up patch."}],
+    }
+    cov_dev = {"prior_story": {"id": "c" * 24, "confidence": "reported", "state": "developing", "category": "security"}, "recent": []}
+    upd_sources_issue = [{"url": issue_unit["url"], "title": issue_unit["title"]}]
+    upd_sources_mr = [{"url": mr_unit["url"], "title": mr_unit["title"]}]
+    all_sources = [{"url": u["url"], "title": u["title"]} for u in (feed_unit, issue_unit, mr_unit)]
+
+    limits_issue = review.repair_limits(
+        {"sources": [feed_unit, issue_unit]}, cov_dev, update=True,
+        candidate_sources=all_sources[:2], update_sources=upd_sources_issue,
+    )
+    assert "released" not in limits_issue["state"]
+    limits_mr = review.repair_limits(
+        {"sources": [feed_unit, mr_unit]}, cov_dev, update=True,
+        candidate_sources=[all_sources[0], all_sources[2]], update_sources=upd_sources_mr,
+    )
+    assert "released" not in limits_mr["state"]
+
+    upd_cand_issue = _candidate(
+        state="released",
+        category="release",
+        tags=["release"],
+        sources=all_sources[:2],
+        updates=[{"at": LATER, "text": "Follow-up bug discussion.", "sources": upd_sources_issue}],
+    )
+    assert "release_state" in review.final_holds(
+        upd_cand_issue, {"mode": "update", "packet": {"sources": [feed_unit, issue_unit]}, "coverage": cov_dev},
+    )
+    upd_cand_mr = _candidate(
+        state="released",
+        category="release",
+        tags=["release"],
+        sources=[all_sources[0], all_sources[2]],
+        updates=[{"at": LATER, "text": "Merged follow-up patch.", "sources": upd_sources_mr}],
+    )
+    assert "release_state" in review.final_holds(
+        upd_cand_mr, {"mode": "update", "packet": {"sources": [feed_unit, mr_unit]}, "coverage": cov_dev},
+    )
+
+    seen_prompts: list[str] = []
+    rev = review.Reviewer(_cfg_llm())
+    monkeypatch.setattr(
+        rev,
+        "complete",
+        lambda prompt, *_a, **_kw: seen_prompts.append(prompt) or verdict("approve", update=True),
+    )
+    rev.review(
+        _candidate(
+            sources=[{"url": issue_unit["url"], "title": issue_unit["title"]}],
+            updates=[{"at": LATER, "text": "Follow-up bug discussion.", "sources": upd_sources_issue}],
+        ),
+        {"sources": [{**issue_unit, "id": "S1", "passages": [{"id": "S1:P1", "text": "Follow-up bug discussion."}]}], "missing_sources": [], "truncated": False},
+        update=True,
+        coverage=cov_dev,
+        specialist="attribution_scope_advice",
+    )
+    assert "Check ONLY candidate.updates[-1].text" in seen_prompts[-1]
+    assert "Do NOT evaluate, fail, or modify read-only title, summary, or why_it_matters" in seen_prompts[-1]

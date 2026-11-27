@@ -440,8 +440,8 @@ def test_ninety_day_unembargoed_hackerone_issue_bypasses_not_recent_while_normal
 
 def test_prompt_versions_and_hackerone_and_tordev_trusted_operator_rules():
     """Verify bumped prompt versions and presence of HackerOne, tor-core, TROVE, and tor-dev rules."""
-    assert analyze.PROMPT_VERSION == "onionflash-23"
-    assert review.REVIEW_VERSION == "onionflash-review-19"
+    assert analyze.PROMPT_VERSION == "onionflash-24"
+    assert review.REVIEW_VERSION == "onionflash-review-20"
     assert "hackerone" in review_gate.OFFICIAL_AUTHORITIES
     assert "dirauth-operator" in review_gate.OFFICIAL_AUTHORITIES
     analyze_prompt = " ".join(analyze.SYSTEM_PROMPT.split())

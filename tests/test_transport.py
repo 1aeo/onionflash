@@ -690,8 +690,12 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
     def _handle(request):
         body = json.loads(request.content)
         schema_name = body["response_format"]["json_schema"]["name"]
-        stage_kind = {"onionflash_news": "writer", "onionflash_polish": "polish"}.get(schema_name, "review")
-        expected_max_tokens = {"writer": 32768, "polish": 1200, "review": review.OUTPUT_TOKENS}[stage_kind]
+        stage_kind = {
+            "onionflash_news": "writer",
+            "onionflash_select": "select",
+            "onionflash_polish": "polish",
+        }.get(schema_name, "review")
+        expected_max_tokens = {"writer": 32768, "select": 1200, "polish": 1200, "review": review.OUTPUT_TOKENS}[stage_kind]
         assert body["max_tokens"] == expected_max_tokens
         assert request.extensions["onionflash_deadline"] == clock[0] + 3610
         assert request.extensions["timeout"]["read"] == 3600
@@ -700,6 +704,8 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
             clock[0] += 300
         if stage_kind == "writer":
             return _httpx_completion(analysis(why_it_matters=""))
+        if stage_kind == "select":
+            return _httpx_completion({"winner": 1, "reason": "Selected candidate."})
         if stage_kind == "polish":
             draft = json.loads(body["messages"][1]["content"])["draft"]
             return _httpx_completion({k: draft[k] for k in ("title", "summary", "why_it_matters")})
@@ -727,7 +733,7 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
     saved = job(store)
     record = job_record(store)
     assert first["budget_reached"] and first["analysis_failed"] == 0
-    expected_first = {"writer": 1, "reservation": 2, "review": 3}[expire]
+    expected_first = {"writer": 1, "reservation": 5, "review": 6}[expire]
     assert first["model_calls"] == len(sent) == expected_first
     assert saved["stage"] == ("verify" if expire == "review" else "review")
     assert record["request_budget"]["reserved"] == (1 if expire == "review" else 0)
@@ -737,7 +743,11 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
     assert all(settings["timeout_seconds"] == 3600 and settings["total_timeout_seconds"] == 3610 for settings in settings_seen)
     second = cli.run(config, store)
     assert second["analysis_failed"] == 0 and second["model_calls"] == (1 if expire == "review" else 2)
-    assert sent == (["writer", "review", "review"] if expire == "writer" else ["writer", "polish", "review", "review"])
+    assert sent == (
+        ["writer", "review", "review"]
+        if expire == "writer"
+        else ["writer", "writer", "writer", "select", "polish", "review", "review"]
+    )
     assert len(store.stories()) == 1 and job(store) is None
 
 
@@ -1090,13 +1100,13 @@ def test_sse_truncated_length_is_non_retryable_and_limits_fail_closed(completion
 
 def test_streaming_json_fallback_midstream_timeout_and_identity_parity(completion_client):
     """Support plain JSON fallback responses, mid-stream SSE ReadTimeouts, and preserve policy_hash/cache_key."""
-    baseline_policy = "d0e8c5fe1f9042cb2bb0c580980aaa91d3666fc265b6bb837a4c698a9d20703f"
+    baseline_policy = "cb997831b02e12829c0f8fc1823ee5db0ae7b788bf1fd6feb53e7da893927266"
     assert review.policy_hash(copy.deepcopy(DEFAULTS)) == baseline_policy
     row = {"content_hash": "a" * 64}
     cfg_on = copy.deepcopy(DEFAULTS)
     cfg_on["llm"]["writer_reasoning"] = True
-    assert analyze.cache_key(row, DEFAULTS["llm"]) == "762b0ed8fe0fedb84281b9da6f18d07ee4ffd02db68dfe172fd18595d046c1db"
-    assert analyze.cache_key(row, cfg_on["llm"]) == "96d51391205f09d8ba48dd2e444fe6b0c02fd1dd12de54eaae65ab7de2e48369"
+    assert analyze.cache_key(row, DEFAULTS["llm"]) == "93706cd7b008cd74a05bb0ef011775c09e069800c29c9ef700aaa416a645b885"
+    assert analyze.cache_key(row, cfg_on["llm"]) == "c95f4fcbf5ca9233de6a47bd798170c9525d157ed5ddf8a118565ae1024160c2"
 
     json_client, _ = completion_client(lambda _req: _httpx_completion({"mode": "json"}))
     _, req1, _ = _ledger()
