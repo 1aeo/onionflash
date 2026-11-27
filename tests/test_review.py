@@ -1494,6 +1494,11 @@ def test_unhedged_conditional_impact_deterministic_guard(monkeypatch):
         why_it_matters="A zero-proof client evicts queued clients from the queue.",
     )
     assert review.has_unhedged_conditional_impact(unhedged_cand["why_it_matters"], pkt, unhedged_cand) is True
+    assert review.has_unhedged_conditional_impact(
+        "A zero-proof client evicts queued clients without needing to issue a valid proof.",
+        pkt,
+        unhedged_cand,
+    ) is True
 
     for qualified in (
         "Operators enabling experimental proof-of-work features may experience reduced queue efficiency.",
@@ -1508,6 +1513,24 @@ def test_unhedged_conditional_impact_deterministic_guard(monkeypatch):
     plain_pkt = copy.deepcopy(pkt)
     plain_pkt["sources"][0]["passages"][0]["text"] = "The defect affects default queue processing."
     assert review.has_unhedged_conditional_impact(unhedged_cand["why_it_matters"], plain_pkt, unhedged_cand) is False
+
+    for rel_kind, rel_state, rel_cat in (("tag", "tagged", "release"), ("gitlab_issue", "developing", "network")):
+        rel_pkt = copy.deepcopy(pkt)
+        rel_pkt["sources"][0]["kind"] = rel_kind
+        rel_pkt["sources"][0]["passages"][0]["text"] = (
+            "Existing connections survive daemon reloads. This release also adds experimental support for a new transport."
+        )
+        rel_cand = _candidate(
+            confidence="reported",
+            state=rel_state,
+            category=rel_cat,
+            tags=[rel_cat],
+            products=["arti"],
+            sources=[{"url": rel_pkt["sources"][0]["url"], "title": "Release"}],
+            why_it_matters="Existing connections survive configuration reloads.",
+        )
+        assert review.has_unhedged_conditional_impact("Existing connections survive configuration reloads.", rel_pkt, rel_cand) is False
+        assert review.has_unhedged_conditional_impact("Existing connections survive daemon reloads.", rel_pkt, rel_cand) is False
 
     rev = _reviewer(monkeypatch, verdict("approve"))
     res = rev.review(unhedged_cand, pkt)

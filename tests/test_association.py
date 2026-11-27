@@ -1292,3 +1292,58 @@ def test_cross_product_release_rollout_related_and_can_route(context):
     out = run_gate(cfg, store, rollout_row, Writer(rollout_cand), Reviewer(verdict("approve", same_story=tor_rel["id"])), LATER)
     assert out["status"] == "routed"
     assert queued_row(store, rollout_item["id"], LATER)["story_id"] == tor_rel["id"]
+
+    # Complete version token boundary (1.4.2 vs 1.4.20) and cross-product version ownership in _can_route.
+    assert candidate.item_mentions_product_version("Arti 1.4.20 released", "arti", "1.4.2") is False
+    assert candidate.item_mentions_product_version("Arti v1.4.2 released", "arti", "1.4.2") is True
+
+    arti_142 = seed_source_story(
+        store,
+        item(
+            kind="feed",
+            authority="official",
+            product="arti",
+            url="https://blog.torproject.org/arti-1-4-2-rel",
+            title="Arti 1.4.2 released",
+            content="Arti 1.4.2 released.",
+        ),
+        draft=analysis(
+            title="Arti 1.4.2 released",
+            summary="Arti 1.4.2 released.",
+            why_it_matters="",
+            category="release",
+            tags=["release"],
+            confidence="confirmed",
+            state="released",
+            products=["arti"],
+            evidence=["Arti 1.4.2 released."],
+        ),
+    )
+    sf_arti_item = item(
+        kind="gitlab_issue",
+        authority="development",
+        product="snowflake",
+        url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/work_items/999",
+        title="Snowflake 1.4.2 fails when launched from Arti",
+        content="Snowflake 1.4.2 fails to start under version 1.4.2.",
+        published_at=LATER,
+        updated_at=LATER,
+    )
+    sf_arti_cand = analysis(
+        title="Snowflake 1.4.2 fails when launched from Arti",
+        summary="Snowflake 1.4.2 fails when launched from Arti.",
+        why_it_matters="",
+        category="network",
+        tags=["network"],
+        confidence="reported",
+        state="developing",
+        products=["snowflake"],
+        evidence=["Snowflake 1.4.2 fails to start under version 1.4.2."],
+    )
+    sf_arti_prep = store.prepare_candidate(pending(store, sf_arti_item, LATER), sf_arti_cand, LATER)
+    assert review_gate._can_route(
+        sf_arti_prep["candidate"],
+        sf_arti_prep,
+        verdict("approve", same_story=arti_142["id"]),
+        arti_142["id"],
+    ) is False

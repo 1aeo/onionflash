@@ -759,18 +759,30 @@ def release_story_key(cluster_key: str, story_obj: dict) -> str | None:
     return versions[0] if versions else None
 
 
+def _other_product_version_spans(item_text: str, prod: str, ver: str) -> list[tuple[int, int]]:
+    if not item_text or not prod or not ver:
+        return []
+    ver_fold = ver.lower()
+    return [
+        (m.start(2), m.end(2))
+        for m in _RELEASE_MENTION.finditer(item_text)
+        if m.group(2).lower() == ver_fold
+        and ("tor-browser" if m.group(1).lower() in {"tor-browser", "tor browser"} else m.group(1).lower()) != prod
+    ]
+
+
+def version_claimed_by_other_product(item_text: str, prod: str, ver: str) -> bool:
+    """Return whether `_RELEASE_MENTION` attributes `ver` to a product other than `prod`."""
+    return bool(_other_product_version_spans(item_text, prod, ver))
+
+
 def item_mentions_product_version(item_text: str, prod: str, ver: str) -> bool:
     """Return whether `item_text` mentions `ver` alongside `prod` without another product claiming it."""
     prod_pat = _RELEASE_PROD_PATTERNS.get(prod)
     if not prod_pat or not ver:
         return False
-    claimed_other = [
-        (m.start(2), m.end(2))
-        for m in _RELEASE_MENTION.finditer(item_text)
-        if m.group(2).lower() == ver.lower()
-        and ("tor-browser" if m.group(1).lower() in {"tor-browser", "tor browser"} else m.group(1).lower()) != prod
-    ]
-    ver_pat = re.compile(rf"(?<![\w.])v?{re.escape(ver)}(?!\.\d)(?![A-Za-z])", re.I)
+    claimed_other = _other_product_version_spans(item_text, prod, ver)
+    ver_pat = re.compile(rf"(?<![\w.])v?{re.escape(ver)}(?!\.\d)(?!\w)", re.I)
     prod_re = re.compile(rf"\b{prod_pat}\b" + (r"(?!\s+project\b)" if prod == "tor" else ""), re.I)
     is_ctor_ver = prod == "tor" and ver.startswith("0.") and ver.count(".") >= 3
     last_end = 0

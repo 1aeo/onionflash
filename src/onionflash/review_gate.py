@@ -618,7 +618,11 @@ def _can_route(candidate: dict, prepared: dict, result: dict, target_id) -> bool
         ):
             return True
         if any(
-            re.search(rf"\b{pat}\b", combined_text, re.I)
+            re.search(rf"\b{pat}\b" + (r"(?!\s+project\b)" if prod == "tor" else ""), combined_text, re.I)
+            and any(
+                not candidate_mod.version_claimed_by_other_product(combined_text, prod, ver)
+                for ver in shared_vers
+            )
             for prod in target_prods
             if (pat := _PRODUCT_NAMES.get(prod))
         ):

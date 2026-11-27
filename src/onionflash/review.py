@@ -814,11 +814,34 @@ _QUALIFIED_IMPACT_RE = re.compile(
     r"\b(?:non-default|not\s+(?:the\s+)?default|experimental|opt[- ]in|"
     r"enabled|configured|config(?:uration)?|option|setting|feature|flag|when|if|unless|"
     r"may|might|could|potentially|possibly|plausibly|likely|reportedly|suspected|allegedly|"
-    r"report|reporter|issue|post|comment|announcement|advisory|author|maintainer|"
-    r"researcher|sender|according\s+to|says|said|states|stated|notes|noted|"
-    r"claims|claimed|suggests|suggested|describes|described|warns|warned)\b",
+    r"reporter|maintainer|researcher|author|sender|according\s+to|"
+    r"(?:in|per|from)\s+(?:the|this|that|an?)\s+(?:report|issue|post|comment|announcement|advisory|thread|disclosure)|"
+    r"(?:the|this|that|an?)\s+(?:report|reporter|issue|post|comment|announcement|advisory|author|maintainer|researcher|sender)\s+"
+    r"(?:says|said|states|stated|notes|noted|claims|claimed|suggests|suggested|describes|described|"
+    r"warns|warned|argues|argued|alleges|alleged|indicates|indicated|asserts|asserted|reports|reported|highlights|highlighted|asks|asked)|"
+    r"says|said|states|stated|notes|noted|claims|claimed|suggests|suggested|describes|described|warns|warned|alleges|alleged)\b",
     re.IGNORECASE,
 )
+_DEFECT_PRECONDITION_RE = re.compile(
+    r"\b(?:defect|bug|issue|flaw|bypass|attack|dos|crash|vulnerabilit\w*|problem|exploit|"
+    r"requires?|only\s+(?:when|if|applies|affects|occurs|happens)|must\s+be\s+enabled|"
+    r"disabled\s+by\s+default|not\s+the\s+default|__is_experimental)\b",
+    re.IGNORECASE,
+)
+_RELEASE_ADDITION_RE = re.compile(r"\bthis\s+release\s+also\s+adds\b", re.IGNORECASE)
+_IMPACT_STOPWORDS = frozenset({
+    "this", "that", "these", "those", "with", "from", "into", "onto", "over", "under",
+    "when", "while", "where", "which", "about", "after", "before", "their", "there",
+    "then", "than", "only", "also", "more", "most", "some", "such", "many", "each",
+    "they", "them", "been", "being", "were", "have", "has", "had", "does", "done",
+    "will", "would", "could", "should", "might", "must", "can", "cannot",
+    "release", "support", "experimental", "feature", "option", "setting", "flag",
+    "default", "non-default",
+})
+
+
+def _impact_content_tokens(text: str) -> set[str]:
+    return {tok for tok in re.findall(r"[a-z0-9]{4,}", text.lower()) if tok not in _IMPACT_STOPWORDS}
 
 
 def has_unhedged_conditional_impact(impact: str, packet: dict, candidate: dict) -> bool:
@@ -826,10 +849,27 @@ def has_unhedged_conditional_impact(impact: str, packet: dict, candidate: dict) 
     for a packet-stated non-default or experimental defect."""
     if not impact or not impact.strip() or candidate.get("confidence") != "reported":
         return False
-    impact_ctx, _, _ = _packet_impact_context(packet)
-    if not _PACKET_CONDITIONAL_FEATURE_RE.search(impact_ctx):
+    if _QUALIFIED_IMPACT_RE.search(impact) is not None:
         return False
-    return _QUALIFIED_IMPACT_RE.search(impact) is None
+    impact_ctx, _, _ = _packet_impact_context(packet)
+    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", impact_ctx) if s.strip()]
+    cond_sents = [s for s in sents if _PACKET_CONDITIONAL_FEATURE_RE.search(s)]
+    if not cond_sents:
+        return False
+    imp_toks = _impact_content_tokens(impact)
+    cond_toks = _impact_content_tokens(" ".join(cond_sents))
+    if (imp_toks and imp_toks <= cond_toks) or len(imp_toks & cond_toks) >= 2:
+        return True
+    sources = packet.get("sources") or () if isinstance(packet, dict) else ()
+    is_release = (
+        candidate.get("category") == "release"
+        or candidate.get("state") in {"tagged", "released"}
+        or (bool(sources) and all(isinstance(s, dict) and s.get("kind") == "tag" for s in sources))
+    )
+    return not is_release and any(
+        _DEFECT_PRECONDITION_RE.search(s) and not _RELEASE_ADDITION_RE.search(s)
+        for s in cond_sents
+    )
 
 
 def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool = False,
