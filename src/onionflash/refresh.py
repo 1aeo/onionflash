@@ -8,7 +8,7 @@ import inspect
 import logging
 import re
 
-from . import candidate as candidate_mod, editorial, render, review as review_mod, source_packet
+from . import candidate as candidate_mod, decisions, editorial, render, review as review_mod, source_packet
 from . import llm as llm_mod
 from .llm import (
     AnalysisError,
@@ -340,6 +340,7 @@ def refresh_story(
     story_payload = candidate_entry["payload"]
     update_count = candidate_entry["update_count"]
     refreshed_hash = candidate_entry["refreshed_hash"]
+    title = story_payload.get("title") if isinstance(story_payload.get("title"), str) else None
 
     try:
         packet, missing_reason = build_story_refresh_packet(
@@ -355,15 +356,26 @@ def refresh_story(
             refreshed_hash=refreshed_hash,
             status="held",
             observed=observed,
+            code="held.refresh.invalid_packet",
+            reason="invalid_packet",
+            extra={"title": title, "hold_code": "invalid_packet"},
         )
         return {"story_id": story_id, "status": "held", "reason": "invalid_packet"}
     if packet is None:
+        skip_code = (
+            "skipped.refresh.ineligible"
+            if missing_reason in {"ineligible_story", "invalid_story"}
+            else "skipped.refresh.missing_sources"
+        )
         store.record_refresh_status(
             story_id,
             update_count=update_count,
             refreshed_hash=refreshed_hash,
             status="skipped",
             observed=observed,
+            code=skip_code,
+            reason=missing_reason,
+            extra={"title": title},
         )
         return {"story_id": story_id, "status": "skipped", "reason": missing_reason}
 
@@ -374,6 +386,41 @@ def refresh_story(
             candidate_raw,
             editorial=editorial.public_metadata(store.db, story_id),
         )
+    except CompletionDeferred:
+        raise
+    except AnalysisError as exc:
+        if exc.retryable:
+            raise
+        store.record_refresh_status(
+            story_id,
+            update_count=update_count,
+            refreshed_hash=refreshed_hash,
+            status="held",
+            observed=observed,
+            code="held.refresh.invalid_output",
+            reason=exc.code,
+            extra={"title": title, "hold_code": exc.code},
+        )
+        return {"story_id": story_id, "status": "held", "reason": exc.code}
+    except (ValueError, TypeError, KeyError, AttributeError):
+        store.record_refresh_status(
+            story_id,
+            update_count=update_count,
+            refreshed_hash=refreshed_hash,
+            status="held",
+            observed=observed,
+            code="held.refresh.invalid_output",
+            reason="invalid_candidate",
+            extra={"title": title, "hold_code": "invalid_candidate"},
+        )
+        return {"story_id": story_id, "status": "held", "reason": "invalid_candidate"}
+
+    candidate_title = (
+        refreshed_public["title"]
+        if isinstance(refreshed_public.get("title"), str) and refreshed_public["title"]
+        else title
+    )
+    try:
         verdict = verify_refreshed_story(
             reviewer,
             refreshed_public,
@@ -392,6 +439,9 @@ def refresh_story(
             refreshed_hash=refreshed_hash,
             status="held",
             observed=observed,
+            code="held.refresh.review_rejected",
+            reason=exc.code,
+            extra={"title": candidate_title, "hold_code": exc.code},
         )
         return {"story_id": story_id, "status": "held", "reason": exc.code}
     except (ValueError, TypeError, KeyError, AttributeError):
@@ -401,20 +451,42 @@ def refresh_story(
             refreshed_hash=refreshed_hash,
             status="held",
             observed=observed,
+            code="held.refresh.review_rejected",
+            reason="invalid_review",
+            extra={"title": candidate_title, "hold_code": "invalid_review"},
         )
-        return {"story_id": story_id, "status": "held", "reason": "invalid_candidate"}
+        return {"story_id": story_id, "status": "held", "reason": "invalid_review"}
 
     verdict_name = verdict.get("verdict") if isinstance(verdict, dict) else None
     if verdict_name != "approve":
         status = "skipped" if verdict_name == "skip" else "held"
+        code = "skipped.refresh.review_skip" if status == "skipped" else "held.refresh.review_rejected"
+        reason = f"review_{verdict_name or 'rejected'}"
+        raw_criteria = verdict.get("criteria") if isinstance(verdict, dict) else None
+        failed = (
+            decisions.failed_criteria(raw_criteria)
+            if isinstance(raw_criteria, dict)
+            else {}
+        )
+        detail_extra: dict[str, object] = {
+            "title": candidate_title,
+            "verdict": verdict_name or "rejected",
+        }
+        if failed:
+            detail_extra["criteria"] = failed
+        elif status == "held":
+            detail_extra["hold_code"] = reason
         store.record_refresh_status(
             story_id,
             update_count=update_count,
             refreshed_hash=refreshed_hash,
             status=status,
             observed=observed,
+            code=code,
+            reason=reason,
+            extra=detail_extra,
         )
-        return {"story_id": story_id, "status": status, "reason": f"review_{verdict_name or 'rejected'}"}
+        return {"story_id": story_id, "status": status, "reason": reason}
 
     primary_kind = (packet["sources"][0].get("kind") or "") if packet.get("sources") else ""
     prepared_for_holds = {
@@ -434,6 +506,9 @@ def refresh_story(
             refreshed_hash=refreshed_hash,
             status="held",
             observed=observed,
+            code="held.refresh.final_check",
+            reason=f"final_check_{holds[0]}",
+            extra={"title": candidate_title, "hold_code": holds[0]},
         )
         return {"story_id": story_id, "status": "held", "reason": f"final_check_{holds[0]}"}
 
@@ -451,6 +526,18 @@ def refresh_story(
             base_prose=base_prose,
         )
     except (candidate_mod.StaleCandidate, editorial.RetiredStory, candidate_mod.ReviewRequired):
+        with store.db:
+            decisions.record_subject(
+                store.db,
+                f"refresh:{story_id}:{update_count}:{refreshed_hash[:12]}",
+                "skipped.refresh.stale_or_locked",
+                observed,
+                story_id=story_id,
+                once=False,
+                title=candidate_title,
+                update_count=update_count,
+                reason="stale_or_locked",
+            )
         return {"story_id": story_id, "status": "skipped", "reason": "stale_or_locked"}
     return committed
 

@@ -1078,6 +1078,21 @@ _CI_PIPELINE_CHORE_RE = re.compile(
     re.I,
 )
 _BOT_DEP_AUTHORS = frozenset({"dependabot", "dependabot[bot]", "renovate", "renovate[bot]"})
+_TEST_CHORE_RE = re.compile(
+    r"^(?:(?!(?:security|advisory)\s*:)(?:[a-z0-9_./-]+:\s+)?)?"
+    r"(?:tests?(?:\([^)]+\))?\s*:"
+    r"|(?:improve|add|fix|update|refactor|clean\s*up)\s+(?:default\s+)?(?:unit\s+|integration\s+|dirauth\s+)?tests?\b)"
+    r"(?!.*\b(?:and\s+fix(?:es|ed)?|bugfix|cve|trove|regression|vulnerabilit\w*|leak)\b)",
+    re.I,
+)
+_INTERNAL_CLEANUP_RE = re.compile(
+    r"(?:"
+    r"(?:^(?!(?:security|advisory)\s*:)(?:[a-z0-9_./-]+:\s+)?|\b)"
+    r"(?:fix(?:ing)?|clean\s*up|resolve|remove)\s+(?:the\s+)?(?:\w+\s+){0,3}todos?\b"
+    r"|^(?!(?:security|advisory)\s*:)(?:[a-z0-9_./-]+:\s+)?(?:refactor|clean\s*up)\s+internal\b"
+    r")(?!.*\b(?:security|vulnerabilit\w*|regression|api\s+break|breaking|bug)\b)",
+    re.I,
+)
 
 _PT_FAMILY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("snowflake", re.compile(r"\bsnowflake\b", re.I)),
@@ -1178,6 +1193,10 @@ def is_housekeeping_item(item: dict) -> tuple[str, str] | None:
         return "skipped.gate.housekeeping", "Routine CI or build pipeline housekeeping item"
     if _HOUSEKEEPING_TITLE_PAT_RE.search(cleaned_title):
         return "skipped.gate.housekeeping", "Routine checklist or housekeeping item"
+    if _TEST_CHORE_RE.search(cleaned_title):
+        return "skipped.gate.housekeeping", "Routine test suite housekeeping item"
+    if _INTERNAL_CLEANUP_RE.search(cleaned_title):
+        return "skipped.gate.housekeeping", "Routine internal refactor or TODO cleanup item"
     return None
 
 

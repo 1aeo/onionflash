@@ -33,13 +33,14 @@ after a rollback, are not in it.
 ## Codes
 
 A code is `<outcome>.<stage>.<reason>` or `<outcome>.<reason>`. The outcome is
-`published`, `skipped`, `held`, `failed`, `merged` or `operator`. The stage names where the
+`published`, `refreshed`, `skipped`, `held`, `failed`, `merged` or `operator`. The stage names where the
 decision was made: `gate` (the application's checks around the review), `network`
 (fixed-text consensus-health alerts, whose rows carry no `item_id` and use the
 report URL or incident key as `subject`), `review` (the first review, or a request
 to repair release labels; in `failed` codes, any request to the reviewer),
 `verification` (a fresh verification), `final_check` (the
-[final checks](FINAL_REVIEW.md#final-checks) of a verified approval), `writer`,
+[final checks](FINAL_REVIEW.md#final-checks) of a verified approval), `refresh`
+(automatic story-summary refreshes when a story accumulates updates), `writer`,
 or `app`. Codes are stable, so counts can be compared over time.
 
 | Code | Meaning |
@@ -111,6 +112,15 @@ or `app`. Codes are stable, so counts can be compared over time.
 | `failed.app.damaged_job` | The item's saved review job is damaged. |
 | `failed.app.source_proof_unavailable` | A saved draft has no verifiable source snapshot; processing requires an explicit retry. |
 | `merged.auto.same_event` | Both review and fresh verification confirmed two published stories report the same event, and the newer story merged into the earlier one. |
+| `refreshed.summary` | A living story's headline, summary, and impact were refreshed and published after accumulated updates. |
+| `skipped.refresh.ineligible` | A living story failed pre-synthesis eligibility rules for a summary refresh. |
+| `skipped.refresh.missing_sources` | A living story lacked complete source material required for a summary refresh. |
+| `skipped.refresh.review_skip` | Verification returned a `skip` verdict on the refreshed story summary. |
+| `skipped.refresh.stale_or_locked` | The story changed concurrently, retired, or became editorially locked before the refreshed summary committed. |
+| `held.refresh.invalid_packet` | Refresh source-packet assembly failed validation before synthesis. |
+| `held.refresh.invalid_output` | Refresh synthesis or public story rendering produced invalid output. |
+| `held.refresh.review_rejected` | Refresh verification rejected or failed on the synthesized summary (`revise`, `hold`, or non-retryable review error). |
+| `held.refresh.final_check` | Refresh post-verification `final_holds` checks blocked publication of the refreshed summary. |
 | `operator.retried` | An operator retried a rejected, dismissed or failed item. |
 | `operator.reconsidered` | An operator retried an ignored (skipped) item. |
 | `operator.dismissed` | An operator dismissed an item. |

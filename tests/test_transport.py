@@ -1102,7 +1102,7 @@ def test_sse_truncated_length_is_non_retryable_and_limits_fail_closed(completion
 
 def test_streaming_json_fallback_midstream_timeout_and_identity_parity(completion_client):
     """Support plain JSON fallback responses, mid-stream SSE ReadTimeouts, and preserve policy_hash/cache_key."""
-    baseline_policy = "cb997831b02e12829c0f8fc1823ee5db0ae7b788bf1fd6feb53e7da893927266"
+    baseline_policy = "055ae58c788d23feb88f31069a514af704a68dc5d46436ff947288e846ec1585"
     assert review.policy_hash(copy.deepcopy(DEFAULTS)) == baseline_policy
     row = {"content_hash": "a" * 64}
     cfg_on = copy.deepcopy(DEFAULTS)

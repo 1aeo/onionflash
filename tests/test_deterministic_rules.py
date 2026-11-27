@@ -624,14 +624,14 @@ def test_narrower_official_not_news_skips_tor_core_project_replies_and_non_dirau
         # 1. tor-core routine issue failing news_value -> skip cleanly
         core_item = _story_item(
             url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/55001",
-            title="Refactor internal helper naming",
-            content="Refactors internal helper variable naming for clarity.",
+            title="Trim verbose status helper wording",
+            content="Trims a minor status helper wording detail for clarity.",
             author="gk",
         )
         r_core = pending(store, core_item)
         out_core = run_gate(
             cfg, store, r_core,
-            Writer(_story_draft(evidence=["Refactors internal helper variable naming for clarity."])),
+            Writer(_story_draft(evidence=["Trims a minor status helper wording detail for clarity."])),
             Reviewer(skip_news), LATER,
         )
         assert out_core["status"] == "ignored" and out_core["review_calls"] == 1
@@ -660,15 +660,15 @@ def test_narrower_official_not_news_skips_tor_core_project_replies_and_non_dirau
         # 3. dirauth author on non-dirauth-operational issue -> skip cleanly (no hold!)
         non_op_dirauth = _story_item(
             url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/55002",
-            title="Clean up internal test helper",
-            content="Simplifies unit test fixture construction inside local harness.",
+            title="Simplify local fixture formatting note",
+            content="Simplifies a local fixture formatting note inside test harness.",
             author="linus",
             labels=[],
         )
         r_nonop = pending(store, non_op_dirauth)
         out_nonop = run_gate(
             cfg, store, r_nonop,
-            Writer(_story_draft(evidence=["Simplifies unit test fixture construction inside local harness."])),
+            Writer(_story_draft(evidence=["Simplifies a local fixture formatting note inside test harness."])),
             Reviewer(skip_news), LATER,
         )
         assert out_nonop["status"] == "ignored" and out_nonop["review_calls"] == 1
@@ -1529,3 +1529,114 @@ def test_generic_pt_overlap_advice_filler_exceptions_and_pt_outage_protection(tm
             {"url": "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/issues/42", "title": "Snowflake broker"},
         ],
     }) == "snowflake"
+
+
+def test_housekeeping_item_skips_test_and_internal_todo_chores_preserving_guards():
+    """Skip pure test chores and TODO/internal cleanups deterministically without skipping guarded real issues."""
+    test_chores = [
+        _story_item(
+            url="https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/3201",
+            title="Improve default dirauth tests",
+            content="Expands test coverage for default directory authority configuration.",
+            author="nickm",
+        ),
+        _story_item(
+            url="https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/3202",
+            title="tests(netdoc): clean up parser assertions",
+            content="Standardizes test helper assertions.",
+        ),
+        _story_item(
+            url="https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/3203",
+            title="tor-netdoc: Add unit tests for cert validation",
+            content="Covers malformed test vectors in test module.",
+        ),
+    ]
+    for chore in test_chores:
+        assert is_housekeeping_item(chore) == ("skipped.gate.housekeeping", "Routine test suite housekeeping item")
+
+    cleanup_chores = [
+        _story_item(
+            url="https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/3204",
+            title="chanmgr: Fix the channel selection TODOs",
+            content="Resolves remaining comment TODOs left during trait cleanup.",
+            author="nickm",
+        ),
+        _story_item(
+            url="https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/3205",
+            title="tor-netdoc: Refactor internal parser traits",
+            content="Consolidates internal parser helpers without changing public behavior.",
+        ),
+        _story_item(
+            url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/42200",
+            title="Clean up internal module scaffolding",
+            content="Moves private helper functions between internal files.",
+        ),
+    ]
+    for chore in cleanup_chores:
+        assert is_housekeeping_item(chore) == (
+            "skipped.gate.housekeeping",
+            "Routine internal refactor or TODO cleanup item",
+        )
+
+    non_skips = [
+        _story_item(
+            url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/42201",
+            title="Fix dirauth consensus vote verification crash",
+            content="Authorities crash during malformed signature verification in voting.",
+            author="arma",
+            labels=["Directory Authority (dirauth)"],
+        ),
+        _story_item(
+            url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/42202",
+            title="Fix dirauth consensus vote verification crash",
+            content="Crash occurs when parsing stale signature hashes.",
+        ),
+        _story_item(
+            url="https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/3206",
+            title="Add unit tests and fix circuit timeout bug",
+            content="Fixes broken circuit build retry timing.",
+        ),
+        _story_item(
+            title="Improve default dirauth tests",
+            content="Test improvement.",
+            public_comments=[make_note(body="Does this expose a fallback bug?")],
+        ),
+        _story_item(
+            title="Improve default dirauth tests",
+            content="Covers CVE-2026-12345 verification.",
+        ),
+        _story_item(
+            title="chanmgr: Fix the channel selection TODOs",
+            content="Related to TROVE-2026-001.",
+            authority="official",
+        ),
+        _story_item(
+            title="Improve default dirauth tests",
+            content="High-severity follow-up.",
+            labels=["severity::high"],
+        ),
+        _story_item(
+            url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/42203",
+            title="Improve dirauth consensus voting tests",
+            content="Tests consensus voting behavior across authorities.",
+            author="linus",
+            labels=["dirauth"],
+        ),
+        _story_item(
+            url="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/merge_requests/511",
+            title="Add unit tests for handshake failure",
+            content="Covers handshake failure recovery in Snowflake proxy.",
+        ),
+        {
+            "source_id": "tor-dev",
+            "kind": "feed",
+            "authority": "project-sender",
+            "url": "https://lists.torproject.org/mailman3/hyperkitty/list/tor-dev@lists.torproject.org/message/MSG1/",
+            "title": "Improve default dirauth tests",
+            "content": "Proposal discussion thread.",
+            "published_at": DATE,
+            "updated_at": DATE,
+        },
+    ]
+    for item_obj in non_skips:
+        assert is_housekeeping_item(item_obj) is None

@@ -2191,7 +2191,7 @@ def test_parallel_specialist_verify_repairs_and_uses_specialist_budget(context):
     """Multi-wave specialist verification runs all 3 lenses per verify wave within MAX_SPECIALIST_REVIEW_REQUESTS."""
     cfg, store = context
     assert review_gate.MAX_REVIEW_REQUESTS == 8
-    assert review_gate.MAX_SPECIALIST_REVIEW_REQUESTS == 20
+    assert review_gate.MAX_SPECIALIST_REVIEW_REQUESTS == 21
 
     row = pending(store, item(id="https://example.org/spec3-repair", url="https://example.org/spec3-repair"))
     verify_calls = []
@@ -2713,7 +2713,7 @@ def test_specialist_gate_validation_preserve_hold_no_downgrade_and_factory_guard
         allow_network=False, parallel_verify=True, reviewer_factory=_ok_factory, specialists=3,
     )["status"] == "deferred"
 
-    # 7) 2-1 specialist skip(news_value) holds as disagreed_news instead of falling into 1-verifier general tiebreak.
+    # 7) 2-1 specialist skip(news_value) triggers a tiebreak vote rather than holding directly as disagreed_news.
     def _split_2_1_factory():
         class _SplitSpec:
             """Return approve on review and 2-1 skip on news_value across specialists."""
@@ -2734,8 +2734,11 @@ def test_specialist_gate_validation_preserve_hold_no_downgrade_and_factory_guard
         cfg, store, row_2_1, Writer(), ApprovingReviewer(),
         parallel_verify=True, reviewer_factory=_split_2_1_factory, specialists=3,
     )
-    assert res_2_1["status"] == "held" and res_2_1["review_calls"] == 4
-    assert json.loads(job(store, row_2_1)["record_json"])["hold_code"] == "disagreed_news"
+    assert res_2_1["status"] == "published" and res_2_1["review_calls"] == 5
+    rec_2_1 = audit(store, row_2_1["id"])
+    assert rec_2_1["specialists"] == 3
+    assert [s["specialist"] for s in rec_2_1["reviews"][1]["specialists"]] == list(review.SPECIALISTS)
+    assert rec_2_1["reviews"][2]["tiebreaker"] is True
 
     # 8) Confirmed transport failure during specialist reask resumes single failed lens cleanly reusing saved wave replies.
     reask_state = {"calls": 0}
@@ -3159,3 +3162,282 @@ def test_specialist_upgrade_tiebreak_general_reask_atomic_wave_and_eval_diag(con
     assert defer_lines[-1]["summary"]["incomplete"] is True
     assert defer_lines[-1]["summary"]["cases"] == 1
     assert defer_lines[-1]["summary"]["errors"] == 0
+
+
+def test_specialist_3_tiebreak_paths_resume_cache_and_evaluation(context, tmp_path, monkeypatch):
+    """Run news_value tiebreak cleanly under specialists=3 across approve, skip, hold, revise, resume, cache, and eval."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+    from onionflash.llm import CompletionClient as _ClientBase
+
+    cfg, store = context
+
+    def _split_factory(mode="skip"):
+        def _build():
+            class _SplitSpec:
+                """Split specialist news_value verdicts while passing factual checks."""
+
+                def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                           specialist=None, validation_error=None, on_request=None):
+                    """Return specialist verification verdicts configured by `mode`."""
+                    if on_request:
+                        on_request(1)
+                    if mode == "skip" and specialist in {"attribution_scope_advice", "novelty_news"}:
+                        return verdict("skip", criterion="news_value", reason="Routine internal chore.", update=update)
+                    if mode == "insuff_1_2":
+                        if specialist == "attribution_scope_advice":
+                            return verdict("skip", criterion="news_value", reason="Internal plumbing.", update=update)
+                        if specialist == "novelty_news":
+                            return verdict(
+                                "hold",
+                                criterion="news_value",
+                                criteria={"news_value": {"outcome": "insufficient", "reason": "Borderline significance."}},
+                                update=update,
+                            )
+                    if mode == "low_passers" and specialist == "attribution_scope_advice":
+                        return verdict("skip", criterion="news_value", reason="Minor change.", update=update)
+                    if mode == "low_passers" and specialist == "novelty_news":
+                        return verdict(
+                            "hold",
+                            criterion="new_information",
+                            criteria={"new_information": {"outcome": "insufficient", "reason": "Unclear overlap."}},
+                            update=update,
+                        )
+                    return verdict("approve", update=update)
+
+            return _SplitSpec()
+
+        return _build
+
+    class _TiebreakSpyReviewer:
+        """Record `tiebreaker` kwarg and return the requested tiebreaker decision (and optional crash/follow-up)."""
+
+        def __init__(self, tb_verdict, *, follow_up=None, crash_once=False):
+            self.tb_verdict = tb_verdict
+            self.follow_up = follow_up
+            self.crash_once = crash_once
+            self.calls: list[tuple[bool, bool, str | None]] = []
+
+        def review(self, cand, packet, *, coverage=None, verification=False, issue=None,
+                   update=False, specialist=None, tiebreaker=False, validation_error=None, on_request=None):
+            """Serve initial review, tiebreak call, or post-tiebreak sequential specialist wave."""
+            if on_request:
+                on_request(1)
+            self.calls.append((verification, tiebreaker, specialist))
+            if not verification:
+                return verdict("approve", update=update)
+            if tiebreaker:
+                if self.crash_once:
+                    self.crash_once = False
+                    raise AnalysisError("Tiebreak interrupted", retryable=True)
+                if isinstance(self.tb_verdict.get("repair"), dict):
+                    return {
+                        **self.tb_verdict,
+                        "repair": {k: v for k, v in self.tb_verdict["repair"].items() if v is not None},
+                    }
+                return self.tb_verdict
+            if specialist is not None and self.follow_up is not None:
+                return self.follow_up
+            return verdict("approve", update=update)
+
+    # 1) 2-1 specialist skip + tiebreak approve -> published (5 calls) with tiebreaker=True passed only on tiebreak.
+    row_app = pending(store, item(id="https://example.org/s3-tb-app", url="https://example.org/s3-tb-app"))
+    rev_app = _TiebreakSpyReviewer(verdict("approve"))
+    res_app = review_gate.process_item(
+        cfg, store, row_app, Writer(), rev_app,
+        parallel_verify=True, reviewer_factory=_split_factory("skip"), specialists=3,
+    )
+    assert res_app["status"] == "published" and res_app["review_calls"] == 5
+    assert rev_app.calls[-1] == (True, True, None)
+    assert all(not tb for _, tb, _ in rev_app.calls[:-1])
+
+    # 2) Specialist insufficient (1 pass, 1 skip, 1 insuff hold) + tiebreak hold(news_value: fail) -> skip + synthesized receipt.
+    row_skip = pending(store, item(id="https://example.org/s3-tb-skip", url="https://example.org/s3-tb-skip"))
+    rev_skip = _TiebreakSpyReviewer(verdict("hold", criterion="news_value", reason="Not newsworthy."))
+    res_skip = review_gate.process_item(
+        cfg, store, row_skip, Writer(), rev_skip,
+        parallel_verify=True, reviewer_factory=_split_factory("insuff_1_2"), specialists=3,
+    )
+    assert res_skip["status"] == "ignored" and res_skip["review_calls"] == 5
+    assert codes(store, row_skip) == ["skipped.verification.news_value"]
+    assert audit(store, row_skip["id"])["reviews"][2]["tiebreaker"] is True
+
+    # 3) ed_passers < 2 on insufficient news_value holds + tiebreak approve -> published.
+    row_lowp = pending(store, item(id="https://example.org/s3-tb-lowp", url="https://example.org/s3-tb-lowp"))
+    rev_lowp = _TiebreakSpyReviewer(verdict("approve"))
+    res_lowp = review_gate.process_item(
+        cfg, store, row_lowp, Writer(), rev_lowp,
+        parallel_verify=True, reviewer_factory=_split_factory("low_passers"), specialists=3,
+    )
+    assert res_lowp["status"] == "published" and res_lowp["review_calls"] == 5
+
+    # 4) Official item + specialist insufficient split + tiebreak skip(news_value) -> hold official_not_news.
+    row_off = pending(
+        store,
+        item(id="https://example.org/s3-tb-off", url="https://example.org/s3-tb-off", authority="official"),
+    )
+    rev_off = _TiebreakSpyReviewer(verdict("skip", criterion="news_value", reason="Internal detail only."))
+    res_off = review_gate.process_item(
+        cfg, store, row_off, Writer(), rev_off,
+        parallel_verify=True, reviewer_factory=_split_factory("insuff_1_2"), specialists=3,
+    )
+    assert res_off["status"] == "held" and res_off["review_calls"] == 5
+    assert codes(store, row_off) == ["held.verification.official_not_news"]
+    assert json.loads(job(store, row_off)["record_json"])["verified_facts"] is True
+
+    # 5) Tiebreak revise triggers another 3-specialist wave, NOT 1 verifier, and publishes repaired text.
+    row_rep = pending(store, item(id="https://example.org/s3-tb-rev", url="https://example.org/s3-tb-rev"))
+    rev_rep = _TiebreakSpyReviewer(
+        verdict("revise", criterion="operational_advice", repair={"summary": "Tiebreak repaired prose."}),
+    )
+
+    def _repair_wave_factory():
+        class _RepairWaveSpec:
+            """Split news_value on initial candidate, then approve across all 3 lenses after tiebreak repair."""
+
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                """Approve repaired prose across all 3 specialist lenses."""
+                if on_request:
+                    on_request(1)
+                if cand["summary"] == "Tiebreak repaired prose.":
+                    return verdict("approve", update=update)
+                if specialist in {"attribution_scope_advice", "novelty_news"}:
+                    return verdict("skip", criterion="news_value", reason="Routine internal chore.", update=update)
+                return verdict("approve", update=update)
+
+        return _RepairWaveSpec()
+
+    res_rep = review_gate.process_item(
+        cfg, store, row_rep, Writer(), rev_rep,
+        parallel_verify=True, reviewer_factory=_repair_wave_factory, specialists=3,
+    )
+    assert res_rep["status"] == "published" and res_rep["review_calls"] == 8
+    rec_rep = audit(store, row_rep["id"])
+    assert len(rec_rep["reviews"]) == 4 and rec_rep["reviews"][2]["tiebreaker"] is True
+    assert [s["specialist"] for s in rec_rep["reviews"][3]["specialists"]] == list(review.SPECIALISTS)
+    assert store.db.execute("SELECT 1 FROM stories WHERE json_extract(payload, '$.summary') = 'Tiebreak repaired prose.'").fetchone() is not None
+
+    # 6) Interrupted specialists=3 tiebreak resumes directly in `tiebreak` without re-running specialists.
+    row_res = pending(store, item(id="https://example.org/s3-tb-resume", url="https://example.org/s3-tb-resume"))
+    rev_res = _TiebreakSpyReviewer(verdict("approve"), crash_once=True)
+    with pytest.raises(AnalysisError):
+        review_gate.process_item(
+            cfg, store, row_res, Writer(), rev_res,
+            parallel_verify=True, reviewer_factory=_split_factory("skip"), specialists=3,
+        )
+    assert job(store, row_res)["stage"] == "tiebreak"
+    assert json.loads(job(store, row_res)["record_json"])["specialists"] == 3
+    res_done = review_gate.process_item(
+        cfg, store, queued_row(store, row_res["id"]), Writer(), rev_res,
+        parallel_verify=True, reviewer_factory=_split_factory("skip"), specialists=3,
+    )
+    assert res_done["status"] == "published" and res_done["review_calls"] == 1
+    assert rev_res.calls[-1] == (True, True, None)
+
+    # 7) _has_specialist_evidence & cache hit accept specialists=3 tiebreak chains but reject missing wave evidence.
+    cand_app = audit(store, row_app["id"])["candidate"]
+    cand_hash = digest(cand_app)
+    rec_with_tb = copy.deepcopy(audit(store, row_app["id"]))
+    assert review_gate._has_specialist_evidence(rec_with_tb, cand_hash, 3, verdict_name="approve") is True
+    rec_missing_wave = copy.deepcopy(rec_with_tb)
+    rec_missing_wave["reviews"].pop(1)
+    assert review_gate._has_specialist_evidence(rec_missing_wave, cand_hash, 3, verdict_name="approve") is False
+
+    # Interrupted commit leaves real specialists=3 + tiebreak receipt in `review_approvals`; resume hits cache in 0 calls.
+    row_cache = pending(store, item(id="https://example.org/s3-tb-cache", url="https://example.org/s3-tb-cache"))
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            store,
+            "commit_candidate",
+            lambda *_a, **_kw: (_ for _ in ()).throw(AnalysisError("Commit interrupted", retryable=True)),
+        )
+        with pytest.raises(AnalysisError):
+            review_gate.process_item(
+                cfg, store, row_cache, Writer(), _TiebreakSpyReviewer(verdict("approve")),
+                parallel_verify=True, reviewer_factory=_split_factory("skip"), specialists=3,
+            )
+    res_cache = review_gate.process_item(
+        cfg, store, queued_row(store, row_cache["id"]), Writer(), _TiebreakSpyReviewer(verdict("approve")),
+        allow_network=False, parallel_verify=True, reviewer_factory=_split_factory("skip"), specialists=3,
+    )
+    assert res_cache["status"] == "published" and res_cache["cache_hit"] is True and res_cache["review_calls"] == 0
+
+    # 8) tools/evaluate_review.py handles specialists=3 news_value split + tiebreaker cleanly.
+    tools_path = Path(__file__).resolve().parents[1] / "tools" / "evaluate_review.py"
+    spec = importlib.util.spec_from_file_location("evaluate_review", tools_path)
+    eval_mod = importlib.util.module_from_spec(spec)
+    sys.modules["evaluate_review"] = eval_mod
+    spec.loader.exec_module(eval_mod)
+
+    eval_cfg = tmp_path / "eval_cfg.toml"
+    eval_cfg.write_text("", encoding="utf-8")
+    eval_cases = tmp_path / "eval_cases.json"
+    eval_cases.write_text(json.dumps({
+        "defaults": {
+            "why_it_matters": "", "priority": "normal", "confidence": "reported", "state": "developing",
+            "products": ["arti"], "published_at": DATE, "updated_at": DATE, "added_at": DATE,
+        },
+        "packets": {"p1": {"sources": [{
+            "url": "https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/3299",
+            "title": "Internal netdoc trait helper",
+            "kind": "gitlab_mr",
+            "authority": "development",
+            "product": "arti",
+            "published_at": DATE,
+            "updated_at": DATE,
+            "upstream_state": "merged",
+            "passages": ["Internal helper code movement."],
+        }]}},
+        "cases": [{"id": "tb-eval-1", "packet": "p1", "expected": "skip", "candidate": {
+            "id": "555555555555555555555555",
+            "title": "Internal helper change",
+            "summary": "Moves internal helper traits.",
+            "category": "security",
+        }}],
+    }), encoding="utf-8")
+
+    eval_calls: list[tuple[bool, bool, str | None]] = []
+
+    class _EvalTieReviewer(_ClientBase):
+        """Split specialists on news_value then skip on tiebreaker=True inside evaluate_review."""
+
+        last_decoded = None
+        client = None
+
+        def __init__(self, *args, **kwargs):
+            """Accept standard evaluation reviewer initialization args."""
+            pass
+
+        def close(self):
+            """No-op close."""
+            pass
+
+        def complete(self, *args, **kwargs):
+            """Unused stub complete."""
+            return {}
+
+        def review(self, cand, packet, *, coverage=None, verification=False, issue=None, update=False,
+                   specialist=None, tiebreaker=False, validation_error=None, on_request=None):
+            """Return approve initially, 2-1 skip under specialists, and skip on tiebreaker."""
+            if on_request:
+                on_request(1)
+            eval_calls.append((verification, tiebreaker, specialist))
+            if not verification:
+                return verdict("approve", update=update)
+            if tiebreaker or specialist in {"attribution_scope_advice", "novelty_news"}:
+                return verdict("skip", criterion="news_value", reason="Internal crate plumbing.", update=update)
+            return verdict("approve", update=update)
+
+    monkeypatch.setattr(eval_mod, "EvaluationReviewer", _EvalTieReviewer)
+    monkeypatch.setattr(eval_mod, "load_config", lambda *_a, **_kw: cfg)
+    eval_out = tmp_path / "eval_out.jsonl"
+    assert eval_mod.main([
+        "--config", str(eval_cfg), "--cases", str(eval_cases), "--output", str(eval_out), "--specialists", "3",
+    ]) == 0
+    report_lines = [json.loads(ln) for ln in eval_out.read_text(encoding="utf-8").splitlines()]
+    assert report_lines[0]["case"] == "tb-eval-1" and report_lines[0]["matched"] is True
+    assert report_lines[0]["final_verdict"] == "skip" and report_lines[0]["review_request_count"] == 5
+    assert report_lines[-1]["summary"]["matched"] == 1
+    assert len(eval_calls) == 5 and eval_calls[-1] == (True, True, None)

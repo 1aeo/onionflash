@@ -1146,8 +1146,11 @@ class Store:
         refreshed_hash: str,
         status: str,
         observed: str,
+        code: str | None = None,
+        reason: str | None = None,
+        extra: dict | None = None,
     ) -> None:
-        """Record a non-committed refresh outcome so unrefreshable stories are not retried every run."""
+        """Record a non-committed refresh outcome and optional decision-log entry atomically."""
         with immediate_transaction(self.db, "Refresh status update requires a fresh transaction"):
             self.db.execute(
                 """INSERT INTO story_refreshes(story_id,last_refreshed_at,update_count,refreshed_hash,status)
@@ -1159,6 +1162,30 @@ class Store:
                    status=excluded.status""",
                 (story_id, observed, update_count, refreshed_hash, status),
             )
+            if code is not None:
+                detail = dict(extra) if isinstance(extra, dict) else {}
+                if "title" not in detail:
+                    row = self.db.execute(
+                        "SELECT CASE WHEN typeof(payload)='text' THEN CAST(payload AS BLOB) END FROM stories WHERE id=?",
+                        (story_id,),
+                    ).fetchone()
+                    if row is not None and isinstance(payload := saved_object(row[0]), dict):
+                        if isinstance(payload.get("title"), str) and payload["title"]:
+                            detail["title"] = payload["title"]
+                detail["update_count"] = update_count
+                if reason is not None:
+                    detail["reason"] = reason
+                for reserved in ("db", "subject", "code", "observed", "source_id", "story_id", "once"):
+                    detail.pop(reserved, None)
+                decisions.record_subject(
+                    self.db,
+                    f"refresh:{story_id}:{update_count}:{refreshed_hash[:12]}",
+                    code,
+                    observed,
+                    story_id=story_id,
+                    once=False,
+                    **detail,
+                )
 
     def commit_story_refresh(
         self,
@@ -1247,6 +1274,17 @@ class Store:
                    refreshed_hash=excluded.refreshed_hash,
                    status=excluded.status""",
                 (story_id, observed, len(current_updates), ref_hash, "refreshed"),
+            )
+            decisions.record_subject(
+                self.db,
+                f"refresh:{story_id}:{len(current_updates)}:{ref_hash[:12]}",
+                "refreshed.summary",
+                observed,
+                story_id=story_id,
+                once=False,
+                title=merged.get("title"),
+                update_count=len(current_updates),
+                reason="refreshed",
             )
             return {
                 "story_id": story_id,
