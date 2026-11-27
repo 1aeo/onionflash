@@ -807,7 +807,8 @@ def _is_factual_sentence(text: str, sent_start: int, sent_end: int, start: int, 
     if re.search(r"(?<!-)\b(?:if|whether|unless)\s+", clause_before) is not None:
         return False
     sent_after = text[start if end is None else end : sent_end]
-    return re.search(r"(?<!-)\b(?:if|whether|unless)(?!-)\b", sent_after) is None
+    clause_after = re.split(r",\s*(?:and|but|so|yet|while|whereas)\b", sent_after, maxsplit=1)[0]
+    return re.search(r"(?<!-)\b(?:if|whether|unless)(?!-)\b", clause_after) is None
 
 
 def is_action_stated_in_source(source_plain: str, word: str, *, base_forms: dict[str, str]) -> bool:

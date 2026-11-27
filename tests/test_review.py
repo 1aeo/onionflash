@@ -1328,6 +1328,7 @@ def test_completed_action_dependency_behavior_and_source_stated_forms():
     for src_text, cand_summary in (
         ("Tor removed the deprecated option in 0.4.9.16.", "Tor removes the deprecated option in 0.4.9.16."),
         ("Tor removes bastet from the list.", "Tor removed bastet."),
+        ("Tor removed bastet, and operators will rotate keys if tests pass.", "Tor removed bastet."),
         ("The patch was shipped in 1.2.0.", "Tor ships the patch in 1.2.0."),
         ("I did disable HTTP/2 yesterday.", "Operators disabled HTTP/2 yesterday."),
         ("I did edit config and remove the obsolete listener.", "Operators removed the obsolete listener."),
