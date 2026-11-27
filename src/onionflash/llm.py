@@ -726,7 +726,6 @@ _AFTER_DID_BLOCKED_RE = re.compile(
     r"^\s*(?:not|never)\b|"
     r"\b(?:asks?|asked|requests?|requested|proposes?|proposed|suggests?|suggested|recommends?|recommended|"
     r"wants?|wanted|plans?|planned|needs?|needed|tries?|tried|attempts?|attempted|"
-    r"investigates?|investigated|explores?|explored|considers?|considered|evaluates?|evaluated|"
     r"whether|if|how|why|can|could|should|would|will|may|might|must)\b"
 )
 _APPLIED_GERUND_RE = re.compile(
@@ -798,14 +797,17 @@ def _sentence_bounds(text: str, start: int, end: int) -> tuple[int, int]:
     return sent_start, sent_end
 
 
-def _is_factual_sentence(text: str, sent_start: int, sent_end: int, start: int) -> bool:
+def _is_factual_sentence(text: str, sent_start: int, sent_end: int, start: int, end: int | None = None) -> bool:
     if sent_end < len(text) and text[sent_end : sent_end + 1] == "?":
         return False
     sent_before = text[sent_start:start].lstrip()
     if sent_before.startswith(("if ", "whether ", "unless ")):
         return False
     clause_before = sent_before.rsplit(",", 1)[-1].lstrip()
-    return re.search(r"\b(?:if|whether|unless)\s+", clause_before) is None
+    if re.search(r"(?<!-)\b(?:if|whether|unless)\s+", clause_before) is not None:
+        return False
+    sent_after = text[start if end is None else end : sent_end]
+    return re.search(r"(?<!-)\b(?:if|whether|unless)(?!-)\b", sent_after) is None
 
 
 def is_action_stated_in_source(source_plain: str, word: str, *, base_forms: dict[str, str]) -> bool:
@@ -816,7 +818,7 @@ def is_action_stated_in_source(source_plain: str, word: str, *, base_forms: dict
             if _DONE_UNPROVEN_PREFIX_RE.search(prev45) or _REQUEST_OR_NEG_PREFIX_RE.search(prev45):
                 continue
             sent_start, sent_end = _sentence_bounds(source_plain, match.start(), match.end())
-            if not _is_factual_sentence(source_plain, sent_start, sent_end, match.start()):
+            if not _is_factual_sentence(source_plain, sent_start, sent_end, match.start(), match.end()):
                 continue
             return True
     base = base_forms.get(word)
@@ -827,7 +829,7 @@ def is_action_stated_in_source(source_plain: str, word: str, *, base_forms: dict
         if _DONE_UNPROVEN_PREFIX_RE.search(prev45) or _REQUEST_OR_NEG_PREFIX_RE.search(prev45):
             continue
         sent_start, sent_end = _sentence_bounds(source_plain, match.start(), match.end())
-        if not _is_factual_sentence(source_plain, sent_start, sent_end, match.start()):
+        if not _is_factual_sentence(source_plain, sent_start, sent_end, match.start(), match.end()):
             continue
         sent_before = source_plain[sent_start : match.start()]
         was_matches = list(_WHAT_DID_WAS_RE.finditer(sent_before))
@@ -842,7 +844,7 @@ def is_action_stated_in_source(source_plain: str, word: str, *, base_forms: dict
     if (ing := _BASE_ING_FORMS.get(base)) is not None:
         for match in re.finditer(rf"\b{ing}\b(?!-)", source_plain):
             sent_start, sent_end = _sentence_bounds(source_plain, match.start(), match.end())
-            if not _is_factual_sentence(source_plain, sent_start, sent_end, match.start()):
+            if not _is_factual_sentence(source_plain, sent_start, sent_end, match.start(), match.end()):
                 continue
             sent_before = source_plain[sent_start : match.start()]
             clause = sent_before[-90:]

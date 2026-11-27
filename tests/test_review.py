@@ -1332,6 +1332,7 @@ def test_completed_action_dependency_behavior_and_source_stated_forms():
         ("I did disable HTTP/2 yesterday.", "Operators disabled HTTP/2 yesterday."),
         ("I did edit config and remove the obsolete listener.", "Operators removed the obsolete listener."),
         ("What I did was edit config and remove the listener.", "The maintainer removed the listener."),
+        ("What I did was investigate the crash and remove the listener.", "The maintainer removed the listener."),
     ):
         src_u = _unit("gitlab_issue", "Tracker", src_text, state="opened")
         cand = _candidate(
@@ -1353,6 +1354,10 @@ def test_completed_action_dependency_behavior_and_source_stated_forms():
         (ISSUE, {"summary": "The compromised node disables logging."}),
         (CRASH, {"title": "Fixed the bug", "summary": "Patched crash."}),
         (_unit("gitlab_issue", "Bastet", "If Tor removes bastet, clients will drop it.", state="opened"),
+         {"summary": "Tor removed bastet."}),
+        (_unit("gitlab_issue", "Bastet", "Tor removes bastet if the compromise is confirmed.", state="opened"),
+         {"summary": "Tor removed bastet."}),
+        (_unit("gitlab_issue", "Bastet", "Tor removes bastet unless operators object.", state="opened"),
          {"summary": "Tor removed bastet."}),
         (_unit("gitlab_issue", "Upgrade Nginx", "Waiting for upstream fixes in 1.30.7.", state="opened"),
          {"summary": "Nginx patched CVE-2026-123007 on the broker."}),
