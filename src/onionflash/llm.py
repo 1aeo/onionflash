@@ -704,7 +704,7 @@ _DEFAULT_BEHAVIOR_CUE_RE = re.compile(
 _EXT_ANY_DEP_IN_CLAUSE_RE = re.compile(rf"\b(?:{_EXT_DEP_CORE_NAMES}|{_EXT_DAEMON_NAMES})\b")
 _TOR_ACTOR_SUBJECT_RE = re.compile(
     r"\b(?:tor(?:\s+browser)?|arti|snowflake|webtunnel|lyrebird|tails|orbot|oniux|"
-    r"developers?|maintainers?|operators?)\s+$"
+    r"developers?|maintainers?|operators?)(?:\s+(?:has|have|had))?(?:\s+(?:already|now|also))?\s+$"
 )
 
 _DONE_SENTENCE_SPLIT_RE = re.compile(r"(?:\.(?=\s|$)|[!?]|;)")
@@ -725,7 +725,9 @@ _DID_COMPOUND_RE = re.compile(
 _AFTER_DID_BLOCKED_RE = re.compile(
     r"^\s*(?:not|never)\b|"
     r"\b(?:asks?|asked|requests?|requested|proposes?|proposed|suggests?|suggested|recommends?|recommended|"
-    r"wants?|wanted|plans?|planned|needs?|needed|tries?|tried|attempts?|attempted)\b"
+    r"wants?|wanted|plans?|planned|needs?|needed|tries?|tried|attempts?|attempted|"
+    r"investigates?|investigated|explores?|explored|considers?|considered|evaluates?|evaluated|"
+    r"whether|if|how|why|can|could|should|would|will|may|might|must)\b"
 )
 _APPLIED_GERUND_RE = re.compile(
     r"(?:"
@@ -800,15 +802,23 @@ def _is_factual_sentence(text: str, sent_start: int, sent_end: int, start: int) 
     if sent_end < len(text) and text[sent_end : sent_end + 1] == "?":
         return False
     sent_before = text[sent_start:start].lstrip()
-    return not sent_before.startswith(("if ", "whether ", "unless "))
+    if sent_before.startswith(("if ", "whether ", "unless ")):
+        return False
+    clause_before = sent_before.rsplit(",", 1)[-1].lstrip()
+    return re.search(r"\b(?:if|whether|unless)\s+", clause_before) is None
 
 
 def is_action_stated_in_source(source_plain: str, word: str, *, base_forms: dict[str, str]) -> bool:
     """Return whether `word` is stated in normalized `source_plain` without negation, modal, or request framing."""
     for form in STRICT_DONE_EQUIV_FORMS.get(word, (word,)):
         for match in re.finditer(rf"\b{form}\b(?!-)", source_plain):
-            if not _DONE_UNPROVEN_PREFIX_RE.search(source_plain[max(0, match.start() - 45) : match.start()]):
-                return True
+            prev45 = source_plain[max(0, match.start() - 45) : match.start()]
+            if _DONE_UNPROVEN_PREFIX_RE.search(prev45) or _REQUEST_OR_NEG_PREFIX_RE.search(prev45):
+                continue
+            sent_start, sent_end = _sentence_bounds(source_plain, match.start(), match.end())
+            if not _is_factual_sentence(source_plain, sent_start, sent_end, match.start()):
+                continue
+            return True
     base = base_forms.get(word)
     if base is None:
         return False

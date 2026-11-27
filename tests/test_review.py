@@ -1327,9 +1327,11 @@ def test_completed_action_dependency_behavior_and_source_stated_forms():
 
     for src_text, cand_summary in (
         ("Tor removed the deprecated option in 0.4.9.16.", "Tor removes the deprecated option in 0.4.9.16."),
+        ("Tor removes bastet from the list.", "Tor removed bastet."),
         ("The patch was shipped in 1.2.0.", "Tor ships the patch in 1.2.0."),
         ("I did disable HTTP/2 yesterday.", "Operators disabled HTTP/2 yesterday."),
         ("I did edit config and remove the obsolete listener.", "Operators removed the obsolete listener."),
+        ("What I did was edit config and remove the listener.", "The maintainer removed the listener."),
     ):
         src_u = _unit("gitlab_issue", "Tracker", src_text, state="opened")
         cand = _candidate(
@@ -1347,12 +1349,17 @@ def test_completed_action_dependency_behavior_and_source_stated_forms():
     for src_u, bad_fields in (
         (ISSUE, {"summary": "Tor removes bastet from the directory authority list."}),
         (ISSUE, {"summary": "Tor disables TLS 1.1 by default."}),
+        (openssl_no_verb, {"summary": "Tor has disabled TLS 1.1 by default in OpenSSL builds."}),
         (ISSUE, {"summary": "The compromised node disables logging."}),
         (CRASH, {"title": "Fixed the bug", "summary": "Patched crash."}),
+        (_unit("gitlab_issue", "Bastet", "If Tor removes bastet, clients will drop it.", state="opened"),
+         {"summary": "Tor removed bastet."}),
         (_unit("gitlab_issue", "Upgrade Nginx", "Waiting for upstream fixes in 1.30.7.", state="opened"),
          {"summary": "Nginx patched CVE-2026-123007 on the broker."}),
         (_unit("gitlab_issue", "Mitigation", "What I did was propose to remove `http2`.", "We considered disabling HTTP/2.", state="opened"),
          {"summary": "dcf removed `http2`."}),
+        (_unit("gitlab_issue", "Listener", "What I did was investigate whether we can remove the listener.", state="opened"),
+         {"summary": "The maintainer removed the listener."}),
         (_unit("gitlab_issue", "Mitigation", "What I did was not remove `http2`.", state="opened"),
          {"summary": "dcf removed `http2`."}),
         (_unit("gitlab_issue", "Mitigation", "Applied the mitigation without disabling HTTP/2.", state="opened"),

@@ -2231,17 +2231,15 @@ def test_selector_inherits_writer_reasoning_profile_and_cache_key(monkeypatch):
         monkeypatch.setenv("SEL_REASONING_KEY", "synthetic-fixture-value")
         select_bodies: list[dict] = []
         select_transport_bytes: list[int] = []
-        draft_idx = [0]
-        lock = threading.Lock()
 
         def _factory(settings, **kwargs):
             def _handle(request: httpx.Request) -> httpx.Response:
                 body = json.loads(request.content)
                 name = body["response_format"]["json_schema"]["name"]
                 if name == "onionflash_news":
-                    with lock:
-                        reply = drafts[draft_idx[0] % len(drafts)]
-                        draft_idx[0] += 1
+                    sys_msg = body["messages"][0]["content"]
+                    slot = next(i for i, hint in enumerate(analyze._STORY_FOCUS_HINTS) if hint in sys_msg)
+                    reply = drafts[slot]
                 elif name == "onionflash_select":
                     select_bodies.append(body)
                     select_transport_bytes.append(settings["max_response_bytes"])
