@@ -227,7 +227,7 @@ def _validate_cases(cases: list[dict], *, draft: bool = False) -> None:
 
 
 def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, polish=False,
-             specialists=1, best_of=1, quote_digest=False, concurrency=1):
+             specialists=1, best_of=1, quote_digest=False, metadata_impact=False, concurrency=1):
     """Score final reviewed candidates and save bounded evaluation evidence privately.
 
     In draft mode the writer drafts each packet once per round, and each case on
@@ -521,7 +521,8 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
             drafts_lock = threading.Lock()
             if concurrency == 1:
                 with (EvaluationReviewer(config, deadline=deadline) as reviewer,
-                      Analyzer(config, deadline=deadline, editorial_polish=polish, best_of=best_of, quote_digest=quote_digest) as writer):
+                      Analyzer(config, deadline=deadline, editorial_polish=polish, best_of=best_of,
+                               quote_digest=quote_digest, metadata_impact_pass=metadata_impact) as writer):
                     for case in cases:
                         outcome = _run_case(iteration, case, reviewer, writer, drafts_lock, drafts, draft_events)
                         if not _record_result(report, outcome):
@@ -532,7 +533,8 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
                         return None
                     with EvaluationReviewer(config, deadline=deadline) as w_rev:
                         if draft:
-                            with Analyzer(config, deadline=deadline, editorial_polish=polish, best_of=best_of, quote_digest=quote_digest) as w_writer:
+                            with Analyzer(config, deadline=deadline, editorial_polish=polish, best_of=best_of,
+                                          quote_digest=quote_digest, metadata_impact_pass=metadata_impact) as w_writer:
                                 return _run_case(iteration, case, w_rev, w_writer, drafts_lock, drafts, draft_events)
                         return _run_case(iteration, case, w_rev, None, drafts_lock, drafts, draft_events)
 
@@ -587,6 +589,8 @@ def main(argv=None):
                         help="number of parallel draft candidates to generate and select from in --draft mode (1 or 3)")
     parser.add_argument("--quote-digest", action="store_true",
                         help="include quote-backed long-thread digests when drafting in --draft mode")
+    parser.add_argument("--metadata-impact", action="store_true",
+                        help="run focused metadata and impact pass when drafting in --draft mode")
     parser.add_argument("--concurrency", type=int, default=1,
                         help="concurrent evaluation cases to run in parallel (1-16)")
     args = parser.parse_args(argv)
@@ -609,7 +613,8 @@ def main(argv=None):
         cases = [case for case in cases if case["id"] in selected]
     result = evaluate(config, cases, args.output, rounds=args.rounds, deadline=time.monotonic() + args.max_seconds,
                       draft=args.draft, polish=args.polish, specialists=args.specialists,
-                      best_of=args.best_of, quote_digest=args.quote_digest, concurrency=args.concurrency)
+                      best_of=args.best_of, quote_digest=args.quote_digest,
+                      metadata_impact=args.metadata_impact, concurrency=args.concurrency)
     return int(bool(result["controlled_mismatches"] or result.get("false_routes") or result["target_missed"]
                     or result["errors"] or result["incomplete"]))
 

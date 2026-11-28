@@ -188,13 +188,24 @@ def _draft_cache_options(analyzer=None) -> tuple[int, bool | None]:
     return best_of, quote_digest
 
 
+def _draft_metadata_impact(analyzer=None) -> bool:
+    """Return whether `_new_analyzer` or a supplied writer instance runs the metadata and impact pass."""
+    if analyzer is not None:
+        return review_gate._writer_metadata_impact(analyzer)
+    try:
+        params = inspect.signature(Analyzer).parameters
+    except (TypeError, ValueError):
+        params = {}
+    return "metadata_impact_pass" in params
+
+
 def _new_analyzer(
     config: dict,
     *,
     deadline: float | None = None,
     request_semaphore: threading.Semaphore | None = None,
 ):
-    """Construct `Analyzer`, opting into polish, best-of-3, and quote-digest when supported."""
+    """Construct `Analyzer`, opting into polish, best-of-3, quote-digest, and metadata/impact when supported."""
     kwargs: dict[str, object] = {"deadline": deadline}
     try:
         params = inspect.signature(Analyzer).parameters
@@ -202,6 +213,8 @@ def _new_analyzer(
         params = {}
     if "editorial_polish" in params:
         kwargs["editorial_polish"] = True
+    if _draft_metadata_impact():
+        kwargs["metadata_impact_pass"] = True
     best_of, quote_digest = _draft_cache_options()
     if "best_of" in params:
         kwargs["best_of"] = best_of
@@ -238,6 +251,7 @@ def _classify_pending_row(
     observed: str | None = None,
     best_of: int | None = None,
     quote_digest: bool | None = None,
+    metadata_impact_pass: bool | None = None,
 ) -> tuple[str, object]:
     """Run deterministic pre-draft triage; when `execute_gates` is true, commit skips/citations before drafting."""
     if row.get("damaged"):
@@ -346,8 +360,11 @@ def _classify_pending_row(
         best_of, default_qd = _draft_cache_options()
         if quote_digest is None:
             quote_digest = default_qd
+    if metadata_impact_pass is None:
+        metadata_impact_pass = _draft_metadata_impact()
     writer_key = cache_key(
-        row, run_config["llm"], prior, best_of=best_of, quote_digest=quote_digest, item=writer_item,
+        row, run_config["llm"], prior, best_of=best_of, quote_digest=quote_digest,
+        item=writer_item, metadata_impact_pass=metadata_impact_pass,
     )
     locked_reuse = (
         job is not None
@@ -413,6 +430,7 @@ def _persist_draft_outcome(
     dispatch_context: str | None = None,
     best_of: int | None = None,
     quote_digest: bool | None = None,
+    metadata_impact_pass: bool | None = None,
 ) -> tuple[str, int]:
     """Persist a completed worker draft or record its failure on the main thread."""
     if exc is None:
@@ -459,7 +477,8 @@ def _persist_draft_outcome(
             report["review_stale"] += 1
             return "handled", endpoint_failures + retryable
         cur_kind, cur_payload = _classify_pending_row(
-            run_config, store, dict(cur), policy, execute_gates=False, best_of=best_of, quote_digest=quote_digest,
+            run_config, store, dict(cur), policy, execute_gates=False,
+            best_of=best_of, quote_digest=quote_digest, metadata_impact_pass=metadata_impact_pass,
         )
         if cur_kind != "draft" or cur_payload[5] != dispatch_context:
             report["review_stale"] += 1
@@ -505,10 +524,12 @@ def _prefetch_drafts(
     concurrency = _effective_concurrency(run_config)
     policy = review.policy_hash(run_config)
     best_of, quote_digest = _draft_cache_options()
+    metadata_impact_pass = _draft_metadata_impact()
     tasks: list[tuple[dict, dict, dict | None, str, dict | None, str]] = []
     for row in pending_rows[: concurrency * 2]:
         kind, payload = _classify_pending_row(
-            run_config, store, row, policy, execute_gates=False, best_of=best_of, quote_digest=quote_digest,
+            run_config, store, row, policy, execute_gates=False,
+            best_of=best_of, quote_digest=quote_digest, metadata_impact_pass=metadata_impact_pass,
         )
         if kind == "draft":
             tasks.append(payload)
@@ -550,6 +571,7 @@ def _prefetch_drafts(
                 dispatch_context=dispatch_context,
                 best_of=best_of,
                 quote_digest=quote_digest,
+                metadata_impact_pass=metadata_impact_pass,
             )
             if outcome == "budget_reached":
                 budget_reached = True
@@ -647,6 +669,7 @@ def _run_sliding_window(
     concurrency = _effective_concurrency(run_config)
     policy = review.policy_hash(run_config)
     best_of, quote_digest = _draft_cache_options(analyzer)
+    metadata_impact_pass = _draft_metadata_impact(analyzer)
     pending_iter = iter(pending_rows)
     in_flight: dict[Future, tuple[dict, str, dict | None, str]] = {}
     ready_rows: deque[dict] = deque()
@@ -674,7 +697,7 @@ def _run_sliding_window(
                 return
             kind, payload = _classify_pending_row(
                 run_config, store, row, policy, execute_gates=True, observed=now_iso(),
-                best_of=best_of, quote_digest=quote_digest,
+                best_of=best_of, quote_digest=quote_digest, metadata_impact_pass=metadata_impact_pass,
             )
             if kind == "failed":
                 report["analysis_failed"] += 1
@@ -743,6 +766,7 @@ def _run_sliding_window(
                     dispatch_context=dispatch_context,
                     best_of=best_of,
                     quote_digest=quote_digest,
+                    metadata_impact_pass=metadata_impact_pass,
                 )
                 if outcome == "budget_reached":
                     budget_reached = True
@@ -778,6 +802,7 @@ def _run_sliding_window(
                     dispatch_context=dispatch_context,
                     best_of=best_of,
                     quote_digest=quote_digest,
+                    metadata_impact_pass=metadata_impact_pass,
                 )
                 if outcome == "budget_reached":
                     report["budget_reached"] = True

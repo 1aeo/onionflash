@@ -18,7 +18,7 @@ from .transport import DeadlineReached, FetchError, HttpClient, Response, is_eve
 _HTTP_CLIENT_CLASS = HttpClient
 from .util import (  # noqa: E402
     LIST_ARCHIVE_HOST, _url_host, has_invalid_text_chars, is_dirauth_category_story, is_trove_item,
-    should_confirm_merged_mr, strict_json,
+    should_confirm_merged_mr, should_confirm_official_feed, strict_json,
 )
 
 _ACRONYM_ALLOWLIST = frozenset({
@@ -340,10 +340,35 @@ _GENERIC_FILLER_RE = re.compile(
     re.IGNORECASE,
 )
 _UNMATCHED_IMPACT_DELIMITERS = (("(", ")"), ("[", "]"), ("“", "”"))
+_META_LINK_CTA_RE = re.compile(
+    r"(?:"
+    r"\bclick\s+here\b"
+    r"|\blink(?:s)?\s+below\b"
+    r"|\blinked\s+(?:below|above)\b"
+    r"|\bfollow\s+(?:the|this)\s+link\b"
+    r"|\bvisit\s+(?:the|this)\s+link\b"
+    r"|\b(?:see|check|read|refer\s+to|view|open)\s+(?:the\s+)?linked?\b"
+    r"|\b(?:complete|fill\s+out|take|participate\s+in)\s+(?:the\s+)?survey\s+(?:via|using|at|through)\s+(?:the|this)\s+link\b"
+    r"|\b(?:respond|reply|submit)\s+(?:via|using|at|through)\s+(?:the|this)\s+link\b"
+    r"|\b(?:via|using|through)\s+(?:the|this)\s+link\b"
+    r"|\bdirects?\s+readers?\s+to\s+(?:read|visit|see|check|view|follow|click)\b"
+    r")",
+    re.IGNORECASE,
+)
+_CONCRETE_IMPACT_RE = re.compile(
+    r"\b(?:"
+    r"crash\w*|panic\w*|leak\w*|bypass\w*|compromis\w*|dos|ddos|denial[- ]of[- ]service|"
+    r"outage\w*|unreachable|corrupt\w*|truncat\w*|exhaust\w*|deanonymiz\w*|vulnerabilit\w*|"
+    r"exploit\w*|stall\w*|fail(?:s|ed|ing|ure)?|cannot\s+connect|unable\s+to|evict\w*|"
+    r"degrad\w*|overload\w*|hang\w*|deadlock\w*|memory\s+exhaust\w*|"
+    r"upgrade\s+to\s+v?\d+\.\d+"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def is_incomplete_or_filler_impact(text: str) -> str | None:
-    """Detect incomplete sentence fragments or generic boilerplate filler in `why_it_matters`."""
+    """Detect incomplete sentence fragments or generic/meta-CTA boilerplate filler in `why_it_matters`."""
     if not isinstance(text, str):
         return None
     stripped = text.strip()
@@ -361,7 +386,63 @@ def is_incomplete_or_filler_impact(text: str) -> str | None:
         return "incomplete_impact"
     if _GENERIC_FILLER_RE.search(stripped):
         return "filler_impact"
+    if _META_LINK_CTA_RE.search(stripped) and not _CONCRETE_IMPACT_RE.search(stripped):
+        return "filler_impact"
     return None
+
+
+_URL_OR_COMMIT_SHA_RE = re.compile(
+    r"(https?://(?:[^\s<>\"'()]+|\([^\s<>\"'()]*\))+)|(?<![0-9A-Za-z_$-])([0-9a-f]{40})(?![0-9A-Za-z_-])"
+)
+_NON_COMMIT_HEX_PREFIX_RE = re.compile(
+    r"(?:\b(?:fingerprints?|v3ident|relay(?:\s+id(?:entity)?)?|identity(?:\s+key)?|signing(?:\s+key)?|"
+    r"rsa|ed25519|digests?|sha-?256|sha-?1)(?:\s*(?:is|are|=|:))?[\s`\"'(\[]*"
+    r"(?:[0-9a-f]{40}(?:\s*(?:,|and|or|/)\s*|[`\"')\]\s]+))*|(?<![a-z])[a-z0-9_.-]+=\s*[`\"'(\[]?)$",
+    re.IGNORECASE,
+)
+_COMMIT_SHA_ALLOWED_PREFIX_RE = re.compile(
+    r"(?:^|[\s(`\[@,]|\b(?:commit|revision|rev|at)\s*(?:[:=#]|\s+)?)$",
+    re.IGNORECASE,
+)
+_TRACKER_OPENER_RE = re.compile(
+    r"^(?:"
+    r"(?:an?\s+)?(?:opened\s+|open\s+|closed\s+|merged\s+|new\s+)?"
+    r"(?:(?:tor(?:\s+browser|\s+project)?|arti|tails|snowflake|webtunnel|lyrebird|orbot|oniux|torspec)\s+)?"
+    r"(?:gitlab\s+)?(?:issue|ticket|merge\s+request|mr|pull\s+request|pr)(?:\s+#?\d+)?\s+"
+    r"(?:reports?|says?|states?|notes?|describes?|requests?|proposes?|flags?|warns?|highlights?|"
+    r"details?|discusses?|asks?|suggests?|raises?|identifies?|opens?|tracks?|alleges?|claims?|announces?)\b"
+    r"|(?:an?\s+)?opened\s+(?:tor(?:\s+browser|\s+project)?|arti|tails|snowflake|webtunnel|lyrebird|orbot|oniux|torspec|gitlab)\s+"
+    r"(?:issue|ticket|merge\s+request|mr)\b"
+    r"|(?:(?:tor(?:\s+browser|\s+project)?|arti|tails|snowflake|webtunnel|lyrebird|orbot|oniux|torspec)\s+)?"
+    r"(?:gitlab\s+)?(?:issue|ticket)\s+#?\d+\s*:"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def shorten_commit_hashes(text: str) -> str:
+    """Shorten standalone 40-hex lowercase git commit SHAs to 8 chars without altering URLs or relay fingerprints."""
+    if not isinstance(text, str) or not text:
+        return text
+
+    def _replace(match: re.Match[str]) -> str:
+        url, sha = match.group(1), match.group(2)
+        if url is not None:
+            return url
+        prefix = text[max(0, match.start() - 240) : match.start()]
+        if _NON_COMMIT_HEX_PREFIX_RE.search(prefix) or not _COMMIT_SHA_ALLOWED_PREFIX_RE.search(prefix):
+            return sha
+        return sha[:8]
+
+    return _URL_OR_COMMIT_SHA_RE.sub(_replace, text)
+
+
+def has_tracker_opener(title: str) -> bool:
+    """Return whether `title` opens with boilerplate tracker-log phrasing instead of the event."""
+    if not isinstance(title, str):
+        return False
+    stripped = title.strip()
+    return bool(stripped) and bool(_TRACKER_OPENER_RE.match(stripped))
 
 
 def _source_item_unquoted_text(source: dict) -> str:
