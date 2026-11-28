@@ -1915,6 +1915,9 @@ def test_cli_run_uses_configured_max_concurrent_requests(context, monkeypatch):
                     in_flight -= 1
         elif schema_name == "onionflash_select":
             reply = {"winner": 1, "reason": "Best candidate."}
+        elif schema_name == "onionflash_metadata_impact":
+            draft = json.loads(body["messages"][1]["content"])["draft"]
+            reply = {k: draft[k] for k in ("category", "priority", "confidence", "state", "products", "tags", "why_it_matters")}
         elif schema_name == "onionflash_polish":
             draft = json.loads(body["messages"][1]["content"])["draft"]
             reply = {k: draft[k] for k in ("title", "summary", "why_it_matters")}
@@ -1986,6 +1989,9 @@ def test_cli_run_prefetches_drafts_concurrently_and_preserves_report_contract(co
                     in_flight -= 1
         elif schema_name == "onionflash_select":
             reply = {"winner": 1, "reason": "Best candidate."}
+        elif schema_name == "onionflash_metadata_impact":
+            draft = json.loads(body["messages"][1]["content"])["draft"]
+            reply = {k: draft[k] for k in ("category", "priority", "confidence", "state", "products", "tags", "why_it_matters")}
         elif schema_name == "onionflash_polish":
             draft = json.loads(body["messages"][1]["content"])["draft"]
             reply = {k: draft[k] for k in ("title", "summary", "why_it_matters")}
@@ -2006,7 +2012,7 @@ def test_cli_run_prefetches_drafts_concurrently_and_preserves_report_contract(co
     assert report["analyzed"] == 4
     assert report["analysis_failed"] == 0
     assert report["budget_reached"] is False
-    assert report["model_calls"] == 36
+    assert report["model_calls"] == 40
     assert len(store.stories()) == 4
     assert store.db.execute("SELECT COUNT(*) FROM review_jobs").fetchone()[0] == 0
     assert set(report) == {
@@ -2283,6 +2289,10 @@ def test_cli_run_concurrent_partial_failures_do_not_double_defer(context, monkey
             return httpx.Response(
                 200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"winner": 1, "reason": "Best candidate."})}}]}
             )
+        if schema_name == "onionflash_metadata_impact":
+            draft = json.loads(body["messages"][1]["content"])["draft"]
+            reply = {k: draft[k] for k in ("category", "priority", "confidence", "state", "products", "tags", "why_it_matters")}
+            return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(reply)}}]})
         if schema_name == "onionflash_polish":
             draft = json.loads(body["messages"][1]["content"])["draft"]
             reply = {k: draft[k] for k in ("title", "summary", "why_it_matters")}
@@ -2300,7 +2310,7 @@ def test_cli_run_concurrent_partial_failures_do_not_double_defer(context, monkey
     report = cli.run(cfg, store)
     assert report["analyzed"] == 1
     assert report["analysis_failed"] == 2
-    assert report["model_calls"] == 15
+    assert report["model_calls"] == 16
     assert len(store.stories()) == 1
     rows = {
         r["url"]: (r["status"], r["attempts"], r["rejections"])
@@ -2363,6 +2373,21 @@ def test_cli_opt_in_adapters_include_best_of_quote_digest_and_specialists(monkey
     monkeypatch.setattr(cli, "Analyzer", _FullAnalyzer)
     cli._new_analyzer(DEFAULTS, deadline=99.0)
     assert seen == [{"deadline": 99.0, "editorial_polish": True, "best_of": 3, "quote_digest": True}]
+
+    class _MetadataAnalyzer:
+        def __init__(self, config, deadline=None, editorial_polish=False, best_of=1, quote_digest=False, metadata_impact_pass=False):
+            seen.append({
+                "deadline": deadline,
+                "editorial_polish": editorial_polish,
+                "best_of": best_of,
+                "quote_digest": quote_digest,
+                "metadata_impact_pass": metadata_impact_pass,
+            })
+
+    seen.clear()
+    monkeypatch.setattr(cli, "Analyzer", _MetadataAnalyzer)
+    cli._new_analyzer(DEFAULTS, deadline=100.0)
+    assert seen == [{"deadline": 100.0, "editorial_polish": True, "best_of": 3, "quote_digest": True, "metadata_impact_pass": True}]
 
     def _spec_process(cfg, store, row, writer, reviewer, observed=None, *, allow_network=True,
                       parallel_verify=False, reviewer_factory=None, specialists=1):

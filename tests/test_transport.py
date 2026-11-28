@@ -694,9 +694,16 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
         stage_kind = {
             "onionflash_news": "writer",
             "onionflash_select": "select",
+            "onionflash_metadata_impact": "metadata_impact",
             "onionflash_polish": "polish",
         }.get(schema_name, "review")
-        expected_max_tokens = {"writer": 32768, "select": 32768, "polish": 1200, "review": review.OUTPUT_TOKENS}[stage_kind]
+        expected_max_tokens = {
+            "writer": 32768,
+            "select": 32768,
+            "metadata_impact": 1200,
+            "polish": 1200,
+            "review": review.OUTPUT_TOKENS,
+        }[stage_kind]
         assert body["max_tokens"] == expected_max_tokens
         if stage_kind == "select":
             assert body["chat_template_kwargs"] == {"enable_thinking": True}
@@ -709,6 +716,11 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
             return _httpx_completion(analysis(why_it_matters=""))
         if stage_kind == "select":
             return _httpx_completion({"winner": 1, "reason": "Selected candidate."})
+        if stage_kind == "metadata_impact":
+            draft = json.loads(body["messages"][1]["content"])["draft"]
+            return _httpx_completion({
+                k: draft[k] for k in ("category", "priority", "confidence", "state", "products", "tags", "why_it_matters")
+            })
         if stage_kind == "polish":
             draft = json.loads(body["messages"][1]["content"])["draft"]
             return _httpx_completion({k: draft[k] for k in ("title", "summary", "why_it_matters")})
@@ -736,7 +748,7 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
     saved = job(store)
     record = job_record(store)
     assert first["budget_reached"] and first["analysis_failed"] == 0
-    expected_first = {"writer": 1, "reservation": 5, "review": 6}[expire]
+    expected_first = {"writer": 1, "reservation": 6, "review": 7}[expire]
     assert first["model_calls"] == len(sent) == expected_first
     assert saved["stage"] == ("verify" if expire == "review" else "review")
     assert record["request_budget"]["reserved"] == (1 if expire == "review" else 0)
@@ -749,7 +761,7 @@ def test_native_run_defers_unsent_work_without_strikes_and_resumes(context, monk
     assert sent == (
         ["writer", "review", "review"]
         if expire == "writer"
-        else ["writer", "writer", "writer", "select", "polish", "review", "review"]
+        else ["writer", "writer", "writer", "select", "metadata_impact", "polish", "review", "review"]
     )
     assert len(store.stories()) == 1 and job(store) is None
 
@@ -1114,8 +1126,8 @@ def test_streaming_json_fallback_midstream_timeout_and_identity_parity(completio
     row = {"content_hash": "a" * 64}
     cfg_on = copy.deepcopy(DEFAULTS)
     cfg_on["llm"]["writer_reasoning"] = True
-    assert analyze.cache_key(row, DEFAULTS["llm"]) == "36451b56df11731ed0ced04ad77e04eddad10f05fd45cb5e8189f2bc041cb4b7"
-    assert analyze.cache_key(row, cfg_on["llm"]) == "7d169250b2d18c83b0b011684ec217ae96371c61eae94e06c68a1155ce3e484f"
+    assert analyze.cache_key(row, DEFAULTS["llm"]) == "da8379962e5487efa496135a4b3f8642c64e17780f9e69175390c9e44f8b4f6e"
+    assert analyze.cache_key(row, cfg_on["llm"]) == "87c1d2b200c94471f2a42d3f2fc6e006c5f0cf2ea395005743331fbffa03314b"
 
     json_client, _ = completion_client(lambda _req: _httpx_completion({"mode": "json"}))
     _, req1, _ = _ledger()

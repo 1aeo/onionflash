@@ -646,7 +646,8 @@ _DIRAUTH_SECURITY_OR_DOS_RE = re.compile(
 _DIRAUTH_OPERATIONAL_TOPIC_RE = re.compile(
     r"\b(?:dirauth|directory\s+authorit\w*|bridge\s+authorit\w*|dirvote|consensus|vot(?:e|es|ing)|"
     r"bwauth|bandwidth\s+authorit\w*|v3ident|signing\s+key|identity\s+key|authority\s+key|"
-    r"authority\s+list|dirauth\s+list|default\s+authorit\w*|ipv[46]|dual[- ]stack|subnet|"
+    r"authority\s+list|dirauth\s+list|default\s+authorit\w*|auth_dirs\.inc|fallback_dirs\.inc|"
+    r"orport|dirport|port\s+change|ipv[46]|dual[- ]stack|subnet|"
     r"migrat(?:e|ion|ing)|ip\s+(?:change|address|migrat\w*)|address\s+change|outage|offline|"
     r"unreachable|overload\w*|hardware|descriptor\s+upload|shared[- ]random|srv|guard\s+flags?|"
     r"missing\s+from\s+(?:the\s+)?consensus)\b",
@@ -654,7 +655,8 @@ _DIRAUTH_OPERATIONAL_TOPIC_RE = re.compile(
 )
 _DIRAUTH_TITLE_OP_RE = re.compile(
     r"\b(?:address|ipv[46]|dual[- ]stack|subnet|migrat\w*|ip\b|keys?|v3ident|cert(?:ificate)?|"
-    r"rotat\w*|retir\w*|remov\w*|add(?:s|ed|ing)?|list|vot(?:e|es|ing)|consensus|dirvote|bwauth|"
+    r"orport|dirport|ports?|rotat\w*|retir\w*|remov\w*|add(?:s|ed|ing)?|updat\w*|chang\w*|"
+    r"regenerat\w*|refresh\w*|list|vot(?:e|es|ing)|consensus|dirvote|bwauth|"
     r"overload\w*|outage|offline|unreachable|degrad\w*|timeout\w*|upload\w*|guard\s+flags?|"
     r"srv|shared[- ]random|stale|missing|replac\w*|hardware|operational)\b",
     re.I,
@@ -990,6 +992,33 @@ def should_confirm_merged_mr(sources: Iterable[dict] | None) -> bool:
     )
 
 
+_OFFICIAL_FEED_TITLE_HEDGE_RE = re.compile(
+    r"\b(?:suspected|unconfirmed|alleged(?:ly)?|plausibl[ey]|reportedly|rumou?r(?:ed|s)?|unverified)\b",
+    re.I,
+)
+_OFFICIAL_FEED_HEDGE_RE = re.compile(
+    r"\b(?:unconfirmed|not\s+confirmed|cannot\s+confirm|could\s+not\s+confirm|"
+    r"alleged(?:ly)?|rumou?r(?:ed|s)?|unverified|"
+    r"suspected\s+(?:compromise|attack|intrusion|breach|incident)|"
+    r"plausibl[ey]\s+(?:compromised|attacked|breached)|"
+    r"reportedly\s+(?:compromised|attacked|breached|down|offline))\b",
+    re.I,
+)
+
+
+def should_confirm_official_feed(source: dict) -> bool:
+    """Return whether `source` is an official non-tag, non-reply, non-hedged announcement feed."""
+    if not isinstance(source, dict) or source.get("authority") != "official" or source.get("kind") != "feed":
+        return False
+    title = str(source.get("title") or "")
+    _, is_reply = _strip_subject_prefixes(title)
+    if is_reply:
+        return False
+    if _OFFICIAL_FEED_TITLE_HEDGE_RE.search(title):
+        return False
+    return not _OFFICIAL_FEED_HEDGE_RE.search(_source_full_text(source))
+
+
 def _source_full_text(source: dict) -> str:
     title = source.get("title") if isinstance(source.get("title"), str) else ""
     body = next((source[k] for k in ("source_content", "content", "unquoted_content") if isinstance(source.get(k), str)), "")
@@ -1009,9 +1038,20 @@ def _source_full_text(source: dict) -> str:
 
 _DIRAUTH_SIGNAL_RE = re.compile(
     r"\b(?:dirauth|directory[- ]authorit\w*|bridge[- ]authorit\w*|bwauth|"
-    r"bandwidth[- ]authorit\w*|dirvote|v3ident|consensus|vot(?:e|es|ing))\b",
+    r"bandwidth[- ]authorit\w*|dirvote|v3ident|consensus|vot(?:e|es|ing)|"
+    r"auth_dirs\.inc|fallback_dirs\.inc)\b",
     re.I,
 )
+_DIRAUTH_PORT_AUTH_RE = re.compile(
+    rf"(?:"
+    rf"(?:dirauth|directory\s+authorit\w*|bridge\s+authorit\w*|{'|'.join(DIRAUTH_NICKNAMES)})"
+    rf"[^.!?\n,;]{{0,50}}\b(?:orport|dirport)\b"
+    rf"|\b(?:orport|dirport)\b[^.!?\n,;]{{0,50}}"
+    rf"\b(?:dirauth|directory\s+authorit\w*|bridge\s+authorit\w*|{'|'.join(DIRAUTH_NICKNAMES)})\b"
+    rf")",
+    re.I,
+)
+_DIRAUTH_LIST_FILE_RE = re.compile(r"\b(?:auth_dirs\.inc|fallback_dirs\.inc)\b", re.I)
 
 
 def has_dirauth_signal(source: dict) -> bool:
@@ -1063,6 +1103,11 @@ def is_dirauth_category_story(sources: Iterable[dict] | None) -> bool:
         title = str(s.get("title") or "")
         if DIRAUTH_NICKNAME_RE.search(title) or re.search(r"\b(?:dirauth|directory\s+authorit\w*|bridge\s+authorit\w*)\b", title, re.I):
             if _DIRAUTH_TITLE_OP_RE.search(title):
+                return True
+        if s.get("authority") != "community":
+            if _DIRAUTH_LIST_FILE_RE.search(text) and _DIRAUTH_TITLE_OP_RE.search(text):
+                return True
+            if _DIRAUTH_PORT_AUTH_RE.search(text) and not re.search(r"\b(?:my|our)\s+relays?\b", title, re.I):
                 return True
     return False
 

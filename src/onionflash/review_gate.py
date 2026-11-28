@@ -1855,6 +1855,11 @@ def _writer_cache_options(writer) -> tuple[int, bool | None]:
     return best_of, quote_digest
 
 
+def _writer_metadata_impact(writer) -> bool:
+    """Return whether `writer` explicitly runs the focused metadata and impact pass."""
+    return getattr(writer, "metadata_impact_pass", False) is True
+
+
 def _require_specialist_support(rev) -> None:
     if rev is None or not _supports_kwarg(rev.review, "specialist"):
         raise TypeError("Reviewer does not accept required 'specialist' keyword argument")
@@ -2391,8 +2396,10 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         return {**report, "status": "stale"}
 
     writer_best_of, writer_quote_digest = _writer_cache_options(writer)
+    writer_metadata_impact = _writer_metadata_impact(writer)
     writer_key = cache_key(
         row, config["llm"], prior, best_of=writer_best_of, quote_digest=writer_quote_digest, item=writer_item,
+        metadata_impact_pass=writer_metadata_impact,
     )
     locked_reuse = (job is not None and existing is not None and editorial.is_locked(store.db, existing["id"])
                     and same_source and saved_draft is not None)

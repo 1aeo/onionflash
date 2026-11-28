@@ -501,7 +501,7 @@ def test_sliding_window_bounds_concurrent_http_under_best_of_3_and_specialists_3
     lock = threading.Lock()
     in_flight = 0
     max_in_flight = 0
-    counts = {"news": 0, "select": 0, "polish": 0, "review": 0}
+    counts = {"news": 0, "select": 0, "metadata_impact": 0, "polish": 0, "review": 0}
     barrier = threading.Barrier(4, timeout=5.0)
 
     def _handle(request: httpx.Request) -> httpx.Response:
@@ -531,6 +531,11 @@ def test_sliding_window_bounds_concurrent_http_under_best_of_3_and_specialists_3
             with lock:
                 counts["select"] += 1
             reply = {"winner": 1, "reason": "Best candidate."}
+        elif schema_name == "onionflash_metadata_impact":
+            with lock:
+                counts["metadata_impact"] += 1
+            draft = json.loads(body["messages"][1]["content"])["draft"]
+            reply = {k: draft[k] for k in ("category", "priority", "confidence", "state", "products", "tags", "why_it_matters")}
         elif schema_name == "onionflash_polish":
             with lock:
                 counts["polish"] += 1
@@ -552,8 +557,8 @@ def test_sliding_window_bounds_concurrent_http_under_best_of_3_and_specialists_3
 
     report = cli.run(cfg, store)
     assert max_in_flight == cli.MAX_CONCURRENT_LLM_ITEMS == 4
-    assert counts == {"news": 12, "select": 4, "polish": 4, "review": 16}
-    assert report["model_calls"] == 36
+    assert counts == {"news": 12, "select": 4, "metadata_impact": 4, "polish": 4, "review": 16}
+    assert report["model_calls"] == 40
     assert report["analyzed"] == 4
     assert len(store.stories()) == 4
 
@@ -706,7 +711,7 @@ def test_draft_cache_parity_stale_failure_guard_refresh_errors_and_harvester_saf
         row = store.pending(10, DATE)[0]
         kind, payload = cli._classify_pending_row(cfg, store, row, review.policy_hash(cfg), execute_gates=False)
         assert kind == "draft"
-        expected_k = cache_key(row, cfg["llm"], None, best_of=3, quote_digest=True)
+        expected_k = cache_key(row, cfg["llm"], None, best_of=3, quote_digest=True, metadata_impact_pass=True)
         assert payload[3] == expected_k and len(payload) == 6
 
         # 2) Stale-context draft failure increments review_stale without charging attempts/rejections.
