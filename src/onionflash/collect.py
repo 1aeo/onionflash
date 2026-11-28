@@ -220,8 +220,9 @@ _PGP_SIGNATURE_RE = re.compile(
 )
 _RELEASE_CLI_BOILERPLATE_RE = re.compile(r"^\s*created using the release-cli\.?\s*$", re.IGNORECASE)
 _TRIVIAL_TAG_MSG_RE = re.compile(
-    r"^(?:(?:bump|set|update)\s+(?:the\s+)?(?:version(?:\s+of\s+\S+)?\s+to|to)\s+\S+|"
-    r"(?:release|tag|prepare|version)\s+\S+)\.?$",
+    r"^(?:(?:bump|set|update)\s+(?:the\s+)?(?:version(?:\s+of\s+\S+)?\s+to|to)|"
+    r"(?:release|tag|prepare|version))\s+"
+    r"(?:[a-z0-9_.-]+-)?v?\d+(?:\.\d+)+(?:[-.~+][a-z0-9._-]+)*\.?$",
     re.IGNORECASE,
 )
 _TAG_VERSION_RE = re.compile(
