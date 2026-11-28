@@ -7,7 +7,7 @@ new JSONL files outside the configured public output directory.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 import json
 import os
 from pathlib import Path
@@ -191,7 +191,7 @@ def _judged_metrics(judged: dict) -> dict:
     clean = judged.get("clean") or {"cases": 0, "ok": 0}
     alarms = clean["cases"] - clean["ok"]
     missed = [*((["catch"] if total and paired / total < CATCH_TARGET else ())),
-              *(f for f, r in flagged.items() if r["unique"] >= FLOOR_CASES and r["paired"] / r["cases"] < FLAW_FLOOR),
+              *(f for f, r in sorted(flagged.items()) if r["unique"] >= FLOOR_CASES and r["paired"] / r["cases"] < FLAW_FLOOR),
               *((["false_alarms"] if clean["cases"] and alarms / clean["cases"] > FALSE_ALARM_LIMIT else ()))]
     return {"target_missed": missed, "catch_rate": _rate(caught, total),
             "paired_catch_rate": _rate(paired, total), "false_alarm_rate": _rate(alarms, clean["cases"])}
@@ -307,7 +307,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
                     try:
                         assert writer is not None
                         result_draft = writer.analyze(item)
-                    except (AnalysisError, CompletionDeferred) as exc:
+                    except (AnalysisError, CompletionDeferred, ValueError, TypeError, KeyError) as exc:
                         result_draft = exc
                     finally:
                         with drafts_lock:
@@ -321,9 +321,7 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
                         cached_draft = drafts[key]
                 if not is_owner:
                     result_draft = cached_draft
-                if isinstance(result_draft, CompletionDeferred):
-                    raise result_draft
-                if isinstance(result_draft, AnalysisError):
+                if isinstance(result_draft, BaseException):
                     raise result_draft
                 record["draft"] = result_draft
                 candidate = record["candidate"] = prepare_story(
@@ -538,10 +536,18 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
                                 return _run_case(iteration, case, w_rev, w_writer, drafts_lock, drafts, draft_events)
                         return _run_case(iteration, case, w_rev, None, drafts_lock, drafts, draft_events)
 
+                cancelled = False
                 with ThreadPoolExecutor(max_workers=min(concurrency, len(cases))) as pool:
                     futures = [pool.submit(_worker_case, case) for case in cases]
                     for fut in as_completed(futures):
-                        if not _record_result(report, fut.result()):
+                        if fut.cancelled():
+                            continue
+                        try:
+                            outcome = fut.result()
+                        except CancelledError:
+                            continue
+                        if not _record_result(report, outcome) and not cancelled:
+                            cancelled = True
                             for rem in futures:
                                 rem.cancel()
             if totals["incomplete"]:

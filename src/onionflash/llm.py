@@ -1138,6 +1138,7 @@ class CompletionClient:
         now: float,
     ) -> str:
         """Atomically select and claim the least-loaded healthy untried pool endpoint."""
+        has_untried_fallback = any(fb not in tried for fb in fallbacks_only)
         with cls._pool_lock:
             entry = cls._pool_state.setdefault(
                 pool_urls,
@@ -1152,19 +1153,24 @@ class CompletionClient:
             n = len(pool_urls)
             start = entry["rr"]
             rotated = [
-                (idx, url)
+                (idx, (start + idx) % n, url)
                 for idx in range(n)
                 if (url := pool_urls[(start + idx) % n]) not in tried
             ]
             if rotated:
-                healthy = [(in_flight.get(url, 0), idx, url) for idx, url in rotated if unhealthy.get(url, 0.0) <= now]
+                healthy = [(in_flight.get(url, 0), idx, pos, url) for idx, pos, url in rotated if unhealthy.get(url, 0.0) <= now]
                 if healthy:
-                    chosen = min(healthy)[2]
-                else:
-                    chosen = min((unhealthy[url], in_flight.get(url, 0), idx, url) for idx, url in rotated)[3]
-                entry["rr"] = (start + 1) % n
-                in_flight[chosen] = in_flight.get(chosen, 0) + 1
-                return chosen
+                    _, _, chosen_pos, chosen = min(healthy)
+                    entry["rr"] = (chosen_pos + 1) % n
+                    in_flight[chosen] = in_flight.get(chosen, 0) + 1
+                    return chosen
+                if not has_untried_fallback:
+                    _, _, _, chosen_pos, chosen = min(
+                        (unhealthy[url], in_flight.get(url, 0), idx, pos, url) for idx, pos, url in rotated
+                    )
+                    entry["rr"] = (chosen_pos + 1) % n
+                    in_flight[chosen] = in_flight.get(chosen, 0) + 1
+                    return chosen
         for fb in fallbacks_only:
             if fb not in tried:
                 return fb

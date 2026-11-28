@@ -1242,16 +1242,28 @@ def test_evaluate_review_specialists_initial_reask_and_low_budget_hold(evaluatio
 
 
 def test_evaluate_parallel_concurrency_matches_sequential(tmp_path, monkeypatch):
-    """Verify `--concurrency 3` produces identical summary counts and valid JSONL without duplicating drafts."""
+    """Verify `--concurrency 3` produces identical summary counts, proves overlap, and deduplicates shared drafts."""
     module = MOD
     config = make_config(tmp_path)
     config["llm"].update(base_url="https://model.example/v1", api_key_env="REVIEW_TEST_KEY")
     monkeypatch.setenv("REVIEW_TEST_KEY", "synthetic-fixture-value")
     corpus = json.loads((Path(__file__).resolve().parents[1] / "tools/review_cases.json").read_text())
-    cases = module.expand(corpus)[:4]
+    all_cases = module.expand(corpus)
+    # Pick two clean approve cases on distinct packets to prove parallel overlap.
+    distinct_approve: list[dict] = []
+    seen_packets: set[str] = set()
+    for case in all_cases:
+        pkt_key = json.dumps(case["packet"], sort_keys=True)
+        if case["expected"] == "approve" and pkt_key not in seen_packets:
+            distinct_approve.append(case)
+            seen_packets.add(pkt_key)
+        if len(distinct_approve) == 2:
+            break
+    cases = all_cases[:4]
 
     draft_calls = 0
     draft_lock = threading.Lock()
+    review_barrier: threading.Barrier | None = None
 
     class _FakeRev(_ClientBase):
         last_decoded = None
@@ -1263,6 +1275,8 @@ def test_evaluate_parallel_concurrency_matches_sequential(tmp_path, monkeypatch)
                    specialist=None, validation_error=None, on_request=None):
             if on_request:
                 on_request(1)
+            if review_barrier is not None:
+                review_barrier.wait()
             return verdict("approve", update=update)
 
     class _FakeWriter(_ClientBase):
@@ -1293,21 +1307,120 @@ def test_evaluate_parallel_concurrency_matches_sequential(tmp_path, monkeypatch)
     assert par_lines[-1]["summary"] == par_res
     assert {row["case"] for row in par_lines[:-1]} == {c["id"] for c in cases}
 
-    shared_pair = [{**cases[0], "id": "shared-a"}, {**cases[0], "id": "shared-b"}]
-    shared_out = tmp_path / "shared_draft.jsonl"
-    module.evaluate(config, shared_pair, shared_out, draft=True, concurrency=2)
-    assert draft_calls == 1
+    review_barrier = threading.Barrier(2, timeout=5.0)
+    overlap_out = tmp_path / "overlap.jsonl"
+    overlap_res = module.evaluate(config, distinct_approve, overlap_out, concurrency=2)
+    assert overlap_res["errors"] == 0 and overlap_res["matched"] == 2
+    review_barrier = None
 
-    first_draft_id = module.draft_cases(corpus)[0]["id"]
+    shared_pair = [{**distinct_approve[0], "id": "shared-a"}, {**distinct_approve[0], "id": "shared-b"}]
+    shared_out = tmp_path / "shared_draft.jsonl"
+    shared_res = module.evaluate(config, shared_pair, shared_out, draft=True, concurrency=2)
+    assert draft_calls == 1
+    assert shared_res["errors"] == 0
+    shared_lines = [json.loads(line) for line in shared_out.read_text().splitlines()]
+    assert len(shared_lines) == 3
+    for row in shared_lines[:-1]:
+        assert "draft" in row and row["outcome"] == "approved"
+    assert shared_lines[-1]["summary"]["errors"] == 0
+
+    approve_draft_id = next(c["id"] for c in module.draft_cases(corpus) if c["expected"] == "approve")
     draft_par_out = tmp_path / "draft_par.jsonl"
     rc = module.main([
         "--config", str(write_toml(tmp_path, '[llm]\nbase_url = "https://model.example/v1"\n')),
         "--cases", str(Path(__file__).resolve().parents[1] / "tools/review_cases.json"),
-        "--case-id", first_draft_id,
+        "--case-id", approve_draft_id,
         "--output", str(draft_par_out),
         "--draft",
         "--concurrency", "3",
     ])
-    assert isinstance(rc, int)
+    assert rc == 0
     assert draft_calls == 2
-    assert len(draft_par_out.read_text().splitlines()) == 2
+    draft_par_lines = [json.loads(line) for line in draft_par_out.read_text().splitlines()]
+    assert len(draft_par_lines) == 2
+    assert "draft" in draft_par_lines[0] and draft_par_lines[0]["outcome"] == "approved"
+    assert draft_par_lines[1]["summary"]["errors"] == 0
+
+
+def test_evaluate_parallel_preserves_shared_writer_errors_deadline_summary_and_sorted_missed(tmp_path, monkeypatch):
+    """Preserve writer errors across shared packets, write summary on deadline cancel, and sort target_missed."""
+    module = MOD
+    config = make_config(tmp_path)
+    config["llm"].update(base_url="https://model.example/v1", api_key_env="REVIEW_TEST_KEY")
+    monkeypatch.setenv("REVIEW_TEST_KEY", "synthetic-fixture-value")
+    corpus = json.loads((Path(__file__).resolve().parents[1] / "tools/review_cases.json").read_text())
+    cases = module.expand(corpus)[:2]
+    shared_pair = [{**cases[0], "id": "err-a"}, {**cases[0], "id": "err-b"}]
+
+    class _FakeRev(_ClientBase):
+        last_decoded = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def review(self, cand, packet, *, coverage=None, verification=False, issue=None, update=False,
+                   specialist=None, validation_error=None, on_request=None):
+            if on_request:
+                on_request(1)
+            return verdict("approve", update=update)
+
+    class _TypeErrorWriter(_ClientBase):
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def analyze(self, item, prior=None):
+            raise TypeError("boom type error")
+
+    monkeypatch.setattr(module, "EvaluationReviewer", _FakeRev)
+    monkeypatch.setattr(module, "Analyzer", _TypeErrorWriter)
+
+    err_out = tmp_path / "shared_err.jsonl"
+    err_res = module.evaluate(config, shared_pair, err_out, draft=True, concurrency=2)
+    assert err_res["errors"] == 2
+    err_rows = [json.loads(line) for line in err_out.read_text().splitlines()[:-1]]
+    assert [row["error"] for row in err_rows] == ["TypeError", "TypeError"]
+
+    # Deadline cancellation under concurrency=2 must still write the incomplete summary row.
+    seen_rev = 0
+    rev_lock = threading.Lock()
+    clock = [100.0]
+
+    class _SlowDeadlineRev(_ClientBase):
+        last_decoded = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def review(self, cand, packet, *, coverage=None, verification=False, issue=None, update=False,
+                   specialist=None, validation_error=None, on_request=None):
+            nonlocal seen_rev
+            if on_request:
+                on_request(1)
+            with rev_lock:
+                seen_rev += 1
+                if seen_rev == 1:
+                    return verdict("approve", update=update)
+            clock[0] = 200.0
+            return verdict("approve", update=update)
+
+    monkeypatch.setattr(module, "EvaluationReviewer", _SlowDeadlineRev)
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    six_cases = module.expand(corpus)[:6]
+    cancel_out = tmp_path / "cancel.jsonl"
+    cancel_res = module.evaluate(config, six_cases, cancel_out, deadline=150.0, concurrency=2)
+    assert cancel_res["incomplete"] is True
+    cancel_lines = [json.loads(line) for line in cancel_out.read_text().splitlines()]
+    assert "summary" in cancel_lines[-1] and cancel_lines[-1]["summary"]["incomplete"] is True
+
+    # _judged_metrics sorts flaw names in target_missed regardless of insertion order.
+    judged_a = {
+        "overclaim": {"cases": 10, "ok": 0, "unique": 10, "paired": 0},
+        "badge_misuse": {"cases": 10, "ok": 0, "unique": 10, "paired": 0},
+        "clean": {"cases": 10, "ok": 10, "unique": 10},
+    }
+    judged_b = {
+        "badge_misuse": {"cases": 10, "ok": 0, "unique": 10, "paired": 0},
+        "overclaim": {"cases": 10, "ok": 0, "unique": 10, "paired": 0},
+        "clean": {"cases": 10, "ok": 10, "unique": 10},
+    }
+    assert module._judged_metrics(judged_a)["target_missed"] == module._judged_metrics(judged_b)["target_missed"] == ["catch", "badge_misuse", "overclaim"]

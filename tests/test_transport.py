@@ -1230,3 +1230,68 @@ def test_pool_base_urls_balances_concurrent_in_flight_requests(monkeypatch):
         hosts = list(pool.map(lambda _: _worker(), range(2)))
     assert sorted(hosts) == ["node1.example", "node2.example"]
     CompletionClient._reset_pool_state()
+
+
+def test_pool_fallback_precedes_cooling_and_cursor_advances_past_chosen(monkeypatch):
+    """Try untried fallback before cooling pool nodes, and advance RR cursor past the selected node."""
+    CompletionClient._reset_pool_state()
+    clock = [50.0]
+    seen_hosts: list[str] = []
+    fail_hosts = {"a.example", "b.example"}
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        seen_hosts.append(request.url.host)
+        if request.url.host in fail_hosts:
+            raise httpx.ConnectError(f"{request.url.host} down", request=request)
+        return _httpx_completion({"host": request.url.host})
+
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["llm"].update(
+        base_url="https://a.example/v1",
+        pool_base_urls=["https://b.example/v1"],
+        fallback_base_urls=["https://fallback.example/v1"],
+        api_key_env="TEST_LLM_KEY",
+    )
+    monkeypatch.setenv("TEST_LLM_KEY", "secret-token")
+    client = CompletionClient(cfg)
+    client.clock = lambda: clock[0]
+    monkeypatch.setattr(
+        llm,
+        "HttpClient",
+        lambda settings, **kwargs: HttpClient(settings, **kwargs, transport=httpx.MockTransport(_handle), resolver=public_dns),
+    )
+
+    # First call fails A and B, putting both in cooldown, and succeeds on fallback.
+    _, req1, _ = _ledger()
+    assert _complete(client, req1) == {"host": "fallback.example"}
+    assert seen_hosts == ["a.example", "b.example", "fallback.example"]
+
+    # Second call during cooldown goes straight to fallback without retrying cooling A/B.
+    seen_hosts.clear()
+    clock[0] = 60.0
+    _, req2, _ = _ledger()
+    assert _complete(client, req2) == {"host": "fallback.example"}
+    assert seen_hosts == ["fallback.example"]
+
+    # 3-node pool [A, B, C] with A cooling should alternate B, C, B, C cleanly.
+    CompletionClient._reset_pool_state()
+    fail_hosts = {"a.example"}
+    seen_hosts.clear()
+    cfg3 = copy.deepcopy(DEFAULTS)
+    cfg3["llm"].update(
+        base_url="https://a.example/v1",
+        pool_base_urls=["https://b.example/v1", "https://c.example/v1"],
+        api_key_env="TEST_LLM_KEY",
+    )
+    client3 = CompletionClient(cfg3)
+    client3.clock = lambda: clock[0]
+    _, r1, _ = _ledger()
+    first = _complete(client3, r1)["host"]
+    assert first in {"b.example", "c.example"}
+    picks = []
+    clock[0] = 65.0
+    for _ in range(4):
+        _, rk, _ = _ledger()
+        picks.append(_complete(client3, rk)["host"])
+    assert picks == ["c.example", "b.example", "c.example", "b.example"] or picks == ["b.example", "c.example", "b.example", "c.example"]
+    CompletionClient._reset_pool_state()

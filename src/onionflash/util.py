@@ -820,9 +820,10 @@ def software_from_url(url: object) -> str | None:
         return None
     try:
         parsed = urlsplit(raw)
+        port = parsed.port
     except ValueError:
         return None
-    if parsed.scheme.lower() != "https" or parsed.port is not None:
+    if parsed.scheme.lower() != "https" or port is not None:
         return None
     netloc = parsed.netloc.lower()
     if netloc in {"tails.net", "www.tails.net"}:

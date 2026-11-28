@@ -120,10 +120,12 @@ def test_gitlab_url_and_source_software_extraction():
     assert util.software_from_url("https://github.com/guardianproject/orbot/releases/tag/v1.0.0") == "orbot"
     assert util.software_from_url("http://github.com/guardianproject/orbot-android/releases") is None
     assert util.software_from_url("https://github.com:8443/guardianproject/orbot-android/releases") is None
+    assert util.software_from_url("https://example.org:invalid/post") is None
     assert util.software_from_url("https://github.com/other/orbot-android/releases") is None
 
     found = util.software_from_sources([
         {"url": "https://example.org/post"},
+        {"url": "https://example.org:invalid/post"},
         {"url": "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/issues/10"},
         "https://blog.torproject.org/new-release-tor-browser-14-5/",
         {"url": "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/merge_requests/11"},
