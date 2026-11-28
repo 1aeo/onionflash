@@ -999,6 +999,8 @@ _OFFICIAL_FEED_TITLE_HEDGE_RE = re.compile(
 _OFFICIAL_FEED_HEDGE_RE = re.compile(
     r"\b(?:unconfirmed|not\s+confirmed|cannot\s+confirm|could\s+not\s+confirm|"
     r"alleged(?:ly)?|rumou?r(?:ed|s)?|unverified|"
+    r"(?:may|might|could)\s+(?:have\s+been|be)\s+(?:compromised|attacked|intruded|breached|down|offline|affected|exposed|exploited|vulnerable|tampered)|"
+    r"(?:appears?|seems?)\s+to\s+(?:have\s+been\s+|be\s+)?(?:compromised|attacked|breached)|"
     r"suspected\s+(?:compromise|attack|intrusion|breach|incident)|"
     r"plausibl[ey]\s+(?:compromised|attacked|breached)|"
     r"reportedly\s+(?:compromised|attacked|breached|down|offline))\b",

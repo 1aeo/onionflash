@@ -395,8 +395,8 @@ _URL_OR_COMMIT_SHA_RE = re.compile(
     r"(https?://[^\s<>()\[\]\"']+)|(?<![0-9A-Za-z_$-])([0-9a-f]{40})(?![0-9A-Za-z_-])"
 )
 _NON_COMMIT_HEX_PREFIX_RE = re.compile(
-    r"(?:\b(?:fingerprint|v3ident|relay(?:\s+id(?:entity)?)?|identity(?:\s+key)?|signing(?:\s+key)?|"
-    r"rsa|ed25519|digest|sha-?256|sha-?1)\s*(?:is|=|:)?\s*|(?<![a-z])[a-z0-9_.-]+=\s*)$",
+    r"(?:\b(?:fingerprints?|v3ident|relay(?:\s+id(?:entity)?)?|identity(?:\s+key)?|signing(?:\s+key)?|"
+    r"rsa|ed25519|digests?|sha-?256|sha-?1)(?:\s*(?:is|=|:))?[\s`\"'(\[]*|(?<![a-z])[a-z0-9_.-]+=\s*[`\"'(\[]?)$",
     re.IGNORECASE,
 )
 _COMMIT_SHA_ALLOWED_PREFIX_RE = re.compile(

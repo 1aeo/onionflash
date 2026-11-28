@@ -435,3 +435,86 @@ def test_cli_review_gate_and_evaluate_review_metadata_impact_wiring(tmp_path, mo
     ])
     assert rc == 0
     assert seen_opts[0]["metadata_impact"] is True
+
+
+def test_coderabbit_fixes_cache_contract_fingerprints_modal_hedges_and_tracker_openers(monkeypatch):
+    """Cover metadata stage cache contract, delimited fingerprints, modal uncertainty, and tracker-opener guards."""
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["llm"].update(
+        base_url="https://llm.example/v1",
+        api_key_env="MI_TEST_KEY",
+        writer_reasoning=True,
+        send_chat_template_kwargs=True,
+        max_output_tokens=1200,
+    )
+    cfg_2400 = copy.deepcopy(cfg)
+    cfg_2400["llm"]["max_output_tokens"] = 2400
+    monkeypatch.setenv("MI_TEST_KEY", "synthetic-fixture-value")
+
+    # 1. Metadata pass incorporates effective non-thinking generation settings into cache_key.
+    row = {"content_hash": "e" * 64}
+    assert cache_key(row, cfg["llm"], metadata_impact_pass=False) == cache_key(
+        row, cfg_2400["llm"], metadata_impact_pass=False
+    )
+    assert cache_key(row, cfg["llm"], metadata_impact_pass=True) != cache_key(
+        row, cfg_2400["llm"], metadata_impact_pass=True
+    )
+
+    # 2. Delimited fingerprints stay full-length while backtick commit SHAs shorten.
+    fp = "f533c81cef0bc0267857c99b2f471adf249fa232"
+    sha = "cadcd0d310831ba237fff4c1a39ef51c53b506db"
+    assert shorten_commit_hashes(f"Relay fingerprint `{fp}` at `{sha}`.") == f"Relay fingerprint `{fp}` at `cadcd0d3`."
+    assert shorten_commit_hashes(f'v3ident="{fp}" and digest "{fp}"') == f'v3ident="{fp}" and digest "{fp}"'
+
+    # 3. Modal uncertainty prevents auto-confirming hedged official feeds.
+    modal_feed = item(
+        kind="feed",
+        authority="official",
+        url="https://lists.torproject.org/pipermail/tor-announce/2026-November/001099.html",
+        title="Mirror status update",
+        content="The mirror may have been compromised; investigation continues.",
+        labels=[],
+    )
+    assert should_confirm_official_feed(modal_feed) is False
+
+    # 4. Best-of-N filters tracker-opener headlines when an event-first candidate exists, and polish cannot reintroduce one.
+    ev = "Tor consensus votes over 16 MB are truncated before signing on directory authorities."
+    src = item(
+        kind="gitlab_issue",
+        url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/41500",
+        title="Consensus votes over 16 MB truncated",
+        content=ev,
+        labels=[],
+    )
+    tracker_cand = analysis(
+        title="Tor issue reports consensus vote truncation over 16 MB",
+        summary="A GitLab issue says consensus votes over 16 MB are truncated before signing.",
+        why_it_matters="",
+        category="directory-authority",
+        tags=["directory-authority"],
+        evidence=[ev],
+    )
+    event_cand = analysis(
+        title="Tor consensus votes over 16 MB truncated before signing",
+        summary="Consensus votes over 16 MB are truncated before signing on directory authorities.",
+        why_it_matters="",
+        category="directory-authority",
+        tags=["directory-authority"],
+        evidence=[ev],
+    )
+    w_best = Analyzer(cfg, best_of=2, editorial_polish=False, metadata_impact_pass=False)
+    w_best.client = FakeLLM(tracker_cand, event_cand, {"winner": 1, "reason": "Picked slot 1."})
+    selected = w_best.analyze(src)
+    assert selected["title"] == event_cand["title"]
+    assert w_best.calls == 3  # selector ran on all candidates, then post-selection guard overruled tracker opener
+
+    bad_polish = {
+        "title": "Tor issue reports consensus vote truncation over 16 MB",
+        "summary": event_cand["summary"],
+        "why_it_matters": "",
+    }
+    w_pol = Analyzer(cfg, best_of=1, editorial_polish=True, metadata_impact_pass=False)
+    w_pol.client = FakeLLM(event_cand, bad_polish)
+    kept = w_pol.analyze(src)
+    assert kept["title"] == event_cand["title"]
+    assert w_pol.calls == 2

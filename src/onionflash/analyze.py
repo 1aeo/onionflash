@@ -638,8 +638,10 @@ def cache_key(
             json.dumps(IMPACT_REASK_SCHEMA, ensure_ascii=False, allow_nan=False),
         ])
         if metadata_impact_pass:
+            metadata_effective = writer_settings({**llm, "writer_reasoning": False})
             identity.extend([
                 "metadata_impact_pass",
+                _llm_contract(metadata_effective),
                 METADATA_IMPACT_PROMPT,
                 json.dumps(METADATA_IMPACT_SCHEMA, ensure_ascii=False, allow_nan=False),
             ])
@@ -1191,6 +1193,8 @@ class Analyzer(CompletionClient):
                 )
                 if cleaned:
                     merged[key] = shorten_commit_hashes(cleaned)
+        if not has_tracker_opener(str(draft.get("title") or "")) and has_tracker_opener(merged["title"]):
+            raise AnalysisError("Polish introduced tracker-log headline opener")
         draft_ids = {m.upper() for m in _ADVISORY_ID_RE.findall(str(draft.get("title") or ""))}
         merged_ids = {m.upper() for m in _ADVISORY_ID_RE.findall(str(merged.get("title") or ""))}
         if draft_ids - merged_ids:
@@ -1345,7 +1349,13 @@ class Analyzer(CompletionClient):
                 winner_idx = self._select_winner(
                     [cand for cand, _, _ in valid], bounded, prior, is_update=is_update
                 )
-                result, clears, stated_clean = valid[winner_idx]
+                picked = valid[winner_idx]
+                if not is_update and has_tracker_opener(str(picked[0].get("title") or "")):
+                    picked = next(
+                        (entry for entry in valid if not has_tracker_opener(str(entry[0].get("title") or ""))),
+                        picked,
+                    )
+                result, clears, stated_clean = picked
 
         if not is_update:
             if (
