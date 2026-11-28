@@ -460,13 +460,19 @@ def test_coderabbit_fixes_cache_contract_fingerprints_modal_hedges_and_tracker_o
         row, cfg_2400["llm"], metadata_impact_pass=True
     )
 
-    # 2. Delimited fingerprints stay full-length while backtick commit SHAs shorten.
+    # 2. Delimited fingerprints, parenthesized URLs, and multi-fingerprint lists stay intact; explicit commits shorten.
     fp = "f533c81cef0bc0267857c99b2f471adf249fa232"
+    fp2 = "8155a1f322f3c41d3c9f7e91c5124567890abcde"
     sha = "cadcd0d310831ba237fff4c1a39ef51c53b506db"
+    paren_url = f"https://example.org/(archive)/commit@{sha}"
     assert shorten_commit_hashes(f"Relay fingerprint `{fp}` at `{sha}`.") == f"Relay fingerprint `{fp}` at `cadcd0d3`."
+    assert shorten_commit_hashes(f"Relay fingerprints {fp} and {fp2}; fix in commit {sha}.") == (
+        f"Relay fingerprints {fp} and {fp2}; fix in commit cadcd0d3."
+    )
     assert shorten_commit_hashes(f'v3ident="{fp}" and digest "{fp}"') == f'v3ident="{fp}" and digest "{fp}"'
+    assert shorten_commit_hashes(f"Archived at {paren_url}") == f"Archived at {paren_url}"
 
-    # 3. Modal uncertainty prevents auto-confirming hedged official feeds.
+    # 3. Modal uncertainty prevents auto-confirming or metadata-promoting hedged official feeds; "to avoid" CTA stays filler.
     modal_feed = item(
         kind="feed",
         authority="official",
@@ -476,8 +482,38 @@ def test_coderabbit_fixes_cache_contract_fingerprints_modal_hedges_and_tracker_o
         labels=[],
     )
     assert should_confirm_official_feed(modal_feed) is False
+    assert is_incomplete_or_filler_impact("Click here to avoid missing future posts.") == "filler_impact"
 
-    # 4. Best-of-N filters tracker-opener headlines when an event-first candidate exists, and polish cannot reintroduce one.
+    modal_draft = analysis(
+        title="Mirror status update under investigation",
+        summary="The notice says a mirror may have been compromised while investigation continues.",
+        why_it_matters="",
+        category="security",
+        confidence="reported",
+        evidence=["The mirror may have been compromised; investigation continues."],
+    )
+    modal_mi = {
+        "category": "security",
+        "priority": "normal",
+        "confidence": "reported",
+        "state": "developing",
+        "products": ["tor"],
+        "tags": ["security"],
+        "why_it_matters": "",
+    }
+    w_modal = Analyzer(cfg, metadata_impact_pass=True)
+    w_modal.client = FakeLLM(modal_draft, modal_mi)
+    modal_out = w_modal.analyze(modal_feed)
+    assert modal_out["confidence"] == "reported"
+    assert "confirmed" not in w_modal.client.requests[1][1]["response_format"]["json_schema"]["schema"]["properties"]["confidence"]["enum"]
+
+    # 3b. Numeric commit hash prefixes are exempt only as commit references, not as general impact counts.
+    num_sha = "12345678" + "ab" * 16
+    num_src = item(kind="gitlab_issue", url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/42001", title="Fix crash", content=f"Regression introduced at {num_sha}.", labels=[])
+    assert "numbers" in analyze._impact_clearing_reasons("The report says 12345678 relays crash.", num_src, ["tor"])
+    assert not analyze._impact_clearing_reasons("Fixes crash introduced in commit 12345678.", num_src, ["tor"])
+
+    # 4. Selector fidelity choice wins when selector succeeds; fallback prefers non-tracker opener; polish cannot add tracker opener.
     ev = "Tor consensus votes over 16 MB are truncated before signing on directory authorities."
     src = item(
         kind="gitlab_issue",
@@ -487,8 +523,8 @@ def test_coderabbit_fixes_cache_contract_fingerprints_modal_hedges_and_tracker_o
         labels=[],
     )
     tracker_cand = analysis(
-        title="Tor issue reports consensus vote truncation over 16 MB",
-        summary="A GitLab issue says consensus votes over 16 MB are truncated before signing.",
+        title="Tor issue reports possible consensus vote truncation over 16 MB",
+        summary="A GitLab issue says consensus votes over 16 MB are possibly truncated before signing.",
         why_it_matters="",
         category="directory-authority",
         tags=["directory-authority"],
@@ -502,11 +538,15 @@ def test_coderabbit_fixes_cache_contract_fingerprints_modal_hedges_and_tracker_o
         tags=["directory-authority"],
         evidence=[ev],
     )
-    w_best = Analyzer(cfg, best_of=2, editorial_polish=False, metadata_impact_pass=False)
-    w_best.client = FakeLLM(tracker_cand, event_cand, {"winner": 1, "reason": "Picked slot 1."})
-    selected = w_best.analyze(src)
-    assert selected["title"] == event_cand["title"]
-    assert w_best.calls == 3  # selector ran on all candidates, then post-selection guard overruled tracker opener
+    w_sel = Analyzer(cfg, best_of=2, editorial_polish=False, metadata_impact_pass=False)
+    w_sel.client = FakeLLM(tracker_cand, event_cand, {"winner": 1, "reason": "Preserves hedge 'possible'."})
+    assert w_sel.analyze(src)["title"] == tracker_cand["title"]
+    assert w_sel.calls == 3
+
+    w_fb = Analyzer(cfg, best_of=2, editorial_polish=False, metadata_impact_pass=False)
+    w_fb.client = FakeLLM(tracker_cand, event_cand, CompletionDeferred("selector timeout"))
+    assert w_fb.analyze(src)["title"] == event_cand["title"]
+    assert w_fb.calls == 3
 
     bad_polish = {
         "title": "Tor issue reports consensus vote truncation over 16 MB",

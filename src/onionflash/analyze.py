@@ -707,6 +707,25 @@ def _impact_context_text(item: dict) -> str:
 _COMMIT_SHA40_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])")
 
 
+def _strip_verified_short_commits(impact: str, ctx: str) -> str:
+    """Remove verified 8-char commit hash references from `impact` before numeric count comparison."""
+    prefixes = {sha_match.group(0)[:8] for sha_match in _COMMIT_SHA40_RE.finditer(ctx)}
+    if not prefixes:
+        return impact
+    cleaned = impact
+    for prefix in sorted(prefixes):
+        if prefix.isdigit():
+            cleaned = re.sub(
+                rf"(?:`{prefix}`|\b(?:commit|revision|rev)\s*(?:[:=#]|\s+)?{prefix}\b|@{prefix}\b|\bat\s+{prefix}(?=\b|[),]))",
+                " ",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+        else:
+            cleaned = re.sub(rf"(?<![0-9a-f]){prefix}(?![0-9a-f])", " ", cleaned)
+    return cleaned
+
+
 def _impact_clearing_reasons(
     impact: str,
     item: dict,
@@ -717,9 +736,7 @@ def _impact_clearing_reasons(
     reasons: set[str] = set()
     ctx = _impact_context_text(item) if impact_context is None else impact_context
     allowed_numbers = _numbers(ctx)
-    for sha_match in _COMMIT_SHA40_RE.finditer(ctx):
-        allowed_numbers |= _numbers(sha_match.group(0)[:8])
-    if _numbers(impact) - allowed_numbers:
+    if _numbers(_strip_verified_short_commits(impact, ctx)) - allowed_numbers:
         reasons.add("numbers")
     if item.get("authority") == "community" and LIST_ARCHIVE_HOST in str(item.get("url") or ""):
         reasons.add("community_list")
@@ -888,6 +905,13 @@ def _normalize_editorial_labels(result: dict, source: dict, schema: dict) -> Non
     """Enforce deterministic merged-MR/official-feed confidence and directory-authority label guardrails."""
     sources = [source]
     if (
+        source.get("authority") == "official"
+        and source.get("kind") == "feed"
+        and not _util.should_confirm_official_feed(source)
+        and "reported" in schema["properties"]["confidence"]["enum"]
+    ):
+        result["confidence"] = "reported"
+    elif (
         (_util.should_confirm_merged_mr(sources) or _util.should_confirm_official_feed(source))
         and "confirmed" in schema["properties"]["confidence"]["enum"]
     ):
@@ -1102,9 +1126,19 @@ class Analyzer(CompletionClient):
         *,
         is_update: bool,
     ) -> int:
-        """Pick the strongest validated draft via the editorial selector, falling back to index 0."""
-        if len(candidates) <= 1 or (self.deadline is not None and self.clock() >= self.deadline):
+        """Pick the strongest validated draft via the editorial selector, falling back cleanly."""
+        if len(candidates) <= 1:
             return 0
+        fallback_idx = (
+            0
+            if is_update
+            else next(
+                (i for i, cand in enumerate(candidates) if not has_tracker_opener(str(cand.get("title") or ""))),
+                0,
+            )
+        )
+        if self.deadline is not None and self.clock() >= self.deadline:
+            return fallback_idx
         selector_schema = copy.deepcopy(SELECTOR_SCHEMA)
         selector_schema["properties"]["winner"]["enum"] = list(range(1, len(candidates) + 1))
         selector_payload = {
@@ -1122,16 +1156,16 @@ class Analyzer(CompletionClient):
                 selector_llm, SELECTOR_PROMPT, selector_payload, selector_schema, "onionflash_select"
             )
         except (CompletionDeferred, AnalysisError, FetchError):
-            return 0
+            return fallback_idx
         max_reason_len = SELECTOR_SCHEMA["properties"]["reason"].get("maxLength", 240)
         if not isinstance(reply, dict) or set(reply) != {"winner", "reason"}:
-            return 0
+            return fallback_idx
         winner = reply.get("winner")
         if type(winner) is not int or not (1 <= winner <= len(candidates)):
-            return 0
+            return fallback_idx
         reason = reply.get("reason")
         if not isinstance(reason, str) or not (1 <= len(reason.strip()) <= max_reason_len):
-            return 0
+            return fallback_idx
         return winner - 1
 
     def _reask_why_it_matters(self, draft: dict, stated: str, bounded: dict, source: dict) -> str:
@@ -1228,6 +1262,13 @@ class Analyzer(CompletionClient):
         """Run focused non-thinking metadata & impact pass and validate against source label limits."""
         mi_schema = copy.deepcopy(METADATA_IMPACT_SCHEMA)
         limits = label_limits([bounded])
+        if (
+            bounded.get("authority") == "official"
+            and bounded.get("kind") == "feed"
+            and not _util.should_confirm_official_feed(bounded)
+            and "reported" in limits.get("confidence", ())
+        ):
+            limits["confidence"] = [c for c in limits["confidence"] if c != "confirmed"] or ["reported"]
         apply_label_limits(mi_schema["properties"], limits)
         mi_payload = {
             "draft": {
@@ -1349,13 +1390,7 @@ class Analyzer(CompletionClient):
                 winner_idx = self._select_winner(
                     [cand for cand, _, _ in valid], bounded, prior, is_update=is_update
                 )
-                picked = valid[winner_idx]
-                if not is_update and has_tracker_opener(str(picked[0].get("title") or "")):
-                    picked = next(
-                        (entry for entry in valid if not has_tracker_opener(str(entry[0].get("title") or ""))),
-                        picked,
-                    )
-                result, clears, stated_clean = picked
+                result, clears, stated_clean = valid[winner_idx]
 
         if not is_update:
             if (

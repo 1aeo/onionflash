@@ -360,7 +360,7 @@ _CONCRETE_IMPACT_RE = re.compile(
     r"crash\w*|panic\w*|leak\w*|bypass\w*|compromis\w*|dos|ddos|denial[- ]of[- ]service|"
     r"outage\w*|unreachable|corrupt\w*|truncat\w*|exhaust\w*|deanonymiz\w*|vulnerabilit\w*|"
     r"exploit\w*|stall\w*|fail(?:s|ed|ing|ure)?|cannot\s+connect|unable\s+to|evict\w*|"
-    r"degrad\w*|overload\w*|hang\w*|deadlock\w*|memory\s+exhaust\w*|to\s+prevent|to\s+avoid|"
+    r"degrad\w*|overload\w*|hang\w*|deadlock\w*|memory\s+exhaust\w*|"
     r"upgrade\s+to\s+v?\d+\.\d+"
     r")\b",
     re.IGNORECASE,
@@ -392,11 +392,12 @@ def is_incomplete_or_filler_impact(text: str) -> str | None:
 
 
 _URL_OR_COMMIT_SHA_RE = re.compile(
-    r"(https?://[^\s<>()\[\]\"']+)|(?<![0-9A-Za-z_$-])([0-9a-f]{40})(?![0-9A-Za-z_-])"
+    r"(https?://(?:[^\s<>\"'()]+|\([^\s<>\"'()]*\))+)|(?<![0-9A-Za-z_$-])([0-9a-f]{40})(?![0-9A-Za-z_-])"
 )
 _NON_COMMIT_HEX_PREFIX_RE = re.compile(
     r"(?:\b(?:fingerprints?|v3ident|relay(?:\s+id(?:entity)?)?|identity(?:\s+key)?|signing(?:\s+key)?|"
-    r"rsa|ed25519|digests?|sha-?256|sha-?1)(?:\s*(?:is|=|:))?[\s`\"'(\[]*|(?<![a-z])[a-z0-9_.-]+=\s*[`\"'(\[]?)$",
+    r"rsa|ed25519|digests?|sha-?256|sha-?1)(?:\s*(?:is|are|=|:))?[\s`\"'(\[]*"
+    r"(?:[0-9a-f]{40}(?:\s*(?:,|and|or|/)\s*|[`\"')\]\s]+))*|(?<![a-z])[a-z0-9_.-]+=\s*[`\"'(\[]?)$",
     re.IGNORECASE,
 )
 _COMMIT_SHA_ALLOWED_PREFIX_RE = re.compile(
@@ -428,7 +429,7 @@ def shorten_commit_hashes(text: str) -> str:
         url, sha = match.group(1), match.group(2)
         if url is not None:
             return url
-        prefix = text[max(0, match.start() - 40) : match.start()]
+        prefix = text[max(0, match.start() - 240) : match.start()]
         if _NON_COMMIT_HEX_PREFIX_RE.search(prefix) or not _COMMIT_SHA_ALLOWED_PREFIX_RE.search(prefix):
             return sha
         return sha[:8]
