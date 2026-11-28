@@ -351,6 +351,7 @@ def test_refresh_v2_constants_and_shared_is_refresh_eligible(tmp_path):
         "updates": [{"at": DATE, "text": "Follow-up detail noted.", "sources": []}],
     }
     assert is_refresh_eligible(base) is False
+    assert is_refresh_eligible({**base, "state": ["fixed"]}) is False
     assert is_refresh_eligible({**base, "updates": base["updates"] * 2}) is False
     assert is_refresh_eligible({**base, "updates": base["updates"] * 3}) is True
     assert is_refresh_eligible({**base, "origin": "network-health", "updates": base["updates"] * 3}) is False

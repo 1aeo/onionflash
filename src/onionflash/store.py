@@ -333,8 +333,10 @@ def is_refresh_eligible(story: dict) -> bool:
     title = story.get("title") if isinstance(story.get("title"), str) else ""
     if len(updates) >= 2 and _REFRESH_TRACKER_HEADLINE_RE.search(title):
         return True
+    state = story.get("state")
     if (
-        story.get("state") in {"fixed", "resolved", "merged", "released"}
+        isinstance(state, str)
+        and state in {"fixed", "resolved", "merged", "released"}
         and title
         and not _REFRESH_SETTLED_HEADLINE_RE.search(title)
         and _REFRESH_OPEN_HEADLINE_RE.search(title)
@@ -1342,10 +1344,13 @@ class Store:
                 cluster_key=story_row["cluster_key"] if story_row else None,
             ) is not None:
                 raise ValueError("Cannot retry refresh for a retired or merged story")
-            if story_row is None or saved_object(story_row["payload_blob"]) is None:
+            story_payload = saved_object(story_row["payload_blob"]) if story_row is not None else None
+            if story_row is None or story_payload is None:
                 raise ValueError("Target story is no longer available")
             if editorial.is_locked(self.db, story_id):
                 raise ValueError("Story is editorially locked or retracted")
+            if not is_refresh_eligible(story_payload):
+                raise ValueError("Story is not currently eligible for refresh")
             changed = self.db.execute(
                 "DELETE FROM story_refreshes WHERE story_id=? AND refreshed_hash=?",
                 (story_id, expected_hash),

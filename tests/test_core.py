@@ -2473,3 +2473,23 @@ def test_cli_refresh_list_and_guarded_retry(tmp_path, capsys):
     with Store(db_path) as store:
         assert [c["story_id"] for c in store.refresh_candidates(limit=5, policy_hash=policy)] == [s1["id"]]
         assert refresh_mod.MAX_REFRESHES_PER_RUN == 4
+
+        # Ineligible stories (e.g., settled 1-update story) reject retry without clearing story_refreshes.
+        settled = seed_story(
+            store,
+            item(url="https://example.org/ref-cli-2", title="Fixed settled bug", content="Fixed body."),
+            analysis(title="Fixed settled bug", summary="Fixed body.", state="fixed", evidence=["Fixed body."]),
+        )
+        u1 = item(url="https://example.org/ref-cli-2/upd", title="Note", content="Follow-up note.", published_at=LATER, updated_at=LATER)
+        r1 = pending(store, u1, at=LATER, ready=LATER, target=settled["id"])
+        finish_reviewed(store, r1, update_analysis(update="Operator noted no further change.", evidence=[u1["content"]]), cache_key(r1, DEFAULTS["llm"]), LATER)
+        inhash = "b" * 64
+        store.record_refresh_status(settled["id"], update_count=1, refreshed_hash=inhash, status="refreshed", observed=LATER, policy_hash=policy)
+    rejected_inelig = invoke_cli(
+        capsys, "refresh", "retry", "--config", cfg_path,
+        "--story", settled["id"], "--expect-hash", inhash, "--reason", "Try ineligible story",
+        expected=2,
+    )
+    assert "eligible" in rejected_inelig["error"].lower()
+    with Store(db_path) as store:
+        assert store.db.execute("SELECT status FROM story_refreshes WHERE story_id=?", (settled["id"],)).fetchone()[0] == "refreshed"
