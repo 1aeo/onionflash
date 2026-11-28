@@ -24,6 +24,7 @@ from .transport import FetchError
 from .util import (
     LIST_ARCHIVE_HOST, digest, effective_authority, gitlab_repo_name,
     mandatory_news_rule, normalize_evidence as _plain, saved_object, software_from_url,
+    tag_enrichment_kind,
 )
 
 PROMPT_VERSION = "onionflash-25"
@@ -189,7 +190,8 @@ and why_it_matters against the supplied source and draft:
   - Never include "release" in tags unless category="release" or state is "released"/"tagged".
 - confidence:
   - Set confidence="confirmed" for genuine official non-tag announcements (tor-blog, tor-announce,
-    tails-news, etc. unless hedged) and merged gitlab_mr (upstream_state="merged").
+    tails-news, etc. unless hedged), official enriched tags carrying release notes or commit logs,
+    and merged gitlab_mr (upstream_state="merged").
   - Keep gitlab_issue items and mailing-list posts (including project-sender on tor-relays) at
     "reported" or "suspected" (or "observed-anomaly" for telemetry alerts), never "confirmed".
 - state, priority & products:
@@ -272,7 +274,7 @@ Score every candidate strictly in priority order:
      keeping required hedges and identifiers) and penalize boilerplate tracker openers ('Tor issue
      reports...', 'Arti issue says...', 'An opened Tor Browser issue...', 'GitLab issue reports...').
 4. Exact label accuracy (confidence, state, category, tags, products):
-   - Keep confidence=confirmed strictly for official non-tag announcements or merged gitlab_mr
+   - Keep confidence=confirmed strictly for official non-tag announcements, official enriched tags, or merged gitlab_mr
      (never project-sender on tor-relays or issues), category=security ONLY for real
      vulnerabilities/TROVE/exposures (NOT user surveys or single-platform build/unit-test crashes),
      category=directory-authority on directory/bridge authority operations (including auth_dirs.inc,
@@ -285,7 +287,7 @@ _STORY_FOCUS_HINTS = (
     "\n\nDRAFTING FOCUS (strict literal fidelity and metadata): Prioritize exact literal fidelity "
     "to source, preserving all hedges, preconditions, scope limits and uncertain status without "
     "unstated roles, directives or completed-action claims, and verify exact category, confidence "
-    "(confirmed only for official non-tag feeds or merged MRs; security only for real vulnerabilities/TROVE), "
+    "(confirmed only for official non-tag feeds, official enriched tags, or merged MRs; security only for real vulnerabilities/TROVE), "
     "state, products and tags.",
     "\n\nDRAFTING FOCUS (thread nuance and named details): Inspect public_comments and thread_digest "
     "(when present) carefully, capturing material maintainer triage, scope narrowings, disagreements, "
@@ -437,7 +439,8 @@ SOCKS, or onion-service story.
 Do not infer generic benefits to stability, reliability, security or privacy from
 the existence of a fix, or urgency from an editorial label. No filler, inferred
 privacy impacts or extra advice. Source-host location alone does not establish
-confirmation. Reserve confirmed for an official Tor Project announcement or a merged
+confirmation. Reserve confirmed for an official Tor Project non-tag announcement, an official enriched tag
+carrying release notes or changelog commits, or a merged
 merge request's own change; use reported for issues, comments, maintainer statements,
 list posts and community claims. Confidence and editorial priority are separate.
 Populate products with the exact lowercase GitLab repository name of each affected
@@ -529,7 +532,7 @@ alternate-channel release or timeline notice repeating only facts prior_story al
 that literal action plainly (for example "An operator asks ...", "@author assigns ...",
 or "A mailing-list announcement also announces ...") without framing it as a milestone. Every
 rule above applies. Set confidence to confirmed when this source is an official non-tag
-announcement or merged gitlab_mr (or when prior_story is already confirmed); otherwise keep
+announcement, an official enriched tag, or merged gitlab_mr (or when prior_story is already confirmed); otherwise keep
 prior_story's confidence. Evidence must support the update.
 """
 UPDATE_PROMPT = _writer_prompt(
@@ -954,6 +957,22 @@ def _slot_prompt(base_prompt: str, slot_index: int, *, is_update: bool) -> str:
     return base_prompt + hints[slot_index % len(hints)]
 
 
+def _apply_source_tag_limits(limits: dict, bounded: dict, *, prior: dict | None = None) -> dict:
+    """Permit `confirmed` only on enriched official tags and keep tag-only stories off `released`."""
+    if bounded.get("kind") != "tag":
+        return limits
+    out = dict(limits)
+    if (
+        bounded.get("tag_enriched") is True
+        and bounded.get("authority") == "official"
+        and "confirmed" not in out["confidence"]
+    ):
+        out["confidence"] = [*out["confidence"], "confirmed"]
+    if prior is None or prior.get("state") != "released":
+        out["state"] = [s for s in out["state"] if s != "released"]
+    return out
+
+
 class Analyzer(CompletionClient):
     """Produce one structurally valid draft; final publication review is separate."""
 
@@ -1268,7 +1287,7 @@ class Analyzer(CompletionClient):
     ) -> tuple[dict, str]:
         """Run focused non-thinking metadata & impact pass and validate against source label limits."""
         mi_schema = copy.deepcopy(METADATA_IMPACT_SCHEMA)
-        limits = label_limits([bounded])
+        limits = _apply_source_tag_limits(label_limits([bounded]), bounded)
         if (
             bounded.get("authority") == "official"
             and bounded.get("kind") == "feed"
@@ -1331,7 +1350,7 @@ class Analyzer(CompletionClient):
             raise ValueError("quote_digest must be a boolean")
         digest_mode = _digest_mode(effective_best_of, quote_digest, default_quote_digest=self.quote_digest)
         is_update = prior is not None
-        if item["kind"] == "tag":
+        if item["kind"] == "tag" and item.get("tag_enriched") is not True:
             return tag_update(item, prior) if is_update else tag_notice(item)
         auth = effective_authority(item, getattr(self, "dirauth_users", None), getattr(self, "tor_core_users", None))
         bounded = {
@@ -1339,6 +1358,10 @@ class Analyzer(CompletionClient):
             "authority": auth,
             **{opt: item[opt] for opt in OPTIONAL_SOURCE_FIELDS if isinstance(item.get(opt), str) and item[opt]},
         }
+        if item.get("kind") == "tag" and item.get("tag_enriched") is True:
+            bounded["tag_enriched"] = True
+            if kind := tag_enrichment_kind(item):
+                bounded["tag_enrichment_kind"] = kind
         if (rule := mandatory_news_rule({**item, "authority": auth})) is not None:
             bounded["mandatory_news_rule"] = rule
         bounded["content"], notes = analysis_context(item)
@@ -1522,7 +1545,7 @@ def _writer_schema(
     else:
         schema["properties"]["title"]["minLength"] = schema["properties"]["summary"]["minLength"] = 1
     schema["properties"]["evidence"]["minItems"] = 1
-    limits = label_limits([bounded])
+    limits = _apply_source_tag_limits(label_limits([bounded]), bounded, prior=prior)
     if prior is not None:
         if prior.get("confidence") == "confirmed":
             limits["confidence"] = ["confirmed"]

@@ -20,7 +20,7 @@ from .schema import SHA256_RE, STORY_ID_RE
 from .util import (
     after, backoff_until, canonical_json, digest, is_dirauth_item, is_hackerone_item,
     is_pt_high_impact, is_tor_core_item, is_trove_item, item_cluster, item_identity,
-    now_iso, safe_canonical_url, saved_object, strict_json, timestamp, valid_note_list,
+    now_iso, safe_canonical_url, saved_object, strict_json, tag_enrichment_kind, timestamp, valid_note_list,
 )
 
 TAG_PRIORITY = 5  # queue floor for deterministic tag notices
@@ -435,6 +435,10 @@ def item_hash_fields(item: dict, *, include_sender_domain: bool = True) -> dict:
         fields["sender_domain"] = item["sender_domain"]
     if item.get("public_comments"):
         fields["public_comments"] = analysis_context(item)[1]
+    if item.get("kind") == "tag" and item.get("tag_enriched") is True:
+        fields["tag_enriched"] = True
+        if kind := tag_enrichment_kind(item):
+            fields["tag_enrichment_kind"] = kind
     return fields
 
 

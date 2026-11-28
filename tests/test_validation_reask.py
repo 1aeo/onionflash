@@ -828,3 +828,23 @@ def test_untrusted_mr_only_update_category_proposal_replays_inherited_release_ta
     assert explicit_record["untrusted_proposals"][0]["accepted"] is False
     assert explicit_record["untrusted_proposals"][0]["disposition"] == "labels"
     assert explicit_record["untrusted_proposals"][0]["repair"] == {"category": "security", "tags": ["security", "release"]}
+
+
+def test_approve_with_failed_criterion_raises_inconsistent_review_and_reasks(llm_context, monkeypatch):
+    """Raise InconsistentReview when verdict=='approve' has a failed criterion and recover via validation re-ask."""
+    cfg, store = llm_context
+    bad_approve = verdict("approve")
+    bad_approve["criteria"]["source_support"]["outcome"] = "fail"
+    with pytest.raises(review.InconsistentReview) as exc_info:
+        review.validate_review(bad_approve, {"sources": [{"id": "S1", "passages": [{"id": "S1:P1"}]}]})
+    assert isinstance(exc_info.value, review.ReviewError)
+    assert exc_info.value.proposal is None
+
+    row = pending(store)
+    checker = wire_reviewer(cfg, bad_approve, verdict("approve"), verdict("approve"))
+    res = run(cfg, store, row, Writer(), checker)
+    assert res["status"] == "published" and checker.calls == 3
+    audit = saved_audit(store)
+    assert _correction(audit)["trigger"] == 1
+    assert _correction(audit)["response"] == 2
+    assert audit["reviews"][0]["reask_response"] is True

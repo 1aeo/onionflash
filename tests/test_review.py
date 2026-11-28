@@ -820,7 +820,7 @@ def _specialist_verdict(action="approve", **kwargs):
 
 def test_reviewer_specialist_prompts_validation_and_policy_hash(monkeypatch):
     """Specialist lenses inject domain guidance, preserve default None, and affect policy_hash."""
-    assert review.REVIEW_VERSION == "onionflash-review-20"
+    assert review.REVIEW_VERSION == "onionflash-review-21"
     assert review.SPECIALISTS == (
         "grounding_status",
         "attribution_scope_advice",

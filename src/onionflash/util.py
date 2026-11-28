@@ -1175,11 +1175,25 @@ _TEST_CHORE_RE = re.compile(
     re.I,
 )
 _INTERNAL_CLEANUP_RE = re.compile(
-    r"^(?!(?:security|advisory)\s*:)(?:[a-z0-9_./-]+:\s+)?"
+    r"^(?!.*\b(?:security|advisory|vulnerabilit\w*|regression|api\s+break|breaking|bug|crash(?:es|ed|ing)?|"
+    r"dos|ddos|panic\w*|leak\w*|overflow\w*|protocol|consensus|dirauth)\b)"
+    r"(?:[a-z0-9_./-]+:\s+)?"
     r"(?:"
     r"(?:fix(?:ing)?|clean\s*up|resolve|remove)\s+(?:the\s+)?(?:\w+\s+){0,3}todos?\b"
     r"|(?:refactor|clean\s*up)\s+internal\b"
-    r")(?!.*\b(?:security|vulnerabilit\w*|regression|api\s+break|breaking|bug)\b)",
+    r"|(?:extract|move|split|reorganize)\s+(?:internal\s+)?(?:helpers?|helper\s+functions?|utility\s+functions?)\b"
+    r"|(?:add|create|introduce|update)\s+(?:a\s+)?(?:mock|dummy)\s+(?:\w+\s+){0,3}(?:stubs?|helpers?|clients?|servers?|impl(?:ementation)?)\b"
+    r"|(?:initial\s+|prep(?:aration)?\s+)?(?:internal\s+)?scaffold(?:ing)?\s+(?:for|prep)\b"
+    r"|(?:prep(?:are)?\s+)?scaffold(?:ing)?\s+pr\b"
+    r")",
+    re.I,
+)
+_INTERNAL_CLEANUP_MATERIAL_SIGNAL_RE = re.compile(
+    r"\b(?:"
+    r"protocol|consensus|dirauth|directory\s+authorit\w*|bridge\s+authorit\w*|"
+    r"wire\s+format|handshake|cell\s+format|descriptor\s+format|public\s+api|"
+    r"cli\s+flag|command[- ]line|config(?:uration)?\s+option|new\s+feature"
+    r")\b",
     re.I,
 )
 _HOUSEKEEPING_BEHAVIOR_CHANGE_RE = re.compile(
@@ -1304,9 +1318,24 @@ def is_housekeeping_item(item: dict) -> tuple[str, str] | None:
     )
     if not has_behavior_change and _TEST_CHORE_RE.search(cleaned_title):
         return "skipped.gate.housekeeping", "Routine test suite housekeeping item"
-    if not has_behavior_change and _INTERNAL_CLEANUP_RE.search(cleaned_title):
+    if (
+        not has_behavior_change
+        and not _INTERNAL_CLEANUP_MATERIAL_SIGNAL_RE.search(full_text)
+        and _INTERNAL_CLEANUP_RE.search(cleaned_title)
+    ):
         return "skipped.gate.housekeeping", "Routine internal refactor or TODO cleanup item"
     return None
+
+
+TAG_ENRICHMENT_KINDS = frozenset({"release_notes", "compare"})
+
+
+def tag_enrichment_kind(item: dict) -> str | None:
+    """Return the validated enrichment kind for an enriched tag, ignoring invalid types."""
+    if not isinstance(item, dict) or item.get("tag_enriched") is not True:
+        return None
+    kind = item.get("tag_enrichment_kind")
+    return kind if isinstance(kind, str) and kind in TAG_ENRICHMENT_KINDS else None
 
 
 def is_pt_high_impact(item: dict) -> bool:
