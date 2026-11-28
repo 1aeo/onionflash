@@ -221,8 +221,7 @@ _PGP_SIGNATURE_RE = re.compile(
 _RELEASE_CLI_BOILERPLATE_RE = re.compile(r"^\s*created using the release-cli\.?\s*$", re.IGNORECASE)
 _TRIVIAL_TAG_MSG_RE = re.compile(
     r"^(?:(?:bump|set|update)\s+(?:the\s+)?(?:version(?:\s+of\s+\S+)?\s+to|to)|"
-    r"(?:release|tag|prepare|version))\s+"
-    r"(?:[a-z0-9_.-]+-)?v?\d+(?:\.\d+)+(?:[-.~+][a-z0-9._-]+)*\.?$",
+    r"(?:release|tag|prepare|version))\s+(?P<target>\S+?)\.?$",
     re.IGNORECASE,
 )
 _TAG_VERSION_RE = re.compile(
@@ -267,18 +266,24 @@ def _clean_release_description(tag_obj: dict) -> str:
     return "\n".join(kept).strip()
 
 
+def _norm_tag_token(text: str) -> str:
+    return re.sub(r"[\s._-]+", "", text.lower()).removeprefix("v")
+
+
 def _bare_tag_names(tag_name: str, item_title: str) -> set[str]:
-    norm = lambda s: re.sub(r"[\s._-]+", "", s.lower()).removeprefix("v")
-    return {norm(tag_name), norm(item_title)}
+    names = {_norm_tag_token(tag_name), _norm_tag_token(item_title)}
+    for raw in (tag_name, item_title):
+        if ver_match := _TAG_VERSION_RE.match(raw.strip()):
+            names.add(_norm_tag_token(f"{ver_match.group('version')}{ver_match.group('pre') or ''}"))
+    names.discard("")
+    return names
 
 
 def _is_trivial_tag_line(line: str, bare_names: set[str]) -> bool:
-    norm_line = re.sub(r"[\s._-]+", "", line.lower()).removeprefix("v")
-    return bool(
-        _RELEASE_CLI_BOILERPLATE_RE.match(line)
-        or _TRIVIAL_TAG_MSG_RE.match(line)
-        or norm_line in bare_names
-    )
+    if _RELEASE_CLI_BOILERPLATE_RE.match(line) or _norm_tag_token(line) in bare_names:
+        return True
+    match = _TRIVIAL_TAG_MSG_RE.match(line)
+    return bool(match and _norm_tag_token(match.group("target")) in bare_names)
 
 
 def _strip_trivial_tag_lines(message: str, tag_name: str, item_title: str) -> str:

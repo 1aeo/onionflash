@@ -484,10 +484,11 @@ def test_tag_enrichment_edge_cases_store_identity_and_mr_body_signal(tmp_path):
     ]
     assert collect._preceding_tag_name(pre_tags, 0, "v2.0.0-pre2") == "v2.0.0-pre1"
 
-    # 2. Multiline boilerplate-only annotations are rejected; mixed boilerplate + substantive (and protocol updates like "Update to HTTP/2.") pass.
+    # 2. Multiline boilerplate-only annotations are rejected; single-component tags (v1) strip boilerplate while dependency/protocol updates stay.
     assert not collect._is_substantive_tag_message("v2.15.4\nBump version to v2.15.4\nCreated using the release-cli.", "v2.15.4", "v2.15.4")
+    assert not collect._is_substantive_tag_message("Bump version to v1", "v1", "v1")
     assert collect._is_substantive_tag_message("Created using the release-cli.\nFix directory authority quorum timeout.", "v2.15.4", "v2.15.4")
-    assert collect._strip_trivial_tag_lines("Bump version to v2.15.4\nUpdate to HTTP/2.\nFix relay startup crash.", "v2.15.4", "v2.15.4") == "Update to HTTP/2.\nFix relay startup crash."
+    assert collect._strip_trivial_tag_lines("Bump version to v2.15.4\nUpdate to openssl-3.0.0\nUpdate to HTTP/2.\nFix relay startup crash.", "v2.15.4", "v2.15.4") == "Update to openssl-3.0.0\nUpdate to HTTP/2.\nFix relay startup crash."
 
     # 3. Heading-only truncation returns empty string so item is not falsely marked enriched.
     long_tag = "v" + ("2." * 95) + "0"
