@@ -1301,10 +1301,13 @@ def test_pool_fallback_precedes_cooling_and_cursor_advances_past_chosen(monkeypa
     url_a, gen_a1 = CompletionClient._pool_claim_next(pool, [], set(), now=100.0)
     assert url_a == "https://a.example/v1"
     url_a2, gen_a2 = CompletionClient._pool_claim_next(pool, [], {"https://b.example/v1"}, now=100.0)
-    assert url_a2 == "https://a.example/v1" and gen_a2 == gen_a1
+    url_a3, gen_a3 = CompletionClient._pool_claim_next(pool, [], {"https://b.example/v1"}, now=100.0)
+    assert url_a2 == url_a3 == "https://a.example/v1" and gen_a2 == gen_a3 == gen_a1
     CompletionClient._pool_release(pool, url_a2, healthy=False, now=105.0, claim_gen=gen_a2)
     CompletionClient._pool_release(pool, url_a, healthy=True, now=106.0, claim_gen=gen_a1)
-    next_pick, _ = CompletionClient._pool_claim_next(pool, [], set(), now=110.0)
+    # An older failure releasing with an earlier clock timestamp cannot shorten the newer cooldown deadline.
+    CompletionClient._pool_release(pool, url_a3, healthy=False, now=101.0, claim_gen=gen_a3)
+    next_pick, _ = CompletionClient._pool_claim_next(pool, [], set(), now=105.0 + CompletionClient.POOL_COOLDOWN_SECONDS - 1.0)
     assert next_pick == "https://b.example/v1"
     CompletionClient._pool_release(pool, next_pick, healthy=True, now=110.0, claim_gen=0)
     CompletionClient._reset_pool_state()

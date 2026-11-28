@@ -1200,7 +1200,10 @@ class CompletionClient:
                 if claim_gen is None or gens.get(url, 0) == claim_gen:
                     entry["unhealthy_until"].pop(url, None)
             elif healthy is False:
-                entry["unhealthy_until"][url] = now + cls.POOL_COOLDOWN_SECONDS
+                entry["unhealthy_until"][url] = max(
+                    entry["unhealthy_until"].get(url, 0.0),
+                    now + cls.POOL_COOLDOWN_SECONDS,
+                )
                 gens[url] = gens.get(url, 0) + 1
 
     def __init__(self, config: dict, deadline: float | None = None):
