@@ -462,6 +462,14 @@ def _persist_draft_outcome(
     return "handled", endpoint_failures
 
 
+def _effective_concurrency(run_config: dict) -> int:
+    """Return the configured bounded LLM worker concurrency (defaulting to MAX_CONCURRENT_LLM_ITEMS)."""
+    raw = (run_config.get("llm") or {}).get("max_concurrent_requests", MAX_CONCURRENT_LLM_ITEMS)
+    if type(raw) is not int:
+        return MAX_CONCURRENT_LLM_ITEMS
+    return max(1, min(16, raw))
+
+
 def _prefetch_drafts(
     run_config: dict,
     store: Store,
@@ -477,10 +485,11 @@ def _prefetch_drafts(
     if not allow_network or endpoint_failures >= 2 or len(pending_rows) <= 1 or time.monotonic() >= run_deadline:
         return 0, endpoint_failures, set(), False
 
+    concurrency = _effective_concurrency(run_config)
     policy = review.policy_hash(run_config)
     best_of, quote_digest = _draft_cache_options()
     tasks: list[tuple[dict, dict, dict | None, str, dict | None, str]] = []
-    for row in pending_rows[: MAX_CONCURRENT_LLM_ITEMS * 2]:
+    for row in pending_rows[: concurrency * 2]:
         kind, payload = _classify_pending_row(
             run_config, store, row, policy, execute_gates=False, best_of=best_of, quote_digest=quote_digest,
         )
@@ -493,9 +502,9 @@ def _prefetch_drafts(
     prefetched_calls = 0
     handled_ids: set[str] = set()
     budget_reached = False
-    draft_semaphore = threading.Semaphore(MAX_CONCURRENT_LLM_ITEMS)
+    draft_semaphore = threading.Semaphore(concurrency)
 
-    with ThreadPoolExecutor(max_workers=min(MAX_CONCURRENT_LLM_ITEMS, len(tasks))) as pool:
+    with ThreadPoolExecutor(max_workers=min(concurrency, len(tasks))) as pool:
         submitted = [
             (
                 (row, writer_key, carry, dispatch_context),
@@ -618,6 +627,7 @@ def _run_sliding_window(
     process_kwargs: dict,
 ) -> tuple[int, int]:
     """Overlap a bounded window of concurrent drafts with immediate main-thread review commits."""
+    concurrency = _effective_concurrency(run_config)
     policy = review.policy_hash(run_config)
     best_of, quote_digest = _draft_cache_options(analyzer)
     pending_iter = iter(pending_rows)
@@ -626,7 +636,7 @@ def _run_sliding_window(
     prefetched_calls = 0
     budget_reached = False
     stopped_dispatch = False
-    draft_semaphore = threading.Semaphore(MAX_CONCURRENT_LLM_ITEMS)
+    draft_semaphore = threading.Semaphore(concurrency)
 
     def _fill_window() -> None:
         nonlocal budget_reached, stopped_dispatch
@@ -634,7 +644,7 @@ def _run_sliding_window(
             not stopped_dispatch
             and not budget_reached
             and endpoint_failures < 2
-            and len(in_flight) < MAX_CONCURRENT_LLM_ITEMS
+            and len(in_flight) < concurrency
         ):
             if time.monotonic() >= run_deadline:
                 report["budget_reached"] = True
@@ -660,7 +670,7 @@ def _run_sliding_window(
                 fut = pool.submit(_draft_one_task, run_config, run_deadline, writer_item_copy, prior_copy, draft_semaphore)
                 in_flight[fut] = (d_row, writer_key, carry, dispatch_context)
 
-    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_LLM_ITEMS) as pool:
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
         _fill_window()
         while ready_rows or in_flight:
             while ready_rows and not budget_reached:
@@ -935,7 +945,7 @@ def run(config: dict, store: Store) -> dict:
                     and endpoint_failures < 2
                     and time.monotonic() < run_deadline
                     and (
-                        bool(run_config["llm"]["base_url"])
+                        bool(run_config["llm"]["base_url"] or run_config["llm"].get("pool_base_urls"))
                         or refresh.StoryRefresher is not _ORIG_REFRESHER
                         or refresh.refresh_due_stories is not _ORIG_REFRESH_DUE_STORIES
                     )
@@ -1038,7 +1048,7 @@ def main(argv: list[str] | None = None) -> int:
                 "model": config["llm"]["model"],
                 "review_model": config["review"]["model"] or config["llm"]["model"],
                 "comments_enabled": config["comments"]["enabled"],
-                "llm_endpoint_configured": bool(config["llm"]["base_url"]),
+                "llm_endpoint_configured": bool(config["llm"]["base_url"] or config["llm"].get("pool_base_urls")),
                 "llm_credential_present": bool(os.environ.get(config["llm"]["api_key_env"])),
             }))
             return 0

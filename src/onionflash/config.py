@@ -75,6 +75,8 @@ DEFAULTS = {
     "llm": {
         "base_url": "",
         "fallback_base_urls": [],
+        "pool_base_urls": [],
+        "max_concurrent_requests": 4,
         "model": "qwen3.8-27b",
         "api_key_env": "ONIONFLASH_LLM_API_KEY",
         "allowed_networks": [],
@@ -101,13 +103,15 @@ BOUNDS = {
     "page_size": (1, 100),
     "max_items_per_source": (1, 10000),
     "max_items_per_run": (1, 1000),
+    "max_concurrent_requests": (1, 16),
 }
 
 OPERATOR_SETTINGS = {
     "collection": {"trusted_operator_domains", "dirauth_gitlab_users", "tor_core_gitlab_users"},
     "http": set(),
     "llm": {
-        "base_url", "fallback_base_urls", "model", "allowed_networks",
+        "base_url", "fallback_base_urls", "pool_base_urls", "max_concurrent_requests",
+        "model", "allowed_networks",
         "allow_http", "send_chat_template_kwargs", "max_items_per_run", "timeout_seconds", "writer_reasoning",
     },
     "storage": {"database", "output_dir"},
@@ -123,10 +127,13 @@ SECTION_SPECS = {
     },
     "llm": {
         "bools": ("allow_http", "send_chat_template_kwargs", "writer_reasoning"),
-        "ints": {"max_items_per_run": BOUNDS["max_items_per_run"]},
+        "ints": {
+            "max_items_per_run": BOUNDS["max_items_per_run"],
+            "max_concurrent_requests": BOUNDS["max_concurrent_requests"],
+        },
         "numbers": {"timeout_seconds": BOUNDS["timeout_seconds"]},
         "strings": {"model": (1, 200)},
-        "lists": ("fallback_base_urls", "allowed_networks"),
+        "lists": ("fallback_base_urls", "pool_base_urls", "allowed_networks"),
     },
 }
 
@@ -370,10 +377,14 @@ def load_config(path: str | Path) -> dict:
     llm["model"] = llm_model
     if llm["writer_reasoning"] and not llm["send_chat_template_kwargs"]:
         raise ValueError("llm.writer_reasoning requires llm.send_chat_template_kwargs")
+    if len(llm["pool_base_urls"]) > 16:
+        raise ValueError("At most 16 LLM pool base URLs are supported")
     llm["base_url"] = _expand(llm["base_url"])
-    llm["fallback_base_urls"] = [_expand(u) if isinstance(u, str) else "" for u in llm["fallback_base_urls"]]
-    if any(not u.strip().rstrip("/") for u in llm["fallback_base_urls"]):
-        raise ValueError("Each LLM fallback base URL must be a nonempty URL")
+    for key in ("fallback_base_urls", "pool_base_urls"):
+        llm[key] = [_expand(u) if isinstance(u, str) else "" for u in llm[key]]
+        if any(not u.strip().rstrip("/") for u in llm[key]):
+            kind = "pool" if key == "pool_base_urls" else "fallback"
+            raise ValueError(f"Each LLM {kind} base URL must be a nonempty URL")
     for network in llm["allowed_networks"]:
         if not isinstance(network, str) or ipaddress.ip_network(network, strict=True).prefixlen == 0:
             raise ValueError("Each allowed_networks entry must be a non-default CIDR string")
@@ -391,17 +402,18 @@ def load_config(path: str | Path) -> dict:
             allow_local=allow_llm_local,
             address_policy=llm_policy,
         )
-    llm["fallback_base_urls"] = [
-        _clean_endpoint_url(
-            url,
-            allow_http=llm["allow_http"],
-            trailing_slash=False,
-            error=llm_error,
-            allow_local=allow_llm_local,
-            address_policy=llm_policy,
-        )
-        for url in llm["fallback_base_urls"]
-    ]
+    for key in ("fallback_base_urls", "pool_base_urls"):
+        llm[key] = [
+            _clean_endpoint_url(
+                url,
+                allow_http=llm["allow_http"],
+                trailing_slash=False,
+                error=llm_error,
+                allow_local=allow_llm_local,
+                address_policy=llm_policy,
+            )
+            for url in llm[key]
+        ]
 
     review = config["review"]
     if not isinstance(review["model"], str) or len(review["model"]) > 200 or any(ord(c) < 32 or ord(c) == 127 for c in review["model"]):

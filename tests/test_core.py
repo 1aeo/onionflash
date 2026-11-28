@@ -23,7 +23,7 @@ from onionflash.analyze import SCHEMA, AnalysisError, Analyzer, tag_notice, vali
 from onionflash.cli import build, run_lock
 from onionflash.collect import CollectionError, collect_source
 from onionflash.config import DEFAULT_TRUSTED_OPERATOR_DOMAINS, DEFAULTS, _clean_endpoint_url, load_config
-from onionflash.llm import is_quoted_list_post, json_object, unquoted_mail_text
+from onionflash.llm import CompletionClient, is_quoted_list_post, json_object, unquoted_mail_text
 from onionflash.source_packet import number_sources
 from onionflash.store import PT_SECURITY_PRIORITY, Store, backup_database, item_priority, source_due
 from onionflash.transport import DeadlineReached, FetchError, HttpClient, Response
@@ -739,6 +739,29 @@ def test_invalid_fallback_base_urls_rejected(tmp_path, monkeypatch, fb, env_val,
         load_config(p)
 
 
+def test_pool_base_urls_and_max_concurrent_requests_config_validation(tmp_path, capsys):
+    """Validate `llm.pool_base_urls` and `llm.max_concurrent_requests` bounds and pool-only `check` status."""
+    too_many_pools = json.dumps([f"https://pool{i}.example/v1" for i in range(17)])
+    for snippet, match in (
+        ('[llm]\npool_base_urls = "https://pool.example/v1"\n', "must be an array"),
+        ('[llm]\npool_base_urls = [""]\n', "nonempty URL"),
+        ('[llm]\npool_base_urls = ["https://192.168.7.42:8000/v1"]\nallow_http = true\n', "Invalid LLM base URL"),
+        (f'[llm]\npool_base_urls = {too_many_pools}\n', "At most 16"),
+        ('[llm]\nmax_concurrent_requests = 0\n', "between 1 and 16"),
+        ('[llm]\nmax_concurrent_requests = 17\n', "between 1 and 16"),
+        ('[llm]\nmax_concurrent_requests = true\n', "between 1 and 16"),
+        ('[llm]\nmax_concurrent_requests = "4"\n', "between 1 and 16"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            load_config(write_toml(tmp_path / "bad_pool", snippet))
+
+    pool_only_cfg = write_toml(tmp_path / "pool_only", '[llm]\npool_base_urls = ["https://pool.example/v1"]\n')
+    checked = invoke_cli(capsys, "check", "--config", pool_only_cfg)
+    assert checked["configuration"] == "valid"
+    assert checked["llm_endpoint_configured"] is True
+    assert cli._effective_concurrency({"llm": {"max_concurrent_requests": True}}) == cli.MAX_CONCURRENT_LLM_ITEMS
+
+
 def test_example_config_and_validation_guards(tmp_path, monkeypatch):
     """Validate config.example.toml (including verified sources) and reject malformed TOML settings."""
     p = tmp_path / "config.toml"
@@ -752,7 +775,7 @@ def test_example_config_and_validation_guards(tmp_path, monkeypatch):
         with pytest.raises(ValueError, match="Invalid LLM base URL"):
             load_config(p)
     monkeypatch.setenv("ONIONFLASH_LLM_BASE_URL", "https://model.example/v1")
-    assert cfg["storage"]["database"] == str(tmp_path / "state/onionflash.sqlite3") and len(cfg["sources"]) == 31 and cfg["llm"]["fallback_base_urls"] == []
+    assert cfg["storage"]["database"] == str(tmp_path / "state/onionflash.sqlite3") and len(cfg["sources"]) == 36 and cfg["llm"]["fallback_base_urls"] == []
     sources = {s["id"]: s for s in cfg["sources"]}
     assert sources["tor-browser-security"]["enabled"] and sources["tor-browser-security"]["authority"] == "development"
     assert sources["anti-censorship-team"]["enabled"] and sources["tor-dev"]["enabled"]
@@ -768,6 +791,11 @@ def test_example_config_and_validation_guards(tmp_path, monkeypatch):
         "lyrebird-merges": ("gitlab_mr", "lyrebird", "development", None, "https://gitlab.torproject.org/api/v4/projects/417/merge_requests"),
         "tails-news": ("feed", "tails", "official", None, "https://tails.net/news/index.en.rss"),
         "tor-browser-high-impact-bugs": ("gitlab_issue", "tor-browser", "development", "tpo/applications/tor-browser", canonical_url("https://gitlab.torproject.org/api/v4/projects/472/issues?labels=Apps::Product::TorBrowser,Apps::Impact::High,Apps::Type::Bug")),
+        "oniux-tags": ("tag", "oniux", "official", None, "https://gitlab.torproject.org/tpo/core/oniux/-/tags?format=atom"),
+        "oniux-issues": ("gitlab_issue", "oniux", "development", "tpo/core/oniux", "https://gitlab.torproject.org/api/v4/projects/3212/issues"),
+        "oniux-merges": ("gitlab_mr", "oniux", "development", None, "https://gitlab.torproject.org/api/v4/projects/3212/merge_requests"),
+        "orbot-android-releases": ("feed", "orbot", "official", None, "https://github.com/guardianproject/orbot-android/releases.atom"),
+        "orbot-apple-releases": ("feed", "orbot", "official", None, "https://github.com/guardianproject/orbot-apple/releases.atom"),
     }
     for sid, (kind, product, authority, project, url) in expected_new.items():
         stream = sources[sid]
@@ -1834,6 +1862,80 @@ def test_registry_and_tor_core_gitlab_users_config_validation(tmp_path, monkeypa
     ):
         with pytest.raises(ValueError, match="tor_core_gitlab_users"):
             load_config(write_toml(tmp_path / "bad_users", f"[collection]\ntor_core_gitlab_users = {bad_users}\n"))
+
+
+def test_cli_run_uses_configured_max_concurrent_requests(context, monkeypatch):
+    """Honor configured `llm.max_concurrent_requests` above default 4 while preserving MAX_CONCURRENT_LLM_ITEMS."""
+    assert cli.MAX_CONCURRENT_LLM_ITEMS == 4
+    cfg, store = context
+    cfg["sources"] = []
+    cfg["llm"].update(
+        base_url="https://llm.example/v1",
+        pool_base_urls=["https://llm2.example/v1"],
+        max_concurrent_requests=6,
+        api_key_env="CONCURRENCY6_KEY",
+    )
+    monkeypatch.setenv("CONCURRENCY6_KEY", "synthetic-fixture-value")
+    patch_cli_pipeline(monkeypatch, now=DATE, reviewer=None, build=lambda *_a: {})
+
+    for i in range(6):
+        store.ingest(
+            item(
+                url=f"https://example.org/c6-{i}",
+                title=f"Concurrent six report {i}",
+                content=f"Distinct verifiable network event {i} under concurrency 6.",
+            ),
+            DATE,
+        )
+
+    barrier = threading.Barrier(6, timeout=5.0)
+    lock = threading.Lock()
+    in_flight = 0
+    max_in_flight = 0
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, max_in_flight
+        body = json.loads(request.content)
+        schema_name = body["response_format"]["json_schema"]["name"]
+        if schema_name == "onionflash_news":
+            with lock:
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+            try:
+                barrier.wait()
+                user_payload = json.loads(body["messages"][1]["content"])
+                reply = analysis(
+                    title=user_payload["title"],
+                    summary=user_payload["content"],
+                    why_it_matters="",
+                    evidence=[user_payload["content"]],
+                )
+            finally:
+                with lock:
+                    in_flight -= 1
+        elif schema_name == "onionflash_select":
+            reply = {"winner": 1, "reason": "Best candidate."}
+        elif schema_name == "onionflash_polish":
+            draft = json.loads(body["messages"][1]["content"])["draft"]
+            reply = {k: draft[k] for k in ("title", "summary", "why_it_matters")}
+        else:
+            reply = verdict()
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(reply)}}]})
+
+    monkeypatch.setattr(
+        llm,
+        "HttpClient",
+        lambda settings, **kwargs: HttpClient(
+            settings, **kwargs, transport=httpx.MockTransport(_handle), resolver=public_dns
+        ),
+    )
+
+    CompletionClient._reset_pool_state()
+    report = cli.run(cfg, store)
+    CompletionClient._reset_pool_state()
+    assert max_in_flight == 6
+    assert report["analyzed"] == 6
+    assert report["analysis_failed"] == 0
 
 
 def test_cli_run_prefetches_drafts_concurrently_and_preserves_report_contract(context, monkeypatch):

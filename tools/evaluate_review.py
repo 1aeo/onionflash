@@ -7,6 +7,7 @@ new JSONL files outside the configured public output directory.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 import json
 import os
 from pathlib import Path
@@ -190,7 +191,7 @@ def _judged_metrics(judged: dict) -> dict:
     clean = judged.get("clean") or {"cases": 0, "ok": 0}
     alarms = clean["cases"] - clean["ok"]
     missed = [*((["catch"] if total and paired / total < CATCH_TARGET else ())),
-              *(f for f, r in flagged.items() if r["unique"] >= FLOOR_CASES and r["paired"] / r["cases"] < FLAW_FLOOR),
+              *(f for f, r in sorted(flagged.items()) if r["unique"] >= FLOOR_CASES and r["paired"] / r["cases"] < FLAW_FLOOR),
               *((["false_alarms"] if clean["cases"] and alarms / clean["cases"] > FALSE_ALARM_LIMIT else ()))]
     return {"target_missed": missed, "catch_rate": _rate(caught, total),
             "paired_catch_rate": _rate(paired, total), "false_alarm_rate": _rate(alarms, clean["cases"])}
@@ -226,7 +227,7 @@ def _validate_cases(cases: list[dict], *, draft: bool = False) -> None:
 
 
 def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, polish=False,
-             specialists=1, best_of=1, quote_digest=False):
+             specialists=1, best_of=1, quote_digest=False, concurrency=1):
     """Score final reviewed candidates and save bounded evaluation evidence privately.
 
     In draft mode the writer drafts each packet once per round, and each case on
@@ -236,6 +237,8 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
         raise ValueError("Use 1 or 3 specialists")
     if best_of < 1:
         raise ValueError("best_of must be at least 1")
+    if type(concurrency) is not int or not 1 <= concurrency <= 16:
+        raise ValueError("concurrency must be between 1 and 16")
     output = Path(output).resolve()
     public = Path(config["storage"]["output_dir"]).resolve()
     if output == public or public in output.parents:
@@ -254,214 +257,299 @@ def evaluate(config, cases, output, *, rounds=1, deadline=None, draft=False, pol
               "holds": {}, "incomplete": False}
     judged, outcomes, seen = {}, {}, set()
     identity = policy_hash(config)
-    with (os.fdopen(descriptor, "w", encoding="utf-8") as report, EvaluationReviewer(config, deadline=deadline) as reviewer,
-          Analyzer(config, deadline=deadline, editorial_polish=polish, best_of=best_of, quote_digest=quote_digest) as writer):
-        for iteration in range(1, rounds + 1):
-            drafts = {}
-            for case in cases:
-                if deadline is not None and time.monotonic() >= deadline:
-                    totals["incomplete"] = True
-                    break
-                started = time.monotonic()
-                scope = case.get("scope", "story")
-                record = {"case": case["id"], "round": iteration, "scope": scope, "expected": case["expected"],
-                          **({"expected_same_story": case["expected_same_story"]} if "expected_same_story" in case else {}),
-                          **({"specialists": specialists} if specialists > 1 else {}),
-                          "policy_hash": identity, "candidate": case["candidate"], "packet": case["packet"],
-                          "existing_coverage": case.get("existing_coverage"), "reviews": [], **initial_review_state()}
-                requests = ReviewRequests(record, specialists=specialists)
-                totals["cases"] += 1
-                reviewer.last_decoded = None
+    state_lock = threading.Lock()
+    credential = os.environ.get(config["llm"]["api_key_env"], "")
+    dirauth_users = list(config["collection"]["dirauth_gitlab_users"])
+    tor_core_users = list(config["collection"]["tor_core_gitlab_users"])
 
-                def _reviewer_factory():
-                    return EvaluationReviewer(config, deadline=deadline)
+    def _run_case(iteration: int, case: dict, reviewer: EvaluationReviewer, writer: Analyzer | None, drafts_lock: threading.Lock, drafts: dict, draft_events: dict) -> dict | None:
+        if deadline is not None and time.monotonic() >= deadline:
+            return None
+        started = time.monotonic()
+        scope = case.get("scope", "story")
+        record = {"case": case["id"], "round": iteration, "scope": scope, "expected": case["expected"],
+                  **({"expected_same_story": case["expected_same_story"]} if "expected_same_story" in case else {}),
+                  **({"specialists": specialists} if specialists > 1 else {}),
+                  "policy_hash": identity, "candidate": case["candidate"], "packet": case["packet"],
+                  "existing_coverage": case.get("existing_coverage"), "reviews": [], **initial_review_state()}
+        requests = ReviewRequests(record, specialists=specialists)
+        reviewer.last_decoded = None
+        case_deltas = {
+            "false_approvals": 0, "omissions": 0, "errors": 0, "editorial_misses": 0,
+            "positive_rejections": 0, "impact_cleared": 0, "draft_unsupported": 0,
+            "repairs_verified": 0, "repairs_held": 0, "repairs_skipped": 0,
+            "verification_repairs": 0, "final_holds": 0, "published_after_checks": 0,
+            "route_cases": 0, "matched_routes": 0, "missed_routes": 0,
+            "false_routes": 0, "wrong_routes": 0, "controlled_mismatches": 0,
+            "matched": 0, "hold_code_full": None, "ok": None,
+        }
 
-                try:
-                    candidate = case["candidate"]
-                    # The reviews follow the gate's steps. The first source is the item that wrote the candidate,
-                    # as in draft mode.
-                    source = case["packet"]["sources"][0]
-                    item = writer_item(source)
-                    if draft:
-                        key = json.dumps(case["packet"], sort_keys=True)
-                        if key not in drafts:
-                            try:
-                                drafts[key] = writer.analyze(item)
-                            except AnalysisError as exc:  # one failed draft fails every case on its packet
-                                drafts[key] = exc
-                        if isinstance(drafts[key], AnalysisError):
-                            raise drafts[key]
-                        record["draft"] = drafts[key]
-                        candidate = record["candidate"] = prepare_story(
-                            {**candidate, **{field: drafts[key][field] for field in EDITABLE}}, editorial=candidate.get("editorial"))
-                        record["draft_kept_unsupported"] = kept_unsupported(case, candidate)
-                        totals["draft_unsupported"] += bool(record["draft_kept_unsupported"])
-                    prior = (case.get("existing_coverage") or {}).get("prior_story")
-                    prior_id = prior["id"] if prior else None
-                    row_source = source
-                    if scope == "latest_update":
-                        by_exact = {u: s for s in reversed(case["packet"]["sources"]) if (u := _exact_url(s.get("url")))}
-                        by_base = {u: s for s in reversed(case["packet"]["sources"]) if (u := _base_url(s.get("url")))}
-                        cited_sources = [c for c in (candidate["updates"][-1].get("sources") or ()) if isinstance(c, dict)]
-                        row_source = (
-                            next((m for c in cited_sources if (m := by_exact.get(_exact_url(c.get("url")))) is not None), None)
-                            or next((m for c in cited_sources if (m := by_base.get(_base_url(c.get("url")))) is not None), None)
-                            or source
-                        )
-                    row_item = item if row_source is source else writer_item(row_source)
-                    if row_source.get("closed_at"):
-                        row_item = {**row_item, "closed_at": row_source["closed_at"]}
-                    identity_item = {**row_item, "url": row_source["url"],
-                                     "source_entry_id": row_source.get("source_entry_id", row_source["url"])}
-                    prepared = {"packet": case["packet"], "coverage": case.get("existing_coverage"),
-                                "review_scope": scope, "mode": "update" if scope == "latest_update" else "story",
-                                "story_id": prior_id,
-                                "cluster_key": story_cluster(identity_item),
-                                "payload": {"editorial_kind": source["kind"]},
-                                "dirauth_users": list(config["collection"]["dirauth_gitlab_users"]),
-                                "tor_core_users": list(config["collection"]["tor_core_gitlab_users"]),
-                                "row": {"url": row_source["url"], "story_id": prior_id,
-                                        "cluster_key": item_cluster(identity_item),
-                                        "payload": json.dumps(row_item)}}
-                    stage, text = "review", candidate
-                    use_parallel = specialists > 1
-                    while True:
-                        if (
-                            use_parallel
-                            and stage == "review"
-                            and not record["reviews"]
-                            and requests.state["reserved"] + len(SPECIALISTS) + 2 <= requests.max_requests
-                        ):
-                            use_parallel = False
-                            step = _parallel_initial_review(
-                                _reviewer_factory, text, prepared, record, requests,
-                                on_verify=lambda: None, save_verify=lambda: None, specialists=specialists,
-                            )
-                        elif specialists > 1 and stage == "verify":
-                            if _pending_reask(record, stage, text, prepared):
-                                if record.get("pending_specialist_wave"):
-                                    if requests.state["reserved"] < requests.max_requests:
-                                        step = _resume_specialist_reask(
-                                            _reviewer_factory, reviewer, text, prepared, record, requests,
-                                        )
-                                    else:
-                                        step = ("hold", ("verification", "specialist_budget"))
-                                elif requests.state["reserved"] < requests.max_requests:
-                                    step = advance_review(reviewer, stage, text, prepared, record, requests)
-                                else:
-                                    step = ("hold", ("verification", "specialist_budget"))
-                            elif requests.state["reserved"] + len(SPECIALISTS) > requests.max_requests:
-                                step = ("hold", ("verification", "specialist_budget"))
-                            else:
-                                step = _parallel_specialist_verify(
-                                    _reviewer_factory, text, prepared, record, requests, specialists=specialists,
-                                )
-                        else:
-                            step = advance_review(reviewer, stage, text, prepared, record, requests)
-                        if step[0] not in {"verify", "repair", "tiebreak", "review"}:
-                            break
-                        stage, text = step
-                    action, value = step
-                    first = record["reviews"][0]["result"]
-                    last = next((entry["result"] for entry in reversed(record["reviews"]) if entry["stage"] == "verification"), None)
-                    actual_route = (value if action == "route" and isinstance(value, str) else
-                                    next((entry["result"].get("same_story") for entry in record["reviews"]
-                                          if entry["result"]["verdict"] in {"approve", "revise", "skip"}
-                                          and entry["result"].get("same_story")), None))
-                    record.update(result=first, same_story=actual_route, kept_unsupported=kept_unsupported(case, text))
-                    if last:
-                        record["verification"] = last
-                    for field, reply in (("model_verdict", first), ("verification_model_verdict", last or {})):
-                        if "model_verdict" in reply:  # the model's own verdict, where a fixed rule replaced it
-                            record[field] = reply["model_verdict"]
-                    # Scores treat a verified approval as published, so they measure the reviewer alone;
-                    # the gate's final checks count apart.
-                    checked = action == "hold" and value[0] == "final_check"
-                    published = action == "approve" or checked
-                    if action == "hold":
-                        record["hold"] = code = ".".join(("held", *value))
-                        record["hold_code"] = value[1]
-                        totals["holds"][code] = totals["holds"].get(code, 0) + 1
-                    record["outcome"] = OUTCOME_STAGES[action]
-                    if checked:
-                        record["final_holds"] = final_holds(text, prepared)
-                    totals["final_holds"] += checked
-                    totals["published_after_checks"] += action == "approve"
-                    record["verification_repairs"] = sum(entry["stage"] == "verification" and entry["result"]["verdict"] == "revise"
-                                                         for entry in record["reviews"][:-1])
-                    totals["verification_repairs"] += record["verification_repairs"]
-                    if record["result"]["verdict"] == "revise":
-                        totals["repairs_verified" if published else "repairs_skipped" if action in {"skip", "route"} else "repairs_held"] += 1
-                    final_verdict = "approve" if published else action
-                    route_ok = True
-                    if "expected_same_story" in case:
-                        totals["route_cases"] += 1
-                        expected_route = case["expected_same_story"]
-                        route_ok = actual_route is None if expected_route is None else action == "route" and value == expected_route
-                        if not route_ok:
-                            totals["false_routes" if expected_route is None else "missed_routes" if actual_route is None else "wrong_routes"] += 1
-                        elif expected_route is not None:
-                            totals["matched_routes"] += 1
-                    unsafe = published and (case["expected"] in {"skip", "hold"} or bool(record["kept_unsupported"]))
-                    published_candidate = text if published else None
-                    missing = omitted(case, published_candidate) if published else []
-                    # not_approve marks news with a flawed draft: hold or a clean repair, never a skip.
-                    missed = (final_verdict in {"skip", "route"}) != (case["expected"] == "skip") and case["expected"] != "approve"
-                    matched = (published if case["expected"] == "approve" else not missed) and not unsafe and not missing and route_ok
-                    record.update(final_verdict=final_verdict, published_candidate=published_candidate, matched=matched)
-                    if missing:
-                        record["omitted"] = missing
-                    totals["matched"] += matched
-                    totals["false_approvals"] += unsafe
-                    totals["omissions"] += bool(missing)
-                    totals["positive_rejections"] += not published and case["expected"] == "approve"
-                    totals["editorial_misses"] += missed
-                    totals["impact_cleared"] += bool(scope == "story" and case["expected"] == "approve" and published
-                                                     and candidate["why_it_matters"] and not published_candidate["why_it_matters"])
-                    if "audit" in case:
-                        # A flagged case is caught when its flaw never publishes and the news is
-                        # not skipped; a clean case must publish unchanged.
-                        record["ok"] = ok = matched and ("flaw" in case or published_candidate == candidate)
-                        row = judged.setdefault(case.get("flaw", "clean"), {"cases": 0, "ok": 0, "unique": 0,
-                                                                            **({"paired": 0} if "flaw" in case else {})})
-                        row["cases"] += 1
-                        row["ok"] += ok
-                        row["unique"] += case["id"] not in seen
-                        seen.add(case["id"])
-                        outcomes[iteration, case["id"]] = ok
+        def _reviewer_factory():
+            return EvaluationReviewer(config, deadline=deadline)
+
+        try:
+            candidate = case["candidate"]
+            source = case["packet"]["sources"][0]
+            item = writer_item(source)
+            if draft:
+                key = json.dumps(case["packet"], sort_keys=True)
+                event_to_wait = None
+                is_owner = False
+                with drafts_lock:
+                    if key in drafts:
+                        cached_draft = drafts[key]
+                    elif key in draft_events:
+                        event_to_wait = draft_events[key]
                     else:
-                        totals["controlled_mismatches"] += not matched
-                except CompletionDeferred:
-                    totals["cases"] -= 1
-                    totals["incomplete"] = True
-                    break
-                except (AnalysisError, ValueError, TypeError, KeyError) as exc:
-                    totals["errors"] += 1
-                    record["error"] = type(exc).__name__
-                    if isinstance(exc, AnalysisError):
-                        record["error_reason"] = str(exc)
-                    last_diag = (
-                        exc._eval_decoded_diagnostic
-                        if hasattr(exc, "_eval_decoded_diagnostic")
-                        else (reviewer.last_decoded if specialists == 1 else None)
+                        draft_events[key] = threading.Event()
+                        is_owner = True
+                if is_owner:
+                    try:
+                        assert writer is not None
+                        result_draft = writer.analyze(item)
+                    except (AnalysisError, CompletionDeferred, ValueError, TypeError, KeyError) as exc:
+                        result_draft = exc
+                    finally:
+                        with drafts_lock:
+                            if "result_draft" not in locals():
+                                result_draft = AnalysisError("Writer failed unexpectedly")
+                            drafts[key] = result_draft
+                            draft_events[key].set()
+                elif event_to_wait is not None:
+                    event_to_wait.wait()
+                    with drafts_lock:
+                        cached_draft = drafts[key]
+                if not is_owner:
+                    result_draft = cached_draft
+                if isinstance(result_draft, BaseException):
+                    raise result_draft
+                record["draft"] = result_draft
+                candidate = record["candidate"] = prepare_story(
+                    {**candidate, **{field: result_draft[field] for field in EDITABLE}}, editorial=candidate.get("editorial"))
+                record["draft_kept_unsupported"] = kept_unsupported(case, candidate)
+                case_deltas["draft_unsupported"] = int(bool(record["draft_kept_unsupported"]))
+            prior = (case.get("existing_coverage") or {}).get("prior_story")
+            prior_id = prior["id"] if prior else None
+            row_source = source
+            if scope == "latest_update":
+                by_exact = {u: s for s in reversed(case["packet"]["sources"]) if (u := _exact_url(s.get("url")))}
+                by_base = {u: s for s in reversed(case["packet"]["sources"]) if (u := _base_url(s.get("url")))}
+                cited_sources = [c for c in (candidate["updates"][-1].get("sources") or ()) if isinstance(c, dict)]
+                row_source = (
+                    next((m for c in cited_sources if (m := by_exact.get(_exact_url(c.get("url")))) is not None), None)
+                    or next((m for c in cited_sources if (m := by_base.get(_base_url(c.get("url")))) is not None), None)
+                    or source
+                )
+            row_item = item if row_source is source else writer_item(row_source)
+            if row_source.get("closed_at"):
+                row_item = {**row_item, "closed_at": row_source["closed_at"]}
+            identity_item = {**row_item, "url": row_source["url"],
+                             "source_entry_id": row_source.get("source_entry_id", row_source["url"])}
+            prepared = {"packet": case["packet"], "coverage": case.get("existing_coverage"),
+                        "review_scope": scope, "mode": "update" if scope == "latest_update" else "story",
+                        "story_id": prior_id,
+                        "cluster_key": story_cluster(identity_item),
+                        "payload": {"editorial_kind": source["kind"]},
+                        "dirauth_users": dirauth_users,
+                        "tor_core_users": tor_core_users,
+                        "row": {"url": row_source["url"], "story_id": prior_id,
+                                "cluster_key": item_cluster(identity_item),
+                                "payload": json.dumps(row_item)}}
+            stage, text = "review", candidate
+            use_parallel = specialists > 1
+            while True:
+                if (
+                    use_parallel
+                    and stage == "review"
+                    and not record["reviews"]
+                    and requests.state["reserved"] + len(SPECIALISTS) + 2 <= requests.max_requests
+                ):
+                    use_parallel = False
+                    step = _parallel_initial_review(
+                        _reviewer_factory, text, prepared, record, requests,
+                        on_verify=lambda: None, save_verify=lambda: None, specialists=specialists,
                     )
-                    if last_diag is not None:
-                        record["decoded_diagnostic"] = last_diag
-                    record.setdefault("matched", False)
-                record["review_request_count"] = requests.actual
-                record.update(recovery_status(record))
-                totals["raw_inconsistencies"] += record["raw_inconsistency_count"]
-                totals["unresolved_inconsistencies"] += int(record["unresolved_inconsistency"])
-                record["seconds"] = round(time.monotonic() - started, 2)
-                encoded = json.dumps(record, ensure_ascii=False, allow_nan=False)
-                credential = os.environ.get(config["llm"]["api_key_env"], "")
-                if len(credential) >= 8:
-                    encoded = encoded.replace(credential, "[redacted]")
-                report.write(encoded + "\n")
-                report.flush()
-                print(json.dumps({key: record.get(key) for key in ("case", "round", "expected", "matched", "ok", "error", "seconds")}
-                                 | {"verdict": record.get("result", {}).get("verdict"),
-                                    "verification": record.get("verification", {}).get("verdict")}), flush=True)
+                elif specialists > 1 and stage == "verify":
+                    if _pending_reask(record, stage, text, prepared):
+                        if record.get("pending_specialist_wave"):
+                            if requests.state["reserved"] < requests.max_requests:
+                                step = _resume_specialist_reask(
+                                    _reviewer_factory, reviewer, text, prepared, record, requests,
+                                )
+                            else:
+                                step = ("hold", ("verification", "specialist_budget"))
+                        elif requests.state["reserved"] < requests.max_requests:
+                            step = advance_review(reviewer, stage, text, prepared, record, requests)
+                        else:
+                            step = ("hold", ("verification", "specialist_budget"))
+                    elif requests.state["reserved"] + len(SPECIALISTS) > requests.max_requests:
+                        step = ("hold", ("verification", "specialist_budget"))
+                    else:
+                        step = _parallel_specialist_verify(
+                            _reviewer_factory, text, prepared, record, requests, specialists=specialists,
+                        )
+                else:
+                    step = advance_review(reviewer, stage, text, prepared, record, requests)
+                if step[0] not in {"verify", "repair", "tiebreak", "review"}:
+                    break
+                stage, text = step
+            action, value = step
+            first = record["reviews"][0]["result"]
+            last = next((entry["result"] for entry in reversed(record["reviews"]) if entry["stage"] == "verification"), None)
+            actual_route = (value if action == "route" and isinstance(value, str) else
+                            next((entry["result"].get("same_story") for entry in record["reviews"]
+                                  if entry["result"]["verdict"] in {"approve", "revise", "skip"}
+                                  and entry["result"].get("same_story")), None))
+            record.update(result=first, same_story=actual_route, kept_unsupported=kept_unsupported(case, text))
+            if last:
+                record["verification"] = last
+            for field, reply in (("model_verdict", first), ("verification_model_verdict", last or {})):
+                if "model_verdict" in reply:
+                    record[field] = reply["model_verdict"]
+            checked = action == "hold" and value[0] == "final_check"
+            published = action == "approve" or checked
+            if action == "hold":
+                record["hold"] = code = ".".join(("held", *value))
+                record["hold_code"] = value[1]
+                case_deltas["hold_code_full"] = code
+            record["outcome"] = OUTCOME_STAGES[action]
+            if checked:
+                record["final_holds"] = final_holds(text, prepared)
+            case_deltas["final_holds"] = int(checked)
+            case_deltas["published_after_checks"] = int(action == "approve")
+            record["verification_repairs"] = sum(entry["stage"] == "verification" and entry["result"]["verdict"] == "revise"
+                                                 for entry in record["reviews"][:-1])
+            case_deltas["verification_repairs"] = record["verification_repairs"]
+            if record["result"]["verdict"] == "revise":
+                rk = "repairs_verified" if published else "repairs_skipped" if action in {"skip", "route"} else "repairs_held"
+                case_deltas[rk] = 1
+            final_verdict = "approve" if published else action
+            route_ok = True
+            if "expected_same_story" in case:
+                case_deltas["route_cases"] = 1
+                expected_route = case["expected_same_story"]
+                route_ok = actual_route is None if expected_route is None else action == "route" and value == expected_route
+                if not route_ok:
+                    rk = "false_routes" if expected_route is None else "missed_routes" if actual_route is None else "wrong_routes"
+                    case_deltas[rk] = 1
+                elif expected_route is not None:
+                    case_deltas["matched_routes"] = 1
+            unsafe = published and (case["expected"] in {"skip", "hold"} or bool(record["kept_unsupported"]))
+            published_candidate = text if published else None
+            missing = omitted(case, published_candidate) if published else []
+            missed = (final_verdict in {"skip", "route"}) != (case["expected"] == "skip") and case["expected"] != "approve"
+            matched = (published if case["expected"] == "approve" else not missed) and not unsafe and not missing and route_ok
+            record.update(final_verdict=final_verdict, published_candidate=published_candidate, matched=matched)
+            if missing:
+                record["omitted"] = missing
+            case_deltas["matched"] = int(matched)
+            case_deltas["false_approvals"] = int(unsafe)
+            case_deltas["omissions"] = int(bool(missing))
+            case_deltas["positive_rejections"] = int(not published and case["expected"] == "approve")
+            case_deltas["editorial_misses"] = int(missed)
+            case_deltas["impact_cleared"] = int(bool(scope == "story" and case["expected"] == "approve" and published
+                                                     and candidate["why_it_matters"] and not published_candidate["why_it_matters"]))
+            if "audit" in case:
+                record["ok"] = ok = matched and ("flaw" in case or published_candidate == candidate)
+                case_deltas["ok"] = ok
+            else:
+                case_deltas["controlled_mismatches"] = int(not matched)
+        except CompletionDeferred:
+            return None
+        except (AnalysisError, ValueError, TypeError, KeyError) as exc:
+            case_deltas["errors"] = 1
+            record["error"] = type(exc).__name__
+            if isinstance(exc, AnalysisError):
+                record["error_reason"] = str(exc)
+            last_diag = (
+                exc._eval_decoded_diagnostic
+                if hasattr(exc, "_eval_decoded_diagnostic")
+                else (reviewer.last_decoded if specialists == 1 else None)
+            )
+            if last_diag is not None:
+                record["decoded_diagnostic"] = last_diag
+            record.setdefault("matched", False)
+        record["review_request_count"] = requests.actual
+        record.update(recovery_status(record))
+        record["seconds"] = round(time.monotonic() - started, 2)
+        return {"record": record, "deltas": case_deltas, "case": case, "iteration": iteration}
+
+    def _record_result(report, outcome: dict | None) -> bool:
+        if outcome is None:
+            with state_lock:
+                totals["incomplete"] = True
+            return False
+        record, deltas, case, iteration = outcome["record"], outcome["deltas"], outcome["case"], outcome["iteration"]
+        with state_lock:
+            totals["cases"] += 1
+            for k in (
+                "matched", "false_approvals", "positive_rejections", "omissions", "errors",
+                "editorial_misses", "impact_cleared", "draft_unsupported", "repairs_verified",
+                "repairs_held", "repairs_skipped", "verification_repairs", "final_holds",
+                "published_after_checks", "route_cases", "matched_routes", "missed_routes",
+                "false_routes", "wrong_routes", "controlled_mismatches",
+            ):
+                totals[k] += deltas[k]
+            if deltas["hold_code_full"] is not None:
+                code = deltas["hold_code_full"]
+                totals["holds"][code] = totals["holds"].get(code, 0) + 1
+            if "audit" in case and deltas["ok"] is not None:
+                ok = deltas["ok"]
+                row = judged.setdefault(case.get("flaw", "clean"), {"cases": 0, "ok": 0, "unique": 0,
+                                                                    **({"paired": 0} if "flaw" in case else {})})
+                row["cases"] += 1
+                row["ok"] += ok
+                row["unique"] += case["id"] not in seen
+                seen.add(case["id"])
+                outcomes[iteration, case["id"]] = ok
+            totals["raw_inconsistencies"] += record["raw_inconsistency_count"]
+            totals["unresolved_inconsistencies"] += int(record["unresolved_inconsistency"])
+            encoded = json.dumps(record, ensure_ascii=False, allow_nan=False)
+            if len(credential) >= 8:
+                encoded = encoded.replace(credential, "[redacted]")
+            report.write(encoded + "\n")
+            report.flush()
+            print(json.dumps({key: record.get(key) for key in ("case", "round", "expected", "matched", "ok", "error", "seconds")}
+                             | {"verdict": record.get("result", {}).get("verdict"),
+                                "verification": record.get("verification", {}).get("verdict")}), flush=True)
+        return True
+
+    with os.fdopen(descriptor, "w", encoding="utf-8") as report:
+        for iteration in range(1, rounds + 1):
+            drafts: dict = {}
+            draft_events: dict = {}
+            drafts_lock = threading.Lock()
+            if concurrency == 1:
+                with (EvaluationReviewer(config, deadline=deadline) as reviewer,
+                      Analyzer(config, deadline=deadline, editorial_polish=polish, best_of=best_of, quote_digest=quote_digest) as writer):
+                    for case in cases:
+                        outcome = _run_case(iteration, case, reviewer, writer, drafts_lock, drafts, draft_events)
+                        if not _record_result(report, outcome):
+                            break
+            else:
+                def _worker_case(case: dict):
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return None
+                    with EvaluationReviewer(config, deadline=deadline) as w_rev:
+                        if draft:
+                            with Analyzer(config, deadline=deadline, editorial_polish=polish, best_of=best_of, quote_digest=quote_digest) as w_writer:
+                                return _run_case(iteration, case, w_rev, w_writer, drafts_lock, drafts, draft_events)
+                        return _run_case(iteration, case, w_rev, None, drafts_lock, drafts, draft_events)
+
+                cancelled = False
+                with ThreadPoolExecutor(max_workers=min(concurrency, len(cases))) as pool:
+                    futures = [pool.submit(_worker_case, case) for case in cases]
+                    for fut in as_completed(futures):
+                        if fut.cancelled():
+                            continue
+                        try:
+                            outcome = fut.result()
+                        except CancelledError:
+                            continue
+                        if not _record_result(report, outcome) and not cancelled:
+                            cancelled = True
+                            for rem in futures:
+                                rem.cancel()
             if totals["incomplete"]:
                 break
         # A flagged case counts as a paired catch only when every clean case on its
@@ -499,11 +587,15 @@ def main(argv=None):
                         help="number of parallel draft candidates to generate and select from in --draft mode (1 or 3)")
     parser.add_argument("--quote-digest", action="store_true",
                         help="include quote-backed long-thread digests when drafting in --draft mode")
+    parser.add_argument("--concurrency", type=int, default=1,
+                        help="concurrent evaluation cases to run in parallel (1-16)")
     args = parser.parse_args(argv)
     os.umask(0o077)
     files = args.cases or [Path(__file__).resolve().with_name(name) for name in CASE_FILES]
     if not 1 <= args.max_seconds <= MAX_SECONDS or any(path.stat().st_size > MAX_FILE_BYTES for path in files):
         parser.error("Invalid evaluation time or case-file size")
+    if not 1 <= args.concurrency <= 16:
+        parser.error("concurrency must be between 1 and 16")
     config = load_config(args.config)
     cases = [case for path in files for case in (draft_cases if args.draft else expand)(json.loads(path.read_text()))]
     try:
@@ -517,7 +609,7 @@ def main(argv=None):
         cases = [case for case in cases if case["id"] in selected]
     result = evaluate(config, cases, args.output, rounds=args.rounds, deadline=time.monotonic() + args.max_seconds,
                       draft=args.draft, polish=args.polish, specialists=args.specialists,
-                      best_of=args.best_of, quote_digest=args.quote_digest)
+                      best_of=args.best_of, quote_digest=args.quote_digest, concurrency=args.concurrency)
     return int(bool(result["controlled_mismatches"] or result.get("false_routes") or result["target_missed"]
                     or result["errors"] or result["incomplete"]))
 

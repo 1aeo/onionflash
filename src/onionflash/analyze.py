@@ -364,7 +364,7 @@ confirmation. Reserve confirmed for an official Tor Project announcement or a me
 merge request's own change; use reported for issues, comments, maintainer statements,
 list posts and community claims. Confidence and editorial priority are separate.
 Populate products with the exact lowercase GitLab repository name of each affected
-Tor software (tor, arti, tor-browser, snowflake, webtunnel, lyrebird, torspec, tails),
+Tor software (tor, arti, tor-browser, snowflake, webtunnel, lyrebird, torspec, tails, oniux, orbot),
 falling back to network only when no specific software repository applies.
 
 Return 1-3 literal supporting excerpts from the supplied title, content or a comment
@@ -718,6 +718,8 @@ _TAG_LABELS = {
     "lyrebird": "Lyrebird",
     "torspec": "Tor specification",
     "tails": "Tails",
+    "oniux": "oniux",
+    "orbot": "Orbot",
 }
 
 
@@ -867,7 +869,8 @@ class Analyzer(CompletionClient):
         inherited = {
             key: copy.deepcopy(self.llm[key])
             for key in (
-                "base_url", "fallback_base_urls", "model", "api_key_env",
+                "base_url", "fallback_base_urls", "pool_base_urls", "max_concurrent_requests",
+                "model", "api_key_env",
                 "allowed_networks", "allow_http", "timeout_seconds",
                 "connect_timeout_seconds", "total_timeout_seconds",
                 "send_chat_template_kwargs",
