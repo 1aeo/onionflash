@@ -24,8 +24,14 @@ OPTIONAL_SOURCE_FIELDS = ("author", "sender_domain")
 
 def source_fingerprint(item: dict) -> str:
     """Polling receipts and scheduling metadata do not change evidence identity."""
+    extra = {}
+    if item.get("tag_enriched") is True:
+        extra["tag_enriched"] = True
+    if item.get("tag_enrichment_kind") in {"release_notes", "compare"}:
+        extra["tag_enrichment_kind"] = item["tag_enrichment_kind"]
     return digest({**{key: item.get(key) for key in BASE_SOURCE_FIELDS},
-                   **{opt: item[opt] for opt in OPTIONAL_SOURCE_FIELDS if item.get(opt)}})
+                   **{opt: item[opt] for opt in OPTIONAL_SOURCE_FIELDS if item.get(opt)},
+                   **extra})
 
 
 def _source_body(item: dict | None) -> str | None:
@@ -244,6 +250,10 @@ def build_packet(
             "url": canonical_url(item["url"]), "title": item["title"], "snapshot": snapshot,
             **{opt: item[opt] for opt in OPTIONAL_SOURCE_FIELDS if isinstance(item.get(opt), str) and item[opt]},
         }
+        if item.get("kind") == "tag" and item.get("tag_enriched") is True:
+            unit["tag_enriched"] = True
+            if item.get("tag_enrichment_kind") in {"release_notes", "compare"}:
+                unit["tag_enrichment_kind"] = item["tag_enrichment_kind"]
         if rule is not None:
             unit["mandatory_news_rule"] = rule
         if item.get("closed_at"):

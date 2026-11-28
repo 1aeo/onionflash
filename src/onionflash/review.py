@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import re
 
 from .analyze import SCHEMA as DRAFT_SCHEMA, _numbers as _impact_numbers
@@ -16,7 +17,7 @@ from .render import prepare_story
 from .schema import FIELD_LIMITS, LABEL_FIELDS, SEMANTIC_FIELDS as EDITABLE, STATES, STORY_ID_RE, UPDATE_CHARS
 from .util import LIST_ARCHIVE_HOST, canonical_url, digest, is_trove_item, normalize_evidence, strict_json
 
-REVIEW_VERSION = "onionflash-review-20"
+REVIEW_VERSION = "onionflash-review-21"
 CRITERIA = ("source_support", "actor_and_action", "status", "uncertainty_attribution",
             "scope_timing", "operational_advice", "technical_details", "news_value", "new_information")
 EDITORIAL_CRITERIA = frozenset({"news_value", "new_information"})
@@ -91,10 +92,12 @@ _SHARED_VERDICT_RULES = """Work through all nine criteria in order before choosi
 a concise reason of at most 25 words, source_refs containing only packet IDs (S1 for
 source metadata, S1:P1 for a passage; [] when absent; never invent IDs), and outcome
 ("pass", "fail" or "insufficient"). A criterion passes when no relevant claim is made;
-say why. Return verdict "approve" ONLY when ALL nine criteria pass, repair is null, and
-source_support.source_refs is non-empty; every non-approve verdict REQUIRES at least one
-criterion outcome to be "fail" or "insufficient" (never return revise, hold or skip when
-all nine pass). Do not change or repeat candidate text when approving. In repair, set
+say why. Before writing verdict, perform an explicit pre-verdict consistency check: return
+verdict "approve" ONLY when ALL nine criteria have outcome "pass", repair is null, and
+source_support.source_refs is non-empty (NEVER emit "approve" if any criterion is "fail"
+or "insufficient"); every non-"approve" verdict ("revise", "hold", or "skip") REQUIRES at
+least one criterion outcome to be "fail" or "insufficient" (never return revise, hold or
+skip when all nine pass). Do not change or repeat candidate text when approving. In repair, set
 every unchanged field to null and never edit identity, sources, dates or editorial
 metadata. An application_issue, when present, is an application-detected defect in the
 candidate, not evidence: repair it with the smallest packet-supported edit, or hold.
@@ -129,6 +132,11 @@ stronger certainty.
 Evaluate every criterion separately (no average score); any defect you plan to revise,
 hold or skip MUST fail its criterion below before verdict:
 source_support: every factual assertion is stated or faithfully paraphrased in the packet.
+Inspect EVERY source S1..Sn in packet.sources (including trailing metrics_timeline or
+changelog sources) before emitting "approve" or "skip": if the candidate omits material
+facts added in S2..Sn, FAIL source_support and return "revise" to include them (never
+approve with material omissions, and never skip when a later source adds new metrics or
+impact news).
 When a packet source has unquoted_content, any title, summary or why_it_matters claim
 attributed to that source MUST be grounded in its unquoted_content (the sender's own reply):
 FAIL source_support whenever such a claim, request, relay count or participant ('On ... wrote:'
@@ -207,12 +215,13 @@ list sender, trusted-operator marks a verified large AROI relay-family operator 
 tor-core marks a listed Tor Project GitLab account, and hackerone
 marks a disclosed HackerOne report — NONE of those authorities confirms a claim or proves a
 person is a developer or C Tor developer. Reserve
-confidence confirmed strictly for an official non-tag Tor Project announcement or a merged
-gitlab_mr; keep reported for issues, comments, hackerone, dirauth-operator, tor-core,
+confidence confirmed strictly for an official non-tag Tor Project announcement, an official
+enriched tag carrying upstream release notes or commit logs (`tag_enriched`), or a merged
+gitlab_mr; keep reported for unenriched tag notices, issues, comments, hackerone, dirauth-operator, tor-core,
 project-sender, trusted-operator and community posts, and report mailing-list proposals as
 proposed (state developing, confidence reported, never adopted). Check candidate.confidence AND standalone why_it_matters (when non-empty) explicitly in
 reason without crediting qualifiers that appear only in summary: fail whenever confirmed
-lacks an official non-tag announcement or merged gitlab_mr, when a headline or why_it_matters
+lacks an official non-tag announcement, an official enriched tag, or merged gitlab_mr, when a headline or why_it_matters
 copies or restates a reported, disputed, or conditional defect (including from a report's
 "## Impact" section) as unqualified present-tense fact while omitting ALL of the packet's
 non-default/experimental preconditions (such as a non-default setting or experimental
@@ -286,14 +295,17 @@ pitches, support threads and tool announcements — fail news_value; only source
 (never text/signatures) establishes project-sender or trusted-operator, citing a proposal
 does not make a post one, and unless case (5) applies, proposal-thread replies pass only
 for acceptance, a merge or a new revision. When prior_story is null, fail news_value (verdict skip) for: internal
-crate/module API plumbing MRs (such as `tor-netdoc:` parser, signature, trait, or type
-helpers), code refactors, internal TODO cleanups, minor whitespace parsing tweaks,
-unit-test improvements, and incremental sub-tasks toward unfinished components — all of
-these MUST fail news_value (verdict skip) unless they ship a user- or operator-visible
-capability, fix a security, DoS, crash, or interoperability bug in released software, or
-alter a consensus or protocol default (in latest_update mode when prior_story is not null,
-keep news_value passing for the on-topic published story and use new_information to
-distinguish material corrections from redundant echoes). Also fail news_value (verdict skip) for:
+crate/module API, type, or trait plumbing MRs (such as `tor-netdoc:` parser, signature,
+trait, or type helpers), helper function extractions or moves across internal modules,
+code refactors, internal TODO cleanups, minor whitespace parsing tweaks, mock/dummy test
+stubs and unit-test improvements, scaffold prep PRs, and incremental internal sub-PRs or
+sub-tasks toward unfinished components — all of these MUST fail news_value (verdict skip)
+unless they have a real user, operator, security, interoperability, or consensus effect
+(such as shipping a user- or operator-visible capability, fixing a security, DoS, crash,
+or interoperability bug in released software, or altering a consensus or protocol default;
+in latest_update mode when prior_story is not null, keep news_value passing for the
+on-topic published story and use new_information to distinguish material corrections from
+redundant echoes). Also fail news_value (verdict skip) for:
 stall/crash/reactor fixes on unreleased branches, docs/spec sections for existing designs,
 user questions, release checklists, routine CI/data-refresh/test tags, open feature
 requests or exploratory benchmarks without adoption/merge, third-party tool notices,
@@ -343,10 +355,15 @@ recap or filler, dropped precondition/hedge/scope, unrequested advice or untrust
 community list post — clear why_it_matters to "" UNLESS a single unquoted packet
 sentence explicitly states a concrete impact or requested reader action, in which case
 either clear it to "" or tighten it strictly to that explicit sentence without adding
-anything, else null when unchanged). If the packet
-holds a worthwhile uncovered development that the candidate omits or buries behind quoted
-old text, revise to state the sender's unquoted development from the packet, or hold;
-never skip it. Use "skip" (repair null, news_value or new_information failed) ONLY when
+anything, else null when unchanged). If the packet holds a worthwhile uncovered development that the candidate omits or buries
+behind quoted old text, revise to state the sender's unquoted development from the packet,
+or hold; never skip it. Check EVERY source S1..Sn before choosing skip: if an otherwise
+valid, novel story only overclaims a badge, state, confidence, category, or release tag
+(such as state "released", confidence "confirmed", or tag/category "release" on an
+unmerged/developing gitlab_issue or without a real release or official announcement),
+FAIL status and/or uncertainty_attribution and return verdict "revise" fixing
+state/confidence/category/tags (never "skip" valid news merely for an overclaimed badge
+or release label). Use "skip" (repair null, news_value or new_information failed) ONLY when
 the packet itself is not news or repeats covered events, preferring skip over polishing
 non-news; if unsure, or if important new material lacks defensible support, return "hold"
 with repair null.
@@ -433,7 +450,12 @@ EXACT REVIEW TARGET:
 Evaluate all nine criteria in order before choosing verdict:
 1. source_support: Every claim, actor, quote, platform, version, count and comparison in candidate.updates[-1].text
    MUST be directly supported by unquoted passage(s) of packet source(s) matching candidate.updates[-1].sources
-   (support only in an earlier source, prior_story or >-quoted reply history fails). Do not generalize one
+   (support only in an earlier source, prior_story or >-quoted reply history fails). Inspect EVERY cited
+   source S1..Sn in packet.sources matching candidate.updates[-1].sources (including trailing metrics_timeline
+   or changelog sources): if candidate.updates[-1].text omits material facts added in S2..Sn
+   that are not already covered in coverage_background.prior_story or earlier updates, FAIL
+   source_support and return "revise" to include them (never approve with material omissions,
+   and never skip when S2..Sn adds new metrics or impact news absent from prior coverage). Do not generalize one
    observer's relay or version, or invent "a new relay" from "with previous versions". Explicit title qualifiers
    such as "(Android Only)" or "alpha" govern over generic "for all platforms" template text.
    When a packet source has mandatory_news_rule="trove", candidate.category MUST be "security"
@@ -455,9 +477,10 @@ Evaluate all nine criteria in order before choosing verdict:
      may advance state to "tagged" or stay "merged". Release labels require state in {{"released", "tagged"}}.
 4. uncertainty_attribution: Keep hedges ("suspected", "plausibly", "may", "reported", "I think") and material
    maintainer disagreement or narrowing. Reserve confidence "confirmed" for an official non-tag Tor Project
-   announcement or merged gitlab_mr (or when coverage_background.prior_story.confidence is already "confirmed",
-   which must never be downgraded). Community, issue, hackerone, dirauth-operator, project-sender and trusted-operator
-   and tor-core sources remain confidence "reported", never "confirmed" (use "reports", "says" or "notes", never "confirms"), and
+   announcement, an official enriched tag (`tag_enriched`) carrying release notes or commit logs, or merged gitlab_mr
+   (or when coverage_background.prior_story.confidence is already "confirmed", which must never be downgraded).
+   Community, issue, hackerone, dirauth-operator, project-sender and trusted-operator
+   and tor-core sources (plus unenriched tag notices) remain confidence "reported", never "confirmed" (use "reports", "says" or "notes", never "confirms"), and
    overload, flag loss or counters alone do not confirm an attack or compromise.
 5. scope_timing: Retain exact affected products, software versions, platforms, sample bounds, dates and inspection
    dates from the cited source; never merge adjacent version numbers when the observer measured only one version,
@@ -498,10 +521,12 @@ Evaluate all nine criteria in order before choosing verdict:
      or questions; (7) thanks, +1s and single-operator "me too" symptom echoes (such as "Yes guard and hsdir flags"
      or "HSDir flag did not stick") adding no measurements, new versions or root cause; (8) restating facts already in
      title, summary or updates[:-1].
-   - Before skipping, examine the cited new source's own unquoted passages (unquoted_content when present),
-     not just the drafted update.
-     The repeated-release rule does not apply when an official announcement adds material incident facts,
-     affected scope, response plans or operator instructions absent from prior coverage. If the draft merely
+   - Before skipping, examine EVERY cited source S1..Sn in packet.sources (including trailing metrics_timeline
+     and changelog entries) and its own unquoted passages (unquoted_content when present), not just S1 or the
+     drafted update.
+     The repeated-release rule does not apply when an official announcement or trailing metrics_timeline/changelog
+     source adds material incident facts, post-release consensus anomalies, affected scope, response plans or
+     operator instructions absent from prior coverage. If the draft merely
      repeats the release or omits that development, PASS new_information for the source's new material,
      fail source_support for the material omission and revise update to state the supported new information,
      or hold; never skip that source as a duplicate. Do not require a new version, completed mitigation or state
@@ -515,7 +540,9 @@ Update repair and skip rules: Set same_story to a separate non-retracted recent 
 report the exact same concrete event, else null. When new_information fails for items (1)-(8) above, ALWAYS return
 verdict "skip" with repair null and prior_story.id in new_information.reason (even if updates[-1].text or state also
 failed a check). Copy the actual coverage_background.prior_story.id literally into that reason before returning
-skip; a phrase such as "already covered" without the id is invalid. For an unrelated wrongly attached event,
+skip; a phrase such as "already covered" without the id is invalid. Never skip an otherwise valid novel update
+merely for an overclaimed badge/state/category/release label (FAIL status/uncertainty_attribution and return
+"revise" fixing those labels instead). For an unrelated wrongly attached event,
 return "hold" with repair null. When new_information passes
 and a defect is fixable from packet, return "revise" editing only update (one complete punctuated sentence <= 200
 chars; do not add "fixed", "resolved" or "removed" on a gitlab_issue unless a passage states that word) and/or
@@ -549,17 +576,18 @@ SPECIALIST VERIFICATION FOCUS (attribution_scope_advice — validate all 9 crite
 """,
     "novelty_news": """
 SPECIALIST VERIFICATION FOCUS (novelty_news — validate all 9 criteria; focus on news_value, new_information, and same_story routing):
-- Evaluate novelty and routing strictly against coverage_background (prior_story, recent, and updates[:-1] in latest_update mode): compare specific defects, versions, releases, MRs/issues, and status changes rather than surface wording. When prior_story is present in standalone story mode, compare the ENTIRE candidate.summary and every packet source/comment sentence-by-sentence against prior_story (never assume identity merely because title, state, or opening sentences match prior_story; pass new post-release anomalies, metrics_timeline observations, and new maintainer impact assessments or mitigation guidance not yet in prior_story).
+- Evaluate novelty and routing strictly against coverage_background (prior_story, recent, and updates[:-1] in latest_update mode): compare specific defects, versions, releases, MRs/issues, and status changes rather than surface wording. Check EVERY source S1..Sn in packet.sources (including trailing metrics_timeline or changelog sources) before emitting "skip" or approving: if S2..Sn adds new post-release anomalies, metrics_timeline observations, or material facts that the draft omitted, FAIL source_support and return "revise" to include them (never approve with material omissions, and never skip when S2..Sn adds new impact news even if S1 is already covered). When prior_story is present in standalone story mode, compare the ENTIRE candidate.summary and every packet source/comment sentence-by-sentence against prior_story (never assume identity merely because title, state, or opening sentences match prior_story; pass new post-release anomalies, metrics_timeline observations, and new maintainer impact assessments or mitigation guidance not yet in prior_story).
+- Badge/state-label overclaim repair: when an otherwise valid, novel story only has an overclaimed badge, state, confidence, category, or release tag (such as state "released", confidence "confirmed", or tag/category "release" on an unmerged/developing gitlab_issue without a real release or official announcement), FAIL status/uncertainty_attribution and return "revise" fixing state/confidence/category/tags (never "skip" valid news for a badge overclaim).
 - When prior_story is null and recent covers the same concrete change under routing rules (a)-(e) — including a Tor Project transport, bridge, or relay rollout/deployment notice upgrading hosts to an already-covered Tor release version without a distinct new bug/incident or uncovered official response plan — set same_story to that live recent entry's id unless the distinct official incident-response exception applies (evaluating further defenses or expecting further releases). Never route to retracted or network-health entries, across distinct versions/incidents, separate product releases (e.g. Tails or Tor Browser), community distro rebuilds, or distinct newly reported bugs in a released version (which stay standalone with same_story null).
 - Enforce the 14-day recency window (honoring HackerOne, mandatory_news_rule, and Severity::high/critical exceptions), mandatory_news_rule ("trove", "release_announcement", "torproject_new_thread"), HackerOne triage, dirauth operational rules, and tor-dev 5-case proposal/critique rules.
-- In standalone reviews (prior_story is null), enforce strict news_value criteria (verdict "skip" when new_information passes): internal crate/module API plumbing MRs (e.g. `tor-netdoc:` parser/signature/trait helpers), internal TODO cleanups, minor whitespace parsing tweaks, unit-test improvements, and incremental sub-tasks toward unfinished components MUST fail news_value (verdict "skip") unless they ship a user/operator-visible capability, fix a security/DoS/crash/interoperability bug in released software, or alter a consensus/protocol default.
+- In standalone reviews (prior_story is null), enforce strict news_value criteria (verdict "skip" when new_information passes): internal crate/module API, type, or trait plumbing MRs (e.g. `tor-netdoc:` parser/signature/trait/type helpers), helper function extractions or moves across internal modules, code refactors, internal TODO cleanups, minor whitespace parsing tweaks, mock/dummy test stubs and unit-test improvements, scaffold prep PRs, and incremental internal sub-PRs or sub-tasks toward unfinished components MUST fail news_value (verdict "skip") unless they have a real user, operator, security, interoperability, or consensus effect (shipping a user/operator-visible capability, fixing a security/DoS/crash/interoperability bug in released software, or altering a consensus/protocol default).
 - In latest_update mode (prior_story is not null), keep news_value passing for the on-topic published story (do not apply standalone internal-plumbing exclusions to material factual corrections) and use new_information to skip redundant echoes/check-ins/me-too replies (naming prior_story.id verbatim) while passing material lifecycle transitions, factual corrections, new measurements, maintainer disputes, or new response plans. Keep factual criteria passing unless a clear defect exists.
 """,
 }
 NEWS_TIEBREAK_PROMPT = """
 NEWS-VALUE TIEBREAKER FOCUS (resolve the news_value split cleanly while validating all 9 criteria):
 - Earlier reviews split on news_value. Make an independent, decisive tiebreaker judgment rather than defaulting to hold.
-- In standalone reviews (prior_story is null), fail news_value (verdict "skip", keeping factual criteria passing unless clearly violated) for internal crate/module API plumbing MRs (such as `tor-netdoc:` parser, signature, trait, or helper additions), code refactors, internal TODO cleanups, minor whitespace parsing tweaks, unit-test improvements, and incremental sub-tasks toward unfinished components, UNLESS they ship a user/operator-visible capability, fix a security/DoS/crash/interoperability bug in released software, or alter a consensus/protocol default. In latest_update mode (prior_story is not null), keep news_value passing for an on-topic published story and use new_information to distinguish material factual corrections or developments from redundant updates.
+- In standalone reviews (prior_story is null), fail news_value (verdict "skip", keeping factual criteria passing unless clearly violated) for internal crate/module API, type, or trait plumbing MRs (such as `tor-netdoc:` parser, signature, trait, or type helper additions), helper function extractions or moves across internal modules, code refactors, internal TODO cleanups, minor whitespace parsing tweaks, mock/dummy test stubs and unit-test improvements, scaffold prep PRs, and incremental internal sub-PRs or sub-tasks toward unfinished components, UNLESS they have a real user, operator, security, interoperability, or consensus effect (shipping a user/operator-visible capability, fixing a security/DoS/crash/interoperability bug in released software, or altering a consensus/protocol default). In latest_update mode (prior_story is not null), keep news_value passing for an on-topic published story and use new_information to distinguish material factual corrections or developments from redundant updates.
 - Pass news_value (verdict "approve" if all factual criteria and new_information also pass, or "revise" only when a fixable factual defect exists) when the unquoted packet reports concrete user, operator, security, consensus/dirauth operational, release/tag, or substantive proposal/measurement news that satisfies the base rubric's source authority and tor-dev eligibility rules (requiring a numbered Tor proposal, [RFC] tag, IETF draft/RFC, or project-sender/trusted-operator standing for unnumbered proposals, critiques, or measurements).
 - Verify all factual criteria independently as well: never approve unsupported assertions, dropped qualifiers, unattributed advice, or invalid labels.
 """
@@ -583,14 +611,17 @@ class ReviewError(AnalysisError):
     code = "review.invalid_reply"
 
 
-INCONSISTENT_VERDICT = "Review refusal requires an explicit failed criterion"
+INCONSISTENT_VERDICT = "Review verdict is inconsistent with its criterion outcomes"
 VALIDATION_REASK_PROMPT = """
 The application rejected an earlier response as structurally inconsistent. The
 validation_error field quotes only that validation error, not a factual judgment.
 Review the unchanged current candidate from the supplied sources again and return
-a complete review consistent with its criteria. Do not invent a failed criterion
-to justify a preferred verdict. The rejected reply and its proposed edits are not
-evidence and have not been applied to the candidate.
+a complete review consistent with its criteria. Before emitting verdict, run an explicit
+pre-verdict consistency check: return "approve" ONLY when all 9 criteria have outcome
+"pass" and repair is null, and return "revise", "hold", or "skip" ONLY when at least one
+criterion has outcome "fail" or "insufficient". Do not invent a failed criterion to
+justify a preferred verdict. The rejected reply and its proposed edits are not evidence
+and have not been applied to the candidate.
 """
 
 
@@ -683,6 +714,52 @@ def _widen_update_state(limits: dict, sources: list[dict], prior: dict, candidat
     widen_release_state_for_update(limits, prior)
 
 
+def _is_enriched_official_tag(source: dict) -> bool:
+    """Return whether a packet tag source carries explicit collector enrichment metadata."""
+    return (
+        isinstance(source, dict)
+        and source.get("kind") == "tag"
+        and source.get("authority") == "official"
+        and source.get("tag_enriched") is True
+    )
+
+
+def _allow_enriched_tag_confirmed(limits: dict, sources: list[dict], prepared: dict | None = None) -> dict:
+    """Permit `confirmed` confidence only when an official tag source carries enrichment metadata."""
+    if "confirmed" in limits.get("confidence", ()):
+        return limits
+    has_enriched = any(_is_enriched_official_tag(source) for source in sources)
+    if not has_enriched and isinstance(prepared, dict) and isinstance(prepared.get("row"), dict):
+        try:
+            raw_payload = json.loads(prepared["row"].get("payload") or "{}")
+        except (ValueError, TypeError):
+            raw_payload = {}
+        row_url = canonical_url(raw_payload.get("url")) if isinstance(raw_payload, dict) else ""
+        has_enriched = (
+            isinstance(raw_payload, dict)
+            and raw_payload.get("tag_enriched") is True
+            and bool(row_url)
+            and any(
+                source.get("kind") == "tag"
+                and source.get("authority") == "official"
+                and canonical_url(source.get("url")) == row_url
+                for source in sources
+            )
+        )
+    if has_enriched:
+        return {**limits, "confidence": [*limits["confidence"], "confirmed"]}
+    return limits
+
+
+def _restrict_tag_only_release_state(limits: dict, sources: list[dict], *, prior: dict | None = None) -> dict:
+    """Exclude `released` on tag-only packets unless `prior` already carries `released`."""
+    if not sources or not all(source.get("kind") == "tag" for source in sources):
+        return limits
+    if isinstance(prior, dict) and prior.get("state") == "released":
+        return limits
+    return {**limits, "state": [state for state in limits.get("state", ()) if state != "released"]}
+
+
 def repair_limits(
     packet: dict,
     coverage: dict | None = None,
@@ -692,14 +769,16 @@ def repair_limits(
     update_sources: list[dict] | tuple[dict, ...] | None = None,
 ) -> dict:
     """Use the same source and prior-label bounds for every kind of proposed edit."""
-    limits = label_limits(packet["sources"])
+    prior = (coverage or {}).get("prior_story") or {} if update else None
+    limits = _allow_enriched_tag_confirmed(label_limits(packet["sources"]), packet["sources"])
+    limits = _restrict_tag_only_release_state(limits, packet["sources"], prior=prior)
     if update:
-        prior = (coverage or {}).get("prior_story") or {}
         if prior.get("confidence") == "confirmed":
             limits["confidence"] = ["confirmed"]
         cited = _cited_packet_sources(packet["sources"], update_sources)
         if cited:
             limits["state"] = label_limits(cited)["state"]
+            limits = _restrict_tag_only_release_state(limits, cited, prior=prior)
         _widen_update_state(limits, cited or packet["sources"], prior, candidate_sources)
     return limits
 
@@ -909,7 +988,9 @@ def _validate(result: dict, refs: set[str], *, wire: bool = False, update: bool 
     verdict, repair = result["verdict"], result["repair"]
     editable = UPDATE_EDITABLE if update else EDITABLE
     if verdict == "approve":
-        if failed or repair is not None or not result["criteria"]["source_support"]["source_refs"]:
+        if failed:
+            raise InconsistentReview()
+        if repair is not None or not result["criteria"]["source_support"]["source_refs"]:
             raise ReviewError("Review approval requires all criteria to pass without edits")
     elif not failed:
         proposal = None
@@ -1081,13 +1162,14 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
     The checks read only the candidate, its packet and the kind of source that wrote its
     text, so every caller reaches the same answer, and none needs a model call."""
     sources = prepared["packet"]["sources"]
-    limits = label_limits(sources)
+    prior = (prepared.get("coverage") or {}).get("prior_story") or {} if prepared.get("mode") == "update" else None
+    limits = _allow_enriched_tag_confirmed(label_limits(sources), sources, prepared)
+    limits = _restrict_tag_only_release_state(limits, sources, prior=prior)
     trove_item = any(is_trove_item(source) or source.get("mandatory_news_rule") == "trove" for source in sources)
     merged = _plain("\n".join(source["title"] for source in sources
                               if source.get("kind") == "gitlab_mr" and source.get("upstream_state") == "merged"))
     all_proof = _plain("\n".join(passage["text"] for source in sources for passage in source["passages"]))
     if prepared.get("mode") == "update":
-        prior = (prepared.get("coverage") or {}).get("prior_story") or {}
         if prior.get("confidence") == "confirmed" and "confirmed" not in limits["confidence"]:
             limits = {**limits, "confidence": [*limits["confidence"], "confirmed"]}
         entry = candidate["updates"][-1]
@@ -1098,6 +1180,7 @@ def final_holds(candidate: dict, prepared: dict) -> list[str]:
         cited_units = [source for source, _ in cited_sources]
         if cited_units:
             limits = {**limits, "state": label_limits(cited_units)["state"]}
+            limits = _restrict_tag_only_release_state(limits, cited_units, prior=prior)
         _widen_update_state(limits, cited_units or sources, prior, candidate.get("sources"))
         claimed = (_claimed_done(entry["text"])
                    if any(source.get("kind") == "gitlab_issue" for source, _ in cited_sources) else [])

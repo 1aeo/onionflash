@@ -203,7 +203,9 @@ def relation(previous: dict | None, item: dict, db=None) -> str:
     if item_kind == "tag":
         if item.get("id") == writer:
             return "own"
-        return "citation" if previous.get("state") in {"tagged", "released"} else "update"
+        if previous.get("state") in {"tagged", "released"}:
+            return "update" if item.get("tag_enriched") is True else "citation"
+        return "update"
     prev_tier = {"tag": 0, "metrics_timeline": 1}.get(kind, 2)
     item_tier = {"tag": 0, "metrics_timeline": 1}.get(item_kind, 2)
     if prev_tier < 2 and (

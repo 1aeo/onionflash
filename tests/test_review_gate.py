@@ -3466,3 +3466,285 @@ def test_specialist_3_tiebreak_paths_resume_cache_and_evaluation(context, tmp_pa
     assert report_lines[0]["final_verdict"] == "skip" and report_lines[0]["review_request_count"] == 5
     assert report_lines[-1]["summary"]["matched"] == 1
     assert len(eval_calls) == 5 and eval_calls[-1] == (True, True, None)
+
+
+def test_specialist_wave_multi_reask_resume_multiwave_and_budget(context):
+    """Re-ask 2 or 3 inconsistent specialists per wave, resume mid-queue on transport error, and hold at budget 21."""
+    cfg, store = context
+    assert review_gate.MAX_SPECIALIST_REVIEW_REQUESTS == 21
+
+    # 1) 2 of 3 specialists fail InconsistentReview in verify wave -> both reasked, then published (1+3+2 = 6 calls).
+    calls_2 = []
+
+    def _two_inconsistent_factory():
+        class _TwoInconsistentSpec:
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                if on_request:
+                    on_request(1)
+                calls_2.append((verification, specialist, validation_error))
+                if verification and specialist in {"grounding_status", "novelty_news"}:
+                    if validation_error is None:
+                        raise review.InconsistentReview()
+                    if on_request and hasattr(on_request, "response_received"):
+                        on_request.response_received()
+                return verdict("approve", update=update)
+
+        return _TwoInconsistentSpec()
+
+    row_2 = pending(store, item(id="https://example.org/spec3-two-inconsistent", url="https://example.org/spec3-two-inconsistent"))
+    res_2 = review_gate.process_item(
+        cfg, store, row_2, Writer(), ApprovingReviewer(),
+        parallel_verify=True, reviewer_factory=_two_inconsistent_factory, specialists=3,
+    )
+    assert res_2["status"] == "published" and res_2["review_calls"] == 6
+    reasks_2 = [c for c in calls_2 if c[2] is not None]
+    assert reasks_2 == [
+        (True, "grounding_status", review.INCONSISTENT_VERDICT),
+        (True, "novelty_news", review.INCONSISTENT_VERDICT),
+    ]
+    rec_2 = audit(store, row_2["id"])
+    assert rec_2["request_budget"]["reserved"] == 6
+    assert rec_2["reviews"][1]["reask_response"] is True
+    assert [s["request"] for s in rec_2["reviews"][1]["specialists"]] == [5, 3, 6]
+
+    # 2) All 3 specialists fail InconsistentReview + transient transport error on 2nd reask -> durable resume finishes cleanly.
+    transport_state = {"failed_once": False}
+    phase2_calls = []
+
+    def _three_with_interrupt_factory():
+        class _ThreeInterruptedSpec:
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                if on_request:
+                    on_request(1)
+                phase2_calls.append((verification, specialist, validation_error))
+                if verification:
+                    if validation_error is None:
+                        raise review.InconsistentReview()
+                    if specialist == "attribution_scope_advice" and not transport_state["failed_once"]:
+                        transport_state["failed_once"] = True
+                        if on_request:
+                            on_request.transport_failed()
+                        raise AnalysisError("Transient timeout on 2nd reask", retryable=True)
+                    if on_request and hasattr(on_request, "response_received"):
+                        on_request.response_received()
+                return verdict("approve", update=update)
+
+        return _ThreeInterruptedSpec()
+
+    row_3 = pending(store, item(id="https://example.org/spec3-three-resume", url="https://example.org/spec3-three-resume"))
+    with pytest.raises(AnalysisError):
+        review_gate.process_item(
+            cfg, store, row_3, Writer(), ApprovingReviewer(),
+            parallel_verify=True, reviewer_factory=_three_with_interrupt_factory, specialists=3,
+        )
+    mid_job = job(store, row_3)
+    mid_rec = json.loads(mid_job["record_json"])
+    assert mid_job["stage"] == "verify"
+    assert mid_rec["pending_specialist_wave"]["failed_specialist"] == "attribution_scope_advice"
+    assert mid_rec["pending_specialist_wave"]["pending_specialists"] == ["novelty_news"]
+    assert [c["specialist"] for c in mid_rec["pending_specialist_wave"]["completed"]] == ["grounding_status"]
+    review_gate.validate_review_state(
+        mid_rec, "verify", mid_rec["candidate"], json.loads(mid_job["envelope_json"]),
+    )
+
+    resumed_3 = review_gate.process_item(
+        cfg, store, queued_row(store, row_3["id"]), Writer(), ApprovingReviewer(),
+        parallel_verify=True, reviewer_factory=_three_with_interrupt_factory, specialists=3,
+    )
+    assert resumed_3["status"] == "published" and resumed_3["review_calls"] == 2
+    rec_3 = audit(store, row_3["id"])
+    assert rec_3["request_budget"]["reserved"] == 8
+    assert "pending_specialist_wave" not in rec_3
+    assert [s["request"] for s in rec_3["reviews"][1]["specialists"]] == [5, 7, 8]
+
+    # 3) Multi-wave repair: wave 1 reasks 1 specialist -> revises -> wave 2 reasks another specialist within budget 21.
+    def _multiwave_factory():
+        class _MultiwaveSpec:
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                if on_request:
+                    on_request(1)
+                if not verification:
+                    return verdict("approve", update=update)
+                edited = cand["summary"] != analysis()["summary"]
+                if not edited and specialist == "grounding_status":
+                    if validation_error is None:
+                        raise review.InconsistentReview()
+                    if on_request and hasattr(on_request, "response_received"):
+                        on_request.response_received()
+                    return verdict("revise", criterion="source_support", repair={"summary": "Wave-repaired summary."}, update=update)
+                if edited and specialist == "novelty_news":
+                    if validation_error is None:
+                        raise review.InconsistentReview()
+                    if on_request and hasattr(on_request, "response_received"):
+                        on_request.response_received()
+                return verdict("approve", update=update)
+
+        return _MultiwaveSpec()
+
+    row_mw = pending(store, item(id="https://example.org/spec3-multiwave", url="https://example.org/spec3-multiwave"))
+    res_mw = review_gate.process_item(
+        cfg, store, row_mw, Writer(), ApprovingReviewer(),
+        parallel_verify=True, reviewer_factory=_multiwave_factory, specialists=3,
+    )
+    assert res_mw["status"] == "published"
+    rec_mw = audit(store, row_mw["id"])
+    assert rec_mw["request_budget"]["reserved"] == 9
+    assert [r["stage"] for r in rec_mw["reviews"]] == ["review", "verification", "verification"]
+
+    # 4) Budget exhaustion when 3 specialists fail near MAX_SPECIALIST_REVIEW_REQUESTS == 21 -> holds specialist_budget.
+    def _all_inconsistent_factory():
+        class _AllInconsistentSpec:
+            def review(self, cand, packet, *, coverage=None, verification=False, update=False,
+                       specialist=None, validation_error=None, on_request=None):
+                if on_request:
+                    on_request(1)
+                if verification and validation_error is None:
+                    raise review.InconsistentReview()
+                if verification and validation_error is not None and hasattr(on_request, "response_received"):
+                    on_request.response_received()
+                return verdict("approve", update=update)
+
+        return _AllInconsistentSpec()
+
+    from onionflash import analyze
+    row_cap = pending(store, item(id="https://example.org/spec3-reask-cap", url="https://example.org/spec3-reask-cap"))
+    prep_cap = review_gate._prepare(store, cfg, row_cap, analysis(), DATE)
+    wkey_cap = analyze.cache_key(row_cap, cfg["llm"])
+    rec_cap = {
+        **review_gate._new_record(row_cap, policy_hash=review.policy_hash(cfg)),
+        "writer": {"key": wkey_cap},
+        "specialists": 3,
+        "candidate": prep_cap["candidate"],
+        "reviews": [{
+            "stage": "review",
+            "candidate_hash": digest(prep_cap["candidate"]),
+            "request": 1,
+            "result": verdict("approve"),
+            **review_gate._context(prep_cap, review.policy_hash(cfg)),
+        }],
+        "request_budget": {"reserved": 17, "inconsistent_requests": [], "validation_reask": None},
+    }
+    review_gate._save(
+        store, row_cap, wkey_cap, review.policy_hash(cfg),
+        "verify", analysis(), prep_cap, rec_cap, DATE, prepared_at=DATE,
+    )
+    res_cap = review_gate.process_item(
+        cfg, store, queued_row(store, row_cap["id"]), Writer(), ApprovingReviewer(),
+        parallel_verify=True, reviewer_factory=_all_inconsistent_factory, specialists=3,
+    )
+    assert res_cap["status"] == "held"
+    cap_rec = json.loads(job(store, row_cap)["record_json"])
+    assert cap_rec["hold_code"] == "specialist_budget"
+    assert cap_rec["request_budget"]["reserved"] == 21
+    assert "pending_specialist_wave" not in cap_rec
+
+    # 5) Large negative trigger is rejected quickly without range materialization.
+    bad_rec = copy.deepcopy(rec_cap)
+    bad_rec["request_budget"] = {
+        "reserved": 3,
+        "inconsistent_requests": [2],
+        "validation_reask": {"trigger": -10**9, "attempts": [2], "response": None, "transport_failed": False},
+    }
+    with pytest.raises(analyze.AnalysisError) as exc_bad:
+        review_gate.ReviewRequests(bad_rec)
+    assert exc_bad.value.code == "app.damaged_job"
+
+    # 6) Specialist budget hold closes any active pending proposal cleanly ("superseded_unverified").
+    row_wait = pending(store, item(id="https://example.org/spec3-budget-waiting", url="https://example.org/spec3-budget-waiting"))
+    prep_wait = review_gate._prepare(store, cfg, row_wait, analysis(), DATE)
+    repaired_wait = {**prep_wait["candidate"], "title": "Updated headline pending specialist verify"}
+    rec_wait = copy.deepcopy(rec_cap)
+    rec_wait["reviews"] = []
+    rec_wait["candidate"] = repaired_wait
+    rec_wait["request_budget"] = {"reserved": 17, "inconsistent_requests": [16], "validation_reask": None}
+    rec_wait["untrusted_proposals"] = [{
+        "error": review.INCONSISTENT_VERDICT,
+        "request": 16,
+        "stage": "review",
+        "mode": "story",
+        "candidate_before_hash": digest(prep_wait["candidate"]),
+        "candidate_after_hash": digest(repaired_wait),
+        "context": review_gate._context(prep_wait, review.policy_hash(cfg)),
+        "changed_fields": ["title"],
+        "repair": {"title": repaired_wait["title"]},
+        "accepted": True,
+        "disposition": "pending",
+        "reask_trigger": False,
+        "reask_response": False,
+    }]
+    review_gate._save(
+        store, row_wait, analyze.cache_key(row_wait, cfg["llm"]), review.policy_hash(cfg),
+        "verify", analysis(), prep_wait, rec_wait, DATE, prepared_at=DATE,
+    )
+    res_wait = review_gate.process_item(
+        cfg, store, queued_row(store, row_wait["id"]), Writer(), ApprovingReviewer(),
+        parallel_verify=True, reviewer_factory=_all_inconsistent_factory, specialists=3,
+    )
+    assert res_wait["status"] == "held"
+    wait_rec = json.loads(job(store, row_wait)["record_json"])
+    assert wait_rec["hold_code"] == "specialist_budget"
+    assert wait_rec["untrusted_proposals"][0]["disposition"] == "superseded_unverified"
+    assert review_gate.validate_review_state(wait_rec, "held", repaired_wait, prep_wait) is None
+
+    # 7) Interrupted 2nd specialist reask after response_received validates cleanly and fails closed without resending.
+    row_intr = pending(store, item(id="https://example.org/spec3-intr-reask", url="https://example.org/spec3-intr-reask"))
+    prep_intr = review_gate._prepare(store, cfg, row_intr, analysis(), DATE)
+    cand_hash_intr = digest(prep_intr["candidate"])
+    ctx_intr = review_gate._context(prep_intr, review.policy_hash(cfg))
+    rec_intr = {
+        **review_gate._new_record(row_intr, policy_hash=review.policy_hash(cfg)),
+        "writer": {"key": analyze.cache_key(row_intr, cfg["llm"])},
+        "specialists": 3,
+        "candidate": prep_intr["candidate"],
+        "reviews": [{
+            "stage": "review",
+            "candidate_hash": cand_hash_intr,
+            "request": 1,
+            "result": verdict("approve"),
+            **ctx_intr,
+        }],
+        "untrusted_proposals": [
+            {"error": review.INCONSISTENT_VERDICT, "request": 3, "stage": "verify", "mode": "story",
+             "candidate_before_hash": cand_hash_intr, "candidate_after_hash": None, "context": copy.deepcopy(ctx_intr),
+             "changed_fields": [], "repair": None, "accepted": False, "disposition": "unusable",
+             "reask_trigger": False, "reask_response": False},
+            {"error": review.INCONSISTENT_VERDICT, "request": 4, "stage": "verify", "mode": "story",
+             "candidate_before_hash": cand_hash_intr, "candidate_after_hash": None, "context": copy.deepcopy(ctx_intr),
+             "changed_fields": [], "repair": None, "accepted": False, "disposition": "unusable",
+             "reask_trigger": True, "reask_response": False},
+        ],
+        "request_budget": {
+            "reserved": 6,
+            "inconsistent_requests": [3, 4],
+            "validation_reask": {"trigger": 4, "attempts": [6], "response": 6, "transport_failed": False},
+        },
+        "pending_specialist_wave": {
+            "trigger": 4,
+            "candidate_hash": cand_hash_intr,
+            "context": copy.deepcopy(ctx_intr),
+            "failed_specialist": "novelty_news",
+            "completed": [
+                {"specialist": "attribution_scope_advice", "request": 2, "result": verdict("approve")},
+                {"specialist": "grounding_status", "request": 5, "result": verdict("approve")},
+            ],
+            "pending_specialists": [],
+        },
+    }
+    review_gate._save(
+        store, row_intr, analyze.cache_key(row_intr, cfg["llm"]), review.policy_hash(cfg),
+        "verify", analysis(), prep_intr, rec_intr, DATE, prepared_at=DATE,
+    )
+    reask_resend = []
+    with pytest.raises(review.ReviewError, match="did not yield a usable"):
+        review_gate.process_item(
+            cfg, store, queued_row(store, row_intr["id"]), Writer(), ApprovingReviewer(),
+            parallel_verify=True,
+            reviewer_factory=lambda: type("_TrapSpec", (), {"review": lambda self, *a, **kw: reask_resend.append(a)})(),
+            specialists=3,
+        )
+    assert not reask_resend
+    assert job(store, row_intr)["stage"] == "verify"
+    assert review_gate.validate_review_state(rec_intr, "verify", prep_intr["candidate"], prep_intr) is None

@@ -1175,11 +1175,17 @@ _TEST_CHORE_RE = re.compile(
     re.I,
 )
 _INTERNAL_CLEANUP_RE = re.compile(
-    r"^(?!(?:security|advisory)\s*:)(?:[a-z0-9_./-]+:\s+)?"
+    r"^(?!.*\b(?:security|advisory|vulnerabilit\w*|regression|api\s+break|breaking|bug|crash(?:es|ed|ing)?|"
+    r"dos|ddos|panic\w*|leak\w*|overflow\w*|protocol|consensus|dirauth)\b)"
+    r"(?:[a-z0-9_./-]+:\s+)?"
     r"(?:"
     r"(?:fix(?:ing)?|clean\s*up|resolve|remove)\s+(?:the\s+)?(?:\w+\s+){0,3}todos?\b"
     r"|(?:refactor|clean\s*up)\s+internal\b"
-    r")(?!.*\b(?:security|vulnerabilit\w*|regression|api\s+break|breaking|bug)\b)",
+    r"|(?:extract|move|split|reorganize)\s+(?:internal\s+)?(?:helpers?|helper\s+functions?|utility\s+functions?)\b"
+    r"|(?:add|create|introduce|update)\s+(?:a\s+)?(?:mock|dummy)\s+(?:\w+\s+){0,3}(?:stubs?|helpers?|clients?|servers?|impl(?:ementation)?)\b"
+    r"|(?:initial\s+|prep(?:aration)?\s+)?(?:internal\s+)?scaffold(?:ing)?\s+(?:for|prep)\b"
+    r"|(?:prep(?:are)?\s+)?scaffold(?:ing)?\s+pr\b"
+    r")",
     re.I,
 )
 _HOUSEKEEPING_BEHAVIOR_CHANGE_RE = re.compile(

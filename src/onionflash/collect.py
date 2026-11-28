@@ -7,7 +7,7 @@ from collections.abc import Iterable
 import re
 from datetime import datetime, timedelta
 from html import unescape
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 from xml.parsers import expat
 
 import feedparser
@@ -213,6 +213,224 @@ def _scan_feed_xml(body: bytes) -> list[str | None]:
     return rss_authors
 
 
+_GITLAB_HOST = "gitlab.torproject.org"
+_PGP_SIGNATURE_RE = re.compile(
+    r"-----BEGIN PGP SIGNATURE-----.*?-----END PGP SIGNATURE-----",
+    re.DOTALL,
+)
+_RELEASE_CLI_BOILERPLATE_RE = re.compile(r"^\s*created using the release-cli\.?\s*$", re.IGNORECASE)
+_TRIVIAL_TAG_MSG_RE = re.compile(
+    r"^(?:(?:bump|set|update)\s+(?:the\s+)?(?:version(?:\s+of\s+\S+)?\s+to|to)\s+\S+|"
+    r"(?:release|tag|prepare|version)\s+\S+)\.?$",
+    re.IGNORECASE,
+)
+_TAG_VERSION_RE = re.compile(
+    r"^(?P<prefix>.*?)(?P<version>\d+(?:\.\d+)+)(?P<pre>(?:[-.~]?(?:alpha|beta|rc|dev)\S*))?$",
+    re.IGNORECASE,
+)
+_MAX_TAG_COMPARE_CALLS = 5
+_MAX_TAG_COMPARE_COMMITS = 20
+_MAX_TAG_ENRICHED_CHARS = 3500
+
+
+def _gitlab_tags_project_path(url: str) -> str | None:
+    """Extract the GitLab project path from a `https://gitlab.torproject.org/<project>/-/tags` feed URL."""
+    parts = urlsplit(url)
+    if parts.scheme.lower() != "https" or (parts.hostname or "").lower() != _GITLAB_HOST:
+        return None
+    path = parts.path.rstrip("/")
+    for suffix in ("/-/tags.atom", "/-/tags"):
+        if path.endswith(suffix):
+            project = path[: -len(suffix)].strip("/")
+            return project or None
+    return None
+
+
+def _clean_tag_message(raw: object) -> str:
+    """Strip inline PGP signature blocks from a tag annotation message."""
+    if not isinstance(raw, str):
+        return ""
+    stripped = _PGP_SIGNATURE_RE.sub("", raw)
+    return "\n".join(line.rstrip() for line in stripped.splitlines()).strip()
+
+
+def _clean_release_description(tag_obj: dict) -> str:
+    """Return substantive `release.description` text after stripping release-cli boilerplate."""
+    rel = tag_obj.get("release")
+    if not isinstance(rel, dict):
+        return ""
+    desc = rel.get("description")
+    if not isinstance(desc, str):
+        return ""
+    kept = [ln.rstrip() for ln in desc.splitlines() if ln.strip() and not _RELEASE_CLI_BOILERPLATE_RE.match(ln)]
+    return "\n".join(kept).strip()
+
+
+def _is_substantive_tag_message(message: str, tag_name: str, item_title: str) -> bool:
+    """Return whether `message` carries notes beyond a bare tag name or version-bump line."""
+    if not message:
+        return False
+    lines = [ln.strip() for ln in message.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    if len(lines) == 1:
+        single = lines[0]
+        if _RELEASE_CLI_BOILERPLATE_RE.match(single) or _TRIVIAL_TAG_MSG_RE.match(single):
+            return False
+        norm = lambda s: re.sub(r"[\s._-]+", "", s.lower()).removeprefix("v")
+        if norm(single) in {norm(tag_name), norm(item_title)}:
+            return False
+    return True
+
+
+def _parse_tag_version(name: str) -> tuple[str, tuple[int, ...], str] | None:
+    match = _TAG_VERSION_RE.match(name.strip())
+    if match is None:
+        return None
+    try:
+        nums = tuple(int(part) for part in match.group("version").split("."))
+    except ValueError:
+        return None
+    return (match.group("prefix").lower(), nums, (match.group("pre") or "").lower())
+
+
+def _pre_order_key(pre: str) -> tuple[tuple[int, object], ...]:
+    """Return a comparable sort key for prerelease suffixes such as `-rc1` < `-rc2` < `-rc10`."""
+    return tuple((0, int(tok)) if tok.isdigit() else (1, tok) for tok in re.findall(r"\d+|[a-z]+", pre.lower()))
+
+
+def _preceding_tag_name(tags: list[dict], tag_idx: int, tag_name: str) -> str | None:
+    """Find the immediately preceding tag on the same release line from GitLab's tags list."""
+    parsed = _parse_tag_version(tag_name)
+    if parsed is not None:
+        prefix, ver, pre = parsed
+        is_pre = bool(pre)
+        ver_key = (ver, 0 if is_pre else 1, _pre_order_key(pre))
+        candidates: list[tuple[tuple[int, tuple[int, ...], int, tuple[tuple[int, object], ...], int], str]] = []
+        for idx, entry in enumerate(tags):
+            cand_name = entry.get("name")
+            if idx == tag_idx or not isinstance(cand_name, str) or not cand_name or cand_name == tag_name:
+                continue
+            cand_parsed = _parse_tag_version(cand_name)
+            if cand_parsed is None:
+                continue
+            c_prefix, c_ver, c_pre = cand_parsed
+            c_is_pre = bool(c_pre)
+            if not is_pre and c_is_pre:
+                continue
+            c_key = (c_ver, 0 if c_is_pre else 1, _pre_order_key(c_pre))
+            if c_prefix != prefix or c_key >= ver_key:
+                continue
+            same_branch = 1 if (len(ver) >= 3 and len(c_ver) == len(ver) and c_ver[:-1] == ver[:-1]) else 0
+            same_pre = 1 if (c_is_pre == is_pre) else 0
+            candidates.append(((same_branch, c_ver, 0 if c_is_pre else 1, _pre_order_key(c_pre), same_pre), cand_name))
+        if candidates:
+            candidates.sort(key=lambda pair: pair[0], reverse=True)
+            return candidates[0][1]
+        return None
+    for nxt in tags[tag_idx + 1 :]:
+        cand_name = nxt.get("name")
+        if isinstance(cand_name, str) and cand_name and cand_name != tag_name:
+            return cand_name
+    return None
+
+
+def _bound_enriched_content(header: str, body: str, limit: int) -> str:
+    text = f"{header}\n{body}".strip()
+    cap = min(max(limit, 200), _MAX_TAG_ENRICHED_CHARS) if limit > 0 else _MAX_TAG_ENRICHED_CHARS
+    if len(text) <= cap:
+        return text
+    clipped = text[:cap].rsplit("\n", 1)[0].rstrip()
+    return clipped if len(clipped) > len(header) + 1 else text[:cap].rstrip()
+
+
+def _enrich_gitlab_tags(client: HttpClient, feed_url: str, items: list[dict], settings: dict) -> None:
+    """Fail-soft enrich GitLab tag items with substantive notes or compare commit shortlogs."""
+    project_path = _gitlab_tags_project_path(feed_url)
+    if project_path is None or not items:
+        return
+    encoded_project = quote(project_path, safe="")
+    tags_api = f"https://{_GITLAB_HOST}/api/v4/projects/{encoded_project}/repository/tags?per_page=15"
+    try:
+        tags_raw = client.request("GET", tags_api).json()
+    except (FetchError, ValueError, TypeError, AttributeError):
+        return
+    if not isinstance(tags_raw, list) or not tags_raw:
+        return
+    tags = [entry for entry in tags_raw if isinstance(entry, dict) and isinstance(entry.get("name"), str)]
+    by_name: dict[str, tuple[int, dict]] = {}
+    for idx, entry in enumerate(tags):
+        by_name.setdefault(entry["name"], (idx, entry))
+    compare_calls = 0
+    content_limit = int(settings.get("content_chars") or _MAX_TAG_ENRICHED_CHARS)
+
+    for item in items:
+        path_tail = unquote(urlsplit(item.get("url") or "").path.rstrip("/").rsplit("/", 1)[-1])
+        matched = by_name.get(path_tail) or by_name.get(str(item.get("title") or "").strip())
+        if matched is None:
+            continue
+        tag_idx, tag_obj = matched
+        tag_name = tag_obj["name"]
+        rel_notes = _clean_release_description(tag_obj)
+        clean_msg = _clean_tag_message(tag_obj.get("message"))
+        item_title = str(item.get("title") or "")
+        rel_substantive = _is_substantive_tag_message(rel_notes, tag_name, item_title)
+        msg_substantive = _is_substantive_tag_message(clean_msg, tag_name, item_title)
+
+        parts = [
+            p for p in (
+                rel_notes if rel_substantive else "",
+                clean_msg if msg_substantive and clean_msg != rel_notes else "",
+            )
+            if p
+        ]
+        if parts:
+            item["content"] = _bound_enriched_content(f"Release notes for {tag_name}:", "\n\n".join(parts), content_limit)
+            item["tag_enriched"] = True
+            item["tag_enrichment_kind"] = "release_notes"
+            continue
+
+        if compare_calls >= _MAX_TAG_COMPARE_CALLS:
+            continue
+        prev_name = _preceding_tag_name(tags, tag_idx, tag_name)
+        if not prev_name:
+            continue
+        compare_url = (
+            f"https://{_GITLAB_HOST}/api/v4/projects/{encoded_project}/repository/compare"
+            f"?from={quote(prev_name, safe='')}&to={quote(tag_name, safe='')}"
+        )
+        compare_calls += 1
+        try:
+            cmp_data = client.request("GET", compare_url).json()
+        except (FetchError, ValueError, TypeError, AttributeError):
+            continue
+        if not isinstance(cmp_data, dict):
+            continue
+        commits = cmp_data.get("commits")
+        if not isinstance(commits, list):
+            continue
+        titles: list[str] = []
+        seen_titles: set[str] = set()
+        for commit in commits:
+            if not isinstance(commit, dict) or not isinstance(commit.get("title"), str):
+                continue
+            title = " ".join(commit["title"].split())
+            if not title or title in seen_titles:
+                continue
+            seen_titles.add(title)
+            titles.append(title)
+            if len(titles) >= _MAX_TAG_COMPARE_COMMITS:
+                break
+        if not titles:
+            continue
+        shortlog = "\n".join(f"- {title}" for title in titles)
+        item["content"] = _bound_enriched_content(
+            f"Release commits ({prev_name}..{tag_name}):", shortlog, content_limit,
+        )
+        item["tag_enriched"] = True
+        item["tag_enrichment_kind"] = "compare"
+
+
 def _feed(
     client: HttpClient,
     source: dict,
@@ -322,6 +540,8 @@ def _feed(
     skipped += len(staged) - len(items)
     # An archive feed is bounded by its newest entries, whatever order it lists them in.
     items = sorted(items, key=lambda item: item["updated_at"], reverse=True)[: source["max_items"]]
+    if source.get("kind") == "tag" and items:
+        _enrich_gitlab_tags(client, url, items, settings)
     return cached_result(url, response, state, items, skipped=skipped)
 
 
