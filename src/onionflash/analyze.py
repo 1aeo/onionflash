@@ -24,6 +24,7 @@ from .transport import FetchError
 from .util import (
     LIST_ARCHIVE_HOST, digest, effective_authority, gitlab_repo_name,
     mandatory_news_rule, normalize_evidence as _plain, saved_object, software_from_url,
+    tag_enrichment_kind,
 )
 
 PROMPT_VERSION = "onionflash-25"
@@ -1359,8 +1360,8 @@ class Analyzer(CompletionClient):
         }
         if item.get("kind") == "tag" and item.get("tag_enriched") is True:
             bounded["tag_enriched"] = True
-            if item.get("tag_enrichment_kind") in {"release_notes", "compare"}:
-                bounded["tag_enrichment_kind"] = item["tag_enrichment_kind"]
+            if kind := tag_enrichment_kind(item):
+                bounded["tag_enrichment_kind"] = kind
         if (rule := mandatory_news_rule({**item, "authority": auth})) is not None:
             bounded["mandatory_news_rule"] = rule
         bounded["content"], notes = analysis_context(item)

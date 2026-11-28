@@ -9,7 +9,7 @@ from .comments import analysis_context
 from .llm import is_quoted_list_post, unquoted_mail_text
 from .util import (
     GITLAB_PROJECT_PATH, canonical_url, digest, effective_authority, gitlab_url_variants,
-    mandatory_news_rule, plain_text, safe_canonical_url, saved_object,
+    mandatory_news_rule, plain_text, safe_canonical_url, saved_object, tag_enrichment_kind,
 )
 
 
@@ -27,8 +27,8 @@ def source_fingerprint(item: dict) -> str:
     extra = {}
     if item.get("tag_enriched") is True:
         extra["tag_enriched"] = True
-    if item.get("tag_enrichment_kind") in {"release_notes", "compare"}:
-        extra["tag_enrichment_kind"] = item["tag_enrichment_kind"]
+    if kind := tag_enrichment_kind(item):
+        extra["tag_enrichment_kind"] = kind
     return digest({**{key: item.get(key) for key in BASE_SOURCE_FIELDS},
                    **{opt: item[opt] for opt in OPTIONAL_SOURCE_FIELDS if item.get(opt)},
                    **extra})
@@ -252,8 +252,8 @@ def build_packet(
         }
         if item.get("kind") == "tag" and item.get("tag_enriched") is True:
             unit["tag_enriched"] = True
-            if item.get("tag_enrichment_kind") in {"release_notes", "compare"}:
-                unit["tag_enrichment_kind"] = item["tag_enrichment_kind"]
+            if kind := tag_enrichment_kind(item):
+                unit["tag_enrichment_kind"] = kind
         if rule is not None:
             unit["mandatory_news_rule"] = rule
         if item.get("closed_at"):

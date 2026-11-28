@@ -1225,6 +1225,12 @@ def validate_review_state(record, stage, candidate, prepared, *, allow_cached=Tr
                 wave_reqs.append(comp["request"])
             if len(set(wave_reqs)) != len(wave_reqs):
                 raise ValueError()
+        if "pending_hold" in record:
+            if (stage != "verify" or record["pending_hold"] != "specialist_budget"
+                    or record.get("specialists") != len(review.SPECIALISTS)
+                    or budget["reserved"] < req_budget.max_requests
+                    or "pending_specialist_wave" in record):
+                raise ValueError()
         _validate_candidate_path(record, stage, candidate, prepared, allow_cached=allow_cached)
     except (ValueError, TypeError, KeyError, AttributeError, review.ReviewError):
         raise AnalysisError("Saved review proposal state is damaged", code="app.damaged_job") from None
@@ -1500,6 +1506,7 @@ def _attach_item(store, row: dict, draft: dict, writer_key: str, routed_record: 
 def _hold(store, row, draft, writer_key, record, observed, stage, reason):
     """One semantic hold is terminal; only source change/operator retry requeues."""
     record.pop("pending_specialist_wave", None)
+    record.pop("pending_hold", None)
     record.update(outcome="held", hold_code=reason, hold_reason=HOLDS[reason],
                   verified_facts=not proposal_needs_check(record) and _verified(record["reviews"]))
     with store.db:
@@ -2072,6 +2079,16 @@ def _finish_specialist_wave(by_spec: dict[str, tuple[int, dict]], candidate, pre
     return action, value
 
 
+def _enter_specialist_budget_hold(record: dict, waiting: dict | None, requests: ReviewRequests):
+    """Persist an explicit budget-hold transition so a resume completes the hold without calling `_pending_reask`."""
+    record.pop("pending_specialist_wave", None)
+    if waiting is not None:
+        waiting["disposition"] = "superseded_unverified"
+    record["pending_hold"] = "specialist_budget"
+    requests.persist()
+    return "hold", ("verification", "specialist_budget")
+
+
 def _run_pending_specialist_reasks(reviewer_factory, reviewer, candidate, prepared, record, requests,
                                    *, waiting=None, cand_hash: str, ctx: dict):
     """Drain all queued inconsistent specialists in `pending_specialist_wave`, up to budget."""
@@ -2086,11 +2103,7 @@ def _run_pending_specialist_reasks(reviewer_factory, reviewer, candidate, prepar
             raise review.ReviewError("Validation correction did not yield a usable review")
         wave = record["pending_specialist_wave"]
         if requests.state["reserved"] >= requests.max_requests:
-            record.pop("pending_specialist_wave", None)
-            if waiting is not None:
-                waiting["disposition"] = "superseded_unverified"
-            requests.persist()
-            return "hold", ("verification", "specialist_budget")
+            return _enter_specialist_budget_hold(record, waiting, requests)
         trigger_req = wave["trigger"]
         failed_specialist = wave["failed_specialist"]
         reask_res, reask_exc = _reask_specialist_worker(
@@ -2120,11 +2133,7 @@ def _run_pending_specialist_reasks(reviewer_factory, reviewer, candidate, prepar
                 by_spec, candidate, prepared, record, cand_hash, reask_req, ctx, waiting, reasked=True,
             )
         if requests.state["reserved"] >= requests.max_requests:
-            record.pop("pending_specialist_wave", None)
-            if waiting is not None:
-                waiting["disposition"] = "superseded_unverified"
-            requests.persist()
-            return "hold", ("verification", "specialist_budget")
+            return _enter_specialist_budget_hold(record, waiting, requests)
         wave["failed_specialist"] = remaining[0]
         wave["pending_specialists"] = remaining[1:]
         requests.state["validation_reask"] = {
@@ -2225,10 +2234,7 @@ def _resolve_specialist_wave(spec_outcomes, s_used_list: list[int], candidate, p
             "reask_response": False,
         })
     if not can_reask:
-        if waiting is not None:
-            waiting["disposition"] = "superseded_unverified"
-        requests.persist()
-        return "hold", ("verification", "specialist_budget")
+        return _enter_specialist_budget_hold(record, waiting, requests)
 
     trigger_req = wave_reqs[trigger_pos]
     requests.state["validation_reask"] = {
@@ -2683,6 +2689,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
         if (
             stage == "approved"
             and not proposal_needs_check(record)
+            and not record.get("pending_hold")
             and record.get("outcome") == "approved"
             and record.get("approval_key") == key
             and job["approval_key"] == key
@@ -2726,6 +2733,7 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
             and reviewer_factory is not None
             and requests.state["reserved"] + needed_initial <= requests.max_requests
             and not proposal_needs_check(record)
+            and not record.get("pending_hold")
         )
         while True:
             if not allow_network:
@@ -2741,7 +2749,9 @@ def process_item(config, store, row, writer, reviewer, observed=None, *, allow_n
                         reviewer=reviewer,
                     )
                 elif effective_specialists > 1 and stage == "verify":
-                    if _pending_reask(record, stage, candidate, prepared):
+                    if record.get("pending_hold") == "specialist_budget":
+                        action, value = "hold", ("verification", "specialist_budget")
+                    elif _pending_reask(record, stage, candidate, prepared):
                         reask_factory = reviewer_factory if (parallel_verify and reviewer_factory is not None) else None
                         if record.get("pending_specialist_wave"):
                             if (

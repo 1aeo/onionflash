@@ -470,3 +470,93 @@ def test_tag_state_released_exclusion_heading_spoof_guard_relation_and_prefix_pr
         prior={"title": "P", "summary": "S", "why_it_matters": "", "confidence": "confirmed", "state": "released", "updated_at": DATE, "category": "release"},
     )
     assert "released" in w_schema_rel["properties"]["state"]["enum"]
+
+
+def test_tag_enrichment_edge_cases_store_identity_and_mr_body_signal(tmp_path):
+    """Cover -pre versions, multiline boilerplate, heading-only cap, cross-project isolation, non-str kind, and MR body protocol signals."""
+    from onionflash import source_packet, store as store_mod
+
+    # 1. `-pre` prerelease tags resolve predecessor on version line instead of falling back to update order.
+    pre_tags = [
+        {"name": "v2.0.0-pre2", "message": "", "release": None},
+        {"name": "v2.1.0", "message": "", "release": None},
+        {"name": "v2.0.0-pre1", "message": "", "release": None},
+    ]
+    assert collect._preceding_tag_name(pre_tags, 0, "v2.0.0-pre2") == "v2.0.0-pre1"
+
+    # 2. Multiline boilerplate-only annotations are rejected; mixed boilerplate + substantive passes.
+    assert not collect._is_substantive_tag_message("v2.15.4\nBump version to v2.15.4\nCreated using the release-cli.", "v2.15.4", "v2.15.4")
+    assert collect._is_substantive_tag_message("Created using the release-cli.\nFix directory authority quorum timeout.", "v2.15.4", "v2.15.4")
+
+    # 3. Heading-only truncation returns empty string so item is not falsely marked enriched.
+    long_tag = "v" + ("2." * 95) + "0"
+    assert collect._bound_enriched_content(f"Release notes for {long_tag}:", "Important fix.", 100) == ""
+
+    # 4. Cross-project tag link is NOT enriched with another project's notes, while slash refs match exact full ref.
+    project = "tpo/anti-censorship/pluggable-transports/snowflake"
+    enc_project = "tpo%2Fanti-censorship%2Fpluggable-transports%2Fsnowflake"
+    feed_url = f"https://gitlab.torproject.org/{project}/-/tags"
+    tags_api = f"https://gitlab.torproject.org/api/v4/projects/{enc_project}/repository/tags?per_page=15"
+    xml_body = _tag_atom_xml(
+        ("v2.0.0", "https://gitlab.torproject.org/tpo/core/tor/-/tags/v2.0.0", "2026-11-20T12:00:00Z"),
+        ("v2.0.0", f"{feed_url}/release/v2.0.0", "2026-11-20T11:00:00Z"),
+    )
+    tags_json = json.dumps([
+        {"name": "v2.0.0", "message": "Snowflake notes should stay in snowflake.", "release": None},
+        {"name": "release/v2.0.0", "message": "Fixes WebRTC ICE stall on relay startup.", "release": None},
+    ]).encode("utf-8")
+    client = _FakeHttpClient({
+        feed_url: _FakeHttpResponse(feed_url, xml_body),
+        tags_api: _FakeHttpResponse(tags_api, tags_json),
+    })
+    out = collect._feed(client, _tag_source(project), feed_url, {}, _feed_settings(), DATE)
+    by_url = {it["url"]: it for it in out["items"]}
+    assert by_url["https://gitlab.torproject.org/tpo/core/tor/-/tags/v2.0.0"].get("tag_enriched") is not True
+    assert by_url[f"{feed_url}/release/v2.0.0"].get("tag_enriched") is True
+    assert "Fixes WebRTC ICE stall" in by_url[f"{feed_url}/release/v2.0.0"]["content"]
+
+    # 5. Non-string tag_enrichment_kind (e.g. []) never raises TypeError in source_fingerprint / build_packet.
+    malformed_tag = {
+        "id": "t-bad-kind", "source_id": "s1", "url": f"{feed_url}/v2.0.0",
+        "title": "v2.0.0", "content": "Release notes for v2.0.0:\nFix", "kind": "tag",
+        "authority": "official", "product": "snowflake", "published_at": DATE, "updated_at": DATE,
+        "labels": [], "upstream_state": "", "public_comments": [],
+        "tag_enriched": True, "tag_enrichment_kind": [],
+    }
+    assert source_packet.source_fingerprint(malformed_tag)
+
+    # 6. Marker-only enrichment changes item_hash, updates stored payload, and changes writer cache_key.
+    db = store_mod.Store(tmp_path / "tag.db")
+    base_tag = {
+        "source_id": "snowflake-tags", "url": f"{feed_url}/v2.15.4",
+        "title": "v2.15.4", "content": "Upstream tag observed: v2.15.4", "kind": "tag",
+        "authority": "official", "product": "snowflake", "published_at": DATE, "updated_at": DATE,
+        "labels": [], "upstream_state": "",
+    }
+    assert db.ingest(dict(base_tag), DATE) is True
+    row_lit = dict(db.db.execute("SELECT * FROM items WHERE url=?", (base_tag["url"],)).fetchone())
+    enriched_same_body = {**base_tag, "tag_enriched": True, "tag_enrichment_kind": "release_notes"}
+    assert db.ingest(enriched_same_body, DATE) is True
+    row_rich = dict(db.db.execute("SELECT * FROM items WHERE url=?", (base_tag["url"],)).fetchone())
+    assert row_rich["content_hash"] != row_lit["content_hash"]
+    assert json.loads(row_rich["payload"])["tag_enrichment_kind"] == "release_notes"
+    llm_cfg = config.DEFAULTS["llm"]
+    assert analyze.cache_key(row_rich, llm_cfg) != analyze.cache_key(row_lit, llm_cfg)
+
+    # 7. Material wire-protocol body prevents helper-extraction skip; pure extraction still skips.
+    assert util.is_housekeeping_item({
+        "kind": "gitlab_mr",
+        "upstream_state": "merged",
+        "title": "Extract helper functions",
+        "content": "Clients now accept a new handshake message. This changes the wire protocol.",
+        "labels": [],
+        "url": "https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/4200",
+    }) is None
+    assert util.is_housekeeping_item({
+        "kind": "gitlab_mr",
+        "upstream_state": "merged",
+        "title": "util: Extract helpers",
+        "content": "Move string formatting helpers without changing behavior.",
+        "labels": [],
+        "url": "https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/4201",
+    }) == ("skipped.gate.housekeeping", "Routine internal refactor or TODO cleanup item")

@@ -225,7 +225,7 @@ _TRIVIAL_TAG_MSG_RE = re.compile(
     re.IGNORECASE,
 )
 _TAG_VERSION_RE = re.compile(
-    r"^(?P<prefix>.*?)(?P<version>\d+(?:\.\d+)+)(?P<pre>(?:[-.~]?(?:alpha|beta|rc|dev)\S*))?$",
+    r"^(?P<prefix>.*?)(?P<version>\d+(?:\.\d+)+)(?P<pre>(?:[-.~]?(?:alpha|beta|pre|rc|dev)\S*))?$",
     re.IGNORECASE,
 )
 _MAX_TAG_COMPARE_CALLS = 5
@@ -267,20 +267,20 @@ def _clean_release_description(tag_obj: dict) -> str:
 
 
 def _is_substantive_tag_message(message: str, tag_name: str, item_title: str) -> bool:
-    """Return whether `message` carries notes beyond a bare tag name or version-bump line."""
+    """Return whether `message` carries notes beyond bare tag names or version-bump lines."""
     if not message:
         return False
     lines = [ln.strip() for ln in message.splitlines() if ln.strip()]
     if not lines:
         return False
-    if len(lines) == 1:
-        single = lines[0]
-        if _RELEASE_CLI_BOILERPLATE_RE.match(single) or _TRIVIAL_TAG_MSG_RE.match(single):
-            return False
-        norm = lambda s: re.sub(r"[\s._-]+", "", s.lower()).removeprefix("v")
-        if norm(single) in {norm(tag_name), norm(item_title)}:
-            return False
-    return True
+    norm = lambda s: re.sub(r"[\s._-]+", "", s.lower()).removeprefix("v")
+    bare_names = {norm(tag_name), norm(item_title)}
+    return any(
+        not _RELEASE_CLI_BOILERPLATE_RE.match(ln)
+        and not _TRIVIAL_TAG_MSG_RE.match(ln)
+        and norm(ln) not in bare_names
+        for ln in lines
+    )
 
 
 def _parse_tag_version(name: str) -> tuple[str, tuple[int, ...], str] | None:
@@ -341,7 +341,10 @@ def _bound_enriched_content(header: str, body: str, limit: int) -> str:
     if len(text) <= cap:
         return text
     clipped = text[:cap].rsplit("\n", 1)[0].rstrip()
-    return clipped if len(clipped) > len(header) + 1 else text[:cap].rstrip()
+    if len(clipped) > len(header) + 1:
+        return clipped
+    fallback = text[:cap].rstrip()
+    return fallback if len(fallback) > len(header) + 1 else ""
 
 
 def _enrich_gitlab_tags(client: HttpClient, feed_url: str, items: list[dict], settings: dict) -> None:
@@ -365,8 +368,20 @@ def _enrich_gitlab_tags(client: HttpClient, feed_url: str, items: list[dict], se
     content_limit = int(settings.get("content_chars") or _MAX_TAG_ENRICHED_CHARS)
 
     for item in items:
-        path_tail = unquote(urlsplit(item.get("url") or "").path.rstrip("/").rsplit("/", 1)[-1])
-        matched = by_name.get(path_tail) or by_name.get(str(item.get("title") or "").strip())
+        item_url = str(item.get("url") or "")
+        url_parts = urlsplit(item_url)
+        if url_parts.scheme.lower() != "https" or (url_parts.hostname or "").lower() != _GITLAB_HOST:
+            continue
+        if "/-/tags/" in url_parts.path:
+            item_project, raw_ref = url_parts.path.split("/-/tags/", 1)
+            if item_project.strip("/") != project_path:
+                continue
+            tag_ref = unquote(raw_ref.rstrip("/"))
+            matched = by_name.get(tag_ref)
+        else:
+            if "/-/" in url_parts.path and url_parts.path.split("/-/", 1)[0].strip("/") != project_path:
+                continue
+            matched = by_name.get(str(item.get("title") or "").strip())
         if matched is None:
             continue
         tag_idx, tag_obj = matched
@@ -385,10 +400,12 @@ def _enrich_gitlab_tags(client: HttpClient, feed_url: str, items: list[dict], se
             if p
         ]
         if parts:
-            item["content"] = _bound_enriched_content(f"Release notes for {tag_name}:", "\n\n".join(parts), content_limit)
-            item["tag_enriched"] = True
-            item["tag_enrichment_kind"] = "release_notes"
-            continue
+            bounded = _bound_enriched_content(f"Release notes for {tag_name}:", "\n\n".join(parts), content_limit)
+            if bounded:
+                item["content"] = bounded
+                item["tag_enriched"] = True
+                item["tag_enrichment_kind"] = "release_notes"
+                continue
 
         if compare_calls >= _MAX_TAG_COMPARE_CALLS:
             continue
@@ -424,11 +441,13 @@ def _enrich_gitlab_tags(client: HttpClient, feed_url: str, items: list[dict], se
         if not titles:
             continue
         shortlog = "\n".join(f"- {title}" for title in titles)
-        item["content"] = _bound_enriched_content(
+        bounded = _bound_enriched_content(
             f"Release commits ({prev_name}..{tag_name}):", shortlog, content_limit,
         )
-        item["tag_enriched"] = True
-        item["tag_enrichment_kind"] = "compare"
+        if bounded:
+            item["content"] = bounded
+            item["tag_enriched"] = True
+            item["tag_enrichment_kind"] = "compare"
 
 
 def _feed(

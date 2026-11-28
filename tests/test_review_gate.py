@@ -3748,3 +3748,89 @@ def test_specialist_wave_multi_reask_resume_multiwave_and_budget(context):
     assert not reask_resend
     assert job(store, row_intr)["stage"] == "verify"
     assert review_gate.validate_review_state(rec_intr, "verify", prep_intr["candidate"], prep_intr) is None
+
+    # 8) Interrupted specialist_budget hold (in both 2-inconsistent-at-cap and last-slot-reask-with-remaining) resumes durably to held.
+    for case_id, extra_rec in [
+        (
+            "https://example.org/spec3-durable-hold-a",
+            {
+                "reviews": [{
+                    "stage": "review",
+                    "candidate_hash": None,
+                    "request": 1,
+                    "result": verdict("approve"),
+                }],
+                "untrusted_proposals": [
+                    {"error": review.INCONSISTENT_VERDICT, "request": 20, "stage": "verify", "mode": "story",
+                     "candidate_before_hash": None, "candidate_after_hash": None, "context": None,
+                     "changed_fields": [], "repair": None, "accepted": False, "disposition": "unusable",
+                     "reask_trigger": False, "reask_response": False},
+                    {"error": review.INCONSISTENT_VERDICT, "request": 21, "stage": "verify", "mode": "story",
+                     "candidate_before_hash": None, "candidate_after_hash": None, "context": None,
+                     "changed_fields": [], "repair": None, "accepted": False, "disposition": "unusable",
+                     "reask_trigger": False, "reask_response": False},
+                ],
+                "request_budget": {"reserved": 21, "inconsistent_requests": [20, 21], "validation_reask": None},
+                "pending_hold": "specialist_budget",
+            },
+        ),
+        (
+            "https://example.org/spec3-durable-hold-b",
+            {
+                "reviews": [{
+                    "stage": "review",
+                    "candidate_hash": None,
+                    "request": 1,
+                    "result": verdict("approve"),
+                }],
+                "untrusted_proposals": [
+                    {"error": review.INCONSISTENT_VERDICT, "request": 18, "stage": "verify", "mode": "story",
+                     "candidate_before_hash": None, "candidate_after_hash": None, "context": None,
+                     "changed_fields": [], "repair": None, "accepted": False, "disposition": "unusable",
+                     "reask_trigger": False, "reask_response": False},
+                    {"error": review.INCONSISTENT_VERDICT, "request": 19, "stage": "verify", "mode": "story",
+                     "candidate_before_hash": None, "candidate_after_hash": None, "context": None,
+                     "changed_fields": [], "repair": None, "accepted": False, "disposition": "unusable",
+                     "reask_trigger": True, "reask_response": False},
+                ],
+                "request_budget": {
+                    "reserved": 21,
+                    "inconsistent_requests": [18, 19],
+                    "validation_reask": {"trigger": 19, "attempts": [21], "response": 21, "transport_failed": False},
+                },
+                "pending_hold": "specialist_budget",
+            },
+        ),
+    ]:
+        row_dh = pending(store, item(id=case_id, url=case_id))
+        prep_dh = review_gate._prepare(store, cfg, row_dh, analysis(), DATE)
+        cand_h_dh = digest(prep_dh["candidate"])
+        ctx_dh = review_gate._context(prep_dh, review.policy_hash(cfg))
+        rec_dh = {
+            **review_gate._new_record(row_dh, policy_hash=review.policy_hash(cfg)),
+            "writer": {"key": analyze.cache_key(row_dh, cfg["llm"])},
+            "specialists": 3,
+            "candidate": prep_dh["candidate"],
+            **copy.deepcopy(extra_rec),
+        }
+        for rev in rec_dh["reviews"]:
+            rev["candidate_hash"] = cand_h_dh
+            rev.update(copy.deepcopy(ctx_dh))
+        for prop in rec_dh["untrusted_proposals"]:
+            prop["candidate_before_hash"] = cand_h_dh
+            prop["context"] = copy.deepcopy(ctx_dh)
+        review_gate._save(
+            store, row_dh, analyze.cache_key(row_dh, cfg["llm"]), review.policy_hash(cfg),
+            "verify", analysis(), prep_dh, rec_dh, DATE, prepared_at=DATE,
+        )
+        res_dh = review_gate.process_item(
+            cfg, store, queued_row(store, row_dh["id"]), Writer(), ApprovingReviewer(),
+            parallel_verify=True,
+            reviewer_factory=lambda: type("_NeverCall", (), {"review": lambda self, *a, **kw: (_ for _ in ()).throw(AssertionError("unexpected call"))})(),
+            specialists=3,
+        )
+        assert res_dh["status"] == "held"
+        saved_dh = json.loads(job(store, row_dh)["record_json"])
+        assert saved_dh["hold_code"] == "specialist_budget"
+        assert "pending_hold" not in saved_dh
+        assert review_gate.validate_review_state(saved_dh, "held", prep_dh["candidate"], prep_dh) is None

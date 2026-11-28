@@ -1188,6 +1188,14 @@ _INTERNAL_CLEANUP_RE = re.compile(
     r")",
     re.I,
 )
+_INTERNAL_CLEANUP_MATERIAL_SIGNAL_RE = re.compile(
+    r"\b(?:"
+    r"protocol|consensus|dirauth|directory\s+authorit\w*|bridge\s+authorit\w*|"
+    r"wire\s+format|handshake|cell\s+format|descriptor\s+format|public\s+api|"
+    r"cli\s+flag|command[- ]line|config(?:uration)?\s+option|new\s+feature"
+    r")\b",
+    re.I,
+)
 _HOUSEKEEPING_BEHAVIOR_CHANGE_RE = re.compile(
     r"\b(?:"
     r"by\s+default|new\s+default|"
@@ -1310,9 +1318,24 @@ def is_housekeeping_item(item: dict) -> tuple[str, str] | None:
     )
     if not has_behavior_change and _TEST_CHORE_RE.search(cleaned_title):
         return "skipped.gate.housekeeping", "Routine test suite housekeeping item"
-    if not has_behavior_change and _INTERNAL_CLEANUP_RE.search(cleaned_title):
+    if (
+        not has_behavior_change
+        and not _INTERNAL_CLEANUP_MATERIAL_SIGNAL_RE.search(full_text)
+        and _INTERNAL_CLEANUP_RE.search(cleaned_title)
+    ):
         return "skipped.gate.housekeeping", "Routine internal refactor or TODO cleanup item"
     return None
+
+
+TAG_ENRICHMENT_KINDS = frozenset({"release_notes", "compare"})
+
+
+def tag_enrichment_kind(item: dict) -> str | None:
+    """Return the validated enrichment kind for an enriched tag, ignoring invalid types."""
+    if not isinstance(item, dict) or item.get("tag_enriched") is not True:
+        return None
+    kind = item.get("tag_enrichment_kind")
+    return kind if isinstance(kind, str) and kind in TAG_ENRICHMENT_KINDS else None
 
 
 def is_pt_high_impact(item: dict) -> bool:
