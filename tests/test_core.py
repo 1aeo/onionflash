@@ -2375,3 +2375,101 @@ def test_cli_opt_in_adapters_include_best_of_quote_digest_and_specialists(monkey
         "reviewer_factory": factory,
         "specialists": 3,
     }
+
+
+def test_cli_refresh_list_and_guarded_retry(tmp_path, capsys):
+    """List refresh states read-only and require CAS `--expect-hash` + `--reason` for `refresh retry`."""
+    from onionflash import refresh as refresh_mod
+    from onionflash.analyze import cache_key
+
+    cfg_path = write_toml(tmp_path)
+    db_path = tmp_path / "state.sqlite3"
+    with Store(db_path) as store:
+        s1 = seed_story(
+            store,
+            item(url="https://example.org/ref-cli-1", title="Held refresh story", content="Initial report body."),
+            analysis(title="Held refresh story", summary="Initial report body.", evidence=["Initial report body."]),
+        )
+        for idx in range(1, 4):
+            ts = after(idx * 3600, DATE)
+            upd = item(
+                url=f"https://example.org/ref-cli-1/upd/{idx}",
+                title=f"Follow-up {idx}",
+                content=f"Milestone {idx} details.",
+                published_at=ts,
+                updated_at=ts,
+            )
+            row = pending(store, upd, at=ts, ready=ts, target=s1["id"])
+            finish_reviewed(
+                store, row, update_analysis(update=f"Milestone {idx} verified.", evidence=[upd["content"]]),
+                cache_key(row, DEFAULTS["llm"]), ts,
+            )
+        cand = store.refresh_candidates(limit=5)[0]
+        policy = "a" * 64
+        store.record_refresh_status(
+            s1["id"],
+            update_count=3,
+            refreshed_hash=cand["refreshed_hash"],
+            status="held",
+            observed=LATER,
+            code="held.refresh.review_rejected",
+            reason="review_hold",
+            extra={"title": s1["title"], "hold_code": "source_support"},
+            policy_hash=policy,
+        )
+
+    # `refresh list` is read-only (works even while run_lock is held) and returns joined metadata.
+    with run_lock(str(db_path)) as held:
+        assert held
+        listed = invoke_cli(capsys, "refresh", "list", "--config", cfg_path)
+        assert len(listed["refreshes"]) == 1
+        entry = listed["refreshes"][0]
+        assert entry["story_id"] == s1["id"]
+        assert entry["title"] == "Held refresh story"
+        assert entry["state"] == "developing"
+        assert entry["story_update_count"] == 3
+        assert entry["update_count"] == 3
+        assert entry["status"] == "held"
+        assert entry["reason"] == "review_hold"
+        assert entry["hold_code"] == "source_support"
+        assert entry["policy_hash"] == policy
+        assert entry["refreshed_hash"] == cand["refreshed_hash"]
+
+        assert invoke_cli(capsys, "refresh", "list", "--config", cfg_path, "--status", "refreshed")["refreshes"] == []
+        assert len(invoke_cli(capsys, "refresh", "list", "--config", cfg_path, "--status", "held")["refreshes"]) == 1
+
+        # `refresh retry` acquires run_lock and returns exit 75 when busy.
+        busy = invoke_cli(
+            capsys, "refresh", "retry", "--config", cfg_path,
+            "--story", s1["id"], "--expect-hash", cand["refreshed_hash"], "--reason", "Retry after prompt update",
+            expected=75,
+        )
+        assert busy["status"] == "already-running"
+
+    # Mismatched `--expect-hash` is rejected with exit 2 and leaves story_refreshes intact.
+    bad = invoke_cli(
+        capsys, "refresh", "retry", "--config", cfg_path,
+        "--story", s1["id"], "--expect-hash", "0" * 64, "--reason", "Wrong hash",
+        expected=2,
+    )
+    assert "changed" in bad["error"].lower()
+
+    # Valid `--expect-hash` clears the refresh record so the story is immediately re-eligible.
+    retried = invoke_cli(
+        capsys, "refresh", "retry", "--config", cfg_path,
+        "--story", s1["id"], "--expect-hash", cand["refreshed_hash"], "--reason", "Retry under v2 policy",
+    )
+    assert retried["status"] == "pending_retry"
+    assert retried["before_status"] == "held"
+    assert invoke_cli(capsys, "refresh", "list", "--config", cfg_path)["refreshes"] == []
+
+    # Second retry with same hash is rejected since the record was cleared.
+    invoke_cli(
+        capsys, "refresh", "retry", "--config", cfg_path,
+        "--story", s1["id"], "--expect-hash", cand["refreshed_hash"], "--reason", "Duplicate retry",
+        expected=2,
+    )
+
+    with Store(db_path) as store:
+        assert [c["story_id"] for c in store.refresh_candidates(limit=5, policy_hash=policy)] == [s1["id"]]
+        assert refresh_mod.MAX_REFRESHES_PER_RUN == 4
