@@ -16,10 +16,11 @@ import sqlite3
 from . import candidate, decisions, doctor, editorial, publication, render
 from .candidate import ReviewRequired, item_source
 from .comments import analysis_context
+from .schema import SHA256_RE, STORY_ID_RE
 from .util import (
     after, backoff_until, canonical_json, digest, is_dirauth_item, is_hackerone_item,
     is_pt_high_impact, is_tor_core_item, is_trove_item, item_cluster, item_identity,
-    safe_canonical_url, saved_object, strict_json, valid_note_list,
+    now_iso, safe_canonical_url, saved_object, strict_json, timestamp, valid_note_list,
 )
 
 TAG_PRIORITY = 5  # queue floor for deterministic tag notices
@@ -293,6 +294,59 @@ def story_refresh_hash(payload: dict) -> str:
     return digest({"updates": payload.get("updates") or [], "sources": payload.get("sources") or []})
 
 
+_REFRESH_SETTLED_HEADLINE_RE = re.compile(r"\b(?:fixed|resolved|merged|released)\b", re.IGNORECASE)
+_REFRESH_OPEN_HEADLINE_RE = re.compile(
+    r"(?:"
+    r"\b(?:requests?|requesting|proposes?|proposing|proposed|asks?|asking|investigat(?:es?|ing)|"
+    r"reportedly|developing|ongoing|unmerged|pending)\b"
+    r"|\b(?:open(?:ed)?\s+(?:issue|ticket|bug|merge\s+request|mr)|merge\s+request)\b"
+    r"|^\s*(?:add|remove|fix|disable|enable|disallow|deprecate|drop|replace|stop|prevent|implement|refactor|investigate)\b(?!\s*:)"
+    r")",
+    re.IGNORECASE,
+)
+_REFRESH_REVERSAL_UPDATE_RE = re.compile(
+    r"(?:"
+    r"\b(?:not\s+affected|unaffected|does\s+not\s+(?:affect|apply|meet)|not\s+vulnerable|audit)\b"
+    r"|(?<!\bnot )(?<!\bno )(?<!\bnever )\b(?:reversed|reverted|retracted|withdrawn|corrected|closed|merged|fixed|resolved)\b"
+    r")",
+    re.IGNORECASE,
+)
+_REFRESH_TRACKER_HEADLINE_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:an?\s+)?(?:opened|open)\s+(?:(?:tor(?:\s+browser)?|arti|snowflake|webtunnel|lyrebird|oniux|orbot|tails|gitlab)\s+)?(?:issue|ticket|merge\s+request|mr|bug)\b"
+    r"|(?:tor(?:\s+browser)?|arti|snowflake|webtunnel|lyrebird|oniux|orbot|tails|gitlab)\s+(?:issue|ticket|bug\s+report|merge\s+request)\b"
+    r"|(?:issue|ticket|merge\s+request)\s+(?:asks|reports|requests|proposes|says|notes|details|describes|opens|opened)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def is_refresh_eligible(story: dict) -> bool:
+    """Return whether a stored story qualifies for living-story summary refresh."""
+    if not isinstance(story, dict) or story.get("origin") == "network-health":
+        return False
+    updates = story.get("updates")
+    if not isinstance(updates, list) or not updates:
+        return False
+    if len(updates) >= MIN_REFRESH_UPDATES:
+        return True
+    title = story.get("title") if isinstance(story.get("title"), str) else ""
+    if len(updates) >= 2 and _REFRESH_TRACKER_HEADLINE_RE.search(title):
+        return True
+    state = story.get("state")
+    if (
+        isinstance(state, str)
+        and state in {"fixed", "resolved", "merged", "released"}
+        and title
+        and not _REFRESH_SETTLED_HEADLINE_RE.search(title)
+        and _REFRESH_OPEN_HEADLINE_RE.search(title)
+    ):
+        return True
+    latest = updates[-1]
+    latest_text = latest.get("text") if isinstance(latest, dict) and isinstance(latest.get("text"), str) else ""
+    return bool(latest_text and _REFRESH_REVERSAL_UPDATE_RE.search(latest_text))
+
+
 def item_priority(
     item: dict,
     dirauth_users: Iterable[str] | None = None,
@@ -469,7 +523,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS story_refreshes (
                 story_id TEXT PRIMARY KEY, last_refreshed_at TEXT NOT NULL,
                 update_count INTEGER NOT NULL DEFAULT 0, refreshed_hash TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'refreshed'
+                status TEXT NOT NULL DEFAULT 'refreshed',
+                policy_hash TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS comment_cache (
@@ -526,11 +581,17 @@ class Store:
             if "rejections" not in _table_columns(self.db, "items"):
                 self.db.execute("ALTER TABLE items ADD COLUMN rejections INTEGER NOT NULL DEFAULT 0")
             self.db.execute("PRAGMA user_version = 1")
+        self._migrate()
         self.db.execute("CREATE INDEX IF NOT EXISTS analyses_source_snapshot ON analyses(source_item_id,created_at DESC,cache_key DESC)")
         if get_meta(self.db, "publication_build_pending") is None and not self.db.execute("SELECT 1 FROM public_artifacts LIMIT 1").fetchone():
             set_meta(self.db, publication_build_pending="1")
         self._comment_requests: dict[str, str] = {}
         self.db.commit()
+
+    def _migrate(self) -> None:
+        """Apply idempotent column migrations for existing databases."""
+        if "policy_hash" not in _table_columns(self.db, "story_refreshes"):
+            self.db.execute("ALTER TABLE story_refreshes ADD COLUMN policy_hash TEXT NOT NULL DEFAULT ''")
 
     def __enter__(self) -> Store:
         return self
@@ -1072,15 +1133,16 @@ class Store:
         with self.db:
             set_meta(self.db, **values)
 
-    def refresh_candidates(self, limit: int = 2) -> list[dict]:
-        """Select eligible live multi-update stories needing a cohesive summary refresh."""
+    def refresh_candidates(self, limit: int = 2, policy_hash: str = "") -> list[dict]:
+        """Select eligible live multi-update or lifecycle-shifted stories needing a cohesive summary refresh."""
         if limit <= 0:
             return []
         cursor = self.db.execute(
             """SELECT s.id, s.cluster_key, s.published_at, s.updated_at,
                       CASE WHEN typeof(s.payload)='text' THEN CAST(s.payload AS BLOB) END AS payload_blob,
                       sr.last_refreshed_at, sr.update_count AS sr_update_count,
-                      sr.refreshed_hash AS sr_refreshed_hash, sr.status AS sr_status
+                      sr.refreshed_hash AS sr_refreshed_hash, sr.status AS sr_status,
+                      sr.policy_hash AS sr_policy_hash
                FROM stories s
                LEFT JOIN editorial_controls e ON e.story_id=s.id
                LEFT JOIN story_refreshes sr ON sr.story_id=s.id
@@ -1098,15 +1160,18 @@ class Store:
                 if editorial.retired(self.db, story_id=row["id"], cluster_key=row["cluster_key"]) is not None:
                     continue
                 payload = saved_object(row["payload_blob"])
-                if payload is None or payload.get("origin") == "network-health":
+                if payload is None or not is_refresh_eligible(payload):
                     continue
                 updates = payload.get("updates")
-                if not isinstance(updates, list) or len(updates) < MIN_REFRESH_UPDATES:
-                    continue
                 current_hash = story_refresh_hash(payload)
                 prev_count = row["sr_update_count"]
                 if prev_count is not None:
-                    if not (
+                    if row["sr_status"] == "held":
+                        policy_changed = bool(policy_hash) and (row["sr_policy_hash"] or "") != policy_hash
+                        has_new_updates = prev_count < len(updates) and row["sr_refreshed_hash"] != current_hash
+                        if not (policy_changed or has_new_updates):
+                            continue
+                    elif not (
                         prev_count < len(updates)
                         and (len(updates) - prev_count) >= MIN_NEW_UPDATES_FOR_REFRESH
                         and row["sr_refreshed_hash"] != current_hash
@@ -1127,6 +1192,7 @@ class Store:
                             "update_count": prev_count,
                             "refreshed_hash": row["sr_refreshed_hash"],
                             "status": row["sr_status"],
+                            "policy_hash": row["sr_policy_hash"],
                         }
                         if prev_count is not None
                         else None
@@ -1149,18 +1215,20 @@ class Store:
         code: str | None = None,
         reason: str | None = None,
         extra: dict | None = None,
+        policy_hash: str = "",
     ) -> None:
         """Record a non-committed refresh outcome and optional decision-log entry atomically."""
         with immediate_transaction(self.db, "Refresh status update requires a fresh transaction"):
             self.db.execute(
-                """INSERT INTO story_refreshes(story_id,last_refreshed_at,update_count,refreshed_hash,status)
-                   VALUES(?,?,?,?,?)
+                """INSERT INTO story_refreshes(story_id,last_refreshed_at,update_count,refreshed_hash,status,policy_hash)
+                   VALUES(?,?,?,?,?,?)
                    ON CONFLICT(story_id) DO UPDATE SET
                    last_refreshed_at=excluded.last_refreshed_at,
                    update_count=excluded.update_count,
                    refreshed_hash=excluded.refreshed_hash,
-                   status=excluded.status""",
-                (story_id, observed, update_count, refreshed_hash, status),
+                   status=excluded.status,
+                   policy_hash=excluded.policy_hash""",
+                (story_id, observed, update_count, refreshed_hash, status, policy_hash),
             )
             if code is not None:
                 detail = dict(extra) if isinstance(extra, dict) else {}
@@ -1187,6 +1255,129 @@ class Store:
                     **detail,
                 )
 
+    record_refresh_attempt = record_refresh_status
+
+    def list_refreshes(self, *, status: str | None = None, limit: int = 50) -> list[dict]:
+        """List recorded living-story refresh states joined with story metadata."""
+        if status is not None:
+            if not isinstance(status, str) or status not in {"held", "refreshed", "skipped", "all"}:
+                raise ValueError("List status must be held, refreshed, skipped, or all")
+            if status == "all":
+                status = None
+        if type(limit) is not int or not 1 <= limit <= decisions.MAX_LIMIT:
+            raise ValueError(f"List limit must be between 1 and {decisions.MAX_LIMIT}")
+        where = "WHERE sr.status=?" if status is not None else ""
+        params: tuple[object, ...] = (status, limit) if status is not None else (limit,)
+        rows = self.db.execute(
+            f"""SELECT sr.story_id, sr.last_refreshed_at, sr.update_count, sr.refreshed_hash,
+                       sr.status, sr.policy_hash,
+                       s.updated_at AS story_updated_at,
+                       CASE WHEN typeof(s.payload)='text' THEN CAST(s.payload AS BLOB) END AS payload_blob,
+                       d.code AS decision_code,
+                       CASE WHEN typeof(d.detail_json)='text' THEN CAST(d.detail_json AS BLOB) END AS detail_blob
+                FROM story_refreshes sr
+                LEFT JOIN stories s ON s.id=sr.story_id
+                LEFT JOIN decision_log d ON d.id=(
+                    SELECT MAX(dl.id) FROM decision_log dl
+                    WHERE dl.story_id=sr.story_id AND dl.subject GLOB 'refresh:' || sr.story_id || ':*'
+                )
+                {where}
+                ORDER BY sr.last_refreshed_at DESC, sr.story_id
+                LIMIT ?""",
+            params,
+        ).fetchall()
+        entries: list[dict] = []
+        for row in rows:
+            payload = saved_object(row["payload_blob"]) if row["payload_blob"] is not None else None
+            detail = saved_object(row["detail_blob"]) if row["detail_blob"] is not None else None
+            updates = payload.get("updates") if isinstance(payload, dict) and isinstance(payload.get("updates"), list) else []
+            entries.append({
+                "story_id": row["story_id"],
+                "title": payload.get("title") if isinstance(payload, dict) and isinstance(payload.get("title"), str) else None,
+                "state": payload.get("state") if isinstance(payload, dict) and isinstance(payload.get("state"), str) else None,
+                "story_update_count": len(updates),
+                "status": row["status"],
+                "code": row["decision_code"],
+                "reason": detail.get("reason") if isinstance(detail, dict) else None,
+                "hold_code": detail.get("hold_code") if isinstance(detail, dict) else None,
+                "update_count": row["update_count"],
+                "refreshed_hash": row["refreshed_hash"],
+                "policy_hash": row["policy_hash"],
+                "last_refreshed_at": row["last_refreshed_at"],
+                "updated_at": row["story_updated_at"] or row["last_refreshed_at"],
+            })
+        return entries
+
+    def reset_refresh_for_retry(
+        self,
+        story_id: str,
+        *,
+        reason: str,
+        expected_hash: str,
+        observed: str | None = None,
+    ) -> dict:
+        """Clear a recorded refresh outcome after CAS hash verification so the story retries next run."""
+        if not isinstance(story_id, str) or not STORY_ID_RE.fullmatch(story_id):
+            raise ValueError("Invalid story ID")
+        if not isinstance(expected_hash, str) or not SHA256_RE.fullmatch(expected_hash):
+            raise ValueError("Expected refresh hash must be its 64-character lowercase hexadecimal value")
+        clean_reason = editorial.clean_text(reason, "operator reason", 1000)
+        stamp = timestamp(observed or now_iso())
+        with immediate_transaction(self.db, "Refresh retry requires a fresh transaction"):
+            sr = self.db.execute(
+                "SELECT story_id,last_refreshed_at,update_count,refreshed_hash,status,policy_hash "
+                "FROM story_refreshes WHERE story_id=?",
+                (story_id,),
+            ).fetchone()
+            if sr is None:
+                raise ValueError("No refresh record found for story")
+            if sr["refreshed_hash"] != expected_hash:
+                raise ValueError("Refresh state changed since it was inspected; refresh list before retrying")
+            story_row = self.db.execute(
+                "SELECT id,cluster_key,CASE WHEN typeof(payload)='text' THEN CAST(payload AS BLOB) END AS payload_blob "
+                "FROM stories WHERE id=?",
+                (story_id,),
+            ).fetchone()
+            if editorial.retired(
+                self.db,
+                story_id=story_id,
+                cluster_key=story_row["cluster_key"] if story_row else None,
+            ) is not None:
+                raise ValueError("Cannot retry refresh for a retired or merged story")
+            story_payload = saved_object(story_row["payload_blob"]) if story_row is not None else None
+            if story_row is None or story_payload is None:
+                raise ValueError("Target story is no longer available")
+            if editorial.is_locked(self.db, story_id):
+                raise ValueError("Story is editorially locked or retracted")
+            if not is_refresh_eligible(story_payload):
+                raise ValueError("Story is not currently eligible for refresh")
+            changed = self.db.execute(
+                "DELETE FROM story_refreshes WHERE story_id=? AND refreshed_hash=?",
+                (story_id, expected_hash),
+            ).rowcount
+            if changed != 1:
+                raise ValueError("Refresh state changed during retry; inspect it again")
+            decisions.record_subject(
+                self.db,
+                f"refresh:{story_id}:retry",
+                "operator.retried",
+                stamp,
+                story_id=story_id,
+                once=False,
+                reason=clean_reason,
+                before_status=sr["status"],
+                before_update_count=sr["update_count"],
+                refreshed_hash=sr["refreshed_hash"],
+            )
+        return {
+            "story_id": story_id,
+            "status": "pending_retry",
+            "before_status": sr["status"],
+            "update_count": sr["update_count"],
+            "refreshed_hash": sr["refreshed_hash"],
+            "reason": clean_reason,
+        }
+
     def commit_story_refresh(
         self,
         story_id: str,
@@ -1196,6 +1387,7 @@ class Store:
         observed: str,
         *,
         base_prose: dict,
+        policy_hash: str = "",
     ) -> dict:
         """Atomically update refreshed prose fields while preserving dates, sources, updates, and labels."""
         with immediate_transaction(self.db, "Story refresh commit requires a fresh transaction"):
@@ -1223,8 +1415,8 @@ class Store:
                 raise candidate.StaleCandidate("Story is editorially locked or retracted")
             current_updates = current_payload.get("updates")
             if (
-                not isinstance(current_updates, list)
-                or len(current_updates) < MIN_REFRESH_UPDATES
+                not is_refresh_eligible(current_payload)
+                or not isinstance(current_updates, list)
                 or len(current_updates) != update_count
                 or story_refresh_hash(current_payload) != refreshed_hash
                 or any(
@@ -1266,14 +1458,15 @@ class Store:
             set_meta(self.db, publication_build_pending="1")
             ref_hash = story_refresh_hash(merged)
             self.db.execute(
-                """INSERT INTO story_refreshes(story_id,last_refreshed_at,update_count,refreshed_hash,status)
-                   VALUES(?,?,?,?,?)
+                """INSERT INTO story_refreshes(story_id,last_refreshed_at,update_count,refreshed_hash,status,policy_hash)
+                   VALUES(?,?,?,?,?,?)
                    ON CONFLICT(story_id) DO UPDATE SET
                    last_refreshed_at=excluded.last_refreshed_at,
                    update_count=excluded.update_count,
                    refreshed_hash=excluded.refreshed_hash,
-                   status=excluded.status""",
-                (story_id, observed, len(current_updates), ref_hash, "refreshed"),
+                   status=excluded.status,
+                   policy_hash=excluded.policy_hash""",
+                (story_id, observed, len(current_updates), ref_hash, "refreshed", policy_hash),
             )
             decisions.record_subject(
                 self.db,

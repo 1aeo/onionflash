@@ -43,6 +43,7 @@ _OPERATOR_ACTION_ORDER = {
     "story": ("show", "history", "correct", "retract", "restore", "unlock", "merge"),
     "rejected": ("list", "show", "retry", "dismiss", "approve"),
     "decisions": ("summary", "list"),
+    "refresh": ("list", "retry"),
 }
 OPERATOR_ACTIONS = {k: set(v) for k, v in _OPERATOR_ACTION_ORDER.items()}
 READ_ONLY_ACTIONS = {"show", "history", "list", "summary"}
@@ -116,6 +117,17 @@ def _operator_parsers(commands, cfg_parent: argparse.ArgumentParser) -> None:
             action.add_argument("--limit", type=int, default=50)
             action.add_argument("--after", type=int, help="Continuation cursor returned by the previous list")
 
+    ref_cmd = commands.add_parser("refresh", help="Inspect or retry living-story summary refreshes")
+    actions = ref_cmd.add_subparsers(dest="action", required=True)
+    for name in _OPERATOR_ACTION_ORDER["refresh"]:
+        parents = [cfg_parent] if name == "list" else [cfg_parent, guarded]
+        action = actions.add_parser(name, parents=parents)
+        if name == "list":
+            action.add_argument("--status", choices=("held", "refreshed", "skipped", "all"), default="all")
+            action.add_argument("--limit", type=int, default=50)
+        else:
+            action.add_argument("--story", required=True, help="Stable story ID")
+
 
 def _operator_command(args, store: Store, config: dict) -> dict:
     """Dispatch one inspection, or one operator action with its required hash and reason."""
@@ -139,6 +151,11 @@ def _operator_command(args, store: Store, config: dict) -> dict:
         if args.action == "summary":
             return decisions.summary(store.db, since)
         return decisions.list_entries(store.db, since, code=args.code, source=args.source, limit=args.limit, after=args.after)
+    if args.command == "refresh":
+        if args.action == "list":
+            status = None if args.status == "all" else args.status
+            return {"refreshes": store.list_refreshes(status=status, limit=args.limit)}
+        return store.reset_refresh_for_retry(args.story, reason=args.reason, expected_hash=args.expect_hash)
     if args.action == "list":
         return rejection.list_items(store, status=args.status, limit=args.limit, after=args.after)
     if args.action == "show":

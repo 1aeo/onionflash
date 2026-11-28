@@ -84,7 +84,7 @@ def test_story_refresh_eligibility_commit_preservation_and_re_eligibility(tmp_pa
         story_cols = [r[1] for r in store.db.execute("PRAGMA table_info(stories)").fetchall()]
         assert story_cols == ["id", "cluster_key", "payload", "published_at", "updated_at"]
         sr_cols = {r[1] for r in store.db.execute("PRAGMA table_info(story_refreshes)").fetchall()}
-        assert sr_cols == {"story_id", "last_refreshed_at", "update_count", "refreshed_hash", "status"}
+        assert sr_cols == {"story_id", "last_refreshed_at", "update_count", "refreshed_hash", "status", "policy_hash"}
 
         s1_item = item(url="https://example.org/s1", title="Initial issue 1", content="Initial issue one body.")
         s1 = seed_story(store, s1_item, analysis(title="Initial issue 1", summary="Initial issue one body.", evidence=["Initial issue one body."]))
