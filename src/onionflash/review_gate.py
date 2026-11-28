@@ -2187,6 +2187,8 @@ def _resolve_specialist_wave(spec_outcomes, s_used_list: list[int], candidate, p
         )
 
     if len(inconsistent) == 1 and requests.state["validation_reask"] is None:
+        if requests.state["reserved"] >= requests.max_requests:
+            return _enter_specialist_budget_hold(record, waiting, requests)
         failed_idx, inc_exc = inconsistent[0]
         seen = _seen_candidates(record, candidate, prepared)
         spec_results = list(results)

@@ -3834,3 +3834,46 @@ def test_specialist_wave_multi_reask_resume_multiwave_and_budget(context):
         assert saved_dh["hold_code"] == "specialist_budget"
         assert "pending_hold" not in saved_dh
         assert review_gate.validate_review_state(saved_dh, "held", prep_dh["candidate"], prep_dh) is None
+
+    # 9) Single inconsistent literal-tag specialist hitting request 21 with no prior correction holds cleanly as specialist_budget.
+    row_s21 = pending(store, item(id="https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-0.4.9.99", url="https://gitlab.torproject.org/tpo/core/tor/-/tags/tor-0.4.9.99", kind="tag", title="tor-0.4.9.99", content="Upstream tag observed: tor-0.4.9.99"))
+    prep_s21 = review_gate._prepare(store, cfg, row_s21, analysis(), DATE)
+    rec_s21 = {
+        **review_gate._new_record(row_s21, policy_hash=review.policy_hash(cfg)),
+        "writer": {"key": analyze.cache_key(row_s21, cfg["llm"])},
+        "specialists": 3,
+        "candidate": prep_s21["candidate"],
+        "reviews": [{
+            "stage": "review",
+            "candidate_hash": digest(prep_s21["candidate"]),
+            "request": 1,
+            "result": verdict("approve"),
+            **review_gate._context(prep_s21, review.policy_hash(cfg)),
+        }],
+        "request_budget": {"reserved": 18, "inconsistent_requests": [], "validation_reask": None},
+    }
+    review_gate._save(
+        store, row_s21, analyze.cache_key(row_s21, cfg["llm"]), review.policy_hash(cfg),
+        "verify", analysis(), prep_s21, rec_s21, DATE, prepared_at=DATE,
+    )
+
+    def _one_bad_factory():
+        idx = {"n": 0}
+        class _OneBad:
+            def review(self, candidate, packet, *, coverage=None, verification=False, issue=None, on_request=None, specialist=None, **kw):
+                idx["n"] += 1
+                on_request(1)
+                if specialist == "novelty_news":
+                    raise review.InconsistentReview(proposal={"summary": "Untrusted edit"})
+                return verdict("approve")
+        return _OneBad()
+
+    res_s21 = review_gate.process_item(
+        cfg, store, queued_row(store, row_s21["id"]), Writer(), ApprovingReviewer(),
+        parallel_verify=True, reviewer_factory=_one_bad_factory, specialists=3,
+    )
+    assert res_s21["status"] == "held"
+    s21_rec = json.loads(job(store, row_s21)["record_json"])
+    assert s21_rec["hold_code"] == "specialist_budget"
+    assert s21_rec["untrusted_proposals"] == []
+    assert review_gate.validate_review_state(s21_rec, "held", prep_s21["candidate"], prep_s21) is None

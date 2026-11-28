@@ -515,6 +515,26 @@ def test_tag_enrichment_edge_cases_store_identity_and_mr_body_signal(tmp_path):
     assert by_url[f"{feed_url}/release/v2.0.0"].get("tag_enriched") is True
     assert "Fixes WebRTC ICE stall" in by_url[f"{feed_url}/release/v2.0.0"]["content"]
 
+    # 4b. Cross-project root URL without /-/ cannot title-match; 500 trivial lines before a real note still keep the real note.
+    cross_root_xml = _tag_atom_xml(
+        ("v2.0.0", "https://gitlab.torproject.org/tpo/core/tor", "2026-11-20T12:00:00Z"),
+        ("v2.0.1", f"{feed_url}/v2.0.1", "2026-11-20T10:00:00Z"),
+    )
+    noisy_notes = "\n".join(["v2.0.1"] * 500 + ["Fixes circuit padding cell leak under heavy load."])
+    tags_noisy_json = json.dumps([
+        {"name": "v2.0.0", "message": "Snowflake notes should stay in snowflake.", "release": None},
+        {"name": "v2.0.1", "message": "", "release": {"description": noisy_notes}},
+    ]).encode("utf-8")
+    client2 = _FakeHttpClient({
+        feed_url: _FakeHttpResponse(feed_url, cross_root_xml),
+        tags_api: _FakeHttpResponse(tags_api, tags_noisy_json),
+    })
+    out2 = collect._feed(client2, _tag_source(project), feed_url, {}, _feed_settings(), DATE)
+    by_url2 = {it["url"]: it for it in out2["items"]}
+    assert by_url2["https://gitlab.torproject.org/tpo/core/tor"].get("tag_enriched") is not True
+    assert by_url2[f"{feed_url}/v2.0.1"].get("tag_enriched") is True
+    assert "Fixes circuit padding cell leak" in by_url2[f"{feed_url}/v2.0.1"]["content"]
+
     # 5. Non-string tag_enrichment_kind (e.g. []) never raises TypeError in source_fingerprint / build_packet.
     malformed_tag = {
         "id": "t-bad-kind", "source_id": "s1", "url": f"{feed_url}/v2.0.0",

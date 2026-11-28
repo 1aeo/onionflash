@@ -266,6 +266,31 @@ def _clean_release_description(tag_obj: dict) -> str:
     return "\n".join(kept).strip()
 
 
+def _bare_tag_names(tag_name: str, item_title: str) -> set[str]:
+    norm = lambda s: re.sub(r"[\s._-]+", "", s.lower()).removeprefix("v")
+    return {norm(tag_name), norm(item_title)}
+
+
+def _is_trivial_tag_line(line: str, bare_names: set[str]) -> bool:
+    norm_line = re.sub(r"[\s._-]+", "", line.lower()).removeprefix("v")
+    return bool(
+        _RELEASE_CLI_BOILERPLATE_RE.match(line)
+        or _TRIVIAL_TAG_MSG_RE.match(line)
+        or norm_line in bare_names
+    )
+
+
+def _strip_trivial_tag_lines(message: str, tag_name: str, item_title: str) -> str:
+    if not message:
+        return ""
+    bare_names = _bare_tag_names(tag_name, item_title)
+    return "\n".join(
+        ln.rstrip()
+        for ln in message.splitlines()
+        if ln.strip() and not _is_trivial_tag_line(ln.strip(), bare_names)
+    ).strip()
+
+
 def _is_substantive_tag_message(message: str, tag_name: str, item_title: str) -> bool:
     """Return whether `message` carries notes beyond bare tag names or version-bump lines."""
     if not message:
@@ -273,14 +298,8 @@ def _is_substantive_tag_message(message: str, tag_name: str, item_title: str) ->
     lines = [ln.strip() for ln in message.splitlines() if ln.strip()]
     if not lines:
         return False
-    norm = lambda s: re.sub(r"[\s._-]+", "", s.lower()).removeprefix("v")
-    bare_names = {norm(tag_name), norm(item_title)}
-    return any(
-        not _RELEASE_CLI_BOILERPLATE_RE.match(ln)
-        and not _TRIVIAL_TAG_MSG_RE.match(ln)
-        and norm(ln) not in bare_names
-        for ln in lines
-    )
+    bare_names = _bare_tag_names(tag_name, item_title)
+    return any(not _is_trivial_tag_line(ln, bare_names) for ln in lines)
 
 
 def _parse_tag_version(name: str) -> tuple[str, tuple[int, ...], str] | None:
@@ -379,29 +398,29 @@ def _enrich_gitlab_tags(client: HttpClient, feed_url: str, items: list[dict], se
             tag_ref = unquote(raw_ref.rstrip("/"))
             matched = by_name.get(tag_ref)
         else:
-            if "/-/" in url_parts.path and url_parts.path.split("/-/", 1)[0].strip("/") != project_path:
+            norm_path = url_parts.path.strip("/")
+            if norm_path != project_path and not norm_path.startswith(f"{project_path}/"):
                 continue
             matched = by_name.get(str(item.get("title") or "").strip())
         if matched is None:
             continue
         tag_idx, tag_obj = matched
         tag_name = tag_obj["name"]
-        rel_notes = _clean_release_description(tag_obj)
-        clean_msg = _clean_tag_message(tag_obj.get("message"))
         item_title = str(item.get("title") or "")
-        rel_substantive = _is_substantive_tag_message(rel_notes, tag_name, item_title)
-        msg_substantive = _is_substantive_tag_message(clean_msg, tag_name, item_title)
+        rel_notes = _strip_trivial_tag_lines(_clean_release_description(tag_obj), tag_name, item_title)
+        clean_msg = _strip_trivial_tag_lines(_clean_tag_message(tag_obj.get("message")), tag_name, item_title)
 
         parts = [
             p for p in (
-                rel_notes if rel_substantive else "",
-                clean_msg if msg_substantive and clean_msg != rel_notes else "",
+                rel_notes if _is_substantive_tag_message(rel_notes, tag_name, item_title) else "",
+                clean_msg if clean_msg != rel_notes and _is_substantive_tag_message(clean_msg, tag_name, item_title) else "",
             )
             if p
         ]
         if parts:
-            bounded = _bound_enriched_content(f"Release notes for {tag_name}:", "\n\n".join(parts), content_limit)
-            if bounded:
+            header = f"Release notes for {tag_name}:"
+            bounded = _bound_enriched_content(header, "\n\n".join(parts), content_limit)
+            if bounded and _is_substantive_tag_message(bounded.removeprefix(header).strip(), tag_name, item_title):
                 item["content"] = bounded
                 item["tag_enriched"] = True
                 item["tag_enrichment_kind"] = "release_notes"
