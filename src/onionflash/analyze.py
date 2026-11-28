@@ -721,8 +721,8 @@ def _strip_verified_short_commits(impact: str, ctx: str) -> str:
                 rf"|\b(?:commit|revision|rev)\s*(?:[:=#]|\s+)?{prefix}\b"
                 rf"|@{prefix}\b"
                 rf"|[([]\s*(?:at\s+)?{prefix}\s*[)\]]"
-                rf"|\b(?:at|with|in|from|on|via|since|after|before|against|by)\s+{prefix}"
-                rf"(?!\s+(?:relays?|clients?|users?|nodes?|connections?|servers?|hosts?|days?|hours?|minutes?|seconds?|bytes?|requests?|circuits?|streams?|errors?|warnings?|issues?|items?|percent)\b)"
+                rf"|\b(?:at|with|in|from|on|via|against|by)\s+{prefix}"
+                rf"(?=$|[,.;:!?)\]]|\s+(?:when|because|while|as|and|or|which|that|to|for|on|in|due|before|after)\b)"
                 rf")",
                 " ",
                 cleaned,

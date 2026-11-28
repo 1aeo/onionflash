@@ -511,6 +511,8 @@ def test_coderabbit_fixes_cache_contract_fingerprints_modal_hedges_and_tracker_o
     num_sha = "12345678" + "ab" * 16
     num_src = item(kind="gitlab_issue", url="https://gitlab.torproject.org/tpo/core/tor/-/work_items/42001", title="Fix crash", content=f"Regression introduced at {num_sha}.", labels=[])
     assert "numbers" in analyze._impact_clearing_reasons("The report says 12345678 relays crash.", num_src, ["tor"])
+    assert "numbers" in analyze._impact_clearing_reasons("The report says the daemon crashes after 12345678 retries.", num_src, ["tor"])
+    assert "numbers" in analyze._impact_clearing_reasons("The report says a crash occurs with 12345678 retries.", num_src, ["tor"])
     assert not analyze._impact_clearing_reasons("Fixes crash introduced in commit 12345678.", num_src, ["tor"])
     assert not analyze._impact_clearing_reasons("The report says a crash occurs with 12345678.", num_src, ["tor"])
 
