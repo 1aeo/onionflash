@@ -267,7 +267,8 @@ def _clean_release_description(tag_obj: dict) -> str:
 
 
 def _norm_tag_token(text: str) -> str:
-    return re.sub(r"[\s._-]+", "", text.lower()).removeprefix("v")
+    collapsed = re.sub(r"[\s_-]+", "-", text.strip().lower()).strip("-")
+    return re.sub(r"^v(?=[\d-])", "", collapsed)
 
 
 def _bare_tag_names(tag_name: str, item_title: str) -> set[str]:
