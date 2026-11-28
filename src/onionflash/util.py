@@ -10,7 +10,7 @@ import re
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 UTC = timezone.utc
 
@@ -829,6 +829,8 @@ def software_from_url(url: object) -> str | None:
     if netloc in {"tails.net", "www.tails.net"}:
         return "tails"
     if netloc in {"github.com", "www.github.com"}:
+        if any(seg in {".", ".."} for seg in unquote(parsed.path).split("/")):
+            return None
         gh_path = parsed.path.lower()
         if gh_path.startswith((
             "/guardianproject/orbot-android/",

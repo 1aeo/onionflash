@@ -121,6 +121,8 @@ def test_gitlab_url_and_source_software_extraction():
     assert util.software_from_url("http://github.com/guardianproject/orbot-android/releases") is None
     assert util.software_from_url("https://github.com:8443/guardianproject/orbot-android/releases") is None
     assert util.software_from_url("https://example.org:invalid/post") is None
+    assert util.software_from_url("https://github.com/guardianproject/orbot/../another-project/releases") is None
+    assert util.software_from_url("https://github.com/guardianproject/orbot/%2e%2e/another-project/releases") is None
     assert util.software_from_url("https://github.com/other/orbot-android/releases") is None
 
     found = util.software_from_sources([

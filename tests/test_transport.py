@@ -1294,4 +1294,17 @@ def test_pool_fallback_precedes_cooling_and_cursor_advances_past_chosen(monkeypa
         _, rk, _ = _ledger()
         picks.append(_complete(client3, rk)["host"])
     assert picks == ["c.example", "b.example", "c.example", "b.example"] or picks == ["b.example", "c.example", "b.example", "c.example"]
+
+    # Older in-flight success must not clear a newer failure cooldown on the same node.
+    CompletionClient._reset_pool_state()
+    pool = ("https://a.example/v1", "https://b.example/v1")
+    url_a, gen_a1 = CompletionClient._pool_claim_next(pool, [], set(), now=100.0)
+    assert url_a == "https://a.example/v1"
+    url_a2, gen_a2 = CompletionClient._pool_claim_next(pool, [], {"https://b.example/v1"}, now=100.0)
+    assert url_a2 == "https://a.example/v1" and gen_a2 == gen_a1
+    CompletionClient._pool_release(pool, url_a2, healthy=False, now=105.0, claim_gen=gen_a2)
+    CompletionClient._pool_release(pool, url_a, healthy=True, now=106.0, claim_gen=gen_a1)
+    next_pick, _ = CompletionClient._pool_claim_next(pool, [], set(), now=110.0)
+    assert next_pick == "https://b.example/v1"
+    CompletionClient._pool_release(pool, next_pick, healthy=True, now=110.0, claim_gen=0)
     CompletionClient._reset_pool_state()

@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import stat
 import threading
+import time
 import unicodedata
 from urllib.parse import urlsplit
 
@@ -1380,10 +1381,33 @@ def test_evaluate_parallel_preserves_shared_writer_errors_deadline_summary_and_s
     err_rows = [json.loads(line) for line in err_out.read_text().splitlines()[:-1]]
     assert [row["error"] for row in err_rows] == ["TypeError", "TypeError"]
 
-    # Deadline cancellation under concurrency=2 must still write the incomplete summary row.
-    seen_rev = 0
-    rev_lock = threading.Lock()
-    clock = [100.0]
+    # Deadline cancellation under concurrency=2 must cancel queued futures and still write the incomplete summary row.
+    from concurrent.futures import ThreadPoolExecutor
+
+    release_running = threading.Event()
+    running_started = threading.Event()
+    cancelled_event = threading.Event()
+    cancelled_count = 0
+    cancel_lock = threading.Lock()
+    rev_idx = 0
+
+    class _SpyPool(ThreadPoolExecutor):
+        def submit(self, fn, /, *args, **kwargs):
+            fut = super().submit(fn, *args, **kwargs)
+            orig_cancel = fut.cancel
+
+            def _watched_cancel():
+                nonlocal cancelled_count
+                was_cancelled = orig_cancel()
+                if was_cancelled:
+                    with cancel_lock:
+                        cancelled_count += 1
+                    cancelled_event.set()
+                    release_running.set()
+                return was_cancelled
+
+            fut.cancel = _watched_cancel
+            return fut
 
     class _SlowDeadlineRev(_ClientBase):
         last_decoded = None
@@ -1393,21 +1417,28 @@ def test_evaluate_parallel_preserves_shared_writer_errors_deadline_summary_and_s
 
         def review(self, cand, packet, *, coverage=None, verification=False, issue=None, update=False,
                    specialist=None, validation_error=None, on_request=None):
-            nonlocal seen_rev
+            nonlocal rev_idx
             if on_request:
                 on_request(1)
-            with rev_lock:
-                seen_rev += 1
-                if seen_rev == 1:
-                    return verdict("approve", update=update)
-            clock[0] = 200.0
+            with cancel_lock:
+                rev_idx += 1
+                idx = rev_idx
+            if idx == 1:
+                running_started.set()
+                assert release_running.wait(timeout=5.0)
+                return verdict("approve", update=update)
+            if idx == 2:
+                assert running_started.wait(timeout=5.0)
+                raise module.CompletionDeferred("simulated deadline reached")
+            assert release_running.wait(timeout=5.0)
             return verdict("approve", update=update)
 
     monkeypatch.setattr(module, "EvaluationReviewer", _SlowDeadlineRev)
-    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
-    six_cases = module.expand(corpus)[:6]
+    monkeypatch.setattr(module, "ThreadPoolExecutor", _SpyPool)
+    four_cases = module.expand(corpus)[:4]
     cancel_out = tmp_path / "cancel.jsonl"
-    cancel_res = module.evaluate(config, six_cases, cancel_out, deadline=150.0, concurrency=2)
+    cancel_res = module.evaluate(config, four_cases, cancel_out, deadline=time.monotonic() + 30.0, concurrency=2)
+    assert cancelled_event.is_set() and cancelled_count >= 1
     assert cancel_res["incomplete"] is True
     cancel_lines = [json.loads(line) for line in cancel_out.read_text().splitlines()]
     assert "summary" in cancel_lines[-1] and cancel_lines[-1]["summary"]["incomplete"] is True

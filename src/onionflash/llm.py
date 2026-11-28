@@ -1136,8 +1136,8 @@ class CompletionClient:
         fallbacks_only: list[str],
         tried: set[str],
         now: float,
-    ) -> str:
-        """Atomically select and claim the least-loaded healthy untried pool endpoint."""
+    ) -> tuple[str, int | None]:
+        """Atomically select and claim the least-loaded healthy untried pool endpoint and its cooldown generation."""
         has_untried_fallback = any(fb not in tried for fb in fallbacks_only)
         with cls._pool_lock:
             entry = cls._pool_state.setdefault(
@@ -1145,11 +1145,13 @@ class CompletionClient:
                 {
                     "in_flight": {url: 0 for url in pool_urls},
                     "unhealthy_until": {},
+                    "gen": {url: 0 for url in pool_urls},
                     "rr": 0,
                 },
             )
             in_flight = entry["in_flight"]
             unhealthy = entry["unhealthy_until"]
+            gens = entry["gen"]
             n = len(pool_urls)
             start = entry["rr"]
             rotated = [
@@ -1163,21 +1165,29 @@ class CompletionClient:
                     _, _, chosen_pos, chosen = min(healthy)
                     entry["rr"] = (chosen_pos + 1) % n
                     in_flight[chosen] = in_flight.get(chosen, 0) + 1
-                    return chosen
+                    return chosen, gens.get(chosen, 0)
                 if not has_untried_fallback:
                     _, _, _, chosen_pos, chosen = min(
                         (unhealthy[url], in_flight.get(url, 0), idx, pos, url) for idx, pos, url in rotated
                     )
                     entry["rr"] = (chosen_pos + 1) % n
                     in_flight[chosen] = in_flight.get(chosen, 0) + 1
-                    return chosen
+                    return chosen, gens.get(chosen, 0)
         for fb in fallbacks_only:
             if fb not in tried:
-                return fb
+                return fb, None
         raise RuntimeError("No untried endpoint available in pool")
 
     @classmethod
-    def _pool_release(cls, pool_urls: tuple[str, ...], url: str, *, healthy: bool | None = None, now: float = 0.0) -> None:
+    def _pool_release(
+        cls,
+        pool_urls: tuple[str, ...],
+        url: str,
+        *,
+        healthy: bool | None = None,
+        now: float = 0.0,
+        claim_gen: int | None = None,
+    ) -> None:
         if not pool_urls or url not in pool_urls:
             return
         with cls._pool_lock:
@@ -1185,10 +1195,13 @@ class CompletionClient:
             if entry is None:
                 return
             entry["in_flight"][url] = max(0, entry["in_flight"].get(url, 0) - 1)
+            gens = entry.setdefault("gen", {u: 0 for u in pool_urls})
             if healthy is True:
-                entry["unhealthy_until"].pop(url, None)
+                if claim_gen is None or gens.get(url, 0) == claim_gen:
+                    entry["unhealthy_until"].pop(url, None)
             elif healthy is False:
                 entry["unhealthy_until"][url] = now + cls.POOL_COOLDOWN_SECONDS
+                gens[url] = gens.get(url, 0) + 1
 
     def __init__(self, config: dict, deadline: float | None = None):
         self.deadline = deadline  # absolute monotonic admission boundary, not a transport cutoff
@@ -1279,10 +1292,10 @@ class CompletionClient:
                 if on_request is not None:
                     on_request(-1)
                 raise
-            base_url = (
+            base_url, claim_gen = (
                 self._pool_claim_next(pool_urls, fallbacks_only, tried, self.clock())
                 if pool_urls
-                else next(legacy_endpoints)
+                else (next(legacy_endpoints), None)
             )
             tried.add(base_url)
             self.calls += 1
@@ -1338,6 +1351,7 @@ class CompletionClient:
                         base_url,
                         healthy=healthy,
                         now=self.clock() if healthy is False else 0.0,
+                        claim_gen=claim_gen,
                     )
         else:
             raise failure
